@@ -1,0 +1,161 @@
+{
+    "dataset_mixture": {
+        "datasets": [
+            {
+                "repo_id": "physical-intelligence/libero",
+                "episodes": [
+                    10,
+                    20,
+                    23,
+                    46,
+                    51,
+                    54,
+                    57,
+                    67,
+                    70,
+                    73,
+                    86,
+                    100,
+                    106,
+                    115,
+                    143,
+                    149,
+                    179,
+                    187,
+                    194,
+                    204,
+                    214,
+                    270,
+                    283,
+                    288,
+                    306,
+                    314,
+                    316,
+                    341,
+                    376
+                ]
+            }
+        ],
+        "weights": [
+            1.0
+        ],
+        "action_freq": 30.0,
+        "image_resample_strategy": "nearest",
+        "vector_resample_strategy": "nearest"
+    },
+    "policy": {
+        "type": "pi0",
+        "pretrained_path": "lerobot/pi0",
+        "n_obs_steps": 1,
+        "normalization_mapping": {
+            "VISUAL": "IDENTITY",
+            "STATE": "MEAN_STD",
+            "ACTION": "MEAN_STD"
+        },
+        "chunk_size": 10,
+        "n_action_steps": 10,
+        "max_state_dim": 32,
+        "max_action_dim": 32,
+        "proj_width": 1024,
+        "num_steps": 10,
+        "init_strategy": "no_init",
+        "attention_implementation": "eager",
+        "freeze_vision_encoder": false,
+        "train_expert_only": false,
+        "train_state_proj": true,
+        "tokenizer_max_length": 100,
+        "optimizer_lr": 2.5e-05,
+        "optimizer_betas": [
+            0.9,
+            0.95
+        ],
+        "optimizer_eps": 1e-08,
+        "optimizer_weight_decay": 1e-10,
+        "scheduler_warmup_steps": 1000,
+        "scheduler_decay_steps": 30000,
+        "scheduler_decay_lr": 2.5e-06
+    },
+    "resume": false,
+    "seed": 1000,
+    "resolution": [
+        224,
+        224
+    ],
+    "num_cams": 2,
+    "action_expert_num_cams": 0,
+    "max_state_dim": 32,
+    "frozen_actions": 0,
+    "max_action_dim": 32,
+    "action_chunk": 10,
+    "loss_weighting": {
+        "MSE": 1,
+        "CE": 1
+    },
+    "num_workers": 2,
+    "batch_size": 2,
+    "gradient_accumulation_steps": 1,
+    "dataloader_batch_size": 2,
+    "prefetch_factor": 8,
+    "steps": 10,
+    "log_freq": 1,
+    "save_checkpoint": true,
+    "save_freq": 10,
+    "use_policy_training_preset": true,
+    "trace_nans": false,
+    "optimizer": {
+        "type": "adamw",
+        "lr": 2.5e-05,
+        "weight_decay": 1e-10,
+        "grad_clip_norm": 10.0,
+        "betas": [
+            0.9,
+            0.95
+        ],
+        "eps": 1e-08
+    },
+    "scheduler": {
+        "type": "cosine_decay_with_warmup",
+        "num_warmup_steps": 1000,
+        "num_decay_steps": 30000,
+        "peak_lr": 2.5e-05,
+        "decay_lr": 2.5e-06
+    },
+    "wandb": {
+        "enable": true,
+        "entity": "wyautox-autox",
+        "project": "pi0_star",
+        "run_id": null,
+        "name": null,
+        "notes": "PI0* training run",
+        "tags": [],
+        "group": null,
+        "job_type": null,
+        "mode": null,
+        "allow_resume": true,
+        "disable_artifact": false
+    },
+    "env": {
+        "type": "libero",
+        "task": "libero_10",
+        "fps": 10,
+        "max_parallel_tasks": 1,
+        "task_ids": [
+            8
+        ],
+        "episode_length": 520,
+        "obs_type": "pixels_agent_pos",
+        "render_mode": "rgb_array",
+        "camera_name": "agentview_image,robot0_eye_in_hand_image",
+        "init_states": true,
+        "camera_name_mapping": null
+    },
+    "eval": {
+        "n_episodes": 4,
+        "batch_size": 4,
+        "use_async_envs": true,
+        "max_episodes_rendered": 4,
+        "grid_size": null
+    },
+    "eval_freq": 1,
+    "last_checkpoint_only": false
+}

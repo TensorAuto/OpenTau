@@ -1,0 +1,124 @@
+{
+    "dataset_mixture": {
+        "datasets": [
+            {
+                "grounding": "dummy"
+            },
+            {
+                "repo_id": "lerobot/droid_100",
+                "episodes": [50, 10]
+            }
+        ],
+        "weights": [
+            1.0,
+            1.0
+        ],
+        "action_freq": 30.0,
+        "image_resample_strategy": "nearest",
+        "vector_resample_strategy": "nearest"
+    },
+    "env": {
+        "type": "libero",
+        "task": "libero_spatial",
+        "task_ids": [0, 2]
+    },
+    "eval": {
+        "n_episodes": 8,
+        "batch_size": 8
+    },
+    "eval_freq": 25,
+    "policy": {
+        "type": "tau0",
+        "pretrained_path": "lerobot/pi0",
+        "n_obs_steps": 1,
+        "normalization_mapping": {
+            "VISUAL": "IDENTITY",
+            "STATE": "MEAN_STD",
+            "ACTION": "MEAN_STD"
+        },
+        "chunk_size": 50,
+        "n_action_steps": 50,
+        "max_state_dim": 32,
+        "max_action_dim": 32,
+        "action_expert_num_cams": 1,
+        "cloud_vlm_latency_mean": 0.16,
+        "cloud_vlm_latency_std": 0.05,
+        "cloud_vlm_latency_lower": 0.10,
+        "cloud_vlm_latency_upper": 0.25,
+        "action_decoder_latency_mean": 0.032,
+        "action_decoder_latency_std": 0.010,
+        "action_decoder_latency_lower": 0.020,
+        "action_decoder_latency_upper": 0.050,
+        "tokenizer_max_length": 52,
+        "response_max_tokens": 52,
+        "n_cross_att_tokens": 10,
+        "proj_width": 1024,
+        "num_steps": 10,
+        "attention_implementation": "eager",
+        "freeze_vision_encoder": true,
+        "train_expert_only": true,
+        "train_state_proj": true,
+        "optimizer_lr": 1e-4,
+        "optimizer_betas": [
+            0.9,
+            0.95
+        ],
+        "optimizer_eps": 1e-08,
+        "optimizer_weight_decay": 0,
+        "scheduler_warmup_steps": 0,
+        "scheduler_decay_steps": 30000,
+        "scheduler_decay_lr": 0
+    },
+    "resume": false,
+    "seed": 1000,
+    "resolution": [224, 224],
+    "num_cams": 2,
+    "action_expert_num_cams": 1,
+    "max_state_dim": 32,
+    "max_action_dim": 32,
+    "action_chunk": 50,
+    "loss_weighting": {"MSE": 1, "CE": 1},
+    "num_workers": 4,
+    "batch_size": 16,
+    "gradient_accumulation_steps": 2,
+    "dataloader_batch_size": 8,
+    "prefetch_factor": 8,
+    "steps": 25,
+    "log_freq": 1,
+    "save_checkpoint": true,
+    "save_freq": 1000,
+    "use_policy_training_preset": true,
+    "debug": true,
+    "optimizer": {
+        "type": "adamw",
+        "lr": 1e-4,
+        "weight_decay": 0,
+        "grad_clip_norm": 10.0,
+        "betas": [
+            0.9,
+            0.95
+        ],
+        "eps": 1e-08
+    },
+    "scheduler": {
+        "type": "cosine_decay_with_warmup",
+        "num_warmup_steps": 0,
+        "num_decay_steps": 30000,
+        "peak_lr": 1e-4,
+        "decay_lr": 0
+    },
+    "wandb": {
+        "enable": true,
+        "entity": "wyautox-autox",
+        "project": "tau0-ci",
+        "run_id": null,
+        "name": null,
+        "notes": "CI Config",
+        "tags": [],
+        "group": null,
+        "job_type": null,
+        "mode": null,
+        "allow_resume": true,
+        "disable_artifact": false
+    }
+}

@@ -1,0 +1,56 @@
+#!/usr/bin/env python
+
+import logging
+from dataclasses import asdict
+from pprint import pformat
+
+import torch
+
+from lerobot.common.policies.factory import get_policy_class
+from lerobot.common.utils.random_utils import set_seed
+from lerobot.common.utils.utils import (
+    attempt_torch_compile,
+    auto_torch_device,
+    create_dummy_observation,
+    init_logging,
+)
+from lerobot.configs import parser
+from lerobot.configs.train import TrainPipelineConfig
+
+
+@parser.wrap()
+def inference_main(cfg: TrainPipelineConfig):
+    logging.info(pformat(asdict(cfg)))
+
+    # Check device is available
+    device = auto_torch_device()
+
+    if cfg.seed is not None:
+        set_seed(cfg.seed)
+
+    logging.info("Creating policy")
+    policy_class = get_policy_class(cfg.policy.type)
+    policy = policy_class.from_pretrained(cfg.policy.pretrained_path, config=cfg.policy)
+    policy.to(device=device, dtype=torch.bfloat16)
+    policy.eval()
+    policy = attempt_torch_compile(policy, device_hint=device)
+
+    # Always reset policy before episode to clear out action cache.
+    policy.reset()
+
+    observation = create_dummy_observation(cfg, device, dtype=torch.bfloat16)
+
+    print(observation.keys())
+
+    with torch.inference_mode():
+        for _ in range(1000):
+            action = policy.select_action(observation)
+            action = action.to("cpu", torch.float32).numpy()
+            print(f"Output shape: {action.shape}")
+
+    logging.info("End of inference")
+
+
+if __name__ == "__main__":
+    init_logging()
+    inference_main()

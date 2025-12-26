@@ -1,0 +1,114 @@
+{
+    "dataset_mixture": {
+        "datasets": [
+            {
+                "repo_id": "lerobot/droid_100"
+            },
+            {
+                "repo_id": "lerobot/aloha_mobile_cabinet"
+            },
+            {
+                "grounding": "dummy"
+            }
+        ],
+        "weights": [
+            1.0,
+            1.0,
+            1.0
+        ],
+        "action_freq": 30.0,
+        "image_resample_strategy": "nearest",
+        "vector_resample_strategy": "nearest"
+    },
+    "policy": {
+        "type": "tau0",
+        "n_obs_steps": 1,
+        "normalization_mapping": {
+            "VISUAL": "IDENTITY",
+            "STATE": "MEAN_STD",
+            "ACTION": "MEAN_STD"
+        },
+        "chunk_size": 50,
+        "n_action_steps": 50,
+        "max_state_dim": 32,
+        "max_action_dim": 32,
+        "action_expert_num_cams": 1,
+        "cloud_vlm_latency_mean": 0.16,
+        "cloud_vlm_latency_std": 0.05,
+        "cloud_vlm_latency_lower": 0.1,
+        "cloud_vlm_latency_upper": 0.25,
+        "action_decoder_latency_mean": 0.032,
+        "action_decoder_latency_std": 0.01,
+        "action_decoder_latency_lower": 0.02,
+        "action_decoder_latency_upper": 0.05,
+        "tokenizer_max_length": 52,
+        "response_max_tokens": 52,
+        "proj_width": 1024,
+        "num_steps": 10,
+        "attention_implementation": "eager",
+        "freeze_vision_encoder": true,
+        "train_expert_only": true,
+        "train_state_proj": true,
+        "optimizer_lr": 2.5e-05,
+        "optimizer_betas": [
+            0.9,
+            0.95
+        ],
+        "optimizer_eps": 1e-08,
+        "optimizer_weight_decay": 1e-10,
+        "scheduler_warmup_steps": 1000,
+        "scheduler_decay_steps": 30000,
+        "scheduler_decay_lr": 2.5e-06
+    },
+    "job_name": "tau0",
+    "resume": false,
+    "seed": 1000,
+    "resolution": [
+        224,
+        224
+    ],
+    "num_cams": 2,
+    "action_expert_num_cams": 1,
+    "max_state_dim": 32,
+    "max_action_dim": 32,
+    "action_chunk": 50,
+    "loss_weighting": {
+        "MSE": 1,
+        "CE": 1
+    },
+    "num_workers": 4,
+    "batch_size": 2,
+    "prefetch_factor": 8,
+    "steps": 100,
+    "log_freq": 1,
+    "save_checkpoint": true,
+    "save_freq": 100,
+    "use_policy_training_preset": true,
+    "optimizer": {
+        "type": "adamw",
+        "lr": 2.5e-05,
+        "weight_decay": 1e-10,
+        "grad_clip_norm": 10.0,
+        "betas": [
+            0.9,
+            0.95
+        ],
+        "eps": 1e-08
+    },
+    "scheduler": {
+        "type": "cosine_decay_with_warmup",
+        "num_warmup_steps": 1000,
+        "num_decay_steps": 30000,
+        "peak_lr": 2.5e-05,
+        "decay_lr": 2.5e-06
+    },
+    "wandb": {
+        "enable": false,
+        "disable_artifact": false,
+        "project": "lerobot",
+        "entity": null,
+        "notes": null,
+        "run_id": null,
+        "mode": null
+    }
+}

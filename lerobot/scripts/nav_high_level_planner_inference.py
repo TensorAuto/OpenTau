@@ -1,0 +1,47 @@
+import argparse
+import logging
+import os
+
+from dotenv import load_dotenv
+from PIL import Image
+
+from lerobot.common.planner import NavHighLevelPlanner
+from lerobot.common.utils.utils import (
+    init_logging,
+)
+
+load_dotenv()
+
+
+def main(img_dir_path):
+    frames = sorted(os.listdir(img_dir_path))
+    logging.info("Loading the frames")
+    img_dict1 = {}
+    for i, image_path in enumerate(frames):
+        img = Image.open(img_dir_path + "/" + image_path).convert("RGB")
+        img_dict1[i] = img
+
+    # dummy instructions
+    task = "The goal is to reach till fridge"
+    nav_planner = NavHighLevelPlanner()
+    logging.info("Inferencing the navigational planner")
+    actions = nav_planner.inference(image_dict=img_dict1, model_name="gpt4o", task=task, mem=None)
+
+    logging.info(f"The instructions are {actions}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Run the navigation high level planner with a specified image directory."
+    )
+
+    # 2. Add the --img_path argument
+    parser.add_argument(
+        "--img_path", type=str, required=True, help="Path to the directory containing the image frames."
+    )
+
+    # 3. Parse the arguments from the command line
+    args = parser.parse_args()
+
+    init_logging()
+    main(args.img_path)

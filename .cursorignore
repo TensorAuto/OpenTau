@@ -1,0 +1,37 @@
+# Additional patterns to ignore during AI agent assistance
+# Note: .gitignore patterns are automatically respected by Cursor
+# This file only contains additional patterns not in .gitignore
+
+# Bazel build output symlinks/dirs at root only
+/bazel-*/
+
+# VCS noise (not in .gitignore)
+/.git/
+
+# Sensitive files - Environment variables, credentials, and keys
+.env.*
+.npmrc
+.pypirc
+credentials.json
+secrets.json
+**/private/
+.ssh/
+.kube/
+service_account.json
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.csr
+*.der
+id_rsa
+id_rsa.pub
+
+# Production configuration files (specific root-level paths)
+/config/production/secret/
+/infra/xtaxi/backend_py/payment/rsa_key/
+/onboard/xview/cert/
+
+# Secret files and directories (anywhere in the codebase)
+**/secrets/

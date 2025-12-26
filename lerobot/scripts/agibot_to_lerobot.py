@@ -1,0 +1,631 @@
+r"""
+This code is adapted from https://huggingface.co/datasets/agibot-world/AgiBotWorld-Alpha/resolve/main/scripts/convert_to_lerobot.py
+Running this script will convert the AgiBotWorld dataset at the source directory into lerobot format, and save it to the target directory.
+Beware of the additional storage consumption as AgiBotWorld dataset is very huge.
+Example usage:
+$ python3 lerobot/scripts/agibot_to_lerobot.py --src_path /input/path --tgt_path /output/path --task_id 1234
+"""
+
+import argparse
+import json
+import logging
+import os
+import shutil
+from copy import deepcopy
+from functools import partial, wraps
+from math import ceil
+from pathlib import Path
+from typing import Callable
+
+import einops
+import h5py
+import numpy as np
+import torch
+from PIL import Image
+from tqdm import tqdm
+from tqdm.contrib.concurrent import process_map
+
+from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.common.datasets.utils import (
+    STATS_PATH,
+    check_timestamps_sync,
+    get_episode_data_index,
+    serialize_dict,
+    write_json,
+    write_task,
+)
+
+HEAD_COLOR = "head_color.mp4"
+HAND_LEFT_COLOR = "hand_left_color.mp4"
+HAND_RIGHT_COLOR = "hand_right_color.mp4"
+HEAD_CENTER_FISHEYE_COLOR = "head_center_fisheye_color.mp4"
+HEAD_LEFT_FISHEYE_COLOR = "head_left_fisheye_color.mp4"
+HEAD_RIGHT_FISHEYE_COLOR = "head_right_fisheye_color.mp4"
+BACK_LEFT_FISHEYE_COLOR = "back_left_fisheye_color.mp4"
+BACK_RIGHT_FISHEYE_COLOR = "back_right_fisheye_color.mp4"
+HEAD_DEPTH = "head_depth"
+
+DEFAULT_IMAGE_PATH = "images/{image_key}/episode_{episode_index:06d}/frame_{frame_index:06d}.jpg"
+
+FEATURES = {
+    "observation.images.top_head": {
+        "dtype": "video",
+        "shape": [480, 640, 3],
+        "names": ["height", "width", "channel"],
+        "video_info": {
+            "video.fps": 30.0,
+            "video.codec": "av1",
+            "video.pix_fmt": "yuv420p",
+            "video.is_depth_map": False,
+            "has_audio": False,
+        },
+    },
+    "observation.images.cam_top_depth": {
+        "dtype": "image",
+        "shape": [480, 640, 1],
+        "names": ["height", "width", "channel"],
+    },
+    "observation.images.hand_left": {
+        "dtype": "video",
+        "shape": [480, 640, 3],
+        "names": ["height", "width", "channel"],
+        "video_info": {
+            "video.fps": 30.0,
+            "video.codec": "av1",
+            "video.pix_fmt": "yuv420p",
+            "video.is_depth_map": False,
+            "has_audio": False,
+        },
+    },
+    "observation.images.hand_right": {
+        "dtype": "video",
+        "shape": [480, 640, 3],
+        "names": ["height", "width", "channel"],
+        "video_info": {
+            "video.fps": 30.0,
+            "video.codec": "av1",
+            "video.pix_fmt": "yuv420p",
+            "video.is_depth_map": False,
+            "has_audio": False,
+        },
+    },
+    "observation.images.head_center_fisheye": {
+        "dtype": "video",
+        "shape": [748, 960, 3],
+        "names": ["height", "width", "channel"],
+        "video_info": {
+            "video.fps": 30.0,
+            "video.codec": "av1",
+            "video.pix_fmt": "yuv420p",
+            "video.is_depth_map": False,
+            "has_audio": False,
+        },
+    },
+    "observation.images.head_left_fisheye": {
+        "dtype": "video",
+        "shape": [748, 960, 3],
+        "names": ["height", "width", "channel"],
+        "video_info": {
+            "video.fps": 30.0,
+            "video.codec": "av1",
+            "video.pix_fmt": "yuv420p",
+            "video.is_depth_map": False,
+            "has_audio": False,
+        },
+    },
+    "observation.images.head_right_fisheye": {
+        "dtype": "video",
+        "shape": [748, 960, 3],
+        "names": ["height", "width", "channel"],
+        "video_info": {
+            "video.fps": 30.0,
+            "video.codec": "av1",
+            "video.pix_fmt": "yuv420p",
+            "video.is_depth_map": False,
+            "has_audio": False,
+        },
+    },
+    "observation.images.back_left_fisheye": {
+        "dtype": "video",
+        "shape": [748, 960, 3],
+        "names": ["height", "width", "channel"],
+        "video_info": {
+            "video.fps": 30.0,
+            "video.codec": "av1",
+            "video.pix_fmt": "yuv420p",
+            "video.is_depth_map": False,
+            "has_audio": False,
+        },
+    },
+    "observation.images.back_right_fisheye": {
+        "dtype": "video",
+        "shape": [748, 960, 3],
+        "names": ["height", "width", "channel"],
+        "video_info": {
+            "video.fps": 30.0,
+            "video.codec": "av1",
+            "video.pix_fmt": "yuv420p",
+            "video.is_depth_map": False,
+            "has_audio": False,
+        },
+    },
+    "observation.state": {
+        "dtype": "float32",
+        "shape": [20],
+        "names": None,
+    },
+    "action": {
+        "dtype": "float32",
+        "shape": [22],
+        "names": None,
+    },
+    "episode_index": {
+        "dtype": "int64",
+        "shape": [1],
+        "names": None,
+    },
+    "frame_index": {
+        "dtype": "int64",
+        "shape": [1],
+        "names": None,
+    },
+    "index": {
+        "dtype": "int64",
+        "shape": [1],
+        "names": None,
+    },
+    "task_index": {
+        "dtype": "int64",
+        "shape": [1],
+        "names": None,
+    },
+}
+
+FRAME_TYPE = dict[str, np.ndarray]
+FRAME_DATASET_TYPE = list[FRAME_TYPE]
+VIDEO_DATASET_TYPE = dict[str, Path]
+LOCAL_DATASET_TYPE = tuple[FRAME_DATASET_TYPE, VIDEO_DATASET_TYPE]
+
+
+def silence_failure(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except BaseException:
+            pass
+
+    return wrapper
+
+
+def get_stats_einops_patterns(dataset, num_workers=0):
+    """These einops patterns will be used to aggregate batches and compute statistics.
+
+    Note: We assume the images are in channel first format
+    """
+
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        num_workers=num_workers,
+        batch_size=2,
+        shuffle=False,
+    )
+    batch = next(iter(dataloader))
+
+    stats_patterns = {}
+
+    for key in dataset.features:
+        # sanity check that tensors are not float64
+        assert batch[key].dtype != torch.float64
+
+        # if isinstance(feats_type, (VideoFrame, Image)):
+        if key in dataset.meta.camera_keys:
+            # sanity check that images are channel first
+            _, c, h, w = batch[key].shape
+            assert c < h and c < w, f"expect channel first images, but instead {batch[key].shape}"
+            assert batch[key].dtype == torch.float32, f"expect torch.float32, but instead {batch[key].dtype=}"
+            # assert batch[key].max() <= 1, f"expect pixels lower than 1, but instead {batch[key].max()=}"
+            # assert batch[key].min() >= 0, f"expect pixels greater than 1, but instead {batch[key].min()=}"
+            stats_patterns[key] = "b c h w -> c 1 1"
+        elif batch[key].ndim == 2:
+            stats_patterns[key] = "b c -> c "
+        elif batch[key].ndim == 1:
+            stats_patterns[key] = "b -> 1"
+        else:
+            raise ValueError(f"{key}, {batch[key].shape}")
+
+    return stats_patterns
+
+
+def compute_stats(dataset, batch_size=8, num_workers=4, max_num_samples=None):
+    """Compute mean/std and min/max statistics of all data keys in a LeRobotDataset."""
+    if max_num_samples is None:
+        max_num_samples = len(dataset)
+
+    # for more info on why we need to set the same number of workers, see `load_from_videos`
+    stats_patterns = get_stats_einops_patterns(dataset, num_workers)
+
+    # mean and std will be computed incrementally while max and min will track the running value.
+    mean, std, max, min = {}, {}, {}, {}
+    for key in stats_patterns:
+        mean[key] = torch.tensor(0.0).float()
+        std[key] = torch.tensor(0.0).float()
+        max[key] = torch.tensor(-float("inf")).float()
+        min[key] = torch.tensor(float("inf")).float()
+
+    def create_seeded_dataloader(dataset, batch_size, seed):
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            num_workers=num_workers,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=False,
+            generator=generator,
+        )
+        return dataloader
+
+    # Note: Due to be refactored soon. The point of storing `first_batch` is to make sure we don't get
+    # surprises when rerunning the sampler.
+    first_batch = None
+    running_item_count = 0  # for online mean computation
+    dataloader = create_seeded_dataloader(dataset, batch_size, seed=1337)
+    for i, batch in enumerate(
+        tqdm(
+            dataloader,
+            total=ceil(max_num_samples / batch_size),
+            desc="Compute mean, min, max",
+        )
+    ):
+        this_batch_size = len(batch["index"])
+        running_item_count += this_batch_size
+        if first_batch is None:
+            first_batch = deepcopy(batch)
+        for key, pattern in stats_patterns.items():
+            batch[key] = batch[key].float()
+            # Numerically stable update step for mean computation.
+            batch_mean = einops.reduce(batch[key], pattern, "mean")
+            # Hint: to update the mean we need x̄ₙ = (Nₙ₋₁x̄ₙ₋₁ + Bₙxₙ) / Nₙ, where the subscript represents
+            # the update step, N is the running item count, B is this batch size, x̄ is the running mean,
+            # and x is the current batch mean. Some rearrangement is then required to avoid risking
+            # numerical overflow. Another hint: Nₙ₋₁ = Nₙ - Bₙ. Rearrangement yields
+            # x̄ₙ = x̄ₙ₋₁ + Bₙ * (xₙ - x̄ₙ₋₁) / Nₙ
+            mean[key] = mean[key] + this_batch_size * (batch_mean - mean[key]) / running_item_count
+            max[key] = torch.maximum(max[key], einops.reduce(batch[key], pattern, "max"))
+            min[key] = torch.minimum(min[key], einops.reduce(batch[key], pattern, "min"))
+
+        if i == ceil(max_num_samples / batch_size) - 1:
+            break
+
+    first_batch_ = None
+    running_item_count = 0  # for online std computation
+    dataloader = create_seeded_dataloader(dataset, batch_size, seed=1337)
+    for i, batch in enumerate(tqdm(dataloader, total=ceil(max_num_samples / batch_size), desc="Compute std")):
+        this_batch_size = len(batch["index"])
+        running_item_count += this_batch_size
+        # Sanity check to make sure the batches are still in the same order as before.
+        if first_batch_ is None:
+            first_batch_ = deepcopy(batch)
+            for key in stats_patterns:
+                assert torch.equal(first_batch_[key], first_batch[key])
+        for key, pattern in stats_patterns.items():
+            batch[key] = batch[key].float()
+            # Numerically stable update step for mean computation (where the mean is over squared
+            # residuals).See notes in the mean computation loop above.
+            batch_std = einops.reduce((batch[key] - mean[key]) ** 2, pattern, "mean")
+            std[key] = std[key] + this_batch_size * (batch_std - std[key]) / running_item_count
+
+        if i == ceil(max_num_samples / batch_size) - 1:
+            break
+
+    for key in stats_patterns:
+        std[key] = torch.sqrt(std[key])
+
+    stats = {}
+    for key in stats_patterns:
+        stats[key] = {
+            "mean": mean[key],
+            "std": std[key],
+            "max": max[key],
+            "min": min[key],
+        }
+    return stats
+
+
+class AgiBotDataset(LeRobotDataset):
+    def __init__(
+        self,
+        repo_id: str,
+        root: str | Path | None = None,
+        episodes: list[int] | None = None,
+        image_transforms: Callable | None = None,
+        delta_timestamps: dict[list[float]] | None = None,
+        tolerance_s: float = 1e-4,
+        download_videos: bool = True,
+        video_backend: str | None = None,
+    ):
+        super().__init__(
+            repo_id=repo_id,
+            root=root,
+            episodes=episodes,
+            image_transforms=image_transforms,
+            delta_timestamps=delta_timestamps,
+            tolerance_s=tolerance_s,
+            download_videos=download_videos,
+            video_backend=video_backend,
+        )
+
+    def save_episode(
+        self, task: str, task_index: int, episode_data: dict | None = None, videos: dict | None = None
+    ) -> None:
+        """
+        We rewrite this method to copy mp4 videos to the target position
+        """
+
+        self.meta.task_to_task_index[task] = task_index
+        self.meta.tasks[task_index] = task
+        write_task(task_index, task, self.root)
+
+        if not episode_data:
+            episode_buffer = self.episode_buffer
+
+        episode_length = episode_buffer.pop("size")
+        episode_index = episode_buffer["episode_index"]
+        if episode_index != self.meta.total_episodes:
+            # TODO(aliberts): Add option to use existing episode_index
+            raise NotImplementedError(
+                "You might have manually provided the episode_buffer with an episode_index that doesn't "
+                "match the total number of episodes in the dataset. This is not supported for now."
+            )
+
+        if episode_length == 0:
+            raise ValueError(
+                "You must add one or several frames with `add_frame` before calling `add_episode`."
+            )
+
+        if not set(episode_buffer.keys()).difference({"task"}) == set(self.features):
+            raise ValueError()
+
+        for key, ft in self.features.items():
+            if key == "index":
+                episode_buffer[key] = np.arange(
+                    self.meta.total_frames, self.meta.total_frames + episode_length
+                )
+            elif key == "episode_index":
+                episode_buffer[key] = np.full((episode_length,), episode_index)
+            elif key == "task_index":
+                episode_buffer[key] = np.full((episode_length,), task_index)
+            elif ft["dtype"] in ["image", "video"]:
+                continue
+            elif len(ft["shape"]) == 1 and ft["shape"][0] == 1:
+                episode_buffer[key] = np.array(episode_buffer[key], dtype=ft["dtype"])
+            elif len(ft["shape"]) == 1 and ft["shape"][0] > 1:
+                episode_buffer[key] = np.stack(episode_buffer[key])
+            else:
+                raise ValueError(key)
+
+        self._wait_image_writer()
+        self._save_episode_table(episode_buffer, episode_index)
+
+        for key in self.meta.video_keys:
+            video_path = self.root / self.meta.get_video_file_path(episode_index, key)
+            episode_buffer[key] = video_path
+            video_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(videos[key], video_path)
+        # TODO(shuheng) LeRobot v2.1 requires a per-episode stat.
+        #  For now we set the version to v2.0 and skip the per-episode stats
+        _episode_stats = {}
+        self.meta.save_episode(episode_index, episode_length, task, _episode_stats)
+        # if not episode_data:  # Reset the buffer
+        #     self.episode_buffer = self.create_episode_buffer()
+        self.consolidated = False
+
+    def consolidate(self, run_compute_stats: bool = True, keep_image_files: bool = False) -> None:
+        self.hf_dataset = self.load_hf_dataset()
+        self.episode_data_index, _ = get_episode_data_index(self.meta.episodes, self.episodes)
+        check_timestamps_sync(
+            self.episode_buffer["timestamp"],
+            self.episode_buffer["frame_index"],
+            self.episode_data_index,
+            self.fps,
+            self.tolerance_s,
+        )
+
+        if not keep_image_files:
+            img_dir = self.root / "images"
+            if img_dir.is_dir():
+                shutil.rmtree(self.root / "images")
+        video_files = list(self.root.rglob("*.mp4"))
+        assert len(video_files) == self.num_episodes * len(self.meta.video_keys)
+
+        parquet_files = list(self.root.rglob("*.parquet"))
+        assert len(parquet_files) == self.num_episodes
+
+        if run_compute_stats:
+            self.stop_image_writer()
+            self.meta.stats = compute_stats(self)
+            serialized_stats = serialize_dict(self.meta.stats)
+            write_json(serialized_stats, self.root / STATS_PATH)
+            self.consolidated = True
+        else:
+            logging.warning(
+                "Skipping computation of the dataset statistics, dataset is not fully consolidated."
+            )
+
+    def add_frame(self, frame: FRAME_TYPE) -> None:
+        """
+        This function only adds the frame to the episode_buffer. Apart from images — which are written in a
+        temporary directory — nothing is written to disk. To save those frames, the 'save_episode()' method
+        then needs to be called.
+        """
+        # TODO(aliberts, rcadene): Add sanity check for the input, check it's numpy or torch,
+        # check the dtype and shape matches, etc.
+
+        if self.episode_buffer is None:
+            self.episode_buffer = self.create_episode_buffer()
+
+        frame_index = self.episode_buffer["size"]
+        timestamp = frame.pop("timestamp", frame_index / self.fps)
+        self.episode_buffer["frame_index"].append(frame_index)
+        self.episode_buffer["timestamp"].append(timestamp)
+
+        for key in frame:
+            if key not in self.features:
+                raise ValueError(key)
+            item = frame[key].numpy() if isinstance(frame[key], torch.Tensor) else frame[key]
+            self.episode_buffer[key].append(item)
+
+        self.episode_buffer["size"] += 1
+
+
+def load_depths(root_dir: str, camera_name: str):
+    cam_path = Path(root_dir)
+    all_imgs = sorted(cam_path.glob(f"{camera_name}*"))
+    return [np.array(Image.open(f)).astype(np.float32) / 1000 for f in all_imgs]
+
+
+@silence_failure
+def load_local_dataset(episode_id: int, src_path: str, task_id: int) -> LOCAL_DATASET_TYPE | None:
+    """Load local dataset and return a dict with observations and actions"""
+
+    ob_dir = Path(src_path) / f"observations/{task_id}/{episode_id}"
+    depth_imgs = load_depths(ob_dir / "depth", HEAD_DEPTH)
+    proprio_dir = Path(src_path) / f"proprio_stats/{task_id}/{episode_id}"
+
+    with h5py.File(proprio_dir / "proprio_stats.h5") as f:
+        state_joint = np.array(f["state/joint/position"])
+        state_effector = np.array(f["state/effector/position"])
+        state_head = np.array(f["state/head/position"])
+        state_waist = np.array(f["state/waist/position"])
+        action_joint = np.array(f["action/joint/position"])
+        action_effector = np.array(f["action/effector/position"])
+        action_head = np.array(f["action/head/position"])
+        action_waist = np.array(f["action/waist/position"])
+        action_velocity = np.array(f["action/robot/velocity"])
+
+    states_value = np.hstack([state_joint, state_effector, state_head, state_waist]).astype(np.float32)
+    assert action_joint.shape[0] == action_effector.shape[0], (
+        f"shape of action_joint:{action_joint.shape};shape of action_effector:{action_effector.shape}"
+    )
+    action_value = np.hstack(
+        [action_joint, action_effector, action_head, action_waist, action_velocity]
+    ).astype(np.float32)
+
+    assert len(depth_imgs) == len(states_value), "Number of images and states are not equal"
+    assert len(depth_imgs) == len(action_value), "Number of images and actions are not equal"
+    frames = [
+        {
+            "observation.images.cam_top_depth": depth_imgs[i],
+            "observation.state": states_value[i],
+            "action": action_value[i],
+        }
+        for i in range(len(depth_imgs))
+    ]
+
+    v_path = ob_dir / "videos"
+    videos = {
+        "observation.images.top_head": v_path / HEAD_COLOR,
+        "observation.images.hand_left": v_path / HAND_LEFT_COLOR,
+        "observation.images.hand_right": v_path / HAND_RIGHT_COLOR,
+        "observation.images.head_center_fisheye": v_path / HEAD_CENTER_FISHEYE_COLOR,
+        "observation.images.head_left_fisheye": v_path / HEAD_LEFT_FISHEYE_COLOR,
+        "observation.images.head_right_fisheye": v_path / HEAD_RIGHT_FISHEYE_COLOR,
+        "observation.images.back_left_fisheye": v_path / BACK_LEFT_FISHEYE_COLOR,
+        "observation.images.back_right_fisheye": v_path / BACK_RIGHT_FISHEYE_COLOR,
+    }
+    return frames, videos
+
+
+def get_task_instruction(task_json_path: str) -> dict:
+    """Get task language instruction"""
+    with open(task_json_path) as f:
+        task_info = json.load(f)
+    task_name = task_info[0]["task_name"]
+    task_init_scene = task_info[0]["init_scene_text"]
+    task_instruction = f"{task_name}.{task_init_scene}"
+    print(f"Get Task Instruction <{task_instruction}>")
+    return task_instruction
+
+
+def main(
+    src_path: str,
+    tgt_path: str,
+    task_id: int,
+    repo_id: str,
+    task_info_json: str,
+    debug: bool = False,
+):
+    task_name = get_task_instruction(task_info_json)
+
+    dataset = AgiBotDataset.create(
+        repo_id=repo_id,
+        root=f"{tgt_path}/{repo_id}",
+        fps=30,
+        robot_type="a2d",
+        features=FEATURES,
+        standardize=False,  # skip standardization since we want to save raw data here.
+    )
+    # TODO LeRobot v2.1 requires a per-episode stats. When loaded, the overall stats are computed from per-episode stats.
+    #  We skip this for now and use per-task stats instead.
+    dataset.meta.info["codebase_version"] = "v2.0"
+
+    all_subdir = sorted(
+        [f.as_posix() for f in Path(src_path).glob(f"observations/{task_id}/*") if f.is_dir()]
+    )
+
+    if debug:
+        all_subdir = all_subdir[:2]
+
+    # Get all episode id
+    all_subdir_eids = [int(Path(path).name) for path in all_subdir]
+
+    if debug:
+        raw_datasets_before_filter = [
+            load_local_dataset(subdir, src_path=src_path, task_id=task_id) for subdir in tqdm(all_subdir_eids)
+        ]
+    else:
+        raw_datasets_before_filter = process_map(
+            partial(load_local_dataset, src_path=src_path, task_id=task_id),
+            all_subdir_eids,
+            max_workers=os.cpu_count() // 2,
+            desc="Generating local dataset",
+        )
+    # remove the None result from the raw_datasets
+    raw_datasets = [dataset for dataset in raw_datasets_before_filter if dataset is not None]
+
+    # remove the None result from the subdirs
+    all_subdir_eids = [
+        eid
+        for eid, dataset in zip(all_subdir_eids, raw_datasets_before_filter, strict=False)
+        if dataset is not None
+    ]
+    all_subdir_episode_desc = [task_name] * len(all_subdir_eids)
+    print(all_subdir_episode_desc)
+
+    for (frames, videos), episode_desc in zip(
+        tqdm(raw_datasets, desc="Generating dataset from raw datasets"),
+        all_subdir_episode_desc,
+        strict=False,
+    ):
+        for frame in tqdm(frames, desc="Generating dataset from raw dataset"):
+            dataset.add_frame(frame)
+        dataset.save_episode(task=episode_desc, task_index=int(task_id), videos=videos)
+    dataset.consolidate()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--src_path", type=str, required=True)
+    parser.add_argument("--task_id", type=str, required=True)
+    parser.add_argument("--tgt_path", type=str, required=True)
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args()
+
+    task_id = args.task_id
+    json_file = f"{args.src_path}/task_info/task_{args.task_id}.json"
+    dataset_base = f"agibotworld/task_{args.task_id}"
+
+    if not Path(json_file).exists():
+        raise FileNotFoundError(f"Cannot find task info json file: {json_file}. Please check the path.")
+    main(args.src_path, args.tgt_path, task_id, dataset_base, json_file, args.debug)

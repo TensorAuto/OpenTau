@@ -1,0 +1,79 @@
+from abc import abstractmethod
+from copy import deepcopy
+from typing import final
+
+import torch
+
+from lerobot.common.datasets.lerobot_dataset import CODEBASE_VERSION, BaseDataset, GroundingDatasetMetadata
+from lerobot.configs.train import TrainPipelineConfig
+
+
+class GroundingDataset(BaseDataset):
+    def __init__(self, cfg: TrainPipelineConfig, num_frames: int = 1, num_episodes: int = 1):
+        super().__init__(cfg)
+        self.num_frames = num_frames
+        self.num_episodes = num_episodes
+        self.meta = self.create_meta()
+
+    def create_meta(self) -> GroundingDatasetMetadata:
+        from lerobot.common.datasets.factory import IMAGENET_STATS
+
+        info = {
+            "codebase_version": CODEBASE_VERSION,
+            "features": {
+                "camera0": {
+                    "dtype": "image",
+                    "shape": [3, 224, 224],
+                    "names": ["channel", "height", "width"],
+                },
+            },
+        }
+        stats = {
+            "image": {
+                "min": [[[0.0]], [[0.0]], [[0.0]]],
+                "max": [[[1.0]], [[1.0]], [[1.0]]],
+                "count": [len(self)],
+                **deepcopy(IMAGENET_STATS),  # mean and std
+            },
+            "state": {
+                "min": [0.0],
+                "max": [0.0],
+                "mean": [0.0],
+                "std": [0.0],
+                "count": [len(self)],
+            },
+            "actions": {
+                "min": [0.0],
+                "max": [0.0],
+                "mean": [0.0],
+                "std": [0.0],
+                "count": [len(self)],
+            },
+        }
+        metadata = GroundingDatasetMetadata(info=info, stats=stats)
+        metadata.repo_id = self._get_feature_mapping_key()
+        return metadata
+
+    @abstractmethod
+    def __getitem_helper__(self, item) -> dict:
+        pass
+
+    @final
+    def __getitem__(self, item):
+        item = self.__getitem_helper__(item)
+
+        # Grounding datasets don't have states or actions. 0-padding is used.
+        item["state"] = torch.zeros(self.max_state_dim)
+        item["actions"] = torch.zeros(self.action_chunk, self.max_action_dim)
+        item["actions_is_pad"] = torch.ones(self.action_chunk, dtype=torch.bool)
+        item = self._to_standard_data_format(item)
+        item["frozen_actions"] = torch.zeros(self.frozen_actions, self.max_action_dim)
+        item["frozen_action_is_pad"] = torch.ones(self.frozen_actions, dtype=torch.bool)
+        item["return_bin_idx"] = torch.tensor(0, dtype=torch.long)
+        item["return_continuous"] = torch.tensor(0, dtype=torch.float32)
+        item["advantage"] = torch.tensor(0, dtype=torch.bfloat16)
+        return item
+
+    def _separate_image_in_time(self, item: dict):
+        # Grounding datasets has nothing to separate.
+        pass
