@@ -33,8 +33,8 @@ from lerobot.common.policies.normalize import Normalize, Unnormalize
 from lerobot.common.policies.pretrained import PreTrainedPolicy
 from lerobot.common.policies.tau0.modeling_tau0 import TAU0Policy
 from lerobot.common.policies.value.reward import (
+    calculate_n_step_return,
     calculate_return_bins_with_equal_width,
-    calculate_return_for_advantage,
 )
 from lerobot.common.utils.utils import create_dummy_observation
 from lerobot.configs.train import TrainPipelineConfig
@@ -362,7 +362,7 @@ def test_return_equal_bin(
 def test_return_for_advantage(
     success, n_steps_look_ahead, episode_end_idx, max_episode_length, current_idx, c_neg, expected_return
 ):
-    return_value = calculate_return_for_advantage(
+    return_value = calculate_n_step_return(
         success, n_steps_look_ahead, episode_end_idx, max_episode_length, current_idx, c_neg
     )
 

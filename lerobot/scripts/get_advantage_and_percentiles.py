@@ -34,7 +34,7 @@ from lerobot.common.datasets.factory import make_dataset
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.common.datasets.utils import ADVANTAGES_PATH
 from lerobot.common.policies.factory import get_policy_class
-from lerobot.common.policies.value.reward import calculate_return_for_advantage
+from lerobot.common.policies.value.reward import calculate_n_step_return
 from lerobot.common.utils.random_utils import set_seed
 from lerobot.common.utils.utils import (
     auto_torch_device,
@@ -167,7 +167,7 @@ def main(cfg: TrainPipelineConfig):
                     success, episode_index, episode_end_idx, current_idx, v0 = map(
                         ensure_primitive, (success, episode_index, episode_end_idx, current_idx, v0)
                     )
-                    reward = calculate_return_for_advantage(
+                    reward = calculate_n_step_return(
                         success=success,
                         n_steps_look_ahead=cfg.policy.reward_config.N_steps_look_ahead,
                         episode_end_idx=episode_end_idx,

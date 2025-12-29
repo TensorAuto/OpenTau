@@ -143,25 +143,25 @@ class ValueFunction(PreTrainedPolicy):
         raise NotImplementedError("Value functions do not sample actions. Use predict_value() instead.")
 
     def calculate_value(self, logits: Tensor) -> Tensor:
-        start_idx = [self.config.reward_config.C_neg] + [
-            -1 + i / self.config.reward_config.number_of_bins
-            for i in range(self.config.reward_config.number_of_bins - 1)
-        ]
-        end_idx = [self.config.reward_config.C_neg] + [
-            -1 + (i + 1) / self.config.reward_config.number_of_bins
-            for i in range(self.config.reward_config.number_of_bins - 1)
-        ]
+        start_idx = torch.linspace(
+            -1,
+            -1 / self.config.reward_config.number_of_bins,
+            self.config.reward_config.number_of_bins,
+            device=logits.device,
+        )
+        end_idx = torch.linspace(
+            -1 + 1 / self.config.reward_config.number_of_bins,
+            0,
+            self.config.reward_config.number_of_bins,
+            device=logits.device,
+        )
 
         mid_idx = rearrange(
-            torch.tensor(
-                [(start_idx[i] + end_idx[i]) / 2 for i in range(len(start_idx))], device=logits.device
-            ),
+            (start_idx + end_idx) / 2,
             "n -> 1 n",
         )
 
-        value = (torch.exp(logits) / torch.sum(torch.exp(logits), dim=-1, keepdim=True)).to(
-            dtype=torch.float32
-        ) @ mid_idx.T
+        value = torch.softmax(logits, dim=-1).to(dtype=torch.float32) @ mid_idx.T
 
         return rearrange(value, "b 1 -> b")
 
