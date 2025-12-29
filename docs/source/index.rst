@@ -1,9 +1,4 @@
-.. LeRobot documentation master file, created by
-   sphinx-quickstart on Wed Dec 17 14:15:21 2025.
-   You can adapt this file completely to your liking, but it should at least
-   contain the root `toctree` directive.
-
-LeRobot documentation
+OpenTau documentation
 =====================
 
 .. toctree::
@@ -12,6 +7,7 @@ LeRobot documentation
 
    overview
    installation
+   concepts
 
 .. toctree::
    :maxdepth: 2

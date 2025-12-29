@@ -12,9 +12,9 @@ sys.path.insert(0, os.path.abspath("../.."))
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
-project = "OpenTensor"
-copyright = "2025, Tensor Auto Inc."
-author = "Tensor Auto Inc."
+project = "OpenTau"
+copyright = "2026, Tensor Auto Inc"
+author = "Tensor Auto Inc"
 
 version = "0.1.0"
 release = "0.1.0"
