@@ -4,41 +4,85 @@ on:
   push:
     branches:
       - main
+      - 'releases/**'
   pull_request:
     branches:
-      "*"
+      - '*'
+  workflow_dispatch:
 
 jobs:
   pre-commit:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    strategy:
+      matrix:
+        python-version: ["3.10"]
     env:
       GIT_LFS_SKIP_SMUDGE: true
+      PYTHONUNBUFFERED: 1
+      UV_VENV: ".venv"
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           lfs: false
-          persist-credentials: false
 
-      - name: Setup Python
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
-          cache: "uv"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install uv
-        run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
 
       - name: Install dependencies
         run: |
-          uv sync --extra test --extra dev
-          source .venv/bin/activate
+          if [ -z "${ACT:-}" ]; then
+            echo "Running in GitHub Actions - using frozen dependencies"
+            uv sync --extra dev --extra test --frozen
+          else
+            echo "Running in act - not using frozen dependencies"
+            uv sync --extra dev --extra test
+          fi
+          echo "Virtual environment created at .venv"
 
-      - name: Run pre-commit
+      - name: Cache pre-commit hooks
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: ${{ runner.os }}-pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pre-commit-
+
+      - name: Cache Python dependencies
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cache/uv
+            .venv
+          key: ${{ runner.os }}-python-${{ hashFiles('pyproject.toml', 'uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-python-
+
+      - name: Run pre-commit hooks
         run: |
           source .venv/bin/activate
-          pre-commit run --all-files
+          if ! command -v pre-commit &> /dev/null; then
+            echo "pre-commit not found, installing..."
+            uv pip install pre-commit
+          fi
+          pre-commit run --all-files --show-diff-on-failure --color=always
+
+      - name: Upload pre-commit results
+        if: always() && failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pre-commit-report
+          path: |
+            .pre-commit-*.log
+            pre-commit.log
+          retention-days: 7
