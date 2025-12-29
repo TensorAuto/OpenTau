@@ -36,8 +36,8 @@ Download the source code:
 
 .. code-block:: bash
 
-    git clone git@code.autox.ds:xisp/agi/lerobot.git
-    cd lerobot
+    git clone https://github.com/TensorAuto/OpenTau.git
+    cd OpenTau
 
 
 Environment Setup
@@ -65,19 +65,19 @@ We recommend using `uv <https://docs.astral.sh/uv/>`_ for fast and simple Python
 Docker Installation (Optional)
 -------------------------------------------
 
-You can also use Docker to install and run OpenTensor.
+You can also use Docker to install and run OpenTau.
 
 1. **Build the Docker image**
 
    .. code-block:: bash
 
-      docker build -t opentensor .
+      docker build -t opentau .
 
 2. **Run the Docker container**
 
    .. code-block:: bash
 
-      docker run -it --gpus all opentensor /bin/bash
+      docker run -it --gpus all opentau /bin/bash
 
    Note: The ``--gpus all`` flag requires the `NVIDIA Container Toolkit <https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html>`_.
 
