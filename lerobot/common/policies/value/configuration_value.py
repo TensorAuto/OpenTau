@@ -71,6 +71,10 @@ class ValueConfig(PreTrainedConfig):
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
 
+        assert self.reward_config.reward_normalizer < 2 * self.reward_config.C_neg, (
+            "Reward normalizer should be less than 2* C_neg"
+        )
+
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):
             key = f"observation.images.empty_camera_{i}"

@@ -143,13 +143,13 @@ class ValueFunction(PreTrainedPolicy):
         raise NotImplementedError("Value functions do not sample actions. Use predict_value() instead.")
 
     def calculate_value(self, logits: Tensor) -> Tensor:
-        start_idx = [self.config.reward_config.C_neg] + [
+        start_idx = [
             -1 + i / self.config.reward_config.number_of_bins
-            for i in range(self.config.reward_config.number_of_bins - 1)
+            for i in range(self.config.reward_config.number_of_bins)
         ]
-        end_idx = [self.config.reward_config.C_neg] + [
+        end_idx = [
             -1 + (i + 1) / self.config.reward_config.number_of_bins
-            for i in range(self.config.reward_config.number_of_bins - 1)
+            for i in range(self.config.reward_config.number_of_bins)
         ]
 
         mid_idx = rearrange(

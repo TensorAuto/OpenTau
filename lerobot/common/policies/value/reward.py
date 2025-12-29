@@ -28,13 +28,8 @@ def calculate_return_bins_with_equal_width(
     # normalize the reward to the range of -1 to 0
     return_normalized = return_value / max_episode_length
 
-    # if reward_normalize if small than -1 but it in special bin 0
-    if return_normalized < -1:
-        return 0, return_normalized
-    # otherwise, compute the bin index and add 1 as the bin index should start from 1 and not 0
-    else:
-        bin_idx = int((return_normalized + 1) * (b - 2))
-        return bin_idx + 1, return_normalized
+    bin_idx = int((return_normalized + 1) * (b - 1))
+    return bin_idx, return_normalized
 
 
 def calculate_return_for_advantage(
