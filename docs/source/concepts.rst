@@ -14,14 +14,17 @@ Datasets are used to handle data loading and processing.
 It supports downloading datasets from the Hugging Face Hub and loading them from local disk.
 The dataset format is versioned (currently v2.0) and utilizes parquet files for data and mp4 files for videos to ensure efficiency and portability.
 There are currently two types of datasets:
+
 *   ``LeRobotDataset``: For robotic data.
 *   ``GroundingDataset``: For VLM datasets such as Visual Question Answering (VQA) or visual grounding.
+
 These datasets are used to train policies.
 
 DatasetMixture
 ^^^^^^^^^^^^^^
 To train policies on multiple datasets simultaneously, OpenTau uses ``lerobot.common.datasets.dataset_mixture.WeightedDatasetMixture``.
 This class:
+
 *   Combines multiple ``LeRobotDataset`` and ``GroundingDataset`` instances.
 *   Different weights can be assigned to each dataset to control the sampling frequency.
 *   Aggregates statistics from all constituent datasets to ensure consistent normalization across the mixture.
@@ -30,9 +33,11 @@ This class:
 Metadata
 ^^^^^^^^
 Metadata is crucial for defining the structure and statistics of a dataset. Handled by ``LeRobotDatasetMetadata`` and ``DatasetMetadata``, it includes:
+
 *   **Info**: Feature shapes, data types, FPS, and robot type.
 *   **Stats**: Mean, standard deviation, min, and max values for each feature, used for normalization (e.g., standardizing images or normalizing action vectors).
 *   **Tasks**: Natural language descriptions of the tasks contained in the dataset.
+
 Metadata is stored in JSON files (``info.json``, ``stats.json``) and JSONL files (``tasks.jsonl``) within the dataset directory.
 
 Standard Data Format
