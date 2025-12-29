@@ -372,7 +372,7 @@ def eval_policy(
                 batch_stacked_frames,
                 all_done_indices.flatten().tolist(),
                 batch_successes.tolist(),
-                strict=True,
+                strict=False,
             ):
                 if n_episodes_rendered >= max_episodes_rendered:
                     break
@@ -822,10 +822,13 @@ def eval_policy_all(
                 per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
 
     if cfg.eval.recording_root is not None:
-        logging.info(f"Consolidating Libero dataset to {cfg.eval.recording_root}...")
+        acc = get_proc_accelerator()
+        acc_rank = acc.local_process_index if acc else 0
+        recording_dir = Path(cfg.eval.recording_root) / f"rank{acc_rank}"
+        logging.info(f"Consolidating Libero dataset to {recording_dir}...")
         consolidate_task_result(
             aggregate_task_results(task_results),
-            output_dir=Path(cfg.eval.recording_root),
+            output_dir=recording_dir,
             allow_overwrite=True,
         )
 
