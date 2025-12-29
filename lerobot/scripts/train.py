@@ -15,6 +15,7 @@
 # limitations under the License.
 import json
 import logging
+import os
 from contextlib import nullcontext
 from pprint import pformat
 from typing import Any
@@ -152,9 +153,10 @@ def train(cfg: TrainPipelineConfig):
 
         if cfg.wandb.enable:
             step = load_training_step(cfg.checkpoint_path) if cfg.resume else None
+            slurm_dict = {k: v for k, v in os.environ.items() if k.startswith("SLURM_")}
             accelerator.init_trackers(
                 cfg.wandb.project,
-                config={**cfg.to_dict(), "accelerator": accelerator_config},
+                config={**cfg.to_dict(), "accelerator": accelerator_config, "slurm": slurm_dict},
                 init_kwargs={"wandb": cfg.wandb.to_wandb_kwargs(step=step)},
             )
             tracker = accelerator.get_tracker("wandb", unwrap=True)
