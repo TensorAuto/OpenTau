@@ -71,8 +71,9 @@ class ValueConfig(PreTrainedConfig):
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
 
-        assert self.reward_config.reward_normalizer < 2 * self.reward_config.C_neg, (
-            "Reward normalizer should be less than 2* C_neg"
+        max_episode_length = self.reward_config.reward_normalizer + self.reward_config.C_neg
+        assert max_episode_length < abs(self.reward_config.C_neg), (
+            "Max episode length should be less than the absolute value of C_neg for proper separation of failed and successful episodes"
         )
 
     def validate_features(self) -> None:
