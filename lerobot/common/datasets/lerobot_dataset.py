@@ -1168,7 +1168,9 @@ class LeRobotDataset(BaseDataset):
             item = self._to_standard_data_format(item)
 
             if self.meta.advantages is not None:
+                # if the advantage file is present, it should contain all advantage values
                 advantage = self.meta.advantages.get((episode_index, frame_index), 0)
+                logging.warning(f"Unable to query advantage value for {episode_index=} and {frame_index=}.")
                 item["advantage"] = torch.tensor(advantage, dtype=torch.bfloat16)
             else:
                 item["advantage"] = torch.tensor(0.0, dtype=torch.bfloat16)
