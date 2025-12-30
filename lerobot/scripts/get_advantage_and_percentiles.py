@@ -50,7 +50,6 @@ def ensure_primitive(maybe_tensor):
         return ensure_primitive(torch.from_numpy(maybe_tensor))
     if isinstance(maybe_tensor, torch.Tensor):
         assert maybe_tensor.numel() == 1, f"Tensor must be a single value, got shape={maybe_tensor.numel()}"
-        return maybe_tensor.item()
     return maybe_tensor
 
 
@@ -172,7 +171,7 @@ def main(cfg: TrainPipelineConfig):
                         success=success,
                         n_steps_look_ahead=cfg.policy.reward_config.N_steps_look_ahead,
                         episode_end_idx=episode_end_idx,
-                        reward_normalizer=cfg.policy.reward_config.reward_normalizer,
+                        max_episode_length=cfg.policy.reward_config.reward_normalizer,
                         current_idx=current_idx,
                         c_neg=cfg.policy.reward_config.C_neg,
                     )
@@ -181,14 +180,14 @@ def main(cfg: TrainPipelineConfig):
 
             # Second pass to compute the advantages
             for batch in dataloader:
-                for episode_index, current_idx, frame_index in zip(
+                for episode_index, current_idx, timestamp in zip(
                     batch["episode_index"],
                     batch["current_idx"],
-                    batch["frame_index"],
+                    batch["timestamp"],
                     strict=True,
                 ):
-                    episode_index, current_idx, frame_index = map(
-                        ensure_primitive, (episode_index, current_idx, frame_index)
+                    episode_index, current_idx, timestamp = map(
+                        ensure_primitive, (episode_index, current_idx, timestamp)
                     )
                     # check if the value for the next n_steps_look_ahead steps is available, else set it to 0
                     look_ahead_idx = current_idx + cfg.policy.reward_config.N_steps_look_ahead
@@ -197,7 +196,7 @@ def main(cfg: TrainPipelineConfig):
                     v0 = values.get((episode_index, current_idx), _default0)["v0"]
                     advantage = ensure_primitive(reward + vn - v0)
                     advantages.append(advantage)
-                    ds_advantage[(episode_index, frame_index)] = advantage
+                    ds_advantage[(episode_index, timestamp)] = advantage
 
         # Convert tuple keys to strings for JSON serialization
         advantage_data_json = {f"{ep_idx},{ts}": val for (ep_idx, ts), val in ds_advantage.items()}
