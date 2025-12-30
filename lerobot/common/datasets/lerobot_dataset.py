@@ -1162,13 +1162,13 @@ class LeRobotDataset(BaseDataset):
 
             episode_index = item["episode_index"].item()
             # don't convert to timestamp to `float`, because torch.float64 is not supported on MPS
-            timestamp = item["timestamp"]
+            frame_index = item["frame_index"].item()
 
             # change data naming to standard data format
             item = self._to_standard_data_format(item)
 
             if self.meta.advantages is not None:
-                advantage = self.meta.advantages.get((episode_index, timestamp), 0)
+                advantage = self.meta.advantages.get((episode_index, frame_index), 0)
                 item["advantage"] = torch.tensor(advantage, dtype=torch.bfloat16)
             else:
                 item["advantage"] = torch.tensor(0.0, dtype=torch.bfloat16)
@@ -1195,7 +1195,7 @@ class LeRobotDataset(BaseDataset):
                     item["current_idx"] = idx
                     item["last_step"] = idx + self.cfg.policy.reward_config.N_steps_look_ahead >= ep_end
                     item["episode_index"] = episode_index
-                    item["timestamp"] = timestamp
+                    item["frame_index"] = frame_index
             else:
                 item["return_bin_idx"] = torch.tensor(0, dtype=torch.long)
                 item["return_continuous"] = torch.tensor(0, dtype=torch.float32)

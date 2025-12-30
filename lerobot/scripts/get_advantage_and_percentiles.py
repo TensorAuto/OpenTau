@@ -181,14 +181,14 @@ def main(cfg: TrainPipelineConfig):
 
             # Second pass to compute the advantages
             for batch in dataloader:
-                for episode_index, current_idx, timestamp in zip(
+                for episode_index, current_idx, frame_index in zip(
                     batch["episode_index"],
                     batch["current_idx"],
-                    batch["timestamp"],
+                    batch["frame_index"],
                     strict=True,
                 ):
-                    episode_index, current_idx, timestamp = map(
-                        ensure_primitive, (episode_index, current_idx, timestamp)
+                    episode_index, current_idx, frame_index = map(
+                        ensure_primitive, (episode_index, current_idx, frame_index)
                     )
                     # check if the value for the next n_steps_look_ahead steps is available, else set it to 0
                     look_ahead_idx = current_idx + cfg.policy.reward_config.N_steps_look_ahead
@@ -197,7 +197,7 @@ def main(cfg: TrainPipelineConfig):
                     v0 = values.get((episode_index, current_idx), _default0)["v0"]
                     advantage = ensure_primitive(reward + vn - v0)
                     advantages.append(advantage)
-                    ds_advantage[(episode_index, timestamp)] = advantage
+                    ds_advantage[(episode_index, frame_index)] = advantage
 
         # Convert tuple keys to strings for JSON serialization
         advantage_data_json = {f"{ep_idx},{ts}": val for (ep_idx, ts), val in ds_advantage.items()}

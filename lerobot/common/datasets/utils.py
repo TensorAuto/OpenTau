@@ -202,7 +202,8 @@ def load_advantages(local_dir: Path) -> dict:
     if not (local_dir / ADVANTAGES_PATH).exists():
         return None
     advantages = load_json(local_dir / ADVANTAGES_PATH)
-    return {(int(k.split(",")[0]), float(k.split(",")[1])): v for k, v in advantages.items()}
+    # keys are of the form "episode_index,frame_index", where both episode_index and frame_index are integers
+    return {tuple(map(int, k.split(","))): v for k, v in advantages.items()}
 
 
 def write_task(task_index: int, task: dict, local_dir: Path):
