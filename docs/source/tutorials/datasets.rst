@@ -1,6 +1,9 @@
 Datasets
 ========
 
+.. note::
+   Make sure you have followed the :doc:`/installation` guide before proceeding.
+
 Standard Data Format (for Development and Inference)
 ----------------------------------------------------
 

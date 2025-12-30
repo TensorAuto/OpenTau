@@ -1,6 +1,9 @@
 Inference
 =========
 
+.. note::
+   Make sure you have followed the :doc:`/installation` guide before proceeding.
+
 Running inference with a trained model
 --------------------------------------
 

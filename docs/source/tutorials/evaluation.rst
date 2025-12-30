@@ -1,6 +1,9 @@
 Evaluation
 ==========
 
+.. note::
+   Make sure you have followed the :doc:`/installation` guide before proceeding.
+
 Evaluating a policy in Simulation
 ---------------------------------
 
