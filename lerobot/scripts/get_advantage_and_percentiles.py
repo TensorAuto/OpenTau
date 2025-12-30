@@ -50,6 +50,7 @@ def ensure_primitive(maybe_tensor):
         return ensure_primitive(torch.from_numpy(maybe_tensor))
     if isinstance(maybe_tensor, torch.Tensor):
         assert maybe_tensor.numel() == 1, f"Tensor must be a single value, got shape={maybe_tensor.numel()}"
+        return maybe_tensor.item()
     return maybe_tensor
 
 
@@ -171,7 +172,7 @@ def main(cfg: TrainPipelineConfig):
                         success=success,
                         n_steps_look_ahead=cfg.policy.reward_config.N_steps_look_ahead,
                         episode_end_idx=episode_end_idx,
-                        max_episode_length=cfg.policy.reward_config.reward_normalizer,
+                        reward_normalizer=cfg.policy.reward_config.reward_normalizer,
                         current_idx=current_idx,
                         c_neg=cfg.policy.reward_config.C_neg,
                     )
