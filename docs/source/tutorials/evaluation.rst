@@ -26,7 +26,7 @@ Evaluating policy in a LIBERO environment
 
 OpenTau currently supports the `LIBERO benchmark <https://libero-project.github.io/main.html>`_. To evaluate the policy on the LIBERO benchmark, add the following section to the training config:
 
-.. code-block:: json
+.. code-block:: javascript
 
     {
         ...,
