@@ -77,6 +77,7 @@ jobs:
             uv pip install pre-commit
           fi
           pre-commit run --all-files --show-diff-on-failure --color=always
+          SKIP=zizmor pre-commit run --all-files --show-diff-on-failure --color=always
 
       - name: Upload pre-commit results
         if: always() && failure()
