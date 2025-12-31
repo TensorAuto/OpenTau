@@ -43,28 +43,7 @@ class EnvConfig(draccus.ChoiceRegistry, abc.ABC):
     @abc.abstractmethod
     def gym_kwargs(self) -> dict:
         raise NotImplementedError()
-
-
-@EnvConfig.register_subclass("metaworld")
-@dataclass
-class MetaworldEnv(EnvConfig):
-    import_name: str = "opentau.envs.metaworld"
-    make_id: str = "Metaworld"
-    task: str = "Meta-World/MT1"
-    env_name: str = "button-press-v3"
-    fps: int = 10
-    render_mode: str = "rgb_array"
-    episode_length: int = 200
-
-    @property
-    def gym_kwargs(self) -> dict:
-        return {
-            "task": self.task,
-            "env_name": self.env_name,
-            "render_mode": self.render_mode,
-            "max_episode_steps": self.episode_length,
-        }
-
+        
 
 @EnvConfig.register_subclass("libero")
 @dataclass
