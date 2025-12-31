@@ -159,12 +159,12 @@ available_datasets = sorted(
 )
 
 # lists all available policies from `src/opentau/policies`
-available_policies = ["pi0", "tau0", "value"]
+available_policies = ["pi0", "pi05", "value"]
 
 # keys and values refer to yaml files
 available_policies_per_env = {
-    "aloha": ["tau0"],
-    "pusht": ["tau0"],
+    "aloha": ["pi0"],
+    "pusht": ["pi0"],
 }
 
 env_task_pairs = [(env, task) for env, tasks in available_tasks_per_env.items() for task in tasks]

@@ -4,7 +4,8 @@ from pathlib import Path
 import torch
 
 from opentau.policies.factory import get_policy_class
-from opentau.policies.tau0.modeling_tau0 import TAU0Policy
+from opentau.policies.pi0.modeling_pi0 import PI0Policy
+from opentau.policies.pi05.modeling_pi05 import PI05Policy
 from opentau.utils.monkey_patch import (
     torch_cumsum_patch,
     torch_full_patch,
@@ -33,7 +34,7 @@ class InferenceWrapper(torch.nn.Module):
 
     def __init__(
         self,
-        decoder: TAU0Policy,
+        decoder: PI0Policy | PI05Policy,
         *,
         prefix_pad_masks: torch.Tensor,
         prefix_offsets: torch.Tensor,

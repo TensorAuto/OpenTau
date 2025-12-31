@@ -24,7 +24,6 @@ from opentau.datasets.utils import dataset_to_policy_features
 from opentau.policies.pi0.configuration_pi0 import PI0Config
 from opentau.policies.pi05.configuration_pi05 import PI05Config
 from opentau.policies.pretrained import PreTrainedPolicy
-from opentau.policies.tau0.configuration_tau0 import TAU0Config
 from opentau.policies.value.configuration_value import ValueConfig
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import FeatureType
@@ -32,11 +31,7 @@ from opentau.configs.types import FeatureType
 
 def get_policy_class(name: str) -> type[PreTrainedPolicy]:
     """Get the policy's class and config class given a name (matching the policy class' `name` attribute)."""
-    if name == "tau0":
-        from opentau.policies.tau0.modeling_tau0 import TAU0Policy
-
-        return TAU0Policy
-    elif name == "pi0":
+    if name == "pi0":
         from opentau.policies.pi0.modeling_pi0 import PI0Policy
 
         return PI0Policy
@@ -53,9 +48,7 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
 
 
 def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
-    if policy_type in ["tau0"]:
-        return TAU0Config(**kwargs)
-    elif policy_type == "pi0":
+    if policy_type == "pi0":
         return PI0Config(**kwargs)
     elif policy_type == "pi05":
         return PI05Config(**kwargs)

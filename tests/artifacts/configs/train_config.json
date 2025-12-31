@@ -21,7 +21,7 @@
         "vector_resample_strategy": "nearest"
     },
     "policy": {
-        "type": "tau0",
+        "type": "pi0",
         "n_obs_steps": 1,
         "normalization_mapping": {
             "VISUAL": "IDENTITY",
@@ -42,7 +42,6 @@
         "action_decoder_latency_lower": 0.02,
         "action_decoder_latency_upper": 0.05,
         "tokenizer_max_length": 52,
-        "response_max_tokens": 52,
         "proj_width": 1024,
         "num_steps": 10,
         "attention_implementation": "eager",
@@ -60,7 +59,7 @@
         "scheduler_decay_steps": 30000,
         "scheduler_decay_lr": 2.5e-06
     },
-    "job_name": "tau0",
+    "job_name": "pi0",
     "resume": false,
     "seed": 1000,
     "resolution": [
