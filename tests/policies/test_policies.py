@@ -22,23 +22,23 @@ import pytest
 import torch
 from safetensors.torch import load_file
 
-from lerobot import available_policies
-from lerobot.common.datasets.dataset_mixture import WeightedDatasetMixture
-from lerobot.common.datasets.utils import cycle, dataset_to_policy_features
-from lerobot.common.policies.factory import (
+from src.opentau import available_policies
+from src.opentau.datasets.dataset_mixture import WeightedDatasetMixture
+from src.opentau.datasets.utils import cycle, dataset_to_policy_features
+from src.opentau.policies.factory import (
     get_policy_class,
     make_policy_config,
 )
-from lerobot.common.policies.normalize import Normalize, Unnormalize
-from lerobot.common.policies.pretrained import PreTrainedPolicy
-from lerobot.common.policies.tau0.modeling_tau0 import TAU0Policy
-from lerobot.common.policies.value.reward import (
+from src.opentau.policies.normalize import Normalize, Unnormalize
+from src.opentau.policies.pretrained import PreTrainedPolicy
+from src.opentau.policies.tau0.modeling_tau0 import TAU0Policy
+from src.opentau.policies.value.reward import (
     calculate_n_step_return,
     calculate_return_bins_with_equal_width,
 )
-from lerobot.common.utils.utils import create_dummy_observation
-from lerobot.configs.train import TrainPipelineConfig
-from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
+from src.opentau.utils.utils import create_dummy_observation
+from src.opentau.configs.train import TrainPipelineConfig
+from src.opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from tests.artifacts.policies.save_policy_to_safetensors import get_policy_stats
 from tests.utils import generic_equal, require_x86_64_kernel
 

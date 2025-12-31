@@ -27,17 +27,17 @@ from accelerate.scheduler import AcceleratedScheduler
 from accelerate.utils import DistributedDataParallelKwargs, gather_object
 from termcolor import colored
 
-from lerobot.common.datasets.factory import make_dataset_mixture
-from lerobot.common.datasets.utils import cycle
-from lerobot.common.envs.factory import make_envs
-from lerobot.common.envs.utils import close_envs
-from lerobot.common.optim.factory import make_optimizer_and_scheduler
-from lerobot.common.policies.factory import make_policy
-from lerobot.common.policies.pretrained import PreTrainedPolicy
-from lerobot.common.utils.accelerate_utils import set_proc_accelerator
-from lerobot.common.utils.logging_utils import AverageMeter, MetricsTracker
-from lerobot.common.utils.random_utils import set_seed
-from lerobot.common.utils.train_utils import (
+from src.opentau.datasets.factory import make_dataset_mixture
+from src.opentau.datasets.utils import cycle
+from src.opentau.envs.factory import make_envs
+from src.opentau.envs.utils import close_envs
+from src.opentau.optim.factory import make_optimizer_and_scheduler
+from src.opentau.policies.factory import make_policy
+from src.opentau.policies.pretrained import PreTrainedPolicy
+from src.opentau.utils.accelerate_utils import set_proc_accelerator
+from src.opentau.utils.logging_utils import AverageMeter, MetricsTracker
+from src.opentau.utils.random_utils import set_seed
+from src.opentau.utils.train_utils import (
     get_step_checkpoint_dir,
     get_step_identifier,
     load_training_state,
@@ -45,15 +45,15 @@ from lerobot.common.utils.train_utils import (
     prune_old_checkpoints,
     save_checkpoint,
 )
-from lerobot.common.utils.utils import (
+from src.opentau.utils.utils import (
     encode_accelerator_state_dict,
     format_big_number,
     init_logging,
     is_launched_with_accelerate,
 )
-from lerobot.configs import parser
-from lerobot.configs.train import TrainPipelineConfig
-from lerobot.scripts.eval import consolidate_eval_info, eval_policy_all
+from src.opentau.configs import parser
+from src.opentau.configs.train import TrainPipelineConfig
+from src.opentau.scripts.eval import consolidate_eval_info, eval_policy_all
 
 
 def update_policy(

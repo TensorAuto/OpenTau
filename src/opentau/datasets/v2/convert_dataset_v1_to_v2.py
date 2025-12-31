@@ -119,7 +119,7 @@ from huggingface_hub import HfApi
 from huggingface_hub.errors import EntryNotFoundError, HfHubHTTPError
 from safetensors.torch import load_file
 
-from lerobot.common.datasets.utils import (
+from src.opentau.datasets.utils import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_PARQUET_PATH,
     DEFAULT_VIDEO_PATH,
@@ -136,13 +136,13 @@ from lerobot.common.datasets.utils import (
     write_json,
     write_jsonlines,
 )
-from lerobot.common.datasets.video_utils import (
+from src.opentau.datasets.video_utils import (
     VideoFrame,  # noqa: F401
     get_image_pixel_channels,
     get_video_info,
 )
-from lerobot.common.robot_devices.robots.configs import RobotConfig
-from lerobot.common.robot_devices.robots.utils import make_robot_config
+from src.opentau.robot_devices.robots.configs import RobotConfig
+from src.opentau.robot_devices.robots.utils import make_robot_config
 
 V16 = "v1.6"
 V20 = "v2.0"

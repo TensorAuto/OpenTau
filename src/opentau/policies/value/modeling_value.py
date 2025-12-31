@@ -22,7 +22,7 @@ Uses SIGLIP for vision encoding and Gemma 3 270M for language processing.
 
 Example usage:
 ```python
-from lerobot.common.policies.value.modeling_value import ValuePolicy
+from src.opentau.policies.value.modeling_value import ValuePolicy
 
 policy = ValuePolicy.from_pretrained("path/to/model")
 value = policy.predict_value(batch)
@@ -36,10 +36,10 @@ from einops import rearrange
 from torch import Tensor, nn
 from transformers import AutoTokenizer
 
-from lerobot.common.policies.normalize import Normalize
-from lerobot.common.policies.pretrained import PreTrainedPolicy
-from lerobot.common.policies.value.configuration_value import ValueConfig
-from lerobot.common.policies.value.siglip_gemma import (
+from src.opentau.policies.normalize import Normalize
+from src.opentau.policies.pretrained import PreTrainedPolicy
+from src.opentau.policies.value.configuration_value import ValueConfig
+from src.opentau.policies.value.siglip_gemma import (
     SiglipGemmaValueConfig,
     SiglipGemmaValueModel,
 )

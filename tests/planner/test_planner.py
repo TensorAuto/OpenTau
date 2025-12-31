@@ -4,7 +4,7 @@ import pytest
 from dotenv import load_dotenv
 from openai._exceptions import OpenAIError
 
-from lerobot.common.planner import HighLevelPlanner, Memory
+from src.opentau.planner import HighLevelPlanner, Memory
 
 load_dotenv()
 

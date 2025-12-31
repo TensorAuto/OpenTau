@@ -73,26 +73,26 @@ from termcolor import colored
 from torch import nn
 from tqdm import trange
 
-from lerobot.common.envs.factory import make_envs
-from lerobot.common.envs.utils import (
+from src.opentau.envs.factory import make_envs
+from src.opentau.envs.utils import (
     add_envs_task,
     check_env_attributes_and_types,
     close_envs,
     preprocess_observation,
 )
-from lerobot.common.policies.factory import make_policy
-from lerobot.common.policies.pretrained import PreTrainedPolicy
-from lerobot.common.utils.accelerate_utils import acc_print, get_proc_accelerator, set_proc_accelerator
-from lerobot.common.utils.io_utils import write_video
-from lerobot.common.utils.libero_dataset_recorder import aggregate_task_results, consolidate_task_result
-from lerobot.common.utils.random_utils import set_seed
-from lerobot.common.utils.utils import (
+from src.opentau.policies.factory import make_policy
+from src.opentau.policies.pretrained import PreTrainedPolicy
+from src.opentau.utils.accelerate_utils import acc_print, get_proc_accelerator, set_proc_accelerator
+from src.opentau.utils.io_utils import write_video
+from src.opentau.utils.libero_dataset_recorder import aggregate_task_results, consolidate_task_result
+from src.opentau.utils.random_utils import set_seed
+from src.opentau.utils.utils import (
     init_logging,
     inside_slurm,
     is_launched_with_accelerate,
 )
-from lerobot.configs import parser
-from lerobot.configs.train import TrainPipelineConfig
+from src.opentau.configs import parser
+from src.opentau.configs.train import TrainPipelineConfig
 
 
 def rollout(

@@ -23,9 +23,9 @@ import PIL.Image
 import pytest
 import torch
 
-from lerobot.common.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.common.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
-from lerobot.common.datasets.utils import (
+from src.opentau.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDataset, LeRobotDatasetMetadata
+from src.opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
+from src.opentau.datasets.utils import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_FEATURES,
     DEFAULT_PARQUET_PATH,
@@ -324,7 +324,7 @@ def lerobot_dataset_metadata():
     """Create a mock LeRobotDatasetMetadata for testing."""
     from unittest.mock import MagicMock
 
-    from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
+    from src.opentau.datasets.lerobot_dataset import LeRobotDatasetMetadata
 
     mock_metadata = MagicMock(spec=LeRobotDatasetMetadata)
     mock_metadata.repo_id = DUMMY_REPO_ID
@@ -427,9 +427,9 @@ def lerobot_dataset_metadata_factory(
             episodes=episodes,
         )
         with (
-            patch("lerobot.common.datasets.lerobot_dataset.get_safe_version") as mock_get_safe_version_patch,
+            patch("src.opentau.datasets.lerobot_dataset.get_safe_version") as mock_get_safe_version_patch,
             patch(
-                "lerobot.common.datasets.lerobot_dataset.snapshot_download"
+                "src.opentau.datasets.lerobot_dataset.snapshot_download"
             ) as mock_snapshot_download_patch,
         ):
             mock_get_safe_version_patch.side_effect = lambda repo_id, version: version
@@ -504,10 +504,10 @@ def lerobot_dataset_factory(
             episodes=episode_dicts,
         )
         with (
-            patch("lerobot.common.datasets.lerobot_dataset.LeRobotDatasetMetadata") as mock_metadata_patch,
-            patch("lerobot.common.datasets.lerobot_dataset.get_safe_version") as mock_get_safe_version_patch,
+            patch("src.opentau.datasets.lerobot_dataset.LeRobotDatasetMetadata") as mock_metadata_patch,
+            patch("src.opentau.datasets.lerobot_dataset.get_safe_version") as mock_get_safe_version_patch,
             patch(
-                "lerobot.common.datasets.lerobot_dataset.snapshot_download"
+                "src.opentau.datasets.lerobot_dataset.snapshot_download"
             ) as mock_snapshot_download_patch,
         ):
             mock_metadata_patch.return_value = mock_metadata
@@ -517,9 +517,9 @@ def lerobot_dataset_factory(
             # Construct a minimal TrainPipelineConfig for the dataset
             from dataclasses import dataclass
 
-            from lerobot.configs.default import DatasetConfig, DatasetMixtureConfig
-            from lerobot.configs.policies import PreTrainedConfig
-            from lerobot.configs.train import TrainPipelineConfig
+            from src.opentau.configs.default import DatasetConfig, DatasetMixtureConfig
+            from src.opentau.configs.policies import PreTrainedConfig
+            from src.opentau.configs.train import TrainPipelineConfig
 
             # Minimal dummy PreTrainedConfig implementation for testing
             @dataclass

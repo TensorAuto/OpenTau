@@ -1,6 +1,6 @@
 from collections import deque
 
-from lerobot.common.planner.utils.utils import load_prompt_library
+from src.opentau.planner.utils.utils import load_prompt_library
 
 
 class Memory:
@@ -15,7 +15,7 @@ class Memory:
         """
 
         self.len = len
-        self.prompts_dict = load_prompt_library("lerobot/common/planner/prompts.yaml")
+        self.prompts_dict = load_prompt_library("src/opentau/planner/prompts.yaml")
 
         if conversation:
             self.conversation = conversation

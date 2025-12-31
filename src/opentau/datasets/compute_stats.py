@@ -17,7 +17,7 @@ from typing import Optional
 
 import numpy as np
 
-from lerobot.common.datasets.utils import load_image_as_numpy
+from src.opentau.datasets.utils import load_image_as_numpy
 
 
 def estimate_num_samples(

@@ -13,13 +13,13 @@
 # limitations under the License.
 from dataclasses import dataclass, field
 
-from lerobot.common.optim.optimizers import AdamWConfig
-from lerobot.common.optim.schedulers import (
+from src.opentau.optim.optimizers import AdamWConfig
+from src.opentau.optim.schedulers import (
     CosineDecayWithWarmupSchedulerConfig,
 )
-from lerobot.configs.policies import PreTrainedConfig
-from lerobot.configs.reward import RewardConfig
-from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
+from src.opentau.configs.policies import PreTrainedConfig
+from src.opentau.configs.reward import RewardConfig
+from src.opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
 
 
 @PreTrainedConfig.register_subclass("value")

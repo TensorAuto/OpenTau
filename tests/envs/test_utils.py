@@ -18,7 +18,7 @@ import warnings
 import gymnasium as gym
 import pytest
 
-from lerobot.common.envs.utils import are_all_envs_same_type, check_env_attributes_and_types
+from src.opentau.envs.utils import are_all_envs_same_type, check_env_attributes_and_types
 
 
 def make_type1_env():

@@ -35,13 +35,13 @@ from torchvision import transforms
 
 import datasets
 from datasets.table import embed_table_storage
-from lerobot.common.datasets.backward_compatibility import (
+from src.opentau.datasets.backward_compatibility import (
     V21_MESSAGE,
     BackwardCompatibilityError,
     ForwardCompatibilityError,
 )
-from lerobot.common.utils.utils import is_valid_numpy_dtype_string
-from lerobot.configs.types import DictLike, FeatureType, PolicyFeature
+from src.opentau.utils.utils import is_valid_numpy_dtype_string
+from src.opentau.configs.types import DictLike, FeatureType, PolicyFeature
 
 DEFAULT_CHUNK_SIZE = 1000  # Max number of episodes per chunk
 
@@ -610,7 +610,7 @@ def create_lerobot_dataset_card(
         ],
     )
 
-    card_template = (importlib.resources.files("lerobot.common.datasets") / "card_template.md").read_text()
+    card_template = (importlib.resources.files("src.opentau.datasets") / "card_template.md").read_text()
 
     return DatasetCard.from_template(
         card_data=card_data,

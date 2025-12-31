@@ -5,7 +5,7 @@ from unittest.mock import patch
 import draccus
 import pytest
 
-from lerobot.configs.parser import filter_path_args, get_cli_overrides, parse_arg
+from src.opentau.configs.parser import filter_path_args, get_cli_overrides, parse_arg
 
 PATH_KEY = "path"
 
@@ -139,8 +139,8 @@ def test_does_not_filter_if_no_path_arg():
     """
     # Simulate get_path_arg returning None for the 'policy' field
     with (
-        patch("lerobot.configs.parser.get_path_arg", return_value=None),
-        patch("lerobot.configs.parser.get_type_arg", return_value="some_type"),
+        patch("src.opentau.configs.parser.get_path_arg", return_value=None),
+        patch("src.opentau.configs.parser.get_type_arg", return_value="some_type"),
     ):
         args = ["--policy.lr=0.01", "--policy.type=some_type", "--env.name=pusht"]
 
@@ -157,8 +157,8 @@ def test_raises_error_on_path_and_type_conflict():
     # Simulate both helpers returning a value for the 'policy' field
 
     with (
-        patch("lerobot.configs.parser.get_path_arg", return_value="some/path"),
-        patch("lerobot.configs.parser.get_type_arg", return_value="some_type"),
+        patch("src.opentau.configs.parser.get_path_arg", return_value="some/path"),
+        patch("src.opentau.configs.parser.get_type_arg", return_value="some_type"),
     ):
         args = [f"--policy.{PATH_KEY}=some/path", f"--policy.{draccus.CHOICE_TYPE_KEY}=some_type"]
 
@@ -172,8 +172,8 @@ def test_handles_single_string_for_fields_to_filter():
     """
 
     with (
-        patch("lerobot.configs.parser.get_path_arg", return_value="a/path"),
-        patch("lerobot.configs.parser.get_type_arg", return_value=None),
+        patch("src.opentau.configs.parser.get_path_arg", return_value="a/path"),
+        patch("src.opentau.configs.parser.get_type_arg", return_value=None),
     ):
         args = ["--config.path=a/path", "--config.name=test", "--seed=123"]
 
@@ -197,8 +197,8 @@ def test_handles_multiple_fields_to_filter():
         return None
 
     with (
-        patch("lerobot.configs.parser.get_path_arg", return_value=path_side_effect),
-        patch("lerobot.configs.parser.get_type_arg", return_value=None),
+        patch("src.opentau.configs.parser.get_path_arg", return_value=path_side_effect),
+        patch("src.opentau.configs.parser.get_type_arg", return_value=None),
     ):
         args = ["--policy.lr=0.01", "--env.name=pusht", "--seed=42", "--policy.path=..."]
 

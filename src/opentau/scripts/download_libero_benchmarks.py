@@ -5,7 +5,7 @@ from pathlib import Path
 from libero.libero import get_libero_path
 from libero.libero.utils.download_utils import check_libero_dataset, libero_dataset_download
 
-from lerobot.configs import parser
+from src.opentau.configs import parser
 
 
 @dataclass

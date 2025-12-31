@@ -14,11 +14,11 @@
 import pytest
 import torch
 
-from lerobot.common.constants import (
+from src.opentau.constants import (
     OPTIMIZER_PARAM_GROUPS,
     OPTIMIZER_STATE,
 )
-from lerobot.common.optim.optimizers import (
+from src.opentau.optim.optimizers import (
     AdamConfig,
     AdamWConfig,
     SGDConfig,

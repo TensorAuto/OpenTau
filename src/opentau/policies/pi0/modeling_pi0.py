@@ -58,16 +58,16 @@ import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 from transformers import AutoTokenizer
 
-from lerobot.common.constants import OBS_STATE
-from lerobot.common.policies.normalize import Normalize, Unnormalize
-from lerobot.common.policies.pi0.configuration_pi0 import PI0Config
-from lerobot.common.policies.pi0.paligemma_with_expert import (
+from src.opentau.constants import OBS_STATE
+from src.opentau.policies.normalize import Normalize, Unnormalize
+from src.opentau.policies.pi0.configuration_pi0 import PI0Config
+from src.opentau.policies.pi0.paligemma_with_expert import (
     PaliGemmaWithExpertConfig,
     PaliGemmaWithExpertModel,
 )
-from lerobot.common.policies.pretrained import PreTrainedPolicy
-from lerobot.common.policies.utils import log_model_loading_keys
-from lerobot.common.utils.utils import get_safe_dtype
+from src.opentau.policies.pretrained import PreTrainedPolicy
+from src.opentau.policies.utils import log_model_loading_keys
+from src.opentau.utils.utils import get_safe_dtype
 
 
 def create_sinusoidal_pos_embedding(

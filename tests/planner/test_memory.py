@@ -1,6 +1,6 @@
 import pytest
 
-from lerobot.common.planner import Memory
+from src.opentau.planner import Memory
 
 
 def add_conversation_for_test(mem: Memory, no_of_conversation: int) -> Memory:

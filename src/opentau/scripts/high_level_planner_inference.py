@@ -7,14 +7,14 @@ from pprint import pformat
 import torch
 from dotenv import load_dotenv
 
-from lerobot.common.planner import HighLevelPlanner, Memory
-from lerobot.common.policies.factory import get_policy_class
-from lerobot.common.utils.random_utils import set_seed
-from lerobot.common.utils.utils import (
+from src.opentau.planner import HighLevelPlanner, Memory
+from src.opentau.policies.factory import get_policy_class
+from src.opentau.utils.random_utils import set_seed
+from src.opentau.utils.utils import (
     init_logging,
 )
-from lerobot.configs import parser
-from lerobot.configs.train import TrainPipelineConfig
+from src.opentau.configs import parser
+from src.opentau.configs.train import TrainPipelineConfig
 
 load_dotenv()
 

@@ -96,9 +96,9 @@ from metaworld.policies.sawyer_window_close_v3_policy import SawyerWindowCloseV3
 from metaworld.policies.sawyer_window_open_v3_policy import SawyerWindowOpenV3Policy
 
 # Import lerobot components
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.common.datasets.utils import DEFAULT_FEATURES
-from lerobot.common.utils.utils import init_logging
+from src.opentau.datasets.lerobot_dataset import LeRobotDataset
+from src.opentau.datasets.utils import DEFAULT_FEATURES
+from src.opentau.utils.utils import init_logging
 
 metaworld_task = {
     "assembly-v3": {"task_name": "Pick up a nut and place it onto a peg.", "policy": SawyerAssemblyV3Policy},

@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from lerobot.common.policies.value.modeling_value import ValueFunction
+from src.opentau.policies.value.modeling_value import ValueFunction
 
 
 class TestValueFunctionIntegration:

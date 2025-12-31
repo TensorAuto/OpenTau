@@ -19,34 +19,34 @@ We do not want to import all the dependencies, but instead we keep it lightweigh
 
 Example:
     ```python
-        import lerobot
-        print(lerobot.available_envs)
-        print(lerobot.available_tasks_per_env)
-        print(lerobot.available_datasets)
-        print(lerobot.available_datasets_per_env)
-        print(lerobot.available_real_world_datasets)
-        print(lerobot.available_policies)
-        print(lerobot.available_policies_per_env)
-        print(lerobot.available_robots)
-        print(lerobot.available_cameras)
-        print(lerobot.available_motors)
+        import src.opentau
+        print(src.opentau.available_envs)
+        print(src.opentau.available_tasks_per_env)
+        print(src.opentau.available_datasets)
+        print(src.opentau.available_datasets_per_env)
+        print(src.opentau.available_real_world_datasets)
+        print(src.opentau.available_policies)
+        print(src.opentau.available_policies_per_env)
+        print(src.opentau.available_robots)
+        print(src.opentau.available_cameras)
+        print(src.opentau.available_motors)
     ```
 
 When implementing a new dataset loadable with LeRobotDataset follow these steps:
-- Update `available_datasets_per_env` in `lerobot/__init__.py`
+- Update `available_datasets_per_env` in `src/opentau/__init__.py`
 
 When implementing a new environment (e.g. `gym_aloha`), follow these steps:
-- Update `available_tasks_per_env` and `available_datasets_per_env` in `lerobot/__init__.py`
+- Update `available_tasks_per_env` and `available_datasets_per_env` in `src/opentau/__init__.py`
 
 When implementing a new policy class (e.g. `DiffusionPolicy`) follow these steps:
-- Update `available_policies` and `available_policies_per_env`, in `lerobot/__init__.py`
+- Update `available_policies` and `available_policies_per_env`, in `src/opentau/__init__.py`
 - Set the required `name` class attribute.
 - Update variables in `tests/test_available.py` by importing your new Policy class
 """
 
 import itertools
 
-from lerobot.__version__ import __version__  # noqa: F401
+from src.opentau.__version__ import __version__  # noqa: F401
 
 # TODO(rcadene): Improve policies and envs. As of now, an item in `available_policies`
 # refers to a yaml file AND a modeling name. Same for `available_envs` which refers to
@@ -158,7 +158,7 @@ available_datasets = sorted(
     set(itertools.chain(*available_datasets_per_env.values(), available_real_world_datasets))
 )
 
-# lists all available policies from `lerobot/common/policies`
+# lists all available policies from `src/opentau/policies`
 available_policies = ["pi0", "tau0", "value"]
 
 # keys and values refer to yaml files

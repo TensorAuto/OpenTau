@@ -27,7 +27,7 @@ from transformers import (
 )
 from transformers.models.auto import CONFIG_MAPPING
 
-from lerobot.common.policies.tau0.local_visual_encoder import SmallCNN
+from src.opentau.policies.tau0.local_visual_encoder import SmallCNN
 
 
 def apply_rope(x, positions, max_wavelength=10_000):

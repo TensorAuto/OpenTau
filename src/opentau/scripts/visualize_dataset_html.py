@@ -67,12 +67,12 @@ import pandas as pd
 import requests
 from flask import Flask, redirect, render_template, request, url_for
 
-from lerobot import available_datasets
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.common.datasets.utils import IterableNamespace
-from lerobot.common.utils.utils import init_logging
-from lerobot.configs.default import DatasetMixtureConfig, WandBConfig
-from lerobot.configs.train import TrainPipelineConfig
+from src.opentau import available_datasets
+from src.opentau.datasets.lerobot_dataset import LeRobotDataset
+from src.opentau.datasets.utils import IterableNamespace
+from src.opentau.utils.utils import init_logging
+from src.opentau.configs.default import DatasetMixtureConfig, WandBConfig
+from src.opentau.configs.train import TrainPipelineConfig
 
 
 def run_server(

@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from lerobot.common.planner import Memory
+from src.opentau.planner import Memory
 
 
 @pytest.fixture(scope="session")

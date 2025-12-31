@@ -23,12 +23,12 @@ import torch
 from safetensors.torch import load_file, save_file
 from torch.nn.parameter import Parameter
 
-from lerobot.common.constants import (
+from src.opentau.constants import (
     OPTIMIZER_PARAM_GROUPS,
     OPTIMIZER_STATE,
 )
-from lerobot.common.datasets.utils import flatten_dict, unflatten_dict, write_json
-from lerobot.common.utils.io_utils import deserialize_json_into_object
+from src.opentau.datasets.utils import flatten_dict, unflatten_dict, write_json
+from src.opentau.utils.io_utils import deserialize_json_into_object
 
 
 @dataclass

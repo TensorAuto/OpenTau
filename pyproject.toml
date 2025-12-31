@@ -18,9 +18,9 @@ issues = "https://github.com/huggingface/lerobot/issues"
 discord = "https://discord.gg/s3KuuzsPFb"
 
 [project]
-name = "lerobot"
+name = "opentau"
 version = "0.1.0"
-description = "🤗 LeRobot: State-of-the-art Machine Learning for Real-World Robotics in Pytorch"
+description = "OpenTau: State-of-the-art Machine Learning for Real-World Robotics in Pytorch"
 authors = [
     { name = "Rémi Cadène", email = "re.cadene@gmail.com" },
     { name = "Simon Alibert", email = "alibert.sim@gmail.com" },
@@ -149,10 +149,10 @@ select = ["E4", "E7", "E9", "F", "I", "N", "B", "C4", "SIM"]
 exclude_dirs = [
     "tests",
     "benchmarks",
-    "lerobot/common/datasets/push_dataset_to_hub",
-    "lerobot/common/datasets/v2/convert_dataset_v1_to_v2",
-    "lerobot/common/policies/tau0/conversion_scripts",
-    "lerobot/scripts/push_dataset_to_hub.py",
+    "src/opentau/datasets/push_dataset_to_hub",
+    "src/opentau/datasets/v2/convert_dataset_v1_to_v2",
+    "src/opentau/policies/tau0/conversion_scripts",
+    "src/opentau/scripts/push_dataset_to_hub.py",
 ]
 skips = ["B101", "B311", "B404", "B603"]
 

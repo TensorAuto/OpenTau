@@ -19,33 +19,33 @@ from typing import Optional
 import numpy as np
 from torch import nn
 
-from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
-from lerobot.common.datasets.utils import dataset_to_policy_features
-from lerobot.common.policies.pi0.configuration_pi0 import PI0Config
-from lerobot.common.policies.pi05.configuration_pi05 import PI05Config
-from lerobot.common.policies.pretrained import PreTrainedPolicy
-from lerobot.common.policies.tau0.configuration_tau0 import TAU0Config
-from lerobot.common.policies.value.configuration_value import ValueConfig
-from lerobot.configs.policies import PreTrainedConfig
-from lerobot.configs.types import FeatureType
+from src.opentau.datasets.lerobot_dataset import LeRobotDatasetMetadata
+from src.opentau.datasets.utils import dataset_to_policy_features
+from src.opentau.policies.pi0.configuration_pi0 import PI0Config
+from src.opentau.policies.pi05.configuration_pi05 import PI05Config
+from src.opentau.policies.pretrained import PreTrainedPolicy
+from src.opentau.policies.tau0.configuration_tau0 import TAU0Config
+from src.opentau.policies.value.configuration_value import ValueConfig
+from src.opentau.configs.policies import PreTrainedConfig
+from src.opentau.configs.types import FeatureType
 
 
 def get_policy_class(name: str) -> type[PreTrainedPolicy]:
     """Get the policy's class and config class given a name (matching the policy class' `name` attribute)."""
     if name == "tau0":
-        from lerobot.common.policies.tau0.modeling_tau0 import TAU0Policy
+        from src.opentau.policies.tau0.modeling_tau0 import TAU0Policy
 
         return TAU0Policy
     elif name == "pi0":
-        from lerobot.common.policies.pi0.modeling_pi0 import PI0Policy
+        from src.opentau.policies.pi0.modeling_pi0 import PI0Policy
 
         return PI0Policy
     elif name == "pi05":
-        from lerobot.common.policies.pi05.modeling_pi05 import PI05Policy
+        from src.opentau.policies.pi05.modeling_pi05 import PI05Policy
 
         return PI05Policy
     elif name == "value":
-        from lerobot.common.policies.value.modeling_value import ValueFunction
+        from src.opentau.policies.value.modeling_value import ValueFunction
 
         return ValueFunction
     else:

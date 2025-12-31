@@ -21,14 +21,14 @@ from termcolor import colored
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
-from lerobot.common.constants import (
+from src.opentau.constants import (
     CHECKPOINTS_DIR,
     LAST_CHECKPOINT_LINK,
     TRAINING_STEP,
 )
-from lerobot.common.datasets.utils import load_json, write_json
-from lerobot.common.utils.random_utils import load_rng_state, save_rng_state
-from lerobot.configs.train import TrainPipelineConfig
+from src.opentau.datasets.utils import load_json, write_json
+from src.opentau.utils.random_utils import load_rng_state, save_rng_state
+from src.opentau.configs.train import TrainPipelineConfig
 
 
 def log_output_dir(out_dir):
