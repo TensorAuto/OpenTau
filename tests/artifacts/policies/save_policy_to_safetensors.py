@@ -29,10 +29,6 @@ from opentau.configs.train import TrainPipelineConfig
 def get_policy_stats(ds_repo_id: str, policy_name: str, policy_kwargs: dict):
     set_seed(1337)
 
-    # Extract action_expert_num_cams from policy_kwargs if present
-    train_cfg_kwargs = {}
-    if "action_expert_num_cams" in policy_kwargs:
-        train_cfg_kwargs["action_expert_num_cams"] = policy_kwargs["action_expert_num_cams"]
 
     train_cfg = TrainPipelineConfig(
         # TODO(rcadene, aliberts): remove dataset download
@@ -46,7 +42,6 @@ def get_policy_stats(ds_repo_id: str, policy_name: str, policy_kwargs: dict):
         policy=make_policy_config(policy_name, **policy_kwargs),
         batch_size=8,
         use_policy_training_preset=True,
-        **train_cfg_kwargs,
     )
     train_cfg.validate()  # Needed for auto-setting some parameters
 

@@ -311,13 +311,10 @@ def check_standard_data_format(item, delta_timestamps_params, dataset, train_pip
         ("response", None),
         ("loss_type", None),
         ("img_is_pad", (train_pipeline_config.num_cams,)),
-        ("local_img_is_pad", (train_pipeline_config.action_expert_num_cams,)),
         ("action_is_pad", (train_pipeline_config.action_chunk,)),
     ]
     for i in range(train_pipeline_config.num_cams):
         keys_shape_required.append((f"camera{i}", (3, *train_pipeline_config.resolution)))
-    for i in range(train_pipeline_config.action_expert_num_cams):
-        keys_shape_required.append((f"local_camera{i}", (3, *train_pipeline_config.resolution)))
 
     # enforce standard data format
     for key, shape in keys_shape_required:
@@ -333,14 +330,14 @@ def check_standard_data_format(item, delta_timestamps_params, dataset, train_pip
             assert item[key].shape == shape, f"{key}"
         elif key == "prompt" or key == "response" or key == "loss_type":
             assert type(item[key]) is str, f"{key}"
-        elif key == "img_is_pad" or key == "img_is_pad_local" or key == "action_is_pad":
+        elif key == "img_is_pad" or key == "action_is_pad":
             assert item[key].shape == shape, f"{key}"
             assert isinstance(item[key], torch.BoolTensor), f"{key}"
 
     # test delta_timestamps
     for timestamp_param in delta_timestamps_params:
         assert timestamp_param["input_group"].shape == (2,)
-        assert (timestamp_param["action"].shape[0] - train_pipeline_config.frozen_actions,) == (
+        assert (timestamp_param["action"].shape[0],) == (
             train_pipeline_config.action_chunk,
         )
 

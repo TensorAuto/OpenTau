@@ -49,7 +49,7 @@ ROBOT0_EYE_IN_HAND_IMAGE = np.arange(HWC, 2 * HWC).astype(np.uint8).reshape(H, W
 PROMPT = "pick up the alphabet soup and place it in the basket"
 MAX_STATE_DIM = 10
 ACTION_CHUNK = 50
-NUM_CAMS, ACTION_EXPERT_NUM_CAMS = 2, 2
+NUM_CAMS = 2
 
 
 @pytest.fixture
@@ -74,12 +74,9 @@ def expected_torch_input():
     return {
         "camera0": torch.tensor(rotate_numpy_image(AGENTVIEW_IMAGE).copy()),
         "camera1": torch.tensor(rotate_numpy_image(ROBOT0_EYE_IN_HAND_IMAGE).copy()),
-        "local_camera0": torch.tensor(rotate_numpy_image(AGENTVIEW_IMAGE).copy()),
-        "local_camera1": torch.tensor(rotate_numpy_image(ROBOT0_EYE_IN_HAND_IMAGE).copy()),
         "prompt": PROMPT,
         "state": torch.tensor(state.copy()),
         "img_is_pad": torch.zeros(NUM_CAMS, dtype=torch.bool),
-        "local_img_is_pad": torch.zeros(ACTION_EXPERT_NUM_CAMS, dtype=torch.bool),
         "action_is_pad": torch.zeros(ACTION_CHUNK, dtype=torch.bool),
     }
 
@@ -164,7 +161,6 @@ def test_libero2torch(obs, expected_torch_input, dataset_mixture_config, policy_
         libero=LiberoEnvConfig(suite="object", id=0),
         max_state_dim=MAX_STATE_DIM,
         action_chunk=ACTION_CHUNK,
-        action_expert_num_cams=ACTION_EXPERT_NUM_CAMS,
         num_cams=NUM_CAMS,
     )
     torch_input = libero2torch(obs, cfg, "cpu", torch.float64)

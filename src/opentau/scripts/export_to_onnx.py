@@ -48,7 +48,7 @@ class InferenceWrapper(torch.nn.Module):
         self.num_cross_att_tokens = num_cross_att_tokens
         self.layer_idx = layer_idx
 
-    def forward(self, key_states, value_states, local_camera0, state, frozen_actions):
+    def forward(self, key_states, value_states, state):
         vlm_tokens = (
             {
                 self.layer_idx: {
@@ -60,14 +60,8 @@ class InferenceWrapper(torch.nn.Module):
             self.prefix_offsets,
             self.num_cross_att_tokens,
         )
-        frozen_action_is_pad = torch.zeros(
-            1, frozen_actions.shape[1], dtype=torch.bool, device=frozen_actions.device
-        )
         observation = {
-            "local_camera0": local_camera0,
             "state": state,
-            "frozen_actions": frozen_actions,
-            "frozen_action_is_pad": frozen_action_is_pad,
         }
         actions = self.decoder.sample_actions(
             observation,
@@ -122,10 +116,8 @@ def main(cfg: TrainPipelineConfig):
         num_cross_att_tokens,
         layer_idx,
     ) = get_vlm_cache(cfg, device, dtype)
-    local_camera0 = torch.zeros((1, 3, *cfg.resolution), device=device, dtype=dtype)
     state = torch.zeros((1, cfg.max_state_dim), device=device, dtype=dtype)
-    frozen_actions = torch.zeros((1, cfg.frozen_actions, cfg.max_state_dim), device=device, dtype=dtype)
-    args = (key_states, value_states, local_camera0, state, frozen_actions)
+    args = (key_states, value_states, state)
     logging.info("Generated example args")
 
     policy_class = get_policy_class(cfg.policy.type)
@@ -162,7 +154,7 @@ def main(cfg: TrainPipelineConfig):
             inference_wrapper.eval(),
             args,
             path,
-            input_names=[KEY_STATES, VALUE_STATES, "local_camera0", "state", "frozen_actions"],
+            input_names=[KEY_STATES, VALUE_STATES, "state"],
             output_names=["action_chunk"],
             opset_version=18,
             do_constant_folding=False,  # constant folding causes weird errors (getting dim -1 from a 0-dim scalar) after forward pass succeeds

@@ -59,8 +59,6 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
     use_amp: bool = False
     pretrained_path: str | None = None
 
-    # Number of cameras to pass into the local action expert, overridable by subclasses
-    action_expert_num_cams: int = 0
     # Mean latency of cloud VLM in seconds.
     cloud_vlm_latency_mean: float = 0.0
     # Standard deviation of latency of cloud VLM in seconds.

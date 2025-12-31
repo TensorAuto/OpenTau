@@ -59,11 +59,9 @@ class TrainPipelineConfig(HubMixin):
     # parameters for the Standard Data Format
     resolution: tuple[int, int] = (224, 224)  # resolution of images (H, W) in data sample
     num_cams: int = 2  # number of cameras for the cloud VLM in each data sample
-    action_expert_num_cams: int = 1  # number of cameras for the action decoder in each data sample
     max_state_dim: int = 32  # maximum dimension of the state vector
     max_action_dim: int = 32  # maximum dimension of the action vector
     action_chunk: int = 50  # size of action chunk
-    frozen_actions: int = 0  # number of actions from the previous chunk to condition on
     loss_weighting: dict[str, float] = field(default_factory=lambda: {"MSE": 1, "CE": 1})
     # Number of workers for the dataloader.
     num_workers: int = 4
@@ -119,7 +117,6 @@ class TrainPipelineConfig(HubMixin):
             self.policy.max_state_dim = self.max_state_dim
             self.policy.max_action_state = self.max_action_dim
             self.policy.chunk_size = self.action_chunk
-            self.policy.frozen_actions = self.frozen_actions
         if self.job_name:
             warn(
                 "cfg.job_name is deprecated and ignored. Set cfg.wandb.project and/or cfg.wandb.name instead."

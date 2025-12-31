@@ -27,12 +27,9 @@ def _libero2np(obs: dict[str, np.ndarray], cfg) -> dict[str, str | np.ndarray]:
     return {
         "camera0": agent_view,
         "camera1": wrist_view,
-        "local_camera0": agent_view,
-        "local_camera1": wrist_view,
         "prompt": cfg.libero.task.language,
         "state": np.pad(state, (0, cfg.max_state_dim - len(state))),
         "img_is_pad": np.zeros(cfg.num_cams, dtype=bool),
-        "local_img_is_pad": np.zeros(cfg.action_expert_num_cams, dtype=bool),
         "action_is_pad": np.zeros(cfg.action_chunk, dtype=bool),
     }
 

@@ -139,8 +139,8 @@ class LiberoEnv(gym.Env):
         # expected format regardless of the original camera naming.
         if camera_name_mapping is None:
             camera_name_mapping = {
-                "agentview_image": ["camera0", "local_camera0"],
-                "robot0_eye_in_hand_image": ["camera1", "local_camera1"],
+                "agentview_image": ["camera0"],
+                "robot0_eye_in_hand_image": ["camera1"],
             }
         self.camera_name_mapping = camera_name_mapping
         for cam in self.camera_name_mapping:

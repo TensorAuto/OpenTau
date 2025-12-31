@@ -58,11 +58,6 @@ class DatasetMixtureMetadata:
                 cam_idx = int(new_key[len("camera") :])
                 if cam_idx >= self.cfg.num_cams:
                     continue
-            # TODO(shuheng): refactor & reduce repetition
-            if new_key.startswith("local_camera"):
-                cam_idx = int(new_key[len("local_camera") :])
-                if cam_idx >= self.cfg.action_expert_num_cams:
-                    continue
             if key in stats:
                 standard_stats[new_key] = stats[key]
             else:
@@ -83,21 +78,6 @@ class DatasetMixtureMetadata:
             if f"camera{cam_idx}" in standard_stats:
                 continue
             standard_stats[f"camera{cam_idx}"] = {
-                "min": np.zeros((3, 1, 1), dtype=np.float32),
-                "max": np.ones((3, 1, 1), dtype=np.float32),
-                "mean": np.zeros((3, 1, 1), dtype=np.float32),
-                "std": np.zeros((3, 1, 1), dtype=np.float32),
-                "count": np.array(
-                    standard_stats["state"]["count"]
-                ),  # create a copy in case this gets modified
-            }
-
-        # pad missing local cameras
-        # TODO(shuheng): refactor & reduce repetition
-        for cam_idx in range(self.cfg.action_expert_num_cams):
-            if f"local_camera{cam_idx}" in standard_stats:
-                continue
-            standard_stats[f"local_camera{cam_idx}"] = {
                 "min": np.zeros((3, 1, 1), dtype=np.float32),
                 "max": np.ones((3, 1, 1), dtype=np.float32),
                 "mean": np.zeros((3, 1, 1), dtype=np.float32),
@@ -133,12 +113,6 @@ class DatasetMixtureMetadata:
         # add camera features
         for i in range(self.cfg.num_cams):
             features[f"camera{i}"] = {
-                "shape": (3, self.cfg.resolution[0], self.cfg.resolution[1]),
-                "dtype": "image",
-            }
-        # add local camera features
-        for i in range(self.cfg.action_expert_num_cams):
-            features[f"local_camera{i}"] = {
                 "shape": (3, self.cfg.resolution[0], self.cfg.resolution[1]),
                 "dtype": "image",
             }
