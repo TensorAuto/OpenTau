@@ -97,7 +97,6 @@ class TestDatasetMixtureMetadata:
         }
 
         train_pipeline_config.num_cams = 2
-        train_pipeline_config.action_expert_num_cams = 2
 
         metadata_mixture = DatasetMixtureMetadata.__new__(DatasetMixtureMetadata)
         metadata_mixture.cfg = train_pipeline_config
@@ -126,13 +125,10 @@ class TestDatasetMixtureMetadata:
         assert result["actions"]["mean"].shape[-1] == train_pipeline_config.max_action_dim
 
         # Check that missing cameras were added
-        # there should be 2 cameras and 2 local cameras
+        # there should be 2 cameras
         assert "camera0" in result
         assert "camera1" in result
         assert "camera2" not in result
-        assert "local_camera0" in result
-        assert "local_camera1" in result
-        assert "local_camera2" not in result
 
     @patch("opentau.datasets.dataset_mixture.DATA_FEATURES_NAME_MAPPING")
     def test_to_standard_data_format_missing_key(self, mock_name_mapping, train_pipeline_config):
@@ -183,7 +179,6 @@ class TestDatasetMixtureMetadata:
         """Test the features property."""
         metadata_mixture = DatasetMixtureMetadata.__new__(DatasetMixtureMetadata)
         train_pipeline_config.num_cams = 2
-        train_pipeline_config.action_expert_num_cams = 2
         metadata_mixture.cfg = train_pipeline_config
 
         features = metadata_mixture.features
@@ -193,9 +188,6 @@ class TestDatasetMixtureMetadata:
         assert "camera0" in features
         assert "camera1" in features
         assert "camera2" not in features
-        assert "local_camera0" in features
-        assert "local_camera1" in features
-        assert "local_camera2" not in features
 
         assert features["state"]["shape"] == (train_pipeline_config.max_state_dim,)
         assert features["actions"]["shape"] == (train_pipeline_config.max_action_dim,)
@@ -205,16 +197,6 @@ class TestDatasetMixtureMetadata:
             train_pipeline_config.resolution[1],
         )
         assert features["camera1"]["shape"] == (
-            3,
-            train_pipeline_config.resolution[0],
-            train_pipeline_config.resolution[1],
-        )
-        assert features["local_camera0"]["shape"] == (
-            3,
-            train_pipeline_config.resolution[0],
-            train_pipeline_config.resolution[1],
-        )
-        assert features["local_camera1"]["shape"] == (
             3,
             train_pipeline_config.resolution[0],
             train_pipeline_config.resolution[1],

@@ -40,7 +40,6 @@
         "n_action_steps": 50,
         "max_state_dim": 32,
         "max_action_dim": 32,
-        "action_expert_num_cams": 1,
         "cloud_vlm_latency_mean": 0.16,
         "cloud_vlm_latency_std": 0.05,
         "cloud_vlm_latency_lower": 0.10,

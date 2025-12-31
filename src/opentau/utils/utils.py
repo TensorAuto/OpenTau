@@ -245,17 +245,11 @@ def create_dummy_observation(cfg, device, dtype=torch.bfloat16) -> dict:
         f"camera{i}": torch.zeros((1, 3, *cfg.resolution), dtype=dtype, device=device)
         for i in range(cfg.num_cams)
     }
-    local_camera_observations = {
-        f"local_camera{i}": torch.zeros((1, 3, *cfg.resolution), dtype=dtype, device=device)
-        for i in range(cfg.action_expert_num_cams)
-    }
     return {
         **camera_observations,
-        **local_camera_observations,
         "state": torch.zeros((1, cfg.max_state_dim), dtype=dtype, device=device),
         "prompt": ["Pick up yellow lego block and put it in the bin"],
         "img_is_pad": torch.zeros((1, cfg.num_cams), dtype=torch.bool, device=device),
-        "local_img_is_pad": torch.zeros((1, cfg.action_expert_num_cams), dtype=torch.bool, device=device),
         "action_is_pad": torch.zeros((1, cfg.action_chunk), dtype=torch.bool, device=device),
     }
 

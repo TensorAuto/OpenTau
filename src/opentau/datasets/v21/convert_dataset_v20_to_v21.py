@@ -95,7 +95,6 @@ def create_fake_train_config() -> TrainPipelineConfig:
         policy=policy_cfg,
         resolution=(224, 224),
         num_cams=2,
-        action_expert_num_cams=1,
         max_state_dim=32,
         max_action_dim=32,
         action_chunk=50,

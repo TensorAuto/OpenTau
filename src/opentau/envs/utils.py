@@ -35,7 +35,7 @@ def preprocess_observation(np_observations: dict, cfg: TrainPipelineConfig) -> d
     """Convert environment observation to LeRobot format observation.
     Args:
         np_observations: Dictionary of observation batches from a Gym vector environment.
-        cfg: Training configuration that contains max_state_dim, num_cams, action_expert_num_cams, resolution, etc.
+        cfg: Training configuration that contains max_state_dim, num_cams, resolution, etc.
     Returns:
         Dictionary of observation batches with keys renamed to LeRobot format and values as tensors.
     """
@@ -70,13 +70,6 @@ def preprocess_observation(np_observations: dict, cfg: TrainPipelineConfig) -> d
     # add padding flags for cameras if needed
     if cfg.num_cams > 0:
         return_observations["img_is_pad"] = torch.zeros((batch_size, cfg.num_cams), dtype=torch.bool)
-
-    # add padding flags for local cameras if needed
-    if cfg.action_expert_num_cams > 0:
-        return_observations["local_img_is_pad"] = torch.zeros(
-            (batch_size, cfg.action_expert_num_cams),
-            dtype=torch.bool,
-        )
 
     # convert all floating point tensors to bfloat16 to save memory
     acc = get_proc_accelerator()

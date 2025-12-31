@@ -416,12 +416,10 @@ class BaseDataset(torch.utils.data.Dataset):
         super().__init__()
         # Standard Data Format parameters
         self.resolution = cfg.resolution  # resolution of images (H, W) in data sample
-        self.num_cams_cloud = cfg.num_cams  # number of cameras in each data sample
-        self.num_cams_local = cfg.action_expert_num_cams  # number of cameras in each data sample
+        self.num_cams = cfg.num_cams  # number of cameras in each data sample
         self.max_state_dim = cfg.max_state_dim  # maximum dimension of the state vector
         self.max_action_dim = cfg.max_action_dim  # maximum dimension of the action vector
         self.action_chunk = cfg.action_chunk  # number of actions to be processed in a chunk
-        self.frozen_actions = cfg.frozen_actions  # number of frozen actions to be processed in a chunk
 
     @abstractmethod
     def _get_feature_mapping_key(self) -> str:
@@ -435,9 +433,7 @@ class BaseDataset(torch.utils.data.Dataset):
         For example, {"image_key": torch.zeros(2, 3, 224, 224), "image_key_is_pad": [False, True] } will become
         {
             "image_key": torch.zeros(3, 224, 224),
-            "image_key_local": torch.zeros(3, 224, 224),
             "image_key_is_pad: False,
-            "image_key_local_is_pad: True,
         }.
         """
         raise NotImplementedError
@@ -446,15 +442,13 @@ class BaseDataset(torch.utils.data.Dataset):
         name_map = DATA_FEATURES_NAME_MAPPING[self._get_feature_mapping_key()]
         image_is_pad = []
         for cam_idx in range(n_cams):
-            std_key = f"local_camera{cam_idx}" if is_local else f"camera{cam_idx}"
+            std_key = f"camera{cam_idx}"
             key = name_map.get(std_key)
 
             if key is None:
                 standard_item[std_key] = torch.zeros((3, *self.resolution))
                 image_is_pad.append(True)
             else:
-                if is_local:
-                    key += "_local"
                 standard_item[std_key] = self.resize_with_pad(
                     item[key],
                     self.resolution[1],
@@ -482,11 +476,10 @@ class BaseDataset(torch.utils.data.Dataset):
         self._separate_image_in_time(item)
 
         standard_item = {}
-        img_is_pad = self._standardize_images(item, standard_item, self.num_cams_cloud, False)
-        local_img_is_pad = self._standardize_images(item, standard_item, self.num_cams_local, True)
+        img_is_pad = self._standardize_images(item, standard_item, self.num_cams, False)
 
         for new_key, key in name_map.items():
-            if new_key.startswith("camera") or new_key.startswith("local_camera"):
+            if new_key.startswith("camera"):
                 continue
             standard_item[new_key] = item[key]
 
@@ -495,7 +488,6 @@ class BaseDataset(torch.utils.data.Dataset):
         standard_item["actions"] = self.pad_vector(standard_item["actions"], self.max_action_dim)
 
         standard_item["img_is_pad"] = torch.tensor(img_is_pad, dtype=torch.bool)
-        standard_item["local_img_is_pad"] = torch.tensor(local_img_is_pad, dtype=torch.bool)
         standard_item["action_is_pad"] = item[name_map["actions"] + "_is_pad"]
 
         # add loss type
@@ -1079,28 +1071,6 @@ class LeRobotDataset(BaseDataset):
             item[key] = torch.BoolTensor(val)
         return item
 
-    def _handle_noop_action_special_case(self, item: dict, idx: int) -> dict:
-        """We will remap the last 25 timesteps to the start of the episode."""
-        ep_idx = item["episode_index"].item()
-        ep_start = self.episode_data_index["from"][self.epi2idx[ep_idx]].item()
-        ep_end = self.episode_data_index["to"][self.epi2idx[ep_idx]].item()
-
-        # if we are at the end of the episode, we will replace the last `self.frozen_actions` timesteps with the start of the episode
-        return_idx = idx
-        useless_indices_start = (
-            ep_end - self.frozen_actions
-        )  # the last `self.frozen_actions` timesteps are useless to sample from since the entire generated action chunk will be padded
-        num_real_frozen_actions = self.frozen_actions
-        if useless_indices_start <= idx:
-            item = self.hf_dataset[
-                ep_start
-            ]  # img and action chunk needs to come from the start of the episode
-            return_idx = ep_start
-            num_real_frozen_actions = idx - useless_indices_start
-            assert num_real_frozen_actions <= self.frozen_actions
-
-        return item, return_idx, num_real_frozen_actions
-
     def __len__(self):
         return self.num_frames
 
@@ -1113,14 +1083,6 @@ class LeRobotDataset(BaseDataset):
             ep_end = self.episode_data_index["to"][self.epi2idx[ep_idx]].item()
 
         episodes_info = self.meta.episodes[ep_idx]
-
-        if (
-            self.episode_data_index is not None and self.epi2idx is not None
-        ):  # this should always be true during training
-            # handle special case where we replace data points from steps at the end of an episode to train on generating the initial action chunk
-            item, idx, num_real_frozen_actions = self._handle_noop_action_special_case(item, idx)
-        else:  # this case only triggers during testing
-            num_real_frozen_actions = 0
 
         # Soft indices are floats instead of integers, which allows for different interpolation strategies such as
         # nearest neighbor or linear interpolation.
@@ -1200,34 +1162,9 @@ class LeRobotDataset(BaseDataset):
                 item["return_bin_idx"] = torch.tensor(0, dtype=torch.long)
                 item["return_continuous"] = torch.tensor(0, dtype=torch.float32)
 
-            # process the frozen actions
-            num_noop_padding = self.frozen_actions - num_real_frozen_actions
-            item["actions"] = item["actions"][
-                num_real_frozen_actions : num_real_frozen_actions + self.cfg.action_chunk
-            ]
-            item["action_is_pad"] = item["action_is_pad"][
-                num_real_frozen_actions : num_real_frozen_actions + self.cfg.action_chunk
-            ]
-            item["frozen_actions"] = torch.cat(
-                [
-                    torch.zeros(num_noop_padding, self.cfg.max_action_dim),
-                    item["actions"][:num_real_frozen_actions],
-                ],
-                dim=0,
-            )
-            item["frozen_action_is_pad"] = torch.cat(
-                [
-                    torch.ones(num_noop_padding, dtype=torch.bool),
-                    item["action_is_pad"][:num_real_frozen_actions],
-                ],
-                dim=0,
-            )
-
             # sanity check for action chunk lengths
             assert item["actions"].shape[0] == self.cfg.action_chunk
             assert item["action_is_pad"].shape[0] == self.cfg.action_chunk
-            assert item["frozen_actions"].shape[0] == self.cfg.frozen_actions
-            assert item["frozen_action_is_pad"].shape[0] == self.cfg.frozen_actions
 
         return item
 
@@ -1472,7 +1409,7 @@ class LeRobotDataset(BaseDataset):
 
     def _separate_image_in_time(self, item: dict):
         name_map = DATA_FEATURES_NAME_MAPPING[self._get_feature_mapping_key()]
-        cam_keys = {v for k, v in name_map.items() if k.startswith("camera") or k.startswith("local_camera")}
+        cam_keys = {v for k, v in name_map.items() if k.startswith("camera")}
         for k in cam_keys:
             images = item.pop(k)
             assert len(images) == 2, (
@@ -1595,5 +1532,4 @@ class LeRobotDataset(BaseDataset):
         obj.vector_resample_strategy = vector_resample_strategy
         obj.standardize = standardize
         obj.episode_data_index, obj.epi2idx = get_episode_data_index(obj.meta.episodes, obj.episodes)
-        obj.frozen_actions = 0
         return obj

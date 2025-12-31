@@ -9,7 +9,7 @@
         "weights": [
             1.0
         ],
-        "action_freq": 30.0,
+        "action_freq": 30.0,    
         "image_resample_strategy": "nearest",
         "vector_resample_strategy": "nearest"
     },
@@ -49,7 +49,6 @@
     "seed": 1000,
     "resolution": [224, 224],
     "num_cams": 1,
-    "action_expert_num_cams": 0,
     "max_state_dim": 32,
     "max_action_dim": 32,
     "action_chunk": 50,

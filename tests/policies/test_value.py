@@ -115,14 +115,12 @@ class TestValueFunctionIntegration:
         batch = {
             "camera0": torch.randn(batch_size, 3, 224, 224),
             "camera1": torch.randn(batch_size, 3, 224, 224),
-            "local_camera0": torch.randn(batch_size, 3, 224, 224),
             "state": torch.randn(batch_size, config.max_state_dim),
             "actions": torch.randn(batch_size, config.chunk_size, config.max_action_dim),
             "prompt": ["Pick up the red block"],
             "response": ["I will pick up the red block"],
             "loss_type": ["MSE"],
             "img_is_pad": torch.zeros(batch_size, 2, dtype=torch.bool),
-            "local_img_is_pad": torch.zeros(batch_size, 1, dtype=torch.bool),
             "action_is_pad": torch.cat(
                 [
                     torch.zeros(batch_size, config.chunk_size // 2, dtype=torch.bool),

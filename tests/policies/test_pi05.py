@@ -220,7 +220,6 @@ class TestPI05Integration:
             "camera1": torch.randn(batch_size, 3, 224, 224),
             "state": torch.randn(batch_size, config.max_state_dim),
             "actions": torch.randn(batch_size, config.chunk_size, config.max_action_dim),
-            "frozen_actions": torch.randn(batch_size, 0, config.max_action_dim),
             "prompt": ["Pick up the red block"],
             "img_is_pad": torch.zeros(batch_size, 2, dtype=torch.bool),
             "action_is_pad": torch.cat(
@@ -230,7 +229,6 @@ class TestPI05Integration:
                 ],
                 dim=1,
             ),
-            "frozen_action_is_pad": torch.zeros(batch_size, 0, dtype=torch.bool),
         }
 
         policy.to(dtype=torch.bfloat16, device="cuda")
@@ -242,7 +240,6 @@ class TestPI05Integration:
         }
 
         batch_cuda["action_is_pad"] = batch_cuda["action_is_pad"].to(dtype=torch.bool)
-        batch_cuda["frozen_action_is_pad"] = batch_cuda["frozen_action_is_pad"].to(dtype=torch.bool)
 
         # Capture intermediate variables for inspection by monkey-patching the paligemma_with_expert forward method
         captured_variables = {}

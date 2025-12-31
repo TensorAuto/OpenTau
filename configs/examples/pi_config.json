@@ -82,9 +82,7 @@
         224
     ],
     "num_cams": 2,
-    "action_expert_num_cams": 0,
     "max_state_dim": 32,
-    "frozen_actions": 0,
     "max_action_dim": 32,
     "action_chunk": 10,
     "loss_weighting": {

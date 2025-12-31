@@ -67,8 +67,6 @@ class GroundingDataset(BaseDataset):
         item["actions"] = torch.zeros(self.action_chunk, self.max_action_dim)
         item["actions_is_pad"] = torch.ones(self.action_chunk, dtype=torch.bool)
         item = self._to_standard_data_format(item)
-        item["frozen_actions"] = torch.zeros(self.frozen_actions, self.max_action_dim)
-        item["frozen_action_is_pad"] = torch.ones(self.frozen_actions, dtype=torch.bool)
         item["return_bin_idx"] = torch.tensor(0, dtype=torch.long)
         item["return_continuous"] = torch.tensor(0, dtype=torch.float32)
         item["advantage"] = torch.tensor(0, dtype=torch.bfloat16)

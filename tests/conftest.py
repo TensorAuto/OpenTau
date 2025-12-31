@@ -93,8 +93,6 @@ def add_mock_dataset_name_mapping():
     mock_name_mapping = {
         "camera0": "camera0",
         "camera1": "camera1",
-        "local_camera0": "camera0",
-        "local_camera1": "camera1",
         "state": "state",
         "actions": "actions",
         "prompt": "task",
