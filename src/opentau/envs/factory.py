@@ -18,14 +18,12 @@ from functools import partial
 
 import gymnasium as gym
 
-from opentau.envs.configs import EnvConfig, LiberoEnv, MetaworldEnv
+from opentau.envs.configs import EnvConfig, LiberoEnv
 from opentau.configs.train import TrainPipelineConfig
 
 
 def make_env_config(env_type: str, **kwargs) -> EnvConfig:
-    if env_type == "metaworld":
-        return MetaworldEnv(**kwargs)
-    elif env_type == "libero":
+    if env_type == "libero":
         return LiberoEnv(**kwargs)
     else:
         raise ValueError(f"Env type '{env_type}' is not available.")

@@ -174,3 +174,7 @@ cython_debug/
 
 # Jetbrains configuration
 .idea/
+
+# Cursor configuration
+.cursorignore
+.cursorindexingignore

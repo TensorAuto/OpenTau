@@ -6,14 +6,6 @@ DATA_FEATURES_NAME_MAPPING = {
         "prompt": "task",
         "response": "response",
     },
-    "ML-GOD/metaworld_mt50": {
-        "camera0": "observation.image",
-        "local_camera0": "observation.image",
-        "state": "observation.state",
-        "actions": "action",
-        "prompt": "task",
-        "response": "response",
-    },
     "ML-GOD/libero_spatial_no_noops_1.0.0_lerobot": {
         "camera0": "observation.images.image",
         "camera1": "observation.images.wrist_image",
@@ -232,7 +224,6 @@ VQA tasks will have a CE loss.
 """
 LOSS_TYPE_MAPPING = {
     "ML-GOD/mt-button-press": "MSE",
-    "ML-GOD/metaworld_mt50": "MSE",
     "ML-GOD/libero_spatial_no_noops_1.0.0_lerobot": "MSE",
     "ML-GOD/libero": "MSE",
     "physical-intelligence/libero": "MSE",
