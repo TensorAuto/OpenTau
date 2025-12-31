@@ -8,6 +8,7 @@ OpenTau documentation
    overview
    installation
    concepts
+   tutorials
 
 .. toctree::
    :maxdepth: 2

@@ -2,8 +2,9 @@
     "dataset_mixture": {
         "datasets": [
             {
-                "repo_id": "physical-intelligence/libero"
+                "repo_id": "lerobot/droid_100"
             }
+
         ],
         "weights": [
             1.0
@@ -13,36 +14,26 @@
         "vector_resample_strategy": "nearest"
     },
     "policy": {
-        "type": "tau0",
-        "pretrained_path": "lerobot/pi0",
-        "init_strategy": "full_he_init",
+        "type": "pi05",
+        "pretrained_path": "william-yue/pi05_base",
         "n_obs_steps": 1,
         "normalization_mapping": {
             "VISUAL": "IDENTITY",
-            "STATE": "MEAN_STD",
+            "STATE": "MIN_MAX",
             "ACTION": "MEAN_STD"
         },
         "chunk_size": 50,
         "n_action_steps": 50,
         "max_state_dim": 32,
         "max_action_dim": 32,
-        "action_expert_num_cams": 1,
-        "cloud_vlm_latency_mean": 0.16,
-        "cloud_vlm_latency_std": 0.05,
-        "cloud_vlm_latency_lower": 0.10,
-        "cloud_vlm_latency_upper": 0.25,
-        "action_decoder_latency_mean": 0.032,
-        "action_decoder_latency_std": 0.010,
-        "action_decoder_latency_lower": 0.020,
-        "action_decoder_latency_upper": 0.050,
-        "tokenizer_max_length": 52,
-        "response_max_tokens": 52,
         "proj_width": 1024,
         "num_steps": 10,
+        "init_strategy": "expert_only_he_init",
         "attention_implementation": "eager",
         "freeze_vision_encoder": true,
         "train_expert_only": true,
-        "train_state_proj": true,
+        "tokenizer_max_length": 256,
+        "discrete_action_max_length": 75,
         "optimizer_lr": 2.5e-05,
         "optimizer_betas": [
             0.9,
@@ -57,17 +48,16 @@
     "resume": false,
     "seed": 1000,
     "resolution": [224, 224],
-    "num_cams": 2,
-    "action_expert_num_cams": 1,
+    "num_cams": 1,
+    "action_expert_num_cams": 0,
     "max_state_dim": 32,
     "max_action_dim": 32,
     "action_chunk": 50,
-    "frozen_actions": 25,
-    "loss_weighting": {"MSE": 1, "CE": 1},
+    "loss_weighting": {"MSE": 10, "CE": 1},
     "num_workers": 4,
-    "batch_size": 2,
+    "batch_size": 1,
     "gradient_accumulation_steps": 1,
-    "dataloader_batch_size": 2,
+    "dataloader_batch_size": 1,
     "prefetch_factor": 8,
     "steps": 100,
     "log_freq": 1,
@@ -95,11 +85,10 @@
     },
     "wandb": {
         "enable": true,
-        "entity": "wyautox-autox",
-        "project": "tau0",
+        "project": "pi05",
         "run_id": null,
         "name": null,
-        "notes": "Dev config for pi0",
+        "notes": "Dev config for pi05",
         "tags": [],
         "group": null,
         "job_type": null,
