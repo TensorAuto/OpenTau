@@ -31,7 +31,6 @@ from opentau.policies.factory import (
 )
 from opentau.policies.normalize import Normalize, Unnormalize
 from opentau.policies.pretrained import PreTrainedPolicy
-from opentau.policies.tau0.modeling_tau0 import TAU0Policy
 from opentau.policies.value.reward import (
     calculate_n_step_return,
     calculate_return_bins_with_equal_width,
@@ -44,7 +43,7 @@ from tests.utils import generic_equal, require_x86_64_kernel
 
 
 @pytest.mark.slow  # ~ 2 min
-@pytest.mark.parametrize("policy_name", ["tau0"])
+@pytest.mark.parametrize("policy_name", ["pi0"])
 @pytest.mark.gpu
 def test_save_and_load_pretrained(dummy_dataset_metadata, tmp_path, policy_name: str):
     policy_cls = get_policy_class(policy_name)
@@ -75,65 +74,10 @@ def test_get_policy_and_config_classes(policy_name: str):
     )
 
 
-@pytest.mark.slow  # ~ 1.5 min
-@pytest.mark.skip(
-    reason="Slow and too similar to test_tau0::TestTAU0Integration::test_complete_tau0_pipeline_integration"
-)
-@pytest.mark.gpu
-def test_tau0(
-    mixture: WeightedDatasetMixture, tau0: TAU0Policy, device: str, tau0_training_config: TrainPipelineConfig
-):
-    """
-    Tests:
-        - Making the policy object.
-        - Checking that the policy follows the correct protocol and subclasses nn.Module
-            and PyTorchModelHubMixin.
-        - Updating the policy.
-        - Using the policy to select actions at inference time.
-        - Test the action can be applied to the policy
-
-    Note: We test various combinations of policy and dataset. The combinations are by no means exhaustive,
-          and for now we add tests as we see fit.
-    """
-    assert isinstance(tau0, PreTrainedPolicy)
-    dataloader = mixture.get_dataloader()
-    dl_iter = cycle(dataloader)
-
-    batch = next(dl_iter)
-
-    batch = {
-        key: value.to(device, non_blocking=True) if isinstance(value, torch.Tensor) else value
-        for key, value in batch.items()
-    }
-    batch["camera1"] = batch["camera0"]  # HACK: tau0_training_config expects 2 cameras
-
-    # Test updating the policy (and test that it does not mutate the batch)
-    batch_ = deepcopy(batch)
-    loss = tau0.forward(batch)
-    assert isinstance(loss, dict) and set(loss) == {"CE", "MSE"}, (
-        f"Loss should be a dict with 'CE' and 'MSE' keys, got {loss}"
-    )
-    assert all(v.isfinite() for v in loss.values()), "Loss contains NaN or Inf values."
-    assert generic_equal(batch, batch_), "Batch is modified after a forward pass."
-
-    # reset the policy and environment
-    tau0.reset()
-
-    observation = create_dummy_observation(tau0_training_config, device)
-    observation["camera1"] = observation["camera0"]  # HACK: tau0_training_config expects 2 cameras
-
-    # get the next action for the environment (also check that the observation batch is not modified)
-    observation_ = deepcopy(observation)
-    with torch.inference_mode():
-        action = tau0.select_action(observation).cpu().numpy()
-        assert action.shape == (1, tau0_training_config.policy.max_action_dim)
-    assert generic_equal(observation, observation_), "Observation batch is modified after a forward pass."
-
-
 @pytest.mark.skip(reason="Slow and we do not really use policy defaults")
 @pytest.mark.gpu
 @pytest.mark.slow  # ~ 1 min
-@pytest.mark.parametrize("policy_name", ["tau0"])
+@pytest.mark.parametrize("policy_name", ["pi0"])
 def test_policy_defaults(dummy_dataset_metadata, policy_name: str):
     """Check that the policy can be instantiated with defaults."""
     policy_cls = get_policy_class(policy_name)
@@ -270,31 +214,9 @@ def test_normalize(insert_temporal_dim, capsys):
     [
         pytest.param(
             "lerobot/droid_100",
-            "tau0",
+            "pi0",
             {"chunk_size": 50, "pretrained_path": "lerobot/pi0"},
             "pretrained",
-            marks=pytest.mark.skip(reason="Slow"),
-        ),
-        pytest.param(
-            "lerobot/droid_100",
-            "tau0",
-            {"chunk_size": 50, "init_strategy": "expert_only_he_init"},
-            "expert_only_he_init",
-            marks=pytest.mark.skip(reason="Slow"),
-        ),
-        pytest.param(
-            "lerobot/droid_100", "tau0", {"chunk_size": 50}, "he_init", marks=pytest.mark.skip(reason="Slow")
-        ),
-        pytest.param(
-            "lerobot/droid_100",
-            "tau0",
-            {
-                "chunk_size": 50,
-                "pretrained_path": "lerobot/pi0",
-                "action_expert_num_cams": 0,
-                "use_cache_layer": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
-            },
-            "mimic_pi0",
             marks=pytest.mark.skip(reason="Slow"),
         ),
     ],

@@ -99,25 +99,7 @@ def save_policy_to_safetensors(output_dir: Path, ds_repo_id: str, policy_name: s
 
 if __name__ == "__main__":
     artifacts_cfg = [
-        ("lerobot/droid_100", "tau0", {"chunk_size": 50, "pretrained_path": "lerobot/pi0"}, "pretrained"),
-        (
-            "lerobot/droid_100",
-            "tau0",
-            {"chunk_size": 50, "init_strategy": "expert_only_he_init"},
-            "expert_only_he_init",
-        ),
-        ("lerobot/droid_100", "tau0", {"chunk_size": 50}, "he_init"),
-        (
-            "lerobot/droid_100",
-            "tau0",
-            {
-                "chunk_size": 50,
-                "pretrained_path": "lerobot/pi0",
-                "action_expert_num_cams": 0,
-                "use_cache_layer": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
-            },
-            "mimic_pi0",
-        ),
+        ("lerobot/droid_100", "pi0", {"chunk_size": 50, "pretrained_path": "lerobot/pi0"}, "pretrained")
     ]
     if len(artifacts_cfg) == 0:
         raise RuntimeError("No policies were provided!")

@@ -14,5 +14,4 @@
 
 from .pi0.configuration_pi0 import PI0Config as PI0Config
 from .pi05.configuration_pi05 import PI05Config as PI05Config
-from .tau0.configuration_tau0 import TAU0Config as TAU0Config
 from .value.configuration_value import ValueConfig as ValueConfig

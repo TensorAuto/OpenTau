@@ -13,7 +13,8 @@ from transformers import AutoTokenizer, PreTrainedTokenizer
 from opentau.datasets.factory import make_dataset_mixture
 from opentau.datasets.lerobot_dataset import BaseDataset
 from opentau.policies.factory import get_policy_class
-from opentau.policies.tau0.modeling_tau0 import TAU0Policy
+from opentau.policies.pi0.modeling_pi0 import PI0Policy
+from opentau.policies.pi05.modeling_pi05 import PI05Policy
 from opentau.configs import parser
 from opentau.configs.train import TrainPipelineConfig
 
@@ -35,7 +36,7 @@ def get_tokenizer(cfg: TrainPipelineConfig) -> callable:
     policy_class = get_policy_class(cfg.policy.type)
 
     # TODO: Add `elif` for other policy types if needed
-    if issubclass(policy_class, TAU0Policy):
+    if issubclass(policy_class, PI0Policy) or issubclass(policy_class, PI05Policy):
         return AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
 
     raise ValueError(f"Unsupported policy type: {cfg.policy.type}")

@@ -299,59 +299,6 @@ def test_resolve_delta_timestamps_with_reward_action_features(
     assert "action" not in feature2group
 
 
-@patch("opentau.policies.tau0.configuration_tau0.TAU0Config.action_delta_indices", [0, 1, 2, 3])
-@patch("opentau.policies.tau0.configuration_tau0.TAU0Config.reward_delta_indices", [0, 1, 2])
-def test_resolve_delta_timestamps_with_delta_indices(
-    train_pipeline_config, dataset_config, lerobot_dataset_metadata
-):
-    """Test that reward and action features are handled correctly when delta indices are set."""
-    # Add reward and action features to the metadata
-    lerobot_dataset_metadata.features = {
-        "next.reward": {"dtype": "float32", "shape": [1]},
-        "actions": {"dtype": "float32", "shape": [7]},
-    }
-
-    delta_params, feature2group = resolve_delta_timestamps(
-        train_pipeline_config, dataset_config, lerobot_dataset_metadata
-    )
-    delta_timestamps, _, _, _ = delta_params
-
-    # Check actions feature
-    assert "actions" in delta_timestamps
-    assert "actions" in feature2group
-
-    # Check values are calculated correctly (indices / action_freq)
-    expected_action_timestamps = [0 / 30.0, 1 / 30.0, 2 / 30.0, 3 / 30.0]  # [0, 1, 2, 3] / 30.0
-    assert delta_timestamps["actions"] == expected_action_timestamps
-    assert feature2group["actions"] == ("actions", None)
-
-
-@patch("opentau.policies.tau0.configuration_tau0.TAU0Config.action_delta_indices", [0, 1, 2, 3])
-@patch("opentau.policies.tau0.configuration_tau0.TAU0Config.reward_delta_indices", [0, 1, 2])
-def test_resolve_delta_timestamps_different_action_freq(
-    train_pipeline_config, dataset_config, lerobot_dataset_metadata
-):
-    """Test that different action frequencies are handled correctly."""
-    # Add reward and action features to the metadata
-    lerobot_dataset_metadata.features = {
-        "next.reward": {"dtype": "float32", "shape": [1]},
-        "actions": {"dtype": "float32", "shape": [7]},
-    }
-
-    # Change action_freq to 60.0
-    train_pipeline_config.dataset_mixture.action_freq = 60.0
-
-    delta_params, _ = resolve_delta_timestamps(
-        train_pipeline_config, dataset_config, lerobot_dataset_metadata
-    )
-    delta_timestamps, _, _, _ = delta_params
-
-    # Check that timestamps are calculated with new action_freq
-    expected_action_timestamps = [0 / 60.0, 1 / 60.0, 2 / 60.0, 3 / 60.0]  # [0, 1, 2, 3] / 60.0
-
-    assert delta_timestamps["actions"] == expected_action_timestamps
-
-
 def test_resolve_delta_timestamps_empty_features(train_pipeline_config, dataset_config):
     """Test behavior with empty features."""
     metadata = MagicMock()

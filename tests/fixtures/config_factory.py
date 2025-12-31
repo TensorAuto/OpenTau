@@ -1,7 +1,7 @@
 import pytest
 
 from opentau.datasets.transforms import ImageTransformsConfig
-from opentau.policies.tau0.configuration_tau0 import TAU0Config
+from opentau.policies.pi0.configuration_pi0 import PI0Config
 from opentau.configs.default import DatasetConfig, DatasetMixtureConfig
 from opentau.configs.train import TrainPipelineConfig
 
@@ -17,7 +17,7 @@ def transforms_config():
 @pytest.fixture
 def policy_config():
     """Return a mock PolicyConfig object with minimal required attributes."""
-    return TAU0Config()
+    return PI0Config()
 
 
 @pytest.fixture

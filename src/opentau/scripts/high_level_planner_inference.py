@@ -64,7 +64,7 @@ def inference_main(cfg: TrainPipelineConfig):
     policy.reset()
 
     for i in range(5):
-        # create dummy observation for tau0
+        # create dummy observation for pi05
         camera_observations = {
             f"camera{i}": torch.zeros((1, 3, *cfg.resolution), dtype=torch.bfloat16, device=device)
             for i in range(cfg.num_cams)

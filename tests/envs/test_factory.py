@@ -18,7 +18,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from opentau.envs.configs import LiberoEnv, MetaworldEnv
+from opentau.envs.configs import LiberoEnv
 from opentau.envs.factory import make_env_config, make_envs
 from opentau.configs.train import TrainPipelineConfig
 

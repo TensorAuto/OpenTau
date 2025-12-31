@@ -52,24 +52,6 @@ def test_validate_with_policy_param(policy_config, dataset_mixture_config, tmp_p
     cfg.validate()
 
 
-def test_validate_without_job_output(policy_config, dataset_mixture_config):
-    """
-    Tests if validate works without job name and output dir
-    """
-
-    cfg = TrainPipelineConfig(
-        dataset_mixture=dataset_mixture_config,
-        policy=policy_config,
-        seed=42,
-        batch_size=8,
-        use_policy_training_preset=True,
-    )
-
-    cfg.validate()
-
-    assert cfg.job_name == "tau0"
-
-
 def test_validate_file_exits(dataset_mixture_config, policy_config, tmp_path):
     """
     Tests if validate raises FileExistsError when empty policy is passed

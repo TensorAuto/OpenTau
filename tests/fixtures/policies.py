@@ -5,7 +5,6 @@ from opentau.datasets.dataset_mixture import WeightedDatasetMixture
 from opentau.datasets.factory import make_dataset_mixture
 from opentau.datasets.utils import dataset_to_policy_features
 from opentau.policies.factory import make_policy, make_policy_config
-from opentau.policies.tau0.modeling_tau0 import TAU0Policy
 from opentau.utils.fake_tensor import FakeTensorContext
 from opentau.configs.default import DatasetConfig
 from opentau.configs.reward import RewardConfig
@@ -41,50 +40,6 @@ def dummy_dataset_metadata(lerobot_dataset_metadata_factory, info_factory, tmp_p
     )
     ds_meta = lerobot_dataset_metadata_factory(root=tmp_path / "init", info=info)
     return ds_meta
-
-
-@pytest.fixture
-def tau0_training_config(train_pipeline_config: TrainPipelineConfig) -> TrainPipelineConfig:
-    cfg = train_pipeline_config
-    cfg.policy = make_policy_config(
-        "tau0",
-        max_state_dim=cfg.max_state_dim,
-        max_action_dim=cfg.max_action_dim,
-    )
-    cfg.dataset_mixture.datasets = [
-        DatasetConfig(repo_id="lerobot/droid_100", episodes=[0]),
-        DatasetConfig(grounding="clevr"),
-    ]
-    cfg.dataset_mixture.weights = [1.0, 1.0]
-    cfg.resolution = (224, 224)
-    ds_meta_features = {
-        "state": {
-            "shape": (cfg.max_state_dim,),
-            "dtype": "float32",
-        },
-        "actions": {
-            "shape": (cfg.action_chunk, cfg.max_action_dim),
-            "dtype": "float32",
-        },
-        "camera0": {
-            "shape": (3, 224, 224),
-            "dtype": "image",
-        },
-        "camera1": {
-            "shape": (3, 224, 224),
-            "dtype": "image",
-        },
-        "local_camera0": {
-            "shape": (3, 224, 224),
-            "dtype": "image",
-        },
-    }
-    features = dataset_to_policy_features(ds_meta_features)
-    cfg.policy.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
-    cfg.policy.input_features = {
-        key: ft for key, ft in features.items() if key not in cfg.policy.output_features
-    }
-    return cfg
 
 
 @pytest.fixture
@@ -193,26 +148,6 @@ def pi05_training_config(train_pipeline_config: TrainPipelineConfig) -> TrainPip
 
 
 @pytest.fixture
-def mixture(tau0_training_config: TrainPipelineConfig) -> WeightedDatasetMixture:
-    return make_dataset_mixture(tau0_training_config)
+def mixture(pi05_training_config: TrainPipelineConfig) -> WeightedDatasetMixture:
+    return make_dataset_mixture(pi05_training_config)
 
-
-# noinspection PyTypeChecker
-@pytest.fixture
-def tau0(
-    tau0_training_config: TrainPipelineConfig, mixture: WeightedDatasetMixture, device: str
-) -> TAU0Policy:
-    policy = make_policy(tau0_training_config.policy, ds_meta=mixture.meta)
-    policy = policy.to(device, dtype=torch.bfloat16)
-    return policy
-
-
-# noinspection PyTypeChecker
-@pytest.fixture
-def fake_tensor_tau0(
-    tau0_training_config: TrainPipelineConfig, mixture: WeightedDatasetMixture
-) -> TAU0Policy:
-    with FakeTensorContext():
-        policy = make_policy(tau0_training_config.policy, ds_meta=mixture.meta)
-        policy = policy.to("cpu", dtype=torch.bfloat16)
-        return policy
