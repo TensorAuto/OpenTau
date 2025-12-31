@@ -23,7 +23,7 @@ import numpy
 import PIL
 import torch
 
-from src.opentau.datasets.video_utils import encode_video_frames
+from opentau.datasets.video_utils import encode_video_frames
 
 
 def concatenate_episodes(ep_dicts):

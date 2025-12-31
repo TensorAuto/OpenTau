@@ -47,12 +47,12 @@ except ImportError:
     HAS_TORCH = False
 
 try:
-    import src.opentau
+    import opentau
 except ImportError:
     HAS_OPENTAU = False
 
 
-opentau_version = src.opentau.__version__ if HAS_OPENTAU else "N/A"
+opentau_version = opentau.__version__ if HAS_OPENTAU else "N/A"
 hf_hub_version = huggingface_hub.__version__ if HAS_HF_HUB else "N/A"
 hf_datasets_version = datasets.__version__ if HAS_HF_DATASETS else "N/A"
 np_version = np.__version__ if HAS_NP else "N/A"

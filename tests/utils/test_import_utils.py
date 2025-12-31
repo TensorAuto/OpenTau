@@ -1,7 +1,7 @@
 import importlib
 from unittest.mock import MagicMock, patch
 
-from src.opentau.utils.import_utils import is_package_available
+from opentau.utils.import_utils import is_package_available
 
 
 def test_package_available_standard():

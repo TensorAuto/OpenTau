@@ -19,10 +19,10 @@ from pathlib import Path
 from datasets import get_dataset_config_info
 from huggingface_hub import HfApi
 
-from src.opentau import available_datasets
-from src.opentau.datasets.lerobot_dataset import LeRobotDatasetMetadata
-from src.opentau.datasets.utils import INFO_PATH, write_info
-from src.opentau.datasets.v21.convert_dataset_v20_to_v21 import V20, SuppressWarnings
+from opentau import available_datasets
+from opentau.datasets.lerobot_dataset import LeRobotDatasetMetadata
+from opentau.datasets.utils import INFO_PATH, write_info
+from opentau.datasets.v21.convert_dataset_v20_to_v21 import V20, SuppressWarnings
 
 LOCAL_DIR = Path("data/")
 

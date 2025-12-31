@@ -18,7 +18,7 @@ from typing import Any
 
 import pytest
 
-from src.opentau.utils.io_utils import deserialize_json_into_object, write_video
+from opentau.utils.io_utils import deserialize_json_into_object, write_video
 
 
 def create_temp_json(tmp_path: Path, data: Any) -> Path:

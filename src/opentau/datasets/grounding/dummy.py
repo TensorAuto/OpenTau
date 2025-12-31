@@ -1,8 +1,8 @@
 import torch
 
-from src.opentau import register_grounding_dataset
-from src.opentau.datasets.grounding.base import GroundingDataset
-from src.opentau.configs.train import TrainPipelineConfig
+from opentau import register_grounding_dataset
+from opentau.datasets.grounding.base import GroundingDataset
+from opentau.configs.train import TrainPipelineConfig
 
 _data = [
     {

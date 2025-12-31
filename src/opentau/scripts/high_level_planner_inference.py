@@ -7,14 +7,14 @@ from pprint import pformat
 import torch
 from dotenv import load_dotenv
 
-from src.opentau.planner import HighLevelPlanner, Memory
-from src.opentau.policies.factory import get_policy_class
-from src.opentau.utils.random_utils import set_seed
-from src.opentau.utils.utils import (
+from opentau.planner import HighLevelPlanner, Memory
+from opentau.policies.factory import get_policy_class
+from opentau.utils.random_utils import set_seed
+from opentau.utils.utils import (
     init_logging,
 )
-from src.opentau.configs import parser
-from src.opentau.configs.train import TrainPipelineConfig
+from opentau.configs import parser
+from opentau.configs.train import TrainPipelineConfig
 
 load_dotenv()
 

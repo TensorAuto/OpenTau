@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from src.opentau.policies.value.modeling_value import ValueFunction
+from opentau.policies.value.modeling_value import ValueFunction
 
 
 class TestValueFunctionIntegration:

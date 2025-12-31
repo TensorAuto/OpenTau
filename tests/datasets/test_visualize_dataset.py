@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from src.opentau.scripts.visualize_dataset_html import visualize_dataset_html
+from opentau.scripts.visualize_dataset_html import visualize_dataset_html
 
 
 def test_visualize_local_dataset(tmp_path, lerobot_dataset_factory):

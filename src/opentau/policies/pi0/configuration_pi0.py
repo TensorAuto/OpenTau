@@ -15,12 +15,12 @@ import logging
 from dataclasses import dataclass, field
 from typing import Literal
 
-from src.opentau.optim.optimizers import AdamWConfig
-from src.opentau.optim.schedulers import (
+from opentau.optim.optimizers import AdamWConfig
+from opentau.optim.schedulers import (
     CosineDecayWithWarmupSchedulerConfig,
 )
-from src.opentau.configs.policies import PreTrainedConfig
-from src.opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
+from opentau.configs.policies import PreTrainedConfig
+from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
 
 
 @PreTrainedConfig.register_subclass("pi0")

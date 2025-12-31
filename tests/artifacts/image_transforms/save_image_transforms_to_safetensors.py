@@ -18,14 +18,14 @@ from pathlib import Path
 import torch
 from safetensors.torch import save_file
 
-from src.opentau.datasets.lerobot_dataset import LeRobotDataset
-from src.opentau.datasets.transforms import (
+from opentau.datasets.lerobot_dataset import LeRobotDataset
+from opentau.datasets.transforms import (
     ImageTransformConfig,
     ImageTransforms,
     ImageTransformsConfig,
     make_transform_from_config,
 )
-from src.opentau.utils.random_utils import seeded_context
+from opentau.utils.random_utils import seeded_context
 
 ARTIFACT_DIR = Path("tests/artifacts/image_transforms")
 DATASET_REPO_ID = "lerobot/droid_100"
@@ -67,9 +67,9 @@ def main():
     # Construct a minimal TrainPipelineConfig for the dataset
     from dataclasses import dataclass
 
-    from src.opentau.configs.default import DatasetConfig, DatasetMixtureConfig
-    from src.opentau.configs.policies import PreTrainedConfig
-    from src.opentau.configs.train import TrainPipelineConfig
+    from opentau.configs.default import DatasetConfig, DatasetMixtureConfig
+    from opentau.configs.policies import PreTrainedConfig
+    from opentau.configs.train import TrainPipelineConfig
 
     # Minimal dummy PreTrainedConfig implementation for testing
     @dataclass

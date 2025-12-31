@@ -10,15 +10,15 @@ import numpy as np
 import onnxruntime as ort
 import torch
 
-from src.opentau.policies.factory import get_policy_class
-from src.opentau.utils.random_utils import set_seed
-from src.opentau.utils.utils import (
+from opentau.policies.factory import get_policy_class
+from opentau.utils.random_utils import set_seed
+from opentau.utils.utils import (
     attempt_torch_compile,
     auto_torch_device,
     init_logging,
 )
-from src.opentau.configs import parser
-from src.opentau.configs.train import TrainPipelineConfig
+from opentau.configs import parser
+from opentau.configs.train import TrainPipelineConfig
 
 
 class ActionInferenceWrapper:

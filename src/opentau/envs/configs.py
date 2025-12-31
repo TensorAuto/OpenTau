@@ -19,9 +19,9 @@ from dataclasses import dataclass, field
 
 import draccus
 
-from src.opentau.constants import ACTION, OBS_IMAGES, OBS_STATE
-from src.opentau.utils.accelerate_utils import get_proc_accelerator
-from src.opentau.configs.types import FeatureType, PolicyFeature
+from opentau.constants import ACTION, OBS_IMAGES, OBS_STATE
+from opentau.utils.accelerate_utils import get_proc_accelerator
+from opentau.configs.types import FeatureType, PolicyFeature
 
 
 @dataclass
@@ -48,7 +48,7 @@ class EnvConfig(draccus.ChoiceRegistry, abc.ABC):
 @EnvConfig.register_subclass("metaworld")
 @dataclass
 class MetaworldEnv(EnvConfig):
-    import_name: str = "src.opentau.envs.metaworld"
+    import_name: str = "opentau.envs.metaworld"
     make_id: str = "Metaworld"
     task: str = "Meta-World/MT1"
     env_name: str = "button-press-v3"
@@ -123,7 +123,7 @@ class LiberoEnv(EnvConfig):
             task_ids = {suite: copy(self.task_ids) for suite in suite_names}
             logging.info(f"[LIBERO environment] No accelerator found, using {task_ids=}.")
         else:
-            from src.opentau.envs.libero import _get_suite
+            from opentau.envs.libero import _get_suite
 
             task_ids = {
                 suite: _get_suite(suite).tasks if self.task_ids is None else self.task_ids

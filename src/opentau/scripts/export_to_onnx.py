@@ -3,16 +3,16 @@ from pathlib import Path
 
 import torch
 
-from src.opentau.policies.factory import get_policy_class
-from src.opentau.policies.tau0.modeling_tau0 import TAU0Policy
-from src.opentau.utils.monkey_patch import (
+from opentau.policies.factory import get_policy_class
+from opentau.policies.tau0.modeling_tau0 import TAU0Policy
+from opentau.utils.monkey_patch import (
     torch_cumsum_patch,
     torch_full_patch,
     torch_pow_patch,
 )
-from src.opentau.utils.utils import auto_torch_device
-from src.opentau.configs import parser
-from src.opentau.configs.train import TrainPipelineConfig
+from opentau.utils.utils import auto_torch_device
+from opentau.configs import parser
+from opentau.configs.train import TrainPipelineConfig
 
 # Some patches are necessary only for dynamo export, which has current upstream bugs.
 # Nonetheless, we apply them here to ensure future compatibility.

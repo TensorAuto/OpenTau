@@ -27,9 +27,9 @@ from safetensors.torch import load_model as load_model_as_safetensor
 from safetensors.torch import save_model as save_model_as_safetensor
 from torch import Tensor, nn
 
-from src.opentau.policies.utils import log_model_loading_keys
-from src.opentau.utils.hub import HubMixin
-from src.opentau.configs.policies import PreTrainedConfig
+from opentau.policies.utils import log_model_loading_keys
+from opentau.utils.hub import HubMixin
+from opentau.configs.policies import PreTrainedConfig
 
 T = TypeVar("T", bound="PreTrainedPolicy")
 

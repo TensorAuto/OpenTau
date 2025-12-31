@@ -8,7 +8,7 @@
 ## AutoX Installation
 Download the source code:
 ```bash
-$ git clone git@code.autox.ds:xisp/agi/src.opentau.git
+$ git clone git@code.autox.ds:xisp/agi/opentau.git
 $ cd lerobot
 ```
 
@@ -207,10 +207,10 @@ In this dataset mixture, all `response`s have a length of 1, all `prompt`s have 
 
 ## AgiBot dataset
 
-A clone of the [`agibot-world/AgiBotWorld-Alpha`](https://huggingface.co/datasets/agibot-world/AgiBotWorld-Alpha/blob/main/scripts/convert_to_src.opentau.py) dataset is provided at `/autox/teams/project-bot/AgiBotWorld-Alpha`. You can use the script `lerobot/scripts/agibot_to_src.opentau.py ` to convert it to lerobot format, saved in a given directory. For example
+A clone of the [`agibot-world/AgiBotWorld-Alpha`](https://huggingface.co/datasets/agibot-world/AgiBotWorld-Alpha/blob/main/scripts/convert_to_opentau.py) dataset is provided at `/autox/teams/project-bot/AgiBotWorld-Alpha`. You can use the script `lerobot/scripts/agibot_to_opentau.py ` to convert it to lerobot format, saved in a given directory. For example
 
 ```bash
-$ python3 lerobot/scripts/agibot_to_src.opentau.py --src_path /autox/teams/project-bot/AgiBotWorld-Alpha --tgt_path <path> --task_id 327
+$ python3 lerobot/scripts/agibot_to_opentau.py --src_path /autox/teams/project-bot/AgiBotWorld-Alpha --tgt_path <path> --task_id 327
 ```
 
 ## Running the GitLab CI server
@@ -371,7 +371,7 @@ After successfully executing the above command, the pre-commit checks will autom
 To run high level planner with gpt4o, OpenAI api key is needed to be set. Create an .env file under lerobot directory and set the variable `OPENAI_API_KEY` to your openai api key. The high level planner inference script will automatically load the api key and pass to openai client.
 
 # Using so100_visualization script
-The so100_visualization script imitates action from src.opentau format dataset in simulator. To, run bi-so100-block-manipulator dataset, pull the data from git lfs and move it under lerobot/lerobot directory. Install the simulator using
+The so100_visualization script imitates action from opentau format dataset in simulator. To, run bi-so100-block-manipulator dataset, pull the data from git lfs and move it under lerobot/lerobot directory. Install the simulator using
 ```bash
 $ uv sync --extra tau0 --extra pusht --extra test --extra video_benchmark --extra accelerate --extra dev --extra feetech --extra openai --extra onnx --extra smolvla --extra so100
 $ source .venv/bin/activate
@@ -479,7 +479,7 @@ python lerobot/scripts/so100_visualization.py --config_path=configs/so100/so100_
 
 Download our source code:
 ```bash
-git clone https://github.com/huggingface/src.opentau.git
+git clone https://github.com/huggingface/opentau.git
 cd lerobot
 ```
 

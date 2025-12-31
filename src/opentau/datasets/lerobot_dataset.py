@@ -36,11 +36,11 @@ from huggingface_hub.errors import RevisionNotFoundError
 
 import datasets
 from datasets import concatenate_datasets, load_dataset
-from src.opentau.constants import HF_OPENTAU_HOME
-from src.opentau.datasets.compute_stats import aggregate_stats, compute_episode_stats
-from src.opentau.datasets.image_writer import AsyncImageWriter, write_image
-from src.opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING, LOSS_TYPE_MAPPING
-from src.opentau.datasets.utils import (
+from opentau.constants import HF_OPENTAU_HOME
+from opentau.datasets.compute_stats import aggregate_stats, compute_episode_stats
+from opentau.datasets.image_writer import AsyncImageWriter, write_image
+from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING, LOSS_TYPE_MAPPING
+from opentau.datasets.utils import (
     DEFAULT_FEATURES,
     DEFAULT_IMAGE_PATH,
     INFO_PATH,
@@ -71,18 +71,18 @@ from src.opentau.datasets.utils import (
     write_info,
     write_json,
 )
-from src.opentau.datasets.video_utils import (
+from opentau.datasets.video_utils import (
     decode_video_frames,
     encode_video_frames,
     get_safe_default_codec,
     get_video_info,
 )
-from src.opentau.policies.value.configuration_value import ValueConfig
-from src.opentau.policies.value.reward import (
+from opentau.policies.value.configuration_value import ValueConfig
+from opentau.policies.value.reward import (
     calculate_return_bins_with_equal_width,
 )
-from src.opentau.utils.utils import on_accelerate_main_proc
-from src.opentau.configs.train import TrainPipelineConfig
+from opentau.utils.utils import on_accelerate_main_proc
+from opentau.configs.train import TrainPipelineConfig
 
 
 def retry_random_on_failure(f):

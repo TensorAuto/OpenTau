@@ -22,9 +22,9 @@ import draccus
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR, LRScheduler
 
-from src.opentau.constants import SCHEDULER_STATE
-from src.opentau.datasets.utils import write_json
-from src.opentau.utils.io_utils import deserialize_json_into_object
+from opentau.constants import SCHEDULER_STATE
+from opentau.datasets.utils import write_json
+from opentau.utils.io_utils import deserialize_json_into_object
 
 
 @dataclass

@@ -17,22 +17,22 @@
 import numpy as np
 
 # NOTE: Don't delete; imported for side effects.
-import src.opentau.datasets.grounding.clevr  # noqa: F401
-import src.opentau.datasets.grounding.cocoqa  # noqa: F401
-import src.opentau.datasets.grounding.dummy  # noqa: F401
-import src.opentau.datasets.grounding.pixmo  # noqa: F401
-import src.opentau.datasets.grounding.vsr  # noqa: F401
-from src.opentau import available_grounding_datasets
-from src.opentau.datasets.dataset_mixture import WeightedDatasetMixture
-from src.opentau.datasets.lerobot_dataset import (
+import opentau.datasets.grounding.clevr  # noqa: F401
+import opentau.datasets.grounding.cocoqa  # noqa: F401
+import opentau.datasets.grounding.dummy  # noqa: F401
+import opentau.datasets.grounding.pixmo  # noqa: F401
+import opentau.datasets.grounding.vsr  # noqa: F401
+from opentau import available_grounding_datasets
+from opentau.datasets.dataset_mixture import WeightedDatasetMixture
+from opentau.datasets.lerobot_dataset import (
     BaseDataset,
     LeRobotDataset,
     LeRobotDatasetMetadata,
 )
-from src.opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
-from src.opentau.datasets.transforms import ImageTransforms
-from src.opentau.configs.default import DatasetConfig
-from src.opentau.configs.train import TrainPipelineConfig
+from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
+from opentau.datasets.transforms import ImageTransforms
+from opentau.configs.default import DatasetConfig
+from opentau.configs.train import TrainPipelineConfig
 
 IMAGENET_STATS = {
     "min": [[[0.0]], [[0.0]], [[0.0]]],  # (c,1,1)

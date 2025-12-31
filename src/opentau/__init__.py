@@ -19,17 +19,17 @@ We do not want to import all the dependencies, but instead we keep it lightweigh
 
 Example:
     ```python
-        import src.opentau
-        print(src.opentau.available_envs)
-        print(src.opentau.available_tasks_per_env)
-        print(src.opentau.available_datasets)
-        print(src.opentau.available_datasets_per_env)
-        print(src.opentau.available_real_world_datasets)
-        print(src.opentau.available_policies)
-        print(src.opentau.available_policies_per_env)
-        print(src.opentau.available_robots)
-        print(src.opentau.available_cameras)
-        print(src.opentau.available_motors)
+        import opentau
+        print(opentau.available_envs)
+        print(opentau.available_tasks_per_env)
+        print(opentau.available_datasets)
+        print(opentau.available_datasets_per_env)
+        print(opentau.available_real_world_datasets)
+        print(opentau.available_policies)
+        print(opentau.available_policies_per_env)
+        print(opentau.available_robots)
+        print(opentau.available_cameras)
+        print(opentau.available_motors)
     ```
 
 When implementing a new dataset loadable with LeRobotDataset follow these steps:
@@ -46,7 +46,7 @@ When implementing a new policy class (e.g. `DiffusionPolicy`) follow these steps
 
 import itertools
 
-from src.opentau.__version__ import __version__  # noqa: F401
+from opentau.__version__ import __version__  # noqa: F401
 
 # TODO(rcadene): Improve policies and envs. As of now, an item in `available_policies`
 # refers to a yaml file AND a modeling name. Same for `available_envs` which refers to

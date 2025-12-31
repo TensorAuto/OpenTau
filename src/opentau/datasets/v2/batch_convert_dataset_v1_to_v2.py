@@ -25,9 +25,9 @@ import traceback
 from pathlib import Path
 from textwrap import dedent
 
-from src.opentau import available_datasets
-from src.opentau.datasets.v2.convert_dataset_v1_to_v2 import convert_dataset
-from src.opentau.robot_devices.robots.configs import AlohaRobotConfig
+from opentau import available_datasets
+from opentau.datasets.v2.convert_dataset_v1_to_v2 import convert_dataset
+from opentau.robot_devices.robots.configs import AlohaRobotConfig
 
 LOCAL_DIR = Path("data/")
 

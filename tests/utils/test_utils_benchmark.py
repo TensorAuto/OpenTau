@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 import pytest
 
-from src.opentau.utils.benchmark import TimeBenchmark
+from opentau.utils.benchmark import TimeBenchmark
 
 
 def test_context_manager_usage():

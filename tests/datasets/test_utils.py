@@ -18,8 +18,8 @@ import torch
 from datasets import Dataset
 from huggingface_hub import DatasetCard
 
-from src.opentau.datasets.push_dataset_to_hub.utils import calculate_episode_data_index
-from src.opentau.datasets.utils import create_lerobot_dataset_card, hf_transform_to_torch
+from opentau.datasets.push_dataset_to_hub.utils import calculate_episode_data_index
+from opentau.datasets.utils import create_lerobot_dataset_card, hf_transform_to_torch
 
 
 def test_default_parameters():

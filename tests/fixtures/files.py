@@ -20,7 +20,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
 
-from src.opentau.datasets.utils import (
+from opentau.datasets.utils import (
     EPISODES_PATH,
     EPISODES_STATS_PATH,
     INFO_PATH,

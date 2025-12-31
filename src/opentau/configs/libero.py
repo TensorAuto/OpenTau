@@ -3,8 +3,8 @@ from dataclasses import dataclass
 
 from libero.libero import benchmark, get_libero_path
 
-from src.opentau.utils.monkey_patch import torch_load_patch
-from src.opentau.configs.train import TrainPipelineConfig
+from opentau.utils.monkey_patch import torch_load_patch
+from opentau.configs.train import TrainPipelineConfig
 
 LIBERO_BENCHMARK_DICT = benchmark.get_benchmark_dict()
 

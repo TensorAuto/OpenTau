@@ -15,9 +15,9 @@
 # limitations under the License.
 from datasets import Dataset
 
-from src.opentau.datasets.push_dataset_to_hub.utils import calculate_episode_data_index
-from src.opentau.datasets.sampler import EpisodeAwareSampler
-from src.opentau.datasets.utils import (
+from opentau.datasets.push_dataset_to_hub.utils import calculate_episode_data_index
+from opentau.datasets.sampler import EpisodeAwareSampler
+from opentau.datasets.utils import (
     hf_transform_to_torch,
 )
 

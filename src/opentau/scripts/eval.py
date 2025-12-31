@@ -73,26 +73,26 @@ from termcolor import colored
 from torch import nn
 from tqdm import trange
 
-from src.opentau.envs.factory import make_envs
-from src.opentau.envs.utils import (
+from opentau.envs.factory import make_envs
+from opentau.envs.utils import (
     add_envs_task,
     check_env_attributes_and_types,
     close_envs,
     preprocess_observation,
 )
-from src.opentau.policies.factory import make_policy
-from src.opentau.policies.pretrained import PreTrainedPolicy
-from src.opentau.utils.accelerate_utils import acc_print, get_proc_accelerator, set_proc_accelerator
-from src.opentau.utils.io_utils import write_video
-from src.opentau.utils.libero_dataset_recorder import aggregate_task_results, consolidate_task_result
-from src.opentau.utils.random_utils import set_seed
-from src.opentau.utils.utils import (
+from opentau.policies.factory import make_policy
+from opentau.policies.pretrained import PreTrainedPolicy
+from opentau.utils.accelerate_utils import acc_print, get_proc_accelerator, set_proc_accelerator
+from opentau.utils.io_utils import write_video
+from opentau.utils.libero_dataset_recorder import aggregate_task_results, consolidate_task_result
+from opentau.utils.random_utils import set_seed
+from opentau.utils.utils import (
     init_logging,
     inside_slurm,
     is_launched_with_accelerate,
 )
-from src.opentau.configs import parser
-from src.opentau.configs.train import TrainPipelineConfig
+from opentau.configs import parser
+from opentau.configs.train import TrainPipelineConfig
 
 
 def rollout(
