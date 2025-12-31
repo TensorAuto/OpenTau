@@ -11,4 +11,4 @@ This section provides step-by-step guides for common tasks in OpenTau, including
    tutorials/inference
    tutorials/evaluation
    tutorials/datasets
-
+   tutorials/offline RL
