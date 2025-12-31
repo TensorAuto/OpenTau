@@ -10,12 +10,12 @@ from pathlib import Path
 from tqdm import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
-from src.opentau.datasets.factory import make_dataset_mixture
-from src.opentau.datasets.lerobot_dataset import BaseDataset
-from src.opentau.policies.factory import get_policy_class
-from src.opentau.policies.tau0.modeling_tau0 import TAU0Policy
-from src.opentau.configs import parser
-from src.opentau.configs.train import TrainPipelineConfig
+from opentau.datasets.factory import make_dataset_mixture
+from opentau.datasets.lerobot_dataset import BaseDataset
+from opentau.policies.factory import get_policy_class
+from opentau.policies.tau0.modeling_tau0 import TAU0Policy
+from opentau.configs import parser
+from opentau.configs.train import TrainPipelineConfig
 
 
 @dataclass

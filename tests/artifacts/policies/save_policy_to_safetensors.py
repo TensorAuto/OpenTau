@@ -19,11 +19,11 @@ from pathlib import Path
 import torch
 from safetensors.torch import save_file
 
-from src.opentau.datasets.factory import make_dataset_mixture
-from src.opentau.policies.factory import make_policy, make_policy_config
-from src.opentau.utils.random_utils import set_seed
-from src.opentau.configs.default import DatasetConfig, DatasetMixtureConfig
-from src.opentau.configs.train import TrainPipelineConfig
+from opentau.datasets.factory import make_dataset_mixture
+from opentau.policies.factory import make_policy, make_policy_config
+from opentau.utils.random_utils import set_seed
+from opentau.configs.default import DatasetConfig, DatasetMixtureConfig
+from opentau.configs.train import TrainPipelineConfig
 
 
 def get_policy_stats(ds_repo_id: str, policy_name: str, policy_kwargs: dict):

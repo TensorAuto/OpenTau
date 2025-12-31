@@ -6,7 +6,7 @@ This section explains the core concepts used in the OpenTau codebase.
 Policies
 --------
 Policies map observations (e.g., camera images, robot proprioceptive states) to actions (or action chunks).
-Policies are implemented as PyTorch modules and inherit from ``src.opentau.policies.pretrained.PreTrainedPolicy``.
+Policies are implemented as PyTorch modules and inherit from ``opentau.policies.pretrained.PreTrainedPolicy``.
 
 Datasets
 --------
@@ -22,7 +22,7 @@ These datasets are used to train policies.
 
 DatasetMixture
 ^^^^^^^^^^^^^^
-To train policies on multiple datasets simultaneously, OpenTau uses ``src.opentau.datasets.dataset_mixture.WeightedDatasetMixture``.
+To train policies on multiple datasets simultaneously, OpenTau uses ``opentau.datasets.dataset_mixture.WeightedDatasetMixture``.
 This class:
 
 *   Combines multiple ``LeRobotDataset`` and ``GroundingDataset`` instances.
@@ -79,13 +79,13 @@ Both the prompt and response strings should contain exactly one newline characte
 Configs
 -------
 Configuration management is handled using `Draccus <https://github.com/dlwh/draccus>`_.
-The main configuration class is ``src.opentau.configs.train.TrainPipelineConfig``, which orchestrates training settings,
+The main configuration class is ``opentau.configs.train.TrainPipelineConfig``, which orchestrates training settings,
 policy configuration, and environment setup. Configs can be loaded from pretrained checkpoints to reproduce experiments.
 
 Environments
 ------------
 Environments wrap simulation or real-robot interfaces compatible with OpenAI Gym/Gymnasium.
 The factory ``lerobot/common/envs/factory.py`` creates vectorized environments for efficient training and evaluation.
-Currently, only `Libero <https://libero-project.github.io/main.html>`_ is supported and it is configured via ``src.opentau.envs.configs.LiberoEnv``.
+Currently, only `Libero <https://libero-project.github.io/main.html>`_ is supported and it is configured via ``opentau.envs.configs.LiberoEnv``.
 
 

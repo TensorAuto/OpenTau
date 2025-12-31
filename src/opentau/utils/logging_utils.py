@@ -15,7 +15,7 @@
 # limitations under the License.
 from typing import Any
 
-from src.opentau.utils.utils import format_big_number
+from opentau.utils.utils import format_big_number
 
 
 class AverageMeter:

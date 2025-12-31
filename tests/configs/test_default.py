@@ -1,7 +1,7 @@
 import pytest
 
-from src.opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING, LOSS_TYPE_MAPPING
-from src.opentau.configs.default import DatasetConfig, DatasetMixtureConfig
+from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING, LOSS_TYPE_MAPPING
+from opentau.configs.default import DatasetConfig, DatasetMixtureConfig
 
 
 @pytest.mark.parametrize(

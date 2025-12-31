@@ -18,9 +18,9 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from src.opentau.envs.configs import LiberoEnv, MetaworldEnv
-from src.opentau.envs.factory import make_env_config, make_envs
-from src.opentau.configs.train import TrainPipelineConfig
+from opentau.envs.configs import LiberoEnv, MetaworldEnv
+from opentau.envs.factory import make_env_config, make_envs
+from opentau.configs.train import TrainPipelineConfig
 
 
 class TestMakeEnvConfig:
@@ -81,7 +81,7 @@ class TestMakeEnv:
     def mock_env_config(self):
         """Create a mock environment configuration"""
         config = Mock(spec=MetaworldEnv)
-        config.import_name = "src.opentau.envs.metaworld"
+        config.import_name = "opentau.envs.metaworld"
         config.make_id = "Metaworld"
         config.already_vectorized = False  # Default to False for most tests
         config.gym_kwargs = {
@@ -108,7 +108,7 @@ class TestMakeEnv:
         with pytest.raises(ValueError, match="`n_envs must be at least 1"):
             make_envs(mock_env_config, mock_train_cfg, n_envs=-1)
 
-    @patch("src.opentau.envs.factory.importlib.import_module")
+    @patch("opentau.envs.factory.importlib.import_module")
     def test_make_env_module_not_found(self, mock_import_module, mock_env_config, mock_train_cfg):
         """Test make_env when module is not found"""
         mock_import_module.side_effect = ModuleNotFoundError("No module named 'test_module'")
@@ -116,7 +116,7 @@ class TestMakeEnv:
         with pytest.raises(ModuleNotFoundError, match="No module named 'test_module'"):
             make_envs(mock_env_config, mock_train_cfg, n_envs=1)
 
-    @patch("src.opentau.envs.libero.LiberoEnv")
+    @patch("opentau.envs.libero.LiberoEnv")
     def test_make_env_sync_vector_env(self, mock_libero_env_cls, libero_env_config, mock_train_cfg):
         mock_libero_env_inst = Mock()
         mock_libero_env_cls.return_value = mock_libero_env_inst
@@ -145,7 +145,7 @@ class TestMakeEnv:
             assert isinstance(result.get("libero_10"), dict)
             assert result["libero_10"].get(0) is mock_vector_env
 
-    @patch("src.opentau.envs.libero.LiberoEnv")
+    @patch("opentau.envs.libero.LiberoEnv")
     def test_make_env_async_vector_env(self, mock_libero_env_cls, libero_env_config, mock_train_cfg):
         mock_libero_env_inst = Mock()
         mock_libero_env_cls.return_value = mock_libero_env_inst
@@ -176,7 +176,7 @@ class TestMakeEnv:
 
     def test_make_env_import_error_message(self, mock_env_config, mock_train_cfg):
         """Test that import error includes helpful installation message"""
-        with patch("src.opentau.envs.factory.importlib.import_module") as mock_import_module:
+        with patch("opentau.envs.factory.importlib.import_module") as mock_import_module:
             mock_import_module.side_effect = ModuleNotFoundError("No module named 'test_module'")
 
             with pytest.raises(ModuleNotFoundError) as exc_info:
@@ -200,8 +200,8 @@ class TestMakeEnvIntegration:
         cfg = Mock(spec=TrainPipelineConfig)
         return cfg
 
-    @patch("src.opentau.envs.factory.importlib.import_module")
-    @patch("src.opentau.envs.factory.gym.make")
+    @patch("opentau.envs.factory.importlib.import_module")
+    @patch("opentau.envs.factory.gym.make")
     def test_make_env_gym_kwargs_from_real_config(
         self, mock_gym_make, mock_import_module, real_env_config, real_train_cfg
     ):
@@ -213,7 +213,7 @@ class TestMakeEnvIntegration:
         mock_gym_make.return_value = mock_env
 
         # Mock SyncVectorEnv
-        with patch("src.opentau.envs.factory.gym.vector.SyncVectorEnv") as mock_sync_vector:
+        with patch("opentau.envs.factory.gym.vector.SyncVectorEnv") as mock_sync_vector:
             mock_vector_env = Mock()
             mock_sync_vector.return_value = mock_vector_env
 

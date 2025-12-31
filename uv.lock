@@ -2125,224 +2125,6 @@ wheels = [
 ]
 
 [[package]]
-name = "lerobot"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "av" },
-    { name = "cmake" },
-    { name = "datasets" },
-    { name = "deepdiff" },
-    { name = "diffusers" },
-    { name = "draccus" },
-    { name = "einops" },
-    { name = "flask" },
-    { name = "gdown" },
-    { name = "h5py" },
-    { name = "huggingface-hub", extra = ["cli", "hf-transfer"] },
-    { name = "imageio", extra = ["ffmpeg"] },
-    { name = "jsonlines" },
-    { name = "numba" },
-    { name = "omegaconf" },
-    { name = "opencv-python-headless" },
-    { name = "packaging" },
-    { name = "pymunk" },
-    { name = "pynput" },
-    { name = "pyzmq" },
-    { name = "r3m" },
-    { name = "rerun-sdk" },
-    { name = "scikit-learn" },
-    { name = "termcolor" },
-    { name = "torch" },
-    { name = "torchcodec", marker = "(platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l' and sys_platform == 'linux') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32')" },
-    { name = "torchvision" },
-    { name = "wandb" },
-    { name = "zarr" },
-]
-
-[package.optional-dependencies]
-accelerate = [
-    { name = "accelerate" },
-    { name = "deepspeed" },
-]
-dev = [
-    { name = "debugpy" },
-    { name = "pre-commit" },
-]
-doc = [
-    { name = "myst-parser" },
-    { name = "sphinx" },
-    { name = "sphinx-copybutton" },
-    { name = "sphinx-design" },
-    { name = "sphinx-rtd-theme" },
-]
-dynamixel = [
-    { name = "dynamixel-sdk" },
-    { name = "pynput" },
-]
-fastapi = [
-    { name = "fastapi", extra = ["standard"] },
-    { name = "uvicorn", extra = ["standard"] },
-]
-feetech = [
-    { name = "feetech-servo-sdk" },
-    { name = "pynput" },
-    { name = "pyudev" },
-]
-intelrealsense = [
-    { name = "pyrealsense2", marker = "sys_platform != 'darwin'" },
-]
-libero = [
-    { name = "bddl" },
-    { name = "cmake" },
-    { name = "easydict" },
-    { name = "future" },
-    { name = "gym" },
-    { name = "libero" },
-    { name = "matplotlib" },
-    { name = "mujoco" },
-    { name = "ninja" },
-    { name = "numpy" },
-    { name = "pyopengl" },
-    { name = "pyopengl-accelerate", marker = "sys_platform == 'linux'" },
-    { name = "robomimic" },
-    { name = "robosuite" },
-    { name = "thop" },
-]
-metaworld = [
-    { name = "gymnasium", extra = ["other"] },
-    { name = "metaworld" },
-    { name = "pyopengl" },
-]
-onnx = [
-    { name = "onnx" },
-    { name = "onnx-ir" },
-    { name = "onnxruntime", marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or sys_platform == 'darwin'" },
-    { name = "onnxruntime-gpu", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (platform_machine == 'x86_64' and sys_platform == 'win32')" },
-    { name = "onnxscript" },
-]
-openai = [
-    { name = "openai" },
-    { name = "python-dotenv" },
-]
-smolvla = [
-    { name = "num2words" },
-]
-stretch = [
-    { name = "hello-robot-stretch-body", marker = "sys_platform == 'linux'" },
-    { name = "pynput" },
-    { name = "pyrealsense2", marker = "sys_platform != 'darwin'" },
-    { name = "pyrender", marker = "sys_platform == 'linux'" },
-]
-tau0 = [
-    { name = "scipy" },
-    { name = "transformers" },
-]
-test = [
-    { name = "pyserial" },
-    { name = "pytest" },
-    { name = "pytest-cov" },
-    { name = "pytest-xdist" },
-]
-umi = [
-    { name = "imagecodecs" },
-]
-video-benchmark = [
-    { name = "pandas" },
-    { name = "scikit-image" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "accelerate", marker = "extra == 'accelerate'", specifier = ">=1.4.0" },
-    { name = "av", specifier = ">=12.0.5" },
-    { name = "bddl", marker = "extra == 'libero'", specifier = "==1.0.1" },
-    { name = "cmake", specifier = ">=3.29.0.1" },
-    { name = "cmake", marker = "extra == 'libero'", specifier = "<4" },
-    { name = "datasets", specifier = ">=2.19.0" },
-    { name = "debugpy", marker = "extra == 'dev'", specifier = ">=1.8.1" },
-    { name = "deepdiff", specifier = ">=7.0.1" },
-    { name = "deepspeed", marker = "extra == 'accelerate'", specifier = ">=0.17.1" },
-    { name = "diffusers", specifier = ">=0.27.2" },
-    { name = "draccus", specifier = ">=0.10.0" },
-    { name = "dynamixel-sdk", marker = "extra == 'dynamixel'", specifier = ">=3.7.31" },
-    { name = "easydict", marker = "extra == 'libero'", specifier = "==1.9" },
-    { name = "einops", specifier = ">=0.8.0" },
-    { name = "fastapi", extras = ["standard"], marker = "extra == 'fastapi'", specifier = ">=0.122.0" },
-    { name = "feetech-servo-sdk", marker = "extra == 'feetech'", specifier = ">=1.0.0" },
-    { name = "flask", specifier = ">=3.0.3" },
-    { name = "future", marker = "extra == 'libero'", specifier = "==0.18.2" },
-    { name = "gdown", specifier = ">=5.1.0" },
-    { name = "gym", marker = "extra == 'libero'", specifier = ">=0.25,<0.27" },
-    { name = "gymnasium", extras = ["other"], marker = "extra == 'metaworld'", specifier = ">=0.29" },
-    { name = "h5py", specifier = ">=3.10.0" },
-    { name = "hello-robot-stretch-body", marker = "python_full_version < '4.0' and sys_platform == 'linux' and extra == 'stretch'", specifier = ">=0.7.27" },
-    { name = "huggingface-hub", extras = ["hf-transfer", "cli"], marker = "python_full_version < '4.0'", specifier = ">=0.27.1" },
-    { name = "imagecodecs", marker = "extra == 'umi'", specifier = ">=2024.1.1" },
-    { name = "imageio", extras = ["ffmpeg"], specifier = ">=2.34.0" },
-    { name = "jsonlines", specifier = ">=4.0.0" },
-    { name = "libero", marker = "extra == 'libero'", git = "https://github.com/shuheng-liu/LIBERO?branch=master" },
-    { name = "matplotlib", marker = "extra == 'libero'", specifier = ">=3.5.3" },
-    { name = "metaworld", marker = "extra == 'metaworld'", specifier = "==3.0.0" },
-    { name = "mujoco", marker = "extra == 'libero'", specifier = ">=3.3.5" },
-    { name = "myst-parser", marker = "extra == 'doc'", specifier = ">=4.0.0" },
-    { name = "ninja", marker = "extra == 'libero'" },
-    { name = "num2words", marker = "extra == 'smolvla'" },
-    { name = "numba", specifier = ">=0.62.0" },
-    { name = "numpy", marker = "extra == 'libero'", specifier = "<2" },
-    { name = "omegaconf", specifier = ">=2.3.0" },
-    { name = "onnx", marker = "extra == 'onnx'", specifier = ">=1.18.0" },
-    { name = "onnx-ir", marker = "extra == 'onnx'", specifier = ">=0.1.4" },
-    { name = "onnxruntime", marker = "(platform_machine == 'aarch64' and extra == 'onnx') or (platform_machine == 'arm64' and extra == 'onnx') or (sys_platform == 'darwin' and extra == 'onnx')", specifier = ">=1.22.1" },
-    { name = "onnxruntime-gpu", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'onnx') or (platform_machine == 'AMD64' and sys_platform == 'win32' and extra == 'onnx') or (platform_machine == 'x86_64' and sys_platform == 'win32' and extra == 'onnx')", specifier = ">=1.22.0" },
-    { name = "onnxscript", marker = "extra == 'onnx'", specifier = ">=0.3.1" },
-    { name = "openai", marker = "extra == 'openai'", specifier = ">=1.0.0" },
-    { name = "opencv-python-headless", specifier = ">=4.9.0" },
-    { name = "packaging", specifier = ">=24.2" },
-    { name = "pandas", marker = "extra == 'video-benchmark'", specifier = ">=2.2.2" },
-    { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.7.0" },
-    { name = "pymunk", specifier = ">=6.6.0" },
-    { name = "pynput", specifier = ">=1.7.7" },
-    { name = "pynput", marker = "extra == 'dynamixel'", specifier = ">=1.7.7" },
-    { name = "pynput", marker = "extra == 'feetech'", specifier = ">=1.7.7" },
-    { name = "pynput", marker = "extra == 'stretch'", specifier = ">=1.7.7" },
-    { name = "pyopengl", marker = "extra == 'libero'", specifier = "==3.1.7" },
-    { name = "pyopengl", marker = "extra == 'metaworld'", specifier = "==3.1.7" },
-    { name = "pyopengl-accelerate", marker = "sys_platform == 'linux' and extra == 'libero'", specifier = "==3.1.7" },
-    { name = "pyrealsense2", marker = "sys_platform != 'darwin' and extra == 'intelrealsense'", specifier = ">=2.55.1.6486" },
-    { name = "pyrealsense2", marker = "sys_platform != 'darwin' and extra == 'stretch'", specifier = ">=2.55.1.6486" },
-    { name = "pyrender", marker = "sys_platform == 'linux' and extra == 'stretch'", git = "https://github.com/mmatl/pyrender.git" },
-    { name = "pyserial", marker = "extra == 'test'", specifier = ">=3.5" },
-    { name = "pytest", marker = "extra == 'test'", specifier = ">=8.1.0" },
-    { name = "pytest-cov", marker = "extra == 'test'", specifier = ">=5.0.0" },
-    { name = "pytest-xdist", marker = "extra == 'test'", specifier = ">=3.8.0" },
-    { name = "python-dotenv", marker = "extra == 'openai'", specifier = ">=1.0.0" },
-    { name = "pyudev", marker = "extra == 'feetech'", specifier = ">=0.24.3" },
-    { name = "pyzmq", specifier = ">=26.2.1" },
-    { name = "r3m", url = "https://github.com/facebookresearch/r3m/archive/b2334e726887fa0206962d7984c69c5fb09cceab.tar.gz" },
-    { name = "rerun-sdk", specifier = ">=0.21.0" },
-    { name = "robomimic", marker = "extra == 'libero'", specifier = "==0.2.0" },
-    { name = "robosuite", marker = "extra == 'libero'", specifier = "==1.4.0" },
-    { name = "scikit-image", marker = "extra == 'video-benchmark'", specifier = ">=0.23.2" },
-    { name = "scikit-learn", specifier = ">=1.7.1" },
-    { name = "scipy", marker = "extra == 'tau0'", specifier = ">=1.15.2" },
-    { name = "sphinx", marker = "extra == 'doc'", specifier = ">=8.1.3" },
-    { name = "sphinx-copybutton", marker = "extra == 'doc'", specifier = ">=0.5.2" },
-    { name = "sphinx-design", marker = "extra == 'doc'", specifier = ">=0.6.1" },
-    { name = "sphinx-rtd-theme", marker = "extra == 'doc'", specifier = ">=3.0.1" },
-    { name = "termcolor", specifier = ">=2.4.0" },
-    { name = "thop", marker = "extra == 'libero'", specifier = "==0.1.1.post2209072238" },
-    { name = "torch", specifier = ">=2.7.1,<2.8.0" },
-    { name = "torchcodec", marker = "(platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l' and sys_platform == 'linux') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32')", specifier = ">=0.4.0,<0.5.0" },
-    { name = "torchvision", specifier = ">=0.22.1,<0.23.0" },
-    { name = "transformers", marker = "extra == 'tau0'", git = "https://github.com/huggingface/transformers.git?rev=dcddb97" },
-    { name = "uvicorn", extras = ["standard"], marker = "extra == 'fastapi'", specifier = ">=0.38.0" },
-    { name = "wandb", specifier = ">=0.16.3" },
-    { name = "zarr", specifier = ">=2.17.0" },
-]
-provides-extras = ["dev", "doc", "dynamixel", "feetech", "intelrealsense", "tau0", "stretch", "test", "umi", "video-benchmark", "accelerate", "openai", "onnx", "smolvla", "libero", "metaworld", "fastapi"]
-
-[[package]]
 name = "libero"
 version = "0.1.0"
 source = { git = "https://github.com/shuheng-liu/LIBERO?branch=master#45c5a018af6a12729d3166263a7a034e4473156e" }
@@ -3239,6 +3021,224 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/95/dd/ed1191c9dc91abcc9f752b499b7928aacabf10567bb2c2535944d848af18/opencv_python_headless-4.11.0.86-cp37-abi3-win32.whl", hash = "sha256:f447d8acbb0b6f2808da71fddd29c1cdd448d2bc98f72d9bb78a7a898fc9621b", size = 29324425, upload-time = "2025-01-16T13:52:49.048Z" },
     { url = "https://files.pythonhosted.org/packages/86/8a/69176a64335aed183529207ba8bc3d329c2999d852b4f3818027203f50e6/opencv_python_headless-4.11.0.86-cp37-abi3-win_amd64.whl", hash = "sha256:6c304df9caa7a6a5710b91709dd4786bf20a74d57672b3c31f7033cc638174ca", size = 39402386, upload-time = "2025-01-16T13:52:56.418Z" },
 ]
+
+[[package]]
+name = "opentau"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "av" },
+    { name = "cmake" },
+    { name = "datasets" },
+    { name = "deepdiff" },
+    { name = "diffusers" },
+    { name = "draccus" },
+    { name = "einops" },
+    { name = "flask" },
+    { name = "gdown" },
+    { name = "h5py" },
+    { name = "huggingface-hub", extra = ["cli", "hf-transfer"] },
+    { name = "imageio", extra = ["ffmpeg"] },
+    { name = "jsonlines" },
+    { name = "numba" },
+    { name = "omegaconf" },
+    { name = "opencv-python-headless" },
+    { name = "packaging" },
+    { name = "pymunk" },
+    { name = "pynput" },
+    { name = "pyzmq" },
+    { name = "r3m" },
+    { name = "rerun-sdk" },
+    { name = "scikit-learn" },
+    { name = "termcolor" },
+    { name = "torch" },
+    { name = "torchcodec", marker = "(platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l' and sys_platform == 'linux') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32')" },
+    { name = "torchvision" },
+    { name = "wandb" },
+    { name = "zarr" },
+]
+
+[package.optional-dependencies]
+accelerate = [
+    { name = "accelerate" },
+    { name = "deepspeed" },
+]
+dev = [
+    { name = "debugpy" },
+    { name = "pre-commit" },
+]
+doc = [
+    { name = "myst-parser" },
+    { name = "sphinx" },
+    { name = "sphinx-copybutton" },
+    { name = "sphinx-design" },
+    { name = "sphinx-rtd-theme" },
+]
+dynamixel = [
+    { name = "dynamixel-sdk" },
+    { name = "pynput" },
+]
+fastapi = [
+    { name = "fastapi", extra = ["standard"] },
+    { name = "uvicorn", extra = ["standard"] },
+]
+feetech = [
+    { name = "feetech-servo-sdk" },
+    { name = "pynput" },
+    { name = "pyudev" },
+]
+intelrealsense = [
+    { name = "pyrealsense2", marker = "sys_platform != 'darwin'" },
+]
+libero = [
+    { name = "bddl" },
+    { name = "cmake" },
+    { name = "easydict" },
+    { name = "future" },
+    { name = "gym" },
+    { name = "libero" },
+    { name = "matplotlib" },
+    { name = "mujoco" },
+    { name = "ninja" },
+    { name = "numpy" },
+    { name = "pyopengl" },
+    { name = "pyopengl-accelerate", marker = "sys_platform == 'linux'" },
+    { name = "robomimic" },
+    { name = "robosuite" },
+    { name = "thop" },
+]
+metaworld = [
+    { name = "gymnasium", extra = ["other"] },
+    { name = "metaworld" },
+    { name = "pyopengl" },
+]
+onnx = [
+    { name = "onnx" },
+    { name = "onnx-ir" },
+    { name = "onnxruntime", marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or sys_platform == 'darwin'" },
+    { name = "onnxruntime-gpu", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (platform_machine == 'x86_64' and sys_platform == 'win32')" },
+    { name = "onnxscript" },
+]
+openai = [
+    { name = "openai" },
+    { name = "python-dotenv" },
+]
+smolvla = [
+    { name = "num2words" },
+]
+stretch = [
+    { name = "hello-robot-stretch-body", marker = "sys_platform == 'linux'" },
+    { name = "pynput" },
+    { name = "pyrealsense2", marker = "sys_platform != 'darwin'" },
+    { name = "pyrender", marker = "sys_platform == 'linux'" },
+]
+tau0 = [
+    { name = "scipy" },
+    { name = "transformers" },
+]
+test = [
+    { name = "pyserial" },
+    { name = "pytest" },
+    { name = "pytest-cov" },
+    { name = "pytest-xdist" },
+]
+umi = [
+    { name = "imagecodecs" },
+]
+video-benchmark = [
+    { name = "pandas" },
+    { name = "scikit-image" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "accelerate", marker = "extra == 'accelerate'", specifier = ">=1.4.0" },
+    { name = "av", specifier = ">=12.0.5" },
+    { name = "bddl", marker = "extra == 'libero'", specifier = "==1.0.1" },
+    { name = "cmake", specifier = ">=3.29.0.1" },
+    { name = "cmake", marker = "extra == 'libero'", specifier = "<4" },
+    { name = "datasets", specifier = ">=2.19.0" },
+    { name = "debugpy", marker = "extra == 'dev'", specifier = ">=1.8.1" },
+    { name = "deepdiff", specifier = ">=7.0.1" },
+    { name = "deepspeed", marker = "extra == 'accelerate'", specifier = ">=0.17.1" },
+    { name = "diffusers", specifier = ">=0.27.2" },
+    { name = "draccus", specifier = ">=0.10.0" },
+    { name = "dynamixel-sdk", marker = "extra == 'dynamixel'", specifier = ">=3.7.31" },
+    { name = "easydict", marker = "extra == 'libero'", specifier = "==1.9" },
+    { name = "einops", specifier = ">=0.8.0" },
+    { name = "fastapi", extras = ["standard"], marker = "extra == 'fastapi'", specifier = ">=0.122.0" },
+    { name = "feetech-servo-sdk", marker = "extra == 'feetech'", specifier = ">=1.0.0" },
+    { name = "flask", specifier = ">=3.0.3" },
+    { name = "future", marker = "extra == 'libero'", specifier = "==0.18.2" },
+    { name = "gdown", specifier = ">=5.1.0" },
+    { name = "gym", marker = "extra == 'libero'", specifier = ">=0.25,<0.27" },
+    { name = "gymnasium", extras = ["other"], marker = "extra == 'metaworld'", specifier = ">=0.29" },
+    { name = "h5py", specifier = ">=3.10.0" },
+    { name = "hello-robot-stretch-body", marker = "python_full_version < '4.0' and sys_platform == 'linux' and extra == 'stretch'", specifier = ">=0.7.27" },
+    { name = "huggingface-hub", extras = ["hf-transfer", "cli"], marker = "python_full_version < '4.0'", specifier = ">=0.27.1" },
+    { name = "imagecodecs", marker = "extra == 'umi'", specifier = ">=2024.1.1" },
+    { name = "imageio", extras = ["ffmpeg"], specifier = ">=2.34.0" },
+    { name = "jsonlines", specifier = ">=4.0.0" },
+    { name = "libero", marker = "extra == 'libero'", git = "https://github.com/shuheng-liu/LIBERO?branch=master" },
+    { name = "matplotlib", marker = "extra == 'libero'", specifier = ">=3.5.3" },
+    { name = "metaworld", marker = "extra == 'metaworld'", specifier = "==3.0.0" },
+    { name = "mujoco", marker = "extra == 'libero'", specifier = ">=3.3.5" },
+    { name = "myst-parser", marker = "extra == 'doc'", specifier = ">=4.0.0" },
+    { name = "ninja", marker = "extra == 'libero'" },
+    { name = "num2words", marker = "extra == 'smolvla'" },
+    { name = "numba", specifier = ">=0.62.0" },
+    { name = "numpy", marker = "extra == 'libero'", specifier = "<2" },
+    { name = "omegaconf", specifier = ">=2.3.0" },
+    { name = "onnx", marker = "extra == 'onnx'", specifier = ">=1.18.0" },
+    { name = "onnx-ir", marker = "extra == 'onnx'", specifier = ">=0.1.4" },
+    { name = "onnxruntime", marker = "(platform_machine == 'aarch64' and extra == 'onnx') or (platform_machine == 'arm64' and extra == 'onnx') or (sys_platform == 'darwin' and extra == 'onnx')", specifier = ">=1.22.1" },
+    { name = "onnxruntime-gpu", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'onnx') or (platform_machine == 'AMD64' and sys_platform == 'win32' and extra == 'onnx') or (platform_machine == 'x86_64' and sys_platform == 'win32' and extra == 'onnx')", specifier = ">=1.22.0" },
+    { name = "onnxscript", marker = "extra == 'onnx'", specifier = ">=0.3.1" },
+    { name = "openai", marker = "extra == 'openai'", specifier = ">=1.0.0" },
+    { name = "opencv-python-headless", specifier = ">=4.9.0" },
+    { name = "packaging", specifier = ">=24.2" },
+    { name = "pandas", marker = "extra == 'video-benchmark'", specifier = ">=2.2.2" },
+    { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.7.0" },
+    { name = "pymunk", specifier = ">=6.6.0" },
+    { name = "pynput", specifier = ">=1.7.7" },
+    { name = "pynput", marker = "extra == 'dynamixel'", specifier = ">=1.7.7" },
+    { name = "pynput", marker = "extra == 'feetech'", specifier = ">=1.7.7" },
+    { name = "pynput", marker = "extra == 'stretch'", specifier = ">=1.7.7" },
+    { name = "pyopengl", marker = "extra == 'libero'", specifier = "==3.1.7" },
+    { name = "pyopengl", marker = "extra == 'metaworld'", specifier = "==3.1.7" },
+    { name = "pyopengl-accelerate", marker = "sys_platform == 'linux' and extra == 'libero'", specifier = "==3.1.7" },
+    { name = "pyrealsense2", marker = "sys_platform != 'darwin' and extra == 'intelrealsense'", specifier = ">=2.55.1.6486" },
+    { name = "pyrealsense2", marker = "sys_platform != 'darwin' and extra == 'stretch'", specifier = ">=2.55.1.6486" },
+    { name = "pyrender", marker = "sys_platform == 'linux' and extra == 'stretch'", git = "https://github.com/mmatl/pyrender.git" },
+    { name = "pyserial", marker = "extra == 'test'", specifier = ">=3.5" },
+    { name = "pytest", marker = "extra == 'test'", specifier = ">=8.1.0" },
+    { name = "pytest-cov", marker = "extra == 'test'", specifier = ">=5.0.0" },
+    { name = "pytest-xdist", marker = "extra == 'test'", specifier = ">=3.8.0" },
+    { name = "python-dotenv", marker = "extra == 'openai'", specifier = ">=1.0.0" },
+    { name = "pyudev", marker = "extra == 'feetech'", specifier = ">=0.24.3" },
+    { name = "pyzmq", specifier = ">=26.2.1" },
+    { name = "r3m", url = "https://github.com/facebookresearch/r3m/archive/b2334e726887fa0206962d7984c69c5fb09cceab.tar.gz" },
+    { name = "rerun-sdk", specifier = ">=0.21.0" },
+    { name = "robomimic", marker = "extra == 'libero'", specifier = "==0.2.0" },
+    { name = "robosuite", marker = "extra == 'libero'", specifier = "==1.4.0" },
+    { name = "scikit-image", marker = "extra == 'video-benchmark'", specifier = ">=0.23.2" },
+    { name = "scikit-learn", specifier = ">=1.7.1" },
+    { name = "scipy", marker = "extra == 'tau0'", specifier = ">=1.15.2" },
+    { name = "sphinx", marker = "extra == 'doc'", specifier = ">=8.1.3" },
+    { name = "sphinx-copybutton", marker = "extra == 'doc'", specifier = ">=0.5.2" },
+    { name = "sphinx-design", marker = "extra == 'doc'", specifier = ">=0.6.1" },
+    { name = "sphinx-rtd-theme", marker = "extra == 'doc'", specifier = ">=3.0.1" },
+    { name = "termcolor", specifier = ">=2.4.0" },
+    { name = "thop", marker = "extra == 'libero'", specifier = "==0.1.1.post2209072238" },
+    { name = "torch", specifier = ">=2.7.1,<2.8.0" },
+    { name = "torchcodec", marker = "(platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l' and sys_platform == 'linux') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32')", specifier = ">=0.4.0,<0.5.0" },
+    { name = "torchvision", specifier = ">=0.22.1,<0.23.0" },
+    { name = "transformers", marker = "extra == 'tau0'", git = "https://github.com/huggingface/transformers.git?rev=dcddb97" },
+    { name = "uvicorn", extras = ["standard"], marker = "extra == 'fastapi'", specifier = ">=0.38.0" },
+    { name = "wandb", specifier = ">=0.16.3" },
+    { name = "zarr", specifier = ">=2.17.0" },
+]
+provides-extras = ["dev", "doc", "dynamixel", "feetech", "intelrealsense", "tau0", "stretch", "test", "umi", "video-benchmark", "accelerate", "openai", "onnx", "smolvla", "libero", "metaworld", "fastapi"]
 
 [[package]]
 name = "orderly-set"

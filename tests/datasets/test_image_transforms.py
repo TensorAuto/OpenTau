@@ -20,7 +20,7 @@ from safetensors.torch import load_file
 from torchvision.transforms import v2
 from torchvision.transforms.v2 import functional as F  # noqa: N812
 
-from src.opentau.datasets.transforms import (
+from opentau.datasets.transforms import (
     ImageTransformConfig,
     ImageTransforms,
     ImageTransformsConfig,
@@ -28,7 +28,7 @@ from src.opentau.datasets.transforms import (
     SharpnessJitter,
     make_transform_from_config,
 )
-from src.opentau.utils.random_utils import seeded_context
+from opentau.utils.random_utils import seeded_context
 from tests.artifacts.image_transforms.save_image_transforms_to_safetensors import ARTIFACT_DIR
 from tests.utils import require_x86_64_kernel
 

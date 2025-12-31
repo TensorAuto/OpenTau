@@ -3,7 +3,7 @@ import functools
 from torch._subclasses import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
-from src.opentau.utils.monkey_patch import (
+from opentau.utils.monkey_patch import (
     torch_fake_tensor_beta_validate_args_patch,
     torch_fake_tensor_is_inf_patch,
     torch_fake_tensor_module_to_patch,

@@ -6,13 +6,13 @@ import torch
 from einops import rearrange
 from robosuite.utils.transform_utils import quat2axisangle
 
-from src.opentau.utils.libero import (
+from opentau.utils.libero import (
     LiberoObservationRecorder,
     libero2torch,
     rotate_numpy_image,
     summarize_libero_results,
 )
-from src.opentau.configs.libero import LiberoEnvConfig, TrainConfigWithLiberoEval
+from opentau.configs.libero import LiberoEnvConfig, TrainConfigWithLiberoEval
 from tests.utils import generic_equal
 
 

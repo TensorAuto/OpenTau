@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 import torch
 
-from src.opentau.datasets.online_buffer import OnlineBuffer, compute_sampler_weights
+from opentau.datasets.online_buffer import OnlineBuffer, compute_sampler_weights
 
 # Some constants for OnlineBuffer tests.
 data_key = "data"

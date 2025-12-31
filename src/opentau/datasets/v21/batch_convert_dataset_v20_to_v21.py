@@ -23,8 +23,8 @@ from pathlib import Path
 
 from huggingface_hub import HfApi
 
-from src.opentau import available_datasets
-from src.opentau.datasets.v21.convert_dataset_v20_to_v21 import V21, convert_dataset
+from opentau import available_datasets
+from opentau.datasets.v21.convert_dataset_v20_to_v21 import V21, convert_dataset
 
 LOCAL_DIR = Path("data/")
 

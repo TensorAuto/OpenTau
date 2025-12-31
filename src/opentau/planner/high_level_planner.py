@@ -12,8 +12,8 @@ from transformers import (
     LlamaTokenizer,
 )
 
-from src.opentau.planner.utils.memory import Memory
-from src.opentau.planner.utils.utils import load_prompt_library, tensor_to_base64
+from opentau.planner.utils.memory import Memory
+from opentau.planner.utils.utils import load_prompt_library, tensor_to_base64
 
 
 class BaseHighLevelPlanner(ABC):

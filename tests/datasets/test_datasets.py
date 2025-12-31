@@ -23,13 +23,13 @@ import pytest
 import torch
 from PIL import Image
 
-from src.opentau import available_grounding_datasets
-from src.opentau.datasets.factory import make_dataset
-from src.opentau.datasets.image_writer import image_array_to_pil_image
-from src.opentau.datasets.lerobot_dataset import (
+from opentau import available_grounding_datasets
+from opentau.datasets.factory import make_dataset
+from opentau.datasets.image_writer import image_array_to_pil_image
+from opentau.datasets.lerobot_dataset import (
     LeRobotDataset,
 )
-from src.opentau.datasets.utils import (
+from opentau.datasets.utils import (
     flatten_dict,
     unflatten_dict,
 )
@@ -427,7 +427,7 @@ def test_flatten_unflatten_dict():
 
 def test_dataset_feature_with_forward_slash_raises_error():
     # make sure dir does not exist
-    from src.opentau.constants import HF_OPENTAU_HOME
+    from opentau.constants import HF_OPENTAU_HOME
 
     dataset_dir = HF_OPENTAU_HOME / "lerobot/test/with/slash"
     # make sure does not exist
@@ -444,4 +444,4 @@ def test_dataset_feature_with_forward_slash_raises_error():
 
 def test_grounding_dataset_imports():
     for dataset in available_grounding_datasets:
-        import_module(f"src.opentau.datasets.grounding.{dataset}")
+        import_module(f"opentau.datasets.grounding.{dataset}")

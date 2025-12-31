@@ -14,11 +14,11 @@
 import pytest
 import torch
 
-from src.opentau.constants import (
+from opentau.constants import (
     OPTIMIZER_PARAM_GROUPS,
     OPTIMIZER_STATE,
 )
-from src.opentau.optim.optimizers import (
+from opentau.optim.optimizers import (
     AdamConfig,
     AdamWConfig,
     SGDConfig,

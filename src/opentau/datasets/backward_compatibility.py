@@ -49,7 +49,7 @@ or open an [issue on GitHub](https://github.com/huggingface/lerobot/issues/new/c
 
 FUTURE_MESSAGE = """
 The dataset you requested ({repo_id}) is only available in {version} format.
-As we cannot ensure forward compatibility with it, please update your current version of src.opentau.
+As we cannot ensure forward compatibility with it, please update your current version of opentau.
 """
 
 

@@ -18,15 +18,15 @@ import torch
 from einops import rearrange
 from torch.utils.data._utils.collate import default_collate
 
-from src.opentau.policies.factory import get_policy_class
-from src.opentau.utils.libero import LiberoObservationRecorder, summarize_libero_results
-from src.opentau.utils.libero import _libero2np as libero2np
-from src.opentau.utils.libero import _np2torch as np2torch
-from src.opentau.utils.monkey_patch import gym_is_gymnasium_patch
-from src.opentau.utils.random_utils import set_seed
-from src.opentau.utils.utils import auto_torch_device
-from src.opentau.configs import parser
-from src.opentau.configs.libero import TrainConfigWithLiberoEval
+from opentau.policies.factory import get_policy_class
+from opentau.utils.libero import LiberoObservationRecorder, summarize_libero_results
+from opentau.utils.libero import _libero2np as libero2np
+from opentau.utils.libero import _np2torch as np2torch
+from opentau.utils.monkey_patch import gym_is_gymnasium_patch
+from opentau.utils.random_utils import set_seed
+from opentau.utils.utils import auto_torch_device
+from opentau.configs import parser
+from opentau.configs.libero import TrainConfigWithLiberoEval
 
 # Sent by client process to indicate simulation completion and signal that the pipe is to be closed
 SENTINEL = "<SENTINEL>"

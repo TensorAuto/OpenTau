@@ -6,7 +6,7 @@ Example usage:
     from time import sleep
     from datetime import datetime
     from torch.utils.data import DataLoader
-    from src.opentau.datasets.grounding.pixmo import PixmoDataset
+    from opentau.datasets.grounding.pixmo import PixmoDataset
 
     pixmo_loader = DataLoader(
         PixmoDataset(),
@@ -36,9 +36,9 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from datasets import load_dataset
-from src.opentau import register_grounding_dataset
-from src.opentau.datasets.grounding.base import GroundingDataset
-from src.opentau.configs.train import TrainPipelineConfig
+from opentau import register_grounding_dataset
+from opentau.datasets.grounding.base import GroundingDataset
+from opentau.configs.train import TrainPipelineConfig
 
 # TODO: add a config to filter the warnings
 logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)

@@ -1,9 +1,9 @@
 import pytest
 
-from src.opentau.datasets.transforms import ImageTransformsConfig
-from src.opentau.policies.tau0.configuration_tau0 import TAU0Config
-from src.opentau.configs.default import DatasetConfig, DatasetMixtureConfig
-from src.opentau.configs.train import TrainPipelineConfig
+from opentau.datasets.transforms import ImageTransformsConfig
+from opentau.policies.tau0.configuration_tau0 import TAU0Config
+from opentau.configs.default import DatasetConfig, DatasetMixtureConfig
+from opentau.configs.train import TrainPipelineConfig
 
 
 @pytest.fixture

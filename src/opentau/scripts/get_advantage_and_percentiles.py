@@ -30,19 +30,19 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from src.opentau.datasets.factory import make_dataset
-from src.opentau.datasets.lerobot_dataset import LeRobotDataset
-from src.opentau.datasets.utils import ADVANTAGES_PATH
-from src.opentau.policies.factory import get_policy_class
-from src.opentau.policies.value.reward import calculate_n_step_return
-from src.opentau.utils.random_utils import set_seed
-from src.opentau.utils.utils import (
+from opentau.datasets.factory import make_dataset
+from opentau.datasets.lerobot_dataset import LeRobotDataset
+from opentau.datasets.utils import ADVANTAGES_PATH
+from opentau.policies.factory import get_policy_class
+from opentau.policies.value.reward import calculate_n_step_return
+from opentau.utils.random_utils import set_seed
+from opentau.utils.utils import (
     auto_torch_device,
     init_logging,
 )
-from src.opentau.configs import parser
-from src.opentau.configs.default import DatasetMixtureConfig
-from src.opentau.configs.train import TrainPipelineConfig
+from opentau.configs import parser
+from opentau.configs.default import DatasetMixtureConfig
+from opentau.configs.train import TrainPipelineConfig
 
 
 def ensure_primitive(maybe_tensor):

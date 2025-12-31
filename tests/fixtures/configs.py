@@ -2,9 +2,9 @@ from dataclasses import dataclass
 
 import pytest
 
-from src.opentau.optim.optimizers import OptimizerConfig
-from src.opentau.optim.schedulers import LRSchedulerConfig
-from src.opentau.configs.policies import PreTrainedConfig
+from opentau.optim.optimizers import OptimizerConfig
+from opentau.optim.schedulers import LRSchedulerConfig
+from opentau.configs.policies import PreTrainedConfig
 
 
 @dataclass

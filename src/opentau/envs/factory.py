@@ -18,8 +18,8 @@ from functools import partial
 
 import gymnasium as gym
 
-from src.opentau.envs.configs import EnvConfig, LiberoEnv, MetaworldEnv
-from src.opentau.configs.train import TrainPipelineConfig
+from opentau.envs.configs import EnvConfig, LiberoEnv, MetaworldEnv
+from opentau.configs.train import TrainPipelineConfig
 
 
 def make_env_config(env_type: str, **kwargs) -> EnvConfig:
@@ -64,7 +64,7 @@ def make_envs(
     # Note: The official LeRobot repo makes a special case for Libero envs here.
     #   cf. https://github.com/huggingface/lerobot/commit/25384727812de60ff6e7a5e705cc016ec5def552
     if isinstance(cfg, LiberoEnv):
-        from src.opentau.envs.libero import create_libero_envs
+        from opentau.envs.libero import create_libero_envs
 
         return create_libero_envs(
             task=cfg.task,

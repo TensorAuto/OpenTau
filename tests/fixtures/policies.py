@@ -1,16 +1,16 @@
 import pytest
 import torch
 
-from src.opentau.datasets.dataset_mixture import WeightedDatasetMixture
-from src.opentau.datasets.factory import make_dataset_mixture
-from src.opentau.datasets.utils import dataset_to_policy_features
-from src.opentau.policies.factory import make_policy, make_policy_config
-from src.opentau.policies.tau0.modeling_tau0 import TAU0Policy
-from src.opentau.utils.fake_tensor import FakeTensorContext
-from src.opentau.configs.default import DatasetConfig
-from src.opentau.configs.reward import RewardConfig
-from src.opentau.configs.train import TrainPipelineConfig
-from src.opentau.configs.types import FeatureType, NormalizationMode
+from opentau.datasets.dataset_mixture import WeightedDatasetMixture
+from opentau.datasets.factory import make_dataset_mixture
+from opentau.datasets.utils import dataset_to_policy_features
+from opentau.policies.factory import make_policy, make_policy_config
+from opentau.policies.tau0.modeling_tau0 import TAU0Policy
+from opentau.utils.fake_tensor import FakeTensorContext
+from opentau.configs.default import DatasetConfig
+from opentau.configs.reward import RewardConfig
+from opentau.configs.train import TrainPipelineConfig
+from opentau.configs.types import FeatureType, NormalizationMode
 
 
 @pytest.fixture

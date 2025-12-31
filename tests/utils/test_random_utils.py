@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 import torch
 
-from src.opentau.utils.random_utils import (
+from opentau.utils.random_utils import (
     deserialize_numpy_rng_state,
     deserialize_python_rng_state,
     deserialize_rng_state,

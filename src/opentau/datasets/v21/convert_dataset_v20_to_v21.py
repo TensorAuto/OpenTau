@@ -37,12 +37,12 @@ from dataclasses import dataclass
 
 from huggingface_hub import HfApi
 
-from src.opentau.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDataset
-from src.opentau.datasets.utils import EPISODES_STATS_PATH, STATS_PATH, load_stats, write_info
-from src.opentau.datasets.v21.convert_stats import check_aggregate_stats, convert_stats
-from src.opentau.configs.default import DatasetConfig, DatasetMixtureConfig
-from src.opentau.configs.policies import PreTrainedConfig
-from src.opentau.configs.train import TrainPipelineConfig
+from opentau.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDataset
+from opentau.datasets.utils import EPISODES_STATS_PATH, STATS_PATH, load_stats, write_info
+from opentau.datasets.v21.convert_stats import check_aggregate_stats, convert_stats
+from opentau.configs.default import DatasetConfig, DatasetMixtureConfig
+from opentau.configs.policies import PreTrainedConfig
+from opentau.configs.train import TrainPipelineConfig
 
 V20 = "v2.0"
 V21 = "v2.1"

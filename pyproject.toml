@@ -134,8 +134,8 @@ fastapi = [
 [tool.uv.sources]
 libero = { git = "https://github.com/shuheng-liu/LIBERO" , branch = "master" }  # the official libero repo is misconfigured for pip install with git
 
-[tool.poetry]
-requires-poetry = ">=2.1"
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.ruff]
 line-length = 110
@@ -170,8 +170,8 @@ default.extend-ignore-identifiers-re = [
 ]
 
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
 
 [tool.pytest.ini_options]
 markers = [

@@ -23,12 +23,12 @@ import torch
 from safetensors.torch import load_file, save_file
 from torch.nn.parameter import Parameter
 
-from src.opentau.constants import (
+from opentau.constants import (
     OPTIMIZER_PARAM_GROUPS,
     OPTIMIZER_STATE,
 )
-from src.opentau.datasets.utils import flatten_dict, unflatten_dict, write_json
-from src.opentau.utils.io_utils import deserialize_json_into_object
+from opentau.datasets.utils import flatten_dict, unflatten_dict, write_json
+from opentau.utils.io_utils import deserialize_json_into_object
 
 
 @dataclass

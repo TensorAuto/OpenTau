@@ -18,7 +18,7 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
-from src.opentau.datasets.compute_stats import (
+from opentau.datasets.compute_stats import (
     _assert_type_and_shape,
     aggregate_feature_stats,
     aggregate_stats,
@@ -61,7 +61,7 @@ def test_sample_indices():
     assert len(indices) == estimate_num_samples(10)
 
 
-@patch("src.opentau.datasets.compute_stats.load_image_as_numpy", side_effect=mock_load_image_as_numpy)
+@patch("opentau.datasets.compute_stats.load_image_as_numpy", side_effect=mock_load_image_as_numpy)
 def test_sample_images(mock_load):
     image_paths = [f"image_{i}.jpg" for i in range(100)]
     images = sample_images(image_paths)
@@ -145,7 +145,7 @@ def test_compute_episode_stats():
     }
 
     with patch(
-        "src.opentau.datasets.compute_stats.load_image_as_numpy", side_effect=mock_load_image_as_numpy
+        "opentau.datasets.compute_stats.load_image_as_numpy", side_effect=mock_load_image_as_numpy
     ):
         stats = compute_episode_stats(episode_data, features)
 

@@ -27,17 +27,17 @@ from accelerate.scheduler import AcceleratedScheduler
 from accelerate.utils import DistributedDataParallelKwargs, gather_object
 from termcolor import colored
 
-from src.opentau.datasets.factory import make_dataset_mixture
-from src.opentau.datasets.utils import cycle
-from src.opentau.envs.factory import make_envs
-from src.opentau.envs.utils import close_envs
-from src.opentau.optim.factory import make_optimizer_and_scheduler
-from src.opentau.policies.factory import make_policy
-from src.opentau.policies.pretrained import PreTrainedPolicy
-from src.opentau.utils.accelerate_utils import set_proc_accelerator
-from src.opentau.utils.logging_utils import AverageMeter, MetricsTracker
-from src.opentau.utils.random_utils import set_seed
-from src.opentau.utils.train_utils import (
+from opentau.datasets.factory import make_dataset_mixture
+from opentau.datasets.utils import cycle
+from opentau.envs.factory import make_envs
+from opentau.envs.utils import close_envs
+from opentau.optim.factory import make_optimizer_and_scheduler
+from opentau.policies.factory import make_policy
+from opentau.policies.pretrained import PreTrainedPolicy
+from opentau.utils.accelerate_utils import set_proc_accelerator
+from opentau.utils.logging_utils import AverageMeter, MetricsTracker
+from opentau.utils.random_utils import set_seed
+from opentau.utils.train_utils import (
     get_step_checkpoint_dir,
     get_step_identifier,
     load_training_state,
@@ -45,15 +45,15 @@ from src.opentau.utils.train_utils import (
     prune_old_checkpoints,
     save_checkpoint,
 )
-from src.opentau.utils.utils import (
+from opentau.utils.utils import (
     encode_accelerator_state_dict,
     format_big_number,
     init_logging,
     is_launched_with_accelerate,
 )
-from src.opentau.configs import parser
-from src.opentau.configs.train import TrainPipelineConfig
-from src.opentau.scripts.eval import consolidate_eval_info, eval_policy_all
+from opentau.configs import parser
+from opentau.configs.train import TrainPipelineConfig
+from opentau.scripts.eval import consolidate_eval_info, eval_policy_all
 
 
 def update_policy(

@@ -17,7 +17,7 @@ import datasets
 import pytest
 from huggingface_hub.utils import filter_repo_objects
 
-from src.opentau.datasets.utils import (
+from opentau.datasets.utils import (
     EPISODES_PATH,
     EPISODES_STATS_PATH,
     INFO_PATH,

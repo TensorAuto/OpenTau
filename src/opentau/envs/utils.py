@@ -24,10 +24,10 @@ import torch
 from torch import Tensor
 from torchvision.transforms import Compose, Resize, ToTensor
 
-from src.opentau.datasets.lerobot_dataset import BaseDataset
-from src.opentau.utils.accelerate_utils import get_proc_accelerator
-from src.opentau.utils.utils import auto_torch_device
-from src.opentau.configs.train import TrainPipelineConfig
+from opentau.datasets.lerobot_dataset import BaseDataset
+from opentau.utils.accelerate_utils import get_proc_accelerator
+from opentau.utils.utils import auto_torch_device
+from opentau.configs.train import TrainPipelineConfig
 
 
 def preprocess_observation(np_observations: dict, cfg: TrainPipelineConfig) -> dict[str, Tensor]:

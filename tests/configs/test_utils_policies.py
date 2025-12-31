@@ -6,8 +6,8 @@ import pytest
 from draccus.utils import ParsingError
 from huggingface_hub.constants import CONFIG_NAME
 
-from src.opentau.configs.policies import PreTrainedConfig
-from src.opentau.configs.types import FeatureType, PolicyFeature
+from opentau.configs.policies import PreTrainedConfig
+from opentau.configs.types import FeatureType, PolicyFeature
 
 ARTIFACT_DIR = Path("tests/artifacts/configs")
 with open(ARTIFACT_DIR / "train_config.json") as f:
@@ -106,7 +106,7 @@ def test_from_pretrained_model_exits(tmp_path):
     with open(tmp_path / "train_config.json", "w") as f:
         json.dump(train_config["policy"], f, indent=4)
 
-    with patch("src.opentau.configs.policies.hf_hub_download", return_value=tmp_path / "train_config.json"):
+    with patch("opentau.configs.policies.hf_hub_download", return_value=tmp_path / "train_config.json"):
         try:
             PreTrainedConfig.from_pretrained(pretrained_name_or_path=repo_id)
         except Exception as e:

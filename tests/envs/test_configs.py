@@ -18,8 +18,8 @@ from dataclasses import dataclass
 
 import pytest
 
-from src.opentau.envs.configs import EnvConfig, MetaworldEnv
-from src.opentau.configs.types import FeatureType, PolicyFeature
+from opentau.envs.configs import EnvConfig, MetaworldEnv
+from opentau.configs.types import FeatureType, PolicyFeature
 
 
 class TestEnvConfig:
@@ -108,7 +108,7 @@ class TestMetaworldEnv:
         """Test default values for MetaworldEnv"""
         config = MetaworldEnv()
 
-        assert config.import_name == "src.opentau.envs.metaworld"
+        assert config.import_name == "opentau.envs.metaworld"
         assert config.make_id == "Metaworld"
         assert config.task == "Meta-World/MT1"
         assert config.env_name == "button-press-v3"
@@ -126,7 +126,7 @@ class TestMetaworldEnv:
         assert config.episode_length == 100
 
         # Check that defaults are still set
-        assert config.import_name == "src.opentau.envs.metaworld"
+        assert config.import_name == "opentau.envs.metaworld"
         assert config.make_id == "Metaworld"
         assert config.task == "Meta-World/MT1"
 

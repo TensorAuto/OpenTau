@@ -20,12 +20,12 @@ import draccus
 import numpy as np
 from draccus.parsers.encoding import encode_dataclass
 
-from src.opentau import (
+from opentau import (
     policies,  # noqa: F401
 )
-from src.opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING, LOSS_TYPE_MAPPING
-from src.opentau.datasets.transforms import ImageTransformsConfig
-from src.opentau.datasets.video_utils import get_safe_default_codec
+from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING, LOSS_TYPE_MAPPING
+from opentau.datasets.transforms import ImageTransformsConfig
+from opentau.datasets.video_utils import get_safe_default_codec
 
 # --- Custom NumPy encoder registration ---
 # For decoding from cmd/yaml

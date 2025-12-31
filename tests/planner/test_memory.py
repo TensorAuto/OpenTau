@@ -1,6 +1,6 @@
 import pytest
 
-from src.opentau.planner import Memory
+from opentau.planner import Memory
 
 
 def add_conversation_for_test(mem: Memory, no_of_conversation: int) -> Memory:

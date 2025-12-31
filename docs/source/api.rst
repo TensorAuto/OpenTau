@@ -5,5 +5,5 @@ API Reference
    :toctree: _autosummary
    :recursive:
 
-   src.opentau.policies
-   src.opentau.datasets
+   opentau.policies
+   opentau.datasets

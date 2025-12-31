@@ -5,8 +5,8 @@ import os
 from dotenv import load_dotenv
 from PIL import Image
 
-from src.opentau.planner import NavHighLevelPlanner
-from src.opentau.utils.utils import (
+from opentau.planner import NavHighLevelPlanner
+from opentau.utils.utils import (
     init_logging,
 )
 

@@ -15,10 +15,10 @@
 # limitations under the License.
 
 
-import src.opentau
-from src.opentau.policies.pi0.modeling_pi0 import PI0Policy
-from src.opentau.policies.tau0.modeling_tau0 import TAU0Policy
-from src.opentau.policies.value.modeling_value import ValueFunction
+import opentau
+from opentau.policies.pi0.modeling_pi0 import PI0Policy
+from opentau.policies.tau0.modeling_tau0 import TAU0Policy
+from opentau.policies.value.modeling_value import ValueFunction
 
 
 def test_available_policies():
@@ -32,14 +32,14 @@ def test_available_policies():
         ValueFunction,
     ]
     policies = [pol_cls.name for pol_cls in policy_classes]
-    assert set(policies) == set(src.opentau.available_policies), policies
+    assert set(policies) == set(opentau.available_policies), policies
 
 
 def test_print():
-    print(src.opentau.available_envs)
-    print(src.opentau.available_tasks_per_env)
-    print(src.opentau.available_datasets)
-    print(src.opentau.available_datasets_per_env)
-    print(src.opentau.available_real_world_datasets)
-    print(src.opentau.available_policies)
-    print(src.opentau.available_policies_per_env)
+    print(opentau.available_envs)
+    print(opentau.available_tasks_per_env)
+    print(opentau.available_datasets)
+    print(opentau.available_datasets_per_env)
+    print(opentau.available_real_world_datasets)
+    print(opentau.available_policies)
+    print(opentau.available_policies_per_env)

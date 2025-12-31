@@ -24,8 +24,8 @@ import torch
 from einops import rearrange
 from gymnasium import spaces
 
-from src.opentau.policies.pi0.modeling_pi0 import resize_with_pad
-from src.opentau.configs.train import TrainPipelineConfig
+from opentau.policies.pi0.modeling_pi0 import resize_with_pad
+from opentau.configs.train import TrainPipelineConfig
 
 
 class Metaworld(gym.Env):
@@ -339,7 +339,7 @@ def register_lerobot_metaworld_envs():
     # Register the main wrapper
     gym.register(
         id="Metaworld",
-        entry_point="src.opentau.envs.metaworld:Metaworld",
+        entry_point="opentau.envs.metaworld:Metaworld",
     )
 
 

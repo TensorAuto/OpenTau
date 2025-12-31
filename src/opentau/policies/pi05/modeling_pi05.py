@@ -63,17 +63,17 @@ from einops import rearrange
 from torch import Tensor, nn
 from transformers import AutoProcessor, AutoTokenizer
 
-from src.opentau.constants import OBS_STATE
-from src.opentau.policies.normalize import Normalize, Unnormalize
-from src.opentau.policies.pi05.configuration_pi05 import PI05Config
-from src.opentau.policies.pi05.paligemma_with_expert import (
+from opentau.constants import OBS_STATE
+from opentau.policies.normalize import Normalize, Unnormalize
+from opentau.policies.pi05.configuration_pi05 import PI05Config
+from opentau.policies.pi05.paligemma_with_expert import (
     PaliGemmaWithExpertConfig,
     PaliGemmaWithExpertModel,
 )
-from src.opentau.policies.pretrained import PreTrainedPolicy, T
-from src.opentau.utils.utils import get_safe_dtype
-from src.opentau.configs.policies import PreTrainedConfig
-from src.opentau.configs.types import NormalizationMode
+from opentau.policies.pretrained import PreTrainedPolicy, T
+from opentau.utils.utils import get_safe_dtype
+from opentau.configs.policies import PreTrainedConfig
+from opentau.configs.types import NormalizationMode
 
 
 def create_sinusoidal_pos_embedding(

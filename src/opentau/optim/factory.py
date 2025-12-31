@@ -18,8 +18,8 @@
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
-from src.opentau.policies.pretrained import PreTrainedPolicy
-from src.opentau.configs.train import TrainPipelineConfig
+from opentau.policies.pretrained import PreTrainedPolicy
+from opentau.configs.train import TrainPipelineConfig
 
 
 def make_optimizer_and_scheduler(

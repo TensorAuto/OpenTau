@@ -1,6 +1,6 @@
 from collections import deque
 
-from src.opentau.planner.utils.utils import load_prompt_library
+from opentau.planner.utils.utils import load_prompt_library
 
 
 class Memory:
