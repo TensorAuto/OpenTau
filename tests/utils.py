@@ -21,8 +21,8 @@ import numpy as np
 import pytest
 import torch
 
-from lerobot.common.utils.import_utils import is_package_available
-from lerobot.common.utils.utils import auto_torch_device
+from src.opentau.utils.import_utils import is_package_available
+from src.opentau.utils.utils import auto_torch_device
 
 
 @pytest.fixture(scope="session")

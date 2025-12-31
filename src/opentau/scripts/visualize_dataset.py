@@ -74,8 +74,8 @@ import torch
 import torch.utils.data
 import tqdm
 
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.scripts.visualize_dataset_html import create_mock_train_config
+from src.opentau.datasets.lerobot_dataset import LeRobotDataset
+from src.opentau.scripts.visualize_dataset_html import create_mock_train_config
 
 
 class EpisodeSampler(torch.utils.data.Sampler):

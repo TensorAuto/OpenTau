@@ -20,12 +20,12 @@ import draccus
 import numpy as np
 from draccus.parsers.encoding import encode_dataclass
 
-from lerobot.common import (
+from src.opentau import (
     policies,  # noqa: F401
 )
-from lerobot.common.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING, LOSS_TYPE_MAPPING
-from lerobot.common.datasets.transforms import ImageTransformsConfig
-from lerobot.common.datasets.video_utils import get_safe_default_codec
+from src.opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING, LOSS_TYPE_MAPPING
+from src.opentau.datasets.transforms import ImageTransformsConfig
+from src.opentau.datasets.video_utils import get_safe_default_codec
 
 # --- Custom NumPy encoder registration ---
 # For decoding from cmd/yaml
@@ -103,7 +103,7 @@ class DatasetMixtureConfig:
 class WandBConfig:
     enable: bool = False  # Enable Weights & Biases logging.
     entity: str | None = None  # The entity name in Weights & Biases, e.g. your username or your team name
-    project: str = "lerobot"  # The project name in Weights & Biases, e.g. "pi0"
+    project: str = "opentau"  # The project name in Weights & Biases, e.g. "pi0"
     run_id: str | None = None  # If provided, the run will be forked from this run ID.
     name: str | None = None  # Name of the run, shown in the UI
     notes: str | None = None  # Description of the run, shown in the UI

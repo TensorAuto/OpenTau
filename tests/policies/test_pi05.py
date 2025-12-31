@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from lerobot.common.policies.pi05.modeling_pi05 import (
+from src.opentau.policies.pi05.modeling_pi05 import (
     PI05Policy,
 )
 

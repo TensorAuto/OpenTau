@@ -17,7 +17,7 @@
 import pytest
 import torch
 
-from lerobot.common.policies.tau0.local_visual_encoder import SmallCNN
+from src.opentau.policies.tau0.local_visual_encoder import SmallCNN
 
 
 @pytest.mark.slow  # ~ 7 sec

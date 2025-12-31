@@ -15,7 +15,7 @@
 # limitations under the License.
 from typing import Any
 
-from lerobot.common.utils.utils import format_big_number
+from src.opentau.utils.utils import format_big_number
 
 
 class AverageMeter:

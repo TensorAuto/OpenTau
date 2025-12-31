@@ -22,13 +22,13 @@ import draccus
 from huggingface_hub import hf_hub_download
 from huggingface_hub.errors import HfHubHTTPError
 
-from lerobot.common.envs.configs import EnvConfig
-from lerobot.common.optim import OptimizerConfig
-from lerobot.common.optim.schedulers import LRSchedulerConfig
-from lerobot.common.utils.hub import HubMixin
-from lerobot.configs import parser
-from lerobot.configs.default import DatasetMixtureConfig, EvalConfig, WandBConfig
-from lerobot.configs.policies import PreTrainedConfig
+from src.opentau.envs.configs import EnvConfig
+from src.opentau.optim import OptimizerConfig
+from src.opentau.optim.schedulers import LRSchedulerConfig
+from src.opentau.utils.hub import HubMixin
+from src.opentau.configs import parser
+from src.opentau.configs.default import DatasetMixtureConfig, EvalConfig, WandBConfig
+from src.opentau.configs.policies import PreTrainedConfig
 
 TRAIN_CONFIG_NAME = "train_config.json"
 

@@ -1,4 +1,4 @@
-r"python lerobot/scripts/get_advantage_and_percentiles.py  \
+r"python src/opentau/scripts/get_advantage_and_percentiles.py  \
 --config_path=outputs/train/2025-11-29/00-38-59_value/checkpoints/00520000 \
 --batch_size=20 \
 --dataloader_batch_size=20 \
@@ -30,19 +30,19 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from lerobot.common.datasets.factory import make_dataset
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.common.datasets.utils import ADVANTAGES_PATH
-from lerobot.common.policies.factory import get_policy_class
-from lerobot.common.policies.value.reward import calculate_n_step_return
-from lerobot.common.utils.random_utils import set_seed
-from lerobot.common.utils.utils import (
+from src.opentau.datasets.factory import make_dataset
+from src.opentau.datasets.lerobot_dataset import LeRobotDataset
+from src.opentau.datasets.utils import ADVANTAGES_PATH
+from src.opentau.policies.factory import get_policy_class
+from src.opentau.policies.value.reward import calculate_n_step_return
+from src.opentau.utils.random_utils import set_seed
+from src.opentau.utils.utils import (
     auto_torch_device,
     init_logging,
 )
-from lerobot.configs import parser
-from lerobot.configs.default import DatasetMixtureConfig
-from lerobot.configs.train import TrainPipelineConfig
+from src.opentau.configs import parser
+from src.opentau.configs.default import DatasetMixtureConfig
+from src.opentau.configs.train import TrainPipelineConfig
 
 
 def ensure_primitive(maybe_tensor):

@@ -1,9 +1,9 @@
 r"""
-This code is adapted from https://huggingface.co/datasets/agibot-world/AgiBotWorld-Alpha/resolve/main/scripts/convert_to_lerobot.py
+This code is adapted from https://huggingface.co/datasets/agibot-world/AgiBotWorld-Alpha/resolve/main/scripts/convert_to_src.opentau.py
 Running this script will convert the AgiBotWorld dataset at the source directory into lerobot format, and save it to the target directory.
 Beware of the additional storage consumption as AgiBotWorld dataset is very huge.
 Example usage:
-$ python3 lerobot/scripts/agibot_to_lerobot.py --src_path /input/path --tgt_path /output/path --task_id 1234
+$ python3 src/opentau/scripts/agibot_to_src.opentau.py --src_path /input/path --tgt_path /output/path --task_id 1234
 """
 
 import argparse
@@ -25,8 +25,8 @@ from PIL import Image
 from tqdm import tqdm
 from tqdm.contrib.concurrent import process_map
 
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.common.datasets.utils import (
+from src.opentau.datasets.lerobot_dataset import LeRobotDataset
+from src.opentau.datasets.utils import (
     STATS_PATH,
     check_timestamps_sync,
     get_episode_data_index,

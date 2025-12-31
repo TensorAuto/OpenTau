@@ -14,12 +14,12 @@
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from lerobot.common.constants import (
+from src.opentau.constants import (
     CHECKPOINTS_DIR,
     LAST_CHECKPOINT_LINK,
     TRAINING_STEP,
 )
-from lerobot.common.utils.train_utils import (
+from src.opentau.utils.train_utils import (
     get_step_checkpoint_dir,
     get_step_identifier,
     load_training_step,
@@ -77,8 +77,8 @@ def test_update_last_checkpoint(tmp_path):
 class TestPruneOldCheckpoints:
     """Test suite for the prune_old_checkpoints function."""
 
-    @patch("lerobot.common.utils.train_utils.shutil.rmtree")
-    @patch("lerobot.common.utils.train_utils.logging")
+    @patch("src.opentau.utils.train_utils.shutil.rmtree")
+    @patch("src.opentau.utils.train_utils.logging")
     def test_prune_old_checkpoints_success(self, mock_logging, mock_rmtree):
         """Test successful pruning of old checkpoints."""
         # Mock checkpoint directory structure
@@ -121,7 +121,7 @@ class TestPruneOldCheckpoints:
         mock_latest_checkpoint.resolve.return_value = Path("/path/to/checkpoints/000100")
         mock_latest_checkpoint.name = "000100"
 
-        with patch("lerobot.common.utils.train_utils.Path") as mock_path:
+        with patch("src.opentau.utils.train_utils.Path") as mock_path:
             mock_path.return_value.resolve.return_value = mock_latest_checkpoint
             mock_path.return_value.parent = mock_parent_dir
 
@@ -142,7 +142,7 @@ class TestPruneOldCheckpoints:
             mock_rmtree.assert_any_call(mock_old_checkpoint1)
             mock_rmtree.assert_any_call(mock_old_checkpoint2)
 
-    @patch("lerobot.common.utils.train_utils.logging")
+    @patch("src.opentau.utils.train_utils.logging")
     def test_prune_old_checkpoints_parent_dir_not_exists(self, mock_logging):
         """Test behavior when parent directory doesn't exist."""
         latest_checkpoint_path = "/nonexistent/path/checkpoint/000100"
@@ -153,7 +153,7 @@ class TestPruneOldCheckpoints:
         mock_parent_dir.resolve.return_value = Path("/nonexistent/path/checkpoint")
         mock_latest_checkpoint.parent = mock_parent_dir
 
-        with patch("lerobot.common.utils.train_utils.Path") as mock_path:
+        with patch("src.opentau.utils.train_utils.Path") as mock_path:
             mock_path.return_value.resolve.return_value = mock_latest_checkpoint
             mock_path.return_value.parent = mock_parent_dir
 
@@ -163,7 +163,7 @@ class TestPruneOldCheckpoints:
                 "Parent directory '/nonexistent/path/checkpoint' does not exist. Aborting cleanup."
             )
 
-    @patch("lerobot.common.utils.train_utils.logging")
+    @patch("src.opentau.utils.train_utils.logging")
     def test_prune_old_checkpoints_latest_not_directory(self, mock_logging):
         """Test behavior when latest checkpoint is not a directory."""
         latest_checkpoint_path = "/path/to/file.txt"
@@ -175,7 +175,7 @@ class TestPruneOldCheckpoints:
         mock_latest_checkpoint.parent = mock_parent_dir
         mock_latest_checkpoint.resolve.return_value = Path("/path/to/file.txt")
 
-        with patch("lerobot.common.utils.train_utils.Path") as mock_path:
+        with patch("src.opentau.utils.train_utils.Path") as mock_path:
             mock_path.return_value.resolve.return_value = mock_latest_checkpoint
             mock_path.return_value.parent = mock_parent_dir
 
@@ -185,8 +185,8 @@ class TestPruneOldCheckpoints:
                 "Checkpoint '/path/to/file.txt' is not a valid directory. Aborting cleanup."
             )
 
-    @patch("lerobot.common.utils.train_utils.shutil.rmtree")
-    @patch("lerobot.common.utils.train_utils.logging")
+    @patch("src.opentau.utils.train_utils.shutil.rmtree")
+    @patch("src.opentau.utils.train_utils.logging")
     def test_prune_old_checkpoints_no_old_checkpoints(self, mock_logging, mock_rmtree):
         """Test behavior when there are no old checkpoints to delete."""
         latest_checkpoint_path = "/path/to/checkpoints/000100"
@@ -219,7 +219,7 @@ class TestPruneOldCheckpoints:
         mock_latest_checkpoint.resolve.return_value = Path("/path/to/checkpoints/000100")
         mock_latest_checkpoint.name = "000100"
 
-        with patch("lerobot.common.utils.train_utils.Path") as mock_path:
+        with patch("src.opentau.utils.train_utils.Path") as mock_path:
             mock_path.return_value.resolve.return_value = mock_latest_checkpoint
             mock_path.return_value.parent = mock_parent_dir
 

@@ -5,8 +5,8 @@ import os
 from dotenv import load_dotenv
 from PIL import Image
 
-from lerobot.common.planner import NavHighLevelPlanner
-from lerobot.common.utils.utils import (
+from src.opentau.planner import NavHighLevelPlanner
+from src.opentau.utils.utils import (
     init_logging,
 )
 

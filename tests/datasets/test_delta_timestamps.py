@@ -21,9 +21,9 @@ import pyarrow.compute as pc
 import pytest
 import torch
 
-from lerobot.common.datasets.factory import resolve_delta_timestamps
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.common.datasets.utils import check_timestamps_sync
+from src.opentau.datasets.factory import resolve_delta_timestamps
+from src.opentau.datasets.lerobot_dataset import LeRobotDataset
+from src.opentau.datasets.utils import check_timestamps_sync
 from tests.fixtures.constants import DUMMY_MOTOR_FEATURES
 
 
@@ -299,8 +299,8 @@ def test_resolve_delta_timestamps_with_reward_action_features(
     assert "action" not in feature2group
 
 
-@patch("lerobot.common.policies.tau0.configuration_tau0.TAU0Config.action_delta_indices", [0, 1, 2, 3])
-@patch("lerobot.common.policies.tau0.configuration_tau0.TAU0Config.reward_delta_indices", [0, 1, 2])
+@patch("src.opentau.policies.tau0.configuration_tau0.TAU0Config.action_delta_indices", [0, 1, 2, 3])
+@patch("src.opentau.policies.tau0.configuration_tau0.TAU0Config.reward_delta_indices", [0, 1, 2])
 def test_resolve_delta_timestamps_with_delta_indices(
     train_pipeline_config, dataset_config, lerobot_dataset_metadata
 ):
@@ -326,8 +326,8 @@ def test_resolve_delta_timestamps_with_delta_indices(
     assert feature2group["actions"] == ("actions", None)
 
 
-@patch("lerobot.common.policies.tau0.configuration_tau0.TAU0Config.action_delta_indices", [0, 1, 2, 3])
-@patch("lerobot.common.policies.tau0.configuration_tau0.TAU0Config.reward_delta_indices", [0, 1, 2])
+@patch("src.opentau.policies.tau0.configuration_tau0.TAU0Config.action_delta_indices", [0, 1, 2, 3])
+@patch("src.opentau.policies.tau0.configuration_tau0.TAU0Config.reward_delta_indices", [0, 1, 2])
 def test_resolve_delta_timestamps_different_action_freq(
     train_pipeline_config, dataset_config, lerobot_dataset_metadata
 ):
@@ -559,7 +559,7 @@ def test_compute_delta_params_empty():
 # Tests for get_delta_indices_soft method
 def test_get_delta_indices_soft_basic():
     """Test basic functionality of get_delta_indices_soft."""
-    from lerobot.common.datasets.utils import get_delta_indices_soft
+    from src.opentau.datasets.utils import get_delta_indices_soft
 
     # Set up delta timestamps info (mean, std, lower, upper)
     delta_timestamps_info = (
@@ -589,7 +589,7 @@ def test_get_delta_indices_soft_basic():
 
 def test_get_delta_indices_soft_multiple_groups():
     """Test get_delta_indices_soft with multiple groups."""
-    from lerobot.common.datasets.utils import get_delta_indices_soft
+    from src.opentau.datasets.utils import get_delta_indices_soft
 
     # Set up delta timestamps info with multiple groups
     delta_timestamps_info = (
@@ -640,7 +640,7 @@ def test_get_delta_indices_soft_multiple_groups():
 
 def test_get_delta_indices_soft_zero_std():
     """Test get_delta_indices_soft with zero standard deviation (deterministic)."""
-    from lerobot.common.datasets.utils import get_delta_indices_soft
+    from src.opentau.datasets.utils import get_delta_indices_soft
 
     # Set up delta timestamps info with zero std
     delta_timestamps_info = (
@@ -667,7 +667,7 @@ def test_get_delta_indices_soft_zero_std():
 
 def test_get_delta_indices_soft_clipping():
     """Test that get_delta_indices_soft properly clips values to bounds."""
-    from lerobot.common.datasets.utils import get_delta_indices_soft
+    from src.opentau.datasets.utils import get_delta_indices_soft
 
     # Set up delta timestamps info with tight bounds
     delta_timestamps_info = (
@@ -692,7 +692,7 @@ def test_get_delta_indices_soft_clipping():
 
 def test_get_delta_indices_soft_different_fps():
     """Test get_delta_indices_soft with different FPS values."""
-    from lerobot.common.datasets.utils import get_delta_indices_soft
+    from src.opentau.datasets.utils import get_delta_indices_soft
 
     # Set up delta timestamps info
     delta_timestamps_info = (
@@ -746,7 +746,7 @@ def test_get_query_indices_soft_basic():
     type(dataset).fps = property(lambda self: 30)
 
     # Mock get_delta_indices_soft to return predictable values
-    with patch("lerobot.common.datasets.lerobot_dataset.get_delta_indices_soft") as mock_get_delta:
+    with patch("src.opentau.datasets.lerobot_dataset.get_delta_indices_soft") as mock_get_delta:
         mock_get_delta.return_value = {
             "input_group": np.array([-3.0, 0.0, 3.0])  # -0.1s, 0s, 0.1s * 30fps
         }
@@ -819,7 +819,7 @@ def test_get_query_indices_soft_no_padding():
     type(dataset).fps = property(lambda self: 30)
 
     # Mock get_delta_indices_soft to return small values
-    with patch("lerobot.common.datasets.lerobot_dataset.get_delta_indices_soft") as mock_get_delta:
+    with patch("src.opentau.datasets.lerobot_dataset.get_delta_indices_soft") as mock_get_delta:
         mock_get_delta.return_value = {
             "input_group": np.array([-1.0])  # Small offset
         }
@@ -864,7 +864,7 @@ def test_get_query_indices_soft_empty_feature2group():
     type(dataset).fps = property(lambda self: 30)
 
     # Mock get_delta_indices_soft
-    with patch("lerobot.common.datasets.lerobot_dataset.get_delta_indices_soft") as mock_get_delta:
+    with patch("src.opentau.datasets.lerobot_dataset.get_delta_indices_soft") as mock_get_delta:
         mock_get_delta.return_value = {"input_group": np.array([-3.0, 0.0, 3.0])}
 
         idx = 50
@@ -908,7 +908,7 @@ def test_get_query_indices_soft_edge_cases():
     type(dataset).fps = property(lambda self: 30)
 
     # Mock get_delta_indices_soft
-    with patch("lerobot.common.datasets.lerobot_dataset.get_delta_indices_soft") as mock_get_delta:
+    with patch("src.opentau.datasets.lerobot_dataset.get_delta_indices_soft") as mock_get_delta:
         mock_get_delta.return_value = {"input_group": np.array([-5.0, 0.0, 5.0])}
 
         # Test at episode start
@@ -1169,7 +1169,7 @@ def test_feature2group(lerobot_dataset, feature2group, delta_indices):
         patch.object(
             lerobot_dataset, "episode_data_index", new_callable=MagicMock
         ) as mock_episode_data_index,
-        patch("lerobot.common.datasets.lerobot_dataset.get_delta_indices_soft", return_value=delta_indices),
+        patch("src.opentau.datasets.lerobot_dataset.get_delta_indices_soft", return_value=delta_indices),
     ):
         # Configure the mocks just like before
         mock_from_item = MagicMock()

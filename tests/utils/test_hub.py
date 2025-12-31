@@ -2,7 +2,7 @@ import os
 
 import pytest
 
-from lerobot.common.utils.hub import HubMixin
+from src.opentau.utils.hub import HubMixin
 from tests.fixtures.utils import DummyHubMixin
 
 

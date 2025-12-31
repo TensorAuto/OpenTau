@@ -5,10 +5,10 @@ import numpy as np
 import torch
 from torch.utils.data import ConcatDataset, DataLoader, Sampler
 
-from lerobot.common.datasets.compute_stats import aggregate_stats
-from lerobot.common.datasets.lerobot_dataset import BaseDataset, DatasetMetadata
-from lerobot.common.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
-from lerobot.configs.train import TrainPipelineConfig
+from src.opentau.datasets.compute_stats import aggregate_stats
+from src.opentau.datasets.lerobot_dataset import BaseDataset, DatasetMetadata
+from src.opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
+from src.opentau.configs.train import TrainPipelineConfig
 
 
 def pad_vector(vector, new_dim):

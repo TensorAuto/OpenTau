@@ -14,8 +14,8 @@
 import pytest
 import torch
 
-from lerobot.common.optim.optimizers import AdamConfig
-from lerobot.common.optim.schedulers import VQBeTSchedulerConfig
+from src.opentau.optim.optimizers import AdamConfig
+from src.opentau.optim.schedulers import VQBeTSchedulerConfig
 
 
 @pytest.fixture

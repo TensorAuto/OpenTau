@@ -8,8 +8,8 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from lerobot.common.utils.hub import HubMixin
-from lerobot.common.utils.utils import (
+from src.opentau.utils.hub import HubMixin
+from src.opentau.utils.utils import (
     capture_timestamp_utc,
     encode_accelerator_state_dict,
     format_big_number,

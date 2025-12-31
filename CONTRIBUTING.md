@@ -106,9 +106,9 @@ Follow these steps to start contributing:
    [information](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository).
 
    ```bash
-   git clone git@github.com:<your Github handle>/lerobot.git
+   git clone git@github.com:<your Github handle>/src.opentau.git
    cd lerobot
-   git remote add upstream https://github.com/huggingface/lerobot.git
+   git remote add upstream https://github.com/huggingface/src.opentau.git
    ```
 
 3. Create a new branch to hold your development changes, and do this for every new PR you work on.

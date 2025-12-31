@@ -19,7 +19,7 @@ import os
 import pytest
 from huggingface_hub import HfApi
 
-from lerobot.common.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
+from src.opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
 from tests.utils import device
 
 # Set OpenGL platform to EGL for headless environments

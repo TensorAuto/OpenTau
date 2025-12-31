@@ -4,8 +4,8 @@ from typing import final
 
 import torch
 
-from lerobot.common.datasets.lerobot_dataset import CODEBASE_VERSION, BaseDataset, GroundingDatasetMetadata
-from lerobot.configs.train import TrainPipelineConfig
+from src.opentau.datasets.lerobot_dataset import CODEBASE_VERSION, BaseDataset, GroundingDatasetMetadata
+from src.opentau.configs.train import TrainPipelineConfig
 
 
 class GroundingDataset(BaseDataset):
@@ -16,7 +16,7 @@ class GroundingDataset(BaseDataset):
         self.meta = self.create_meta()
 
     def create_meta(self) -> GroundingDatasetMetadata:
-        from lerobot.common.datasets.factory import IMAGENET_STATS
+        from src.opentau.datasets.factory import IMAGENET_STATS
 
         info = {
             "codebase_version": CODEBASE_VERSION,

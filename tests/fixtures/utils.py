@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from huggingface_hub import hf_hub_download
 
-from lerobot.common.utils.hub import HubMixin
+from src.opentau.utils.hub import HubMixin
 
 hf_token = os.getenv("HUGGINGFACE_HUB_TOKEN")
 

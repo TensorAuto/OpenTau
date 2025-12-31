@@ -6,14 +6,14 @@ from pprint import pformat
 import torch
 from torch.utils.data._utils.collate import default_collate
 
-from lerobot.common.policies.factory import get_policy_class
-from lerobot.common.policies.pretrained import PreTrainedPolicy
-from lerobot.common.utils.libero import LiberoObservationRecorder, libero2torch, summarize_libero_results
-from lerobot.common.utils.monkey_patch import gym_is_gymnasium_patch
-from lerobot.common.utils.random_utils import set_seed
-from lerobot.common.utils.utils import auto_torch_device, init_logging
-from lerobot.configs import parser
-from lerobot.configs.libero import TrainConfigWithLiberoEval
+from src.opentau.policies.factory import get_policy_class
+from src.opentau.policies.pretrained import PreTrainedPolicy
+from src.opentau.utils.libero import LiberoObservationRecorder, libero2torch, summarize_libero_results
+from src.opentau.utils.monkey_patch import gym_is_gymnasium_patch
+from src.opentau.utils.random_utils import set_seed
+from src.opentau.utils.utils import auto_torch_device, init_logging
+from src.opentau.configs import parser
+from src.opentau.configs.libero import TrainConfigWithLiberoEval
 
 LIBERO_ACTION_DIM = 7
 

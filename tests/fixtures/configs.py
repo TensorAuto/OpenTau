@@ -2,9 +2,9 @@ from dataclasses import dataclass
 
 import pytest
 
-from lerobot.common.optim.optimizers import OptimizerConfig
-from lerobot.common.optim.schedulers import LRSchedulerConfig
-from lerobot.configs.policies import PreTrainedConfig
+from src.opentau.optim.optimizers import OptimizerConfig
+from src.opentau.optim.schedulers import LRSchedulerConfig
+from src.opentau.configs.policies import PreTrainedConfig
 
 
 @dataclass

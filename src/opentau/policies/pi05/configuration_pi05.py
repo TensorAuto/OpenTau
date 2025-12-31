@@ -15,12 +15,12 @@ import logging
 from dataclasses import dataclass, field
 from typing import Literal
 
-from lerobot.common.optim.optimizers import AdamWConfig
-from lerobot.common.optim.schedulers import (
+from src.opentau.optim.optimizers import AdamWConfig
+from src.opentau.optim.schedulers import (
     CosineDecayWithWarmupSchedulerConfig,
 )
-from lerobot.configs.policies import PreTrainedConfig
-from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
+from src.opentau.configs.policies import PreTrainedConfig
+from src.opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
 
 
 @PreTrainedConfig.register_subclass("pi05")

@@ -5,5 +5,5 @@ API Reference
    :toctree: _autosummary
    :recursive:
 
-   lerobot.common.policies
-   lerobot.common.datasets
+   src.opentau.policies
+   src.opentau.datasets

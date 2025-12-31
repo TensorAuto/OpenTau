@@ -3,7 +3,7 @@ modify source code of 3rd party libraries, such as transformers or even PyTorch 
 
 Where necessary, we can do
 
->>> from lerobot.common.utils.monkey_patch import torch_cumsum_patch, torch_pow_patch
+>>> from src.opentau.utils.monkey_patch import torch_cumsum_patch, torch_pow_patch
 >>> torch_cumsum_patch()  # Apply the patch to handle bool tensors in cumsum
 >>> torch_pow_patch()  # Apply the patch to handle mixed number-tensor exponentiation in pow
 

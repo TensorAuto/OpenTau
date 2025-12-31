@@ -13,7 +13,7 @@
 # limitations under the License.
 import pytest
 
-from lerobot.common.utils.logging_utils import AverageMeter, MetricsTracker
+from src.opentau.utils.logging_utils import AverageMeter, MetricsTracker
 
 
 @pytest.fixture

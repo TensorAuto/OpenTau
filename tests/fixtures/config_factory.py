@@ -1,9 +1,9 @@
 import pytest
 
-from lerobot.common.datasets.transforms import ImageTransformsConfig
-from lerobot.common.policies.tau0.configuration_tau0 import TAU0Config
-from lerobot.configs.default import DatasetConfig, DatasetMixtureConfig
-from lerobot.configs.train import TrainPipelineConfig
+from src.opentau.datasets.transforms import ImageTransformsConfig
+from src.opentau.policies.tau0.configuration_tau0 import TAU0Config
+from src.opentau.configs.default import DatasetConfig, DatasetMixtureConfig
+from src.opentau.configs.train import TrainPipelineConfig
 
 
 @pytest.fixture

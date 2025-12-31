@@ -36,11 +36,11 @@ from huggingface_hub.errors import RevisionNotFoundError
 
 import datasets
 from datasets import concatenate_datasets, load_dataset
-from lerobot.common.constants import HF_LEROBOT_HOME
-from lerobot.common.datasets.compute_stats import aggregate_stats, compute_episode_stats
-from lerobot.common.datasets.image_writer import AsyncImageWriter, write_image
-from lerobot.common.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING, LOSS_TYPE_MAPPING
-from lerobot.common.datasets.utils import (
+from src.opentau.constants import HF_OPENTAU_HOME
+from src.opentau.datasets.compute_stats import aggregate_stats, compute_episode_stats
+from src.opentau.datasets.image_writer import AsyncImageWriter, write_image
+from src.opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING, LOSS_TYPE_MAPPING
+from src.opentau.datasets.utils import (
     DEFAULT_FEATURES,
     DEFAULT_IMAGE_PATH,
     INFO_PATH,
@@ -71,18 +71,18 @@ from lerobot.common.datasets.utils import (
     write_info,
     write_json,
 )
-from lerobot.common.datasets.video_utils import (
+from src.opentau.datasets.video_utils import (
     decode_video_frames,
     encode_video_frames,
     get_safe_default_codec,
     get_video_info,
 )
-from lerobot.common.policies.value.configuration_value import ValueConfig
-from lerobot.common.policies.value.reward import (
+from src.opentau.policies.value.configuration_value import ValueConfig
+from src.opentau.policies.value.reward import (
     calculate_return_bins_with_equal_width,
 )
-from lerobot.common.utils.utils import on_accelerate_main_proc
-from lerobot.configs.train import TrainPipelineConfig
+from src.opentau.utils.utils import on_accelerate_main_proc
+from src.opentau.configs.train import TrainPipelineConfig
 
 
 def retry_random_on_failure(f):
@@ -185,7 +185,7 @@ class LeRobotDatasetMetadata(DatasetMetadata):
         super().__init__()
         self.repo_id = repo_id
         self.revision = revision if revision else CODEBASE_VERSION
-        self.root = Path(root) if root is not None else HF_LEROBOT_HOME / repo_id
+        self.root = Path(root) if root is not None else HF_OPENTAU_HOME / repo_id
 
         try:
             if force_cache_sync:
@@ -382,7 +382,7 @@ class LeRobotDatasetMetadata(DatasetMetadata):
         """Creates metadata for a LeRobotDataset."""
         obj = cls.__new__(cls)
         obj.repo_id = repo_id
-        obj.root = Path(root) if root is not None else HF_LEROBOT_HOME / repo_id
+        obj.root = Path(root) if root is not None else HF_OPENTAU_HOME / repo_id
 
         obj.root.mkdir(parents=True, exist_ok=False)
 
@@ -719,7 +719,7 @@ class LeRobotDataset(BaseDataset):
         super().__init__(cfg)
         self.cfg = cfg
         self.repo_id = repo_id
-        self.root = Path(root) if root else HF_LEROBOT_HOME / repo_id
+        self.root = Path(root) if root else HF_OPENTAU_HOME / repo_id
         self.image_transforms = image_transforms
         if bool(delta_timestamps) ^ bool(feature2group):
             raise ValueError(

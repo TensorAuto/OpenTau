@@ -13,8 +13,8 @@
 # limitations under the License.
 from torch.optim.lr_scheduler import LambdaLR
 
-from lerobot.common.constants import SCHEDULER_STATE
-from lerobot.common.optim.schedulers import (
+from src.opentau.constants import SCHEDULER_STATE
+from src.opentau.optim.schedulers import (
     ConstantSchedulerConfig,
     CosineDecayWithWarmupSchedulerConfig,
     DiffuserSchedulerConfig,

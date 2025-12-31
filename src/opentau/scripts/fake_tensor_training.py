@@ -2,9 +2,9 @@ from dataclasses import dataclass
 
 import torch
 
-from lerobot.common.utils.fake_tensor import FakeTensorContext
-from lerobot.common.utils.utils import auto_torch_device
-from lerobot.configs import parser
+from src.opentau.utils.fake_tensor import FakeTensorContext
+from src.opentau.utils.utils import auto_torch_device
+from src.opentau.configs import parser
 
 
 @dataclass

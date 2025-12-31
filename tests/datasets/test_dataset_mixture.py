@@ -21,13 +21,13 @@ import numpy as np
 import pytest
 import torch
 
-from lerobot.common.datasets.dataset_mixture import (
+from src.opentau.datasets.dataset_mixture import (
     DatasetMixtureMetadata,
     WeightedDatasetMixture,
     pad_vector,
 )
-from lerobot.common.datasets.factory import make_dataset
-from lerobot.configs.default import DatasetConfig
+from src.opentau.datasets.factory import make_dataset
+from src.opentau.configs.default import DatasetConfig
 
 
 class TestPadVector:
@@ -67,7 +67,7 @@ class TestPadVector:
 class TestDatasetMixtureMetadata:
     """Test the DatasetMixtureMetadata class."""
 
-    @patch("lerobot.common.datasets.dataset_mixture.DATA_FEATURES_NAME_MAPPING")
+    @patch("src.opentau.datasets.dataset_mixture.DATA_FEATURES_NAME_MAPPING")
     def test_init_success(self, mock_name_mapping, train_pipeline_config, lerobot_dataset_metadata):
         """Test successful initialization of DatasetMixtureMetadata."""
         # Mock the name mapping
@@ -87,7 +87,7 @@ class TestDatasetMixtureMetadata:
         assert "actions" in metadata_mixture.stats
         assert "camera0" in metadata_mixture.stats
 
-    @patch("lerobot.common.datasets.dataset_mixture.DATA_FEATURES_NAME_MAPPING")
+    @patch("src.opentau.datasets.dataset_mixture.DATA_FEATURES_NAME_MAPPING")
     def test_to_standard_data_format(self, mock_name_mapping, train_pipeline_config):
         """Test _to_standard_data_format method."""
         # Mock the name mapping
@@ -134,7 +134,7 @@ class TestDatasetMixtureMetadata:
         assert "local_camera1" in result
         assert "local_camera2" not in result
 
-    @patch("lerobot.common.datasets.dataset_mixture.DATA_FEATURES_NAME_MAPPING")
+    @patch("src.opentau.datasets.dataset_mixture.DATA_FEATURES_NAME_MAPPING")
     def test_to_standard_data_format_missing_key(self, mock_name_mapping, train_pipeline_config):
         """Test _to_standard_data_format with missing key."""
         # Mock the name mapping to include a key not in stats
@@ -150,7 +150,7 @@ class TestDatasetMixtureMetadata:
         with pytest.raises(KeyError, match="Key 'missing_key' not found in stats"):
             metadata_mixture._to_standard_data_format("test_dataset", stats)
 
-    @patch("lerobot.common.datasets.dataset_mixture.DATA_FEATURES_NAME_MAPPING")
+    @patch("src.opentau.datasets.dataset_mixture.DATA_FEATURES_NAME_MAPPING")
     def test_to_standard_data_format_missing_stats(self, mock_name_mapping, train_pipeline_config):
         """Test _to_standard_data_format with missing required statistics."""
         # Mock the name mapping

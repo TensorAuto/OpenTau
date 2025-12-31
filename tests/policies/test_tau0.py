@@ -18,20 +18,20 @@ import pytest
 import torch
 from torch import nn
 
-from lerobot.common.policies.tau0.configuration_tau0 import TAU0Config
-from lerobot.common.policies.tau0.modeling_tau0 import (
+from src.opentau.policies.tau0.configuration_tau0 import TAU0Config
+from src.opentau.policies.tau0.modeling_tau0 import (
     TAU0FlowMatching,
     TAU0Policy,
     create_sinusoidal_pos_embedding,
     make_att_2d_masks,
     sample_beta,
 )
-from lerobot.common.policies.tau0.paligemma_with_expert import (
+from src.opentau.policies.tau0.paligemma_with_expert import (
     PaliGemmaWithExpertConfig,
     PaliGemmaWithExpertModel,
     apply_rope,
 )
-from lerobot.common.utils.fake_tensor import FakeTensorContext, run_with_fake_tensor
+from src.opentau.utils.fake_tensor import FakeTensorContext, run_with_fake_tensor
 
 
 class TestTAU0Policy:
@@ -59,8 +59,8 @@ class TestTAU0Policy:
         assert hasattr(policy_cloud, "language_tokenizer")
         assert hasattr(policy_cloud, "model")
 
-    @patch("lerobot.common.policies.tau0.modeling_tau0.TAU0FlowMatching")
-    @patch("lerobot.common.policies.tau0.modeling_tau0.AutoTokenizer")
+    @patch("src.opentau.policies.tau0.modeling_tau0.TAU0FlowMatching")
+    @patch("src.opentau.policies.tau0.modeling_tau0.AutoTokenizer")
     @run_with_fake_tensor
     def test_tau0_policy_set_execution_target(
         self, mock_autotokenizer, mock_tau0flowmatching, tau0_training_config
@@ -165,7 +165,7 @@ class TestTAU0Policy:
     @pytest.mark.slow  # 1 mins
     def test_tau0_policy_select_action(self, tau0, tau0_training_config):
         """Test action selection."""
-        from lerobot.common.utils.utils import create_dummy_observation
+        from src.opentau.utils.utils import create_dummy_observation
 
         observation = create_dummy_observation(tau0_training_config, "cuda")
         observation["camera1"] = observation["camera0"]  # HACK: tau0_training_config expects 2 cameras
@@ -177,7 +177,7 @@ class TestTAU0Policy:
 
     def test_transform_state_dict_keys(self):
         """Test _transform_state_dict_keys method with various key transformations."""
-        from lerobot.common.policies.tau0.modeling_tau0 import TAU0Policy
+        from src.opentau.policies.tau0.modeling_tau0 import TAU0Policy
 
         # Test case 1: Basic key transformations
         state_dict = {
@@ -211,7 +211,7 @@ class TestTAU0Policy:
 
     def test_transform_state_dict_keys_tied_weights_lm_head_only(self):
         """Test tied weights handling when only lm_head.weight is present."""
-        from lerobot.common.policies.tau0.modeling_tau0 import TAU0Policy
+        from src.opentau.policies.tau0.modeling_tau0 import TAU0Policy
 
         state_dict = {
             "model.paligemma_with_expert.paligemma.lm_head.weight": torch.randn(2, 2),
@@ -229,7 +229,7 @@ class TestTAU0Policy:
 
     def test_transform_state_dict_keys_tied_weights_embed_tokens_only(self):
         """Test tied weights handling when only embed_tokens.weight is present."""
-        from lerobot.common.policies.tau0.modeling_tau0 import TAU0Policy
+        from src.opentau.policies.tau0.modeling_tau0 import TAU0Policy
 
         state_dict = {
             "model.paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight": torch.randn(
@@ -249,7 +249,7 @@ class TestTAU0Policy:
 
     def test_transform_state_dict_keys_tied_weights_both_present(self):
         """Test tied weights handling when both lm_head.weight and embed_tokens.weight are present."""
-        from lerobot.common.policies.tau0.modeling_tau0 import TAU0Policy
+        from src.opentau.policies.tau0.modeling_tau0 import TAU0Policy
 
         state_dict = {
             "model.paligemma_with_expert.paligemma.lm_head.weight": torch.randn(100, 200),
@@ -272,7 +272,7 @@ class TestTAU0Policy:
 
     def test_transform_state_dict_keys_no_tied_weights(self):
         """Test when neither lm_head.weight nor embed_tokens.weight are present."""
-        from lerobot.common.policies.tau0.modeling_tau0 import TAU0Policy
+        from src.opentau.policies.tau0.modeling_tau0 import TAU0Policy
 
         state_dict = {
             "model.paligemma_with_expert.paligemma.vision_tower.conv1.weight": torch.randn(2, 2),
@@ -288,7 +288,7 @@ class TestTAU0Policy:
 
     def test_transform_state_dict_keys_empty_dict(self):
         """Test with empty state dict."""
-        from lerobot.common.policies.tau0.modeling_tau0 import TAU0Policy
+        from src.opentau.policies.tau0.modeling_tau0 import TAU0Policy
 
         state_dict = {}
         transformed = TAU0Policy._transform_state_dict_keys(state_dict)
@@ -296,7 +296,7 @@ class TestTAU0Policy:
 
     def test_transform_state_dict_keys_no_transformations(self):
         """Test with keys that don't need transformation."""
-        from lerobot.common.policies.tau0.modeling_tau0 import TAU0Policy
+        from src.opentau.policies.tau0.modeling_tau0 import TAU0Policy
 
         state_dict = {
             "model.paligemma_with_expert.gemma_expert.weight": torch.randn(2),
@@ -310,11 +310,11 @@ class TestTAU0Policy:
 
     @pytest.mark.slow  # 3s
     @patch("safetensors.torch.load_file")
-    @patch("lerobot.common.policies.tau0.modeling_tau0.log_model_loading_keys")
+    @patch("src.opentau.policies.tau0.modeling_tau0.log_model_loading_keys")
     @run_with_fake_tensor
     def test_load_as_safetensor_success(self, mock_log_keys, mock_load_file, tau0_training_config):
         """Test successful loading of safetensor file."""
-        from lerobot.common.policies.tau0.modeling_tau0 import TAU0Policy
+        from src.opentau.policies.tau0.modeling_tau0 import TAU0Policy
 
         # Mock the state dict that would be loaded from file
         mock_state_dict = {
@@ -340,10 +340,10 @@ class TestTAU0Policy:
 
     @pytest.mark.slow  # 3s
     @patch("safetensors.torch.load_file")
-    @patch("lerobot.common.policies.tau0.modeling_tau0.log_model_loading_keys")
+    @patch("src.opentau.policies.tau0.modeling_tau0.log_model_loading_keys")
     def test_load_as_safetensor_with_missing_keys(self, mock_log_keys, mock_load_file, tau0_training_config):
         """Test loading with missing keys."""
-        from lerobot.common.policies.tau0.modeling_tau0 import TAU0Policy
+        from src.opentau.policies.tau0.modeling_tau0 import TAU0Policy
 
         mock_state_dict = {
             "model.paligemma_with_expert.paligemma.language_model.lm_head.weight": torch.randn(257152, 200),
@@ -372,7 +372,7 @@ class TestTAU0Policy:
     @patch("safetensors.torch.load_file")
     def test_load_as_safetensor_key_transformation(self, mock_load_file, tau0_training_config):
         """Test that key transformations are applied during loading."""
-        from lerobot.common.policies.tau0.modeling_tau0 import TAU0Policy
+        from src.opentau.policies.tau0.modeling_tau0 import TAU0Policy
 
         # Mock state dict with keys that need transformation
         mock_state_dict = {
@@ -417,7 +417,7 @@ class TestTAU0Policy:
     @patch("safetensors.torch.load_file")
     def test_load_as_safetensor_different_map_location(self, mock_load_file, tau0_training_config):
         """Test loading with different map_location."""
-        from lerobot.common.policies.tau0.modeling_tau0 import TAU0Policy
+        from src.opentau.policies.tau0.modeling_tau0 import TAU0Policy
 
         mock_state_dict = {"test.weight": torch.randn(10, 10)}
         mock_load_file.return_value = mock_state_dict
@@ -436,7 +436,7 @@ class TestTAU0Policy:
     @patch("safetensors.torch.load_file")
     def test_load_as_safetensor_strict_false(self, mock_load_file, tau0_training_config):
         """Test loading with strict=False."""
-        from lerobot.common.policies.tau0.modeling_tau0 import TAU0Policy
+        from src.opentau.policies.tau0.modeling_tau0 import TAU0Policy
 
         mock_state_dict = {"test.weight": torch.randn(10, 10)}
         mock_load_file.return_value = mock_state_dict

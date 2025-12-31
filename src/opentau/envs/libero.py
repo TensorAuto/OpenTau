@@ -29,7 +29,7 @@ from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 from robosuite.utils.transform_utils import quat2axisangle
 
-from lerobot.common.utils.accelerate_utils import acc_print
+from src.opentau.utils.accelerate_utils import acc_print
 
 
 def _parse_camera_names(camera_name: str | Sequence[str]) -> list[str]:

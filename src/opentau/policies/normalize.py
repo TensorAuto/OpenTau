@@ -18,7 +18,7 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
+from src.opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
 
 EPS = 1e-8  # Small epsilon value for numerical stability in normalization
 

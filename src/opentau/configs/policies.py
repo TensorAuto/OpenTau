@@ -22,10 +22,10 @@ from huggingface_hub import hf_hub_download
 from huggingface_hub.constants import CONFIG_NAME
 from huggingface_hub.errors import HfHubHTTPError
 
-from lerobot.common.optim.optimizers import OptimizerConfig
-from lerobot.common.optim.schedulers import LRSchedulerConfig
-from lerobot.common.utils.hub import HubMixin
-from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
+from src.opentau.optim.optimizers import OptimizerConfig
+from src.opentau.optim.schedulers import LRSchedulerConfig
+from src.opentau.utils.hub import HubMixin
+from src.opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
 
 # Generic variable that is either PreTrainedConfig or a subclass thereof
 T = TypeVar("T", bound="PreTrainedConfig")

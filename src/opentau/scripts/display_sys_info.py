@@ -24,7 +24,7 @@ HAS_HF_HUB = True
 HAS_HF_DATASETS = True
 HAS_NP = True
 HAS_TORCH = True
-HAS_LEROBOT = True
+HAS_OPENTAU = True
 
 try:
     import huggingface_hub
@@ -47,12 +47,12 @@ except ImportError:
     HAS_TORCH = False
 
 try:
-    import lerobot
+    import src.opentau
 except ImportError:
-    HAS_LEROBOT = False
+    HAS_OPENTAU = False
 
 
-lerobot_version = lerobot.__version__ if HAS_LEROBOT else "N/A"
+opentau_version = src.opentau.__version__ if HAS_OPENTAU else "N/A"
 hf_hub_version = huggingface_hub.__version__ if HAS_HF_HUB else "N/A"
 hf_datasets_version = datasets.__version__ if HAS_HF_DATASETS else "N/A"
 np_version = np.__version__ if HAS_NP else "N/A"
@@ -62,11 +62,10 @@ torch_cuda_available = torch.cuda.is_available() if HAS_TORCH else "N/A"
 cuda_version = torch._C._cuda_getCompiledVersion() if HAS_TORCH and torch.version.cuda is not None else "N/A"
 
 
-# TODO(aliberts): refactor into an actual command `lerobot env`
 def display_sys_info() -> dict:
     """Run this to get basic system info to help for tracking issues & bugs."""
     info = {
-        "`lerobot` version": lerobot_version,
+        "`opentau` version": opentau_version,
         "Platform": platform.platform(),
         "Python version": platform.python_version(),
         "Huggingface_hub version": hf_hub_version,

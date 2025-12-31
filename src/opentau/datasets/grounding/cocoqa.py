@@ -6,9 +6,9 @@ import torch
 from PIL import Image
 
 from datasets import load_dataset
-from lerobot import register_grounding_dataset
-from lerobot.common.datasets.grounding.base import GroundingDataset
-from lerobot.configs.train import TrainPipelineConfig
+from src.opentau import register_grounding_dataset
+from src.opentau.datasets.grounding.base import GroundingDataset
+from src.opentau.configs.train import TrainPipelineConfig
 
 logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 

@@ -4,9 +4,9 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from lerobot.common.policies.pi0.configuration_pi0 import PI0Config
-from lerobot.common.policies.pi0.modeling_pi0 import PI0Policy
-from lerobot.configs.types import FeatureType, PolicyFeature
+from src.opentau.policies.pi0.configuration_pi0 import PI0Config
+from src.opentau.policies.pi0.modeling_pi0 import PI0Policy
+from src.opentau.configs.types import FeatureType, PolicyFeature
 
 
 @pytest.fixture
@@ -24,8 +24,8 @@ def pi0_config():
     return config
 
 
-@patch("lerobot.common.policies.pi0.modeling_pi0.AutoTokenizer")
-@patch("lerobot.common.policies.pi0.modeling_pi0.PI0FlowMatching")
+@patch("src.opentau.policies.pi0.modeling_pi0.AutoTokenizer")
+@patch("src.opentau.policies.pi0.modeling_pi0.PI0FlowMatching")
 def test_prepare_language_advantage_conditioning(mock_flow_matching, mock_auto_tokenizer, pi0_config):
     # Setup mock tokenizer
     mock_tokenizer_instance = mock_auto_tokenizer.from_pretrained.return_value
@@ -60,8 +60,8 @@ def test_prepare_language_advantage_conditioning(mock_flow_matching, mock_auto_t
     )
 
 
-@patch("lerobot.common.policies.pi0.modeling_pi0.AutoTokenizer")
-@patch("lerobot.common.policies.pi0.modeling_pi0.PI0FlowMatching")
+@patch("src.opentau.policies.pi0.modeling_pi0.AutoTokenizer")
+@patch("src.opentau.policies.pi0.modeling_pi0.PI0FlowMatching")
 def test_prepare_language_no_advantage(mock_flow_matching, mock_auto_tokenizer, pi0_config):
     # Setup mock tokenizer
     mock_tokenizer_instance = mock_auto_tokenizer.from_pretrained.return_value
@@ -93,8 +93,8 @@ def test_prepare_language_no_advantage(mock_flow_matching, mock_auto_tokenizer, 
     )
 
 
-@patch("lerobot.common.policies.pi0.modeling_pi0.AutoTokenizer")
-@patch("lerobot.common.policies.pi0.modeling_pi0.PI0FlowMatching")
+@patch("src.opentau.policies.pi0.modeling_pi0.AutoTokenizer")
+@patch("src.opentau.policies.pi0.modeling_pi0.PI0FlowMatching")
 def test_prepare_language_existing_newline(mock_flow_matching, mock_auto_tokenizer, pi0_config):
     # Test case where prompt already ends with newline
     mock_tokenizer_instance = mock_auto_tokenizer.from_pretrained.return_value

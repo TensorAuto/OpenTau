@@ -19,11 +19,11 @@ from pathlib import Path
 import torch
 from safetensors.torch import save_file
 
-from lerobot.common.datasets.factory import make_dataset_mixture
-from lerobot.common.policies.factory import make_policy, make_policy_config
-from lerobot.common.utils.random_utils import set_seed
-from lerobot.configs.default import DatasetConfig, DatasetMixtureConfig
-from lerobot.configs.train import TrainPipelineConfig
+from src.opentau.datasets.factory import make_dataset_mixture
+from src.opentau.policies.factory import make_policy, make_policy_config
+from src.opentau.utils.random_utils import set_seed
+from src.opentau.configs.default import DatasetConfig, DatasetMixtureConfig
+from src.opentau.configs.train import TrainPipelineConfig
 
 
 def get_policy_stats(ds_repo_id: str, policy_name: str, policy_kwargs: dict):
