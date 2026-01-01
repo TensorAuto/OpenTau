@@ -13,21 +13,20 @@
 # limitations under the License.
 
 name: "\U0001F41B Bug Report"
-description: Submit a bug report to help us improve LeRobot
+description: Submit a bug report to help us improve OpenTau
 body:
   - type: markdown
     attributes:
       value: |
         Thanks for taking the time to submit a bug report! 🐛
-        If this is not a bug related to the LeRobot library directly, but instead a general question about your code or the library specifically please use our [discord](https://discord.gg/s3KuuzsPFb).
 
   - type: textarea
     id: system-info
     attributes:
       label: System Info
-      description: If needed, you can share your lerobot configuration with us by running `python -m opentau.scripts.display_sys_info` and copy-pasting its outputs below
+      description: If needed, you can share your OpenTau configuration with us by running `python -m opentau.scripts.display_sys_info` and copy-pasting its outputs below
       render: Shell
-      placeholder: lerobot version, OS, python version, numpy version, torch version, and lerobot's configuration
+      placeholder: OpenTau version, OS, python version, numpy version, torch version, and OpenTau's configuration
     validations:
       required: true
 
@@ -37,7 +36,7 @@ body:
       label: Information
       description: 'The problem arises when using:'
       options:
-        - label: "One of the scripts in the examples/ folder of LeRobot"
+        - label: "One of the scripts in the src/opentau/scripts/ folder of OpenTau"
         - label: "My own task or dataset (give details below)"
 
   - type: textarea

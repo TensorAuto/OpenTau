@@ -2,11 +2,12 @@
 Explain what this PR does. Feel free to tag your PR with the appropriate label(s).
 
 Examples:
-|  Title               | Label           |
-|----------------------|-----------------|
-| Fixes #[issue]       | (🐛 Bug)        |
-| Adds new dataset     | (🗃️ Dataset)    |
-| Optimizes something  | (⚡️ Performance) |
+|  Title               | Label               |
+|----------------------|---------------------|
+| Fixes #[issue]       | (🐛 Bug)            |
+| Adds new Feature     | (🗃️ Feature)        |
+| Optimizes something  | (⚡️ Performance)    |
+| Updates docs         | (📝 Documentation)  |
 
 ## How it was tested
 Explain/show how you tested your changes.
@@ -27,8 +28,4 @@ pytest -sx tests/test_stuff.py::test_something
 python lerobot/scripts/train.py --some.option=true
 ```
 
-## SECTION TO REMOVE BEFORE SUBMITTING YOUR PR
-**Note**: Anyone in the community is free to review the PR once the tests have passed. Feel free to tag
-members/contributors who may be interested in your PR. Try to avoid tagging more than 3 people.
-
-**Note**: Before submitting this PR, please read the [contributor guideline](https://github.com/huggingface/lerobot/blob/main/CONTRIBUTING.md#submitting-a-pull-request-pr).
+### Note: Before submitting this PR, please read the [contributor guideline](https://github.com/TensorAuto/OpenTau/blob/main/CONTRIBUTING.md).
