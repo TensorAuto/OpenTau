@@ -445,6 +445,15 @@ wheels = [
 ]
 
 [[package]]
+name = "decorator"
+version = "5.2.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/43/fa/6d96a0978d19e17b68d634497769987b16c8f4cd0a7a05048bec693caa6b/decorator-5.2.1.tar.gz", hash = "sha256:65f266143752f734b0a7cc83c46f4618af75b8c5911b00ccb61d0ac9b6da0360", size = 56711, upload-time = "2025-02-24T04:41:34.073Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4e/8c/f3147f5c4b73e7550fe5f9352eaa956ae838d5c51eb58e7a25b9f3e2643b/decorator-5.2.1-py3-none-any.whl", hash = "sha256:d316bb415a2d9e2d2b3abcc4084c6502fc09240e292cd76a76afc106a1c8e04a", size = 9190, upload-time = "2025-02-24T04:41:32.565Z" },
+]
+
+[[package]]
 name = "deepdiff"
 version = "8.6.1"
 source = { registry = "https://pypi.org/simple" }
@@ -613,6 +622,15 @@ wheels = [
 ]
 
 [[package]]
+name = "farama-notifications"
+version = "0.0.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/2e/2c/8384832b7a6b1fd6ba95bbdcae26e7137bb3eedc955c42fd5cdcc086cfbf/Farama-Notifications-0.0.4.tar.gz", hash = "sha256:13fceff2d14314cf80703c8266462ebf3733c7d165336eee998fc58e545efd18", size = 2131, upload-time = "2023-02-27T18:28:41.047Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/05/2c/ffc08c54c05cdce6fbed2aeebc46348dbe180c6d2c541c7af7ba0aa5f5f8/Farama_Notifications-0.0.4-py3-none-any.whl", hash = "sha256:14de931035a41961f7c056361dc7f980762a143d05791ef5794a751a2caf05ae", size = 2511, upload-time = "2023-02-27T18:28:39.447Z" },
+]
+
+[[package]]
 name = "fasteners"
 version = "0.20"
 source = { registry = "https://pypi.org/simple" }
@@ -629,15 +647,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/20/b5/23b216d9d985a9566
 wheels = [
     { url = "https://files.pythonhosted.org/packages/cb/a8/20d0723294217e47de6d9e2e40fd4a9d2f7c4b6ef974babd482a59743694/fastjsonschema-2.21.2-py3-none-any.whl", hash = "sha256:1c797122d0a86c5cace2e54bf4e819c36223b552017172f32c5c024a6b77e463", size = 24024, upload-time = "2025-08-14T18:49:34.776Z" },
 ]
-
-[[package]]
-name = "feetech-servo-sdk"
-version = "1.0.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "pyserial" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/5f/8e/c53d6f9a8bf3a86a635b58eeb675723f1b040f1665a0681467756c8989aa/feetech-servo-sdk-1.0.0.tar.gz", hash = "sha256:d4d3832e4b1b22a8222133a414db9f868224c2fb639426a1b11d96ddfe84e69c", size = 8392, upload-time = "2022-11-08T03:44:45.269Z" }
 
 [[package]]
 name = "filelock"
@@ -833,6 +842,29 @@ wheels = [
 ]
 
 [[package]]
+name = "gymnasium"
+version = "1.2.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cloudpickle" },
+    { name = "farama-notifications" },
+    { name = "numpy" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/76/59/653a9417d98ed3e29ef9734ba52c3495f6c6823b8d5c0c75369f25111708/gymnasium-1.2.3.tar.gz", hash = "sha256:2b2cb5b5fbbbdf3afb9f38ca952cc48aa6aa3e26561400d940747fda3ad42509", size = 829230, upload-time = "2025-12-18T16:51:10.234Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/56/d3/ea5f088e3638dbab12e5c20d6559d5b3bdaeaa1f2af74e526e6815836285/gymnasium-1.2.3-py3-none-any.whl", hash = "sha256:e6314bba8f549c7fdcc8677f7cd786b64908af6e79b57ddaa5ce1825bffb5373", size = 952113, upload-time = "2025-12-18T16:51:08.445Z" },
+]
+
+[package.optional-dependencies]
+other = [
+    { name = "matplotlib" },
+    { name = "moviepy" },
+    { name = "opencv-python" },
+    { name = "seaborn" },
+]
+
+[[package]]
 name = "h11"
 version = "0.16.0"
 source = { registry = "https://pypi.org/simple" }
@@ -969,20 +1001,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/cc/3f/2c29224acb2e2df4d2046e4c73ee2662023c58ff5b113c4c1adac0886c43/humanfriendly-10.0.tar.gz", hash = "sha256:6b0b831ce8f15f7300721aa49829fc4e83921a9a301cc7f606be6686a2288ddc", size = 360702, upload-time = "2021-09-17T21:40:43.31Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/f0/0f/310fb31e39e2d734ccaa2c0fb981ee41f7bd5056ce9bc29b2248bd569169/humanfriendly-10.0-py2.py3-none-any.whl", hash = "sha256:1697e1a8a8f550fd43c2865cd84542fc175a61dcb779b6fee18cf6b6ccba1477", size = 86794, upload-time = "2021-09-17T21:40:39.897Z" },
-]
-
-[[package]]
-name = "hydra-core"
-version = "1.3.2"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "antlr4-python3-runtime" },
-    { name = "omegaconf" },
-    { name = "packaging" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/6d/8e/07e42bc434a847154083b315779b0a81d567154504624e181caf2c71cd98/hydra-core-1.3.2.tar.gz", hash = "sha256:8a878ed67216997c3e9d88a8e72e7b4767e81af37afb4ea3334b269a4390a824", size = 3263494, upload-time = "2023-02-23T18:33:43.03Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/c6/50/e0edd38dcd63fb26a8547f13d28f7a008bc4a3fd4eb4ff030673f22ad41a/hydra_core-1.3.2-py3-none-any.whl", hash = "sha256:fa0238a9e31df3373b35b0bfb672c34cc92718d21f81311d8996a16de1141d8b", size = 154547, upload-time = "2023-02-23T18:33:40.801Z" },
 ]
 
 [[package]]
@@ -1373,6 +1391,24 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/41/79/7433f30ee04bd4faa303844048f55e1eb939131c8e5195a00a96a0939b64/ml_dtypes-0.5.4-cp310-cp310-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:b4b801ebe0b477be666696bda493a9be8356f1f0057a57f1e35cd26928823e5a", size = 5051883, upload-time = "2025-11-17T22:31:33.658Z" },
     { url = "https://files.pythonhosted.org/packages/10/b1/8938e8830b0ee2e167fc75a094dea766a1152bde46752cd9bfc57ee78a82/ml_dtypes-0.5.4-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:388d399a2152dd79a3f0456a952284a99ee5c93d3e2f8dfe25977511e0515270", size = 5030369, upload-time = "2025-11-17T22:31:35.595Z" },
     { url = "https://files.pythonhosted.org/packages/c7/a3/51886727bd16e2f47587997b802dd56398692ce8c6c03c2e5bb32ecafe26/ml_dtypes-0.5.4-cp310-cp310-win_amd64.whl", hash = "sha256:4ff7f3e7ca2972e7de850e7b8fcbb355304271e2933dd90814c1cb847414d6e2", size = 210738, upload-time = "2025-11-17T22:31:37.43Z" },
+]
+
+[[package]]
+name = "moviepy"
+version = "2.2.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "decorator" },
+    { name = "imageio" },
+    { name = "imageio-ffmpeg" },
+    { name = "numpy" },
+    { name = "pillow" },
+    { name = "proglog" },
+    { name = "python-dotenv" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/de/61/15f9476e270f64c78a834e7459ca045d669f869cec24eed26807b8cd479d/moviepy-2.2.1.tar.gz", hash = "sha256:c80cb56815ece94e5e3e2d361aa40070eeb30a09d23a24c4e684d03e16deacb1", size = 58431438, upload-time = "2025-05-21T19:31:52.601Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9a/73/7d3b2010baa0b5eb1e4dfa9e4385e89b6716be76f2fa21a6c0fe34b68e5a/moviepy-2.2.1-py3-none-any.whl", hash = "sha256:6b56803fec2ac54b557404126ac1160e65448e03798fa282bd23e8fab3795060", size = 129871, upload-time = "2025-05-21T19:31:50.11Z" },
 ]
 
 [[package]]
@@ -1897,10 +1933,12 @@ name = "opentau"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "accelerate" },
     { name = "av" },
     { name = "cmake" },
     { name = "datasets" },
     { name = "deepdiff" },
+    { name = "deepspeed" },
     { name = "diffusers" },
     { name = "draccus" },
     { name = "einops" },
@@ -1919,40 +1957,36 @@ dependencies = [
     { name = "onnxscript" },
     { name = "opencv-python-headless" },
     { name = "packaging" },
+    { name = "pandas" },
     { name = "pymunk" },
     { name = "pynput" },
+    { name = "pyserial" },
+    { name = "pytest" },
+    { name = "pytest-cov" },
+    { name = "pytest-xdist" },
     { name = "pyzmq" },
-    { name = "r3m" },
     { name = "rerun-sdk" },
+    { name = "scikit-image" },
     { name = "scikit-learn" },
+    { name = "scipy" },
     { name = "termcolor" },
     { name = "torch" },
     { name = "torchcodec", marker = "(platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l' and sys_platform == 'linux') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32')" },
     { name = "torchvision" },
+    { name = "transformers" },
     { name = "wandb" },
     { name = "zarr" },
 ]
 
 [package.optional-dependencies]
 dev = [
-    { name = "accelerate" },
     { name = "debugpy" },
-    { name = "deepspeed" },
-    { name = "feetech-servo-sdk" },
-    { name = "pandas" },
+    { name = "myst-parser" },
     { name = "pre-commit" },
-    { name = "pynput" },
     { name = "pyserial" },
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "pytest-xdist" },
-    { name = "pyudev" },
-    { name = "scikit-image" },
-    { name = "scipy" },
-    { name = "transformers" },
-]
-doc = [
-    { name = "myst-parser" },
     { name = "sphinx" },
     { name = "sphinx-copybutton" },
     { name = "sphinx-design" },
@@ -1964,6 +1998,7 @@ libero = [
     { name = "easydict" },
     { name = "future" },
     { name = "gym" },
+    { name = "gymnasium", extra = ["other"] },
     { name = "libero" },
     { name = "matplotlib" },
     { name = "mujoco" },
@@ -1982,7 +2017,7 @@ openai = [
 
 [package.metadata]
 requires-dist = [
-    { name = "accelerate", marker = "extra == 'dev'", specifier = ">=1.4.0" },
+    { name = "accelerate", specifier = ">=1.4.0" },
     { name = "av", specifier = ">=12.0.5" },
     { name = "bddl", marker = "extra == 'libero'", specifier = "==1.0.1" },
     { name = "cmake", specifier = ">=3.29.0.1" },
@@ -1990,16 +2025,16 @@ requires-dist = [
     { name = "datasets", specifier = ">=2.19.0" },
     { name = "debugpy", marker = "extra == 'dev'", specifier = ">=1.8.1" },
     { name = "deepdiff", specifier = ">=7.0.1" },
-    { name = "deepspeed", marker = "extra == 'dev'", specifier = ">=0.17.1" },
+    { name = "deepspeed", specifier = ">=0.17.1" },
     { name = "diffusers", specifier = ">=0.27.2" },
     { name = "draccus", specifier = ">=0.10.0" },
     { name = "easydict", marker = "extra == 'libero'", specifier = "==1.9" },
     { name = "einops", specifier = ">=0.8.0" },
-    { name = "feetech-servo-sdk", marker = "extra == 'dev'", specifier = ">=1.0.0" },
     { name = "flask", specifier = ">=3.0.3" },
     { name = "future", marker = "extra == 'libero'", specifier = "==0.18.2" },
     { name = "gdown", specifier = ">=5.1.0" },
     { name = "gym", marker = "extra == 'libero'", specifier = ">=0.25,<0.27" },
+    { name = "gymnasium", extras = ["other"], marker = "extra == 'libero'", specifier = ">=0.29" },
     { name = "h5py", specifier = ">=3.10.0" },
     { name = "huggingface-hub", extras = ["hf-transfer", "cli"], marker = "python_full_version < '4.0'", specifier = ">=0.27.1" },
     { name = "imageio", extras = ["ffmpeg"], specifier = ">=2.34.0" },
@@ -2007,7 +2042,7 @@ requires-dist = [
     { name = "libero", marker = "extra == 'libero'", git = "https://github.com/shuheng-liu/LIBERO?branch=master" },
     { name = "matplotlib", marker = "extra == 'libero'", specifier = ">=3.5.3" },
     { name = "mujoco", marker = "extra == 'libero'", specifier = ">=3.3.5" },
-    { name = "myst-parser", marker = "extra == 'doc'", specifier = ">=4.0.0" },
+    { name = "myst-parser", marker = "extra == 'dev'", specifier = ">=4.0.0" },
     { name = "ninja", marker = "extra == 'libero'" },
     { name = "numba", specifier = ">=0.62.0" },
     { name = "numpy", marker = "extra == 'libero'", specifier = "<2" },
@@ -2020,41 +2055,42 @@ requires-dist = [
     { name = "openai", marker = "extra == 'openai'", specifier = ">=1.0.0" },
     { name = "opencv-python-headless", specifier = ">=4.9.0" },
     { name = "packaging", specifier = ">=24.2" },
-    { name = "pandas", marker = "extra == 'dev'", specifier = ">=2.2.2" },
+    { name = "pandas", specifier = ">=2.2.2" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.7.0" },
     { name = "pymunk", specifier = ">=6.6.0" },
     { name = "pynput", specifier = ">=1.7.7" },
-    { name = "pynput", marker = "extra == 'dev'", specifier = ">=1.7.7" },
     { name = "pyopengl", marker = "extra == 'libero'", specifier = "==3.1.7" },
     { name = "pyopengl-accelerate", marker = "sys_platform == 'linux' and extra == 'libero'", specifier = "==3.1.7" },
+    { name = "pyserial", specifier = ">=3.5" },
     { name = "pyserial", marker = "extra == 'dev'", specifier = ">=3.5" },
+    { name = "pytest", specifier = ">=8.1.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.1.0" },
+    { name = "pytest-cov", specifier = ">=5.0.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0.0" },
+    { name = "pytest-xdist", specifier = ">=3.8.0" },
     { name = "pytest-xdist", marker = "extra == 'dev'", specifier = ">=3.8.0" },
     { name = "python-dotenv", marker = "extra == 'openai'", specifier = ">=1.0.0" },
-    { name = "pyudev", marker = "extra == 'dev'", specifier = ">=0.24.3" },
     { name = "pyzmq", specifier = ">=26.2.1" },
-    { name = "r3m", url = "https://github.com/facebookresearch/r3m/archive/b2334e726887fa0206962d7984c69c5fb09cceab.tar.gz" },
     { name = "rerun-sdk", specifier = ">=0.21.0" },
     { name = "robomimic", marker = "extra == 'libero'", specifier = "==0.2.0" },
     { name = "robosuite", marker = "extra == 'libero'", specifier = "==1.4.0" },
-    { name = "scikit-image", marker = "extra == 'dev'", specifier = ">=0.23.2" },
+    { name = "scikit-image", specifier = ">=0.23.2" },
     { name = "scikit-learn", specifier = ">=1.7.1" },
-    { name = "scipy", marker = "extra == 'dev'", specifier = ">=1.15.2" },
-    { name = "sphinx", marker = "extra == 'doc'", specifier = ">=8.1.3" },
-    { name = "sphinx-copybutton", marker = "extra == 'doc'", specifier = ">=0.5.2" },
-    { name = "sphinx-design", marker = "extra == 'doc'", specifier = ">=0.6.1" },
-    { name = "sphinx-rtd-theme", marker = "extra == 'doc'", specifier = ">=3.0.1" },
+    { name = "scipy", specifier = ">=1.15.2" },
+    { name = "sphinx", marker = "extra == 'dev'", specifier = ">=8.1.3" },
+    { name = "sphinx-copybutton", marker = "extra == 'dev'", specifier = ">=0.5.2" },
+    { name = "sphinx-design", marker = "extra == 'dev'", specifier = ">=0.6.1" },
+    { name = "sphinx-rtd-theme", marker = "extra == 'dev'", specifier = ">=3.0.1" },
     { name = "termcolor", specifier = ">=2.4.0" },
     { name = "thop", marker = "extra == 'libero'", specifier = "==0.1.1.post2209072238" },
     { name = "torch", specifier = ">=2.7.1,<2.8.0" },
     { name = "torchcodec", marker = "(platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l' and sys_platform == 'linux') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32')", specifier = ">=0.4.0,<0.5.0" },
     { name = "torchvision", specifier = ">=0.22.1,<0.23.0" },
-    { name = "transformers", marker = "extra == 'dev'", git = "https://github.com/huggingface/transformers.git?rev=dcddb97" },
+    { name = "transformers", git = "https://github.com/huggingface/transformers.git?rev=dcddb97" },
     { name = "wandb", specifier = ">=0.16.3" },
     { name = "zarr", specifier = ">=2.17.0" },
 ]
-provides-extras = ["dev", "doc", "openai", "libero"]
+provides-extras = ["dev", "openai", "libero"]
 
 [[package]]
 name = "orderly-set"
@@ -2162,6 +2198,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/40/f1/6d86a29246dfd2e9b6237f0b5823717f60cad94d47ddc26afa916d21f525/pre_commit-4.5.1.tar.gz", hash = "sha256:eb545fcff725875197837263e977ea257a402056661f09dae08e4b149b030a61", size = 198232, upload-time = "2025-12-16T21:14:33.552Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/5d/19/fd3ef348460c80af7bb4669ea7926651d1f95c23ff2df18b9d24bab4f3fa/pre_commit-4.5.1-py2.py3-none-any.whl", hash = "sha256:3b3afd891e97337708c1674210f8eba659b52a38ea5f822ff142d10786221f77", size = 226437, upload-time = "2025-12-16T21:14:32.409Z" },
+]
+
+[[package]]
+name = "proglog"
+version = "0.1.12"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "tqdm" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c2/af/c108866c452eda1132f3d6b3cb6be2ae8430c97e9309f38ca9dbd430af37/proglog-0.1.12.tar.gz", hash = "sha256:361ee074721c277b89b75c061336cb8c5f287c92b043efa562ccf7866cda931c", size = 8794, upload-time = "2025-05-09T14:36:18.316Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c1/1b/f7ea6cde25621cd9236541c66ff018f4268012a534ec31032bcb187dc5e7/proglog-0.1.12-py3-none-any.whl", hash = "sha256:ccaafce51e80a81c65dc907a460c07ccb8ec1f78dc660cfd8f9ec3a22f01b84c", size = 6337, upload-time = "2025-05-09T14:36:16.798Z" },
 ]
 
 [[package]]
@@ -2560,15 +2608,6 @@ wheels = [
 ]
 
 [[package]]
-name = "pyudev"
-version = "0.24.4"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/5e/1d/8bdbf651de1002e8b58fbe817bee22b1e8bfcdd24341d42c3238ce9a75f4/pyudev-0.24.4.tar.gz", hash = "sha256:e788bb983700b1a84efc2e88862b0a51af2a995d5b86bc9997546505cf7b36bc", size = 56135, upload-time = "2025-10-08T17:26:58.661Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/2a/51/3dc0cd6498b24dea3cdeaed648568e3ca7454d41334d840b114156d7479f/pyudev-0.24.4-py3-none-any.whl", hash = "sha256:b3b6b01c68e6fc628428cc45ff3fe6c277afbb5d96507f14473ddb4a6b959e00", size = 62784, upload-time = "2025-10-08T17:26:57.664Z" },
-]
-
-[[package]]
 name = "pyyaml"
 version = "6.0.3"
 source = { registry = "https://pypi.org/simple" }
@@ -2631,30 +2670,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/47/42/1ff831fa87fe8f0a840ddb399054ca0009605d820e2b44ea43114f5459f4/pyzmq-27.1.0-pp310-pypy310_pp73-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:9c1790386614232e1b3a40a958454bdd42c6d1811837b15ddbb052a032a43f62", size = 567747, upload-time = "2025-09-08T23:09:43.741Z" },
     { url = "https://files.pythonhosted.org/packages/d1/db/5c4d6807434751e3f21231bee98109aa57b9b9b55e058e450d0aef59b70f/pyzmq-27.1.0-pp310-pypy310_pp73-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:448f9cb54eb0cee4732b46584f2710c8bc178b0e5371d9e4fc8125201e413a74", size = 747371, upload-time = "2025-09-08T23:09:45.575Z" },
     { url = "https://files.pythonhosted.org/packages/26/af/78ce193dbf03567eb8c0dc30e3df2b9e56f12a670bf7eb20f9fb532c7e8a/pyzmq-27.1.0-pp310-pypy310_pp73-win_amd64.whl", hash = "sha256:05b12f2d32112bf8c95ef2e74ec4f1d4beb01f8b5e703b38537f8849f92cb9ba", size = 544862, upload-time = "2025-09-08T23:09:47.448Z" },
-]
-
-[[package]]
-name = "r3m"
-version = "0.0.0"
-source = { url = "https://github.com/facebookresearch/r3m/archive/b2334e726887fa0206962d7984c69c5fb09cceab.tar.gz" }
-dependencies = [
-    { name = "gdown" },
-    { name = "hydra-core" },
-    { name = "omegaconf" },
-    { name = "pillow" },
-    { name = "torch" },
-    { name = "torchvision" },
-]
-sdist = { hash = "sha256:c3d8b8870508836a68c80182751a6184ec44b9e5ca6dddc52032569b02103f34" }
-
-[package.metadata]
-requires-dist = [
-    { name = "gdown", specifier = ">=4.4.0" },
-    { name = "hydra-core", specifier = ">=1.1.1" },
-    { name = "omegaconf", specifier = ">=2.1.1" },
-    { name = "pillow", specifier = ">=9.0.1" },
-    { name = "torch", specifier = ">=1.7.1" },
-    { name = "torchvision", specifier = ">=0.8.2" },
 ]
 
 [[package]]
@@ -2878,6 +2893,20 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/25/e1/3df8f83cb15f3500478c889be8fb18700813b95e9e087328230b98d547ff/scipy-1.15.3-cp310-cp310-musllinux_1_2_aarch64.whl", hash = "sha256:ed7284b21a7a0c8f1b6e5977ac05396c0d008b89e05498c8b7e8f4a1423bba0e", size = 37238749, upload-time = "2025-05-08T16:04:55.215Z" },
     { url = "https://files.pythonhosted.org/packages/93/3e/b3257cf446f2a3533ed7809757039016b74cd6f38271de91682aa844cfc5/scipy-1.15.3-cp310-cp310-musllinux_1_2_x86_64.whl", hash = "sha256:5380741e53df2c566f4d234b100a484b420af85deb39ea35a1cc1be84ff53a5c", size = 40022383, upload-time = "2025-05-08T16:05:01.914Z" },
     { url = "https://files.pythonhosted.org/packages/d1/84/55bc4881973d3f79b479a5a2e2df61c8c9a04fcb986a213ac9c02cfb659b/scipy-1.15.3-cp310-cp310-win_amd64.whl", hash = "sha256:9d61e97b186a57350f6d6fd72640f9e99d5a4a2b8fbf4b9ee9a841eab327dc13", size = 41259201, upload-time = "2025-05-08T16:05:08.166Z" },
+]
+
+[[package]]
+name = "seaborn"
+version = "0.13.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "matplotlib" },
+    { name = "numpy" },
+    { name = "pandas" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/86/59/a451d7420a77ab0b98f7affa3a1d78a313d2f7281a57afb1a34bae8ab412/seaborn-0.13.2.tar.gz", hash = "sha256:93e60a40988f4d65e9f4885df477e2fdaff6b73a9ded434c1ab356dd57eefff7", size = 1457696, upload-time = "2024-01-25T13:21:52.551Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/83/11/00d3c3dfc25ad54e731d91449895a79e4bf2384dc3ac01809010ba88f6d5/seaborn-0.13.2-py3-none-any.whl", hash = "sha256:636f8336facf092165e27924f223d3c62ca560b1f2bb5dff7ab7fad265361987", size = 294914, upload-time = "2024-01-25T13:21:49.598Z" },
 ]
 
 [[package]]
