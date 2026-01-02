@@ -13,6 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""PaliGemma with Expert Module for PI0.
+
+This module implements the PaliGemma model with an additional expert module,
+specifically designed for the Pi0 policy. It combines a pre-trained PaliGemma
+Vision-Language Model (VLM) with a Gemma-based expert model to handle
+action generation and conditioning.
+"""
+
 
 import torch
 import torch.version
@@ -28,9 +36,16 @@ from transformers import (
 from transformers.models.auto import CONFIG_MAPPING
 
 
-def apply_rope(x, positions, max_wavelength=10_000):
-    """
-    Applies RoPE positions [B, L] to x [B, L, H, D].
+def apply_rope(x: torch.Tensor, positions: torch.Tensor, max_wavelength: int = 10_000) -> torch.Tensor:
+    """Applies RoPE positions to the input tensor.
+
+    Args:
+        x: Input tensor of shape [B, L, H, D].
+        positions: Position tensor of shape [B, L].
+        max_wavelength: Maximum wavelength for RoPE. Defaults to 10_000.
+
+    Returns:
+        Tensor: The input tensor with RoPE applied, of shape [B, L, H, D].
     """
     d_half = x.shape[-1] // 2
     device = x.device
@@ -55,6 +70,8 @@ def apply_rope(x, positions, max_wavelength=10_000):
 
 
 class PaliGemmaWithExpertConfig(PretrainedConfig):
+    """Configuration class for PaliGemmaWithExpertModel."""
+
     model_type = "PaliGemmaWithExpertModel"
     sub_configs = {"paligemma_config": AutoConfig, "gemma_expert_config": AutoConfig}
 
@@ -69,6 +86,18 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
         dropout: float = 0.1,
         **kwargs,
     ):
+        """Initializes the configuration.
+
+        Args:
+            paligemma_config: Configuration dictionary for the PaliGemma model.
+            gemma_expert_config: Configuration dictionary for the Gemma expert model.
+            freeze_vision_encoder: Whether to freeze the vision encoder. Defaults to True.
+            train_expert_only: Whether to train only the expert model. Defaults to True.
+            attention_implementation: Attention implementation to use ("eager" or "fa2"). Defaults to "eager".
+            load_pretrained_paligemma: Whether to load a pretrained PaliGemma model. Defaults to False.
+            dropout: Dropout probability. Defaults to 0.1.
+            **kwargs: Additional keyword arguments passed to PretrainedConfig.
+        """
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
         self.attention_implementation = attention_implementation
@@ -158,6 +187,7 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
     def __post_init__(self):
+        """Validates configuration parameters."""
         super().__post_init__()
         if self.train_expert_only and not self.freeze_vision_encoder:
             raise ValueError(
@@ -171,9 +201,16 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
 
 
 class PaliGemmaWithExpertModel(PreTrainedModel):
+    """PaliGemma model with an additional expert module for action generation."""
+
     config_class = PaliGemmaWithExpertConfig
 
     def __init__(self, config: PaliGemmaWithExpertConfig):
+        """Initializes the PaliGemmaWithExpertModel.
+
+        Args:
+            config: Configuration object for the model.
+        """
         super().__init__(config=config)
         self.config = config
 
@@ -190,7 +227,8 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         self.to_bfloat16_like_physical_intelligence()
         self.set_requires_grad()
 
-    def set_requires_grad(self):
+    def set_requires_grad(self) -> None:
+        """Sets the requires_grad attribute for model parameters based on configuration."""
         if self.config.freeze_vision_encoder:
             self.paligemma.vision_tower.eval()
             for params in self.paligemma.vision_tower.parameters():
@@ -201,7 +239,12 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             for params in self.paligemma.parameters():
                 params.requires_grad = False
 
-    def train(self, mode: bool = True):
+    def train(self, mode: bool = True) -> None:
+        """Sets the module in training mode.
+
+        Args:
+            mode: whether to set training mode (True) or evaluation mode (False). Defaults to True.
+        """
         super().train(mode)
 
         if self.config.freeze_vision_encoder:
@@ -210,7 +253,8 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         if self.config.train_expert_only:
             self.paligemma.eval()
 
-    def to_bfloat16_like_physical_intelligence(self):
+    def to_bfloat16_like_physical_intelligence(self) -> None:
+        """Casts specific model components to bfloat16 dtype."""
         self.paligemma = self.paligemma.to(dtype=torch.bfloat16)
 
         params_to_change_dtype = [
@@ -223,14 +267,30 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             if any(selector in name for selector in params_to_change_dtype):
                 param.data = param.data.to(dtype=torch.bfloat16)
 
-    def embed_image(self, image: torch.Tensor):
+    def embed_image(self, image: torch.Tensor) -> torch.Tensor:
+        """Computes image embeddings.
+
+        Args:
+            image: Input image tensor.
+
+        Returns:
+            torch.Tensor: Image embeddings.
+        """
         # Handle different transformers versions
         if hasattr(self.paligemma, "get_image_features"):
             return self.paligemma.get_image_features(image)
         else:
             return self.paligemma.model.get_image_features(image)
 
-    def embed_language_tokens(self, tokens: torch.Tensor):
+    def embed_language_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Embeds language tokens.
+
+        Args:
+            tokens: Input token indices.
+
+        Returns:
+            torch.Tensor: Token embeddings.
+        """
         return self.paligemma.language_model.embed_tokens(tokens)
 
     # TODO: break down this huge forward into modules or functions
@@ -242,7 +302,22 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         inputs_embeds: list[torch.FloatTensor] = None,
         use_cache: bool | None = None,
         fill_kv_cache: bool | None = None,
-    ):
+    ) -> tuple[list[torch.FloatTensor | None], list[torch.FloatTensor] | Cache | None]:
+        """Forward pass of the model.
+
+        Args:
+            attention_mask: Attention mask tensor.
+            position_ids: Position IDs tensor.
+            past_key_values: Past key values for caching.
+            inputs_embeds: List of input embeddings for the different model parts.
+            use_cache: Whether to use KV cache.
+            fill_kv_cache: Whether to fill the KV cache.
+
+        Returns:
+            tuple: A tuple containing:
+                - outputs_embeds: List of output embeddings.
+                - past_key_values: Updated past key values.
+        """
         models = [self.paligemma.language_model, self.gemma_expert.model]
 
         for hidden_states in inputs_embeds:
@@ -361,20 +436,35 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         return outputs_embeds, past_key_values
 
     def get_attention_interface(self):
-        if self.config.attention_implementation == "fa2":
-            attention_interface = self.flash_attention_forward
-        else:
-            attention_interface = self.eager_attention_forward
-        return attention_interface
+        """Returns the attention implementation function based on config.
 
-    def flash_attention_forward(
-        self, attention_mask, batch_size, head_dim, query_states, key_states, value_states
-    ):
-        raise NotImplementedError("FA2 is not implemented (yet)")
+        Returns:
+            callable: The attention function to use.
+        """
+        return self.eager_attention_forward
 
     def eager_attention_forward(
-        self, attention_mask, batch_size, head_dim, query_states, key_states, value_states
-    ):
+        self,
+        attention_mask: torch.Tensor,
+        batch_size: int,
+        head_dim: int,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Eager attention forward pass using standard matrix multiplications.
+
+        Args:
+            attention_mask: Attention mask tensor.
+            batch_size: Batch size.
+            head_dim: Head dimension.
+            query_states: Query states tensor.
+            key_states: Key states tensor.
+            value_states: Value states tensor.
+
+        Returns:
+            torch.Tensor: Attention output.
+        """
         num_att_heads = self.config.paligemma_config.text_config.num_attention_heads
         num_key_value_heads = self.config.paligemma_config.text_config.num_key_value_heads
         num_key_value_groups = num_att_heads // num_key_value_heads

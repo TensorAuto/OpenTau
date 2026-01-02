@@ -11,3 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""PI0 Policy Module.
+
+This module implements the π0 (Pi0) Vision-Language-Action Flow Model policy,
+designed for general robot control. It includes the policy definition,
+configuration, and model architecture.
+"""

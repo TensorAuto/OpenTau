@@ -15,40 +15,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-π0: A Vision-Language-Action Flow Model for General Robot Control
+"""π0: A Vision-Language-Action Flow Model for General Robot Control
 
 [Paper](https://www.physicalintelligence.company/download/pi0.pdf)
-[Jax code](https://github.com/Physical-Intelligence/openpi)
-
-Designed by Physical Intelligence. Ported from Jax by Hugging Face.
-Disclaimer: It is not expected to perform as well as the original implementation.
-
-Install pi0 extra dependencies:
-```bash
-pip install -e ".[pi0]"
-```
-
-Example of finetuning the pi0 pretrained model (`pi0_base` in `openpi`):
-```bash
-lerobot-train \
---policy.path=lerobot/pi0 \
---dataset.repo_id=danaaubakirova/koch_test
-```
-
-Example of finetuning the pi0 neural network with PaliGemma and expert Gemma
-pretrained with VLM default parameters before pi0 finetuning:
-```bash
-lerobot-train \
---policy.type=pi0 \
---dataset.repo_id=danaaubakirova/koch_test
-```
-
-Example of using the pi0 pretrained model outside LeRobot training framework:
-```python
-policy = Pi0Policy.from_pretrained("lerobot/pi0")
-```
-
 """
 
 import math
@@ -72,16 +41,30 @@ from opentau.utils.utils import get_safe_dtype
 
 
 def create_sinusoidal_pos_embedding(
-    time: torch.tensor, dimension: int, min_period: float, max_period: float, device="cpu"
+    time: Tensor, dimension: int, min_period: float, max_period: float, device: torch.device | str = "cpu"
 ) -> Tensor:
-    """Computes sine-cosine positional embedding vectors for scalar positions."""
+    """Computes sine-cosine positional embedding vectors for scalar positions.
+
+    Args:
+        time: A 1-D tensor of shape (batch_size,).
+        dimension: The dimension of the embedding vectors. Must be divisible by 2.
+        min_period: The minimum period of the sinusoidal functions.
+        max_period: The maximum period of the sinusoidal functions.
+        device: The device to create the tensors on. Defaults to "cpu".
+
+    Returns:
+        A tensor of shape (batch_size, dimension) containing the positional embeddings.
+
+    Raises:
+        ValueError: If dimension is not divisible by 2 or if time tensor is not 1-D.
+    """
     if dimension % 2 != 0:
         raise ValueError(f"dimension ({dimension}) must be divisible by 2")
 
     if time.ndim != 1:
         raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
 
-    dtype = get_safe_dtype(torch.float64, device.type)
+    dtype = get_safe_dtype(torch.float64, device.type) if isinstance(device, torch.device) else get_safe_dtype(torch.float64, device)
     fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
     period = min_period * (max_period / min_period) ** fraction
 
@@ -92,8 +75,8 @@ def create_sinusoidal_pos_embedding(
     return pos_emb
 
 
-def make_att_2d_masks(pad_masks, att_masks):
-    """Copied from big_vision.
+def make_att_2d_masks(pad_masks: Tensor, att_masks: Tensor) -> Tensor:
+    """Creates a 2-D attention mask given padding and 1-D attention masks.
 
     Tokens can attend to valid inputs tokens which have a cumulative mask_ar
     smaller or equal to theirs. This way `mask_ar` int[B, N] can be used to
@@ -109,9 +92,15 @@ def make_att_2d_masks(pad_masks, att_masks):
           block can attend all previous blocks and all tokens on the same block.
 
     Args:
-      input_mask: bool[B, N] true if its part of the input, false if padding.
-      mask_ar: int32[B, N] mask that's 1 where previous tokens cannot depend on
-        it and 0 where it shares the same attention mask as the previous token.
+        pad_masks: bool[B, N] true if its part of the input, false if padding.
+        att_masks: int32[B, N] mask that's 1 where previous tokens cannot depend on
+            it and 0 where it shares the same attention mask as the previous token.
+
+    Returns:
+        A 2D attention mask tensor of shape (B, N, N).
+
+    Raises:
+        ValueError: If att_masks or pad_masks are not 2D.
     """
     if att_masks.ndim != 2:
         raise ValueError(att_masks.ndim)
@@ -125,7 +114,22 @@ def make_att_2d_masks(pad_masks, att_masks):
     return att_2d_masks
 
 
-def resize_with_pad(img, width, height, pad_value=-1):
+def resize_with_pad(img: Tensor, width: int, height: int, pad_value: int = -1) -> Tensor:
+    """Resizes an image to fit within the specified dimensions while maintaining aspect ratio,
+    and pads the remaining area with the specified value.
+
+    Args:
+        img: Input image tensor of shape (batch_size, channels, current_height, current_width).
+        width: Target width.
+        height: Target height.
+        pad_value: Value to use for padding. Defaults to -1.
+
+    Returns:
+        The resized and padded image tensor of shape (batch_size, channels, height, width).
+
+    Raises:
+        ValueError: If the input image tensor does not have 4 dimensions.
+    """
     # assume no-op when width height fits already
     if img.ndim != 4:
         raise ValueError(f"(b,c,h,w) expected, but {img.shape}")
@@ -147,9 +151,16 @@ def resize_with_pad(img, width, height, pad_value=-1):
     return padded_img
 
 
-def pad_vector(vector, new_dim):
-    """Can be (batch_size x sequence_length x features_dimension)
-    or (batch_size x features_dimension)
+def pad_vector(vector: Tensor, new_dim: int) -> Tensor:
+    """Pads the last dimension of a vector to a new size with zeros.
+
+    Args:
+        vector: Input tensor. Can be (batch_size x sequence_length x features_dimension)
+            or (batch_size x features_dimension).
+        new_dim: The new size for the last dimension.
+
+    Returns:
+        The padded tensor.
     """
     if vector.shape[-1] == new_dim:
         return vector
@@ -161,62 +172,8 @@ def pad_vector(vector, new_dim):
     return new_vector
 
 
-def normalize(x, min_val, max_val):
-    return (x - min_val) / (max_val - min_val)
-
-
-def unnormalize(x, min_val, max_val):
-    return x * (max_val - min_val) + min_val
-
-
-def safe_arcsin(value):
-    # This ensures that the input stays within
-    # [−1,1] to avoid invalid values for arcsin
-    return torch.arcsin(torch.clamp(value, -1.0, 1.0))
-
-
-def aloha_gripper_to_angular(value):
-    # Aloha transforms the gripper positions into a linear space. The following code
-    # reverses this transformation to be consistent with pi0 which is pretrained in
-    # angular space.
-    #
-    # These values are coming from the Aloha code:
-    # PUPPET_GRIPPER_POSITION_OPEN, PUPPET_GRIPPER_POSITION_CLOSED
-    value = unnormalize(value, min_val=0.01844, max_val=0.05800)
-
-    # This is the inverse of the angular to linear transformation inside the Interbotix code.
-    def linear_to_radian(linear_position, arm_length, horn_radius):
-        value = (horn_radius**2 + linear_position**2 - arm_length**2) / (2 * horn_radius * linear_position)
-        return safe_arcsin(value)
-
-    # The constants are taken from the Interbotix code.
-    value = linear_to_radian(value, arm_length=0.036, horn_radius=0.022)
-
-    # Normalize to [0, 1].
-    # The values 0.4 and 1.5 were measured on an actual Trossen robot.
-    return normalize(value, min_val=0.4, max_val=1.5)
-
-
-def aloha_gripper_from_angular(value):
-    # Convert from the gripper position used by pi0 to the gripper position that is used by Aloha.
-    # Note that the units are still angular but the range is different.
-
-    # The values 0.4 and 1.5 were measured on an actual Trossen robot.
-    value = unnormalize(value, min_val=0.4, max_val=1.5)
-
-    # These values are coming from the Aloha code:
-    # PUPPET_GRIPPER_JOINT_OPEN, PUPPET_GRIPPER_JOINT_CLOSE
-    return normalize(value, min_val=-0.6213, max_val=1.4910)
-
-
-def aloha_gripper_from_angular_inv(value):
-    # Directly inverts the gripper_from_angular function.
-    value = unnormalize(value, min_val=-0.6213, max_val=1.4910)
-    return normalize(value, min_val=0.4, max_val=1.5)
-
-
 class PI0Policy(PreTrainedPolicy):
-    """Wrapper class around PI0FlowMatching model to train and run inference within LeRobot."""
+    """Wrapper class around PI0FlowMatching model to train and run inference within OpenTau."""
 
     config_class = PI0Config
     name = "pi0"
@@ -226,10 +183,10 @@ class PI0Policy(PreTrainedPolicy):
         config: PI0Config,
         dataset_stats: dict[str, dict[str, Tensor]] | None = None,
     ):
-        """
+        """Initializes the PI0Policy.
+
         Args:
-            config: Policy configuration class instance or None, in which case the default instantiation of
-                    the configuration class is used.
+            config: Policy configuration class instance.
             dataset_stats: Dataset statistics to be used for normalization. If not passed here, it is expected
                 that they will be passed with a call to `load_state_dict` before the policy is used.
         """
@@ -250,7 +207,7 @@ class PI0Policy(PreTrainedPolicy):
 
         self.reset()
 
-    def reset(self):
+    def reset(self) -> None:
         """This should be called whenever the environment is reset."""
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
 
@@ -271,6 +228,12 @@ class PI0Policy(PreTrainedPolicy):
 
         Also handles tied weights between lm_head.weight and
         embed_tokens.weight.
+
+        Args:
+            state_dict: The state dictionary to transform.
+
+        Returns:
+            The transformed state dictionary.
         """
         import re
 
@@ -330,7 +293,17 @@ class PI0Policy(PreTrainedPolicy):
     def _load_as_safetensor(
         cls, model: "PI0Policy", model_file: str, map_location: str, strict: bool
     ) -> "PI0Policy":
-        """Override to apply key transformations before loading."""
+        """Override to apply key transformations before loading.
+
+        Args:
+            model: The model instance.
+            model_file: Path to the model file.
+            map_location: Device mapping location.
+            strict: Whether to strictly enforce state dict matching.
+
+        Returns:
+            The loaded model instance.
+        """
         from safetensors.torch import load_file
 
         # Load the state dict from file safely
@@ -350,11 +323,24 @@ class PI0Policy(PreTrainedPolicy):
         return model
 
     def get_optim_params(self) -> dict:
+        """Returns the parameters to be optimized.
+
+        Returns:
+            A generator over the model parameters.
+        """
         return self.parameters()
 
     @classmethod
     def from_pretrained(cls, *args, **kwargs):
-        """Override the from_pretrained method to display important disclaimer."""
+        """Override the from_pretrained method to display important disclaimer.
+
+        Args:
+            *args: Positional arguments passed to super().from_pretrained.
+            **kwargs: Keyword arguments passed to super().from_pretrained.
+
+        Returns:
+            The loaded model instance.
+        """
         print(
             "⚠️  DISCLAIMER: The PI0 model is ported from JAX by the Hugging Face team. \n"
             "   It is not expected to perform as well as the original implementation. \n"
@@ -364,7 +350,17 @@ class PI0Policy(PreTrainedPolicy):
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
-        """Predict a chunk of actions given environment observations."""
+        """Predict a chunk of actions given environment observations.
+
+        Args:
+            batch: Batch of data containing environment observations.
+
+        Returns:
+            The predicted action chunk.
+
+        Raises:
+            NotImplementedError: Always, as this method is not implemented for PI0.
+        """
         raise NotImplementedError("Currently not implemented for PI0")
 
     @torch.no_grad()
@@ -374,6 +370,13 @@ class PI0Policy(PreTrainedPolicy):
         This method wraps `select_actions` in order to return one action at a time for execution in the
         environment. It works by managing the actions in a queue and only calling `select_actions` when the
         queue is empty.
+
+        Args:
+            batch: Batch of data containing environment observations.
+            noise: Optional noise tensor to be used during sampling.
+
+        Returns:
+            The selected action tensor.
         """
         self.eval()
 
@@ -385,7 +388,16 @@ class PI0Policy(PreTrainedPolicy):
         return self._action_queue.popleft()
 
     @torch.no_grad()
-    def sample_actions(self, batch: dict[str, Tensor], noise: Tensor = None):
+    def sample_actions(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+        """Sample actions from the policy given environment observations.
+
+        Args:
+            batch: Batch of data containing environment observations.
+            noise: Optional noise tensor.
+
+        Returns:
+            The sampled actions tensor of shape (batch_size, action_dim).
+        """
         if self.config.adapt_to_pi_aloha:
             batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
 
@@ -418,8 +430,19 @@ class PI0Policy(PreTrainedPolicy):
         actions = actions.transpose(0, 1)
         return actions
 
-    def forward(self, batch: dict[str, Tensor], noise=None, time=None) -> tuple[Tensor, dict[str, Tensor]]:
-        """Do a full training forward pass to compute the loss"""
+    def forward(
+        self, batch: dict[str, Tensor], noise: Tensor | None = None, time: Tensor | None = None
+    ) -> dict[str, Tensor]:
+        """Do a full training forward pass to compute the loss.
+
+        Args:
+            batch: Batch of data containing environment observations, actions, and targets.
+            noise: Optional noise tensor.
+            time: Optional time tensor.
+
+        Returns:
+            A dictionary containing the loss components ("MSE" and "CE").
+        """
         batch = self.normalize_inputs(batch)
         batch = self.normalize_targets(batch)
 
@@ -443,9 +466,22 @@ class PI0Policy(PreTrainedPolicy):
 
         return {"MSE": loss, "CE": torch.zeros_like(loss, requires_grad=True)}
 
-    def prepare_images(self, batch):
-        """Apply Pi0 preprocessing to the images, like resizing to 224x224 and padding to keep aspect ratio, and
-        convert pixel range from [0.0, 1.0] to [-1.0, 1.0] as requested by SigLIP.
+    def prepare_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
+        """Apply Pi0 preprocessing to the images.
+
+        Resizes to 224x224 and padding to keep aspect ratio, and converts pixel range
+        from [0.0, 1.0] to [-1.0, 1.0] as requested by SigLIP.
+
+        Args:
+            batch: Batch of data containing image tensors.
+
+        Returns:
+            A tuple containing:
+                - images: A list of processed image tensors.
+                - img_masks: A list of image mask tensors.
+
+        Raises:
+            ValueError: If no image features are present in the batch.
         """
         images = []
         img_masks = []
@@ -486,8 +522,17 @@ class PI0Policy(PreTrainedPolicy):
 
         return images, img_masks
 
-    def prepare_language(self, batch) -> tuple[Tensor, Tensor]:
-        """Tokenize the text input"""
+    def prepare_language(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+        """Tokenize the text input.
+
+        Args:
+            batch: Batch of data containing "prompt" and potentially "advantage".
+
+        Returns:
+            A tuple containing:
+                - lang_tokens: Tensor of language tokens.
+                - lang_masks: Tensor of language attention masks.
+        """
         device = batch["state"].device
         tasks = batch["prompt"]
 
@@ -514,42 +559,13 @@ class PI0Policy(PreTrainedPolicy):
 
         return lang_tokens, lang_masks
 
-    def _pi_aloha_decode_state(self, state):
-        # Flip the joints.
-        for motor_idx in [1, 2, 8, 9]:
-            state[:, motor_idx] *= -1
-        # Reverse the gripper transformation that is being applied by the Aloha runtime.
-        for motor_idx in [6, 13]:
-            state[:, motor_idx] = aloha_gripper_to_angular(state[:, motor_idx])
-        return state
-
-    def _pi_aloha_encode_actions(self, actions):
-        # Flip the joints.
-        for motor_idx in [1, 2, 8, 9]:
-            actions[:, :, motor_idx] *= -1
-        # Reverse the gripper transformation that is being applied by the Aloha runtime.
-        for motor_idx in [6, 13]:
-            actions[:, :, motor_idx] = aloha_gripper_from_angular(actions[:, :, motor_idx])
-        return actions
-
-    def _pi_aloha_encode_actions_inv(self, actions):
-        # Flip the joints again.
-        for motor_idx in [1, 2, 8, 9]:
-            actions[:, :, motor_idx] *= -1
-        # Reverse the gripper transformation that is being applied by the Aloha runtime.
-        for motor_idx in [6, 13]:
-            actions[:, :, motor_idx] = aloha_gripper_from_angular_inv(actions[:, :, motor_idx])
-        return actions
-
 
 class PI0FlowMatching(nn.Module):
     """
     π0: A Vision-Language-Action Flow Model for General Robot Control
 
     [Paper](https://www.physicalintelligence.company/download/pi0.pdf)
-    [Jax code](https://github.com/Physical-Intelligence/openpi)
 
-    Designed by Physical Intelligence. Ported from Jax by Hugging Face.
     ┌──────────────────────────────┐
     │               actions        │
     │               ▲              │
@@ -569,7 +585,12 @@ class PI0FlowMatching(nn.Module):
     └──────────────────────────────┘
     """
 
-    def __init__(self, config):
+    def __init__(self, config: PI0Config):
+        """Initializes the PI0FlowMatching model.
+
+        Args:
+            config: Model configuration.
+        """
         super().__init__()
         self.config = config
 
@@ -597,12 +618,17 @@ class PI0FlowMatching(nn.Module):
 
         self._init_model()
 
-    def set_requires_grad(self):
+    def set_requires_grad(self) -> None:
+        """Sets the requires_grad attribute for state projection parameters."""
         for params in self.state_proj.parameters():
             params.requires_grad = self.config.train_state_proj
 
-    def _init_weights(self, module):
-        """Initialize weights using He (Kaiming) initialization."""
+    def _init_weights(self, module: nn.Module) -> None:
+        """Initialize weights using He (Kaiming) initialization.
+
+        Args:
+            module: The module to initialize.
+        """
         if isinstance(module, nn.Linear):
             nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
             if module.bias is not None:
@@ -611,8 +637,8 @@ class PI0FlowMatching(nn.Module):
             nn.init.ones_(module.weight)
             nn.init.zeros_(module.bias)
 
-    def _init_model(self):
-        """Initialize the model weights."""
+    def _init_model(self) -> None:
+        """Initialize the model weights based on the configuration."""
         if self.config.init_strategy == "no_init":
             return
         elif self.config.init_strategy == "full_he_init":
@@ -624,7 +650,16 @@ class PI0FlowMatching(nn.Module):
         else:
             raise ValueError(f"Invalid init strategy: {self.config.init_strategy}")
 
-    def sample_noise(self, shape, device):
+    def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
+        """Samples Gaussian noise.
+
+        Args:
+            shape: The shape of the noise tensor.
+            device: The device to create the tensor on.
+
+        Returns:
+            A tensor containing the sampled noise.
+        """
         noise = torch.normal(
             mean=0.0,
             std=1.0,
@@ -634,17 +669,42 @@ class PI0FlowMatching(nn.Module):
         )
         return noise
 
-    def sample_time(self, bsize, device):
+    def sample_time(self, bsize: int, device: torch.device | str) -> Tensor:
+        """Samples time steps from a Beta distribution.
+
+        Args:
+            bsize: Batch size.
+            device: The device to create the tensor on.
+
+        Returns:
+            A tensor containing the sampled time steps.
+        """
         beta_dist = torch.distributions.Beta(concentration1=1.5, concentration0=1.0)
         time_beta = beta_dist.sample((bsize,)).to(device=device, dtype=torch.float32)
         time = time_beta * 0.999 + 0.001
         return time
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self,
+        images: list[Tensor],
+        img_masks: list[Tensor],
+        lang_tokens: Tensor,
+        lang_masks: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
+
+        Args:
+            images: List of image tensors.
+            img_masks: List of image mask tensors.
+            lang_tokens: Language token tensor.
+            lang_masks: Language mask tensor.
+
+        Returns:
+            A tuple containing:
+                - embs: Concatenated embeddings tensor.
+                - pad_masks: Concatenated padding masks tensor.
+                - att_masks: Attention masks tensor.
         """
         # TODO: avoid list in python and torch.cat ; prefer pre-allocation with torch.empty
         embs = []
@@ -692,8 +752,22 @@ class PI0FlowMatching(nn.Module):
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, state, noisy_actions, timestep):
-        """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
+    def embed_suffix(
+        self, state: Tensor, noisy_actions: Tensor, timestep: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing.
+
+        Args:
+            state: State tensor.
+            noisy_actions: Tensor containing noisy actions.
+            timestep: Tensor containing timesteps.
+
+        Returns:
+            A tuple containing:
+                - embs: Concatenated embeddings tensor.
+                - pad_masks: Concatenated padding masks tensor.
+                - att_masks: Attention masks tensor.
+        """
         embs = []
         pad_masks = []
         att_masks = []
@@ -747,9 +821,31 @@ class PI0FlowMatching(nn.Module):
         return embs, pad_masks, att_masks
 
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+        self,
+        images: list[Tensor],
+        img_masks: list[Tensor],
+        lang_tokens: Tensor,
+        lang_masks: Tensor,
+        state: Tensor,
+        actions: Tensor,
+        noise: Tensor | None = None,
+        time: Tensor | None = None,
     ) -> Tensor:
-        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
+        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors).
+
+        Args:
+            images: List of image tensors.
+            img_masks: List of image mask tensors.
+            lang_tokens: Language token tensor.
+            lang_masks: Language mask tensor.
+            state: State tensor.
+            actions: Action tensor.
+            noise: Optional noise tensor.
+            time: Optional time tensor.
+
+        Returns:
+            The computed loss tensor.
+        """
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
 
@@ -787,8 +883,28 @@ class PI0FlowMatching(nn.Module):
         losses = F.mse_loss(u_t, v_t, reduction="none")
         return losses
 
-    def sample_actions(self, images, img_masks, lang_tokens, lang_masks, state, noise=None) -> Tensor:
-        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
+    def sample_actions(
+        self,
+        images: list[Tensor],
+        img_masks: list[Tensor],
+        lang_tokens: Tensor,
+        lang_masks: Tensor,
+        state: Tensor,
+        noise: Tensor | None = None,
+    ) -> Tensor:
+        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors).
+
+        Args:
+            images: List of image tensors.
+            img_masks: List of image mask tensors.
+            lang_tokens: Language token tensor.
+            lang_masks: Language mask tensor.
+            state: State tensor.
+            noise: Optional noise tensor.
+
+        Returns:
+            The sampled action tensor.
+        """
         bsize = state.shape[0]
         device = state.device
 
@@ -834,13 +950,24 @@ class PI0FlowMatching(nn.Module):
 
     def denoise_step(
         self,
-        state,
-        prefix_pad_masks,
-        past_key_values,
-        x_t,
-        timestep,
-    ):
-        """Apply one denoising step of the noise `x_t` at a given timestep."""
+        state: Tensor,
+        prefix_pad_masks: Tensor,
+        past_key_values: list[dict[str, Tensor]],
+        x_t: Tensor,
+        timestep: Tensor,
+    ) -> Tensor:
+        """Apply one denoising step of the noise `x_t` at a given timestep.
+
+        Args:
+            state: State tensor.
+            prefix_pad_masks: Prefix padding masks.
+            past_key_values: Past key values from the VLM.
+            x_t: Current noise tensor.
+            timestep: Current timestep.
+
+        Returns:
+            The predicted velocity tensor (v_t).
+        """
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(state, x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]
