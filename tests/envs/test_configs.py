@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,8 +19,8 @@ from dataclasses import dataclass
 
 import pytest
 
-from opentau.envs.configs import EnvConfig
 from opentau.configs.types import FeatureType, PolicyFeature
+from opentau.envs.configs import EnvConfig
 
 
 class TestEnvConfig:

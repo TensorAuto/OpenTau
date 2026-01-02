@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,19 +24,20 @@ from abc import abstractmethod
 from pathlib import Path
 from typing import Callable
 
+import datasets
 import numpy as np
 import packaging.version
 import PIL.Image
 import torch
 import torch.nn.functional as F  # noqa: N812
 import torch.utils
+from datasets import concatenate_datasets, load_dataset
 from einops import rearrange
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.constants import REPOCARD_NAME
 from huggingface_hub.errors import RevisionNotFoundError
 
-import datasets
-from datasets import concatenate_datasets, load_dataset
+from opentau.configs.train import TrainPipelineConfig
 from opentau.constants import HF_OPENTAU_HOME
 from opentau.datasets.compute_stats import aggregate_stats, compute_episode_stats
 from opentau.datasets.image_writer import AsyncImageWriter, write_image
@@ -82,7 +84,6 @@ from opentau.policies.value.reward import (
     calculate_return_bins_with_equal_width,
 )
 from opentau.utils.utils import on_accelerate_main_proc
-from opentau.configs.train import TrainPipelineConfig
 
 
 def retry_random_on_failure(f):

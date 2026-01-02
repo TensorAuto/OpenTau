@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,6 +22,7 @@ from termcolor import colored
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
+from opentau.configs.train import TrainPipelineConfig
 from opentau.constants import (
     CHECKPOINTS_DIR,
     LAST_CHECKPOINT_LINK,
@@ -28,7 +30,6 @@ from opentau.constants import (
 )
 from opentau.datasets.utils import load_json, write_json
 from opentau.utils.random_utils import load_rng_state, save_rng_state
-from opentau.configs.train import TrainPipelineConfig
 
 
 def log_output_dir(out_dir):

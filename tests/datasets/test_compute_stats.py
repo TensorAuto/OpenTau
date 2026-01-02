@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -144,9 +145,7 @@ def test_compute_episode_stats():
         "observation.state": {"dtype": "numeric"},
     }
 
-    with patch(
-        "opentau.datasets.compute_stats.load_image_as_numpy", side_effect=mock_load_image_as_numpy
-    ):
+    with patch("opentau.datasets.compute_stats.load_image_as_numpy", side_effect=mock_load_image_as_numpy):
         stats = compute_episode_stats(episode_data, features)
 
     assert "observation.image" in stats and "observation.state" in stats

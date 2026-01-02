@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,6 +28,8 @@ from accelerate.scheduler import AcceleratedScheduler
 from accelerate.utils import DistributedDataParallelKwargs, gather_object
 from termcolor import colored
 
+from opentau.configs import parser
+from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.factory import make_dataset_mixture
 from opentau.datasets.utils import cycle
 from opentau.envs.factory import make_envs
@@ -34,6 +37,7 @@ from opentau.envs.utils import close_envs
 from opentau.optim.factory import make_optimizer_and_scheduler
 from opentau.policies.factory import make_policy
 from opentau.policies.pretrained import PreTrainedPolicy
+from opentau.scripts.eval import consolidate_eval_info, eval_policy_all
 from opentau.utils.accelerate_utils import set_proc_accelerator
 from opentau.utils.logging_utils import AverageMeter, MetricsTracker
 from opentau.utils.random_utils import set_seed
@@ -51,9 +55,6 @@ from opentau.utils.utils import (
     init_logging,
     is_launched_with_accelerate,
 )
-from opentau.configs import parser
-from opentau.configs.train import TrainPipelineConfig
-from opentau.scripts.eval import consolidate_eval_info, eval_policy_all
 
 
 def update_policy(

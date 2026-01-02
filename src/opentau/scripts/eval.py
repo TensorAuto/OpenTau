@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -73,6 +74,8 @@ from termcolor import colored
 from torch import nn
 from tqdm import trange
 
+from opentau.configs import parser
+from opentau.configs.train import TrainPipelineConfig
 from opentau.envs.factory import make_envs
 from opentau.envs.utils import (
     add_envs_task,
@@ -91,8 +94,6 @@ from opentau.utils.utils import (
     inside_slurm,
     is_launched_with_accelerate,
 )
-from opentau.configs import parser
-from opentau.configs.train import TrainPipelineConfig
 
 
 def rollout(

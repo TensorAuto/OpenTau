@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,14 +20,14 @@ from typing import Optional
 import numpy as np
 from torch import nn
 
+from opentau.configs.policies import PreTrainedConfig
+from opentau.configs.types import FeatureType
 from opentau.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from opentau.datasets.utils import dataset_to_policy_features
 from opentau.policies.pi0.configuration_pi0 import PI0Config
 from opentau.policies.pi05.configuration_pi05 import PI05Config
 from opentau.policies.pretrained import PreTrainedPolicy
 from opentau.policies.value.configuration_value import ValueConfig
-from opentau.configs.policies import PreTrainedConfig
-from opentau.configs.types import FeatureType
 
 
 def get_policy_class(name: str) -> type[PreTrainedPolicy]:

@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,9 +27,8 @@ from typing import Any, ClassVar
 import pyarrow as pa
 import torch
 import torchvision
-from PIL import Image
-
 from datasets.features.features import register_feature
+from PIL import Image
 
 
 def get_safe_default_codec():

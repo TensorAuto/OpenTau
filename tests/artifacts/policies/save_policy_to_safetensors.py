@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,16 +20,15 @@ from pathlib import Path
 import torch
 from safetensors.torch import save_file
 
+from opentau.configs.default import DatasetConfig, DatasetMixtureConfig
+from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.factory import make_dataset_mixture
 from opentau.policies.factory import make_policy, make_policy_config
 from opentau.utils.random_utils import set_seed
-from opentau.configs.default import DatasetConfig, DatasetMixtureConfig
-from opentau.configs.train import TrainPipelineConfig
 
 
 def get_policy_stats(ds_repo_id: str, policy_name: str, policy_kwargs: dict):
     set_seed(1337)
-
 
     train_cfg = TrainPipelineConfig(
         # TODO(rcadene, aliberts): remove dataset download

@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,9 +19,9 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from opentau.configs.train import TrainPipelineConfig
 from opentau.envs.configs import LiberoEnv
 from opentau.envs.factory import make_env_config, make_envs
-from opentau.configs.train import TrainPipelineConfig
 
 
 class TestMakeEnvConfig:
@@ -109,4 +110,3 @@ class TestMakeEnv:
             assert isinstance(result, dict)
             assert isinstance(result.get("libero_10"), dict)
             assert result["libero_10"].get(0) is mock_vector_env
-

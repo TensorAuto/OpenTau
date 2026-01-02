@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +16,6 @@
 # limitations under the License.
 import inspect
 import math
-from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -23,23 +23,19 @@ import torch
 from safetensors.torch import load_file
 
 from opentau import available_policies
-from opentau.datasets.dataset_mixture import WeightedDatasetMixture
-from opentau.datasets.utils import cycle, dataset_to_policy_features
+from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
+from opentau.datasets.utils import dataset_to_policy_features
 from opentau.policies.factory import (
     get_policy_class,
     make_policy_config,
 )
 from opentau.policies.normalize import Normalize, Unnormalize
-from opentau.policies.pretrained import PreTrainedPolicy
 from opentau.policies.value.reward import (
     calculate_n_step_return,
     calculate_return_bins_with_equal_width,
 )
-from opentau.utils.utils import create_dummy_observation
-from opentau.configs.train import TrainPipelineConfig
-from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from tests.artifacts.policies.save_policy_to_safetensors import get_policy_stats
-from tests.utils import generic_equal, require_x86_64_kernel
+from tests.utils import require_x86_64_kernel
 
 
 @pytest.mark.slow  # ~ 2 min

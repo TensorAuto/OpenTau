@@ -1,4 +1,5 @@
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -37,12 +38,12 @@ from dataclasses import dataclass
 
 from huggingface_hub import HfApi
 
-from opentau.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDataset
-from opentau.datasets.utils import EPISODES_STATS_PATH, STATS_PATH, load_stats, write_info
-from opentau.datasets.v21.convert_stats import check_aggregate_stats, convert_stats
 from opentau.configs.default import DatasetConfig, DatasetMixtureConfig
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.train import TrainPipelineConfig
+from opentau.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDataset
+from opentau.datasets.utils import EPISODES_STATS_PATH, STATS_PATH, load_stats, write_info
+from opentau.datasets.v21.convert_stats import check_aggregate_stats, convert_stats
 
 V20 = "v2.0"
 V21 = "v2.1"

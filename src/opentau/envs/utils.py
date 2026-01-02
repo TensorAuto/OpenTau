@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,10 +25,10 @@ import torch
 from torch import Tensor
 from torchvision.transforms import Compose, Resize, ToTensor
 
+from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.lerobot_dataset import BaseDataset
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import auto_torch_device
-from opentau.configs.train import TrainPipelineConfig
 
 
 def preprocess_observation(np_observations: dict, cfg: TrainPipelineConfig) -> dict[str, Tensor]:

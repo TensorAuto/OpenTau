@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,13 +22,13 @@ import numpy as np
 import pytest
 import torch
 
+from opentau.configs.default import DatasetConfig
 from opentau.datasets.dataset_mixture import (
     DatasetMixtureMetadata,
     WeightedDatasetMixture,
     pad_vector,
 )
 from opentau.datasets.factory import make_dataset
-from opentau.configs.default import DatasetConfig
 
 
 class TestPadVector:

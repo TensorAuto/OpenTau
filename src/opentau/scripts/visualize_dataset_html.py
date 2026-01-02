@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -68,11 +69,11 @@ import requests
 from flask import Flask, redirect, render_template, request, url_for
 
 from opentau import available_datasets
+from opentau.configs.default import DatasetMixtureConfig, WandBConfig
+from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.lerobot_dataset import LeRobotDataset
 from opentau.datasets.utils import IterableNamespace
 from opentau.utils.utils import init_logging
-from opentau.configs.default import DatasetMixtureConfig, WandBConfig
-from opentau.configs.train import TrainPipelineConfig
 
 
 def run_server(

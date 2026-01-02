@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,8 +19,8 @@ from functools import partial
 
 import gymnasium as gym
 
-from opentau.envs.configs import EnvConfig, LiberoEnv
 from opentau.configs.train import TrainPipelineConfig
+from opentau.envs.configs import EnvConfig, LiberoEnv
 
 
 def make_env_config(env_type: str, **kwargs) -> EnvConfig:
