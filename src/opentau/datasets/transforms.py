@@ -208,7 +208,18 @@ class ImageTransformsConfig:
     )
 
 
-def make_transform_from_config(cfg: ImageTransformConfig):
+def make_transform_from_config(cfg: ImageTransformConfig) -> Transform:
+    """Create a transform instance from an ImageTransformConfig.
+
+    Args:
+        cfg: Configuration object specifying the transform type and parameters.
+
+    Returns:
+        Transform instance (Identity, ColorJitter, or SharpnessJitter).
+
+    Raises:
+        ValueError: If the transform type is not recognized.
+    """
     if cfg.type == "Identity":
         return v2.Identity(**cfg.kwargs)
     elif cfg.type == "ColorJitter":

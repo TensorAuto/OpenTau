@@ -42,11 +42,40 @@ def estimate_num_samples(
 
 
 def sample_indices(data_len: int) -> list[int]:
+    """Generate evenly spaced sample indices from a dataset.
+
+    Uses estimate_num_samples to determine how many samples to take,
+    then returns evenly spaced indices across the dataset length.
+
+    Args:
+        data_len: Total length of the dataset.
+
+    Returns:
+        List of evenly spaced integer indices.
+    """
     num_samples = estimate_num_samples(data_len)
     return np.round(np.linspace(0, data_len - 1, num_samples)).astype(int).tolist()
 
 
-def auto_downsample_height_width(img: np.ndarray, target_size: int = 150, max_size_threshold: int = 300):
+def auto_downsample_height_width(
+    img: np.ndarray, target_size: int = 150, max_size_threshold: int = 300
+) -> np.ndarray:
+    """Automatically downsample an image if it exceeds size threshold.
+
+    If the image's maximum dimension is below the threshold, returns it unchanged.
+    Otherwise, downsamples by an integer factor to bring the larger dimension
+    close to the target size.
+
+    Args:
+        img: Input image array of shape (C, H, W).
+        target_size: Target size for the larger dimension after downsampling.
+            Defaults to 150.
+        max_size_threshold: Maximum size before downsampling is applied.
+            Defaults to 300.
+
+    Returns:
+        Downsampled image array, or original if no downsampling needed.
+    """
     _, height, width = img.shape
 
     if max(width, height) < max_size_threshold:
@@ -58,6 +87,17 @@ def auto_downsample_height_width(img: np.ndarray, target_size: int = 150, max_si
 
 
 def sample_images(image_paths: list[str]) -> np.ndarray:
+    """Load and downsample a subset of images from file paths.
+
+    Samples images using evenly spaced indices, loads them as uint8 arrays,
+    and automatically downsamples large images to reduce memory usage.
+
+    Args:
+        image_paths: List of file paths to image files.
+
+    Returns:
+        Array of shape (num_samples, C, H, W) containing sampled images as uint8.
+    """
     sampled_indices = sample_indices(len(image_paths))
 
     images = None
@@ -76,6 +116,16 @@ def sample_images(image_paths: list[str]) -> np.ndarray:
 
 
 def get_feature_stats(array: np.ndarray, axis: tuple, keepdims: bool) -> dict[str, np.ndarray]:
+    """Compute statistical measures (min, max, mean, std, count) for an array.
+
+    Args:
+        array: Input numpy array to compute statistics over.
+        axis: Axes along which to compute statistics.
+        keepdims: Whether to keep reduced dimensions.
+
+    Returns:
+        Dictionary containing 'min', 'max', 'mean', 'std', and 'count' statistics.
+    """
     return {
         "min": np.min(array, axis=axis, keepdims=keepdims),
         "max": np.max(array, axis=axis, keepdims=keepdims),
@@ -86,6 +136,19 @@ def get_feature_stats(array: np.ndarray, axis: tuple, keepdims: bool) -> dict[st
 
 
 def compute_episode_stats(episode_data: dict[str, list[str] | np.ndarray], features: dict) -> dict:
+    """Compute statistics for a single episode.
+
+    For image/video features, samples and downsamples images before computing stats.
+    For other features, computes stats directly on the array data.
+
+    Args:
+        episode_data: Dictionary mapping feature names to their data (arrays or image paths).
+        features: Dictionary of feature specifications with 'dtype' keys.
+
+    Returns:
+        Dictionary mapping feature names to their statistics (min, max, mean, std, count).
+        Image statistics are normalized to [0, 1] range.
+    """
     ep_stats = {}
     for key, data in episode_data.items():
         if features[key]["dtype"] == "string":
@@ -110,7 +173,18 @@ def compute_episode_stats(episode_data: dict[str, list[str] | np.ndarray], featu
     return ep_stats
 
 
-def _assert_type_and_shape(stats_list: list[dict[str, dict]]):
+def _assert_type_and_shape(stats_list: list[dict[str, dict]]) -> None:
+    """Validate that statistics dictionaries have correct types and shapes.
+
+    Checks that all values are numpy arrays, have at least 1 dimension,
+    count has shape (1,), and image stats have shape (3, 1, 1).
+
+    Args:
+        stats_list: List of statistics dictionaries to validate.
+
+    Raises:
+        ValueError: If any statistic has incorrect type or shape.
+    """
     for i in range(len(stats_list)):
         for fkey in stats_list[i]:
             for k, v in stats_list[i][fkey].items():
@@ -129,7 +203,19 @@ def _assert_type_and_shape(stats_list: list[dict[str, dict]]):
 def aggregate_feature_stats(
     stats_ft_list: list[dict[str, dict]], weights: Optional[list[float]] = None
 ) -> dict[str, dict[str, np.ndarray]]:
-    """Aggregates stats for a single feature."""
+    """Aggregate statistics for a single feature across multiple episodes/datasets.
+
+    Computes weighted mean and variance using the parallel algorithm for variance
+    computation. Min and max are taken as the global min/max across all stats.
+
+    Args:
+        stats_ft_list: List of statistics dictionaries for the same feature.
+        weights: Optional weights for each statistics entry. If None, uses
+            count values as weights.
+
+    Returns:
+        Aggregated statistics dictionary with min, max, mean, std, and count.
+    """
     means = np.stack([s["mean"] for s in stats_ft_list])
     variances = np.stack([s["std"] ** 2 for s in stats_ft_list])
 

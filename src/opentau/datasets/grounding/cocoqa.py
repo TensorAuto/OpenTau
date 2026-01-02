@@ -28,11 +28,31 @@ logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 
 
 def _img_to_normalized_tensor(img: Image.Image, img_shape: tuple) -> torch.Tensor:
+    """Convert a PIL Image to a normalized torch tensor.
+
+    Resizes the image and converts it from (H, W, C) to (C, H, W) format,
+    normalizing pixel values to [0, 1].
+
+    Args:
+        img: PIL Image to convert.
+        img_shape: Target image shape (height, width).
+
+    Returns:
+        Normalized tensor of shape (C, H, W) with values in [0, 1].
+    """
     img = img.resize(img_shape, Image.BILINEAR)
     return torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0
 
 
 def _filter_dataset(dataset: List) -> List:
+    """Filter dataset to only include samples with 'where' questions.
+
+    Args:
+        dataset: List of dataset samples.
+
+    Returns:
+        Filtered list containing only samples with 'where' in the question.
+    """
     filtered_dataset = []
     for sd in dataset:
         if "where" in sd["question"]:
@@ -43,6 +63,12 @@ def _filter_dataset(dataset: List) -> List:
 
 @register_grounding_dataset("cocoqa")
 class COCODataset(GroundingDataset):
+    """COCO-QA dataset for visual question answering and grounding tasks.
+
+    Loads the ThucPD/coco-qa-vi dataset from HuggingFace and filters it to
+    only include 'where' questions for spatial reasoning tasks.
+    """
+
     def __init__(self, cfg: TrainPipelineConfig):
         self.dataset = load_dataset("ThucPD/coco-qa-vi", split="train")
 
@@ -55,7 +81,16 @@ class COCODataset(GroundingDataset):
     def _get_feature_mapping_key(self) -> str:
         return "cocoqa"
 
-    def __getitem_helper__(self, item):
+    def __getitem_helper__(self, item) -> dict:
+        """Get a COCO-QA dataset item.
+
+        Args:
+            item: Index of the item to retrieve.
+
+        Returns:
+            Dictionary with image, task, postfix, task_type, and prompt
+            extracted from the COCO-QA dataset sample.
+        """
         sample = self.filtered_dataset[item]
         img = sample["image"]
 

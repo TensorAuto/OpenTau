@@ -87,6 +87,18 @@ from opentau.utils.utils import on_accelerate_main_proc
 
 
 def retry_random_on_failure(f):
+    """Decorator to retry dataset item retrieval with random indices on failure.
+
+    When a dataset item fails to load, this decorator will retry with random
+    indices up to `_total_rand_attempts` times before raising an error.
+
+    Args:
+        f: The `__getitem__` method to wrap.
+
+    Returns:
+        Wrapped function that retries on failure.
+    """
+
     @functools.wraps(f)
     def wrapped(self, idx):
         g = getattr(self, "_rr_rng", None)
@@ -128,6 +140,14 @@ CODEBASE_VERSION = "v2.1"
 
 
 class DatasetMetadata:
+    """Base class for dataset metadata containing info and statistics.
+
+    Attributes:
+        info: Dictionary containing dataset information (features, fps, etc.).
+        stats: Dictionary containing dataset statistics for normalization.
+        repo_id: Repository ID of the dataset (set by subclasses).
+    """
+
     def __init__(self, *, info: dict = None, stats: dict = None):
         self.info = info or {"features": {}}
         self.stats = stats or {}
@@ -172,6 +192,8 @@ class DatasetMetadata:
 
 
 class GroundingDatasetMetadata(DatasetMetadata):
+    """Metadata class for grounding datasets (vision-language datasets)."""
+
     pass
 
 
@@ -200,7 +222,12 @@ class LeRobotDatasetMetadata(DatasetMetadata):
             self.pull_from_repo(allow_patterns="meta/")
             self.load_metadata()
 
-    def load_metadata(self):
+    def load_metadata(self) -> None:
+        """Load dataset metadata from disk.
+
+        Loads info, tasks, episodes, statistics, and advantages from the
+        dataset root directory. Handles version compatibility checks.
+        """
         self.info = load_info(self.root)
         check_version_compatibility(self.repo_id, self._version, CODEBASE_VERSION)
         self.tasks, self.task_to_task_index = load_tasks(self.root)
@@ -234,16 +261,43 @@ class LeRobotDatasetMetadata(DatasetMetadata):
         return packaging.version.parse(self.info["codebase_version"])
 
     def get_data_file_path(self, ep_index: int) -> Path:
+        """Get the file path for a specific episode's parquet data file.
+
+        Args:
+            ep_index: Episode index.
+
+        Returns:
+            Path to the parquet file for the episode.
+        """
         ep_chunk = self.get_episode_chunk(ep_index)
         fpath = self.data_path.format(episode_chunk=ep_chunk, episode_index=ep_index)
         return Path(fpath)
 
     def get_video_file_path(self, ep_index: int, vid_key: str) -> Path:
+        """Get the file path for a specific episode's video file.
+
+        Args:
+            ep_index: Episode index.
+            vid_key: Video key/name (e.g., "camera0").
+
+        Returns:
+            Path to the video file for the episode.
+        """
         ep_chunk = self.get_episode_chunk(ep_index)
         fpath = self.video_path.format(episode_chunk=ep_chunk, video_key=vid_key, episode_index=ep_index)
         return Path(fpath)
 
     def get_episode_chunk(self, ep_index: int) -> int:
+        """Get the chunk index for a given episode index.
+
+        Episodes are grouped into chunks for efficient storage.
+
+        Args:
+            ep_index: Episode index.
+
+        Returns:
+            Chunk index containing this episode.
+        """
         return ep_index // self.chunks_size
 
     @property
@@ -439,7 +493,21 @@ class BaseDataset(torch.utils.data.Dataset):
         """
         raise NotImplementedError
 
-    def _standardize_images(self, item, standard_item, n_cams, is_local):
+    def _standardize_images(self, item, standard_item, n_cams, is_local) -> list[bool]:
+        """Standardize image features to a common format.
+
+        Resizes images to the target resolution with padding, and tracks
+        which images are padded.
+
+        Args:
+            item: Input item dictionary with original image keys.
+            standard_item: Output dictionary to populate with standardized images.
+            n_cams: Number of cameras to process.
+            is_local: Whether processing local (past) images.
+
+        Returns:
+            List of boolean values indicating which images are padded.
+        """
         name_map = DATA_FEATURES_NAME_MAPPING[self._get_feature_mapping_key()]
         image_is_pad = []
         for cam_idx in range(n_cams):
@@ -472,7 +540,18 @@ class BaseDataset(torch.utils.data.Dataset):
 
         return image_is_pad
 
-    def _to_standard_data_format(self, item: dict):
+    def _to_standard_data_format(self, item: dict) -> dict:
+        """Convert dataset item to standard data format.
+
+        Standardizes feature names, separates images in time, pads vectors,
+        and ensures consistent data types and formats.
+
+        Args:
+            item: Raw dataset item dictionary.
+
+        Returns:
+            Dictionary with standardized feature names and formats.
+        """
         name_map = DATA_FEATURES_NAME_MAPPING[self._get_feature_mapping_key()]
         self._separate_image_in_time(item)
 
@@ -509,7 +588,24 @@ class BaseDataset(torch.utils.data.Dataset):
 
         return standard_item
 
-    def resize_with_pad(self, img, width, height, pad_value=0):
+    def resize_with_pad(self, img, width, height, pad_value=0) -> torch.Tensor:
+        """Resize an image to target dimensions with padding.
+
+        Maintains aspect ratio by resizing to fit within target dimensions,
+        then pads on the left and top to reach exact target size.
+
+        Args:
+            img: Input image tensor of shape (C, H, W).
+            width: Target width.
+            height: Target height.
+            pad_value: Value to use for padding. Defaults to 0.
+
+        Returns:
+            Resized and padded image tensor of shape (C, height, width).
+
+        Raises:
+            ValueError: If input image doesn't have 4 dimensions when reshaped.
+        """
         # assume no-op when width height fits already
         img = rearrange(img, "c h w -> 1 c h w")
         if img.ndim != 4:
@@ -878,6 +974,14 @@ class LeRobotDataset(BaseDataset):
         self.pull_from_repo(allow_patterns=files, ignore_patterns=ignore_patterns)
 
     def get_episodes_file_paths(self) -> list[Path]:
+        """Get file paths for all selected episodes.
+
+        Returns paths for both parquet data files and video files (if applicable)
+        for all episodes in the dataset.
+
+        Returns:
+            List of file paths for episode data and videos.
+        """
         episodes = self.episodes if self.episodes is not None else list(range(self.meta.total_episodes))
         fpaths = [str(self.meta.get_data_file_path(ep_idx)) for ep_idx in episodes]
         if len(self.meta.video_keys) > 0:
@@ -904,6 +1008,11 @@ class LeRobotDataset(BaseDataset):
         return hf_dataset
 
     def create_hf_dataset(self) -> datasets.Dataset:
+        """Create an empty HuggingFace dataset with the correct features.
+
+        Returns:
+            Empty dataset with features matching the dataset specification.
+        """
         features = get_hf_features_from_features(self.features)
         ft_dict = {col: [] for col in features}
         hf_dataset = datasets.Dataset.from_dict(ft_dict, features=features, split="train")
@@ -942,9 +1051,19 @@ class LeRobotDataset(BaseDataset):
     def _get_query_indices_soft(
         self, idx: int, ep_idx: int
     ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
-        r"""Returns a dictionary of soft indices for querying the dataset, and a dictionary of padding masks.
-        "soft" means that the indices are floats instead of integers. Further processing is required to perform query on
-        integer indices and perform interpolation if needed.
+        """Get soft (float) indices for querying features with delta timestamps.
+
+        Computes indices for features based on delta timestamps, accounting for
+        episode boundaries. Returns both query indices and padding masks.
+
+        Args:
+            idx: Current data index.
+            ep_idx: Current episode index.
+
+        Returns:
+            Tuple of (query_indices, padding):
+                - query_indices: Dictionary mapping feature names to soft indices.
+                - padding: Dictionary mapping feature names to boolean padding masks.
         """
         ep_start = self.episode_data_index["from"][self.epi2idx[ep_idx]].item()
         ep_end = self.episode_data_index["to"][self.epi2idx[ep_idx]].item()
@@ -972,6 +1091,18 @@ class LeRobotDataset(BaseDataset):
         current_ts: float,
         query_indices: dict[str, np.ndarray] | None = None,
     ) -> dict[str, np.ndarray]:
+        """Get query timestamps for video features.
+
+        Converts soft indices to timestamps for video frame extraction.
+        If query_indices is provided, uses them; otherwise uses current timestamp.
+
+        Args:
+            current_ts: Current timestamp in seconds.
+            query_indices: Optional dictionary of soft indices for features.
+
+        Returns:
+            Dictionary mapping video keys to query timestamps.
+        """
         if query_indices:
             # In case values are lists
             query_indices = {k: np.array(v, dtype=np.float32) for k, v in query_indices.items()}
@@ -995,6 +1126,20 @@ class LeRobotDataset(BaseDataset):
         return query_timestamps
 
     def _query_hf_dataset_soft(self, soft_indices: dict[str, np.ndarray]) -> dict:
+        """Query dataset using soft (float) indices with interpolation.
+
+        Converts soft indices to hard indices based on resample strategy
+        (linear interpolation or nearest neighbor).
+
+        Args:
+            soft_indices: Dictionary mapping feature names to soft (float) indices.
+
+        Returns:
+            Dictionary of feature values queried from the dataset.
+
+        Raises:
+            ValueError: If vector_resample_strategy is not 'linear' or 'nearest'.
+        """
         # soft indices are float indices that need to be converted to hard (integer) indices
         if self.vector_resample_strategy == "linear":
             floor_indices = {k: np.floor(v).astype(int) for k, v in soft_indices.items()}
@@ -1023,6 +1168,14 @@ class LeRobotDataset(BaseDataset):
         )
 
     def _query_hf_dataset(self, hard_indices: dict[str, np.ndarray]) -> dict:
+        """Query dataset using hard (integer) indices.
+
+        Args:
+            hard_indices: Dictionary mapping feature names to integer indices.
+
+        Returns:
+            Dictionary of feature values stacked as tensors.
+        """
         # TODO(shuheng): look into optimization when using hf_dataset.select
         return {
             key: torch.stack(list(self.hf_dataset.select(q_idx)[key]))
@@ -1068,6 +1221,15 @@ class LeRobotDataset(BaseDataset):
         return item
 
     def _add_padding_keys(self, item: dict, padding: dict[str, list[bool]]) -> dict:
+        """Add padding mask keys to the item dictionary.
+
+        Args:
+            item: Item dictionary to modify.
+            padding: Dictionary mapping feature names to boolean padding masks.
+
+        Returns:
+            Modified item dictionary with padding keys added.
+        """
         for key, val in padding.items():
             item[key] = torch.BoolTensor(val)
         return item

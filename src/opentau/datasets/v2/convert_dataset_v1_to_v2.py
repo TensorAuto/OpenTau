@@ -155,6 +155,21 @@ V1_STATS_PATH = "meta_data/stats.safetensors"
 
 
 def parse_robot_config(robot_cfg: RobotConfig) -> tuple[str, dict]:
+    """Parse robot configuration to extract robot type and motor names.
+
+    Extracts state and action motor names from the robot configuration.
+    Currently supports "aloha" and "koch" robot types.
+
+    Args:
+        robot_cfg: Robot configuration object.
+
+    Returns:
+        Dictionary with 'robot_type' and 'names' keys. The 'names' dictionary
+        maps feature keys to lists of motor names.
+
+    Raises:
+        NotImplementedError: If robot type is not supported.
+    """
     if robot_cfg.type in ["aloha", "koch"]:
         state_names = [
             f"{arm}_{motor}" if len(robot_cfg.follower_arms) > 1 else motor
@@ -184,6 +199,18 @@ def parse_robot_config(robot_cfg: RobotConfig) -> tuple[str, dict]:
 
 
 def convert_stats_to_json(v1_dir: Path, v2_dir: Path) -> None:
+    """Convert statistics from v1.6 safetensors format to v2.0 JSON format.
+
+    Loads statistics from safetensors file, converts to JSON, and validates
+    that the conversion preserves all values correctly.
+
+    Args:
+        v1_dir: Directory containing v1.6 dataset with meta_data/stats.safetensors.
+        v2_dir: Directory where v2.0 dataset meta/stats.json will be written.
+
+    Raises:
+        AssertionError: If converted statistics don't match original values.
+    """
     safetensor_path = v1_dir / V1_STATS_PATH
     stats = load_file(safetensor_path)
     serialized_stats = {key: value.tolist() for key, value in stats.items()}
@@ -207,6 +234,19 @@ def convert_stats_to_json(v1_dir: Path, v2_dir: Path) -> None:
 def get_features_from_hf_dataset(
     dataset: Dataset, robot_config: RobotConfig | None = None
 ) -> dict[str, list]:
+    """Extract feature specifications from a HuggingFace dataset.
+
+    Converts HuggingFace dataset features to the format expected by v2.0 datasets.
+    Handles Value, Sequence, Image, and VideoFrame feature types.
+
+    Args:
+        dataset: HuggingFace dataset to extract features from.
+        robot_config: Optional robot configuration for motor name extraction.
+
+    Returns:
+        Dictionary mapping feature names to feature specifications with
+        'dtype', 'shape', and 'names' keys.
+    """
     robot_config = parse_robot_config(robot_config)
     features = {}
     for key, ft in dataset.features.items():
@@ -244,6 +284,19 @@ def get_features_from_hf_dataset(
 
 
 def add_task_index_by_episodes(dataset: Dataset, tasks_by_episodes: dict) -> tuple[Dataset, list[str]]:
+    """Add task_index column to dataset based on episode-to-task mapping.
+
+    Creates a task_index column by mapping episode indices to task indices.
+    Also creates a tasks list mapping task_index to task description.
+
+    Args:
+        dataset: HuggingFace dataset to modify.
+        tasks_by_episodes: Dictionary mapping episode_index to task description.
+
+    Returns:
+        Tuple of (modified_dataset, tasks_list) where tasks_list maps
+        task_index to task description.
+    """
     df = dataset.to_pandas()
     tasks = list(set(tasks_by_episodes.values()))
     tasks_to_task_index = {task: task_idx for task_idx, task in enumerate(tasks)}
@@ -259,6 +312,21 @@ def add_task_index_by_episodes(dataset: Dataset, tasks_by_episodes: dict) -> tup
 def add_task_index_from_tasks_col(
     dataset: Dataset, tasks_col: str
 ) -> tuple[Dataset, dict[str, list[str]], list[str]]:
+    """Add task_index column from an existing tasks column in the dataset.
+
+    Extracts tasks from the specified column, creates task indices, and removes
+    the original tasks column. Also handles cleaning of tensor string formats.
+
+    Args:
+        dataset: HuggingFace dataset containing a tasks column.
+        tasks_col: Name of the column containing task descriptions.
+
+    Returns:
+        Tuple of (modified_dataset, tasks_list, tasks_by_episode):
+            - modified_dataset: Dataset with task_index column added and tasks_col removed.
+            - tasks_list: List of unique tasks.
+            - tasks_by_episode: Dictionary mapping episode_index to list of tasks.
+    """
     df = dataset.to_pandas()
 
     # HACK: This is to clean some of the instructions in our version of Open X datasets
@@ -287,6 +355,20 @@ def split_parquet_by_episodes(
     total_chunks: int,
     output_dir: Path,
 ) -> list:
+    """Split dataset into separate parquet files, one per episode.
+
+    Organizes episodes into chunks and writes each episode to its own parquet file
+    following the v2.0 directory structure.
+
+    Args:
+        dataset: HuggingFace dataset to split.
+        total_episodes: Total number of episodes in the dataset.
+        total_chunks: Total number of chunks to organize episodes into.
+        output_dir: Root directory where parquet files will be written.
+
+    Returns:
+        List of episode lengths (one per episode).
+    """
     table = dataset.data.table
     episode_lengths = []
     for ep_chunk in range(total_chunks):
@@ -314,10 +396,23 @@ def move_videos(
     clean_gittatributes: Path,
     branch: str = "main",
 ) -> None:
-    """
-    HACK: Since HfApi() doesn't provide a way to move files directly in a repo, this function will run git
-    commands to fetch git lfs video files references to move them into subdirectories without having to
-    actually download them.
+    """Move video files from v1.6 flat structure to v2.0 chunked structure.
+
+    Uses git LFS to move video file references without downloading the actual files.
+    This is a workaround since HfApi doesn't support moving files directly.
+
+    Args:
+        repo_id: Repository ID of the dataset.
+        video_keys: List of video feature keys to move.
+        total_episodes: Total number of episodes.
+        total_chunks: Total number of chunks.
+        work_dir: Working directory for git operations.
+        clean_gittatributes: Path to clean .gitattributes file.
+        branch: Git branch to work with. Defaults to "main".
+
+    Note:
+        This function uses git commands to manipulate LFS-tracked files without
+        downloading them, which is more efficient than using the HuggingFace API.
     """
     _lfs_clone(repo_id, work_dir, branch)
 
@@ -373,6 +468,14 @@ def move_videos(
 
 
 def fix_lfs_video_files_tracking(work_dir: Path, lfs_untracked_videos: list[str]) -> None:
+    """Fix Git LFS tracking for video files that aren't properly tracked.
+
+    Adds video files to .gitattributes to ensure they're tracked by Git LFS.
+
+    Args:
+        work_dir: Working directory containing the repository.
+        lfs_untracked_videos: List of video file paths that need LFS tracking.
+    """
     """
     HACK: This function fixes the tracking by git lfs which was not properly set on some repos. In that case,
     there's no other option than to download the actual files and reupload them with lfs tracking.
@@ -392,6 +495,13 @@ def fix_lfs_video_files_tracking(work_dir: Path, lfs_untracked_videos: list[str]
 
 
 def fix_gitattributes(work_dir: Path, current_gittatributes: Path, clean_gittatributes: Path) -> None:
+    """Replace .gitattributes file with a clean version and commit the change.
+
+    Args:
+        work_dir: Working directory containing the repository.
+        current_gittatributes: Path to current .gitattributes file.
+        clean_gittatributes: Path to clean .gitattributes file to use as replacement.
+    """
     shutil.copyfile(clean_gittatributes, current_gittatributes)
     subprocess.run(["git", "add", ".gitattributes"], cwd=work_dir, check=True)
     subprocess.run(["git", "commit", "-m", "Fix .gitattributes"], cwd=work_dir, check=True)
@@ -399,6 +509,16 @@ def fix_gitattributes(work_dir: Path, current_gittatributes: Path, clean_gittatr
 
 
 def _lfs_clone(repo_id: str, work_dir: Path, branch: str) -> None:
+    """Clone a repository with Git LFS support, skipping actual file downloads.
+
+    Initializes Git LFS and clones the repository without downloading LFS files
+    (using GIT_LFS_SKIP_SMUDGE=1) for efficiency.
+
+    Args:
+        repo_id: Repository ID to clone.
+        work_dir: Directory where the repository will be cloned.
+        branch: Git branch to checkout.
+    """
     subprocess.run(["git", "lfs", "install"], cwd=work_dir, check=True)
     repo_url = f"https://huggingface.co/datasets/{repo_id}"
     env = {"GIT_LFS_SKIP_SMUDGE": "1"}  # Prevent downloading LFS files
@@ -410,6 +530,15 @@ def _lfs_clone(repo_id: str, work_dir: Path, branch: str) -> None:
 
 
 def _get_lfs_untracked_videos(work_dir: Path, video_files: list[str]) -> list[str]:
+    """Get list of video files that are not tracked by Git LFS.
+
+    Args:
+        work_dir: Working directory containing the repository.
+        video_files: List of video file paths to check.
+
+    Returns:
+        List of video file paths that are not tracked by Git LFS.
+    """
     lfs_tracked_files = subprocess.run(
         ["git", "lfs", "ls-files", "-n"], cwd=work_dir, capture_output=True, text=True, check=True
     )
@@ -418,6 +547,19 @@ def _get_lfs_untracked_videos(work_dir: Path, video_files: list[str]) -> list[st
 
 
 def get_videos_info(repo_id: str, local_dir: Path, video_keys: list[str], branch: str) -> dict:
+    """Get video information (codec, dimensions, etc.) from the first episode.
+
+    Downloads video files from the first episode to extract metadata.
+
+    Args:
+        repo_id: Repository ID of the dataset.
+        local_dir: Local directory where videos will be downloaded.
+        video_keys: List of video feature keys to get info for.
+        branch: Git branch to use.
+
+    Returns:
+        Dictionary mapping video keys to their information dictionaries.
+    """
     # Assumes first episode
     video_files = [
         DEFAULT_VIDEO_PATH.format(episode_chunk=0, video_key=vid_key, episode_index=0)
@@ -443,7 +585,29 @@ def convert_dataset(
     robot_config: RobotConfig | None = None,
     test_branch: str | None = None,
     **card_kwargs,
-):
+) -> None:
+    """Convert a dataset from v1.6 format to v2.0 format.
+
+    Handles conversion of metadata, statistics, parquet files, videos, and tasks.
+    Supports three scenarios: single task dataset, single task per episode, or
+    multiple tasks per episode.
+
+    Args:
+        repo_id: Repository ID of the dataset to convert.
+        local_dir: Local directory for downloading and writing converted dataset.
+        single_task: Single task description for datasets with one task.
+            Mutually exclusive with tasks_path and tasks_col.
+        tasks_path: Path to JSON file mapping episode_index to task descriptions.
+            Mutually exclusive with single_task and tasks_col.
+        tasks_col: Name of column in parquet files containing task descriptions.
+            Mutually exclusive with single_task and tasks_path.
+        robot_config: Optional robot configuration for extracting motor names.
+        test_branch: Optional branch name for testing conversion without affecting main.
+        **card_kwargs: Additional keyword arguments for dataset card creation.
+
+    Raises:
+        ValueError: If task specification arguments are invalid or missing.
+    """
     v1 = get_safe_version(repo_id, V16)
     v1x_dir = local_dir / V16 / repo_id
     v20_dir = local_dir / V20 / repo_id

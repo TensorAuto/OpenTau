@@ -23,6 +23,18 @@ from opentau.datasets.lerobot_dataset import CODEBASE_VERSION, BaseDataset, Grou
 
 
 class GroundingDataset(BaseDataset):
+    """Base class for vision-language grounding datasets.
+
+    Grounding datasets are used for training vision-language-action models on
+    image-text tasks without robot actions. They provide images, prompts, and
+    responses for grounding tasks.
+
+    Attributes:
+        num_frames: Number of frames in the dataset.
+        num_episodes: Number of episodes (always 1 for grounding datasets).
+        meta: Dataset metadata containing features and statistics.
+    """
+
     def __init__(self, cfg: TrainPipelineConfig, num_frames: int = 1, num_episodes: int = 1):
         super().__init__(cfg)
         self.num_frames = num_frames
@@ -30,6 +42,14 @@ class GroundingDataset(BaseDataset):
         self.meta = self.create_meta()
 
     def create_meta(self) -> GroundingDatasetMetadata:
+        """Create metadata for the grounding dataset.
+
+        Initializes metadata with ImageNet statistics for images and zero
+        statistics for state and actions (since grounding datasets don't have them).
+
+        Returns:
+            GroundingDatasetMetadata object with initialized info and stats.
+        """
         from opentau.datasets.factory import IMAGENET_STATS
 
         info = {
@@ -70,6 +90,15 @@ class GroundingDataset(BaseDataset):
 
     @abstractmethod
     def __getitem_helper__(self, item) -> dict:
+        """Helper method to get a dataset item (to be implemented by subclasses).
+
+        Args:
+            item: Index of the item to retrieve.
+
+        Returns:
+            Dictionary containing the raw item data with keys like 'image',
+            'task', 'postfix', 'task_type', 'prompt'.
+        """
         pass
 
     @final
@@ -86,6 +115,13 @@ class GroundingDataset(BaseDataset):
         item["advantage"] = torch.tensor(0, dtype=torch.bfloat16)
         return item
 
-    def _separate_image_in_time(self, item: dict):
+    def _separate_image_in_time(self, item: dict) -> None:
+        """Separate images in time (no-op for grounding datasets).
+
+        Grounding datasets don't have temporal image sequences, so this is a no-op.
+
+        Args:
+            item: Item dictionary (unmodified).
+        """
         # Grounding datasets has nothing to separate.
         pass

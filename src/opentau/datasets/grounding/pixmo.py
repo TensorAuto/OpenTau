@@ -99,8 +99,22 @@ def _pil_from_url(url: str) -> Image.Image | None:
         return None
 
 
-def _get_post_fix(label, points, orig_w, orig_h, max_points=16):
-    r"""Map the points from pixel space to grid space, deduplicate, and return a postfix string (in json format)."""
+def _get_post_fix(label: str, points: list, orig_w: int, orig_h: int, max_points: int = 16) -> str:
+    """Map points from pixel space to grid space and return a JSON postfix string.
+
+    Converts pixel coordinates to a 255x255 grid, deduplicates points, and
+    limits to max_points. Returns a JSON string with point coordinates and labels.
+
+    Args:
+        label: Label for the points (e.g., object class name).
+        points: List of point dictionaries with 'x' and 'y' keys.
+        orig_w: Original image width.
+        orig_h: Original image height.
+        max_points: Maximum number of points to include. Defaults to 16.
+
+    Returns:
+        JSON string containing point coordinates and labels.
+    """
     # use `dict` to deduplicate as `set` is not guaranteed to preserve order
     deduplicated = {
         (int(p["x"] * POINT_GRID / orig_w), int(p["y"] * POINT_GRID / orig_h)): None for p in points
@@ -112,6 +126,17 @@ def _get_post_fix(label, points, orig_w, orig_h, max_points=16):
 
 
 def _img_to_normalized_tensor(img: Image.Image) -> torch.Tensor:
+    """Convert a PIL Image to a normalized torch tensor.
+
+    Resizes the image to IMG_SIZE and converts it from (H, W, C) to (C, H, W)
+    format, normalizing pixel values to [0, 1].
+
+    Args:
+        img: PIL Image to convert.
+
+    Returns:
+        Normalized tensor of shape (C, IMG_SIZE, IMG_SIZE) with values in [0, 1].
+    """
     img = img.resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR)
     # pytorch uses (C, H, W) while PIL uses (H, W, C)
     return torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0
@@ -134,7 +159,21 @@ class PixmoDataset(GroundingDataset):
     def _get_feature_mapping_key(self) -> str:
         return "pixmo"
 
-    def __getitem_helper__(self, item):
+    def __getitem_helper__(self, item) -> dict:
+        """Get a PixMo dataset item.
+
+        Downloads the image from URL and formats it for part localization tasks.
+        Retries with random indices if image download fails.
+
+        Args:
+            item: Index of the item to retrieve.
+
+        Returns:
+            Dictionary with image, task, postfix, task_type, and prompt.
+
+        Raises:
+            RuntimeError: If too many consecutive items fail to load.
+        """
         for _ in range(self.consecutive_bad_tolerance):
             if item in self.bad_ids:
                 item = np.random.randint(0, len(self.ds))

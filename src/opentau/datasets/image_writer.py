@@ -25,6 +25,18 @@ import torch
 
 
 def safe_stop_image_writer(func):
+    """Decorator to safely stop image writer on exceptions.
+
+    Ensures that the image writer is properly stopped if an exception occurs
+    during function execution.
+
+    Args:
+        func: Function to wrap.
+
+    Returns:
+        Wrapped function that stops image writer on exceptions.
+    """
+
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
@@ -40,6 +52,27 @@ def safe_stop_image_writer(func):
 
 
 def image_array_to_pil_image(image_array: np.ndarray, range_check: bool = True) -> PIL.Image.Image:
+    """Convert a numpy array to a PIL Image.
+
+    Supports channel-first (C, H, W) and channel-last (H, W, C) formats.
+    Converts float arrays in [0, 1] to uint8 in [0, 255].
+
+    Args:
+        image_array: Input image array of shape (C, H, W) or (H, W, C).
+        range_check: If True, validates that float arrays are in [0, 1] range.
+            Defaults to True.
+
+    Returns:
+        PIL Image object.
+
+    Raises:
+        ValueError: If array has wrong number of dimensions, wrong number of
+            channels, or float values are outside [0, 1] range.
+        NotImplementedError: If image doesn't have 3 channels.
+
+    Note:
+        TODO(aliberts): handle 1 channel and 4 for depth images
+    """
     # TODO(aliberts): handle 1 channel and 4 for depth images
     if image_array.ndim != 3:
         raise ValueError(f"The array has {image_array.ndim} dimensions, but 3 is expected for an image.")
@@ -69,7 +102,18 @@ def image_array_to_pil_image(image_array: np.ndarray, range_check: bool = True) 
     return PIL.Image.fromarray(image_array)
 
 
-def write_image(image: np.ndarray | PIL.Image.Image, fpath: Path):
+def write_image(image: np.ndarray | PIL.Image.Image, fpath: Path) -> None:
+    """Write an image to disk.
+
+    Converts numpy arrays to PIL Images if needed, then saves to the specified path.
+
+    Args:
+        image: Image to save (numpy array or PIL Image).
+        fpath: Path where the image will be saved.
+
+    Raises:
+        TypeError: If image type is not supported.
+    """
     try:
         if isinstance(image, np.ndarray):
             img = image_array_to_pil_image(image)
@@ -82,7 +126,15 @@ def write_image(image: np.ndarray | PIL.Image.Image, fpath: Path):
         print(f"Error writing image {fpath}: {e}")
 
 
-def worker_thread_loop(queue: queue.Queue):
+def worker_thread_loop(queue: queue.Queue) -> None:
+    """Worker thread loop for asynchronous image writing.
+
+    Continuously processes items from the queue until receiving None (sentinel).
+    Each item should be a tuple of (image_array, file_path).
+
+    Args:
+        queue: Queue containing (image_array, file_path) tuples or None sentinel.
+    """
     while True:
         item = queue.get()
         if item is None:
@@ -93,7 +145,15 @@ def worker_thread_loop(queue: queue.Queue):
         queue.task_done()
 
 
-def worker_process(queue: queue.Queue, num_threads: int):
+def worker_process(queue: queue.Queue, num_threads: int) -> None:
+    """Worker process that manages multiple threads for image writing.
+
+    Creates and manages a pool of worker threads that process items from the queue.
+
+    Args:
+        queue: Queue containing (image_array, file_path) tuples or None sentinels.
+        num_threads: Number of worker threads to create in this process.
+    """
     threads = []
     for _ in range(num_threads):
         t = threading.Thread(target=worker_thread_loop, args=(queue,))
@@ -147,16 +207,30 @@ class AsyncImageWriter:
                 p.start()
                 self.processes.append(p)
 
-    def save_image(self, image: torch.Tensor | np.ndarray | PIL.Image.Image, fpath: Path):
+    def save_image(self, image: torch.Tensor | np.ndarray | PIL.Image.Image, fpath: Path) -> None:
+        """Queue an image for asynchronous writing.
+
+        Converts torch tensors to numpy arrays and adds the image to the write queue.
+
+        Args:
+            image: Image to save (torch Tensor, numpy array, or PIL Image).
+            fpath: Path where the image will be saved.
+        """
         if isinstance(image, torch.Tensor):
             # Convert tensor to numpy array to minimize main process time
             image = image.cpu().numpy()
         self.queue.put((image, fpath))
 
-    def wait_until_done(self):
+    def wait_until_done(self) -> None:
+        """Wait until all queued images have been written to disk."""
         self.queue.join()
 
-    def stop(self):
+    def stop(self) -> None:
+        """Stop all worker threads/processes and clean up resources.
+
+        Sends sentinel values to all workers and waits for them to finish.
+        Terminates processes if they don't respond.
+        """
         if self._stopped:
             return
 

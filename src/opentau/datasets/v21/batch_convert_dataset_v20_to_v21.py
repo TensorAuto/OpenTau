@@ -30,7 +30,12 @@ from opentau.datasets.v21.convert_dataset_v20_to_v21 import V21, convert_dataset
 LOCAL_DIR = Path("data/")
 
 
-def batch_convert():
+def batch_convert() -> None:
+    """Batch convert multiple datasets from v2.0 to v2.1 format.
+
+    Processes all datasets in available_datasets, converting each one
+    and logging the results to a file. Skips datasets already in v2.1.
+    """
     status = {}
     LOCAL_DIR.mkdir(parents=True, exist_ok=True)
     logfile = LOCAL_DIR / "conversion_log_v21.txt"
