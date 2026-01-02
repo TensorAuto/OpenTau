@@ -12,6 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Base class for pre-trained policies in OpenTau.
+
+This module defines the abstract base class `PreTrainedPolicy` which handles
+loading, saving, and basic interface requirements for all policy implementations
+in the OpenTau library. It integrates with Hugging Face Hub for model sharing
+and safetensors for efficient serialization.
+"""
+
 import abc
 import logging
 import os
@@ -41,20 +50,39 @@ DEFAULT_POLICY_CARD = """
 {{ card_data }}
 ---
 
-This policy has been pushed to the Hub using [LeRobot](https://github.com/huggingface/lerobot):
+This policy has been pushed to the Hub using [OpenTau](https://github.com/TensorAuto/OpenTau):
 - Docs: {{ docs_url | default("[More Information Needed]", true) }}
 """
 
 
 class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
-    """
-    Base class for policy models.
+    """Base class for all policy models in OpenTau.
+
+    This class extends `nn.Module` and `HubMixin` to provide common functionality
+    for policy models, including configuration management, model loading/saving,
+    and abstract methods that all policies must implement.
+
+    Attributes:
+        config_class: The configuration class associated with this policy.
+            Must be defined in subclasses.
+        name: The name of the policy. Must be defined in subclasses.
+        config: The configuration instance for this policy.
     """
 
     config_class: None
     name: None
 
     def __init__(self, config: PreTrainedConfig, *inputs, **kwargs):
+        """Initializes the PreTrainedPolicy.
+
+        Args:
+            config: The configuration object for the policy.
+            *inputs: Variable length argument list.
+            **kwargs: Arbitrary keyword arguments.
+
+        Raises:
+            ValueError: If `config` is not an instance of `PreTrainedConfig`.
+        """
         super().__init__()
         if not isinstance(config, PreTrainedConfig):
             raise ValueError(
@@ -72,6 +100,11 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
             raise TypeError(f"Class {cls.__name__} must define 'name'")
 
     def _save_pretrained(self, save_directory: Path) -> None:
+        """Saves the policy and its configuration to a directory.
+
+        Args:
+            save_directory: The directory to save the policy to.
+        """
         self.config._save_pretrained(save_directory)
         model_to_save = self.module if hasattr(self, "module") else self
         save_model_as_safetensor(model_to_save, str(save_directory / SAFETENSORS_SINGLE_FILE))
@@ -92,9 +125,31 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         strict: bool = False,
         **kwargs,
     ) -> T:
-        """
-        The policy is set in evaluation mode by default using `policy.eval()` (dropout modules are
-        deactivated). To train it, you should first set it back in training mode with `policy.train()`.
+        """Loads a pretrained policy from a local path or the Hugging Face Hub.
+
+        The policy is set in evaluation mode by default using `policy.eval()`
+        (dropout modules are deactivated). To train it, you should first set it
+        back in training mode with `policy.train()`.
+
+        Args:
+            pretrained_name_or_path: The name or path of the pretrained model.
+            config: Optional configuration object. If None, it will be loaded from the
+                pretrained model.
+            force_download: Whether to force download the model weights.
+            resume_download: Whether to resume an interrupted download.
+            proxies: Proxy configuration for downloading.
+            token: Hugging Face token for authentication.
+            cache_dir: Directory to cache downloaded files.
+            local_files_only: Whether to only look for local files.
+            revision: The specific model version to use (branch, tag, or commit hash).
+            strict: Whether to strictly enforce matching keys in state_dict.
+            **kwargs: Additional keyword arguments passed to the constructor.
+
+        Returns:
+            T: An instance of the loaded policy.
+
+        Raises:
+            FileNotFoundError: If the model file is not found.
         """
         if config is None:
             config = PreTrainedConfig.from_pretrained(
@@ -137,8 +192,13 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         return policy
 
     def _tile_linear_input_weight(self, state_dict_to_load: dict):
-        r"""Modify the `state_dict_to_load` in-place by tiling the input weights of linear layers such that
-        it's compatible with the model architecture.
+        """Modifies the `state_dict_to_load` in-place by tiling linear layer input weights.
+
+        This ensures compatibility with the model architecture when weight dimensions don't match exactly,
+        typically used for expanding input layers.
+
+        Args:
+            state_dict_to_load: The state dictionary to modify.
         """
         for name, submodule in self.named_modules():
             if not isinstance(submodule, torch.nn.Linear):
@@ -162,6 +222,17 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
 
     @classmethod
     def _load_as_safetensor(cls, model: T, model_file: str, map_location: str, strict: bool) -> T:
+        """Loads model weights from a safetensors file.
+
+        Args:
+            model: The model instance to load weights into.
+            model_file: Path to the safetensors file.
+            map_location: Device to map the weights to.
+            strict: Whether to enforce strict key matching.
+
+        Returns:
+            T: The model with loaded weights.
+        """
         # Create base kwargs
         kwargs = {"strict": strict}
 
@@ -196,38 +267,49 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
 
     @abc.abstractmethod
     def get_optim_params(self) -> dict:
-        """
-        Returns the policy-specific parameters dict to be passed on to the optimizer.
+        """Returns the policy-specific parameters dict to be passed on to the optimizer.
+
+        Returns:
+            dict: A dictionary of parameters to optimize.
         """
         raise NotImplementedError
 
     @abc.abstractmethod
     def reset(self):
-        """To be called whenever the environment is reset.
+        """Resets the policy state.
 
-        Does things like clearing caches.
+        This method should be called whenever the environment is reset.
+        It handles tasks like clearing caches or resetting internal states for stateful policies.
         """
         raise NotImplementedError
 
     # TODO(aliberts, rcadene): split into 'forward' and 'compute_loss'?
     @abc.abstractmethod
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict | None]:
-        """_summary_
+        """Performs a forward pass of the policy.
 
         Args:
-            batch (dict[str, Tensor]): _description_
+            batch: A dictionary of input tensors.
 
         Returns:
-            tuple[Tensor, dict | None]: The loss and potentially other information. Apart from the loss which
-                is a Tensor, all other items should be logging-friendly, native Python types.
+            tuple[Tensor, dict | None]: A tuple containing:
+                - The loss tensor.
+                - An optional dictionary of metrics or auxiliary outputs.
+                  Apart from the loss, items should be logging-friendly native Python types.
         """
         raise NotImplementedError
 
     @abc.abstractmethod
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
-        """Return one action to run in the environment (potentially in batch mode).
+        """Selects an action based on the input batch.
 
-        When the model uses a history of observations, or outputs a sequence of actions, this method deals
-        with caching.
+        This method handles action selection during inference, including
+        caching for stateful policies (e.g. RNNs, Transformers).
+
+        Args:
+            batch: A dictionary of observation tensors.
+
+        Returns:
+            Tensor: The selected action(s).
         """
         raise NotImplementedError

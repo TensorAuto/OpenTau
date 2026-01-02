@@ -15,6 +15,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Utility functions for policy implementations in OpenTau.
+
+This module provides helper functions for managing data queues, inspecting model
+properties (device, dtype), determining output shapes, and logging model loading
+information.
+"""
+
 import logging
 from collections import deque
 
@@ -24,7 +31,20 @@ from torch import nn
 
 def populate_queues(
     queues: dict[str, deque], batch: dict[str, torch.Tensor], exclude_keys: list[str] | None = None
-):
+) -> dict[str, deque]:
+    """Populates queues with batch data.
+
+    If a queue is not full (e.g. at the start of an episode), it is filled by repeating
+    the first observation. Otherwise, the latest observation is appended.
+
+    Args:
+        queues: A dictionary of deques to be populated.
+        batch: A dictionary containing the data to add to the queues.
+        exclude_keys: A list of keys to exclude from population. Defaults to None.
+
+    Returns:
+        dict[str, deque]: The updated dictionary of queues.
+    """
     if exclude_keys is None:
         exclude_keys = []
     for key in batch:
@@ -45,7 +65,14 @@ def populate_queues(
 def get_device_from_parameters(module: nn.Module) -> torch.device:
     """Get a module's device by checking one of its parameters.
 
-    Note: assumes that all parameters have the same device
+    Note:
+        Assumes that all parameters have the same device.
+
+    Args:
+        module: The PyTorch module to inspect.
+
+    Returns:
+        torch.device: The device of the module's parameters.
     """
     return next(iter(module.parameters())).device
 
@@ -53,18 +80,24 @@ def get_device_from_parameters(module: nn.Module) -> torch.device:
 def get_dtype_from_parameters(module: nn.Module) -> torch.dtype:
     """Get a module's parameter dtype by checking one of its parameters.
 
-    Note: assumes that all parameters have the same dtype.
+    Note:
+        Assumes that all parameters have the same dtype.
+
+    Args:
+        module: The PyTorch module to inspect.
+
+    Returns:
+        torch.dtype: The data type of the module's parameters.
     """
     return next(iter(module.parameters())).dtype
 
 
 def get_output_shape(module: nn.Module, input_shape: tuple) -> tuple:
-    """
-    Calculates the output shape of a PyTorch module given an input shape.
+    """Calculates the output shape of a PyTorch module given an input shape.
 
     Args:
-        module (nn.Module): a PyTorch module
-        input_shape (tuple): A tuple representing the input shape, e.g., (batch_size, channels, height, width)
+        module: A PyTorch module.
+        input_shape: A tuple representing the input shape, e.g., (batch_size, channels, height, width).
 
     Returns:
         tuple: The output shape of the module.
@@ -79,8 +112,8 @@ def log_model_loading_keys(missing_keys: list[str], unexpected_keys: list[str]) 
     """Log missing and unexpected keys when loading a model.
 
     Args:
-        missing_keys (list[str]): Keys that were expected but not found.
-        unexpected_keys (list[str]): Keys that were found but not expected.
+        missing_keys: Keys that were expected but not found.
+        unexpected_keys: Keys that were found but not expected.
     """
     if missing_keys:
         # DO NOT UPDATE THIS MESSAGE WITHOUT UPDATING THE REGEX IN .gitlab/scripts/check_pi0_state_keys.py

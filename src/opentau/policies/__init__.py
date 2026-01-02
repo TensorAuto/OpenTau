@@ -13,6 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Policies module for OpenTau.
+
+This module exports the configuration classes for available policies,
+such as PI0, PI05, and Value policy.
+"""
+
 from .pi0.configuration_pi0 import PI0Config as PI0Config
 from .pi05.configuration_pi05 import PI05Config as PI05Config
 from .value.configuration_value import ValueConfig as ValueConfig

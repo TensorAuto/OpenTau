@@ -15,6 +15,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Factory functions for creating policy instances and configurations.
+
+This module provides utility functions to instantiate policy classes and their
+corresponding configurations based on policy names and types. It handles the
+logic for creating fresh policies or loading pretrained ones, as well as
+parsing features from datasets or environments to properly configure the policies.
+"""
+
 from typing import Optional
 
 import numpy as np
@@ -31,7 +39,18 @@ from opentau.policies.value.configuration_value import ValueConfig
 
 
 def get_policy_class(name: str) -> type[PreTrainedPolicy]:
-    """Get the policy's class and config class given a name (matching the policy class' `name` attribute)."""
+    """Get the policy's class given a name.
+
+    Args:
+        name: The name of the policy (e.g., "pi0", "pi05", "value").
+            Must match the policy class's `name` attribute.
+
+    Returns:
+        type[PreTrainedPolicy]: The policy class corresponding to the given name.
+
+    Raises:
+        NotImplementedError: If the policy with the given name is not implemented.
+    """
     if name == "pi0":
         from opentau.policies.pi0.modeling_pi0 import PI0Policy
 
@@ -49,6 +68,18 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
 
 
 def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
+    """Creates a policy configuration object based on the policy type.
+
+    Args:
+        policy_type: The type of the policy (e.g., "pi0", "pi05", "value").
+        **kwargs: Keyword arguments to be passed to the configuration class constructor.
+
+    Returns:
+        PreTrainedConfig: An instance of the corresponding policy configuration class.
+
+    Raises:
+        ValueError: If the policy type is not available.
+    """
     if policy_type == "pi0":
         return PI0Config(**kwargs)
     elif policy_type == "pi05":
@@ -74,18 +105,22 @@ def make_policy(
     in order to properly dimension and instantiate a policy for that dataset or environment.
 
     Args:
-        cfg (PreTrainedConfig): The config of the policy to make. If `pretrained_path` is set, the policy will
+        cfg: The config of the policy to make. If `pretrained_path` is set, the policy will
             be loaded with the weights from that path.
-        ds_meta (LeRobotDatasetMetadata | None, optional): Dataset metadata to take input/output shapes and
-            statistics to use for (un)normalization of inputs/outputs in the policy. Defaults to None.
-        features (dict[str, FeatureType] | None, optional): Input and output features. Defaults to None.
-
-    Raises:
-        ValueError: Either ds_meta or env and env_cfg must be provided.
-        NotImplementedError: if the policy.type is 'vqbet' and the policy device 'mps' (due to an incompatibility)
+        ds_meta: Dataset metadata to take input/output shapes and statistics to use for
+            (un)normalization of inputs/outputs in the policy. Defaults to None.
+        features: Input and output features. Defaults to None.
+        stats: Dictionary of statistics for normalization. Defaults to None.
+        execution_target: Target for execution. Can be "robot", "cloud", or None.
+            None implies unified training. "robot" implies robot action decoder inference.
+            "cloud" implies VLM on cloud inference. Defaults to None.
 
     Returns:
-        PreTrainedPolicy: _description_
+        PreTrainedPolicy: An instance of the created policy.
+
+    Raises:
+        ValueError: If neither or both `ds_meta` and `features` are provided when features are not already set in config.
+        ValueError: If `execution_target` is invalid.
     """
     features_already_set = (
         isinstance(cfg.input_features, dict)
