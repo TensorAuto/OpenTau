@@ -45,6 +45,6 @@ We provide fully functioning $\pi_{0.5}$ checkpoints trained on the LIBERO datas
 | More coming soon...                                                         |                                                                                                          |                                                                    |
 
 ## Acknowledgements
-We would like to thank the original authors of the [$\pi$ series](https://www.pi.website/blog) papers for their groundbreaking work in the VLA field.
+We would like to thank the original authors of the $\pi$ series [papers](https://www.pi.website/blog) for their groundbreaking work in the VLA field.
 We also acknowledge the contributions of the open-source community, especially [LeRobot](https://huggingface.co/lerobot), for their efforts in re-implementing the $\pi$ models and standardizing training infrastructure.
 OpenTau builds upon these foundations to provide a more accessible and comprehensive tool for training vision-language agents.
