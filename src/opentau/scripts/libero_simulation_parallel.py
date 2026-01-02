@@ -1,3 +1,17 @@
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import ctypes
 import logging
 import os
@@ -18,6 +32,8 @@ import torch
 from einops import rearrange
 from torch.utils.data._utils.collate import default_collate
 
+from opentau.configs import parser
+from opentau.configs.libero import TrainConfigWithLiberoEval
 from opentau.policies.factory import get_policy_class
 from opentau.utils.libero import LiberoObservationRecorder, summarize_libero_results
 from opentau.utils.libero import _libero2np as libero2np
@@ -25,8 +41,6 @@ from opentau.utils.libero import _np2torch as np2torch
 from opentau.utils.monkey_patch import gym_is_gymnasium_patch
 from opentau.utils.random_utils import set_seed
 from opentau.utils.utils import auto_torch_device
-from opentau.configs import parser
-from opentau.configs.libero import TrainConfigWithLiberoEval
 
 # Sent by client process to indicate simulation completion and signal that the pipe is to be closed
 SENTINEL = "<SENTINEL>"

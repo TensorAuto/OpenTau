@@ -1,4 +1,5 @@
 # Copyright 2025 Physical Intelligence and The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,13 +14,13 @@
 # limitations under the License.
 from dataclasses import dataclass, field
 
+from opentau.configs.policies import PreTrainedConfig
+from opentau.configs.reward import RewardConfig
+from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from opentau.optim.optimizers import AdamWConfig
 from opentau.optim.schedulers import (
     CosineDecayWithWarmupSchedulerConfig,
 )
-from opentau.configs.policies import PreTrainedConfig
-from opentau.configs.reward import RewardConfig
-from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
 
 
 @PreTrainedConfig.register_subclass("value")

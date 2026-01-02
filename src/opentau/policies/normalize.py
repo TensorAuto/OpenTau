@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-import sys
 
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
 # Copyright 2026 Tensor Auto Inc. All rights reserved.
@@ -15,6 +14,9 @@ import sys
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+import sys
+
 import numpy as np
 import torch
 from torch import Tensor, nn
