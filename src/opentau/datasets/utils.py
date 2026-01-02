@@ -14,6 +14,100 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Utility functions for dataset management, I/O, and validation.
+
+This module provides a comprehensive set of utility functions for working with
+LeRobot datasets, including file I/O operations, metadata management, data
+validation, version compatibility checking, and HuggingFace Hub integration.
+
+The module is organized into several functional areas:
+    - Dictionary manipulation: Flattening/unflattening nested dictionaries
+    - File I/O: JSON and JSONL reading/writing with automatic directory creation
+    - Metadata management: Loading and saving dataset info, statistics, episodes,
+      tasks, and advantages
+    - Data validation: Frame and episode buffer validation with detailed error
+      messages
+    - Version compatibility: Checking dataset versions against codebase versions
+    - Image handling: Loading images as numpy arrays with format conversion
+    - HuggingFace integration: Converting features to HuggingFace format, creating
+      dataset cards, managing branches
+
+Key Features:
+    - Automatic serialization: Converts tensors and arrays to JSON-compatible
+      formats when saving metadata
+    - Backward compatibility: Handles datasets from older format versions
+    - Comprehensive validation: Validates frames, episodes, and features with
+      detailed error reporting
+    - Path management: Standard paths for dataset structure (meta/, data/, videos/)
+    - Type conversion: Handles numpy arrays, PIL Images, and torch tensors
+
+Constants:
+    DEFAULT_CHUNK_SIZE: Maximum number of episodes per chunk (1000).
+    ADVANTAGES_PATH, INFO_PATH, EPISODES_PATH, STATS_PATH, etc.: Standard
+        relative paths for dataset metadata files.
+    DEFAULT_FEATURES: Dictionary of default feature specifications (timestamp,
+        frame_index, episode_index, index, task_index).
+
+Classes:
+    IterableNamespace: Namespace object supporting both dictionary iteration
+        and dot notation access, with recursive dictionary conversion.
+
+Functions:
+    Dictionary manipulation:
+        flatten_dict: Flatten nested dictionaries with separator-based keys.
+        unflatten_dict: Expand flattened keys into nested dictionaries.
+        get_nested_item: Access nested dictionary items using flattened keys.
+        serialize_dict: Convert tensors/arrays to JSON-serializable format.
+
+    File I/O:
+        load_json, write_json: JSON file operations.
+        load_jsonlines, write_jsonlines, append_jsonlines: JSONL operations.
+
+    Metadata management:
+        load_info, write_info: Dataset info (features, fps, etc.).
+        load_stats, write_stats: Dataset statistics (mean, std, min, max).
+        load_episodes, write_episode: Episode information.
+        load_episodes_stats, write_episode_stats: Per-episode statistics.
+        load_tasks, write_task: Task descriptions.
+        load_advantages: Advantage values for reinforcement learning.
+
+    Data validation:
+        validate_frame: Validate frame data against feature specifications.
+        validate_episode_buffer: Validate episode buffer before adding.
+        validate_features_presence: Check required/optional features.
+        validate_feature_dtype_and_shape: Validate feature types and shapes.
+
+    Version compatibility:
+        is_valid_version: Check if version string is parseable.
+        check_version_compatibility: Check dataset vs codebase version.
+        get_safe_version: Get compatible version from repository.
+
+    Image and data conversion:
+        load_image_as_numpy: Load images with format conversion.
+        hf_transform_to_torch: Convert HuggingFace dataset to torch tensors.
+        get_hf_features_from_features: Convert features to HuggingFace format.
+        dataset_to_policy_features: Convert to policy feature format.
+
+    Other utilities:
+        check_timestamps_sync: Validate timestamp synchronization.
+        get_episode_data_index: Compute episode indices in flattened dataset.
+        get_delta_indices_soft: Compute soft indices for delta timestamps.
+        create_empty_dataset_info: Create initial dataset info structure.
+        create_lerobot_dataset_card: Create HuggingFace dataset card.
+        cycle: Safe iterator cycling for PyTorch dataloaders.
+
+Example:
+    Load dataset metadata:
+        >>> info = load_info(Path("my_dataset"))
+        >>> stats = load_stats(Path("my_dataset"))
+        >>> episodes = load_episodes(Path("my_dataset"))
+
+    Validate a frame:
+        >>> features = {"state": {"dtype": "float32", "shape": (7,)}}
+        >>> frame = {"state": np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])}
+        >>> validate_frame(frame, features)
+"""
+
 import contextlib
 import importlib.resources
 import json

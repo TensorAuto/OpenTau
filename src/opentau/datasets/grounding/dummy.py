@@ -1,3 +1,4 @@
+
 # Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -11,6 +12,32 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Dummy grounding dataset for testing and development.
+
+This module provides a simple synthetic grounding dataset for testing the
+dataset infrastructure without requiring external data sources or network
+access. The dataset contains three predefined items: black, white, and gray
+images with corresponding question-answer pairs.
+
+The dataset cycles through the predefined items, making it useful for
+testing data loading pipelines, training loops, and debugging.
+
+Classes:
+    DummyGroundingDataset: Synthetic dataset class that provides simple test
+        data with configurable length.
+
+Constants:
+    _data: List of three predefined dataset items (black, white, gray images)
+        with corresponding tasks, postfixes, and prompts.
+
+Example:
+    Use dummy dataset for testing:
+        >>> from opentau.configs.default import DatasetConfig
+        >>> cfg = DatasetConfig(grounding="dummy")
+        >>> dataset = make_dataset(cfg, train_cfg)
+        >>> len(dataset)  # Returns 1000 by default
+"""
 
 import torch
 

@@ -15,6 +15,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Factory functions for creating datasets and dataset mixtures.
+
+This module provides factory functions to create individual datasets and
+weighted dataset mixtures from configuration objects. It handles the setup
+of delta timestamps, image transforms, and metadata configuration before
+instantiating datasets.
+
+The factory supports two types of datasets:
+    1. LeRobot datasets: Standard robot learning datasets loaded from HuggingFace
+       repositories with configurable delta timestamps for temporal alignment.
+    2. Grounding datasets: Vision-language grounding datasets (CLEVR, COCO-QA,
+       PIXMO, VSR, etc.) for multimodal learning tasks.
+
+Key Features:
+    - Delta timestamp resolution: Automatically configures temporal offsets
+      for features based on policy latency settings (action decoder and
+      cloud VLM latencies).
+    - Image transform support: Applies configurable image transformations
+      during dataset creation.
+    - Imagenet stats override: Optionally replaces dataset statistics with
+      ImageNet normalization statistics for camera features.
+    - Grounding dataset registration: Supports extensible grounding dataset
+      registration through side-effect imports.
+
+Functions:
+    make_dataset: Creates a single dataset instance from a DatasetConfig,
+        handling delta timestamp setup, image transforms, and metadata
+        configuration.
+    make_dataset_mixture: Creates a WeightedDatasetMixture from a
+        TrainPipelineConfig containing multiple dataset configurations.
+    resolve_delta_timestamps: Resolves delta timestamps configuration based
+        on TrainPipelineConfig settings, mapping features to temporal groups.
+
+Constants:
+    IMAGENET_STATS: ImageNet normalization statistics (mean, std, min, max)
+        used for camera feature normalization when use_imagenet_stats is enabled.
+
+Example:
+    Create a single dataset:
+        >>> dataset = make_dataset(dataset_cfg, train_cfg, return_advantage_input=False)
+
+    Create a dataset mixture:
+        >>> mixture = make_dataset_mixture(train_cfg, return_advantage_input=False)
+        >>> dataloader = mixture.get_dataloader()
+"""
+
 import numpy as np
 
 # NOTE: Don't delete; imported for side effects.

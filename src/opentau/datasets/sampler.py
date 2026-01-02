@@ -14,6 +14,43 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Episode-aware sampler for PyTorch DataLoader.
+
+This module provides a sampler that respects episode boundaries in robot
+learning datasets. It allows filtering specific episodes, dropping frames
+from episode boundaries, and optional shuffling while maintaining episode
+structure awareness.
+
+The sampler is designed for use with PyTorch DataLoader to ensure proper
+sampling behavior when working with sequential episode data, where episode
+boundaries are important for maintaining temporal coherence or avoiding
+invalid transitions.
+
+Key Features:
+    - Episode filtering: Select specific episodes to include in sampling.
+    - Boundary frame dropping: Optionally drop frames from the start or end
+      of episodes (useful for avoiding invalid transitions or edge cases).
+    - Optional shuffling: Shuffle indices while maintaining episode awareness.
+    - PyTorch compatible: Implements the standard Sampler interface for use
+      with DataLoader.
+
+Classes:
+    EpisodeAwareSampler: PyTorch-style sampler that respects episode
+        boundaries, supports episode filtering, frame dropping, and shuffling.
+
+Example:
+    Create a sampler for specific episodes:
+        >>> episode_data_index = {"from": [0, 100, 200], "to": [99, 199, 299]}
+        >>> sampler = EpisodeAwareSampler(
+        ...     episode_data_index,
+        ...     episode_indices_to_use=[0, 2],  # Use episodes 0 and 2
+        ...     drop_n_first_frames=5,
+        ...     drop_n_last_frames=5,
+        ...     shuffle=True
+        ... )
+        >>> dataloader = DataLoader(dataset, sampler=sampler)
+"""
+
 from typing import Iterator, Union
 
 import torch

@@ -14,6 +14,77 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Video encoding, decoding, and information extraction utilities.
+
+This module provides functionality for working with video files in robot learning
+datasets, including frame extraction at specific timestamps, video encoding from
+image sequences, and metadata extraction. It supports multiple video backends
+for flexible deployment across different platforms.
+
+The module handles the complexity of video codecs, including inter-frame compression
+where frames are stored as differences relative to key frames. This requires
+loading preceding key frames when accessing specific timestamps, which the module
+handles automatically.
+
+Key Features:
+    - Multiple backends: Supports torchcodec (when available), pyav, and
+      video_reader backends with automatic fallback.
+    - Timestamp-based frame extraction: Extracts frames at specific timestamps
+      with tolerance checking to ensure synchronization.
+    - Video encoding: Encodes image sequences to video files using ffmpeg with
+      configurable codecs and quality settings.
+    - Metadata extraction: Extracts video and audio stream information using
+      ffprobe.
+    - HuggingFace integration: Provides VideoFrame feature type for HuggingFace
+      datasets.
+
+Classes:
+    VideoFrame: PyArrow-based feature type for HuggingFace datasets containing
+        video frames with path and timestamp information.
+
+Functions:
+    Video decoding:
+        decode_video_frames: Main interface for decoding frames at timestamps
+            with automatic backend selection.
+        decode_video_frames_torchcodec: Decode frames using torchcodec backend.
+        decode_video_frames_torchvision: Decode frames using torchvision backends
+            (pyav or video_reader).
+
+    Video encoding:
+        encode_video_frames: Encode a sequence of PNG images into a video file
+            using ffmpeg.
+
+    Video information:
+        get_video_info: Extract video stream metadata (fps, dimensions, codec).
+        get_audio_info: Extract audio stream metadata (channels, codec, bitrate).
+        get_video_pixel_channels: Determine pixel channels from pixel format.
+        get_image_pixel_channels: Determine pixel channels from PIL Image mode.
+
+    Backend management:
+        get_safe_default_codec: Get default codec backend with fallback logic.
+
+Example:
+    Decode frames at specific timestamps:
+        >>> frames = decode_video_frames(
+        ...     video_path="videos/episode_0.mp4",
+        ...     timestamps=[0.1, 0.2, 0.3],
+        ...     tolerance_s=1e-4,
+        ...     backend="torchcodec"
+        ... )
+
+    Encode images to video:
+        >>> encode_video_frames(
+        ...     imgs_dir="images/episode_0",
+        ...     video_path="videos/episode_0.mp4",
+        ...     fps=30,
+        ...     vcodec="libsvtav1"
+        ... )
+
+    Get video information:
+        >>> info = get_video_info("videos/episode_0.mp4")
+        >>> print(f"FPS: {info['video.fps']}, Resolution: {info['video.width']}x{info['video.height']}")
+"""
+
 import importlib
 import json
 import logging

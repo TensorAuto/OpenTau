@@ -14,6 +14,57 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Image transformation utilities for data augmentation.
+
+This module provides configurable image transformation pipelines for data
+augmentation during training. It extends torchvision.transforms.v2 with custom
+transforms and a flexible configuration system that supports weighted random
+sampling of transform subsets.
+
+The module implements a probabilistic augmentation strategy where a random
+subset of available transforms is applied to each image, with configurable
+weights controlling the sampling probability. This approach provides more
+diverse augmentations compared to applying all transforms deterministically.
+
+Key Features:
+    - Random subset sampling: Applies a random subset of N transforms from a
+      larger pool, controlled by configurable weights.
+    - Custom transforms: Includes SharpnessJitter for more diverse sharpness
+      augmentation compared to standard torchvision transforms.
+    - Configurable pipeline: Dataclass-based configuration system for easy
+      customization of transform parameters and weights.
+    - Flexible ordering: Option to apply transforms in random order or
+      deterministic order.
+    - Torchvision v2 integration: Built on top of torchvision.transforms.v2
+      for modern transform API support.
+
+Classes:
+    RandomSubsetApply: Transform container that applies a random subset of
+        transforms with weighted sampling and optional random ordering.
+    SharpnessJitter: Custom transform for randomly jittering image sharpness
+        with uniform distribution sampling.
+    ImageTransformConfig: Dataclass for configuring individual transform
+        parameters (weight, type, kwargs).
+    ImageTransformsConfig: Dataclass for configuring the overall transform
+        pipeline (enable flag, max transforms, random order, transform list).
+    ImageTransforms: Main transform class that composes transforms based on
+        configuration.
+
+Functions:
+    make_transform_from_config: Factory function to create transform instances
+        from ImageTransformConfig.
+
+Example:
+    Create and use image transforms:
+        >>> config = ImageTransformsConfig(
+        ...     enable=True,
+        ...     max_num_transforms=3,
+        ...     random_order=True
+        ... )
+        >>> transforms = ImageTransforms(config)
+        >>> augmented_image = transforms(image_tensor)
+"""
+
 import collections
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence

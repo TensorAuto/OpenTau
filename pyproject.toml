@@ -25,7 +25,7 @@ description = "OpenTau: Tensor's VLA Training Infrastructure for Real-World Robo
 authors = [
     { name = "Shuheng Liu", email = "wish1104@icloud.com" },
     { name = "William Yue", email = "williamyue37@gmail.com" },
-    { name = "Akshay Shah", email = "ashah@tensor.ai" },
+    { name = "Akshay Shah", email = "akshayhitendrashah@gmail.com" },
     { name = "Xingrui Gu", email = "xingrui_gu@berkeley.edu" }
 ]
 readme = "README.md"

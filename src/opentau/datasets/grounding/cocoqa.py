@@ -1,3 +1,4 @@
+
 # Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -11,6 +12,34 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""COCO-QA dataset for visual question answering and grounding tasks.
+
+This module provides the COCO-QA dataset implementation for training
+vision-language models on visual question answering tasks. The dataset is
+filtered to only include 'where' questions, focusing on spatial reasoning
+tasks that are relevant for robotic manipulation.
+
+The dataset is loaded from HuggingFace (ThucPD/coco-qa-vi) and automatically
+filtered to retain only spatial reasoning questions.
+
+Classes:
+    COCODataset: Dataset class that loads, filters, and formats COCO-QA data
+        for grounding tasks.
+
+Functions:
+    _img_to_normalized_tensor: Convert PIL Image to normalized torch tensor
+        with channel-first format and [0, 1] normalization.
+    _filter_dataset: Filter dataset samples to only include 'where' questions
+        for spatial reasoning tasks.
+
+Example:
+    Use COCO-QA dataset in training:
+        >>> from opentau.configs.default import DatasetConfig
+        >>> cfg = DatasetConfig(grounding="cocoqa")
+        >>> dataset = make_dataset(cfg, train_cfg)
+"""
+
 
 import logging
 from typing import List

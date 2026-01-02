@@ -14,6 +14,57 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Statistics computation and aggregation for dataset features.
+
+This module provides functionality to compute statistical measures (min, max,
+mean, standard deviation, and count) for dataset features, with special
+handling for image and video data. It supports per-episode statistics
+computation and aggregation across multiple episodes or datasets using
+weighted averaging.
+
+The module handles two main use cases:
+    1. Computing statistics for individual episodes: Samples images efficiently,
+       downsamples large images to reduce memory usage, and computes statistics
+       for all feature types (images, vectors, etc.).
+    2. Aggregating statistics across multiple episodes/datasets: Combines
+       statistics using weighted mean and variance computation, taking global
+       min/max values.
+
+Key Features:
+    - Memory-efficient image sampling: Uses heuristic-based sampling to
+      estimate optimal number of samples based on dataset size.
+    - Automatic image downsampling: Reduces large images (>300px) to ~150px
+      for faster processing.
+    - Weighted aggregation: Supports custom weights or uses episode counts
+      as weights for aggregating statistics.
+    - Parallel variance algorithm: Uses efficient algorithm for computing
+      weighted variance across multiple statistics.
+
+Functions:
+    estimate_num_samples: Heuristic to estimate optimal number of samples
+        based on dataset size.
+    sample_indices: Generate evenly spaced sample indices from a dataset.
+    auto_downsample_height_width: Automatically downsample large images.
+    sample_images: Load and downsample a subset of images from file paths.
+    get_feature_stats: Compute statistical measures for an array.
+    compute_episode_stats: Compute statistics for a single episode.
+    aggregate_feature_stats: Aggregate statistics for a feature across
+        multiple episodes.
+    aggregate_stats: Aggregate statistics from multiple episodes/datasets.
+
+Example:
+    Compute statistics for a single episode:
+        >>> episode_data = {"state": state_array, "camera0": image_paths}
+        >>> features = {"state": {"dtype": "float32"}, "camera0": {"dtype": "image"}}
+        >>> stats = compute_episode_stats(episode_data, features)
+
+    Aggregate statistics across multiple episodes:
+        >>> stats_list = [episode1_stats, episode2_stats, episode3_stats]
+        >>> weights = [100, 200, 150]  # Optional: custom weights
+        >>> aggregated = aggregate_stats(stats_list, weights=weights)
+"""
+
 from typing import Optional
 
 import numpy as np
