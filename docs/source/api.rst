@@ -7,3 +7,4 @@ API Reference
 
    opentau.policies
    opentau.datasets
+   opentau.envs

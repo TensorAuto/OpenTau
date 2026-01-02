@@ -68,7 +68,7 @@ def _select_task_ids(total_tasks: int, task_ids: Iterable[int] | None) -> list[i
     return ids
 
 
-def get_task_init_states(task_suite: Any, i: int) -> np.ndarray:
+def _get_task_init_states(task_suite: Any, i: int) -> np.ndarray:
     init_states_path = (
         Path(get_libero_path("init_states"))
         / task_suite.tasks[i].problem_folder
@@ -78,7 +78,7 @@ def get_task_init_states(task_suite: Any, i: int) -> np.ndarray:
     return init_states
 
 
-def get_libero_dummy_action():
+def get_libero_dummy_action() -> list[float | int]:
     """Get dummy/no-op action, used to roll out the simulation while the robot does nothing."""
     return [0, 0, 0, 0, 0, 0, -1]
 
@@ -99,6 +99,8 @@ TASK_SUITE_MAX_STEPS: dict[str, int] = {
 
 
 class LiberoEnv(gym.Env):
+    r"""Environment wrapper for LIBERO tasks."""
+
     metadata = {"render_modes": ["rgb_array"], "render_fps": 80}
 
     def __init__(
@@ -119,6 +121,24 @@ class LiberoEnv(gym.Env):
         num_steps_wait: int = 10,
         render_cam: str | None = None,
     ):
+        r"""Initialize the LiberoEnv.
+        Args:
+            task_suite: The LIBERO task suite to use.
+            task_id: The ID of the task within the suite.
+            task_suite_name: The name of the task suite.
+            camera_name: The name(s) of the camera(s) to use for observations. If a string, can be comma-separated.
+            obs_type: The type of observation to return. Options are 'pixels' or 'pixels
+            render_mode: The render mode for the environment.
+            observation_width: The width of the observation images.
+            observation_height: The height of the observation images.
+            visualization_width: The width of the visualization window.
+            visualization_height: The height of the visualization window.
+            init_states: Whether to use predefined initial states for the tasks.
+            episode_index: The index of the episode for selecting initial states.
+            camera_name_mapping: Optional mapping from raw camera names to desired observation keys.
+            num_steps_wait: Number of no-op steps to take after reset to stabilize the environment.
+            render_cam: The camera name to use for rendering. If None, uses the first camera.
+        """
         super().__init__()
         self.task_id = task_id
         self.obs_type = obs_type
@@ -152,7 +172,7 @@ class LiberoEnv(gym.Env):
         self.num_steps_wait = num_steps_wait
         self.episode_index = episode_index
         # Load once and keep
-        self._init_states = get_task_init_states(task_suite, self.task_id) if self.init_states else None
+        self._init_states = _get_task_init_states(task_suite, self.task_id) if self.init_states else None
         self._init_state_id = self.episode_index  # tie each sub-env to a fixed init state
 
         self._env = self._make_envs_task(task_suite, self.task_id)
@@ -198,7 +218,9 @@ class LiberoEnv(gym.Env):
             low=ACTION_LOW, high=ACTION_HIGH, shape=(ACTION_DIM,), dtype=np.float32
         )
 
-    def render(self):
+    def render(self) -> np.ndarray:
+        r"""Render the environment and return a numpy array representing the RGB camera.
+        If `self.render_cam` is set, use that camera; otherwise, use the first camera."""
         raw_obs = self._env.env._get_observations()
         cams: dict[str, np.ndarray] = self._format_raw_obs(raw_obs)["pixels"]
         # if `self.render_cam` is not set, use the first camera
@@ -247,7 +269,15 @@ class LiberoEnv(gym.Env):
             "Please switch to an image-based obs_type (e.g. 'pixels', 'pixels_agent_pos')."
         )
 
-    def reset(self, seed=None, **kwargs):
+    def reset(self, seed=None, **kwargs) -> tuple[dict[str, Any], dict[str, Any]]:
+        r"""Reset the environment with the given seed.
+
+        Args:
+            seed: The seed to use for resetting the environment.
+        Returns:
+            observation: The initial observation after reset.
+            info: Additional information about the reset.
+        """
         super().reset(seed=seed)
         self._env.seed(seed)
         if self.init_states and self._init_states is not None:
@@ -264,6 +294,16 @@ class LiberoEnv(gym.Env):
         return observation, info
 
     def step(self, action: np.ndarray) -> tuple[dict[str, Any], float, bool, bool, dict[str, Any]]:
+        r"""Take a step in the environment with the given action.
+        Args:
+            action: The action to take.
+        Returns:
+            observation: The observation after taking the step.
+            reward: The reward obtained from taking the step.
+            terminated: Whether the episode has terminated.
+            truncated: Whether the episode was truncated.
+            info: Additional information about the step.
+        """
         if action.ndim != 1:
             raise ValueError(
                 f"Expected action to be 1-D (shape (action_dim,)), "
@@ -292,6 +332,7 @@ class LiberoEnv(gym.Env):
         return observation, reward, terminated, truncated, info
 
     def close(self):
+        r"""Close the environment and release any resources."""
         self._env.close()
 
 
