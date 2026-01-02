@@ -1,3 +1,17 @@
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Datasets for Image-Text Point Set grounding tasks.
 
@@ -31,14 +45,14 @@ from io import BytesIO
 import numpy as np
 import requests
 import torch
+from datasets import load_dataset
 from PIL import Image
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from datasets import load_dataset
 from opentau import register_grounding_dataset
-from opentau.datasets.grounding.base import GroundingDataset
 from opentau.configs.train import TrainPipelineConfig
+from opentau.datasets.grounding.base import GroundingDataset
 
 # TODO: add a config to filter the warnings
 logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)

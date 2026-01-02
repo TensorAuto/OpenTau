@@ -1,4 +1,5 @@
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -428,9 +429,7 @@ def lerobot_dataset_metadata_factory(
         )
         with (
             patch("opentau.datasets.lerobot_dataset.get_safe_version") as mock_get_safe_version_patch,
-            patch(
-                "opentau.datasets.lerobot_dataset.snapshot_download"
-            ) as mock_snapshot_download_patch,
+            patch("opentau.datasets.lerobot_dataset.snapshot_download") as mock_snapshot_download_patch,
         ):
             mock_get_safe_version_patch.side_effect = lambda repo_id, version: version
             mock_snapshot_download_patch.side_effect = mock_snapshot_download
@@ -506,9 +505,7 @@ def lerobot_dataset_factory(
         with (
             patch("opentau.datasets.lerobot_dataset.LeRobotDatasetMetadata") as mock_metadata_patch,
             patch("opentau.datasets.lerobot_dataset.get_safe_version") as mock_get_safe_version_patch,
-            patch(
-                "opentau.datasets.lerobot_dataset.snapshot_download"
-            ) as mock_snapshot_download_patch,
+            patch("opentau.datasets.lerobot_dataset.snapshot_download") as mock_snapshot_download_patch,
         ):
             mock_metadata_patch.return_value = mock_metadata
             mock_get_safe_version_patch.side_effect = lambda repo_id, version: version

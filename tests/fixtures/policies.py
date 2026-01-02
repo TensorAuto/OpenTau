@@ -1,15 +1,27 @@
-import pytest
-import torch
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-from opentau.datasets.dataset_mixture import WeightedDatasetMixture
-from opentau.datasets.factory import make_dataset_mixture
-from opentau.datasets.utils import dataset_to_policy_features
-from opentau.policies.factory import make_policy, make_policy_config
-from opentau.utils.fake_tensor import FakeTensorContext
+import pytest
+
 from opentau.configs.default import DatasetConfig
 from opentau.configs.reward import RewardConfig
 from opentau.configs.train import TrainPipelineConfig
 from opentau.configs.types import FeatureType, NormalizationMode
+from opentau.datasets.dataset_mixture import WeightedDatasetMixture
+from opentau.datasets.factory import make_dataset_mixture
+from opentau.datasets.utils import dataset_to_policy_features
+from opentau.policies.factory import make_policy_config
 
 
 @pytest.fixture
@@ -150,4 +162,3 @@ def pi05_training_config(train_pipeline_config: TrainPipelineConfig) -> TrainPip
 @pytest.fixture
 def mixture(pi05_training_config: TrainPipelineConfig) -> WeightedDatasetMixture:
     return make_dataset_mixture(pi05_training_config)
-
