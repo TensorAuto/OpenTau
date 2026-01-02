@@ -13,4 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+r"""This package includes environments for training and evaluating policies. Only LIBERO is supported for now."""
+
 from .configs import EnvConfig  # noqa: F401
