@@ -12,6 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Configuration module for the Value policy.
+
+This module defines the `ValueConfig` class, which handles the configuration parameters
+for the Value policy. It includes settings for the model architecture,
+optimization, scheduling, and data processing.
+"""
+
 from dataclasses import dataclass, field
 
 from opentau.configs.policies import PreTrainedConfig
@@ -20,12 +28,33 @@ from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from opentau.optim.optimizers import AdamWConfig
 from opentau.optim.schedulers import (
     CosineDecayWithWarmupSchedulerConfig,
+    LRSchedulerConfig,
 )
 
 
 @PreTrainedConfig.register_subclass("value")
 @dataclass
 class ValueConfig(PreTrainedConfig):
+    """Configuration class for the Value policy.
+
+    Args:
+        n_obs_steps: Number of observation steps to be used.
+        chunk_size: The chunk size for the policy.
+        normalization_mapping: Mapping of feature types to normalization modes.
+        max_state_dim: Maximum dimension for state vectors.
+        resize_imgs_with_padding: Tuple indicating the size to resize images with padding.
+        empty_cameras: Number of empty cameras to add.
+        tokenizer_max_length: Maximum length for the tokenizer.
+        reward_config: Configuration for the reward.
+        optimizer_lr: Learning rate for the optimizer.
+        optimizer_betas: Betas for the optimizer.
+        optimizer_eps: Epsilon for the optimizer.
+        optimizer_weight_decay: Weight decay for the optimizer.
+        scheduler_warmup_steps: Number of warmup steps for the scheduler.
+        scheduler_decay_steps: Number of decay steps for the scheduler.
+        scheduler_decay_lr: Decay learning rate for the scheduler.
+    """
+
     # Input / output structure.
     n_obs_steps: int = 1
     chunk_size: int = 50
@@ -64,9 +93,9 @@ class ValueConfig(PreTrainedConfig):
     scheduler_decay_lr: float = 2.5e-6
 
     def __post_init__(self):
+        """Input validation (not exhaustive)."""
         super().__post_init__()
 
-        """Input validation (not exhaustive)."""
         if self.n_obs_steps != 1:
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
@@ -78,6 +107,7 @@ class ValueConfig(PreTrainedConfig):
         )
 
     def validate_features(self) -> None:
+        """Validates features and adds empty cameras if specified."""
         for i in range(self.empty_cameras):
             key = f"observation.images.empty_camera_{i}"
             empty_camera = PolicyFeature(
@@ -87,6 +117,11 @@ class ValueConfig(PreTrainedConfig):
             self.input_features[key] = empty_camera
 
     def get_optimizer_preset(self) -> AdamWConfig:
+        """Returns the optimizer preset configuration.
+
+        Returns:
+            AdamWConfig: The optimizer configuration.
+        """
         return AdamWConfig(
             lr=self.optimizer_lr,
             betas=self.optimizer_betas,
@@ -94,7 +129,12 @@ class ValueConfig(PreTrainedConfig):
             weight_decay=self.optimizer_weight_decay,
         )
 
-    def get_scheduler_preset(self):
+    def get_scheduler_preset(self) -> LRSchedulerConfig:
+        """Returns the scheduler preset configuration.
+
+        Returns:
+            CosineDecayWithWarmupSchedulerConfig: The scheduler configuration.
+        """
         return CosineDecayWithWarmupSchedulerConfig(
             peak_lr=self.optimizer_lr,
             decay_lr=self.scheduler_decay_lr,
@@ -104,12 +144,27 @@ class ValueConfig(PreTrainedConfig):
 
     @property
     def observation_delta_indices(self) -> None:
+        """Returns the observation delta indices.
+
+        Returns:
+            None: Always returns None.
+        """
         return None
 
     @property
     def action_delta_indices(self) -> list:
+        """Returns the action delta indices.
+
+        Returns:
+            list: List of indices from 0 to chunk_size.
+        """
         return list(range(self.chunk_size))
 
     @property
     def reward_delta_indices(self) -> None:
+        """Returns the reward delta indices.
+
+        Returns:
+            None: Always returns None.
+        """
         return None
