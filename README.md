@@ -22,13 +22,13 @@ OpenTau ($\tau$) is a tool developed by *[Tensor](https://www.tensor.auto)* to b
 |                                                 Features |          OpenPi           |             LeRobot              | **OpenTau** |
 |---------------------------------------------------------:|:-------------------------:|:--------------------------------:|:-----------:|
 |                  Co-training with Heterogeneous Datasets |             ❌             |                ❌                 |      ✅      |
-|                 Discrete Actions Training in $\pi_{0.5}$ |             ❌             |                ❌                 |      ✅      |
+|                  Discrete Actions Training in $\pi$ 0.5 |             ❌             |                ❌                 |      ✅      |
 | Knowledge Insulation (KI) between VLM and Action Decoder |             ❌             |                ❌                 |      ✅      |
 |                              Dropout Layers in PaliGemma | ✅ (Jax) <br>❌ (PyTorch) |                ❌                 |      ✅      |
 |                        Multi-Node and Multi-GPU Training |             ❌             |                ✅                 |      ✅      |
-|                 Fully Functioning $\pi_{0.5}$ Checkpoint |             ✅             | ❌ <br> (Missing Text Embeddings) |      ✅      |
+|                   Fully Functioning $\pi$ 0.5 Checkpoint |             ✅             | ❌ <br> (Missing Text Embeddings) |      ✅      |
 |            Simulation Environments for Evaluating Models |             ❌             |                ✅                 |      ✅      |
-|      $\pi_{0.6}^*$-Style Reinforcement Learning Pipeline |             ❌             |                ❌                 |      ✅      |
+|         $\pi$* 0.6 style Reinforcement Learning Pipeline |             ❌             |                ❌                 |      ✅      |
 |                                                Framework |       Jax / PyTorch       |             PyTorch              |   PyTorch   |
 
 ## Quick Start
