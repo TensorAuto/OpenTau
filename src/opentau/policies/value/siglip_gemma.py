@@ -13,6 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""SigLip + Gemma Model for Value Function Estimation.
+
+This module defines the configuration and model classes for a value function estimator
+that combines a SigLIP vision encoder and a Gemma language model.
+"""
 
 import torch
 from einops import rearrange
@@ -28,6 +33,15 @@ from transformers.models.auto import CONFIG_MAPPING
 
 
 class SiglipGemmaValueConfig(PretrainedConfig):
+    """Configuration class for SiglipGemmaValueModel.
+
+    Args:
+        siglip_config: Configuration for the SigLIP vision model.
+        gemma_config: Configuration for the Gemma language model.
+        num_value_bins: Number of bins for value discretization. Defaults to 201.
+        **kwargs: Additional keyword arguments passed to `PretrainedConfig`.
+    """
+
     model_type = "SiglipGemmaValueModel"
     sub_configs = {"siglip_config": AutoConfig, "gemma_config": AutoConfig}
 
@@ -111,6 +125,15 @@ class SiglipGemmaValueConfig(PretrainedConfig):
 
 
 class SiglipGemmaValueModel(PreTrainedModel):
+    """SigLIP + Gemma Model for Value Function Estimation.
+
+    This model combines a SigLIP vision encoder and a Gemma language model to estimate
+    state values. It projects the final hidden state to a set of discretized value bins.
+
+    Args:
+        config: Configuration object of type `SiglipGemmaValueConfig`.
+    """
+
     config_class = SiglipGemmaValueConfig
 
     def __init__(self, config: SiglipGemmaValueConfig):
@@ -125,8 +148,15 @@ class SiglipGemmaValueModel(PreTrainedModel):
         # Value head: projects final hidden state to discretized value bins
         self.value_head = nn.Linear(640, config.num_value_bins)
 
-    def embed_image(self, image: torch.Tensor):
-        """Embed images using SIGLIP vision encoder."""
+    def embed_image(self, image: torch.Tensor) -> torch.Tensor:
+        """Embeds images using the SIGLIP vision encoder.
+
+        Args:
+            image: Tensor containing image pixel values.
+
+        Returns:
+            torch.Tensor: The embedded image features.
+        """
         # Handle different transformers versions
         if hasattr(self.vision_encoder, "get_image_features"):
             return self.vision_encoder.get_image_features(image)
@@ -134,8 +164,15 @@ class SiglipGemmaValueModel(PreTrainedModel):
             outputs = self.vision_encoder(pixel_values=image)
             return outputs.last_hidden_state
 
-    def embed_language_tokens(self, tokens: torch.Tensor):
-        """Embed language tokens using Gemma embedding layer."""
+    def embed_language_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Embeds language tokens using the Gemma embedding layer.
+
+        Args:
+            tokens: Tensor containing language token IDs.
+
+        Returns:
+            torch.Tensor: The embedded language tokens.
+        """
         return self.gemma.embed_tokens(tokens)
 
     def forward(
@@ -143,17 +180,17 @@ class SiglipGemmaValueModel(PreTrainedModel):
         inputs_embeds: torch.FloatTensor,
         attention_mask: torch.Tensor,
         position_ids: torch.LongTensor,
-    ):
-        """
-        Forward pass that processes vision and language inputs and outputs a value.
+    ) -> torch.Tensor:
+        """Forward pass that processes vision and language inputs and outputs a value.
 
         Args:
             inputs_embeds: Tensor of shape [batch_size, sequence_length, embedding_dim]
-            attention_mask: Attention mask for the sequence
-            position_ids: Position IDs for RoPE
+                containing the combined embeddings of images and text.
+            attention_mask: Attention mask for the sequence.
+            position_ids: Position IDs for RoPE.
 
         Returns:
-            logits: logits for discretized values of shape [batch_size, 201]
+            torch.Tensor: Logits for discretized values of shape [batch_size, num_value_bins].
         """
 
         attention_mask = rearrange(attention_mask, "b n1 n2 -> b 1 n1 n2")  # support multihead attention

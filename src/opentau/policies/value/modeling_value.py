@@ -15,20 +15,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Value Function Model using SIGLIP and Gemma 3 270M
+"""Value Function Model using SIGLIP and Gemma 3 270M
 
 A value function model that estimates state values for reinforcement learning.
 Uses SIGLIP for vision encoding and Gemma 3 270M for language processing.
-
-Example usage:
-```python
-from opentau.policies.value.modeling_value import ValuePolicy
-
-policy = ValuePolicy.from_pretrained("path/to/model")
-value = policy.predict_value(batch)
-```
-
 """
 
 import torch
@@ -47,7 +37,7 @@ from opentau.policies.value.siglip_gemma import (
 
 
 def make_att_2d_masks(pad_masks, att_masks):
-    """Copied from big_vision.
+    """Creates a 2-D attention mask given padding and 1-D attention masks.
 
     Tokens can attend to valid inputs tokens which have a cumulative mask_ar
     smaller or equal to theirs. This way `mask_ar` int[B, N] can be used to
@@ -63,9 +53,15 @@ def make_att_2d_masks(pad_masks, att_masks):
           block can attend all previous blocks and all tokens on the same block.
 
     Args:
-      input_mask: bool[B, N] true if its part of the input, false if padding.
-      mask_ar: int32[B, N] mask that's 1 where previous tokens cannot depend on
-        it and 0 where it shares the same attention mask as the previous token.
+    pad_masks: bool[B, N] true if its part of the input, false if padding.
+        att_masks: int32[B, N] mask that's 1 where previous tokens cannot depend on
+            it and 0 where it shares the same attention mask as the previous token.
+
+    Returns:
+        torch.Tensor: The 2D attention masks.
+
+    Raises:
+        ValueError: If input masks are not 2D.
     """
     if att_masks.ndim != 2:
         raise ValueError(att_masks.ndim)
@@ -80,6 +76,20 @@ def make_att_2d_masks(pad_masks, att_masks):
 
 
 def resize_with_pad(img, width, height, pad_value=-1):
+    """Resizes an image while preserving aspect ratio and padding to target dimensions.
+
+    Args:
+        img: Input image tensor of shape (B, C, H, W).
+        width: Target width.
+        height: Target height.
+        pad_value: Value to use for padding. Defaults to -1.
+
+    Returns:
+        torch.Tensor: Resized and padded image tensor.
+
+    Raises:
+        ValueError: If image dimensions are not 4D (B, C, H, W).
+    """
     # assume no-op when width height fits already
     if img.ndim != 4:
         raise ValueError(f"(b,c,h,w) expected, but {img.shape}")
@@ -112,10 +122,11 @@ class ValueFunction(PreTrainedPolicy):
         config: ValueConfig,
         dataset_stats: dict[str, dict[str, Tensor]] | None = None,
     ):
-        """
+        """Initializes the ValueFunction policy.
+
         Args:
             config: Value Function configuration class instance or None, in which case the default instantiation of
-                    the configuration class is used.
+                the configuration class is used.
             dataset_stats: Dataset statistics to be used for normalization. If not passed here, it is expected
                 that they will be passed with a call to `load_state_dict` before the policy is used.
         """
@@ -129,21 +140,56 @@ class ValueFunction(PreTrainedPolicy):
         self.model = ValueModel(config)
 
     def reset(self):
-        """This should be called whenever the environment is reset."""
+        """Resets the internal state of the policy.
+
+        This method is called at the beginning of each episode. For value functions,
+        there is no internal state to reset.
+        """
         pass  # Value functions don't need state reset
 
     def get_optim_params(self) -> dict:
+        """Returns the parameters to be optimized.
+
+        Returns:
+            dict: Dictionary of parameters to optimize.
+        """
         return self.parameters()
 
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
-        """Value functions don't select actions. This method raises NotImplementedError."""
+        """Selects an action based on the current policy.
+
+        Args:
+            batch: Dictionary containing observation data.
+
+        Returns:
+            Tensor: The selected action.
+
+        Raises:
+            NotImplementedError: Value functions do not select actions.
+        """
         raise NotImplementedError("Value functions do not select actions. Use predict_value() instead.")
 
     def sample_actions(self, batch: dict[str, Tensor], noise: Tensor = None):
-        """Value functions don't sample actions. This method raises NotImplementedError."""
+        """Samples actions from the policy.
+
+        Args:
+            batch: Dictionary containing observation data.
+            noise: Optional noise tensor.
+
+        Raises:
+            NotImplementedError: Value functions do not sample actions.
+        """
         raise NotImplementedError("Value functions do not sample actions. Use predict_value() instead.")
 
     def calculate_value(self, logits: Tensor) -> Tensor:
+        """Calculates the expected value from the logits distribution.
+
+        Args:
+            logits: Tensor containing the logits for value bins.
+
+        Returns:
+            Tensor: The expected value.
+        """
         start_idx = torch.linspace(
             -1,
             -1 / self.config.reward_config.number_of_bins,
@@ -221,8 +267,20 @@ class ValueFunction(PreTrainedPolicy):
         }
 
     def prepare_images(self, batch):
-        """Apply preprocessing to the images, like resizing to 224x224 and padding to keep aspect ratio, and
-        convert pixel range from [0.0, 1.0] to [-1.0, 1.0] as requested by SigLIP.
+        """Preprocesses images for the model.
+
+        Resizes images to 224x224, pads to keep aspect ratio, and converts pixel range
+        from [0.0, 1.0] to [-1.0, 1.0] as requested by SigLIP. Also handles missing images
+        by creating empty placeholders.
+
+        Args:
+            batch: Dictionary containing batch data.
+
+        Returns:
+            tuple: A tuple containing a list of image tensors and a list of mask tensors.
+
+        Raises:
+            ValueError: If all image features are missing from the batch.
         """
         images = []
         img_masks = []
@@ -264,7 +322,14 @@ class ValueFunction(PreTrainedPolicy):
         return images, img_masks
 
     def prepare_language(self, batch) -> tuple[Tensor, Tensor]:
-        """Tokenize the text input"""
+        """Tokenizes the text input for the model.
+
+        Args:
+            batch: Dictionary containing batch data, including "prompt".
+
+        Returns:
+            tuple: A tuple containing language token tensors and attention mask tensors.
+        """
         device = batch.get("state", list(batch.values())[0]).device
         tasks = batch["prompt"]
 
@@ -314,6 +379,11 @@ class ValueModel(nn.Module):
     CLASSIFICATION_TOKEN_ID = 6  # unused token id in Gemma 3 270M that we repurpose for classification
 
     def __init__(self, config):
+        """Initializes the ValueModel.
+
+        Args:
+            config: Configuration object for the model.
+        """
         super().__init__()
         self.config = config
 
@@ -331,8 +401,19 @@ class ValueModel(nn.Module):
     def embed_sequence(
         self, images, img_masks, lang_tokens, lang_masks, state
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Embed sequence of images and language tokens with embedding layer to prepare
-        for SiglipGemmaValueModel transformer processing.
+        """Embeds sequence of images and language tokens.
+
+        Prepares embeddings for SiglipGemmaValueModel transformer processing.
+
+        Args:
+            images: List of image tensors.
+            img_masks: List of image mask tensors.
+            lang_tokens: Language token tensor.
+            lang_masks: Language mask tensor.
+            state: State tensor.
+
+        Returns:
+            tuple: A tuple containing embeddings, padding masks, and attention masks.
         """
         # TODO: avoid list in python and torch.cat ; prefer pre-allocation with torch.empty
         embs = []

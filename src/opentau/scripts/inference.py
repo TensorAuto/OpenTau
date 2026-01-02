@@ -19,16 +19,17 @@ from dataclasses import asdict
 from pprint import pformat
 
 import torch
-from lerobot.common.policies.factory import get_policy_class
-from lerobot.common.utils.random_utils import set_seed
-from lerobot.common.utils.utils import (
+
+from opentau.policies.factory import get_policy_class
+from opentau.utils.random_utils import set_seed
+from opentau.utils.utils import (
     attempt_torch_compile,
     auto_torch_device,
     create_dummy_observation,
     init_logging,
 )
-from lerobot.configs import parser
-from lerobot.configs.train import TrainPipelineConfig
+from opentau.configs import parser
+from opentau.configs.train import TrainPipelineConfig
 
 
 @parser.wrap()
