@@ -14,6 +14,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+r"""This module contains utility functions for environments."""
+
 import warnings
 from collections.abc import Mapping, Sequence
 from functools import singledispatch
@@ -29,8 +32,6 @@ from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.lerobot_dataset import BaseDataset
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import auto_torch_device
-
-r"""This module contains utility functions for environments."""
 
 
 def preprocess_observation(np_observations: dict, cfg: TrainPipelineConfig) -> dict[str, Tensor]:

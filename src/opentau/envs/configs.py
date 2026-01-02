@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-r"""This package contains configuration files for different environments. Only LIBERO is supported for now."""
+r"""This module contains configuration files for different environments. Only LIBERO is supported for now."""
 
 import abc
 import logging
