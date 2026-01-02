@@ -12,6 +12,53 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Weighted dataset mixture for combining multiple datasets with controlled sampling.
+
+This module provides functionality to combine multiple PyTorch datasets into a
+single weighted mixture, enabling training on heterogeneous datasets with
+controlled sampling proportions. It supports hierarchical sampling strategies
+that efficiently handle large-scale dataset combinations while maintaining
+memory efficiency.
+
+The module implements a two-level sampling approach:
+    1. Dataset-level sampling: Selects which dataset to sample from based on
+       specified weights.
+    2. Sample-level sampling: Uniformly samples within the selected dataset.
+
+This hierarchical approach avoids expensive multinomial sampling over millions
+of individual samples by operating at the dataset level, making it scalable
+for large dataset mixtures.
+
+Key Features:
+    - Weighted sampling: Control relative sampling frequency of different
+      datasets through configurable weights.
+    - Memory-efficient sampling: Hierarchical sampler processes samples in
+      chunks to minimize memory overhead.
+    - Metadata aggregation: Automatically aggregates and standardizes metadata
+      from multiple datasets, including statistics normalization and feature
+      name mapping.
+    - Format standardization: Converts dataset-specific feature formats to a
+      common standard format, handling vector padding and missing cameras.
+
+Classes:
+    WeightedDatasetMixture: Main class for combining multiple datasets with
+        weighted sampling. Creates concatenated datasets and provides DataLoader
+        with hierarchical sampling.
+    HierarchicalSampler: Custom PyTorch sampler that implements two-level
+        weighted sampling (dataset selection, then uniform sample selection).
+    DatasetMixtureMetadata: Aggregates metadata from multiple datasets,
+        standardizes feature names, pads vectors, and combines statistics.
+
+Functions:
+    pad_vector: Pads the last dimension of a vector to a target size with zeros.
+
+Example:
+    Create a dataset mixture with two datasets:
+        >>> datasets = [dataset1, dataset2]
+        >>> weights = [0.7, 0.3]  # 70% from dataset1, 30% from dataset2
+        >>> mixture = WeightedDatasetMixture(cfg, datasets, weights, action_freq=30.0)
+        >>> dataloader = mixture.get_dataloader()
+"""
 import logging
 from typing import List, Optional
 
@@ -47,8 +94,8 @@ def pad_vector(vector: np.ndarray, new_dim: int) -> np.ndarray:
 
 
 class DatasetMixtureMetadata:
-    """
-    A class to hold metadata for a mixture of datasets.
+    """A class to hold metadata for a mixture of datasets.
+
     This is used to aggregate metadata from multiple datasets into a single object.
     """
 

@@ -14,6 +14,61 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""LeRobot dataset implementation for robot learning data management.
+
+This module provides the core dataset implementation for loading, creating, and
+managing robot learning datasets. It supports both loading existing datasets from
+the HuggingFace Hub or local disk, as well as creating new datasets for data
+recording.
+
+The dataset structure consists of:
+    - Metadata: Info, statistics, tasks, and episode information stored as JSON
+    - Data files: Episode data stored as Parquet files organized by chunks
+    - Videos: Optional video files for camera observations stored as MP4 files
+
+Key Features:
+    - Temporal alignment: Supports delta timestamps for temporal feature
+      alignment, enabling sampling of features at different time offsets with
+      optional Gaussian noise for data augmentation.
+    - Multi-modal support: Handles images, videos, state vectors, actions, and
+      text prompts with automatic format conversion and standardization.
+    - Version compatibility: Automatic version checking and backward compatibility
+      handling for datasets created with older format versions.
+    - Asynchronous image writing: Optional async image writer for high-frequency
+      data recording without blocking the main process.
+    - Statistics management: Per-episode and aggregated statistics for data
+      normalization, with automatic computation and aggregation.
+    - Video handling: Supports multiple video backends (torchcodec, pyav,
+      video_reader) for efficient video encoding and decoding.
+
+Classes:
+    DatasetMetadata: Base class for dataset metadata management.
+    LeRobotDatasetMetadata: Metadata manager for LeRobot datasets with Hub
+        integration, version checking, and statistics loading.
+    GroundingDatasetMetadata: Metadata manager for grounding datasets.
+    BaseDataset: Base PyTorch Dataset class with common functionality.
+    LeRobotDataset: Main dataset class for robot learning data, supporting
+        loading from Hub/local disk, temporal alignment, video/image handling,
+        and data recording.
+
+Functions:
+    retry_random_on_failure: Decorator to retry dataset item retrieval with
+        random indices on failure.
+
+Example:
+    Load an existing dataset:
+        >>> dataset = LeRobotDataset(cfg, repo_id="my-robot-dataset")
+        >>> dataloader = DataLoader(dataset, batch_size=32)
+
+    Create a new dataset for recording:
+        >>> dataset = LeRobotDataset.create(
+        ...     repo_id="my-new-dataset",
+        ...     fps=30,
+        ...     features={"state": {"shape": (7,), "dtype": "float32"}},
+        ...     use_videos=True
+        ... )
+"""
+
 import contextlib
 import functools
 import logging
@@ -198,6 +253,45 @@ class GroundingDatasetMetadata(DatasetMetadata):
 
 
 class LeRobotDatasetMetadata(DatasetMetadata):
+    """Metadata manager for LeRobot datasets with Hub integration and version handling.
+
+    This class manages all metadata for LeRobot datasets, including dataset info,
+    statistics, episodes, tasks, and advantages. It handles loading from local disk
+    or HuggingFace Hub, version compatibility checking, and provides utilities for
+    accessing dataset files and information.
+
+    The class automatically handles:
+        - Loading metadata from local disk or downloading from HuggingFace Hub
+        - Version compatibility checking and automatic version resolution
+        - Backward compatibility with older dataset formats (v2.0 vs v2.1)
+        - Episode and task management
+        - Statistics aggregation (per-episode and global)
+
+    Attributes:
+        repo_id: Repository ID of the dataset on HuggingFace Hub.
+        root: Local root directory where the dataset is stored.
+        revision: Git revision (branch/tag/commit) of the dataset.
+        info: Dictionary containing dataset information (features, fps, paths, etc.).
+        stats: Aggregated statistics dictionary (mean, std, min, max, count).
+        episodes_stats: Per-episode statistics dictionary.
+        episodes: Dictionary mapping episode_index to episode information.
+        tasks: Dictionary mapping task_index to task descriptions.
+        task_to_task_index: Reverse mapping from task description to task_index.
+        advantages: Dictionary mapping (episode_index, timestamp) to advantage values.
+
+    Example:
+        Load metadata from Hub:
+            >>> meta = LeRobotDatasetMetadata("lerobot/aloha_mobile_cabinet")
+            >>> print(f"Total episodes: {meta.total_episodes}")
+
+        Create new dataset metadata:
+            >>> meta = LeRobotDatasetMetadata.create(
+            ...     repo_id="my-dataset",
+            ...     fps=30,
+            ...     features={"state": {"dtype": "float32", "shape": (7,)}}
+            ... )
+    """
+
     def __init__(
         self,
         repo_id: str,
@@ -466,8 +560,47 @@ class LeRobotDatasetMetadata(DatasetMetadata):
 
 
 class BaseDataset(torch.utils.data.Dataset):
+    """Base class for all robot learning datasets.
+
+    This abstract base class provides common functionality for both LeRobotDataset
+    and GroundingDataset, including data format standardization, image processing,
+    and vector padding. It ensures all datasets conform to a standard format
+    regardless of their source or structure.
+
+    Key Features:
+        - Standard data format conversion: Maps dataset-specific feature names
+          to standard names (camera0, camera1, state, actions, etc.)
+        - Image standardization: Resizes and pads images to target resolution
+          while maintaining aspect ratio
+        - Vector padding: Pads state and action vectors to maximum dimensions
+        - Data type conversion: Converts floating-point tensors to bfloat16 for
+          memory efficiency
+        - String normalization: Ensures prompts and responses have consistent
+          newline formatting
+
+    Subclasses must implement:
+        - `_get_feature_mapping_key()`: Returns the key used for feature name
+          mapping (e.g., "lerobot/aloha_mobile_cabinet")
+        - `_separate_image_in_time()`: Separates temporal image sequences into
+          individual frames
+
+    Attributes:
+        resolution: Target image resolution (height, width).
+        num_cams: Number of camera views in each sample.
+        max_state_dim: Maximum dimension for state vectors.
+        max_action_dim: Maximum dimension for action vectors.
+        action_chunk: Number of actions processed in a chunk.
+
+    Example:
+        Create a custom dataset:
+            >>> class MyDataset(BaseDataset):
+            ...     def _get_feature_mapping_key(self):
+            ...         return "my-dataset"
+            ...     def _separate_image_in_time(self, item):
+            ...         pass  # No temporal separation needed
+    """
+
     def __init__(self, cfg: TrainPipelineConfig):
-        r"""Base class for LeRobotDataset and GroundingDataset."""
         super().__init__()
         # Standard Data Format parameters
         self.resolution = cfg.resolution  # resolution of images (H, W) in data sample
@@ -644,6 +777,68 @@ class BaseDataset(torch.utils.data.Dataset):
 
 
 class LeRobotDataset(BaseDataset):
+    """Main dataset class for loading and managing robot learning data.
+
+    This class provides a PyTorch Dataset interface for robot learning datasets
+    stored in the LeRobot format. It supports loading from HuggingFace Hub or
+    local disk, handles temporal alignment with delta timestamps, manages video
+    and image data, and provides data recording capabilities.
+
+    The dataset structure consists of:
+        - Metadata: JSON files containing info, statistics, episodes, tasks
+        - Data files: Parquet files organized by chunks containing episode data
+        - Videos: Optional MP4 files for camera observations
+
+    Key Features:
+        - Hub integration: Automatic download from HuggingFace Hub with version
+          compatibility checking
+        - Temporal alignment: Delta timestamps enable sampling features at
+          different time offsets with optional Gaussian noise for augmentation
+        - Video/image handling: Supports both video files and individual images
+          with automatic frame extraction and synchronization
+        - Episode filtering: Load specific episodes by index
+        - Data recording: Create new datasets and add episodes programmatically
+        - Statistics: Per-episode and aggregated statistics for normalization
+
+    Two Usage Modes:
+        1. Loading existing datasets: From local disk or HuggingFace Hub
+        2. Creating new datasets: Using the `create()` classmethod for data
+           recording
+
+    Attributes:
+        cfg: Training pipeline configuration.
+        repo_id: Repository ID of the dataset.
+        root: Local root directory for the dataset.
+        meta: LeRobotDatasetMetadata instance containing all metadata.
+        hf_dataset: HuggingFace Dataset containing parquet data.
+        episodes: Dictionary mapping episode_index to episode info.
+        image_transforms: Optional image transforms to apply.
+        delta_timestamps_params: Processed delta timestamp parameters.
+        feature2group: Mapping from features to temporal groups.
+        video_backend: Backend used for video decoding.
+        standardize: Whether to standardize data format.
+
+    Example:
+        Load dataset from Hub:
+            >>> dataset = LeRobotDataset(cfg, repo_id="lerobot/aloha")
+            >>> dataloader = DataLoader(dataset, batch_size=32)
+
+        Load specific episodes:
+            >>> dataset = LeRobotDataset(
+            ...     cfg,
+            ...     repo_id="lerobot/aloha",
+            ...     episodes=[0, 1, 2, 5, 10]
+            ... )
+
+        Create new dataset for recording:
+            >>> dataset = LeRobotDataset.create(
+            ...     cfg,
+            ...     repo_id="my-new-dataset",
+            ...     fps=30,
+            ...     features={"state": {"dtype": "float32", "shape": (7,)}}
+            ... )
+    """
+
     def __init__(
         self,
         cfg: TrainPipelineConfig,

@@ -1,3 +1,4 @@
+
 # Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -11,6 +12,32 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""CLEVR dataset for visual reasoning and grounding tasks.
+
+This module provides the CLEVR (Compositional Language and Elementary Visual
+Reasoning) dataset implementation for training vision-language models on
+compositional visual reasoning tasks. The dataset contains synthetic scenes
+with geometric objects and questions requiring compositional reasoning.
+
+The dataset is loaded from HuggingFace and formatted for grounding tasks,
+providing images, questions, and answers for visual reasoning.
+
+Classes:
+    CLEVRDataset: Dataset class that loads and formats CLEVR data from
+        MMInstruction/Clevr_CoGenT_TrainA_70K_Complex on HuggingFace.
+
+Functions:
+    _img_to_normalized_tensor: Convert PIL Image to normalized torch tensor
+        with channel-first format and [0, 1] normalization.
+
+Example:
+    Use CLEVR dataset in training:
+        >>> from opentau.configs.default import DatasetConfig
+        >>> cfg = DatasetConfig(grounding="clevr")
+        >>> dataset = make_dataset(cfg, train_cfg)
+"""
+
 
 import logging
 

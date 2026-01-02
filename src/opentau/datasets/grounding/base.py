@@ -12,6 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Base class for vision-language grounding datasets.
+
+This module provides the base class for all grounding datasets, which are used
+for training vision-language-action models on image-text tasks without robot
+actions. Grounding datasets provide images, prompts, and responses for tasks
+like visual question answering, spatial reasoning, and object grounding.
+
+The base class handles common functionality including:
+    - Metadata creation with ImageNet statistics for images
+    - Zero-padding of state and action features for compatibility
+    - Standard data format conversion
+    - Integration with the dataset mixture system
+
+Classes:
+    GroundingDataset: Abstract base class that all grounding datasets inherit
+        from. Provides common functionality for metadata creation, data format
+        conversion, and zero-padding of missing features.
+
+Example:
+    Create a custom grounding dataset:
+        >>> from opentau import register_grounding_dataset
+        >>> @register_grounding_dataset("my_dataset")
+        >>> class MyGroundingDataset(GroundingDataset):
+        ...     def __getitem_helper__(self, item):
+        ...         return {"image": ..., "task": ..., "postfix": ...}
+"""
+
 from abc import abstractmethod
 from copy import deepcopy
 from typing import final

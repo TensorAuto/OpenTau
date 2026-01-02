@@ -53,7 +53,7 @@ def _make_memmap_safe(**kwargs) -> np.memmap:
 
     Note:
         For information on dtypes, see:
-        https://numpy.org/doc/stable/reference/arrays.dtypes.html#arrays-dtypes-constructing
+    https://numpy.org/doc/stable/reference/arrays.dtypes.html#arrays-dtypes-constructing
     """
     if kwargs["mode"].startswith("w"):
         required_space = kwargs["dtype"].itemsize * np.prod(kwargs["shape"])  # bytes

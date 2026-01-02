@@ -14,6 +14,52 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Asynchronous image writing utilities for high-frequency data recording.
+
+This module provides functionality for writing images to disk asynchronously
+using multithreading or multiprocessing, which is critical for controlling
+robots and recording data at high frame rates without blocking the main process.
+
+The module supports two execution models:
+    1. Threading mode (num_processes=0): Creates a pool of worker threads
+       for concurrent image writing within a single process.
+    2. Multiprocessing mode (num_processes>0): Creates multiple processes,
+       each with their own thread pool, for maximum parallelism.
+
+Key Features:
+    - Asynchronous writing: Images are queued and written in background
+      workers, preventing I/O blocking of the main process.
+    - Multiple input formats: Supports torch Tensors, numpy arrays, and
+      PIL Images with automatic conversion.
+    - Format flexibility: Handles both channel-first (C, H, W) and
+      channel-last (H, W, C) image formats.
+    - Type conversion: Automatically converts float arrays in [0, 1] to
+      uint8 in [0, 255] for PIL Image compatibility.
+    - Safe cleanup: Decorator ensures image writers are properly stopped
+      even when exceptions occur.
+
+Classes:
+    AsyncImageWriter: Main class for asynchronous image writing with
+        configurable threading or multiprocessing backends.
+
+Functions:
+    image_array_to_pil_image: Convert numpy array to PIL Image with format
+        and type conversion.
+    write_image: Write an image (numpy array or PIL Image) to disk.
+    worker_thread_loop: Worker thread loop for processing image write queue.
+    worker_process: Worker process that manages multiple threads for image
+        writing.
+    safe_stop_image_writer: Decorator to safely stop image writer on
+        exceptions.
+
+Example:
+    Create an async image writer with threading:
+        >>> writer = AsyncImageWriter(num_processes=0, num_threads=4)
+        >>> writer.save_image(image_array, Path("output/image.jpg"))
+        >>> writer.wait_until_done()  # Wait for all images to be written
+        >>> writer.stop()  # Clean up resources
+"""
+
 import multiprocessing
 import queue
 import threading

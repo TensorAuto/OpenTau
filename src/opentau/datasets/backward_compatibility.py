@@ -13,6 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Backward compatibility error handling for dataset format versions.
+
+This module provides exception classes and error messages for handling dataset
+format version incompatibilities. It supports detection and user-friendly
+reporting of backward and forward compatibility issues when loading datasets
+that use older or newer format versions than the current OpenTau version
+supports.
+"""
+
 import packaging.version
 
 V2_MESSAGE = """
