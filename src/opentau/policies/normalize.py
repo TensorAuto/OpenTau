@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
 # Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
@@ -15,8 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
+"""Normalization and Unnormalization utilities for policies.
 
+This module provides classes and functions to normalize and unnormalize data
+(e.g., observations and actions) based on statistical properties (mean, std, min, max).
+It handles different normalization modes and supports creating buffers for statistics.
+"""
+
+import sys
 import numpy as np
 import torch
 from torch import Tensor, nn
@@ -27,6 +32,13 @@ EPS = 1e-8  # Small epsilon value for numerical stability in normalization
 
 
 def warn_missing_keys(features: dict[str, PolicyFeature], batch: dict[str, Tensor], mode: str) -> None:
+    """Warns if expected features are missing from the batch.
+
+    Args:
+        features: Dictionary of expected policy features.
+        batch: Dictionary containing the data batch.
+        mode: The operation mode (e.g., "normalization" or "unnormalization") for the warning message.
+    """
     for missing_key in set(features) - set(batch):
         red_seq = "\033[91m"
         reset_seq = "\033[0m"
@@ -45,11 +57,18 @@ def create_stats_buffers(
     Create buffers per modality (e.g. "observation.image", "action") containing their mean, std, min, max
     statistics.
 
-    Args: (see Normalize and Unnormalize)
+    Args:
+        features: Dictionary mapping feature names to PolicyFeature objects.
+        norm_map: Dictionary mapping feature types to NormalizationMode.
+        stats: Optional dictionary containing pre-computed statistics (mean, std, min, max)
+            for each feature. If None, buffers are initialized with infinity.
 
     Returns:
         dict: A dictionary where keys are modalities and values are `nn.ParameterDict` containing
             `nn.Parameters` set to `requires_grad=False`, suitable to not be updated during backpropagation.
+
+    Raises:
+        ValueError: If stats contain types other than np.ndarray or torch.Tensor.
     """
     stats_buffers = {}
 
@@ -123,6 +142,14 @@ def create_stats_buffers(
 
 
 def _no_stats_error_str(name: str) -> str:
+    """Returns an error message string for missing statistics.
+
+    Args:
+        name: Name of the statistic (e.g., "mean", "std").
+
+    Returns:
+        str: The error message string.
+    """
     return (
         f"`{name}` is infinity. You should either initialize with `stats` as an argument, or use a "
         "pretrained model."
@@ -138,17 +165,13 @@ class Normalize(nn.Module):
         norm_map: dict[str, NormalizationMode],
         stats: dict[str, dict[str, Tensor]] | None = None,
     ):
-        """
+        """Initializes the Normalize module.
+
         Args:
-            shapes (dict): A dictionary where keys are input modalities (e.g. "observation.image") and values
-            are their shapes (e.g. `[3,96,96]`]). These shapes are used to create the tensor buffer containing
-            mean, std, min, max statistics. If the provided `shapes` contain keys related to images, the shape
-            is adjusted to be invariant to height and width, assuming a channel-first (c, h, w) format.
-            modes (dict): A dictionary where keys are output modalities (e.g. "observation.image") and values
-                are their normalization modes among:
-                    - "mean_std": subtract the mean and divide by standard deviation.
-                    - "min_max": map to [-1, 1] range.
-            stats (dict, optional): A dictionary where keys are output modalities (e.g. "observation.image")
+            features: A dictionary where keys are input modalities (e.g. "observation.image") and values
+                are their PolicyFeature definitions.
+            norm_map: A dictionary where keys are feature types and values are their normalization modes.
+            stats: A dictionary where keys are output modalities (e.g. "observation.image")
                 and values are dictionaries of statistic types and their values (e.g.
                 `{"mean": torch.randn(3,1,1)}, "std": torch.randn(3,1,1)}`). If provided, as expected for
                 training the model for the first time, these statistics will overwrite the default buffers. If
@@ -167,6 +190,17 @@ class Normalize(nn.Module):
     # TODO(rcadene): should we remove torch.no_grad?
     @torch.no_grad
     def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Normalizes the batch data.
+
+        Args:
+            batch: Dictionary containing the data to normalize.
+
+        Returns:
+            dict[str, Tensor]: The normalized batch data.
+
+        Raises:
+            ValueError: If an unknown normalization mode is encountered.
+        """
         warn_missing_keys(self.features, batch, "normalization")
         batch = dict(batch)  # shallow copy avoids mutating the input batch
         for key, ft in self.features.items():
@@ -214,23 +248,15 @@ class Unnormalize(nn.Module):
         norm_map: dict[str, NormalizationMode],
         stats: dict[str, dict[str, Tensor]] | None = None,
     ):
-        """
+        """Initializes the Unnormalize module.
+
         Args:
-            shapes (dict): A dictionary where keys are input modalities (e.g. "observation.image") and values
-            are their shapes (e.g. `[3,96,96]`]). These shapes are used to create the tensor buffer containing
-            mean, std, min, max statistics. If the provided `shapes` contain keys related to images, the shape
-            is adjusted to be invariant to height and width, assuming a channel-first (c, h, w) format.
-            modes (dict): A dictionary where keys are output modalities (e.g. "observation.image") and values
-                are their normalization modes among:
-                    - "mean_std": subtract the mean and divide by standard deviation.
-                    - "min_max": map to [-1, 1] range.
-            stats (dict, optional): A dictionary where keys are output modalities (e.g. "observation.image")
-                and values are dictionaries of statistic types and their values (e.g.
-                `{"mean": torch.randn(3,1,1)}, "std": torch.randn(3,1,1)}`). If provided, as expected for
-                training the model for the first time, these statistics will overwrite the default buffers. If
-                not provided, as expected for finetuning or evaluation, the default buffers should to be
-                overwritten by a call to `policy.load_state_dict(state_dict)`. That way, initializing the
-                dataset is not needed to get the stats, since they are already in the policy state_dict.
+            features: A dictionary where keys are input modalities (e.g. "observation.image") and values
+                are their PolicyFeature definitions.
+            norm_map: A dictionary where keys are feature types and values are their normalization modes.
+            stats: A dictionary where keys are output modalities (e.g. "observation.image")
+                and values are dictionaries of statistic types and their values. If provided,
+                these statistics will overwrite the default buffers.
         """
         super().__init__()
         self.features = features
@@ -244,6 +270,17 @@ class Unnormalize(nn.Module):
     # TODO(rcadene): should we remove torch.no_grad?
     @torch.no_grad
     def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Unnormalizes the batch data.
+
+        Args:
+            batch: Dictionary containing the data to unnormalize.
+
+        Returns:
+            dict[str, Tensor]: The unnormalized batch data.
+
+        Raises:
+            ValueError: If an unknown normalization mode is encountered.
+        """
         warn_missing_keys(self.features, batch, "unnormalization")
         batch = dict(batch)  # shallow copy avoids mutating the input batch
         for key, ft in self.features.items():
