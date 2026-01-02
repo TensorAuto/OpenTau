@@ -1,32 +1,47 @@
 Overview
 ========
 
-AutoX Humanoid VLA is a codebase for training and evaluating robot policies, based on the LeRobot library.
+OpenTau is a PyTorch toolkit for training vision-language-action (VLA) models while fully leveraging the key techniques introduced in the :math:`\pi`-series papers.
 
-LeRobot: State-of-the-art AI for real-world robotics
-----------------------------------------------------
+Motivation
+----------
 
-LeRobot aims to provide models, datasets, and tools for real-world robotics in PyTorch. The goal is to lower the barrier to entry to robotics so that everyone can contribute and benefit from sharing datasets and pretrained models.
+The :math:`\pi` series policies are by far the most popular models in today's VLA community. While many training techniques have been described in the :math:`\pi` papers, only a small fraction of these techniques have been implemented in open-source repositories.
 
-LeRobot contains state-of-the-art approaches that have been shown to transfer to the real-world with a focus on imitation learning and reinforcement learning.
+Whether you use the official OpenPi codebase or LeRobot's reimplementation, you are missing out on a lot of the key components that make the :math:`\pi` models perform so well.
 
-It provides a set of pretrained models, datasets with human collected demonstrations, and simulation environments to get started without assembling a robot.
+OpenTau (:math:`\tau`) is a tool developed by `Tensor <https://www.tensor.auto>`_ to bridge this gap.
 
 Key Features
 ------------
 
-* **Pretrained Models**: Access to state-of-the-art pretrained policies.
-* **Datasets**: Tools to visualize and load datasets in standard formats.
-* **Simulation**: Support for environments like ALOHA, PushT, and xArm.
-* **Training**: Scripts for training policies using imitation learning.
-* **Evaluation**: Tools for evaluating policies in simulation and on real robots.
+OpenTau aims to make it easy to train VLAs on your own datasets while including the techniques that matter, such as:
 
-Structure
----------
+- Co-training on an adjustable mixture of heterogeneous datasets
+- Discrete actions for fast VLM convergence in :math:`\pi_{0.5}`
+- Knowledge insulation between the VLM backbone and the action expert
+- Dropout layers in the VLM that prevent overfitting
+- A reinforcement learning pipeline described in :math:`\pi^*_{0.6}`
+- Multi-node and multi-GPU training
+- Simulation environments for evaluating models
 
-The repository is structured as follows:
+Quick Start
+-----------
 
-* ``lerobot/configs``: Configuration classes for policies and environments.
-* ``lerobot/common``: Core classes including datasets, environments, policies, and robot devices.
-* ``lerobot/scripts``: Command-line scripts for training, evaluation, and data processing.
-* ``examples``: Examples demonstrating how to use the library.
+If you are familiar with LeRobot, getting started with OpenTau is very easy. Because OpenTau is a fork of the popular LeRobot repository, any LeRobot-compliant policy and dataset can be used directly with OpenTau.
+
+Checkpoints
+-----------
+
+We provide fully functioning :math:`\pi_{0.5}` checkpoints trained on the LIBERO dataset with high success rates.
+
+- `TensorAuto/tPi0.5-libero <https://huggingface.co/TensorAuto/tPi0.5-libero>`_: A :math:`\pi_{0.5}` model checkpoint trained on the LIBERO dataset with discrete actions and knowledge insulation.
+
+Acknowledgements
+----------------
+
+We would like to thank the original authors of the :math:`\pi` series `papers <https://www.pi.website/blog>`_ for their groundbreaking work in the VLA field.
+
+We also acknowledge the contributions of the open-source community, especially `LeRobot <https://huggingface.co/lerobot>`_, for their efforts in re-implementing the :math:`\pi` models and standardizing training infrastructure.
+
+OpenTau builds upon these foundations to provide a more accessible and comprehensive tool for training vision-language agents.
