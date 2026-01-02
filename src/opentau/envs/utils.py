@@ -30,6 +30,8 @@ from opentau.datasets.lerobot_dataset import BaseDataset
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import auto_torch_device
 
+r"""This module contains utility functions for environments."""
+
 
 def preprocess_observation(np_observations: dict, cfg: TrainPipelineConfig) -> dict[str, Tensor]:
     # TODO(aliberts, rcadene): refactor this to use features from the environment (no hardcoding)

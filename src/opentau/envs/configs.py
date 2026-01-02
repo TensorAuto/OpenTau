@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+r"""This package contains configuration files for different environments. Only LIBERO is supported for now."""
+
 import abc
 import logging
 from copy import copy
@@ -27,6 +29,23 @@ from opentau.utils.accelerate_utils import get_proc_accelerator
 
 @dataclass
 class EnvConfig(draccus.ChoiceRegistry, abc.ABC):
+    """Base configuration for an environment.
+
+    Attributes:
+        import_name: Name under which the environment should be imported. For LIBERO, this doesn't need to be set.
+        make_id: Gymnasium/Gym environment id (e.g., ``"CartPole-v1"``) when using ``gym.make``-style construction.
+        task: Optional task or suite identifier understood by the environment.
+        fps: Target frames-per-second used for stepping/rendering.
+        features: Mapping from logical feature names (e.g., ``"action"``,
+            ``"pixels/agentview_image"``) to :class:`~opentau.configs.types.PolicyFeature`
+            definitions consumed by policies.
+        features_map: Mapping from environment keys to standardized OpenTau keys
+            (e.g., mapping env observations into ``OBS_IMAGES`` / ``OBS_STATE``).
+        max_parallel_tasks: Maximum number of tasks to run in parallel within the env.
+        disable_env_checker: Whether to disable Gymnasium environment checking.
+
+    """
+
     import_name: str = None
     make_id: str = None
     task: str | None = None
@@ -38,17 +57,46 @@ class EnvConfig(draccus.ChoiceRegistry, abc.ABC):
 
     @property
     def type(self) -> str:
+        """Return the registered choice name for this config.
+
+        Returns:
+            The draccus choice name used in configs/CLI.
+        """
         return self.get_choice_name(self.__class__)
 
     @property
     @abc.abstractmethod
     def gym_kwargs(self) -> dict:
+        """Keyword arguments used to construct the environment.
+
+        Subclasses must implement this to return the kwargs consumed by the project’s
+        environment builder (often ``gym.make`` or an equivalent factory).
+
+        Returns:
+            A dict of keyword arguments for environment construction.
+        """
         raise NotImplementedError()
 
 
 @EnvConfig.register_subclass("libero")
 @dataclass
 class LiberoEnv(EnvConfig):
+    r"""Configuration for the LIBERO environment.
+
+    Attributes:
+        task: The LIBERO task or suite to use (e.g., ``"libero_10"``).
+        task_ids: Optional list of specific task IDs within the suite to use (if ``None``, all tasks in the suite are used).
+        fps: Target frames-per-second for stepping/rendering.
+        episode_length: Maximum length of each episode in steps.
+        obs_type: Type of observations to use (e.g., ``"pixels_agent_pos"``).
+        render_mode: Rendering mode for the environment (e.g., ``"rgb_array"``).
+        camera_name: Comma-separated names of cameras to use for rendering.
+        init_states: Whether to initialize states randomly.
+        camera_name_mapping: Optional mapping from camera names to standardized keys.
+        features: Mapping from logical feature names to :class:`~opentau.configs.types.PolicyFeature` definitions.
+        features_map: Mapping from environment keys to standardized OpenTau keys.
+    """
+
     task: str = "libero_10"  # can also choose libero_spatial, libero_object, etc.
     task_ids: list[int] | None = None
     fps: int = 30
@@ -93,6 +141,7 @@ class LiberoEnv(EnvConfig):
 
     @property
     def gym_kwargs(self) -> dict:
+        r"""Return the keyword arguments used to construct the LIBERO environment."""
         suite_names = [s.strip() for s in str(self.task).split(",") if s.strip()]
 
         accelerator = get_proc_accelerator()

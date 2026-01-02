@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+r"""This module provides an environment wrapper for LIBERO tasks."""
+
 from __future__ import annotations
 
 import os
