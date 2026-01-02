@@ -85,6 +85,13 @@ def preprocess_observation(np_observations: dict, cfg: TrainPipelineConfig) -> d
 
 
 def are_all_envs_same_type(env: gym.vector.VectorEnv) -> bool:
+    r"""Checks if all environments in a vectorized environment are of the same type.
+
+    Args:
+        env: A vectorized Gym environment (SyncVectorEnv or AsyncVectorEnv).
+    Returns:
+        True if all environments are of the same type, False otherwise.
+    """
     if not isinstance(env, (gym.vector.SyncVectorEnv, gym.vector.AsyncVectorEnv)):
         raise ValueError("Only gym.vector.SyncVectorEnv and gym.vector.AsyncVectorEnv are supported for now.")
 
@@ -94,6 +101,14 @@ def are_all_envs_same_type(env: gym.vector.VectorEnv) -> bool:
 
 
 def check_env_attributes_and_types(env: gym.vector.VectorEnv) -> None:
+    r"""Checks if all environments in a vectorized environment have 'task_description' or 'task' attributes.
+    A warning will be raised if any environment is missing these attributes.
+
+    Args:
+        env: A vectorized Gym environment (SyncVectorEnv or AsyncVectorEnv).
+    Raises:
+        ValueError: If the environment is not a SyncVectorEnv or AsyncVectorEnv.
+    """
     with warnings.catch_warnings():
         warnings.simplefilter("once", UserWarning)  # Apply filter only in this function
 
@@ -119,7 +134,14 @@ def check_env_attributes_and_types(env: gym.vector.VectorEnv) -> None:
 
 
 def add_envs_task(env: gym.vector.VectorEnv, observation: dict[str, Any]) -> dict[str, Any]:
-    """Adds task feature to the observation dict with respect to the first environment attribute."""
+    r"""Adds task feature to the observation dict with respect to the first environment attribute.
+
+    Args:
+        env: A vectorized Gym environment (SyncVectorEnv or AsyncVectorEnv).
+        observation: A dictionary of observations from the vectorized environment, which will be modified in place.
+    Returns:
+        The updated observation dictionary with the 'prompt' key added.
+    """
     if not isinstance(env, (gym.vector.SyncVectorEnv, gym.vector.AsyncVectorEnv)):
         raise ValueError("Only gym.vector.SyncVectorEnv and gym.vector.AsyncVectorEnv are supported for now.")
 
@@ -145,7 +167,7 @@ def _close_single_env(env: Any) -> None:
 
 @singledispatch
 def close_envs(obj: Any) -> None:
-    """Default: raise if the type is not recognized."""
+    """Close a single environment, a list of environments, or a dictionary of environments."""
     raise NotImplementedError(f"close_envs not implemented for type {type(obj).__name__}")
 
 

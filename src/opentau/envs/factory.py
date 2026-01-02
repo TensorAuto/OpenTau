@@ -24,6 +24,9 @@ from opentau.envs.configs import EnvConfig, LiberoEnv
 
 
 def make_env_config(env_type: str, **kwargs) -> EnvConfig:
+    r"""Factory method to create an environment config based on the env_type.
+    Right now, only 'libero' is supported.
+    """
     if env_type == "libero":
         return LiberoEnv(**kwargs)
     else:
