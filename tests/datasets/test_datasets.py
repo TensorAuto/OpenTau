@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -337,9 +338,7 @@ def check_standard_data_format(item, delta_timestamps_params, dataset, train_pip
     # test delta_timestamps
     for timestamp_param in delta_timestamps_params:
         assert timestamp_param["input_group"].shape == (2,)
-        assert (timestamp_param["action"].shape[0],) == (
-            train_pipeline_config.action_chunk,
-        )
+        assert (timestamp_param["action"].shape[0],) == (train_pipeline_config.action_chunk,)
 
 
 @pytest.mark.slow  # 3 sec

@@ -1,4 +1,5 @@
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,12 +16,12 @@ import logging
 from dataclasses import dataclass, field
 from typing import Literal
 
+from opentau.configs.policies import PreTrainedConfig
+from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from opentau.optim.optimizers import AdamWConfig
 from opentau.optim.schedulers import (
     CosineDecayWithWarmupSchedulerConfig,
 )
-from opentau.configs.policies import PreTrainedConfig
-from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
 
 
 @PreTrainedConfig.register_subclass("pi05")

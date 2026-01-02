@@ -1,4 +1,5 @@
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,9 +20,9 @@ from dataclasses import dataclass, field
 
 import draccus
 
+from opentau.configs.types import FeatureType, PolicyFeature
 from opentau.constants import ACTION, OBS_IMAGES, OBS_STATE
 from opentau.utils.accelerate_utils import get_proc_accelerator
-from opentau.configs.types import FeatureType, PolicyFeature
 
 
 @dataclass
@@ -43,7 +44,7 @@ class EnvConfig(draccus.ChoiceRegistry, abc.ABC):
     @abc.abstractmethod
     def gym_kwargs(self) -> dict:
         raise NotImplementedError()
-        
+
 
 @EnvConfig.register_subclass("libero")
 @dataclass

@@ -7,6 +7,7 @@ r"python src/opentau/scripts/get_advantage_and_percentiles.py  \
 #!/usr/bin/env python
 
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,6 +31,9 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+from opentau.configs import parser
+from opentau.configs.default import DatasetMixtureConfig
+from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.factory import make_dataset
 from opentau.datasets.lerobot_dataset import LeRobotDataset
 from opentau.datasets.utils import ADVANTAGES_PATH
@@ -40,9 +44,6 @@ from opentau.utils.utils import (
     auto_torch_device,
     init_logging,
 )
-from opentau.configs import parser
-from opentau.configs.default import DatasetMixtureConfig
-from opentau.configs.train import TrainPipelineConfig
 
 
 def ensure_primitive(maybe_tensor):

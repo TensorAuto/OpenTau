@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,6 +24,8 @@ import opentau.datasets.grounding.dummy  # noqa: F401
 import opentau.datasets.grounding.pixmo  # noqa: F401
 import opentau.datasets.grounding.vsr  # noqa: F401
 from opentau import available_grounding_datasets
+from opentau.configs.default import DatasetConfig
+from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.dataset_mixture import WeightedDatasetMixture
 from opentau.datasets.lerobot_dataset import (
     BaseDataset,
@@ -31,8 +34,6 @@ from opentau.datasets.lerobot_dataset import (
 )
 from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
 from opentau.datasets.transforms import ImageTransforms
-from opentau.configs.default import DatasetConfig
-from opentau.configs.train import TrainPipelineConfig
 
 IMAGENET_STATS = {
     "min": [[[0.0]], [[0.0]], [[0.0]]],  # (c,1,1)

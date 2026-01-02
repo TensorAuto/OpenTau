@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,24 +25,24 @@ from pprint import pformat
 from types import SimpleNamespace
 from typing import Any
 
+import datasets
 import jsonlines
 import numpy as np
 import packaging.version
 import torch
+from datasets.table import embed_table_storage
 from huggingface_hub import DatasetCard, DatasetCardData, HfApi
 from huggingface_hub.errors import RevisionNotFoundError
 from PIL import Image as PILImage
 from torchvision import transforms
 
-import datasets
-from datasets.table import embed_table_storage
+from opentau.configs.types import DictLike, FeatureType, PolicyFeature
 from opentau.datasets.backward_compatibility import (
     V21_MESSAGE,
     BackwardCompatibilityError,
     ForwardCompatibilityError,
 )
 from opentau.utils.utils import is_valid_numpy_dtype_string
-from opentau.configs.types import DictLike, FeatureType, PolicyFeature
 
 DEFAULT_CHUNK_SIZE = 1000  # Max number of episodes per chunk
 

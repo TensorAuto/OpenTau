@@ -1,4 +1,5 @@
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,9 +28,9 @@ from safetensors.torch import load_model as load_model_as_safetensor
 from safetensors.torch import save_model as save_model_as_safetensor
 from torch import Tensor, nn
 
+from opentau.configs.policies import PreTrainedConfig
 from opentau.policies.utils import log_model_loading_keys
 from opentau.utils.hub import HubMixin
-from opentau.configs.policies import PreTrainedConfig
 
 T = TypeVar("T", bound="PreTrainedPolicy")
 

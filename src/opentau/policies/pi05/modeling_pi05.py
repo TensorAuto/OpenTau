@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright 2025 Physical Intelligence and The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -63,6 +64,8 @@ from einops import rearrange
 from torch import Tensor, nn
 from transformers import AutoProcessor, AutoTokenizer
 
+from opentau.configs.policies import PreTrainedConfig
+from opentau.configs.types import NormalizationMode
 from opentau.constants import OBS_STATE
 from opentau.policies.normalize import Normalize, Unnormalize
 from opentau.policies.pi05.configuration_pi05 import PI05Config
@@ -72,8 +75,6 @@ from opentau.policies.pi05.paligemma_with_expert import (
 )
 from opentau.policies.pretrained import PreTrainedPolicy, T
 from opentau.utils.utils import get_safe_dtype
-from opentau.configs.policies import PreTrainedConfig
-from opentau.configs.types import NormalizationMode
 
 
 def create_sinusoidal_pos_embedding(
