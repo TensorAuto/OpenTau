@@ -24,6 +24,19 @@ from opentau.datasets.utils import write_episode_stats
 
 
 def sample_episode_video_frames(dataset: LeRobotDataset, episode_index: int, ft_key: str) -> np.ndarray:
+    """Sample video frames from an episode for statistics computation.
+
+    Uses evenly spaced sampling to reduce the number of frames processed
+    while maintaining representative statistics.
+
+    Args:
+        dataset: LeRobotDataset containing the episode.
+        episode_index: Index of the episode to sample from.
+        ft_key: Feature key for the video to sample.
+
+    Returns:
+        Numpy array of sampled video frames.
+    """
     ep_len = dataset.meta.episodes[episode_index]["length"]
     sampled_indices = sample_indices(ep_len)
     query_timestamps = dataset._get_query_timestamps(0.0, {ft_key: sampled_indices})
@@ -31,7 +44,16 @@ def sample_episode_video_frames(dataset: LeRobotDataset, episode_index: int, ft_
     return video_frames[ft_key].numpy()
 
 
-def convert_episode_stats(dataset: LeRobotDataset, ep_idx: int):
+def convert_episode_stats(dataset: LeRobotDataset, ep_idx: int) -> None:
+    """Convert statistics for a single episode from v2.0 to v2.1 format.
+
+    Computes per-episode statistics, sampling video frames if needed.
+    Stores results in dataset.meta.episodes_stats.
+
+    Args:
+        dataset: LeRobotDataset containing the episode.
+        ep_idx: Index of the episode to convert.
+    """
     ep_start_idx = dataset.episode_data_index["from"][ep_idx]
     ep_end_idx = dataset.episode_data_index["to"][ep_idx]
     ep_data = dataset.hf_dataset.select(range(ep_start_idx, ep_end_idx))
@@ -56,7 +78,20 @@ def convert_episode_stats(dataset: LeRobotDataset, ep_idx: int):
     dataset.meta.episodes_stats[ep_idx] = ep_stats
 
 
-def convert_stats(dataset: LeRobotDataset, num_workers: int = 0):
+def convert_stats(dataset: LeRobotDataset, num_workers: int = 0) -> None:
+    """Convert dataset statistics from v2.0 to v2.1 format.
+
+    Computes per-episode statistics for all episodes and writes them to disk.
+    Can use parallel processing with ThreadPoolExecutor for faster computation.
+
+    Args:
+        dataset: LeRobotDataset to convert (must have episodes=None to process all).
+        num_workers: Number of worker threads for parallel processing.
+            If 0, processes sequentially. Defaults to 0.
+
+    Raises:
+        AssertionError: If dataset.episodes is not None.
+    """
     assert dataset.episodes is None
     print("Computing episodes stats")
     total_episodes = dataset.meta.total_episodes
@@ -81,8 +116,23 @@ def check_aggregate_stats(
     reference_stats: dict[str, dict[str, np.ndarray]],
     video_rtol_atol: tuple[float] = (1e-2, 1e-2),
     default_rtol_atol: tuple[float] = (5e-6, 6e-5),
-):
-    """Verifies that the aggregated stats from episodes_stats are close to reference stats."""
+) -> None:
+    """Verify that aggregated episode statistics match reference statistics.
+
+    Aggregates per-episode statistics and compares them to reference stats
+    with appropriate tolerances for different feature types.
+
+    Args:
+        dataset: LeRobotDataset with episodes_stats populated.
+        reference_stats: Reference statistics dictionary to compare against.
+        video_rtol_atol: Relative and absolute tolerance for video features.
+            Defaults to (1e-2, 1e-2) to account for image sub-sampling.
+        default_rtol_atol: Relative and absolute tolerance for other features.
+            Defaults to (5e-6, 6e-5).
+
+    Raises:
+        AssertionError: If aggregated stats don't match reference within tolerance.
+    """
     agg_stats = aggregate_stats(list(dataset.meta.episodes_stats.values()))
     for key, ft in dataset.features.items():
         # These values might need some fine-tuning

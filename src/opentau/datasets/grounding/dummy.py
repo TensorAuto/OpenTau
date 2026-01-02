@@ -45,6 +45,12 @@ _data = [
 
 @register_grounding_dataset("dummy")
 class DummyGroundingDataset(GroundingDataset):
+    """Dummy grounding dataset for testing purposes.
+
+    Provides simple synthetic data with black, white, and gray images
+    for testing the dataset infrastructure.
+    """
+
     def __init__(self, cfg: TrainPipelineConfig, length: int = 1000):
         self.length = length
         super().__init__(cfg)
@@ -53,6 +59,16 @@ class DummyGroundingDataset(GroundingDataset):
         return self.length
 
     def __getitem_helper__(self, item) -> dict:
+        """Get a dummy dataset item.
+
+        Cycles through a small set of predefined items (black, white, gray images).
+
+        Args:
+            item: Index of the item to retrieve.
+
+        Returns:
+            Dictionary with image, task, postfix, task_type, and prompt.
+        """
         return _data[item % len(_data)]
 
     def _get_feature_mapping_key(self) -> str:

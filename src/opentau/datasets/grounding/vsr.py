@@ -58,12 +58,31 @@ def _pil_from_url(url: str) -> Image.Image | None:
 
 
 def _img_to_normalized_tensor(img: Image.Image, img_shape: tuple) -> torch.Tensor:
+    """Convert a PIL Image to a normalized torch tensor.
+
+    Resizes the image and converts it from (H, W, C) to (C, H, W) format,
+    normalizing pixel values to [0, 1].
+
+    Args:
+        img: PIL Image to convert.
+        img_shape: Target image shape (height, width).
+
+    Returns:
+        Normalized tensor of shape (C, H, W) with values in [0, 1].
+    """
     img = img.resize(img_shape, Image.BILINEAR)
     return torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0
 
 
 @register_grounding_dataset("vsr")
 class VSRDataset(GroundingDataset):
+    """Visual Spatial Reasoning (VSR) dataset for true/false statement grounding.
+
+    Loads the cambridgeltl/vsr_random dataset from HuggingFace and formats it
+    for visual reasoning tasks where models must determine if statements about
+    images are true or false.
+    """
+
     def __init__(self, cfg: TrainPipelineConfig, consecutive_bad_tolerance=100):
         self.dataset = load_dataset("cambridgeltl/vsr_random", split="train")
         super().__init__(cfg)
@@ -77,7 +96,21 @@ class VSRDataset(GroundingDataset):
     def _get_feature_mapping_key(self) -> str:
         return "vsr"
 
-    def __getitem_helper__(self, item):
+    def __getitem_helper__(self, item) -> dict:
+        """Get a VSR dataset item.
+
+        Downloads the image from URL and formats it for true/false reasoning tasks.
+        Retries with random indices if image download fails.
+
+        Args:
+            item: Index of the item to retrieve.
+
+        Returns:
+            Dictionary with image, task, postfix, task_type, and prompt.
+
+        Raises:
+            RuntimeError: If too many consecutive items fail to load.
+        """
         for _ in range(self.consecutive_bad_tolerance):
             if item in self.bad_ids:
                 item = np.random.randint(0, len(self.dataset))

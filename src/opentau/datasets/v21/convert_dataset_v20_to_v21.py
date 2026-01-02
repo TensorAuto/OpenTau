@@ -50,6 +50,11 @@ V21 = "v2.1"
 
 
 class SuppressWarnings:
+    """Context manager to temporarily suppress logging warnings.
+
+    Sets logging level to ERROR on entry and restores previous level on exit.
+    """
+
     def __enter__(self):
         self.previous_level = logging.getLogger().getEffectiveLevel()
         logging.getLogger().setLevel(logging.ERROR)
@@ -108,7 +113,18 @@ def convert_dataset(
     repo_id: str,
     branch: str | None = None,
     num_workers: int = 4,
-):
+) -> None:
+    """Convert a dataset from v2.0 to v2.1 format.
+
+    Converts statistics from global format to per-episode format, updates
+    codebase version, and pushes changes to the hub.
+
+    Args:
+        repo_id: Repository ID of the dataset to convert.
+        branch: Git branch to push changes to. If None, uses default branch.
+        num_workers: Number of worker threads for parallel statistics computation.
+            Defaults to 4.
+    """
     with SuppressWarnings():
         # Create fake config for the dataset
         cfg = create_fake_train_config()

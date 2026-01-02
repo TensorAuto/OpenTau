@@ -27,6 +27,18 @@ logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 
 
 def _img_to_normalized_tensor(img: Image.Image, img_shape: tuple) -> torch.Tensor:
+    """Convert a PIL Image to a normalized torch tensor.
+
+    Resizes the image and converts it from (H, W, C) to (C, H, W) format,
+    normalizing pixel values to [0, 1].
+
+    Args:
+        img: PIL Image to convert.
+        img_shape: Target image shape (height, width).
+
+    Returns:
+        Normalized tensor of shape (C, H, W) with values in [0, 1].
+    """
     img = img.resize(img_shape, Image.BILINEAR)
 
     # pytorch uses (C, H, W) while PIL uses (H, W, C)
@@ -35,6 +47,12 @@ def _img_to_normalized_tensor(img: Image.Image, img_shape: tuple) -> torch.Tenso
 
 @register_grounding_dataset("clevr")
 class CLEVRDataset(GroundingDataset):
+    """CLEVR dataset for visual reasoning and grounding tasks.
+
+    Loads the MMInstruction/Clevr_CoGenT_TrainA_70K_Complex dataset from
+    HuggingFace and formats it for grounding tasks.
+    """
+
     def __init__(self, cfg: TrainPipelineConfig, consecutive_bad_tolerance=100):
         self.dataset = load_dataset("MMInstruction/Clevr_CoGenT_TrainA_70K_Complex", split="train")
         super().__init__(cfg)
@@ -45,7 +63,16 @@ class CLEVRDataset(GroundingDataset):
     def _get_feature_mapping_key(self) -> str:
         return "clevr"
 
-    def __getitem_helper__(self, item):
+    def __getitem_helper__(self, item) -> dict:
+        """Get a CLEVR dataset item.
+
+        Args:
+            item: Index of the item to retrieve.
+
+        Returns:
+            Dictionary with image, task, postfix, task_type, and prompt
+            extracted from the CLEVR dataset sample.
+        """
         sample = self.dataset[item]
         img = sample["image"]
 

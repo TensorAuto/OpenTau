@@ -96,6 +96,20 @@ def flatten_dict(d: dict, parent_key: str = "", sep: str = "/") -> dict:
 
 
 def unflatten_dict(d: dict, sep: str = "/") -> dict:
+    """Unflatten a dictionary by expanding keys with separators into nested dictionaries.
+
+    Args:
+        d: Dictionary with flattened keys (e.g., {"a/b": 1, "a/c/d": 2}).
+        sep: Separator used to split keys. Defaults to "/".
+
+    Returns:
+        Nested dictionary structure (e.g., {"a": {"b": 1, "c": {"d": 2}}}).
+
+    Example:
+        >>> dct = {"a/b": 1, "a/c/d": 2, "e": 3}
+        >>> print(unflatten_dict(dct))
+        {"a": {"b": 1, "c": {"d": 2}}, "e": 3}
+    """
     outdict = {}
     for key, value in d.items():
         parts = key.split(sep)
@@ -109,6 +123,21 @@ def unflatten_dict(d: dict, sep: str = "/") -> dict:
 
 
 def get_nested_item(obj: DictLike, flattened_key: str, sep: str = "/") -> Any:
+    """Get a nested item from a dictionary-like object using a flattened key.
+
+    Args:
+        obj: Dictionary-like object to access.
+        flattened_key: Flattened key path (e.g., "a/b/c").
+        sep: Separator used in the flattened key. Defaults to "/".
+
+    Returns:
+        The value at the nested path specified by the flattened key.
+
+    Example:
+        >>> dct = {"a": {"b": {"c": 42}}}
+        >>> get_nested_item(dct, "a/b/c")
+        42
+    """
     split_keys = flattened_key.split(sep)
     getter = obj[split_keys[0]]
     if len(split_keys) == 1:
@@ -121,6 +150,20 @@ def get_nested_item(obj: DictLike, flattened_key: str, sep: str = "/") -> Any:
 
 
 def serialize_dict(stats: dict[str, torch.Tensor | np.ndarray | dict]) -> dict:
+    """Serialize a dictionary containing tensors and arrays to JSON-serializable format.
+
+    Converts torch.Tensor and np.ndarray to lists, and np.generic to Python scalars.
+    The dictionary structure is preserved through flattening and unflattening.
+
+    Args:
+        stats: Dictionary containing statistics with tensor/array values.
+
+    Returns:
+        Dictionary with serialized (list/scalar) values in the same structure.
+
+    Raises:
+        NotImplementedError: If a value type is not supported for serialization.
+    """
     serialized_dict = {}
     for key, value in flatten_dict(stats).items():
         if isinstance(value, (torch.Tensor, np.ndarray)):
@@ -135,7 +178,17 @@ def serialize_dict(stats: dict[str, torch.Tensor | np.ndarray | dict]) -> dict:
 
 
 def embed_images(dataset: datasets.Dataset) -> datasets.Dataset:
-    # Embed image bytes into the table before saving to parquet
+    """Embed image bytes into the dataset table before saving to parquet.
+
+    Converts the dataset to arrow format, embeds image storage, and restores
+    the original format.
+
+    Args:
+        dataset: HuggingFace dataset containing images.
+
+    Returns:
+        Dataset with embedded image bytes, ready for parquet serialization.
+    """
     format = dataset.format
     dataset = dataset.with_format("arrow")
     dataset = dataset.map(embed_table_storage, batched=False)
@@ -144,55 +197,141 @@ def embed_images(dataset: datasets.Dataset) -> datasets.Dataset:
 
 
 def load_json(fpath: Path) -> Any:
+    """Load JSON data from a file.
+
+    Args:
+        fpath: Path to the JSON file.
+
+    Returns:
+        Parsed JSON data (dict, list, or primitive type).
+    """
     with open(fpath) as f:
         return json.load(f)
 
 
 def write_json(data: dict, fpath: Path) -> None:
+    """Write data to a JSON file.
+
+    Creates parent directories if they don't exist. Uses 4-space indentation
+    and allows non-ASCII characters.
+
+    Args:
+        data: Dictionary or other JSON-serializable data to write.
+        fpath: Path where the JSON file will be written.
+    """
     fpath.parent.mkdir(exist_ok=True, parents=True)
     with open(fpath, "w") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
 
 
 def load_jsonlines(fpath: Path) -> list[Any]:
+    """Load JSON Lines (JSONL) data from a file.
+
+    Args:
+        fpath: Path to the JSONL file.
+
+    Returns:
+        List of dictionaries, one per line in the file.
+    """
     with jsonlines.open(fpath, "r") as reader:
         return list(reader)
 
 
 def write_jsonlines(data: dict, fpath: Path) -> None:
+    """Write data to a JSON Lines (JSONL) file.
+
+    Creates parent directories if they don't exist. Writes each item in the
+    data iterable as a separate line.
+
+    Args:
+        data: Iterable of dictionaries to write (one per line).
+        fpath: Path where the JSONL file will be written.
+    """
     fpath.parent.mkdir(exist_ok=True, parents=True)
     with jsonlines.open(fpath, "w") as writer:
         writer.write_all(data)
 
 
 def append_jsonlines(data: dict, fpath: Path) -> None:
+    """Append a single dictionary to a JSON Lines (JSONL) file.
+
+    Creates parent directories if they don't exist. Appends the data as a
+    new line to the existing file.
+
+    Args:
+        data: Dictionary to append as a new line.
+        fpath: Path to the JSONL file (will be created if it doesn't exist).
+    """
     fpath.parent.mkdir(exist_ok=True, parents=True)
     with jsonlines.open(fpath, "a") as writer:
         writer.write(data)
 
 
-def write_info(info: dict, local_dir: Path):
+def write_info(info: dict, local_dir: Path) -> None:
+    """Write dataset info dictionary to the standard info.json file.
+
+    Args:
+        info: Dataset info dictionary to write.
+        local_dir: Root directory of the dataset where meta/info.json will be written.
+    """
     write_json(info, local_dir / INFO_PATH)
 
 
 def load_info(local_dir: Path) -> dict:
+    """Load dataset info from the standard info.json file.
+
+    Converts feature shapes from lists to tuples for consistency.
+
+    Args:
+        local_dir: Root directory of the dataset containing meta/info.json.
+
+    Returns:
+        Dataset info dictionary with feature shapes as tuples.
+    """
     info = load_json(local_dir / INFO_PATH)
     for ft in info["features"].values():
         ft["shape"] = tuple(ft["shape"])
     return info
 
 
-def write_stats(stats: dict, local_dir: Path):
+def write_stats(stats: dict, local_dir: Path) -> None:
+    """Write dataset statistics to the standard stats.json file.
+
+    Serializes tensors and arrays to JSON-compatible format before writing.
+
+    Args:
+        stats: Dictionary containing dataset statistics (may contain tensors/arrays).
+        local_dir: Root directory of the dataset where meta/stats.json will be written.
+    """
     serialized_stats = serialize_dict(stats)
     write_json(serialized_stats, local_dir / STATS_PATH)
 
 
 def cast_stats_to_numpy(stats) -> dict[str, dict[str, np.ndarray]]:
+    """Convert statistics dictionary values to numpy arrays.
+
+    Flattens the dictionary, converts all values to numpy arrays, then
+    unflattens to restore the original structure.
+
+    Args:
+        stats: Dictionary with statistics (values may be lists or other types).
+
+    Returns:
+        Dictionary with the same structure but all values as numpy arrays.
+    """
     stats = {key: np.array(value) for key, value in flatten_dict(stats).items()}
     return unflatten_dict(stats)
 
 
 def load_stats(local_dir: Path) -> dict[str, dict[str, np.ndarray]]:
+    """Load dataset statistics from the standard stats.json file.
+
+    Args:
+        local_dir: Root directory of the dataset containing meta/stats.json.
+
+    Returns:
+        Dictionary with statistics as numpy arrays, or None if the file doesn't exist.
+    """
     if not (local_dir / STATS_PATH).exists():
         return None
     stats = load_json(local_dir / STATS_PATH)
@@ -200,13 +339,32 @@ def load_stats(local_dir: Path) -> dict[str, dict[str, np.ndarray]]:
 
 
 def load_advantages(local_dir: Path) -> dict:
+    """Load advantage values from the advantages.json file.
+
+    Advantages are keyed by (episode_index, timestamp) tuples in the JSON file
+    as comma-separated strings, which are converted to tuple keys.
+
+    Args:
+        local_dir: Root directory of the dataset containing meta/advantages.json.
+
+    Returns:
+        Dictionary mapping (episode_index, timestamp) tuples to advantage values,
+        or None if the file doesn't exist.
+    """
     if not (local_dir / ADVANTAGES_PATH).exists():
         return None
     advantages = load_json(local_dir / ADVANTAGES_PATH)
     return {(int(k.split(",")[0]), float(k.split(",")[1])): v for k, v in advantages.items()}
 
 
-def write_task(task_index: int, task: dict, local_dir: Path):
+def write_task(task_index: int, task: dict, local_dir: Path) -> None:
+    """Write a task entry to the tasks.jsonl file.
+
+    Args:
+        task_index: Integer index of the task.
+        task: Task description dictionary.
+        local_dir: Root directory of the dataset where meta/tasks.jsonl will be written.
+    """
     task_dict = {
         "task_index": task_index,
         "task": task,
@@ -215,22 +373,55 @@ def write_task(task_index: int, task: dict, local_dir: Path):
 
 
 def load_tasks(local_dir: Path) -> tuple[dict, dict]:
+    """Load tasks from the tasks.jsonl file.
+
+    Args:
+        local_dir: Root directory of the dataset containing meta/tasks.jsonl.
+
+    Returns:
+        Tuple of (tasks_dict, task_to_index_dict):
+            - tasks_dict: Dictionary mapping task_index to task description.
+            - task_to_index_dict: Dictionary mapping task description to task_index.
+    """
     tasks = load_jsonlines(local_dir / TASKS_PATH)
     tasks = {item["task_index"]: item["task"] for item in sorted(tasks, key=lambda x: x["task_index"])}
     task_to_task_index = {task: task_index for task_index, task in tasks.items()}
     return tasks, task_to_task_index
 
 
-def write_episode(episode: dict, local_dir: Path):
+def write_episode(episode: dict, local_dir: Path) -> None:
+    """Write an episode entry to the episodes.jsonl file.
+
+    Args:
+        episode: Episode dictionary containing episode_index, tasks, length, etc.
+        local_dir: Root directory of the dataset where meta/episodes.jsonl will be written.
+    """
     append_jsonlines(episode, local_dir / EPISODES_PATH)
 
 
 def load_episodes(local_dir: Path) -> dict:
+    """Load episodes from the episodes.jsonl file.
+
+    Args:
+        local_dir: Root directory of the dataset containing meta/episodes.jsonl.
+
+    Returns:
+        Dictionary mapping episode_index to episode information dictionary.
+    """
     episodes = load_jsonlines(local_dir / EPISODES_PATH)
     return {item["episode_index"]: item for item in sorted(episodes, key=lambda x: x["episode_index"])}
 
 
-def write_episode_stats(episode_index: int, episode_stats: dict, local_dir: Path):
+def write_episode_stats(episode_index: int, episode_stats: dict, local_dir: Path) -> None:
+    """Write episode statistics to the episodes_stats.jsonl file.
+
+    Serializes tensors and arrays in the stats before writing.
+
+    Args:
+        episode_index: Index of the episode.
+        episode_stats: Dictionary containing statistics for the episode (may contain tensors/arrays).
+        local_dir: Root directory of the dataset where meta/episodes_stats.jsonl will be written.
+    """
     # We wrap episode_stats in a dictionary since `episode_stats["episode_index"]`
     # is a dictionary of stats and not an integer.
     episode_stats = {"episode_index": episode_index, "stats": serialize_dict(episode_stats)}
@@ -238,6 +429,14 @@ def write_episode_stats(episode_index: int, episode_stats: dict, local_dir: Path
 
 
 def load_episodes_stats(local_dir: Path) -> dict:
+    """Load episode statistics from the episodes_stats.jsonl file.
+
+    Args:
+        local_dir: Root directory of the dataset containing meta/episodes_stats.jsonl.
+
+    Returns:
+        Dictionary mapping episode_index to statistics dictionary (with numpy arrays).
+    """
     episodes_stats = load_jsonlines(local_dir / EPISODES_STATS_PATH)
     return {
         item["episode_index"]: cast_stats_to_numpy(item["stats"])
@@ -248,12 +447,37 @@ def load_episodes_stats(local_dir: Path) -> dict:
 def backward_compatible_episodes_stats(
     stats: dict[str, dict[str, np.ndarray]], episodes: list[int]
 ) -> dict[str, dict[str, np.ndarray]]:
+    """Create episode-level statistics from global statistics for backward compatibility.
+
+    In older dataset versions, statistics were stored globally rather than per-episode.
+    This function creates per-episode statistics by assigning the same global stats
+    to each episode.
+
+    Args:
+        stats: Global statistics dictionary.
+        episodes: List of episode indices.
+
+    Returns:
+        Dictionary mapping episode_index to the same statistics dictionary.
+    """
     return dict.fromkeys(episodes, stats)
 
 
 def load_image_as_numpy(
     fpath: str | Path, dtype: np.dtype = np.float32, channel_first: bool = True
 ) -> np.ndarray:
+    """Load an image file as a numpy array.
+
+    Args:
+        fpath: Path to the image file.
+        dtype: Data type for the array. Defaults to np.float32.
+        channel_first: If True, return array in (C, H, W) format; otherwise (H, W, C).
+            Defaults to True.
+
+    Returns:
+        Image as numpy array. If dtype is floating point, values are normalized to [0, 1].
+        Otherwise, values are in [0, 255].
+    """
     img = PILImage.open(fpath).convert("RGB")
     img_array = np.array(img, dtype=dtype)
     if channel_first:  # (H, W, C) -> (C, H, W)
@@ -282,6 +506,14 @@ def hf_transform_to_torch(items_dict: dict[torch.Tensor | None]):
 
 
 def is_valid_version(version: str) -> bool:
+    """Check if a version string is valid and can be parsed.
+
+    Args:
+        version: Version string to validate.
+
+    Returns:
+        True if the version string is valid, False otherwise.
+    """
     try:
         packaging.version.parse(version)
         return True
@@ -295,6 +527,18 @@ def check_version_compatibility(
     current_version: str | packaging.version.Version,
     enforce_breaking_major: bool = True,
 ) -> None:
+    """Check compatibility between a dataset version and the current codebase version.
+
+    Args:
+        repo_id: Repository ID of the dataset.
+        version_to_check: Version of the dataset to check.
+        current_version: Current codebase version.
+        enforce_breaking_major: If True, raise error for major version mismatches.
+            Defaults to True.
+
+    Raises:
+        BackwardCompatibilityError: If the dataset version is too old (major version mismatch).
+    """
     v_check = (
         packaging.version.parse(version_to_check)
         if not isinstance(version_to_check, packaging.version.Version)
@@ -369,6 +613,21 @@ def get_safe_version(repo_id: str, version: str | packaging.version.Version) -> 
 
 
 def get_hf_features_from_features(features: dict) -> datasets.Features:
+    """Convert dataset features dictionary to HuggingFace Features object.
+
+    Maps feature types and shapes to appropriate HuggingFace feature types
+    (Image, Value, Sequence, Array2D, Array3D, Array4D, Array5D).
+
+    Args:
+        features: Dictionary mapping feature names to feature specifications
+            with 'dtype' and 'shape' keys.
+
+    Returns:
+        HuggingFace Features object compatible with the dataset library.
+
+    Raises:
+        ValueError: If a feature shape is not supported (more than 5 dimensions).
+    """
     hf_features = {}
     for key, ft in features.items():
         if ft["dtype"] == "video":
@@ -396,6 +655,20 @@ def get_hf_features_from_features(features: dict) -> datasets.Features:
 
 
 def dataset_to_policy_features(features: dict[str, dict]) -> dict[str, PolicyFeature]:
+    """Convert dataset features to policy feature format.
+
+    Maps dataset features to policy feature types (VISUAL, ENV, STATE, ACTION)
+    based on feature names and data types.
+
+    Args:
+        features: Dictionary mapping feature names to feature specifications.
+
+    Returns:
+        Dictionary mapping feature names to PolicyFeature objects.
+
+    Raises:
+        ValueError: If a visual feature doesn't have 3 dimensions.
+    """
     # TODO(aliberts): Implement "type" in dataset features and simplify this
     policy_features = {}
     for key, ft in features.items():
@@ -428,6 +701,18 @@ def create_empty_dataset_info(
     features: dict,
     use_videos: bool,
 ) -> dict:
+    """Create an empty dataset info dictionary with default values.
+
+    Args:
+        codebase_version: Version of the codebase used to create the dataset.
+        fps: Frames per second used during data collection.
+        robot_type: Type of robot used (can be None).
+        features: Dictionary of feature specifications.
+        use_videos: Whether videos are used for visual modalities.
+
+    Returns:
+        Dictionary containing dataset metadata with initialized counters and paths.
+    """
     return {
         "codebase_version": codebase_version,
         "robot_type": robot_type,
@@ -448,6 +733,23 @@ def create_empty_dataset_info(
 def get_episode_data_index(
     episode_dicts: dict[dict], episodes: list[int] | None = None
 ) -> tuple[dict[str, torch.Tensor], dict[int, int]]:
+    """Compute data indices for episodes in a flattened dataset.
+
+    Calculates start and end indices for each episode in a concatenated dataset,
+    and creates a mapping from episode index to position in the episodes list.
+
+    Args:
+        episode_dicts: Dictionary mapping episode_index to episode info dicts
+            containing 'length' keys.
+        episodes: Optional list of episode indices to include. If None, uses all
+            episodes from episode_dicts.
+
+    Returns:
+        Tuple of (episode_data_index, ep2idx):
+            - episode_data_index: Dictionary with 'from' and 'to' tensors indicating
+              start and end indices for each episode.
+            - ep2idx: Dictionary mapping episode_index to position in the episodes list.
+    """
     # `episodes_dicts` are not necessarily sorted, or starting with episode_index 0.
     episode_lengths = {edict["episode_index"]: edict["length"] for edict in episode_dicts.values()}
 
@@ -675,7 +977,19 @@ class IterableNamespace(SimpleNamespace):
         return vars(self).keys()
 
 
-def validate_frame(frame: dict, features: dict):
+def validate_frame(frame: dict, features: dict) -> None:
+    """Validate that a frame dictionary matches the expected features.
+
+    Checks that all required features are present, no unexpected features exist,
+    and that feature types and shapes match the specification.
+
+    Args:
+        frame: Dictionary containing frame data to validate.
+        features: Dictionary of expected feature specifications.
+
+    Raises:
+        ValueError: If the frame doesn't match the feature specifications.
+    """
     optional_features = {"timestamp"}
     expected_features = (set(features) - set(DEFAULT_FEATURES.keys())) | {"task"}
     actual_features = set(frame.keys())
@@ -695,7 +1009,17 @@ def validate_frame(frame: dict, features: dict):
 
 def validate_features_presence(
     actual_features: set[str], expected_features: set[str], optional_features: set[str]
-):
+) -> str:
+    """Validate that required features are present and no unexpected features exist.
+
+    Args:
+        actual_features: Set of feature names actually present.
+        expected_features: Set of feature names that must be present.
+        optional_features: Set of feature names that may be present but aren't required.
+
+    Returns:
+        Error message string (empty if validation passes).
+    """
     error_message = ""
     missing_features = expected_features - actual_features
     extra_features = actual_features - (expected_features | optional_features)
@@ -710,7 +1034,24 @@ def validate_features_presence(
     return error_message
 
 
-def validate_feature_dtype_and_shape(name: str, feature: dict, value: np.ndarray | PILImage.Image | str):
+def validate_feature_dtype_and_shape(
+    name: str, feature: dict, value: np.ndarray | PILImage.Image | str
+) -> str:
+    """Validate that a feature value matches its expected dtype and shape.
+
+    Routes to appropriate validation function based on feature type.
+
+    Args:
+        name: Name of the feature being validated.
+        feature: Feature specification dictionary with 'dtype' and 'shape' keys.
+        value: Actual value to validate.
+
+    Returns:
+        Error message string (empty if validation passes).
+
+    Raises:
+        NotImplementedError: If the feature dtype is not supported.
+    """
     expected_dtype = feature["dtype"]
     expected_shape = feature["shape"]
     if is_valid_numpy_dtype_string(expected_dtype):
@@ -725,7 +1066,18 @@ def validate_feature_dtype_and_shape(name: str, feature: dict, value: np.ndarray
 
 def validate_feature_numpy_array(
     name: str, expected_dtype: str, expected_shape: list[int], value: np.ndarray
-):
+) -> str:
+    """Validate that a numpy array feature matches expected dtype and shape.
+
+    Args:
+        name: Name of the feature being validated.
+        expected_dtype: Expected numpy dtype as a string.
+        expected_shape: Expected shape as a list of integers.
+        value: Actual numpy array to validate.
+
+    Returns:
+        Error message string (empty if validation passes).
+    """
     error_message = ""
     if isinstance(value, np.ndarray):
         actual_dtype = value.dtype
@@ -742,7 +1094,25 @@ def validate_feature_numpy_array(
     return error_message
 
 
-def validate_feature_image_or_video(name: str, expected_shape: list[str], value: np.ndarray | PILImage.Image):
+def validate_feature_image_or_video(
+    name: str, expected_shape: list[str], value: np.ndarray | PILImage.Image
+) -> str:
+    """Validate that an image or video feature matches expected shape.
+
+    Supports both channel-first (C, H, W) and channel-last (H, W, C) formats.
+
+    Args:
+        name: Name of the feature being validated.
+        expected_shape: Expected shape as [C, H, W].
+        value: Actual image/video value (PIL Image or numpy array).
+
+    Returns:
+        Error message string (empty if validation passes).
+
+    Note:
+        Pixel value range validation ([0,1] for float, [0,255] for uint8) is
+        performed by the image writer threads, not here.
+    """
     # Note: The check of pixels range ([0,1] for float and [0,255] for uint8) is done by the image writer threads.
     error_message = ""
     if isinstance(value, np.ndarray):
@@ -758,13 +1128,37 @@ def validate_feature_image_or_video(name: str, expected_shape: list[str], value:
     return error_message
 
 
-def validate_feature_string(name: str, value: str):
+def validate_feature_string(name: str, value: str) -> str:
+    """Validate that a feature value is a string.
+
+    Args:
+        name: Name of the feature being validated.
+        value: Actual value to validate.
+
+    Returns:
+        Error message string (empty if validation passes).
+    """
     if not isinstance(value, str):
         return f"The feature '{name}' is expected to be of type 'str', but type '{type(value)}' provided instead.\n"
     return ""
 
 
-def validate_episode_buffer(episode_buffer: dict, total_episodes: int, features: dict):
+def validate_episode_buffer(episode_buffer: dict, total_episodes: int, features: dict) -> None:
+    """Validate that an episode buffer is properly formatted.
+
+    Checks that required keys exist, episode_index matches total_episodes,
+    buffer is not empty, and all features are present.
+
+    Args:
+        episode_buffer: Dictionary containing episode data to validate.
+        total_episodes: Total number of episodes already in the dataset.
+        features: Dictionary of expected feature specifications.
+
+    Raises:
+        ValueError: If the buffer is missing required keys, is empty, or has
+            mismatched features.
+        NotImplementedError: If episode_index doesn't match total_episodes.
+    """
     if "size" not in episode_buffer:
         raise ValueError("size key not found in episode_buffer")
 

@@ -31,6 +31,22 @@ hub_api = HfApi()
 
 
 def fix_dataset(repo_id: str) -> str:
+    """Remove 'language_instruction' feature from dataset metadata if present.
+
+    Checks if the dataset has a 'language_instruction' feature in metadata
+    that doesn't exist in parquet files, and removes it from info.json.
+
+    Args:
+        repo_id: Repository ID of the dataset to fix.
+
+    Returns:
+        Status message indicating success, skip reason, or error.
+
+    Raises:
+        ValueError: If there are unexpected feature differences between
+            parquet files and metadata, or if the difference is not
+            just 'language_instruction'.
+    """
     if not hub_api.revision_exists(repo_id, V20, repo_type="dataset"):
         return f"{repo_id}: skipped (not in {V20})."
 
@@ -67,7 +83,12 @@ def fix_dataset(repo_id: str) -> str:
         return f"{repo_id}: success - PR: {commit_info.pr_url}"
 
 
-def batch_fix():
+def batch_fix() -> None:
+    """Batch process all available datasets to remove language_instruction feature.
+
+    Iterates through all datasets in available_datasets and attempts to fix
+    each one, logging results to a file.
+    """
     status = {}
     LOCAL_DIR.mkdir(parents=True, exist_ok=True)
     logfile = LOCAL_DIR / "fix_features_v20.txt"

@@ -30,8 +30,12 @@ import torchvision
 from datasets.features.features import register_feature
 from PIL import Image
 
+def get_safe_default_codec() -> str:
+    """Get the default video codec backend, falling back to pyav if torchcodec is unavailable.
 
-def get_safe_default_codec():
+    Returns:
+        Backend name: "torchcodec" if available, otherwise "pyav".
+    """
     if importlib.util.find_spec("torchcodec"):
         return "torchcodec"
     else:
@@ -256,7 +260,27 @@ def encode_video_frames(
     log_level: str | None = "error",
     overwrite: bool = False,
 ) -> None:
-    """More info on ffmpeg arguments tuning on `benchmark/video/README.md`"""
+    """Encode a sequence of images into a video file using ffmpeg.
+
+    Args:
+        imgs_dir: Directory containing sequentially numbered PNG frames
+            (frame_000000.png, frame_000001.png, etc.).
+        video_path: Output path for the encoded video file.
+        fps: Frames per second for the output video.
+        vcodec: Video codec to use. Defaults to "libsvtav1".
+        pix_fmt: Pixel format. Defaults to "yuv420p".
+        g: GOP (Group of Pictures) size. Defaults to 2.
+        crf: Constant Rate Factor for quality control. Defaults to 30.
+        fast_decode: Fast decode parameter for libsvtav1. Defaults to 0.
+        log_level: FFmpeg log level. Defaults to "error".
+        overwrite: Whether to overwrite existing video file. Defaults to False.
+
+    Raises:
+        OSError: If video encoding fails or output file is not created.
+
+    Note:
+        More info on ffmpeg arguments tuning on `benchmark/video/README.md`
+    """
     video_path = Path(video_path)
     imgs_dir = Path(imgs_dir)
     video_path.parent.mkdir(parents=True, exist_ok=True)
@@ -333,6 +357,24 @@ with warnings.catch_warnings():
 
 
 def get_audio_info(video_path: Path | str) -> dict:
+    """Extract audio stream information from a video file using ffprobe.
+
+    Args:
+        video_path: Path to the video file.
+
+    Returns:
+        Dictionary containing audio information:
+            - has_audio: Boolean indicating if audio stream exists.
+            - audio.channels: Number of audio channels (if available).
+            - audio.codec: Audio codec name (if available).
+            - audio.bit_rate: Bit rate in bits per second (if available).
+            - audio.sample_rate: Sample rate in Hz (if available).
+            - audio.bit_depth: Bit depth (if available).
+            - audio.channel_layout: Channel layout (if available).
+
+    Raises:
+        RuntimeError: If ffprobe command fails.
+    """
     ffprobe_audio_cmd = [
         "ffprobe",
         "-v",
@@ -369,6 +411,25 @@ def get_audio_info(video_path: Path | str) -> dict:
 
 
 def get_video_info(video_path: Path | str) -> dict:
+    """Extract video stream information from a video file using ffprobe.
+
+    Args:
+        video_path: Path to the video file.
+
+    Returns:
+        Dictionary containing video and audio information:
+            - video.fps: Frames per second.
+            - video.height: Video height in pixels.
+            - video.width: Video width in pixels.
+            - video.channels: Number of pixel channels.
+            - video.codec: Video codec name.
+            - video.pix_fmt: Pixel format.
+            - video.is_depth_map: Whether video is a depth map.
+            - Plus all fields from get_audio_info().
+
+    Raises:
+        RuntimeError: If ffprobe command fails.
+    """
     ffprobe_video_cmd = [
         "ffprobe",
         "-v",
@@ -410,6 +471,17 @@ def get_video_info(video_path: Path | str) -> dict:
 
 
 def get_video_pixel_channels(pix_fmt: str) -> int:
+    """Determine the number of pixel channels from a pixel format string.
+
+    Args:
+        pix_fmt: Pixel format string (e.g., "yuv420p", "rgb24").
+
+    Returns:
+        Number of channels (1, 3, or 4).
+
+    Raises:
+        ValueError: If pixel format is unknown.
+    """
     if "gray" in pix_fmt or "depth" in pix_fmt or "monochrome" in pix_fmt:
         return 1
     elif "rgba" in pix_fmt or "yuva" in pix_fmt:
@@ -420,7 +492,18 @@ def get_video_pixel_channels(pix_fmt: str) -> int:
         raise ValueError("Unknown format")
 
 
-def get_image_pixel_channels(image: Image):
+def get_image_pixel_channels(image: Image) -> int:
+    """Determine the number of pixel channels from a PIL Image mode.
+
+    Args:
+        image: PIL Image object.
+
+    Returns:
+        Number of channels (1, 2, 3, or 4).
+
+    Raises:
+        ValueError: If image mode is unknown.
+    """
     if image.mode == "L":
         return 1  # Grayscale
     elif image.mode == "LA":

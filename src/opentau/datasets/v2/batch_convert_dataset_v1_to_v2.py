@@ -861,7 +861,12 @@ DATASETS = {
 # spellchecker:on
 
 
-def batch_convert():
+def batch_convert() -> None:
+    """Batch convert multiple datasets from v1.6 to v2.0 format.
+
+    Processes all datasets specified in the DATASETS dictionary, converting
+    each one and logging the results to a file.
+    """
     status = {}
     logfile = LOCAL_DIR / "conversion_log.txt"
     assert set(DATASETS) == {id_.split("/")[1] for id_ in available_datasets}

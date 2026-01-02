@@ -33,12 +33,27 @@ from opentau.datasets.lerobot_dataset import LeRobotDataset
 
 
 def _make_memmap_safe(**kwargs) -> np.memmap:
-    """Make a numpy memmap with checks on available disk space first.
+    """Create a numpy memmap with checks on available disk space.
 
-    Expected kwargs are: "filename", "dtype" (must by np.dtype), "mode" and "shape"
+    Validates that sufficient disk space is available before creating the memmap
+    file in write mode.
 
-    For information on dtypes:
-    https://numpy.org/doc/stable/reference/arrays.dtypes.html#arrays-dtypes-constructing
+    Args:
+        **kwargs: Keyword arguments for np.memmap including:
+            - filename: Path to the memmap file.
+            - dtype: numpy dtype (must be np.dtype).
+            - mode: File mode ('r+', 'w+', etc.).
+            - shape: Shape of the array.
+
+    Returns:
+        numpy memmap array.
+
+    Raises:
+        RuntimeError: If required disk space exceeds 80% of available space.
+
+    Note:
+        For information on dtypes, see:
+        https://numpy.org/doc/stable/reference/arrays.dtypes.html#arrays-dtypes-constructing
     """
     if kwargs["mode"].startswith("w"):
         required_space = kwargs["dtype"].itemsize * np.prod(kwargs["shape"])  # bytes
@@ -121,11 +136,15 @@ class OnlineBuffer(torch.utils.data.Dataset):
     def delta_timestamps(self) -> dict[str, np.ndarray] | None:
         return self._delta_timestamps
 
-    def set_delta_timestamps(self, value: dict[str, list[float]] | None):
+    def set_delta_timestamps(self, value: dict[str, list[float]] | None) -> None:
         """Set delta_timestamps converting the values to numpy arrays.
 
-        The conversion is for an optimization in the __getitem__. The loop is much slower if the arrays
-        need to be converted into numpy arrays.
+        The conversion is for an optimization in the __getitem__. The loop is much
+        slower if the arrays need to be converted into numpy arrays on each access.
+
+        Args:
+            value: Dictionary mapping feature names to lists of delta timestamps,
+                or None to disable delta timestamps.
         """
         if value is not None:
             self._delta_timestamps = {k: np.array(v) for k, v in value.items()}
@@ -133,7 +152,22 @@ class OnlineBuffer(torch.utils.data.Dataset):
             self._delta_timestamps = None
 
     def _make_data_spec(self, data_spec: dict[str, Any], buffer_capacity: int) -> dict[str, dict[str, Any]]:
-        """Makes the data spec for np.memmap."""
+        """Create the complete data specification for numpy memmap files.
+
+        Adds internal keys (_next_index, _occupancy_mask) and standard keys
+        (index, frame_index, episode_index, timestamp) to the user-provided spec.
+
+        Args:
+            data_spec: User-provided data specification dictionary.
+            buffer_capacity: Maximum number of frames the buffer can hold.
+
+        Returns:
+            Complete data specification including internal and standard keys.
+
+        Raises:
+            ValueError: If data_spec contains keys starting with '_' or contains
+                any of the preset keys (index, frame_index, episode_index, timestamp).
+        """
         if any(k.startswith("_") for k in data_spec):
             raise ValueError(
                 "data_spec keys should not start with '_'. This prefix is reserved for internal logic."
@@ -165,15 +199,23 @@ class OnlineBuffer(torch.utils.data.Dataset):
             complete_data_spec[k] = {"dtype": v["dtype"], "shape": (buffer_capacity, *v["shape"])}
         return complete_data_spec
 
-    def add_data(self, data: dict[str, np.ndarray]):
-        """Add new data to the buffer, which could potentially mean shifting old data out.
+    def add_data(self, data: dict[str, np.ndarray]) -> None:
+        """Add new data to the buffer, potentially overwriting old data in a circular fashion.
 
-        The new data should contain all the frames (in order) of any number of episodes. The indices should
-        start from 0 (note to the developer: this can easily be generalized). See the `rollout` and
-        `eval_policy` functions in `eval.py` for more information on how the data is constructed.
+        The new data should contain all frames (in order) of any number of episodes.
+        Indices should start from 0. This method shifts incoming data indices and
+        episode indices to continue from the last frame in the buffer.
 
-        Shift the incoming data index and episode_index to continue on from the last frame. Note that this
-        will be done in place!
+        Args:
+            data: Dictionary mapping data keys to numpy arrays. All arrays must
+                have the same length. Must include all keys from data_keys.
+
+        Raises:
+            ValueError: If data is missing required keys or arrays have different lengths.
+
+        Note:
+            This modifies the input data in place by shifting indices.
+            See `rollout` and `eval_policy` functions in `eval.py` for usage examples.
         """
         if len(missing_keys := (set(self.data_keys).difference(set(data)))) > 0:
             raise ValueError(f"Missing data keys: {missing_keys}")
@@ -235,6 +277,14 @@ class OnlineBuffer(torch.utils.data.Dataset):
         return self.num_frames
 
     def _item_to_tensors(self, item: dict) -> dict:
+        """Convert all values in an item dictionary to torch tensors.
+
+        Args:
+            item: Dictionary with numpy arrays, torch tensors, or scalars.
+
+        Returns:
+            Dictionary with all values converted to torch tensors.
+        """
         item_ = {}
         for k, v in item.items():
             if isinstance(v, torch.Tensor):
@@ -293,7 +343,14 @@ class OnlineBuffer(torch.utils.data.Dataset):
         return self._item_to_tensors(item)
 
     def get_data_by_key(self, key: str) -> torch.Tensor:
-        """Returns all data for a given data key as a Tensor."""
+        """Get all occupied data for a given key as a torch tensor.
+
+        Args:
+            key: Data key to retrieve.
+
+        Returns:
+            Tensor containing all non-padded data for the specified key.
+        """
         return torch.from_numpy(self._data[key][self._data[OnlineBuffer.OCCUPANCY_MASK_KEY]])
 
 

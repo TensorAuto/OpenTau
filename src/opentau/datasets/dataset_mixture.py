@@ -25,8 +25,17 @@ from opentau.datasets.lerobot_dataset import BaseDataset, DatasetMetadata
 from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
 
 
-def pad_vector(vector, new_dim):
-    """Only the last dimension of the vector is padded to 'new_dim' with zeros."""
+def pad_vector(vector: np.ndarray, new_dim: int) -> np.ndarray:
+    """Pad the last dimension of a vector to a target size with zeros.
+
+    Args:
+        vector: Input numpy array to pad.
+        new_dim: Target size for the last dimension.
+
+    Returns:
+        Padded array with the last dimension expanded to new_dim. If the
+        vector already has the target dimension, returns it unchanged.
+    """
     if vector.shape[-1] == new_dim:
         return vector
     shape = list(vector.shape)
@@ -57,7 +66,22 @@ class DatasetMixtureMetadata:
     def _to_standard_data_format(
         self, repo_id: str, stats: dict[str, dict[str, np.ndarray]]
     ) -> dict[str, dict[str, np.ndarray]]:
-        """Converts stats to the standard data format."""
+        """Convert statistics to the standard data format.
+
+        Maps feature names from dataset-specific format to standard format,
+        pads state and action vectors, and ensures all required cameras are present.
+
+        Args:
+            repo_id: Repository ID used to look up feature name mapping.
+            stats: Statistics dictionary with dataset-specific feature names.
+
+        Returns:
+            Statistics dictionary with standard feature names and padded vectors.
+
+        Raises:
+            KeyError: If a required feature is missing from stats or if required
+                statistics (mean, std, min, max) are missing.
+        """
         name_map = DATA_FEATURES_NAME_MAPPING[repo_id]
         features_without_stats = ["prompt", "response", "advantage"]
 
@@ -273,17 +297,25 @@ class WeightedDatasetMixture:
             raise ValueError("All datasets must have a 'meta' attribute with valid metadata.")
         self.meta = DatasetMixtureMetadata(cfg, [ds.meta for ds in datasets], dataset_weights)
 
-    def _log_dataset_info(self):
+    def _log_dataset_info(self) -> None:
+        """Log information about all datasets in the mixture."""
         logging.info("Dataset information:")
         for i, ds in enumerate(self.datasets):
             logging.info(f"  - {self.dataset_names[i]}: Length={len(ds)}, Weight={self.dataset_weights[i]}")
         logging.info("-" * 30)
 
     def _calculate_sample_weights(self) -> Optional[torch.Tensor]:
-        """
-        Calculates the weight for each individual sample in the concatenated dataset.
+        """Calculate the weight for each individual sample in the concatenated dataset.
+
         Samples from datasets with higher weights or smaller sizes (for a given weight)
-        will have higher individual sample weights.
+        will have higher individual sample weights. Weight per sample = dataset_weight / dataset_length.
+
+        Returns:
+            Tensor of sample weights, or None if all datasets are empty or have zero weight.
+
+        Raises:
+            RuntimeError: If there's a mismatch between concatenated dataset length
+                and calculated sample weights.
         """
         if not self.concatenated_dataset:  # Handles case where all input datasets are empty
             logging.warning("Warning: Concatenated dataset is empty. No sample weights to calculate.")
@@ -329,11 +361,16 @@ class WeightedDatasetMixture:
         return torch.DoubleTensor(all_sample_weights)
 
     def get_dataloader(self) -> DataLoader:
-        """
-        Creates and returns a PyTorch DataLoader with weighted sampling.
+        """Create and return a PyTorch DataLoader with weighted sampling.
+
+        Uses HierarchicalSampler to first sample a dataset according to weights,
+        then uniformly sample within that dataset.
 
         Returns:
-            DataLoader: A DataLoader instance configured for weighted sampling.
+            DataLoader configured for weighted hierarchical sampling.
+
+        Raises:
+            ValueError: If no non-empty dataset has a positive sampling weight.
         """
         if len(self.concatenated_dataset) == 0:
             logging.warning("Warning: Concatenated dataset is empty. DataLoader will produce no batches.")
