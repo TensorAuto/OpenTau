@@ -12,6 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Configuration module for the PI05 Policy.
+
+This module defines the `PI05Config` class, which handles the configuration parameters
+for the PI05 Vision-Language-Action Flow Model. It includes settings for the model architecture,
+optimization, scheduling, and data processing.
+"""
+
 import logging
 from dataclasses import dataclass, field
 from typing import Literal
@@ -21,12 +29,54 @@ from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from opentau.optim.optimizers import AdamWConfig
 from opentau.optim.schedulers import (
     CosineDecayWithWarmupSchedulerConfig,
+    LRSchedulerConfig,
 )
 
 
 @PreTrainedConfig.register_subclass("pi05")
 @dataclass
 class PI05Config(PreTrainedConfig):
+    """Configuration class for the PI05 Policy.
+
+    This class defines the configuration parameters for the PI05 model, including
+    input/output structure, model architecture, training settings, and preprocessing.
+
+    Args:
+        n_obs_steps: Number of observation steps to use. Defaults to 1.
+        chunk_size: Size of the action chunk. The upper bound for n_action_steps. Defaults to 50.
+        n_action_steps: Number of action steps to predict. Defaults to 50.
+        normalization_mapping: Mapping of feature names to normalization modes.
+            Defaults to identity for visual features and mean-std for state and action.
+        max_state_dim: Maximum dimension for state vectors. Shorter vectors are padded. Defaults to 32.
+        max_action_dim: Maximum dimension for action vectors. Shorter vectors are padded. Defaults to 32.
+        resize_imgs_with_padding: Target size (height, width) for image resizing with padding.
+            Defaults to (224, 224).
+        empty_cameras: Number of empty camera inputs to add. Used for specific adaptations like
+            Aloha simulation. Defaults to 0.
+        adapt_to_pi_aloha: Whether to adapt joint and gripper values from standard Aloha space
+            to PI internal runtime space. Defaults to False.
+        use_delta_joint_actions_aloha: Whether to use delta joint actions for Aloha.
+            Currently not implemented. Defaults to False.
+        tokenizer_max_length: Maximum length for tokenizer. Defaults to 256.
+        discrete_action_max_length: Maximum length for discrete action tokens. Defaults to 32.
+        proj_width: Width of the projection layer. Defaults to 1024.
+        dropout: Dropout rate. Defaults to 0.1.
+        num_steps: Number of flow matching steps for decoding. Defaults to 10.
+        init_strategy: Initialization strategy. One of "no_init", "full_he_init", "expert_only_he_init".
+            Defaults to "full_he_init".
+        use_cache: Whether to use KV cache during inference. Defaults to True.
+        attention_implementation: Attention implementation to use ("eager" or "fa2"). Defaults to "eager".
+        freeze_vision_encoder: Whether to freeze the vision encoder during fine-tuning. Defaults to True.
+        train_expert_only: Whether to train only the expert module. Defaults to False.
+        optimizer_lr: Learning rate for the optimizer. Defaults to 2.5e-5.
+        optimizer_betas: Beta parameters for AdamW optimizer. Defaults to (0.9, 0.95).
+        optimizer_eps: Epsilon parameter for AdamW optimizer. Defaults to 1e-8.
+        optimizer_weight_decay: Weight decay for AdamW optimizer. Defaults to 1e-10.
+        scheduler_warmup_steps: Number of warmup steps for the scheduler. Defaults to 1_000.
+        scheduler_decay_steps: Number of decay steps for the scheduler. Defaults to 30_000.
+        scheduler_decay_lr: Target learning rate after decay. Defaults to 2.5e-6.
+    """
+
     # Input / output structure.
     n_obs_steps: int = 1
     chunk_size: int = 50
@@ -95,9 +145,8 @@ class PI05Config(PreTrainedConfig):
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
 
-    # TODO: Add EMA
-
     def __post_init__(self):
+        """Post-initialization validation."""
         super().__post_init__()
 
         # TODO(Steven): Validate device and amp? in all policy configs?
@@ -131,9 +180,11 @@ class PI05Config(PreTrainedConfig):
             self.init_strategy = "no_init"
 
     def validate_features(self) -> None:
-        # TODO: implement value error
-        # if not self.image_features and not self.env_state_feature:
-        #     raise ValueError("You must provide at least one image or the environment state among the inputs.")
+        """Validates the features and adds empty cameras if configured.
+
+        This method checks feature configurations and dynamically adds empty camera inputs
+        to `self.input_features` based on the `empty_cameras` parameter.
+        """
 
         for i in range(self.empty_cameras):
             key = f"observation.images.empty_camera_{i}"
@@ -144,6 +195,11 @@ class PI05Config(PreTrainedConfig):
             self.input_features[key] = empty_camera
 
     def get_optimizer_preset(self) -> AdamWConfig:
+        """Returns the default optimizer configuration.
+
+        Returns:
+            AdamWConfig: The optimizer configuration with default parameters.
+        """
         return AdamWConfig(
             lr=self.optimizer_lr,
             betas=self.optimizer_betas,
@@ -151,7 +207,12 @@ class PI05Config(PreTrainedConfig):
             weight_decay=self.optimizer_weight_decay,
         )
 
-    def get_scheduler_preset(self):
+    def get_scheduler_preset(self) -> LRSchedulerConfig:
+        """Returns the default scheduler configuration.
+
+        Returns:
+            CosineDecayWithWarmupSchedulerConfig: The scheduler configuration with default parameters.
+        """
         return CosineDecayWithWarmupSchedulerConfig(
             peak_lr=self.optimizer_lr,
             decay_lr=self.scheduler_decay_lr,
@@ -161,12 +222,27 @@ class PI05Config(PreTrainedConfig):
 
     @property
     def observation_delta_indices(self) -> None:
+        """Indices for observation deltas.
+
+        Returns:
+            None: As observation deltas are not used.
+        """
         return None
 
     @property
-    def action_delta_indices(self) -> list:
+    def action_delta_indices(self) -> list[int]:
+        """Indices for action deltas.
+
+        Returns:
+            list[int]: A list of indices corresponding to the chunk size.
+        """
         return list(range(self.chunk_size))
 
     @property
     def reward_delta_indices(self) -> None:
+        """Indices for reward deltas.
+
+        Returns:
+            None: As reward deltas are not used.
+        """
         return None
