@@ -9,6 +9,7 @@ OpenTau documentation
    installation
    concepts
    tutorials
+   model
    contributing
 
 .. toctree::
