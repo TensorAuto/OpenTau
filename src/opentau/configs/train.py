@@ -12,6 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Training pipeline configuration module.
+
+This module provides the TrainPipelineConfig class which contains all configuration
+parameters needed to run a training pipeline, including dataset settings, policy
+configuration, training hyperparameters, and evaluation settings.
+"""
+
 import datetime as dt
 import os
 import sys
@@ -37,12 +44,80 @@ TRAIN_CONFIG_NAME = "train_config.json"
 # Somehow, calling `logging.warning()` sets the logger level to WARNING.
 # We print directly to stderr instead.
 def warn(*args, **kwargs):
-    """A dummy warning function to avoid using the logging module."""
+    """Print a warning message to stderr.
+
+    This function is used instead of logging.warning() to avoid setting the logger
+    level to WARNING.
+
+    Args:
+        *args: Variable length argument list to print.
+        **kwargs: Arbitrary keyword arguments passed to print().
+    """
     print("WARNING:", *args, **kwargs, file=sys.stderr)
 
 
 @dataclass
 class TrainPipelineConfig(HubMixin):
+    """Configuration for the training pipeline.
+
+    This class contains all configuration parameters needed to run a training
+    pipeline, including dataset settings, policy configuration, training hyperparameters,
+    and evaluation settings.
+
+    Args:
+        dataset_mixture: Configuration for the dataset mixture to use during training.
+        policy: Configuration for the policy model. If None, must be set via CLI or
+            from a pretrained checkpoint.
+        output_dir: Directory where all run outputs will be saved. If another training
+            session uses the same directory, its contents will be overwritten unless
+            `resume` is set to True.
+        job_name: Name identifier for the training job. If not provided, defaults to
+            the policy type.
+        resume: If True, resume a previous run. Requires `output_dir` to point to
+            an existing run directory with at least one checkpoint. When resuming,
+            the configuration from the checkpoint is used by default, regardless of
+            command-line arguments.
+        seed: Random seed used for training (model initialization, dataset shuffling)
+            and for evaluation environments. Defaults to 1000.
+        resolution: Resolution of images (height, width) in data samples. Defaults to (224, 224).
+        num_cams: Number of cameras for the cloud VLM in each data sample. Defaults to 2.
+        max_state_dim: Maximum dimension of the state vector. Defaults to 32.
+        max_action_dim: Maximum dimension of the action vector. Defaults to 32.
+        action_chunk: Size of action chunk. Defaults to 50.
+        loss_weighting: Dictionary mapping loss type names to their weights.
+            Defaults to {"MSE": 1, "CE": 1}.
+        num_workers: Number of workers for the dataloader. Defaults to 4.
+        batch_size: Total batch size for training. If None, calculated from
+            `dataloader_batch_size * gradient_accumulation_steps`.
+        gradient_accumulation_steps: Number of gradient accumulation steps.
+            Defaults to 1.
+        dataloader_batch_size: Batch size used by the dataloader. If None, calculated
+            from `batch_size // gradient_accumulation_steps`.
+        prefetch_factor: Prefetch factor for the dataloader. If None, uses default.
+        steps: Total number of training steps. Defaults to 100,000.
+        log_freq: Frequency of logging in training iterations. Defaults to 200.
+        save_checkpoint: Whether to save checkpoints during training. Defaults to True.
+        save_freq: Frequency of checkpoint saving in training iterations. Checkpoints
+            are saved every `save_freq` steps and after the last training step.
+            Defaults to 20,000.
+        use_policy_training_preset: If True, use optimizer and scheduler presets from
+            the policy configuration. Defaults to False.
+        optimizer: Configuration for the optimizer. Required if
+            `use_policy_training_preset` is False.
+        scheduler: Configuration for the learning rate scheduler. Required if
+            `use_policy_training_preset` is False.
+        wandb: Configuration for Weights & Biases logging. Defaults to WandBConfig().
+        debug: If True, set logging level to DEBUG. Defaults to False.
+        trace_nans: Enable anomaly detection for debugging NaN/Inf values.
+            Warning: causes large computational overhead. Defaults to False.
+        env: Optional environment configuration for evaluation. Defaults to None.
+        eval: Configuration for evaluation settings. Defaults to EvalConfig().
+        eval_freq: Frequency of evaluation in training steps. If 0, evaluation
+            is disabled. Defaults to 0.
+        last_checkpoint_only: If True, only evaluate the last checkpoint.
+            Defaults to True.
+    """
+
     dataset_mixture: DatasetMixtureConfig
     policy: PreTrainedConfig | None = None
     # Set `dir` to where you would like to save all of the run outputs. If you run another training session
@@ -91,6 +166,7 @@ class TrainPipelineConfig(HubMixin):
     last_checkpoint_only: bool = True
 
     def __post_init__(self):
+        """Initialize post-creation attributes and validate batch size configuration."""
         self.checkpoint_path = None
 
         if self.dataloader_batch_size is None and self.batch_size is None:
@@ -124,6 +200,20 @@ class TrainPipelineConfig(HubMixin):
             )
 
     def validate(self):
+        """Validate and finalize the training configuration.
+
+        This method performs several validation and setup tasks:
+        - Loads policy configuration from CLI arguments or pretrained path if specified
+        - Sets up checkpoint paths for resuming training
+        - Validates output directory and creates default if needed
+        - Sets up optimizer and scheduler from presets if enabled
+        - Updates policy configuration with training parameters
+
+        Raises:
+            ValueError: If required configurations are missing or invalid.
+            FileExistsError: If output directory exists and resume is False.
+            NotADirectoryError: If config_path for resuming doesn't exist locally.
+        """
         # HACK: We parse again the cli args here to get the pretrained paths if there was some.
         policy_path = parser.get_path_arg("policy")
         if policy_path:
@@ -173,13 +263,30 @@ class TrainPipelineConfig(HubMixin):
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
-        """This enables the parser to load config from the policy using `--policy.path=local/dir`"""
+        """Get list of field names that support path-based loading.
+
+        This enables the parser to load config from the policy using
+        `--policy.path=local/dir`.
+
+        Returns:
+            List of field names that support path-based configuration loading.
+        """
         return ["policy"]
 
     def to_dict(self) -> dict:
+        """Convert the configuration to a dictionary.
+
+        Returns:
+            Dictionary representation of the configuration.
+        """
         return draccus.encode(self)
 
     def _save_pretrained(self, save_directory: Path) -> None:
+        """Save the configuration to a directory.
+
+        Args:
+            save_directory: Directory path where the configuration will be saved.
+        """
         with open(save_directory / TRAIN_CONFIG_NAME, "w") as f, draccus.config_type("json"):
             draccus.dump(self, f, indent=4)
 
@@ -197,6 +304,38 @@ class TrainPipelineConfig(HubMixin):
         revision: str | None = None,
         **kwargs,
     ) -> "TrainPipelineConfig":
+        """Load a training configuration from a pretrained model or local path.
+
+        Args:
+            cls: The class to instantiate.
+            pretrained_name_or_path: Can be either:
+                - A string, the model id of a pretrained config hosted inside a model
+                  repo on huggingface.co.
+                - A path to a directory containing a configuration file saved using
+                  the `_save_pretrained` method.
+                - A path to a saved configuration JSON file.
+            force_download: Whether to force (re-)downloading the config files and
+                configuration from the HuggingFace Hub. Defaults to False.
+            resume_download: Whether to resume downloading the config files.
+                Defaults to None.
+            proxies: Dictionary of proxies to use for requests. Defaults to None.
+            token: The token to use as HTTP bearer authorization. If True, will use
+                the token generated when running `huggingface-cli login`. Defaults to None.
+            cache_dir: Path to a directory in which a downloaded pretrained model
+                configuration should be cached. Defaults to None.
+            local_files_only: Whether to only look at local files (i.e., do not try
+                to download the config). Defaults to False.
+            revision: The specific model version to use. It can be a branch name, a
+                tag name, or a commit id. Defaults to None.
+            **kwargs: Additional keyword arguments passed to the parser.
+
+        Returns:
+            An instance of TrainPipelineConfig loaded from the specified path.
+
+        Raises:
+            FileNotFoundError: If the configuration file is not found on the
+                HuggingFace Hub or in the local path.
+        """
         model_id = str(pretrained_name_or_path)
         config_file: str | None = None
         if Path(model_id).is_dir():

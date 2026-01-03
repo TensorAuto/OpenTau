@@ -14,9 +14,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-This file contains lists of available environments, dataset and policies to reflect the current state of LeRobot library.
-We do not want to import all the dependencies, but instead we keep it lightweight to ensure fast access to these variables.
+"""OpenTau package initialization and registry.
+
+This module provides lightweight access to available environments, datasets, and policies
+without importing heavy dependencies. It serves as the main entry point for discovering
+what components are available in the OpenTau library.
+
+The module maintains several key registries:
+- `available_envs`: List of supported environment types (e.g., "aloha", "pusht")
+- `available_tasks_per_env`: Mapping of environments to their available tasks
+- `available_datasets_per_env`: Mapping of environments to their compatible datasets
+- `available_real_world_datasets`: List of real-world robot datasets
+- `available_grounding_datasets`: Registry for grounding datasets (populated via decorator)
+- `available_policies`: List of available policy types (e.g., "pi0", "pi05", "value")
+- `available_policies_per_env`: Mapping of environments to their compatible policies
 
 Example:
     ```python
@@ -28,20 +39,17 @@ Example:
         print(opentau.available_real_world_datasets)
         print(opentau.available_policies)
         print(opentau.available_policies_per_env)
-        print(opentau.available_robots)
-        print(opentau.available_cameras)
-        print(opentau.available_motors)
     ```
 
-When implementing a new dataset loadable with LeRobotDataset follow these steps:
+When implementing a new dataset, follow these steps:
 - Update `available_datasets_per_env` in `src/opentau/__init__.py`
 
-When implementing a new environment (e.g. `gym_aloha`), follow these steps:
+When implementing a new environment (e.g., `gym_aloha`), follow these steps:
 - Update `available_tasks_per_env` and `available_datasets_per_env` in `src/opentau/__init__.py`
 
-When implementing a new policy class (e.g. `DiffusionPolicy`) follow these steps:
-- Update `available_policies` and `available_policies_per_env`, in `src/opentau/__init__.py`
-- Set the required `name` class attribute.
+When implementing a new policy class (e.g., `DiffusionPolicy`), follow these steps:
+- Update `available_policies` and `available_policies_per_env` in `src/opentau/__init__.py`
+- Set the required `name` class attribute
 - Update variables in `tests/test_available.py` by importing your new Policy class
 """
 

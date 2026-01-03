@@ -12,6 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Type definitions for configuration classes.
+
+This module provides type definitions used across configuration classes, including
+enumerations for feature types and normalization modes, as well as protocol
+definitions and dataclasses for policy features.
+"""
+
 # Note: We subclass str so that serialization is straightforward
 # https://stackoverflow.com/questions/24481852/serialising-an-enum-member-to-json
 from dataclasses import dataclass
@@ -20,6 +27,15 @@ from typing import Any, Protocol
 
 
 class FeatureType(str, Enum):
+    """Enumeration of feature types used in policy configurations.
+
+    Attributes:
+        STATE: Robot state features.
+        VISUAL: Visual/image features.
+        ENV: Environment state features.
+        ACTION: Action features.
+    """
+
     STATE = "STATE"
     VISUAL = "VISUAL"
     ENV = "ENV"
@@ -27,16 +43,40 @@ class FeatureType(str, Enum):
 
 
 class NormalizationMode(str, Enum):
+    """Enumeration of normalization modes for features.
+
+    Attributes:
+        MIN_MAX: Normalize using min-max scaling.
+        MEAN_STD: Normalize using mean and standard deviation.
+        IDENTITY: No normalization (identity transformation).
+    """
+
     MIN_MAX = "MIN_MAX"
     MEAN_STD = "MEAN_STD"
     IDENTITY = "IDENTITY"
 
 
 class DictLike(Protocol):
+    """Protocol for dictionary-like objects that support item access.
+
+    This protocol defines the interface for objects that can be accessed
+    using dictionary-style indexing with the `[]` operator.
+    """
+
     def __getitem__(self, key: Any) -> Any: ...
 
 
 @dataclass
 class PolicyFeature:
+    """Configuration for a policy feature.
+
+    This class describes a single feature used by a policy, including its
+    type and shape information.
+
+    Args:
+        type: The type of feature (STATE, VISUAL, ENV, or ACTION).
+        shape: The shape of the feature as a tuple.
+    """
+
     type: FeatureType
     shape: tuple

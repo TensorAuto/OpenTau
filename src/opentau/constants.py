@@ -12,7 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# keys
+"""Constants used throughout the OpenTau library.
+
+This module defines key constants for:
+- Observation and action keys used in datasets and environments
+- File and directory names for checkpoints, training state, and model storage
+- Cache directory configuration for HuggingFace Hub integration
+
+These constants ensure consistent naming conventions across the codebase and
+provide a centralized location for configuration values.
+"""
+
 import os
 from pathlib import Path
 

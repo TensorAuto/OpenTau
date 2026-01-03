@@ -1,6 +1,3 @@
-#!/usr/bin/env python
-
-# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
 # Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,11 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""To enable `opentau.__version__`"""
 
-from importlib.metadata import PackageNotFoundError, version
+"""Configuration module for OpenTau.
 
-try:
-    __version__ = version("opentau")
-except PackageNotFoundError:
-    __version__ = "unknown"
+This module provides configuration classes and utilities for training pipelines,
+datasets, policies, environments, and evaluation settings.
+"""

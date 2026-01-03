@@ -12,6 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Command-line argument parsing and configuration loading utilities.
+
+This module provides utilities for parsing command-line arguments, loading
+configuration files from local paths or the HuggingFace Hub, and handling
+plugin discovery and loading. It extends draccus functionality with support
+for path-based configuration loading and plugin system integration.
+"""
+
 import importlib
 import inspect
 import pkgutil
@@ -31,13 +39,31 @@ draccus.set_config_type("json")
 
 
 def get_cli_overrides(field_name: str, args: Sequence[str] | None = None) -> list[str] | None:
-    """Parses arguments from cli at a given nested attribute level.
+    """Parse arguments from CLI at a given nested attribute level.
 
-    For example, supposing the main script was called with:
-    python myscript.py --arg1=1 --arg2.subarg1=abc --arg2.subarg2=some/path
+    This function extracts command-line arguments that are nested under a specific
+    field name and returns them with the field name prefix removed.
 
-    If called during execution of myscript.py, get_cli_overrides("arg2") will return:
-    ["--subarg1=abc" "--subarg2=some/path"]
+    Args:
+        field_name: The field name to extract nested arguments for.
+        args: Sequence of command-line arguments to parse. If None, uses sys.argv[1:].
+            Defaults to None.
+
+    Returns:
+        List of denested arguments with the field name prefix removed, or None if
+        no matching arguments are found.
+
+    Example:
+        Supposing the main script was called with:
+        ```
+        python myscript.py --arg1=1 --arg2.subarg1=abc --arg2.subarg2=some/path
+        ```
+
+        If called during execution of myscript.py, `get_cli_overrides("arg2")` will
+        return:
+        ```
+        ["--subarg1=abc", "--subarg2=some/path"]
+        ```
     """
     if args is None:
         args = sys.argv[1:]
@@ -53,6 +79,22 @@ def get_cli_overrides(field_name: str, args: Sequence[str] | None = None) -> lis
 
 
 def parse_arg(arg_name: str, args: Sequence[str] | None = None) -> str | None:
+    """Parse a single command-line argument value.
+
+    Args:
+        arg_name: Name of the argument to parse (without the '--' prefix).
+        args: Sequence of command-line arguments to parse. If None, uses sys.argv[1:].
+            Defaults to None.
+
+    Returns:
+        The value of the argument if found, or None if not found.
+
+    Example:
+        For command-line arguments `['--batch_size=32', '--lr=0.001']`:
+        - `parse_arg('batch_size')` returns `'32'`
+        - `parse_arg('lr')` returns `'0.001'`
+        - `parse_arg('missing')` returns `None`
+    """
     if args is None:
         args = sys.argv[1:]
     prefix = f"--{arg_name}="
@@ -143,33 +185,86 @@ def load_plugin(plugin_path: str) -> None:
 
 
 def get_path_arg(field_name: str, args: Sequence[str] | None = None) -> str | None:
+    """Get the path argument for a given field name.
+
+    This function extracts the path argument for a field, which is typically
+    specified as `--field_name.path=some/path`.
+
+    Args:
+        field_name: The field name to get the path argument for.
+        args: Sequence of command-line arguments to parse. If None, uses sys.argv[1:].
+            Defaults to None.
+
+    Returns:
+        The path value if found, or None if not found.
+
+    Example:
+        For `--policy.path=/path/to/config`, `get_path_arg('policy')` returns
+        `'/path/to/config'`.
+    """
     return parse_arg(f"{field_name}.{PATH_KEY}", args)
 
 
 def get_type_arg(field_name: str, args: Sequence[str] | None = None) -> str | None:
+    """Get the type argument for a given field name.
+
+    This function extracts the type argument for a field, which is typically
+    specified as `--field_name.type=SomeType`.
+
+    Args:
+        field_name: The field name to get the type argument for.
+        args: Sequence of command-line arguments to parse. If None, uses sys.argv[1:].
+            Defaults to None.
+
+    Returns:
+        The type value if found, or None if not found.
+
+    Example:
+        For `--policy.type=Pi0Config`, `get_type_arg('policy')` returns `'Pi0Config'`.
+    """
     return parse_arg(f"{field_name}.{draccus.CHOICE_TYPE_KEY}", args)
 
 
 def filter_arg(field_to_filter: str, args: Sequence[str] | None = None) -> list[str]:
+    """Filter out arguments matching a specific field name.
+
+    Args:
+        field_to_filter: The field name to filter out (without the '--' prefix).
+        args: Sequence of command-line arguments to filter. If None, uses sys.argv[1:].
+            Defaults to None.
+
+    Returns:
+        List of arguments with the specified field filtered out.
+
+    Example:
+        For `['--batch_size=32', '--lr=0.001', '--batch_size=64']`:
+        `filter_arg('batch_size')` returns `['--lr=0.001']`.
+    """
+    if args is None:
+        args = sys.argv[1:]
     return [arg for arg in args if not arg.startswith(f"--{field_to_filter}=")]
 
 
 def filter_path_args(fields_to_filter: str | list[str], args: Sequence[str] | None = None) -> list[str]:
-    """
-    Filters command-line arguments related to fields with specific path arguments.
+    """Filter command-line arguments related to fields with specific path arguments.
+
+    This function removes all arguments related to specified fields when a path
+    argument is present for those fields. It also validates that path and type
+    arguments are not both specified for the same field.
 
     Args:
-        fields_to_filter (str | list[str]): A single str or a list of str whose arguments need to be filtered.
-        args (Sequence[str] | None): The sequence of command-line arguments to be filtered.
-            Defaults to None.
+        fields_to_filter: A single field name or a list of field names whose
+            arguments need to be filtered.
+        args: The sequence of command-line arguments to be filtered. If None,
+            uses sys.argv[1:]. Defaults to None.
 
     Returns:
-        list[str]: A filtered list of arguments, with arguments related to the specified
+        A filtered list of arguments, with arguments related to the specified
         fields removed.
 
     Raises:
-        ArgumentError: If both a path argument (e.g., `--field_name.path`) and a type
-            argument (e.g., `--field_name.type`) are specified for the same field.
+        ArgumentError: If both a path argument (e.g., `--field_name.path`) and a
+            type argument (e.g., `--field_name.type`) are specified for the same field.
     """
     if isinstance(fields_to_filter, str):
         fields_to_filter = [fields_to_filter]
@@ -188,17 +283,22 @@ def filter_path_args(fields_to_filter: str | list[str], args: Sequence[str] | No
 
 
 def filter_distributed_args(args: Sequence[str] | None = None) -> list[str]:
-    """
-    Filters out distributed training arguments that are automatically injected by
-    distributed training frameworks (e.g., DeepSpeed, torchrun) but not recognized
-    by the custom argument parser.
+    """Filter out distributed training arguments.
+
+    This function removes arguments that are automatically injected by distributed
+    training frameworks (e.g., DeepSpeed, torchrun) but not recognized by the
+    custom argument parser.
 
     Args:
-        args (Sequence[str] | None): The sequence of command-line arguments to be filtered.
-            Defaults to None.
+        args: The sequence of command-line arguments to be filtered. If None,
+            uses sys.argv[1:]. Defaults to None.
 
     Returns:
-        list[str]: A filtered list of arguments with distributed training arguments removed.
+        A filtered list of arguments with distributed training arguments removed.
+
+    Note:
+        Filtered arguments include: local_rank, node_rank, master_addr, master_port,
+        world_size, and rank.
     """
     if args is None:
         args = sys.argv[1:]
@@ -232,14 +332,27 @@ def filter_distributed_args(args: Sequence[str] | None = None) -> list[str]:
 
 
 def wrap(config_path: Path | None = None):
-    """
-    HACK: Similar to draccus.wrap but does three additional things:
-        - Will remove '.path' arguments from CLI in order to process them later on.
-        - If a 'config_path' is passed and the main config class has a 'from_pretrained' method, will
-          initialize it from there to allow to fetch configs from the hub directly
-        - Will load plugins specified in the CLI arguments. These plugins will typically register
-            their own subclasses of config classes, so that draccus can find the right class to instantiate
-            from the CLI '.type' arguments
+    """Wrap a function to handle configuration parsing with enhanced features.
+
+    This decorator is similar to `draccus.wrap` but provides three additional features:
+    1. Removes '.path' arguments from CLI to process them later
+    2. If a 'config_path' is passed and the main config class has a 'from_pretrained'
+       method, initializes it from there to allow fetching configs from the hub directly
+    3. Loads plugins specified in CLI arguments. These plugins typically register
+       their own subclasses of config classes, so that draccus can find the right
+       class to instantiate from the CLI '.type' arguments
+
+    Args:
+        config_path: Optional path to a configuration file. If provided and the
+            config class supports `from_pretrained`, will load from this path.
+            Defaults to None.
+
+    Returns:
+        A decorator function that wraps the target function with enhanced configuration
+        parsing capabilities.
+
+    Note:
+        This is a HACK wrapper around draccus.wrap to add custom functionality.
     """
 
     def wrapper_outer(fn):
