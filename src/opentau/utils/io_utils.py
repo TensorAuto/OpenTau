@@ -14,6 +14,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Utilities for file I/O operations.
+
+This module provides functions for reading and writing JSON files, saving videos,
+and deserializing JSON data into structured objects with type checking.
+"""
+
 import json
 import warnings
 from pathlib import Path
@@ -25,7 +31,14 @@ JsonLike = str | int | float | bool | None | list["JsonLike"] | dict[str, "JsonL
 T = TypeVar("T", bound=JsonLike)
 
 
-def write_video(video_path, stacked_frames, fps):
+def write_video(video_path: str | Path, stacked_frames: list, fps: float) -> None:
+    """Write a list of frames to a video file.
+
+    Args:
+        video_path: Path where the video file will be saved.
+        stacked_frames: List of image frames to write.
+        fps: Frames per second for the output video.
+    """
     # Filter out DeprecationWarnings raised from pkg_resources
     with warnings.catch_warnings():
         warnings.filterwarnings(
@@ -35,11 +48,23 @@ def write_video(video_path, stacked_frames, fps):
 
 
 def deserialize_json_into_object(fpath: Path, obj: T) -> T:
-    """
-    Loads the JSON data from `fpath` and recursively fills `obj` with the
+    """Load JSON data and recursively fill an object with matching structure.
+
+    Loads the JSON data from fpath and recursively fills obj with the
     corresponding values (strictly matching structure and types).
-    Tuples in `obj` are expected to be lists in the JSON data, which will be
+    Tuples in obj are expected to be lists in the JSON data, which will be
     converted back into tuples.
+
+    Args:
+        fpath: Path to the JSON file to load.
+        obj: Template object with the desired structure and types.
+
+    Returns:
+        Object with the same structure as obj, filled with values from the JSON file.
+
+    Raises:
+        TypeError: If structure or types don't match between JSON and obj.
+        ValueError: If dictionary keys or list/tuple lengths don't match.
     """
     with open(fpath, encoding="utf-8") as f:
         data = json.load(f)

@@ -14,6 +14,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Utilities for benchmarking and timing code execution.
+
+This module provides the TimeBenchmark class for measuring execution time
+using context managers or decorators in a thread-safe manner.
+"""
+
 import threading
 import time
 from contextlib import ContextDecorator

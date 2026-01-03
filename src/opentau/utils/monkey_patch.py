@@ -42,8 +42,16 @@ __patches_applied = set()
 
 
 def _run_once_only(func):
-    r"""A decorator that ensures the function is run once only, even if called multiple times.
-    Subsequent calls to the function will return immediately without executing the function body again.
+    """Decorator that ensures the function is run once only.
+
+    Subsequent calls to the function will return immediately without executing
+    the function body again.
+
+    Args:
+        func: Function to be wrapped.
+
+    Returns:
+        Wrapped function that executes only once.
     """
 
     @wraps(func)
@@ -59,14 +67,20 @@ def _run_once_only(func):
 
 
 def patches_applied():
-    r"""Returns a list of all patches that have been applied."""
+    """Get a list of all patches that have been applied.
+
+    Returns:
+        List of patch function names that have been applied.
+    """
     return [func.__name__ for func in __patches_applied]
 
 
 @_run_once_only
 def torch_cumsum_patch():
-    r"""Overrides the default `torch.cumsum` to handle bool tensors correctly.
+    """Override torch.cumsum to handle bool tensors correctly.
+
     PyTorch allows cumsum on bool tensors, but ONNX Runtime does not.
+    This patch converts bool tensors to int64 before calling cumsum.
     """
     original_cumsum = torch.cumsum
 
@@ -80,7 +94,11 @@ def torch_cumsum_patch():
 
 @_run_once_only
 def torch_pow_patch():
-    r"""Overrides the default `torch.pow` to ensure that both base and exponent are tensors."""
+    """Override torch.pow to ensure both base and exponent are tensors.
+
+    This patch converts scalar arguments to tensors before calling pow,
+    ensuring compatibility with ONNX export.
+    """
     original_pow = torch.pow
 
     def _patched_pow(base, exponent, *args, **kwargs):
@@ -99,7 +117,11 @@ def torch_pow_patch():
 
 @_run_once_only
 def torch_full_patch():
-    r"""Overrides the default torch.full to ensure that True/False are converted to 1/0 before reaching C++ level."""
+    """Override torch.full to convert bool fill values to int.
+
+    This patch ensures that True/False are converted to 1/0 before reaching
+    the C++ level, improving compatibility with certain backends.
+    """
     original_full = torch.full
 
     def _patched_full(size, fill_value, *args, **kwargs):
@@ -112,8 +134,11 @@ def torch_full_patch():
 
 @_run_once_only
 def torch_fake_tensor_module_to_patch():
-    r"""Without this, `torch.nn.Module.to(device)` is a no-op in FakeTensorMode, leading to device mismatch.
-    PyTorch team promised to fix in Feb 2024, but there's little development on this issue ever since.
+    """Fix torch.nn.Module.to(device) behavior in FakeTensorMode.
+
+    Without this patch, Module.to(device) is a no-op in FakeTensorMode, leading
+    to device mismatch errors. This patch enables proper device conversion.
+
     See https://github.com/pytorch/pytorch/issues/119665 for more details.
     """
     torch.__future__.set_overwrite_module_params_on_conversion(True)
@@ -121,8 +146,11 @@ def torch_fake_tensor_module_to_patch():
 
 @_run_once_only
 def torch_fake_tensor_to_numpy_patch():
-    r"""This allows .numpy() call on FakeTensor to return a numpy array with random values.
-    Calling .numpy() multiple times on the same FakeTensor may return different values.
+    """Enable .numpy() calls on FakeTensor to return random numpy arrays.
+
+    This patch allows .numpy() to be called on FakeTensor instances, returning
+    numpy arrays with random values. Note that calling .numpy() multiple times
+    on the same FakeTensor may return different values.
     """
     _torch2np = {
         torch.float32: np.float32,
@@ -158,7 +186,11 @@ def torch_fake_tensor_to_numpy_patch():
 
 @_run_once_only
 def torch_fake_tensor_beta_validate_args_patch():
-    r"""torch.distributions.Beta doesn't work without validate_args=True in FakeTensorMode."""
+    """Fix torch.distributions.Beta to work in FakeTensorMode.
+
+    This patch sets validate_args=False by default for Beta distributions,
+    which is required for FakeTensorMode compatibility.
+    """
     original_beta_init = torch.distributions.Beta.__init__
 
     def _patched_beta_init(self, *args, **kwargs):
@@ -170,6 +202,11 @@ def torch_fake_tensor_beta_validate_args_patch():
 
 @_run_once_only
 def torch_fake_tensor_is_inf_patch():
+    """Patch torch.isinf to work with FakeTensor.
+
+    This patch provides a mock implementation of torch.isinf that returns
+    a mock object compatible with FakeTensor operations.
+    """
     from unittest.mock import Mock
 
     def _patched_isinf(x):
@@ -185,8 +222,10 @@ def torch_fake_tensor_is_inf_patch():
 
 @_run_once_only
 def gym_is_gymnasium_patch():
-    r"""Monkey patch to ensure that `import gym` is equivalent to `import gymnasium as gym` in LIBERO code.
-    This is necessary because gym is incompatible with numpy >= 2.0
+    """Monkey patch to make `import gym` equivalent to `import gymnasium as gym`.
+
+    This patch is necessary because the original gym package is incompatible
+    with numpy >= 2.0. It redirects gym imports to use gymnasium instead.
     """
     _g = importlib.import_module("gymnasium")
     sys.modules.setdefault("gym", _g)
@@ -221,7 +260,12 @@ def gym_is_gymnasium_patch():
 
 @_run_once_only
 def torch_load_patch():
-    r"""Overrides the default `torch.load` to handle `weights_only` argument."""
+    """Override torch.load to handle weights_only argument.
+
+    This patch ensures that torch.load properly handles the weights_only
+    argument for PyTorch versions >= 2.6, setting it to False by default
+    if not explicitly provided.
+    """
     if torch.__version__ < "2.6":
         return
 

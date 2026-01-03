@@ -14,15 +14,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Utilities for tracking and logging training metrics.
+
+This module provides classes for tracking metrics during training, including
+AverageMeter for computing running averages and MetricsTracker for managing
+multiple metrics with step tracking.
+"""
+
 from typing import Any
 
 from opentau.utils.utils import format_big_number
 
 
 class AverageMeter:
-    """
-    Computes and stores the average and current value
+    """Computes and stores the average and current value.
+
     Adapted from https://github.com/pytorch/examples/blob/main/imagenet/main.py
+
+    Args:
+        name: Name of the metric being tracked.
+        fmt: Format string for displaying the average value. Defaults to ":f".
     """
 
     def __init__(self, name: str, fmt: str = ":f"):
@@ -31,12 +42,19 @@ class AverageMeter:
         self.reset()
 
     def reset(self) -> None:
+        """Reset all accumulated statistics to zero."""
         self.val = 0.0
         self.avg = 0.0
         self.sum = 0.0
         self.count = 0.0
 
     def update(self, val: float, n: int = 1) -> None:
+        """Update the meter with a new value.
+
+        Args:
+            val: New value to add.
+            n: Number of samples this value represents. Defaults to 1.
+        """
         self.val = val
         self.sum += val * n
         self.count += n
@@ -89,6 +107,14 @@ class MetricsTracker:
         metrics: dict[str, AverageMeter],
         initial_step: int = 0,
     ):
+        """Initialize the metrics tracker.
+
+        Args:
+            batch_size: Number of samples per gradient update.
+            metrics: Dictionary of metric names to AverageMeter instances.
+            initial_step: Starting step number (useful when resuming training).
+                Defaults to 0.
+        """
         self.__dict__.update(dict.fromkeys(self.__keys__))
         # This is the actual batch size, i.e., number of samples used to compute a gradient update;
         #   not to be confused with number of dataloader_batch_size.
@@ -135,8 +161,14 @@ class MetricsTracker:
         return " ".join(display_list)
 
     def to_dict(self, use_avg: bool = True) -> dict[str, int | float]:
-        """
-        Returns the current metric values (or averages if `use_avg=True`) as a dict.
+        """Convert current metrics to a dictionary.
+
+        Args:
+            use_avg: If True, use average values; otherwise use current values.
+                Defaults to True.
+
+        Returns:
+            Dictionary containing steps, samples, and all metric values.
         """
         return {
             "steps": self.steps,

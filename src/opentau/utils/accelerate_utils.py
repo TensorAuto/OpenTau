@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Utilities for managing Accelerate accelerator instances.
+
+This module provides functions for setting and getting a global accelerator
+instance, which is useful for accessing accelerator state throughout the codebase.
+"""
 
 import warnings
 
@@ -19,7 +24,18 @@ from accelerate import Accelerator
 _acc: Accelerator | None = None
 
 
-def set_proc_accelerator(accelerator: Accelerator, allow_reset=False) -> None:
+def set_proc_accelerator(accelerator: Accelerator, allow_reset: bool = False) -> None:
+    """Set the global accelerator instance for the current process.
+
+    Args:
+        accelerator: Accelerator instance to set.
+        allow_reset: If True, allow resetting an already-set accelerator.
+            Defaults to False.
+
+    Raises:
+        AssertionError: If accelerator is not an Accelerator instance.
+        RuntimeError: If accelerator is already set and allow_reset is False.
+    """
     global _acc
 
     assert isinstance(accelerator, Accelerator), (
@@ -38,10 +54,24 @@ def set_proc_accelerator(accelerator: Accelerator, allow_reset=False) -> None:
 
 
 def get_proc_accelerator() -> Accelerator:
+    """Get the global accelerator instance for the current process.
+
+    Returns:
+        The accelerator instance, or None if not set.
+    """
     return _acc
 
 
-def acc_print(*args, **kwargs):
+def acc_print(*args, **kwargs) -> None:
+    """Print with process index prefix when using accelerate.
+
+    If an accelerator is set, prints with a prefix showing the process index.
+    Otherwise, prints normally.
+
+    Args:
+        *args: Positional arguments to pass to print.
+        **kwargs: Keyword arguments to pass to print.
+    """
     acc = get_proc_accelerator()
     if acc is None:
         print(*args, **kwargs)

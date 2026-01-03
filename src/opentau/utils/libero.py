@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Utilities for working with the LIBERO robotics environment.
+
+This module provides functions for converting LIBERO observations to PyTorch tensors,
+summarizing LIBERO evaluation results, and recording observations from LIBERO environments.
+"""
+
 import logging
 from pathlib import Path
 
@@ -23,12 +29,30 @@ from robosuite.utils.transform_utils import quat2axisangle
 
 
 def rotate_numpy_image(image: np.ndarray) -> np.ndarray:
+    """Rotate and normalize a numpy image array.
+
+    Args:
+        image: Input image array in HWC format with values in [0, 255].
+
+    Returns:
+        Rotated and normalized image array in CHW format with values in [0, 1].
+    """
     image = image.astype(float) / 255.0
     image = np.rot90(image, 2)
     return rearrange(image, "H W C -> C H W")
 
 
 def _libero2np(obs: dict[str, np.ndarray], cfg) -> dict[str, str | np.ndarray]:
+    """Convert LIBERO observation dictionary to numpy format.
+
+    Args:
+        obs: LIBERO observation dictionary containing robot state and images.
+        cfg: Configuration object with task language, state dimensions, etc.
+
+    Returns:
+        Dictionary with converted observations in numpy format, including camera
+        images, state, prompt, and padding flags.
+    """
     eef_pos = obs["robot0_eef_pos"]
     eef_angle = quat2axisangle(obs["robot0_eef_quat"])
     gripper_pos = obs["robot0_gripper_qpos"]
@@ -51,6 +75,20 @@ def _libero2np(obs: dict[str, np.ndarray], cfg) -> dict[str, str | np.ndarray]:
 def _np2torch(
     np_input: dict[str, str | np.ndarray], device: str, dtype: torch.dtype
 ) -> dict[str, str | torch.Tensor]:
+    """Convert numpy arrays in dictionary to PyTorch tensors.
+
+    Args:
+        np_input: Dictionary containing numpy arrays and strings.
+        device: Target device for tensors (e.g., 'cuda', 'cpu').
+        dtype: Target dtype for floating point tensors.
+
+    Returns:
+        Dictionary with numpy arrays converted to PyTorch tensors on the
+        specified device. String values are preserved as-is.
+
+    Raises:
+        TypeError: If a value type is not supported (not str or np.ndarray).
+    """
     torch_input = {}
     for k, v in np_input.items():
         if isinstance(v, str):
@@ -69,13 +107,36 @@ def _np2torch(
 def libero2torch(
     obs: dict[str, np.ndarray], cfg, device: str, dtype: torch.dtype
 ) -> dict[str, str | torch.Tensor]:
-    r"""Convert Libero observation to PyTorch tensors."""
+    """Convert LIBERO observation to PyTorch tensors.
+
+    Args:
+        obs: LIBERO observation dictionary containing robot state and images.
+        cfg: Configuration object with task language, state dimensions, etc.
+        device: Target device for tensors (e.g., 'cuda', 'cpu').
+        dtype: Target dtype for floating point tensors.
+
+    Returns:
+        Dictionary with observations converted to PyTorch tensors on the
+        specified device, including camera images, state, prompt, and padding flags.
+    """
     np_input = _libero2np(obs, cfg)
     torch_input = _np2torch(np_input, device, dtype)
     return torch_input
 
 
 def summarize_libero_results(results: list[int]) -> dict:
+    """Summarize LIBERO evaluation results.
+
+    Args:
+        results: List of integer results where:
+            - Positive values indicate success (number of steps taken).
+            - -1 indicates failure.
+            - -2 indicates crash.
+
+    Returns:
+        Dictionary containing summary statistics including success/failure/crash
+        rates, counts, indices, and average steps taken for successful episodes.
+    """
     if not results:
         return {"message": "No results to summarize."}
 
@@ -105,8 +166,20 @@ def summarize_libero_results(results: list[int]) -> dict:
     }
 
 
-# This is not multi-processing safe, so every process should use a different (folder, camera_name) pair.
 class LiberoObservationRecorder:
+    """Context manager for recording LIBERO observations to video files.
+
+    This class is not multi-processing safe. Each process should use a different
+    (folder, camera_name) pair.
+
+    Args:
+        folder: Directory path where video files will be saved. If None, recording
+            is disabled.
+        camera_names: List of camera names to record. If None, no cameras are recorded.
+        fps: Frames per second for the output videos. Defaults to 10.
+        extension: Video file extension. Defaults to "mp4".
+    """
+
     def __init__(self, folder, camera_names=None, fps=10, extension="mp4"):
         if folder is None:
             logging.debug("No folder specified for video recording. Skipping.")
@@ -125,6 +198,11 @@ class LiberoObservationRecorder:
         return self
 
     def record(self, obs):
+        """Record a single observation frame.
+
+        Args:
+            obs: Observation dictionary containing camera images keyed by camera name.
+        """
         for writer, camera in zip(self.writers, self.camera_names, strict=True):
             writer.append_data(np.rot90(obs[camera], k=2))
 

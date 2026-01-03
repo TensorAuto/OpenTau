@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Utilities for working with PyTorch FakeTensor.
+
+This module provides a FakeTensorContext class and decorator for running code
+with FakeTensor mode enabled, which is useful for shape inference and testing
+without actual tensor computations.
+"""
 
 import functools
 
@@ -30,6 +36,16 @@ _shared_shape_env = ShapeEnv()
 
 
 class FakeTensorContext:
+    """Context manager for enabling FakeTensor mode with necessary patches.
+
+    This context manager applies all necessary monkey patches for FakeTensor
+    compatibility and manages the FakeTensorMode lifecycle.
+
+    Args:
+        allow_non_fake_inputs: If True, allow non-fake tensors as inputs.
+            Defaults to True.
+    """
+
     def __init__(self, allow_non_fake_inputs: bool = True):
         self.mode = FakeTensorMode(
             shape_env=_shared_shape_env,
@@ -48,7 +64,14 @@ class FakeTensorContext:
 
 
 def run_with_fake_tensor(fn):
-    r"""Decorator to run a function with FakeTensor enabled."""
+    """Decorator to run a function with FakeTensor enabled.
+
+    Args:
+        fn: Function to wrap.
+
+    Returns:
+        Wrapped function that runs with FakeTensorContext enabled.
+    """
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
