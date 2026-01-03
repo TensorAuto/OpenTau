@@ -14,6 +14,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""General utility functions for device management, logging, and common operations.
+
+This module provides utilities for device selection, logging initialization,
+number formatting, platform-specific operations, and various helper functions
+used throughout the OpenTau codebase.
+"""
 
 import enum
 import inspect
@@ -25,21 +31,29 @@ from copy import copy
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timezone
 from functools import wraps
-from typing import Callable
+from typing import Any, Callable
 
 import accelerate
 import numpy as np
 import torch
 
 
-def inside_slurm():
-    """Check whether the python process was launched through slurm"""
+def inside_slurm() -> bool:
+    """Check whether the Python process was launched through SLURM.
+
+    Returns:
+        True if the process is running in a SLURM environment, False otherwise.
+    """
     # TODO(rcadene): return False for interactive mode `--pty bash`
     return "SLURM_JOB_ID" in os.environ
 
 
-def auto_torch_device():
-    """Automatically select the best available torch device."""
+def auto_torch_device() -> torch.device:
+    """Automatically select the best available torch device.
+
+    Returns:
+        torch.device instance. Priority: CUDA > MPS > CPU.
+    """
     if torch.cuda.is_available():
         return torch.device("cuda")
     if torch.backends.mps.is_available():
@@ -68,9 +82,18 @@ def get_safe_torch_device(try_device: str, log: bool = False, accelerator: Calla
     return device
 
 
-def get_safe_dtype(dtype: torch.dtype, device: str | torch.device):
-    """
-    mps is currently not compatible with float64
+def get_safe_dtype(dtype: torch.dtype, device: str | torch.device) -> torch.dtype:
+    """Get a dtype that is compatible with the given device.
+
+    MPS is currently not compatible with float64, so this function converts
+    float64 to float32 for MPS devices.
+
+    Args:
+        dtype: Desired dtype.
+        device: Target device (string or torch.device).
+
+    Returns:
+        Compatible dtype for the device.
     """
     if isinstance(device, torch.device):
         device = device.type
@@ -81,6 +104,17 @@ def get_safe_dtype(dtype: torch.dtype, device: str | torch.device):
 
 
 def is_torch_device_available(try_device: str) -> bool:
+    """Check if a torch device is available.
+
+    Args:
+        try_device: Device name to check ('cuda', 'mps', or 'cpu').
+
+    Returns:
+        True if the device is available, False otherwise.
+
+    Raises:
+        ValueError: If try_device is not one of the recognized device types.
+    """
     if try_device == "cuda":
         return torch.cuda.is_available()
     elif try_device == "mps":
@@ -91,7 +125,18 @@ def is_torch_device_available(try_device: str) -> bool:
         raise ValueError(f"Unknown device '{try_device}.")
 
 
-def is_amp_available(device: str):
+def is_amp_available(device: str) -> bool:
+    """Check if automatic mixed precision (AMP) is available for a device.
+
+    Args:
+        device: Device name to check ('cuda', 'mps', or 'cpu').
+
+    Returns:
+        True if AMP is available for the device, False otherwise.
+
+    Raises:
+        ValueError: If device is not one of the recognized device types.
+    """
     if device in ["cuda", "cpu"]:
         return True
     elif device == "mps":
@@ -111,7 +156,18 @@ def _format_stack(stack: list[inspect.FrameInfo]) -> str:
     )
 
 
-def init_logging(accelerator: accelerate.Accelerator | None = None, level=logging.INFO):
+def init_logging(accelerator: accelerate.Accelerator | None = None, level=logging.INFO) -> None:
+    """Initialize logging configuration with custom formatter.
+
+    This function sets up logging with a custom formatter that includes
+    timestamp, filename, and line number. It can only be initialized once
+    per process and will warn if called multiple times.
+
+    Args:
+        accelerator: Optional Accelerator instance. If provided, logging level
+            is set to WARNING on non-main processes to avoid duplicate logs.
+        level: Logging level to use. Defaults to logging.INFO.
+    """
     global _logging_init_stack
     stack = inspect.stack()
 
@@ -143,7 +199,16 @@ def init_logging(accelerator: accelerate.Accelerator | None = None, level=loggin
         logging.getLogger().setLevel(logging.WARNING)
 
 
-def format_big_number(num, precision=0):
+def format_big_number(num: float | int, precision: int = 0) -> str:
+    """Format a large number with appropriate suffix (K, M, B, T, Q).
+
+    Args:
+        num: Number to format.
+        precision: Number of decimal places. Defaults to 0.
+
+    Returns:
+        Formatted string with suffix (e.g., "1.5K", "2.3M").
+    """
     suffixes = ["", "K", "M", "B", "T", "Q"]
     divisor = 1000.0
 
@@ -155,11 +220,23 @@ def format_big_number(num, precision=0):
     return num
 
 
-def capture_timestamp_utc():
+def capture_timestamp_utc() -> datetime:
+    """Capture the current UTC timestamp.
+
+    Returns:
+        datetime object representing the current UTC time.
+    """
     return datetime.now(timezone.utc)
 
 
-def say(text, blocking=False):
+def say(text: str, blocking: bool = False) -> None:
+    """Use text-to-speech to speak text (platform-specific).
+
+    Args:
+        text: Text to speak.
+        blocking: If True, wait for speech to complete before returning.
+            Defaults to False.
+    """
     # Check if mac, linux, or windows.
     if platform.system() == "Darwin":
         cmd = f'say "{text}"'
@@ -179,7 +256,14 @@ def say(text, blocking=False):
     os.system(cmd)  # nosec: B605
 
 
-def log_say(text, play_sounds, blocking=False):
+def log_say(text: str, play_sounds: bool, blocking: bool = False) -> None:
+    """Log text and optionally speak it using text-to-speech.
+
+    Args:
+        text: Text to log and optionally speak.
+        play_sounds: If True, also speak the text using text-to-speech.
+        blocking: If True, wait for speech to complete. Defaults to False.
+    """
     logging.info(text)
 
     if play_sounds:
@@ -187,6 +271,17 @@ def log_say(text, play_sounds, blocking=False):
 
 
 def get_channel_first_image_shape(image_shape: tuple) -> tuple:
+    """Convert image shape from HWC to CHW format if needed.
+
+    Args:
+        image_shape: Image shape tuple, either (H, W, C) or (C, H, W).
+
+    Returns:
+        Image shape in CHW format (C, H, W).
+
+    Raises:
+        ValueError: If the input shape is not in a recognized format.
+    """
     shape = copy(image_shape)
     if shape[2] < shape[0] and shape[2] < shape[1]:  # (h, w, c) -> (c, h, w)
         shape = (shape[2], shape[0], shape[1])
@@ -197,12 +292,26 @@ def get_channel_first_image_shape(image_shape: tuple) -> tuple:
 
 
 def has_method(cls: object, method_name: str) -> bool:
+    """Check if a class or object has a specific method.
+
+    Args:
+        cls: Class or object to check.
+        method_name: Name of the method to check for.
+
+    Returns:
+        True if the method exists and is callable, False otherwise.
+    """
     return hasattr(cls, method_name) and callable(getattr(cls, method_name))
 
 
 def is_valid_numpy_dtype_string(dtype_str: str) -> bool:
-    """
-    Return True if a given string can be converted to a numpy dtype.
+    """Check if a string can be converted to a numpy dtype.
+
+    Args:
+        dtype_str: String to check.
+
+    Returns:
+        True if the string is a valid numpy dtype, False otherwise.
     """
     try:
         # Attempt to convert the string to a numpy dtype
@@ -214,13 +323,27 @@ def is_valid_numpy_dtype_string(dtype_str: str) -> bool:
 
 
 def is_launched_with_accelerate() -> bool:
+    """Check if the process was launched with accelerate.
+
+    Returns:
+        True if ACCELERATE_MIXED_PRECISION is in the environment, False otherwise.
+    """
     return "ACCELERATE_MIXED_PRECISION" in os.environ
 
 
 def attempt_torch_compile(fn: callable, device_hint=None) -> callable:
-    r"""Attempt to compile a PyTorch function using `torch.compile`.
-    The argument `device_hint` is used to check if torch.compile works reliably on the device.
-    Compilation is skipped if the device is MPS (Metal Performance Shaders) as it is experimental.
+    """Attempt to compile a PyTorch function using torch.compile.
+
+    The argument device_hint is used to check if torch.compile works reliably
+    on the device. Compilation is skipped if the device is MPS (Metal Performance
+    Shaders) as it is experimental.
+
+    Args:
+        fn: Function to compile.
+        device_hint: Optional device hint to check compatibility.
+
+    Returns:
+        Compiled function if compilation succeeds, otherwise the original function.
     """
     if device_hint and "mps" in str(device_hint):
         logging.warning("torch.compile is experimental on MPS devices. Compilation skipped.")
@@ -243,6 +366,18 @@ def attempt_torch_compile(fn: callable, device_hint=None) -> callable:
 
 
 def create_dummy_observation(cfg, device, dtype=torch.bfloat16) -> dict:
+    """Create a dummy observation dictionary for testing or initialization.
+
+    Args:
+        cfg: Configuration object with num_cams, resolution, max_state_dim,
+            and action_chunk attributes.
+        device: Device to create tensors on.
+        dtype: Data type for tensors. Defaults to torch.bfloat16.
+
+    Returns:
+        Dictionary containing dummy camera observations, state, prompt, and
+        padding flags.
+    """
     camera_observations = {
         f"camera{i}": torch.zeros((1, 3, *cfg.resolution), dtype=dtype, device=device)
         for i in range(cfg.num_cams)
@@ -256,8 +391,15 @@ def create_dummy_observation(cfg, device, dtype=torch.bfloat16) -> dict:
     }
 
 
-def encode_accelerator_state_dict(obj):
-    """Encodes an object into a json/yaml-compatible primitive type."""
+def encode_accelerator_state_dict(obj) -> Any:
+    """Encode an object into a JSON/YAML-compatible primitive type.
+
+    Args:
+        obj: Object to encode (can be Enum, dict, list, tuple, dataclass, etc.).
+
+    Returns:
+        Encoded object with all nested structures converted to primitives.
+    """
     if isinstance(obj, enum.Enum):
         return encode_accelerator_state_dict(obj.value)
     elif isinstance(obj, (str, int, float, bool)) or obj is None:

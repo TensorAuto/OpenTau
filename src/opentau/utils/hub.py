@@ -12,6 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Utilities for interacting with the Hugging Face Hub.
+
+This module provides the HubMixin class which enables objects to be saved to
+and loaded from the Hugging Face Hub, similar to ModelHubMixin but with fewer
+assumptions about the object type.
+"""
 
 from pathlib import Path
 from tempfile import TemporaryDirectory

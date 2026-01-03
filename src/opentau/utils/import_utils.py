@@ -14,14 +14,33 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Utilities for checking package availability and versions.
+
+This module provides functions to check if packages are installed and optionally
+retrieve their versions without importing them, which is useful for conditional
+imports and dependency checking.
+"""
+
 import importlib
 import logging
 
 
 def is_package_available(pkg_name: str, return_version: bool = False) -> tuple[bool, str] | bool:
-    """Copied from https://github.com/huggingface/transformers/blob/main/src/transformers/utils/import_utils.py
-    Check if the package spec exists and grab its version to avoid importing a local directory.
-    **Note:** this doesn't work for all packages.
+    """Check if a package is available and optionally return its version.
+
+    Copied from https://github.com/huggingface/transformers/blob/main/src/transformers/utils/import_utils.py
+
+    This function checks if the package spec exists and grabs its version to
+    avoid importing a local directory. Note: this doesn't work for all packages.
+
+    Args:
+        pkg_name: Name of the package to check.
+        return_version: If True, return a tuple of (available, version).
+            If False, return only the availability boolean. Defaults to False.
+
+    Returns:
+        If return_version is False, returns a boolean indicating availability.
+        If return_version is True, returns a tuple of (available, version).
     """
     package_exists = importlib.util.find_spec(pkg_name) is not None
     package_version = "N/A"
