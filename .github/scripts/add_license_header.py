@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Pre-commit hook to add license headers to Python files.
 
 This script checks if edited Python files have the required license header.
