@@ -76,6 +76,12 @@ LICENSE_PATTERN_EXISTING = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
+# Pattern to detect new license header (Tensor Auto only)
+LICENSE_PATTERN_NEW = re.compile(
+    r"#\s*Copyright.*Tensor Auto.*?\n#\s*\n#\s*Licensed under the Apache License",
+    re.DOTALL | re.IGNORECASE,
+)
+
 # Pattern to detect HuggingFace-only license header
 LICENSE_PATTERN_HUGGINGFACE = re.compile(
     r"#\s*Copyright.*HuggingFace.*?\n#\s*\n#\s*Licensed under the Apache License",
@@ -88,6 +94,13 @@ def has_existing_license_header(content: str) -> bool:
     # Check first 20 lines for license header
     first_lines = "\n".join(content.split("\n")[:20])
     return bool(LICENSE_PATTERN_EXISTING.search(first_lines))
+
+
+def has_new_license_header(content: str) -> bool:
+    """Check if file content has the new license header (Tensor Auto only)."""
+    # Check first 20 lines for license header
+    first_lines = "\n".join(content.split("\n")[:20])
+    return bool(LICENSE_PATTERN_NEW.search(first_lines))
 
 
 def has_huggingface_license_header(content: str) -> bool:
@@ -107,6 +120,10 @@ def add_license_header(file_path: Path) -> bool:
 
     # Skip if existing license header (both copyrights) already present
     if has_existing_license_header(content):
+        return False
+
+    # Skip if new license header (Tensor Auto only) already present
+    if has_new_license_header(content):
         return False
 
     # Determine which license header to add
