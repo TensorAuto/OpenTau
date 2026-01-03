@@ -1,7 +1,7 @@
 exclude: >-
     (?x)^(
         tests/artifacts/.*\.safetensors$|
-        lerobot/scripts/zero_to_fp32.py$
+        src/opentau/scripts/zero_to_fp32\.py$
     )|\.cache/
 
 default_language_version:
@@ -45,6 +45,15 @@ repos:
         args: [--fix]
       - id: ruff-format
 
+  ##### License Header #####
+  - repo: local
+    hooks:
+      - id: add-license-header
+        name: Add License Header
+        entry: python scripts/add_license_header.py
+        language: system
+        types: [python]
+        pass_filenames: true
 
   ##### Security #####
   - repo: https://github.com/gitleaks/gitleaks
