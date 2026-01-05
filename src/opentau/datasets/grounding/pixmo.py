@@ -15,36 +15,6 @@
 
 This module provides the PIXMO (Pixel-level Manipulation) dataset implementation
 for training vision-language models on part localization and object grounding tasks.
-
-The dataset contains images with point annotations for object parts, enabling models
-to learn fine-grained spatial understanding.
-
-The dataset is loaded from HuggingFace (allenai/pixmo-points) and includes
-automatic retry logic for handling image download failures. Point coordinates
-are normalized to a 255x255 grid and formatted as JSON strings in the postfix.
-
-Classes:
-    PixmoDataset: Dataset class that loads and formats PIXMO data for part
-        localization tasks.
-
-Functions:
-    _pil_from_url: Download and decode an image from URL with retry logic.
-    _get_post_fix: Convert point coordinates to normalized grid format and
-        format as JSON string.
-    _img_to_normalized_tensor: Convert PIL Image to normalized torch tensor.
-
-Constants:
-    IMG_SIZE: Target image size (224x224).
-    POINT_GRID: Grid size for point normalization (255x255).
-    MAX_RETRIES: Maximum HTTP retry attempts.
-    HTTP_TIMEOUT: HTTP request timeout in seconds.
-
-Example:
-    Use PIXMO dataset in training::
-
-        >>> from opentau.configs.default import DatasetConfig
-        >>> cfg = DatasetConfig(grounding="pixmo")
-        >>> dataset = make_dataset(cfg, train_cfg)
 """
 
 import json

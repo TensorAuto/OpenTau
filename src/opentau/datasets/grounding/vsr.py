@@ -17,37 +17,6 @@ This module provides the VSR dataset implementation for training vision-language
 models on visual spatial reasoning tasks. The dataset contains images with
 statements about spatial relationships, and models must determine whether each
 statement is true or false based on the image content.
-
-The dataset is loaded from HuggingFace (cambridgeltl/vsr_random) and includes
-automatic retry logic for handling image download failures. Statements are
-formatted as grounding tasks with true/false labels.
-
-Key Features:
-    * Spatial reasoning: Tests understanding of spatial relationships between
-      objects in images.
-    * Binary classification: Simple true/false format for clear learning signal.
-    * Robust loading: Automatic retry with random sampling for failed image
-      downloads.
-
-Classes:
-    VSRDataset: Dataset class that loads and formats VSR data for true/false
-        spatial reasoning tasks.
-
-Functions:
-    _pil_from_url: Download and decode an image from URL with retry logic.
-    _img_to_normalized_tensor: Convert PIL Image to normalized torch tensor
-        with channel-first format and [0, 1] normalization.
-
-Constants:
-    MAX_RETRIES: Maximum HTTP retry attempts.
-    HTTP_TIMEOUT: HTTP request timeout in seconds.
-
-Example:
-    Use VSR dataset in training::
-
-        >>> from opentau.configs.default import DatasetConfig
-        >>> cfg = DatasetConfig(grounding="vsr")
-        >>> dataset = make_dataset(cfg, train_cfg)
 """
 
 import logging
