@@ -955,8 +955,8 @@ class LeRobotDataset(BaseDataset):
             repo_id (str): This is the repo id that will be used to fetch the dataset. Locally, the dataset
                 will be stored under root/repo_id.
             root (Path | None, optional): Local directory to use for downloading/writing files. You can also
-                set the LEROBOT_HOME environment variable to point to a different location. Defaults to
-                '~/.cache/huggingface/lerobot'.
+                set the HF_OPENTAU_HOME environment variable to point to a different location. Defaults to
+                '~/.cache/huggingface/opentau'.
             episodes (list[int] | None, optional): If specified, this will only load episodes specified by
                 their episode_index in this list. Defaults to None.
             image_transforms (Callable | None, optional): You can pass standard v2 image transforms from

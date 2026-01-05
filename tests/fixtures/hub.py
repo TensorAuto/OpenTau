@@ -25,7 +25,7 @@ from opentau.datasets.utils import (
     STATS_PATH,
     TASKS_PATH,
 )
-from tests.fixtures.constants import LEROBOT_TEST_DIR
+from tests.fixtures.constants import OPENTAU_TEST_DIR
 
 
 @pytest.fixture(scope="session")
@@ -90,7 +90,7 @@ def mock_snapshot_download_factory(
             **kwargs,
         ) -> str:
             if not local_dir:
-                local_dir = LEROBOT_TEST_DIR
+                local_dir = OPENTAU_TEST_DIR
 
             # List all possible files
             all_files = []
