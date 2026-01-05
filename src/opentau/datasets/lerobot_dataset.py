@@ -22,11 +22,13 @@ the HuggingFace Hub or local disk, as well as creating new datasets for data
 recording.
 
 The dataset structure consists of:
+
     - Metadata: Info, statistics, tasks, and episode information stored as JSON
     - Data files: Episode data stored as Parquet files organized by chunks
     - Videos: Optional video files for camera observations stored as MP4 files
 
 Key Features:
+
     - Temporal alignment: Supports delta timestamps for temporal feature
       alignment, enabling sampling of features at different time offsets with
       optional Gaussian noise for data augmentation.
@@ -42,18 +44,28 @@ Key Features:
       video_reader) for efficient video encoding and decoding.
 
 Classes:
-    DatasetMetadata: Base class for dataset metadata management.
-    LeRobotDatasetMetadata: Metadata manager for LeRobot datasets with Hub
-        integration, version checking, and statistics loading.
-    GroundingDatasetMetadata: Metadata manager for grounding datasets.
-    BaseDataset: Base PyTorch Dataset class with common functionality.
-    LeRobotDataset: Main dataset class for robot learning data, supporting
-        loading from Hub/local disk, temporal alignment, video/image handling,
-        and data recording.
+
+    DatasetMetadata
+        Base class for dataset metadata management.
+
+    LeRobotDatasetMetadata
+        Metadata manager for LeRobot datasets with Hub integration, version
+        checking, and statistics loading.
+
+    GroundingDatasetMetadata
+        Metadata manager for grounding datasets.
+
+    BaseDataset
+        Base PyTorch Dataset class with common functionality.
+
+    LeRobotDataset
+        Main dataset class for robot learning data, supporting loading from
+        Hub/local disk, temporal alignment, video/image handling, and data
+        recording.
 
 Functions:
-    retry_random_on_failure: Decorator to retry dataset item retrieval with
-        random indices on failure.
+    retry_random_on_failure
+        Decorator to retry dataset item retrieval with random indices on failure.
 
 Example:
     Load an existing dataset:
@@ -861,10 +873,12 @@ class LeRobotDataset(BaseDataset):
         standardize: bool = True,
         return_advantage_input: bool = False,
     ):
-        """
+        """Initialize LeRobotDataset.
+
         2 modes are available for instantiating this class, depending on 2 different use cases:
 
         1. Your dataset already exists:
+
             - On your local disk in the 'root' folder. This is typically the case when you recorded your
               dataset locally and you may or may not have pushed it to the hub yet. Instantiating this class
               with 'root' will load your dataset directly from disk. This can happen while you're offline (no
@@ -877,54 +891,57 @@ class LeRobotDataset(BaseDataset):
               prompted to convert it using our conversion script from v1.6 to v2.0, which you can find at
               lerobot/common/datasets/v2/convert_dataset_v1_to_v2.py.
 
-
         2. Your dataset doesn't already exists (either on local disk or on the Hub): you can create an empty
            LeRobotDataset with the 'create' classmethod. This can be used for recording a dataset or port an
            existing dataset to the LeRobotDataset format.
 
-
         In terms of files, LeRobotDataset encapsulates 3 main things:
+
             - metadata:
+
                 - info contains various information about the dataset like shapes, keys, fps etc.
                 - stats stores the dataset statistics of the different modalities for normalization
                 - tasks contains the prompts for each task of the dataset, which can be used for
                   task-conditioned training.
+
             - hf_dataset (from datasets.Dataset), which will read any values from parquet files.
+
             - videos (optional) from which frames are loaded to be synchronous with data from parquet files.
 
-        A typical LeRobotDataset looks like this from its root path:
-        .
-        ├── data
-        │   ├── chunk-000
-        │   │   ├── episode_000000.parquet
-        │   │   ├── episode_000001.parquet
-        │   │   ├── episode_000002.parquet
-        │   │   └── ...
-        │   ├── chunk-001
-        │   │   ├── episode_001000.parquet
-        │   │   ├── episode_001001.parquet
-        │   │   ├── episode_001002.parquet
-        │   │   └── ...
-        │   └── ...
-        ├── meta
-        │   ├── episodes.jsonl
-        │   ├── info.json
-        │   ├── stats.json
-        │   └── tasks.jsonl
-        └── videos
-            ├── chunk-000
-            │   ├── observation.images.laptop
-            │   │   ├── episode_000000.mp4
-            │   │   ├── episode_000001.mp4
-            │   │   ├── episode_000002.mp4
+        A typical LeRobotDataset looks like this from its root path::
+
+            .
+            ├── data
+            │   ├── chunk-000
+            │   │   ├── episode_000000.parquet
+            │   │   ├── episode_000001.parquet
+            │   │   ├── episode_000002.parquet
             │   │   └── ...
-            │   ├── observation.images.phone
-            │   │   ├── episode_000000.mp4
-            │   │   ├── episode_000001.mp4
-            │   │   ├── episode_000002.mp4
+            │   ├── chunk-001
+            │   │   ├── episode_001000.parquet
+            │   │   ├── episode_001001.parquet
+            │   │   ├── episode_001002.parquet
             │   │   └── ...
-            ├── chunk-001
-            └── ...
+            │   └── ...
+            ├── meta
+            │   ├── episodes.jsonl
+            │   ├── info.json
+            │   ├── stats.json
+            │   └── tasks.jsonl
+            └── videos
+                ├── chunk-000
+                │   ├── observation.images.laptop
+                │   │   ├── episode_000000.mp4
+                │   │   ├── episode_000001.mp4
+                │   │   ├── episode_000002.mp4
+                │   │   └── ...
+                │   ├── observation.images.phone
+                │   │   ├── episode_000000.mp4
+                │   │   ├── episode_000001.mp4
+                │   │   ├── episode_000002.mp4
+                │   │   └── ...
+                ├── chunk-001
+                └── ...
 
         Note that this file-based structure is designed to be as versatile as possible. The files are split by
         episodes which allows a more granular control over which episodes one wants to use and download. The

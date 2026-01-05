@@ -9,7 +9,7 @@ Building a dataset mixture
 
 You can define a dataset mixture in your configuration file using the ``dataset_mixture`` key. Here is an example:
 
-.. code-block:: json
+.. code-block:: javascript
 
     {
         "dataset_mixture": {
@@ -30,21 +30,21 @@ You can define a dataset mixture in your configuration file using the ``dataset_
         ...
     }
 
-For each new dataset, you must add an entry to ``opentau/datasets/standard_data_format_mapping.py`` to map the dataset features to the Standard Data Format (see the :ref:`Standard Data Format section <concepts/standard-data-format>` in the Concepts documentation).
+For each new dataset, you must add an entry to ``opentau/datasets/standard_data_format_mapping.py`` to map the dataset features to the Standard Data Format.
 Alternatively, you can provide a custom mapping in the dataset config using the ``data_features_name_mapping`` and ``loss_type_mapping`` keys.
 For example:
 
-.. code-block:: json
+.. code-block:: javascript
 
     {
         "dataset_mixture": {
             "datasets": [
                 {
-                    "repo_id": "physical-intelligence/libero"
+                    "repo_id": "physical-intelligence/libero",
                     "data_features_name_mapping": {
                         "camera0": "observation.images.exterior_image_1_left",
-                        "camera1": "observation.images.exterior_image_2_left",
-                    }
+                        "camera1": "observation.images.exterior_image_2_left"
+                    },
                     "loss_type_mapping": "MSE"
                 },
                 {
