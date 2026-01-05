@@ -4,7 +4,6 @@
             {
                 "repo_id": "lerobot/droid_100"
             }
-
         ],
         "weights": [
             1.0
@@ -15,25 +14,57 @@
     },
     "policy": {
         "type": "pi05",
-        "pretrained_path": "william-yue/pi05_base",
+        "pretrained_path": "TensorAuto/tPi0.5-libero",
         "n_obs_steps": 1,
+        "input_features": {
+            "camera0": {
+                "shape": [
+                    3,
+                    224,
+                    224
+                ],
+                "type": "VISUAL"
+            },
+            "camera1": {
+                "shape": [
+                    3,
+                    224,
+                    224
+                ],
+                "type": "VISUAL"
+            },
+            "state": {
+                "shape": [
+                    32
+                ],
+                "type": "STATE"
+            }
+        },
+        "output_features": {
+            "actions": {
+                "shape": [
+                    32
+                ],
+                "type": "ACTION"
+            }
+        },
         "normalization_mapping": {
             "VISUAL": "IDENTITY",
             "STATE": "MIN_MAX",
             "ACTION": "MEAN_STD"
         },
-        "chunk_size": 50,
-        "n_action_steps": 50,
+        "chunk_size": 10,
+        "n_action_steps": 10,
         "max_state_dim": 32,
         "max_action_dim": 32,
         "proj_width": 1024,
         "num_steps": 10,
-        "init_strategy": "expert_only_he_init",
+        "init_strategy": "no_init",
         "attention_implementation": "eager",
-        "freeze_vision_encoder": true,
-        "train_expert_only": true,
+        "freeze_vision_encoder": false,
+        "train_expert_only": false,
         "tokenizer_max_length": 256,
-        "discrete_action_max_length": 75,
+        "discrete_action_max_length": 60,
         "optimizer_lr": 2.5e-05,
         "optimizer_betas": [
             0.9,
@@ -45,14 +76,21 @@
         "scheduler_decay_steps": 30000,
         "scheduler_decay_lr": 2.5e-06
     },
+    "output_dir": "outputs/pi05_libero_eval",
     "resume": false,
     "seed": 1000,
-    "resolution": [224, 224],
+    "resolution": [
+        224,
+        224
+    ],
     "num_cams": 2,
     "max_state_dim": 32,
     "max_action_dim": 32,
-    "action_chunk": 50,
-    "loss_weighting": {"MSE": 10, "CE": 1},
+    "action_chunk": 10,
+    "loss_weighting": {
+        "MSE": 1.0,
+        "CE": 1.0
+    },
     "num_workers": 4,
     "batch_size": 2,
     "gradient_accumulation_steps": 1,
@@ -63,7 +101,7 @@
     "save_checkpoint": true,
     "save_freq": 100,
     "use_policy_training_preset": true,
-    "trace_nans": true,
+    "trace_nans": false,
     "optimizer": {
         "type": "adamw",
         "lr": 2.5e-05,
@@ -74,6 +112,29 @@
             0.95
         ],
         "eps": 1e-08
+    },
+    "env": {
+        "type": "libero",
+        "task": "libero_10",
+        "fps": 30,
+        "max_parallel_tasks": 1,
+        "task_ids": [
+            8
+        ],
+        "episode_length": 520,
+        "obs_type": "pixels_agent_pos",
+        "render_mode": "rgb_array",
+        "camera_name": "agentview_image,robot0_eye_in_hand_image",
+        "init_states": true,
+        "camera_name_mapping": null
+    },
+    "eval": {
+        "n_episodes": 2,
+        "batch_size": 2,
+        "use_async_envs": true,
+        "max_episodes_rendered": 2,
+        "recording_root": "/tmp/libero-rollout",
+        "grid_size": null
     },
     "scheduler": {
         "type": "cosine_decay_with_warmup",
@@ -88,7 +149,7 @@
         "project": "pi05",
         "run_id": null,
         "name": null,
-        "notes": "Dev config for pi0.5",
+        "notes": "Evaluating pi0.5 on libero",
         "tags": [],
         "group": null,
         "job_type": null,
