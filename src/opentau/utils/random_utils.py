@@ -231,14 +231,12 @@ def set_seed(seed, accelerator: accelerate.Accelerator = None) -> None:
 def seeded_context(seed: int) -> Generator[None, None, None]:
     """Set the seed when entering a context, and restore the prior random state at exit.
 
-    Example usage:
+    Example usage::
 
-    ```
-    a = random.random()  # produces some random number
-    with seeded_context(1337):
-        b = random.random()  # produces some other random number
-    c = random.random()  # produces yet another random number, but the same it would have if we never made `b`
-    ```
+        a = random.random()  # produces some random number
+        with seeded_context(1337):
+            b = random.random()  # produces some other random number
+        c = random.random()  # produces yet another random number, but the same it would have if we never made `b`
     """
     random_state_dict = get_rng_state()
     set_seed(seed)

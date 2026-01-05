@@ -137,6 +137,11 @@ class SiglipGemmaValueModel(PreTrainedModel):
     config_class = SiglipGemmaValueConfig
 
     def __init__(self, config: SiglipGemmaValueConfig):
+        """Initializes the SiglipGemmaValueModel.
+
+        Args:
+            config: Configuration object of type `SiglipGemmaValueConfig`.
+        """
         super().__init__(config=config)
 
         self.vision_encoder = SiglipVisionModel.from_pretrained("google/siglip2-so400m-patch14-224")

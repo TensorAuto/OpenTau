@@ -27,33 +27,27 @@ from typing import Any, Protocol
 
 
 class FeatureType(str, Enum):
-    """Enumeration of feature types used in policy configurations.
-
-    Attributes:
-        STATE: Robot state features.
-        VISUAL: Visual/image features.
-        ENV: Environment state features.
-        ACTION: Action features.
-    """
+    """Enumeration of feature types used in policy configurations."""
 
     STATE = "STATE"
+    """Robot state features."""
     VISUAL = "VISUAL"
+    """Visual/image features."""
     ENV = "ENV"
+    """Environment state features."""
     ACTION = "ACTION"
+    """Action features."""
 
 
 class NormalizationMode(str, Enum):
-    """Enumeration of normalization modes for features.
-
-    Attributes:
-        MIN_MAX: Normalize using min-max scaling.
-        MEAN_STD: Normalize using mean and standard deviation.
-        IDENTITY: No normalization (identity transformation).
-    """
+    """Enumeration of normalization modes for features."""
 
     MIN_MAX = "MIN_MAX"
+    """Normalize using min-max scaling."""
     MEAN_STD = "MEAN_STD"
+    """Normalize using mean and standard deviation."""
     IDENTITY = "IDENTITY"
+    """No normalization (identity transformation)."""
 
 
 class DictLike(Protocol):

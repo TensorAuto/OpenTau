@@ -53,7 +53,7 @@ def make_att_2d_masks(pad_masks, att_masks):
           block can attend all previous blocks and all tokens on the same block.
 
     Args:
-    pad_masks: bool[B, N] true if its part of the input, false if padding.
+        pad_masks: bool[B, N] true if its part of the input, false if padding.
         att_masks: int32[B, N] mask that's 1 where previous tokens cannot depend on
             it and 0 where it shares the same attention mask as the previous token.
 

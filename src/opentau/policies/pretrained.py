@@ -63,14 +63,14 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
     and abstract methods that all policies must implement.
 
     Attributes:
-        config_class: The configuration class associated with this policy.
-            Must be defined in subclasses.
-        name: The name of the policy. Must be defined in subclasses.
         config: The configuration instance for this policy.
     """
 
     config_class: None
+    """The configuration class associated with this policy. Must be defined in subclasses."""
+
     name: None
+    """The name of the policy. Must be defined in subclasses."""
 
     def __init__(self, config: PreTrainedConfig, *inputs, **kwargs):
         """Initializes the PreTrainedPolicy.

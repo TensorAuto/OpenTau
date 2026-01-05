@@ -335,6 +335,7 @@ def wrap(config_path: Path | None = None):
     """Wrap a function to handle configuration parsing with enhanced features.
 
     This decorator is similar to `draccus.wrap` but provides three additional features:
+
     1. Removes '.path' arguments from CLI to process them later
     2. If a 'config_path' is passed and the main config class has a 'from_pretrained'
        method, initializes it from there to allow fetching configs from the hub directly
