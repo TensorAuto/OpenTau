@@ -309,6 +309,7 @@ class TrainPipelineConfig(HubMixin):
         Args:
             cls: The class to instantiate.
             pretrained_name_or_path: Can be either:
+
                 - A string, the model id of a pretrained config hosted inside a model
                   repo on huggingface.co.
                 - A path to a directory containing a configuration file saved using

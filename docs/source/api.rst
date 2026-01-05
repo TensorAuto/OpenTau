@@ -8,3 +8,7 @@ API Reference
    opentau.policies
    opentau.datasets
    opentau.envs
+   opentau.utils
+   opentau.constants
+   opentau.configs
+   opentau.planner

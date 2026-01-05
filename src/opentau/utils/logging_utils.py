@@ -69,29 +69,27 @@ class MetricsTracker:
     """
     A helper class to track and log metrics over time.
 
-    Usage pattern:
+    Usage pattern::
 
-    ```python
-    # initialize, potentially with non-zero initial step (e.g. if resuming run)
-    metrics = {"loss": AverageMeter("loss", ":.3f")}
-    train_metrics = MetricsTracker(cfg, dataset, metrics, initial_step=step)
+        # initialize, potentially with non-zero initial step (e.g. if resuming run)
+        metrics = {"loss": AverageMeter("loss", ":.3f")}
+        train_metrics = MetricsTracker(cfg, dataset, metrics, initial_step=step)
 
-    # update metrics derived from step (samples, episodes, epochs) at each training step
-    train_metrics.step()
+        # update metrics derived from step (samples, episodes, epochs) at each training step
+        train_metrics.step()
 
-    # update various metrics
-    loss = policy.forward(batch)
-    train_metrics.loss = loss
+        # update various metrics
+        loss = policy.forward(batch)
+        train_metrics.loss = loss
 
-    # display current metrics
-    logging.info(train_metrics)
+        # display current metrics
+        logging.info(train_metrics)
 
-    # export for wandb
-    wandb.log(train_metrics.to_dict())
+        # export for wandb
+        wandb.log(train_metrics.to_dict())
 
-    # reset averages after logging
-    train_metrics.reset_averages()
-    ```
+        # reset averages after logging
+        train_metrics.reset_averages()
     """
 
     __keys__ = [

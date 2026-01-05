@@ -416,12 +416,13 @@ def encode_accelerator_state_dict(obj) -> Any:
 
 def on_accelerate_main_proc(*, local=False, _sync=False):
     r"""Returns a decorator to run a function only on the main process when using `accelerate`.
+
     If `local` is True (defaults to False), the function will run on the main process of each node
-        (useful for multi-node setups).
+    (useful for multi-node setups).
     If `_sync` is True (defaults to False), the output of the function will be broadcasted to all processes.
     If `_sync` is True, you must ensure that all processes call the decorated function, otherwise it will deadlock.
 
-    YOU SHOULD BE EXTREMELY CAREFUL WHEN USING THIS DECORATOR with _sync=True. Consider the following example
+    YOU SHOULD BE EXTREMELY CAREFUL WHEN USING THIS DECORATOR with _sync=True. Consider the following example::
 
     >>> @on_accelerate_main_proc()
     ... def f():
@@ -434,17 +435,11 @@ def on_accelerate_main_proc(*, local=False, _sync=False):
     In this case, if f() is called on all processes, they will deadlock at g() because child processes don't even
     enter f(), hence never call g(), and thus won't reach the broadcast.
 
-    Another example:
+    Another example::
+
     >>> @on_accelerate_main_proc(_sync=cond())
     ... def f():
     ...     print("hi")
-
-    In this case, if cond() is not the same on all processes, they may deadlock because one or more processes don't
-    require a _sync, hence won't reach the broadcast, blocking the other processes.
-
-    To prevent accidental misues, we set _sync to False by default.
-
-    TODO: record list of processes that called the decorated function with _sync=True and only send result to them
     """
 
     def decorator(func):
