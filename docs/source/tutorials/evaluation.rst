@@ -46,4 +46,3 @@ OpenTau currently supports the `LIBERO benchmark <https://libero-project.github.
 This will run the 0th task and 2nd task in ``libero_spatial``. Each task will run for 8 simulations in parallel.
 
 When launched with accelerate, each GPU process will only work on its fraction of the tasks, improving throughput.
-

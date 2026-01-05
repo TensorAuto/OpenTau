@@ -4,7 +4,7 @@ Datasets
 .. note::
    Make sure you have followed the :doc:`/installation` guide before proceeding.
 
-Building a dataset mixture 
+Building a dataset mixture
 --------------------------
 
 You can define a dataset mixture in your configuration file using the ``dataset_mixture`` key. Here is an example:
@@ -73,5 +73,3 @@ Each training config should contain a dataset mixture definition. To evaluate th
         --num_workers=10
 
 This will output a token count for each language key in the dataset mixture, and save it to ``outputs/stats/token_count.json``.
-
-

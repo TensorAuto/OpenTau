@@ -51,4 +51,3 @@ Training can be resumed by running:
 
 .. note::
    When resuming training from a checkpoint, the training step count will continue from the checkpoint's step, but the dataloader will be reset.
-

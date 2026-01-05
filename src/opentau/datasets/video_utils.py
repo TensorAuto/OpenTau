@@ -101,6 +101,7 @@ import torchvision
 from datasets.features.features import register_feature
 from PIL import Image
 
+
 def get_safe_default_codec() -> str:
     """Get the default video codec backend, falling back to pyav if torchcodec is unavailable.
 
