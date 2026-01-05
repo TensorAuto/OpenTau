@@ -29,6 +29,18 @@ jobs:
           persist-credentials: false
           lfs: false
 
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          # This frees up the most space (~20GB+)
+          tool-cache: true
+          # Keep what you need, remove the rest
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
