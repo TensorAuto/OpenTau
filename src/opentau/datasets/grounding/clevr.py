@@ -1,4 +1,3 @@
-
 # Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -37,7 +36,6 @@ Example:
         >>> cfg = DatasetConfig(grounding="clevr")
         >>> dataset = make_dataset(cfg, train_cfg)
 """
-
 
 import logging
 

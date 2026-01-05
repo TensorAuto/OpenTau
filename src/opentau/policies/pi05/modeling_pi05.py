@@ -70,7 +70,11 @@ def create_sinusoidal_pos_embedding(
     if time.ndim != 1:
         raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
 
-    dtype = get_safe_dtype(torch.float64, device.type) if isinstance(device, torch.device) else get_safe_dtype(torch.float64, device)
+    dtype = (
+        get_safe_dtype(torch.float64, device.type)
+        if isinstance(device, torch.device)
+        else get_safe_dtype(torch.float64, device)
+    )
     fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
     period = min_period * (max_period / min_period) ** fraction
 
@@ -636,8 +640,8 @@ class PI05Policy(PreTrainedPolicy):
     def prepare_discrete_state(self, batch: dict[str, Tensor]) -> list[str]:
         """Discretizes the state into bins and converts it to a string representation.
 
-        Each dimension of the state vector is discretized into 256 bins. 
-        The values of each dimension of the state are expected to be in the range [-1, 1]. 
+        Each dimension of the state vector is discretized into 256 bins.
+        The values of each dimension of the state are expected to be in the range [-1, 1].
         The discretization bins are linearly spaced between -1 and 1.
         The index of the bin for each dimension is then concatenated into a space-separated string.
 
@@ -655,7 +659,9 @@ class PI05Policy(PreTrainedPolicy):
         if np.any(state_np < -1.0) or np.any(state_np > 1.0):
             raise ValueError("State values are not normalized. All state values should be in [-1, 1].")
         discretized_states = np.digitize(state_np, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
-        return [" ".join(map(str, row)) for row in discretized_states] # TODO: return a tensor instead of a list of strings?
+        return [
+            " ".join(map(str, row)) for row in discretized_states
+        ]  # TODO: return a tensor instead of a list of strings?
 
     def prepare_discrete_actions(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
         """Prepares discrete actions for the model by tokenizing and padding them.
@@ -671,7 +677,9 @@ class PI05Policy(PreTrainedPolicy):
         device = batch["discrete_actions"].device
         discrete_actions = batch["discrete_actions"].to(device="cpu", dtype=torch.float32)
         tokens = self.discrete_action_processor.__call__(discrete_actions)
-        discrete_action_tokens, discrete_action_masks = pad_discrete_tokens(tokens, self.config.discrete_action_max_length)
+        discrete_action_tokens, discrete_action_masks = pad_discrete_tokens(
+            tokens, self.config.discrete_action_max_length
+        )
         return torch.from_numpy(discrete_action_tokens).to(device=device, dtype=torch.long), torch.from_numpy(
             discrete_action_masks
         ).to(device=device, dtype=torch.bool)
@@ -965,9 +973,7 @@ class PI05FlowMatching(nn.Module):
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(
-        self, noisy_actions: Tensor, timestep: Tensor
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    def embed_suffix(self, noisy_actions: Tensor, timestep: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Embed noisy_actions, timestep to prepare for Expert Gemma processing.
 
         Args:

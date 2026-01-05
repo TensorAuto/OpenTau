@@ -87,5 +87,3 @@ Environments
 Environments wrap simulation or real-robot interfaces compatible with OpenAI Gym/Gymnasium.
 The factory ``lerobot/common/envs/factory.py`` creates vectorized environments for efficient training and evaluation.
 Currently, only `Libero <https://libero-project.github.io/main.html>`_ is supported and it is configured via ``opentau.envs.configs.LiberoEnv``.
-
-

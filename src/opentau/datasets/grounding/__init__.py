@@ -65,4 +65,3 @@ Example:
         >>> print(list(available_grounding_datasets.keys()))
         ['clevr', 'cocoqa', 'dummy', 'pixmo', 'vsr']
 """
-

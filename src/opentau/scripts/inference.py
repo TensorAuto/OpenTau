@@ -20,6 +20,8 @@ from pprint import pformat
 
 import torch
 
+from opentau.configs import parser
+from opentau.configs.train import TrainPipelineConfig
 from opentau.policies.factory import get_policy_class
 from opentau.utils.random_utils import set_seed
 from opentau.utils.utils import (
@@ -28,8 +30,6 @@ from opentau.utils.utils import (
     create_dummy_observation,
     init_logging,
 )
-from opentau.configs import parser
-from opentau.configs.train import TrainPipelineConfig
 
 
 @parser.wrap()

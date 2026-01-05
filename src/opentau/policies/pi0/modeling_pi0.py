@@ -64,7 +64,11 @@ def create_sinusoidal_pos_embedding(
     if time.ndim != 1:
         raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
 
-    dtype = get_safe_dtype(torch.float64, device.type) if isinstance(device, torch.device) else get_safe_dtype(torch.float64, device)
+    dtype = (
+        get_safe_dtype(torch.float64, device.type)
+        if isinstance(device, torch.device)
+        else get_safe_dtype(torch.float64, device)
+    )
     fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
     period = min_period * (max_period / min_period) ** fraction
 

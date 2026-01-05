@@ -20,7 +20,7 @@ Some of the ways you can contribute to OpenTau:
 * Contributing to the examples or to the documentation.
 * Submitting issues related to bugs or desired new features.
 
-Following the guides below, feel free to open issues and PRs. 
+Following the guides below, feel free to open issues and PRs.
 
 Submitting a new issue or feature request
 -----------------------------------------
