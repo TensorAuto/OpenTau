@@ -42,16 +42,22 @@ Key Features:
       weighted variance across multiple statistics.
 
 Functions:
-    estimate_num_samples: Heuristic to estimate optimal number of samples
-        based on dataset size.
-    sample_indices: Generate evenly spaced sample indices from a dataset.
-    auto_downsample_height_width: Automatically downsample large images.
-    sample_images: Load and downsample a subset of images from file paths.
-    get_feature_stats: Compute statistical measures for an array.
-    compute_episode_stats: Compute statistics for a single episode.
-    aggregate_feature_stats: Aggregate statistics for a feature across
-        multiple episodes.
-    aggregate_stats: Aggregate statistics from multiple episodes/datasets.
+    estimate_num_samples
+        Heuristic to estimate optimal number of samples based on dataset size.
+    sample_indices
+        Generate evenly spaced sample indices from a dataset.
+    auto_downsample_height_width
+        Automatically downsample large images.
+    sample_images
+        Load and downsample a subset of images from file paths.
+    get_feature_stats
+        Compute statistical measures for an array.
+    compute_episode_stats
+        Compute statistics for a single episode.
+    aggregate_feature_stats
+        Aggregate statistics for a feature across multiple episodes.
+    aggregate_stats
+        Aggregate statistics from multiple episodes/datasets.
 
 Example:
     Compute statistics for a single episode:

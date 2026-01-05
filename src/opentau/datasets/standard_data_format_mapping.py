@@ -35,22 +35,25 @@ Key Features:
       (MSE for continuous actions, CE for discrete classification tasks).
 
 Constants:
-    DATA_FEATURES_NAME_MAPPING: Dictionary mapping dataset repository IDs to
-        feature name dictionaries. Each inner dictionary maps standard feature
-        names (keys) to dataset-specific feature names (values).
-        Standard feature names include:
-            - "camera0", "camera1", ...: Camera/image observations
-            - "state": Robot state observations
-            - "actions": Action outputs
-            - "prompt": Task descriptions or prompts
-            - "response": Expected responses or labels
 
-    LOSS_TYPE_MAPPING: Dictionary mapping dataset repository IDs to loss type
-        strings. Valid values are:
-            - "MSE": Mean Squared Error (typically for continuous robotic
-              actions)
-            - "CE": Cross Entropy (typically for discrete classification tasks
-              like VQA)
+    DATA_FEATURES_NAME_MAPPING
+        Dictionary mapping dataset repository IDs to feature name dictionaries.
+        Each inner dictionary maps standard feature names (keys) to
+        dataset-specific feature names (values). Standard feature names include:
+
+        - "camera0", "camera1", ...: Camera/image observations
+        - "state": Robot state observations
+        - "actions": Action outputs
+        - "prompt": Task descriptions or prompts
+        - "response": Expected responses or labels
+
+    LOSS_TYPE_MAPPING
+        Dictionary mapping dataset repository IDs to loss type strings. Valid
+        values are:
+
+        - "MSE": Mean Squared Error (typically for continuous robotic actions)
+        - "CE": Cross Entropy (typically for discrete classification tasks
+          like VQA)
 
 Example:
     Access feature name mapping for a dataset:

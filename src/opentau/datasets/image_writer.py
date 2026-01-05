@@ -21,6 +21,7 @@ using multithreading or multiprocessing, which is critical for controlling
 robots and recording data at high frame rates without blocking the main process.
 
 The module supports two execution models:
+
     1. Threading mode (num_processes=0): Creates a pool of worker threads
        for concurrent image writing within a single process.
     2. Multiprocessing mode (num_processes>0): Creates multiple processes,
@@ -39,18 +40,22 @@ Key Features:
       even when exceptions occur.
 
 Classes:
-    AsyncImageWriter: Main class for asynchronous image writing with
-        configurable threading or multiprocessing backends.
+
+    AsyncImageWriter
+        Main class for asynchronous image writing with configurable threading
+        or multiprocessing backends.
 
 Functions:
-    image_array_to_pil_image: Convert numpy array to PIL Image with format
-        and type conversion.
-    write_image: Write an image (numpy array or PIL Image) to disk.
-    worker_thread_loop: Worker thread loop for processing image write queue.
-    worker_process: Worker process that manages multiple threads for image
-        writing.
-    safe_stop_image_writer: Decorator to safely stop image writer on
-        exceptions.
+    image_array_to_pil_image
+        Convert numpy array to PIL Image with format and type conversion.
+    write_image
+        Write an image (numpy array or PIL Image) to disk.
+    worker_thread_loop
+        Worker thread loop for processing image write queue.
+    worker_process
+        Worker process that manages multiple threads for image writing.
+    safe_stop_image_writer
+        Decorator to safely stop image writer on exceptions.
 
 Example:
     Create an async image writer with threading:

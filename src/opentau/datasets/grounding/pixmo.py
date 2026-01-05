@@ -1,4 +1,3 @@
-
 # Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,26 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-"""
-Datasets for Image-Text Point Set grounding tasks.
+"""Datasets for Image-Text Point Set grounding tasks.
 
 This module provides the PIXMO (Pixel-level Manipulation) dataset implementation
-for training vision-language models on part localization and object grounding
-tasks. The dataset contains images with point annotations for object parts,
-enabling models to learn fine-grained spatial understanding.
+for training vision-language models on part localization and object grounding tasks.
+
+The dataset contains images with point annotations for object parts, enabling models
+to learn fine-grained spatial understanding.
 
 The dataset is loaded from HuggingFace (allenai/pixmo-points) and includes
 automatic retry logic for handling image download failures. Point coordinates
 are normalized to a 255x255 grid and formatted as JSON strings in the postfix.
-
-Key Features:
-    - Point set grounding: Provides pixel-level point annotations for object
-      parts with labels.
-    - Robust loading: Automatic retry with random sampling for failed image
-      downloads.
-    - Grid normalization: Converts pixel coordinates to normalized grid space
-      for consistent representation.
 
 Classes:
     PixmoDataset: Dataset class that loads and formats PIXMO data for part
@@ -50,7 +40,8 @@ Constants:
     HTTP_TIMEOUT: HTTP request timeout in seconds.
 
 Example:
-    Use PIXMO dataset in training:
+    Use PIXMO dataset in training::
+
         >>> from opentau.configs.default import DatasetConfig
         >>> cfg = DatasetConfig(grounding="pixmo")
         >>> dataset = make_dataset(cfg, train_cfg)

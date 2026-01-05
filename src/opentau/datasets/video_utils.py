@@ -39,29 +39,38 @@ Key Features:
       datasets.
 
 Classes:
-    VideoFrame: PyArrow-based feature type for HuggingFace datasets containing
-        video frames with path and timestamp information.
+
+    VideoFrame
+        PyArrow-based feature type for HuggingFace datasets containing video
+        frames with path and timestamp information.
 
 Functions:
+
     Video decoding:
-        decode_video_frames: Main interface for decoding frames at timestamps
-            with automatic backend selection.
-        decode_video_frames_torchcodec: Decode frames using torchcodec backend.
-        decode_video_frames_torchvision: Decode frames using torchvision backends
-            (pyav or video_reader).
+        decode_video_frames
+            Main interface for decoding frames at timestamps with automatic backend selection.
+        decode_video_frames_torchcodec
+            Decode frames using torchcodec backend.
+        decode_video_frames_torchvision
+            Decode frames using torchvision backends (pyav or video_reader).
 
     Video encoding:
-        encode_video_frames: Encode a sequence of PNG images into a video file
-            using ffmpeg.
+        encode_video_frames
+            Encode a sequence of PNG images into a video file using ffmpeg.
 
     Video information:
-        get_video_info: Extract video stream metadata (fps, dimensions, codec).
-        get_audio_info: Extract audio stream metadata (channels, codec, bitrate).
-        get_video_pixel_channels: Determine pixel channels from pixel format.
-        get_image_pixel_channels: Determine pixel channels from PIL Image mode.
+        get_video_info
+            Extract video stream metadata (fps, dimensions, codec).
+        get_audio_info
+            Extract audio stream metadata (channels, codec, bitrate).
+        get_video_pixel_channels
+            Determine pixel channels from pixel format.
+        get_image_pixel_channels
+            Determine pixel channels from PIL Image mode.
 
     Backend management:
-        get_safe_default_codec: Get default codec backend with fallback logic.
+        get_safe_default_codec
+            Get default codec backend with fallback logic.
 
 Example:
     Decode frames at specific timestamps:
@@ -100,6 +109,7 @@ import torch
 import torchvision
 from datasets.features.features import register_feature
 from PIL import Image
+
 
 def get_safe_default_codec() -> str:
     """Get the default video codec backend, falling back to pyav if torchcodec is unavailable.

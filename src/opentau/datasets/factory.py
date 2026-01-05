@@ -101,8 +101,10 @@ def resolve_delta_timestamps(
 
     Returns:
         A 2-tuple containing:
+
             - At index 0, a 4-tuple containing delta timestamps mean, std, lower, and upper bounds for each group.
             - At index 1, a dictionary mapping feature names to their corresponding group and index.
+
         The delta timestamps and group mapping should follow the structure expected by LeRobotDataset.
     """
     group = "input_group"

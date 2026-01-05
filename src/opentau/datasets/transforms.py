@@ -185,10 +185,28 @@ class SharpnessJitter(Transform):
         return float(sharpness[0]), float(sharpness[1])
 
     def make_params(self, flat_inputs: list[Any]) -> dict[str, Any]:
+        """Generate random parameters for sharpness jitter.
+
+        Args:
+            flat_inputs: List of input tensors.
+
+        Returns:
+            Dictionary containing 'sharpness_factor' sampled uniformly from
+            the configured sharpness range.
+        """
         sharpness_factor = torch.empty(1).uniform_(self.sharpness[0], self.sharpness[1]).item()
         return {"sharpness_factor": sharpness_factor}
 
     def transform(self, inpt: Any, params: dict[str, Any]) -> Any:
+        """Apply sharpness adjustment to input.
+
+        Args:
+            inpt: Input image or video tensor.
+            params: Dictionary containing 'sharpness_factor' from make_params.
+
+        Returns:
+            Transformed image or video with adjusted sharpness.
+        """
         sharpness_factor = params["sharpness_factor"]
         return self._call_kernel(F.adjust_sharpness, inpt, sharpness_factor=sharpness_factor)
 

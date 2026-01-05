@@ -1,4 +1,3 @@
-
 # Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """VSR (Visual Spatial Reasoning) dataset for true/false statement grounding.
 
 This module provides the VSR dataset implementation for training vision-language
@@ -25,10 +23,10 @@ automatic retry logic for handling image download failures. Statements are
 formatted as grounding tasks with true/false labels.
 
 Key Features:
-    - Spatial reasoning: Tests understanding of spatial relationships between
+    * Spatial reasoning: Tests understanding of spatial relationships between
       objects in images.
-    - Binary classification: Simple true/false format for clear learning signal.
-    - Robust loading: Automatic retry with random sampling for failed image
+    * Binary classification: Simple true/false format for clear learning signal.
+    * Robust loading: Automatic retry with random sampling for failed image
       downloads.
 
 Classes:
@@ -45,7 +43,8 @@ Constants:
     HTTP_TIMEOUT: HTTP request timeout in seconds.
 
 Example:
-    Use VSR dataset in training:
+    Use VSR dataset in training::
+
         >>> from opentau.configs.default import DatasetConfig
         >>> cfg = DatasetConfig(grounding="vsr")
         >>> dataset = make_dataset(cfg, train_cfg)
