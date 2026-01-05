@@ -1,0 +1,97 @@
+name: CPU Tests
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  GIT_LFS_SKIP_SMUDGE: "1"
+  GIT_CLEAN_FLAGS: "-ffdx -e .venv/"
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  PATH: "${{ env.HOME }}/.local/bin:${{ env.PATH }}"
+  UV_LINK_MODE: "copy"
+  MUJOCO_GL: "egl"
+  PYOPENGL_PLATFORM: "egl"
+  PRE_COMMIT_HOME: "/pre-commit-cache"
+
+jobs:
+  cpu-tests:
+    name: CPU Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          lfs: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+
+      - name: Verify uv installation
+        run: |
+          which uv
+          uv --version
+
+      - name: Install dependencies
+        run: |
+          uv sync --extra dev --extra feetech --extra openai
+
+      - name: Activate virtual environment and verify Python
+        run: |
+          source .venv/bin/activate
+          which python3
+          python3 --version
+
+      - name: Verify ffmpeg
+        run: ffmpeg -version
+
+      - name: Set up HuggingFace authentication
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          source .venv/bin/activate
+          hf auth login --token $HF_TOKEN
+
+      - name: Configure wandb
+        run: |
+          source .venv/bin/activate
+          wandb offline
+
+      - name: Check disk space
+        run: df -h /dev/shm
+
+      - name: Run CPU tests with coverage
+        run: |
+          source .venv/bin/activate
+          echo "Running cpu based pytest and generating coverage report..."
+          pytest -m "not gpu" -n auto -v --cov=lerobot/ --cov-report=xml:cpu_test/cpu_test.xml --ignore=tests/planner/test_planner.py tests/
+          echo "Pytest execution and coverage report generation completed."
+
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v4
+        if: always()
+        with:
+          file: ./cpu_test/cpu_test.xml
+          flags: cpu
+          name: cpu-coverage
+          fail_ci_if_error: false
