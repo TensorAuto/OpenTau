@@ -25,7 +25,7 @@ RUN apt-get update && apt-get install -y \
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
 # Set working directory
-WORKDIR /lerobot
+WORKDIR /opentau
 
 # Copy project files
 COPY . .
@@ -34,14 +34,10 @@ COPY . .
 # We explicitly use the system python 3.10 for the venv
 RUN uv venv .venv --python /usr/bin/python3.10 && \
     . .venv/bin/activate && \
-    uv sync --extra tau0 --extra test --extra video_benchmark \
-    --extra accelerate --extra dev --extra feetech \
-    --extra openai --extra onnx --extra smolvla \
-    --extra libero --extra metaworld
+    uv sync --all-extras
 
 # Set environment variables
-ENV PATH="/lerobot/.venv/bin:$PATH"
-ENV LEROBOT_HOME="/lerobot"
+ENV PATH=".venv/bin:$PATH"
 
 # Default command
 CMD ["/bin/bash"]
