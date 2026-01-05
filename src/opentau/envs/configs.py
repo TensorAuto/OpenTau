@@ -31,7 +31,7 @@ from opentau.utils.accelerate_utils import get_proc_accelerator
 class EnvConfig(draccus.ChoiceRegistry, abc.ABC):
     """Base configuration for an environment.
 
-    Attributes:
+    Args:
         import_name: Name under which the environment should be imported. For LIBERO, this doesn't need to be set.
         make_id: Gymnasium/Gym environment id (e.g., ``"CartPole-v1"``) when using ``gym.make``-style construction.
         task: Optional task or suite identifier understood by the environment.
@@ -83,7 +83,7 @@ class EnvConfig(draccus.ChoiceRegistry, abc.ABC):
 class LiberoEnv(EnvConfig):
     r"""Configuration for the LIBERO environment.
 
-    Attributes:
+    Args:
         task: The LIBERO task or suite to use (e.g., ``"libero_10"``).
         task_ids: Optional list of specific task IDs within the suite to use (if ``None``, all tasks in the suite are used).
         fps: Target frames-per-second for stepping/rendering.
