@@ -424,22 +424,22 @@ def on_accelerate_main_proc(*, local=False, _sync=False):
 
     YOU SHOULD BE EXTREMELY CAREFUL WHEN USING THIS DECORATOR with _sync=True. Consider the following example::
 
-    >>> @on_accelerate_main_proc()
-    ... def f():
-    ...     return g()
-    ...
-    ... @on_accelerate_main_proc(_sync=True)
-    ... def g():
-    ...     return 42
+        @on_accelerate_main_proc()
+        def f():
+            return g()
+
+        @on_accelerate_main_proc(_sync=True)
+        def g():
+            return 42
 
     In this case, if f() is called on all processes, they will deadlock at g() because child processes don't even
     enter f(), hence never call g(), and thus won't reach the broadcast.
 
     Another example::
 
-    >>> @on_accelerate_main_proc(_sync=cond())
-    ... def f():
-    ...     print("hi")
+        @on_accelerate_main_proc(_sync=cond())
+        def f():
+            print("hi")
     """
 
     def decorator(func):
