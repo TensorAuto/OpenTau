@@ -13,7 +13,6 @@ env:
   GIT_LFS_SKIP_SMUDGE: "1"
   GIT_CLEAN_FLAGS: "-ffdx -e .venv/"
   PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
-  PATH: "${{ env.HOME }}/.local/bin:${{ env.PATH }}"
   UV_LINK_MODE: "copy"
   MUJOCO_GL: "egl"
   PYOPENGL_PLATFORM: "egl"
