@@ -52,5 +52,5 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
-          tags: TensorAuto/OpenTau:latest
+          tags: tensorauto/opentau:latest
           build-args: PYTHON_VERSION=${{ env.PYTHON_VERSION }}
