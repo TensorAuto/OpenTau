@@ -227,7 +227,7 @@ def test_get_image_transforms_random_order(img_tensor_factory):
             torch.testing.assert_close(out_imgs[0], out_imgs[i])
 
 
-@pytest.skip(reason="Skipping test_backward_compatibility_single_transforms for CI on github")
+@pytest.mark.skip(reason="Skipping test_backward_compatibility_single_transforms for CI on github")
 @pytest.mark.parametrize(
     "tf_type, tf_name, min_max_values",
     [
@@ -250,7 +250,7 @@ def test_backward_compatibility_single_transforms(
         torch.testing.assert_close(actual, expected)
 
 
-@pytest.skip(reason="Skipping test_backward_compatibility_default_config for CI on github")
+@pytest.mark.skip(reason="Skipping test_backward_compatibility_default_config for CI on github")
 @require_x86_64_kernel
 # @pytest.mark.xfail(reason="still under development")
 def test_backward_compatibility_default_config(img_tensor, default_transforms):
