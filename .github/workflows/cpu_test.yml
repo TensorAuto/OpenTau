@@ -33,13 +33,13 @@ jobs:
         uses: jlumbroso/free-disk-space@main
         with:
           # This frees up the most space (~20GB+)
-          tool-cache: true
+          tool-cache: false
           # Keep what you need, remove the rest
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: true
+          android: false
+          dotnet: false
+          haskell: false
+          large-packages: false
+          swap-storage: false
 
       - name: Set up Python
         uses: actions/setup-python@v4
