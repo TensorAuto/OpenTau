@@ -66,7 +66,7 @@ Command line to run the SFT training:
 
 .. code-block:: bash
 
-    accelerate launch --config_file=<path/to/accelerate_config.yaml> lerobot/scripts/train.py --config_path=<path/to/config.json>
+    opentau-train --accelerate-config=<path/to/accelerate_config.yaml> --config_path=<path/to/config.json>
 
 
 Stage 2: Fine-tuning the value function on whole libero dataset till convergence.
@@ -150,7 +150,7 @@ Command line to run the value function training:
 
 .. code-block:: bash
 
-    accelerate launch --config_file=<path/to/accelerate_config.yaml> lerobot/scripts/train.py --config_path=<path/to/config.json>
+    opentau-train --accelerate-config=<path/to/accelerate_config.yaml> --config_path=<path/to/config.json>
 
 
 Stage 3: Offline RL training
@@ -218,7 +218,7 @@ Command line to run the value function fine-tuning:
 
 .. code-block:: bash
 
-    accelerate launch --config_file=<path/to/accelerate_config.yaml> lerobot/scripts/train.py --config_path=<path/to/config.json>
+    opentau-train --accelerate-config=<path/to/accelerate_config.yaml> --config_path=<path/to/config.json>
 
 
 Sub-stage 3: Compute the advantage for each data point using the fine-tuned value function and calculate the epsilon threshold for setting I\ :sub:`t`\ (Indicator) VLA policy training.
@@ -302,4 +302,4 @@ Command line to run the VLA policy fine-tuning:
 
 .. code-block:: bash
 
-    accelerate launch --config_file=<path/to/accelerate_config.yaml> lerobot/scripts/train.py --config_path=<path/to/config.json>
+    opentau-train --accelerate-config=<path/to/accelerate_config.yaml> --config_path=<path/to/config.json>
