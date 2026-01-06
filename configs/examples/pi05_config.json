@@ -65,8 +65,6 @@
             224
         ],
         "empty_cameras": 0,
-        "adapt_to_pi_aloha": false,
-        "use_delta_joint_actions_aloha": false,
         "tokenizer_max_length": 256,
         "discrete_action_max_length": 60,
         "proj_width": 1024,
