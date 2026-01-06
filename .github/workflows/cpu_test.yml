@@ -2,9 +2,6 @@ name: CPU Tests
 
 on:
   workflow_dispatch:
-  workflow_call:
-  pull_request:
-  push:
 
 permissions:
   contents: read
@@ -31,15 +28,6 @@ jobs:
 
       - name: Free Disk Space (Ubuntu)
         uses: jlumbroso/free-disk-space@main
-        with:
-          # This frees up the most space (~20GB+)
-          tool-cache: false
-          # Keep what you need, remove the rest
-          android: false
-          dotnet: false
-          haskell: false
-          large-packages: false
-          swap-storage: false
 
       - name: Set up Python
         uses: actions/setup-python@v4
