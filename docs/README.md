@@ -1,6 +1,6 @@
-# LeRobot Documentation
+# OpenTau Documentation
 
-This directory contains the Sphinx documentation for the LeRobot project.
+This directory contains the Sphinx documentation for the OpenTau project.
 
 ## Installation
 
@@ -50,4 +50,4 @@ The documentation uses **reStructuredText (.rst)** and **Markdown (.md)** (via M
 -   **reStructuredText**: The standard for Sphinx. Good for complex directives and autodoc.
 -   **Markdown**: Supported via MyST. Useful for narrative documentation.
 
-To update the API documentation, edit the docstrings in the Python code. The `index.rst` file is configured to automatically document the `lerobot` package.
+To update the API documentation, edit the docstrings in the Python code. The `index.rst` file is configured to automatically document the `OpenTau` package.

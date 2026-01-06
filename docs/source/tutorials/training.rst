@@ -13,7 +13,7 @@ To train a model, run the following command:
 
 .. code-block:: bash
 
-    accelerate launch lerobot/scripts/train.py --config_path=examples/pi05_config.json
+    opentau-train --config_path=examples/pi05_config.json
 
 This uses the default accelerate config file at `~/.cache/huggingface/accelerate/default_config.yaml` which is set by running ``accelerate config``.
 
@@ -21,8 +21,14 @@ Optionally, to use a specific accelerate config file (instead of the default), r
 
 .. code-block:: bash
 
-    accelerate launch --config_file=examples/accelerate_ci_config.yaml lerobot/scripts/train.py --config_path=examples/pi05_config.json
+    opentau-train --accelerate-config=examples/accelerate_ci_config.yaml --config_path=examples/pi05_config.json
 
+.. note::
+   For advanced users: ``opentau-train`` is a convenience wrapper that invokes ``accelerate launch`` and ``src/opentau/scripts/train.py``. The command above is equivalent to running:
+
+   .. code-block:: bash
+
+       accelerate launch --config_file examples/accelerate_ci_config.yaml src/opentau/scripts/train.py --config_path=examples/pi05_config.json
 
 Checkpointing and Resuming Training
 -----------------------------------
@@ -31,7 +37,7 @@ Start training and saving checkpoints:
 
 .. code-block:: bash
 
-    accelerate launch lerobot/scripts/train.py --config_path=examples/pi05_config.json --output_dir=outputs/train/pi05 --steps 40 --log_freq 5 --save_freq 20
+    opentau-train --config_path=examples/pi05_config.json --output_dir=outputs/train/pi05 --steps 40 --log_freq 5 --save_freq 20
 
 A checkpoint should be saved at step 40. The checkpoint should be saved in the directory ``outputs/train/pi05/checkpoints/000040/``.
 
@@ -47,7 +53,7 @@ Training can be resumed by running:
 
 .. code-block:: bash
 
-    accelerate launch lerobot/scripts/train.py --config_path=outputs/train/pi05/checkpoints/000040/train_config.json --resume=true --steps=100
+    opentau-train --config_path=outputs/train/pi05/checkpoints/000040/train_config.json --resume=true --steps=100
 
 .. note::
    When resuming training from a checkpoint, the training step count will continue from the checkpoint's step, but the dataloader will be reset.

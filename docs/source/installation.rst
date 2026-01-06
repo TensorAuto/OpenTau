@@ -53,7 +53,7 @@ We recommend using `uv <https://docs.astral.sh/uv/>`_ for fast and simple Python
 
    .. code-block:: bash
 
-      uv sync --extra tau0 --extra test --extra video_benchmark --extra accelerate --extra dev --extra feetech --extra openai --extra onnx --extra smolvla --extra libero --extra metaworld
+      uv sync --all-extras
 
 3. **Activate the virtual environment**
 
