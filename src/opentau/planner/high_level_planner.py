@@ -37,7 +37,7 @@ class BaseHighLevelPlanner(ABC):
     """
 
     def __init__(self):
-        self.prompts_dict = load_prompt_library("lerobot/common/planner/prompts.yaml")
+        self.prompts_dict = load_prompt_library("src/opentau/prompts/planner/prompts.yaml")
 
     @abstractmethod
     def inference(

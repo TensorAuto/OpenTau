@@ -163,7 +163,7 @@ class PI05Config(PreTrainedConfig):
 
         if self.use_delta_joint_actions_aloha:
             raise NotImplementedError(
-                "`use_delta_joint_actions_aloha` is used by pi05 for aloha real models. It is not ported yet in LeRobot."
+                "`use_delta_joint_actions_aloha` is used by pi05 for aloha real models. It is not ported yet."
             )
 
         assert self.init_strategy in ["no_init", "full_he_init", "expert_only_he_init"], (

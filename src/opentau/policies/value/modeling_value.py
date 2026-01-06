@@ -112,7 +112,7 @@ def resize_with_pad(img, width, height, pad_value=-1):
 
 
 class ValueFunction(PreTrainedPolicy):
-    """Wrapper class around Value Function model to train and run inference within LeRobot."""
+    """Wrapper class around Value Function model to train and run inference within OpenTau."""
 
     config_class = ValueConfig
     name = "value"

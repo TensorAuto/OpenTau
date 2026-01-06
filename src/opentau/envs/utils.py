@@ -36,12 +36,12 @@ from opentau.utils.utils import auto_torch_device
 
 def preprocess_observation(np_observations: dict, cfg: TrainPipelineConfig) -> dict[str, Tensor]:
     # TODO(aliberts, rcadene): refactor this to use features from the environment (no hardcoding)
-    """Convert environment observation to LeRobot format observation.
+    """Convert environment observation to OpenTau format observation.
     Args:
         np_observations: Dictionary of observation batches from a Gym vector environment.
         cfg: Training configuration that contains max_state_dim, num_cams, resolution, etc.
     Returns:
-        Dictionary of observation batches with keys renamed to LeRobot format and values as tensors.
+        Dictionary of observation batches with keys renamed to OpenTau format and values as tensors.
     """
     # map to expected inputs for the policy
     return_observations = {}

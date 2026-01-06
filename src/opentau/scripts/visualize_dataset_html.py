@@ -30,7 +30,7 @@ Example of usage:
 
 - Visualize data stored on a local machine:
 ```bash
-local$ python lerobot/scripts/visualize_dataset_html.py \
+local$ python src/opentau/scripts/visualize_dataset_html.py \
     --repo-id lerobot/pusht
 
 local$ open http://localhost:9090
@@ -38,7 +38,7 @@ local$ open http://localhost:9090
 
 - Visualize data stored on a distant machine with a local viewer:
 ```bash
-distant$ python lerobot/scripts/visualize_dataset_html.py \
+distant$ python src/opentau/scripts/visualize_dataset_html.py \
     --repo-id lerobot/pusht
 
 local$ ssh -L 9090:localhost:9090 distant  # create a ssh tunnel
@@ -47,7 +47,7 @@ local$ open http://localhost:9090
 
 - Select episodes to visualize:
 ```bash
-python lerobot/scripts/visualize_dataset_html.py \
+python src/opentau/scripts/visualize_dataset_html.py \
     --repo-id lerobot/pusht \
     --episodes 7 3 5 1 4
 ```

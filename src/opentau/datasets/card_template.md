@@ -4,7 +4,7 @@
 {{ card_data }}
 ---
 
-This dataset was created using [LeRobot](https://github.com/huggingface/lerobot).
+This dataset was created using [OpenTau](https://github.com/TensorAuto/OpenTau).
 
 ## Dataset Description
 
