@@ -88,6 +88,9 @@ dependencies = [
     "deepspeed>=0.17.1"
 ]
 
+[project.scripts]
+opentau-train = "opentau.scripts.launch_train:main"
+
 [project.optional-dependencies]
 dev = ["pre-commit>=3.7.0",
     "debugpy>=1.8.1",
