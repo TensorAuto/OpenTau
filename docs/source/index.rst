@@ -7,6 +7,7 @@ OpenTau documentation
 
    overview
    installation
+   getting_started
    concepts
    tutorials
    model
