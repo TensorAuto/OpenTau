@@ -2,81 +2,41 @@
     "dataset_mixture": {
         "datasets": [
             {
-                "repo_id": "lerobot/droid_100"
+                "repo_id": "physical-intelligence/libero",
+                "episodes": [
+                    0,1,2,3,4,5,6,7,8,9
+                ]
             }
 
         ],
         "weights": [
             1.0
         ],
-        "action_freq": 30.0,
+        "action_freq": 10.0,
         "image_resample_strategy": "nearest",
         "vector_resample_strategy": "nearest"
     },
     "policy": {
         "type": "pi05",
-        "pretrained_path": "TensorAuto/tPi0.5-libero",
+        "pretrained_path": "TensorAuto/pi05_base",
         "n_obs_steps": 1,
         "normalization_mapping": {
             "VISUAL": "IDENTITY",
             "STATE": "MIN_MAX",
             "ACTION": "MEAN_STD"
         },
-        "input_features": {
-            "state": {
-                "type": "STATE",
-                "shape": [
-                    32
-                ]
-            },
-            "camera0": {
-                "type": "VISUAL",
-                "shape": [
-                    3,
-                    224,
-                    224
-                ]
-            },
-            "camera1": {
-                "type": "VISUAL",
-                "shape": [
-                    3,
-                    224,
-                    224
-                ]
-            }
-        },
-        "output_features": {
-            "actions": {
-                "type": "ACTION",
-                "shape": [
-                    32
-                ]
-            }
-        },
-        "device": null,
-        "use_amp": false,
         "chunk_size": 10,
         "n_action_steps": 10,
         "max_state_dim": 32,
         "max_action_dim": 32,
-        "resize_imgs_with_padding": [
-            224,
-            224
-        ],
-        "empty_cameras": 0,
-        "adapt_to_pi_aloha": false,
-        "use_delta_joint_actions_aloha": false,
-        "tokenizer_max_length": 256,
-        "discrete_action_max_length": 60,
         "proj_width": 1024,
-        "dropout": 0.1,
         "num_steps": 10,
-        "init_strategy": "no_init",
-        "use_cache": true,
+        "init_strategy": "expert_only_he_init",
         "attention_implementation": "eager",
         "freeze_vision_encoder": true,
         "train_expert_only": true,
+        "tokenizer_max_length": 256,
+        "discrete_action_max_length": 60,
         "optimizer_lr": 2.5e-05,
         "optimizer_betas": [
             0.9,
@@ -94,17 +54,17 @@
     "num_cams": 2,
     "max_state_dim": 32,
     "max_action_dim": 32,
-    "action_chunk": 50,
-    "loss_weighting": {"MSE": 10, "CE": 1},
-    "num_workers": 4,
+    "action_chunk": 10,
+    "loss_weighting": {"MSE": 1, "CE": 1},
+    "num_workers": 16,
     "batch_size": 2,
     "gradient_accumulation_steps": 1,
     "dataloader_batch_size": 2,
     "prefetch_factor": 8,
-    "steps": 100,
-    "log_freq": 1,
+    "steps": 40,
+    "log_freq": 5,
     "save_checkpoint": true,
-    "save_freq": 100,
+    "save_freq": 10,
     "use_policy_training_preset": true,
     "trace_nans": true,
     "optimizer": {
@@ -131,7 +91,7 @@
         "project": "pi05",
         "run_id": null,
         "name": null,
-        "notes": "Dev config for pi0.5",
+        "notes": "PI05 training run",
         "tags": [],
         "group": null,
         "job_type": null,

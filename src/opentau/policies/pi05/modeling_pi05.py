@@ -657,7 +657,10 @@ class PI05Policy(PreTrainedPolicy):
         state = batch["state"]
         state_np = state.to(device="cpu", dtype=torch.float32).numpy()
         if np.any(state_np < -1.0) or np.any(state_np > 1.0):
-            raise ValueError("State values are not normalized. All state values should be in [-1, 1].")
+            logging.warning(
+                f"State values are not normalized between -1 and 1. Min: {state_np.min()}, Max: {state_np.max()}"
+            )
+        state_np = np.clip(state_np, -1.0, 1.0)
         discretized_states = np.digitize(state_np, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
         return [
             " ".join(map(str, row)) for row in discretized_states
