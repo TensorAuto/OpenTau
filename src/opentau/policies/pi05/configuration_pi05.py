@@ -53,10 +53,6 @@ class PI05Config(PreTrainedConfig):
             Defaults to (224, 224).
         empty_cameras: Number of empty camera inputs to add. Used for specific adaptations like
             Aloha simulation. Defaults to 0.
-        adapt_to_pi_aloha: Whether to adapt joint and gripper values from standard Aloha space
-            to PI internal runtime space. Defaults to False.
-        use_delta_joint_actions_aloha: Whether to use delta joint actions for Aloha.
-            Currently not implemented. Defaults to False.
         tokenizer_max_length: Maximum length for tokenizer. Defaults to 256.
         discrete_action_max_length: Maximum length for discrete action tokens. Defaults to 32.
         proj_width: Width of the projection layer. Defaults to 1024.
@@ -100,14 +96,6 @@ class PI05Config(PreTrainedConfig):
     # Add empty images. Used by pi05_aloha_sim which adds the empty
     # left and right wrist cameras in addition to the top camera.
     empty_cameras: int = 0
-
-    # Converts the joint and gripper values from the standard Aloha space to
-    # the space used by the pi internal runtime which was used to train the base model.
-    adapt_to_pi_aloha: bool = False
-
-    # Converts joint dimensions to deltas with respect to the current state before passing to the model.
-    # Gripper dimensions will remain in absolute values.
-    use_delta_joint_actions_aloha: bool = False
 
     # Tokenizer
     tokenizer_max_length: int = 256
@@ -159,11 +147,6 @@ class PI05Config(PreTrainedConfig):
         if self.n_obs_steps != 1:
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
-            )
-
-        if self.use_delta_joint_actions_aloha:
-            raise NotImplementedError(
-                "`use_delta_joint_actions_aloha` is used by pi05 for aloha real models. It is not ported yet."
             )
 
         assert self.init_strategy in ["no_init", "full_he_init", "expert_only_he_init"], (

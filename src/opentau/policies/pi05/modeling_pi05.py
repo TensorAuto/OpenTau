@@ -35,7 +35,6 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import NormalizationMode
-from opentau.constants import OBS_STATE
 from opentau.policies.normalize import Normalize, Unnormalize
 from opentau.policies.pi05.configuration_pi05 import PI05Config
 from opentau.policies.pi05.paligemma_with_expert import (
@@ -550,9 +549,6 @@ class PI05Policy(PreTrainedPolicy):
         Returns:
             The sampled actions tensor of shape (batch_size, action_dim).
         """
-        if self.config.adapt_to_pi_aloha:
-            batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
-
         batch = self.normalize_inputs(batch)
 
         images, img_masks = self.prepare_images(batch)
@@ -571,9 +567,6 @@ class PI05Policy(PreTrainedPolicy):
         actions = actions[:, :, :original_action_dim]
 
         actions = self.unnormalize_outputs({"actions": actions})["actions"]
-
-        if self.config.adapt_to_pi_aloha:
-            actions = self._pi_aloha_encode_actions(actions)
 
         # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
         # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
