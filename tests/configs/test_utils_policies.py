@@ -112,7 +112,7 @@ def test_from_pretrained(tmp_path):
 
 def test_from_pretrained_model_exits(tmp_path):
     """
-    Tests if from_pretrained  downloads config from hugging face
+    Tests if from_pretrained downloads config from hugging face
     """
 
     repo_id = "ML_GOD/test"

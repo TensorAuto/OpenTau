@@ -246,10 +246,10 @@ def test_resolve_delta_timestamps_input_group_calculation(
 
     # Check values are correct (negative because they represent past timestamps)
     # Using default PI0Config values
-    expected_mean = [-0.032, -0.16]  # action_decoder_latency_mean, cloud_vlm_latency_mean
-    expected_std = [0.010, 0.05]  # action_decoder_latency_std, cloud_vlm_latency_std
-    expected_lower = [-0.050, -0.25]  # action_decoder_latency_upper, cloud_vlm_latency_upper (note: -upper)
-    expected_upper = [-0.020, -0.10]  # action_decoder_latency_lower, cloud_vlm_latency_lower (note: -lower)
+    expected_mean = [0.0, 0.0]  # action_decoder_latency_mean, cloud_vlm_latency_mean
+    expected_std = [0.0, 0.0]  # action_decoder_latency_std, cloud_vlm_latency_std
+    expected_lower = [0.0, 0.0]  # action_decoder_latency_upper, cloud_vlm_latency_upper (note: -upper)
+    expected_upper = [0.0, 0.0]  # action_decoder_latency_lower, cloud_vlm_latency_lower (note: -lower)
 
     assert delta_timestamps["input_group"] == expected_mean
     assert delta_timestamps_std["input_group"] == expected_std

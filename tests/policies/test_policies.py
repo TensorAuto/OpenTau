@@ -252,7 +252,7 @@ def test_backward_compatibility(ds_repo_id: str, policy_name: str, policy_kwargs
         torch.testing.assert_close(actions[key], saved_actions[key], rtol=rtol, atol=atol, check_device=False)
 
 
-@pytest.skip(reason="Skipping test_return_equal_bin")
+@pytest.mark.skip(reason="Skipping test_return_equal_bin")
 @pytest.mark.parametrize(
     "success, b, episode_end_idx, max_episode_length, current_idx, c_neg, expected_bin_idx",
     [(True, 200, 401, 600, 200, -1000.0, int(400 / 3)), (False, 200, 401, 600, 200, -1000.0, 0)],
