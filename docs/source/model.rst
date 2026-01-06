@@ -8,7 +8,7 @@ pi05
 - Pi05 is a state of the art Vision-language-action flow model for general robot control. It supports both autoregressive discrete actions and flow matching continuous actions.
 - More details can be found in the `pi05 paper <https://www.pi.website/download/pi05.pdf>`_.
 - See the implementation in `src/opentau/policies/pi05/modeling_pi05.py`.
-- Checkpoint of the model finetuned on the LIBERO dataset is available on Hugging Face: `TensorAuto/tPi05-Libero <https://huggingface.co/TensorAuto/tPi05-Libero>`_
+- Checkpoint of the model finetuned on the LIBERO dataset is available on Hugging Face: `TensorAuto/tPi05-Libero <https://huggingface.co/TensorAuto/tPi0.5-libero>`_
 - Disclaimer: Our implementation doesn't support sub-task prediction yet, as mentioned in the paper.
 
 
