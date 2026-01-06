@@ -31,11 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Free Disk Space (Ubuntu)
-        uses: jlumbroso/free-disk-space-action@v1.3.1
-        with:
-          # this might remove tools that are actually needed,
-          # if set to "true" but frees about 6GB
-          tool-cache: false
+        uses: jlumbroso/free-disk-space@main
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
