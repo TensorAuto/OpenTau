@@ -28,7 +28,7 @@ from opentau.utils.utils import auto_torch_device
 
 @pytest.fixture(scope="session")
 def device():
-    return os.environ.get("LEROBOT_TEST_DEVICE", auto_torch_device())
+    return os.environ.get("OPENTAU_TEST_DEVICE", auto_torch_device())
 
 
 def require_x86_64_kernel(func):

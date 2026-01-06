@@ -26,7 +26,7 @@ from opentau.datasets.utils import create_lerobot_dataset_card, hf_transform_to_
 def test_default_parameters():
     card = create_lerobot_dataset_card()
     assert isinstance(card, DatasetCard)
-    assert card.data.tags == ["LeRobot"]
+    assert card.data.tags == ["OpenTau"]
     assert card.data.task_categories == ["robotics"]
     assert card.data.configs == [
         {
@@ -39,7 +39,7 @@ def test_default_parameters():
 def test_with_tags():
     tags = ["tag1", "tag2"]
     card = create_lerobot_dataset_card(tags=tags)
-    assert card.data.tags == ["LeRobot", "tag1", "tag2"]
+    assert card.data.tags == ["OpenTau", "tag1", "tag2"]
 
 
 def test_calculate_episode_data_index():

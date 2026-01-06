@@ -120,7 +120,7 @@ DATASET_CARD_TEMPLATE = """
 ---
 # Metadata will go there
 ---
-This dataset was created using [LeRobot](https://github.com/huggingface/lerobot).
+This dataset was created using [OpenTau](https://github.com/TensorAuto/OpenTau).
 
 ## {}
 
@@ -949,10 +949,10 @@ def create_lerobot_dataset_card(
     **kwargs,
 ) -> DatasetCard:
     """
-    Keyword arguments will be used to replace values in ./lerobot/common/datasets/card_template.md.
+    Keyword arguments will be used to replace values in `src/opentau/datasets/card_template.md`.
     Note: If specified, license must be one of https://huggingface.co/docs/hub/repositories-licenses.
     """
-    card_tags = ["LeRobot"]
+    card_tags = ["OpenTau"]
 
     if tags:
         card_tags += tags

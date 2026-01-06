@@ -425,14 +425,14 @@ def test_dataset_feature_with_forward_slash_raises_error():
     # make sure dir does not exist
     from opentau.constants import HF_OPENTAU_HOME
 
-    dataset_dir = HF_OPENTAU_HOME / "lerobot/test/with/slash"
+    dataset_dir = HF_OPENTAU_HOME / "opentau/test/with/slash"
     # make sure does not exist
     if dataset_dir.exists():
         dataset_dir.rmdir()
 
     with pytest.raises(ValueError):
         LeRobotDataset.create(
-            repo_id="lerobot/test/with/slash",
+            repo_id="opentau/test/with/slash",
             fps=30,
             features={"a/b": {"dtype": "float32", "shape": 2, "names": None}},
         )

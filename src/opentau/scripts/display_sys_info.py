@@ -16,7 +16,7 @@
 # limitations under the License.
 
 """Use this script to get a quick summary of your system config.
-It should be able to run without any of LeRobot's dependencies or LeRobot itself installed.
+It should be able to run without any of OpenTau's dependencies or OpenTau itself installed.
 """
 
 import platform

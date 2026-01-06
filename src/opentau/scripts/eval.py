@@ -14,38 +14,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Evaluate a policy on an environment by running rollouts and computing metrics.
-
-Usage examples:
-
-You want to evaluate a model from the hub (eg: https://huggingface.co/lerobot/diffusion_pusht)
-for 10 episodes.
-
-```
-lerobot-eval \
-    --policy.path=lerobot/diffusion_pusht \
-    --env.type=pusht \
-    --eval.batch_size=10 \
-    --eval.n_episodes=10 \
-    --use_amp=false \
-    --device=cuda
-```
-
-OR, you want to evaluate a model checkpoint from the LeRobot training script for 10 episodes.
-```
-lerobot-eval \
-    --policy.path=outputs/train/diffusion_pusht/checkpoints/005000/pretrained_model \
-    --env.type=pusht \
-    --eval.batch_size=10 \
-    --eval.n_episodes=10 \
-    --use_amp=false \
-    --device=cuda
-```
-
-Note that in both examples, the repo/folder should contain at least `config.json` and `model.safetensors` files.
-
-You can learn about the CLI options for this script in the `EvalPipelineConfig` in lerobot/configs/eval.py
-"""
+"""Evaluate a policy on an environment by running rollouts and computing metrics."""
 
 import concurrent.futures as cf
 import datetime as dt
@@ -166,7 +135,7 @@ def rollout(
     check_env_attributes_and_types(env)
     successes = np.zeros((env.num_envs,), dtype=bool)
     while not np.all(done) and step < max_steps:
-        # Numpy array to tensor and changing dictionary keys to LeRobot policy format.
+        # Numpy array to tensor and changing dictionary keys to OpenTau policy format.
         observation = preprocess_observation(observation, cfg=cfg)
         # Infer "task" from attributes of environments.
         # TODO: works with SyncVectorEnv but not AsyncVectorEnv
