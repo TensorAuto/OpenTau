@@ -239,7 +239,7 @@ def test_to_dict(dataset_mixture_config, dataset_config):
 
 def test_from_pretrained_path_exists(tmp_path):
     """
-    Tests if from_pretrained  works properly
+    Tests if from_pretrained works properly
     """
 
     with open(tmp_path / "train_config.json", "w") as f:
@@ -253,7 +253,7 @@ def test_from_pretrained_path_exists(tmp_path):
 
 def test_from_pretrained_file_does_not_exists(tmp_path):
     """
-    Tests if from_pretrained  raises Parsing Error when empty path is given
+    Tests if from_pretrained raises Parsing Error when empty path is given
     """
 
     with pytest.raises(ParsingError):
@@ -262,7 +262,7 @@ def test_from_pretrained_file_does_not_exists(tmp_path):
 
 def test_from_pretrained_path_does_not_exits():
     """
-    Tests if from_pretrained  raises FileNotFound Error when invalid higging face repo id is passed
+    Tests if from_pretrained raises FileNotFound Error when invalid higging face repo id is passed
     """
     with pytest.raises(FileNotFoundError):
         TrainPipelineConfig.from_pretrained(pretrained_name_or_path="bert123")
@@ -270,7 +270,7 @@ def test_from_pretrained_path_does_not_exits():
 
 def test_from_pretrained_file_exits(tmp_path):
     """
-    Tests if from_pretrained  downloads config from local directory
+    Tests if from_pretrained downloads config from local directory
     """
 
     with open(tmp_path / "train_config.json", "w") as f:
@@ -284,7 +284,7 @@ def test_from_pretrained_file_exits(tmp_path):
 
 def test_from_pretrained_model_exits(tmp_path):
     """
-    Tests if from_pretrained  downloads config from hugging face
+    Tests if from_pretrained downloads config from hugging face
     """
 
     repo_id = "ML_GOD/test"
