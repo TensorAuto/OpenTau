@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://www.tensor.auto">
-    <img src="assets/logo.png" alt="Logo" width="100">
+    <img src="assets/logo.png" alt="Logo">
   </a>
 </p>
 
