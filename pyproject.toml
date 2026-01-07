@@ -76,7 +76,7 @@ dependencies = [
     "onnxruntime-gpu>=1.22.0 ; ((sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and (platform_machine == 'AMD64' or platform_machine == 'x86_64'))) ",
     "onnxscript>=0.3.1",
     "onnx-ir>=0.1.4",
-    "transformers @ git+https://github.com/huggingface/transformers.git@dcddb97",
+    "opentau-transformers==4.53.3",
     "scipy>=1.15.2",
     "pytest>=8.1.0",
     "pytest-cov>=5.0.0",
