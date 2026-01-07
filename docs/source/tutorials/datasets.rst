@@ -30,7 +30,7 @@ You can define a dataset mixture in your configuration file using the ``dataset_
         ...
     }
 
-For each new dataset, you must add an entry to ``opentau/datasets/standard_data_format_mapping.py`` to map the dataset features to the Standard Data Format.
+For each new dataset, you must add an entry to ``src/opentau/datasets/standard_data_format_mapping.py`` to map the dataset features to the Standard Data Format.
 Alternatively, you can provide a custom mapping in the dataset config using the ``data_features_name_mapping`` and ``loss_type_mapping`` keys.
 For example:
 
@@ -67,7 +67,7 @@ Each training config should contain a dataset mixture definition. To evaluate th
 
 .. code-block:: bash
 
-    python lerobot/scripts/compute_max_token_length.py \
+    python src/opentau/scripts/compute_max_token_length.py \
         --target_cfg=<path/to/your/training/config.json>\
         --output_path=outputs/stats/token_count.json \
         --num_workers=10

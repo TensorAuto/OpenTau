@@ -12,7 +12,7 @@ Datasets
 --------
 Datasets are used to handle data loading and processing.
 It supports downloading datasets from the Hugging Face Hub and loading them from local disk.
-The dataset format is versioned (currently v2.0) and utilizes parquet files for data and mp4 files for videos to ensure efficiency and portability.
+The dataset format is versioned (currently v2.1) and utilizes parquet files for data and mp4 files for videos to ensure efficiency and portability.
 There are currently two types of datasets:
 
 *   ``LeRobotDataset``: For robotic data.
@@ -55,7 +55,6 @@ The Standard Data Format is the expected data format returned by ``torch.utils.d
 
         "state": torch.Tensor,    # shape (max_state_dim)
         "actions": torch.Tensor,  # shape (action_chunk, max_action_dim)
-        "frozen_actions": torch.Tensor,  # shape (frozen_actions, max_action_dim)
         "prompt": str,            # the task prompt, e.g. "Pick up the object and place it on the table."
         "response": str,          # the response from the VLM for vision QA tasks. For LeRobotDataset, this will be an empty string.
         "loss_type": str,         # the loss type to be applied to this sample (either "CE" for cross entropy or "MSE" for mean squared error)
@@ -74,8 +73,6 @@ The config file will have to provide the following information in TrainPipelineC
 
 Cameras should be labeled in order of importance (e.g. camera0 is the most important camera, camera1 is the second most important camera, etc.). The model dataset will select the most important cameras to use if num_cams is less than the number of cameras in the dataset.
 
-Both the prompt and response strings should contain exactly one newline character at the end of the string unless they are empty strings.
-
 Configs
 -------
 Configuration management is handled using `Draccus <https://github.com/dlwh/draccus>`_.
@@ -85,5 +82,5 @@ policy configuration, and environment setup. Configs can be loaded from pretrain
 Environments
 ------------
 Environments wrap simulation or real-robot interfaces compatible with OpenAI Gym/Gymnasium.
-The factory ``lerobot/common/envs/factory.py`` creates vectorized environments for efficient training and evaluation.
+The factory ``src/opentau/envs/factory.py`` creates vectorized environments for efficient training and evaluation.
 Currently, only `Libero <https://libero-project.github.io/main.html>`_ is supported and it is configured via ``opentau.envs.configs.LiberoEnv``.

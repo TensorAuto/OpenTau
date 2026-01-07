@@ -11,4 +11,3 @@ API Reference
    opentau.utils
    opentau.constants
    opentau.configs
-   opentau.planner

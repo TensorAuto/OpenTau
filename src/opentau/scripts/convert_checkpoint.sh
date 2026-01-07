@@ -16,7 +16,7 @@
 
 # Script to convert DeepSpeed checkpoint to model.safetensors
 # Usage: ./convert_checkpoint.sh <checkpoint_directory>
-# Example: ./convert_checkpoint.sh outputs/train/tau0/checkpoints/000040/
+# Example: ./convert_checkpoint.sh outputs/train/pi05/checkpoints/000040/
 
 set -e  # Exit on any error
 
@@ -24,7 +24,7 @@ set -e  # Exit on any error
 if [ $# -eq 0 ]; then
     echo "Error: Please provide the checkpoint directory path"
     echo "Usage: $0 <checkpoint_directory>"
-    echo "Example: $0 outputs/train/tau0/checkpoints/000040/"
+    echo "Example: $0 outputs/train/pi05/checkpoints/000040/"
     exit 1
 fi
 

@@ -7,13 +7,13 @@ Evaluation
 Evaluating a policy in Simulation
 ---------------------------------
 
-OpenTau supports evaluation in asynchronous vectorized simulation environments. To evaluate a policy in simulation, you can launch the ``lerobot/scripts/eval.py`` script with ``accelerate launch``.
+OpenTau supports evaluation in asynchronous vectorized simulation environments. To evaluate a policy in simulation, you can launch the ``src/opentau/scripts/eval.py`` script with ``accelerate launch``.
 Each accelerate process will only work on its fraction of the tasks, improving throughput.
 For example, to evaluate a policy on the LIBERO 10, run:
 
 .. code-block:: bash
 
-    accelerate launch --config_file <ACCELERATE_CONFIG_PATH> lerobot/scripts/eval.py --config_path=outputs/train/tau0/checkpoints/000040/train_config.json
+    accelerate launch --config_file <ACCELERATE_CONFIG_PATH> src/opentau/scripts/eval.py --config_path=outputs/train/pi05/checkpoints/000040/train_config.json
 
 .. note::
    You can't pass in an DeepSpeed accelerate config file to ``eval.py`` as DeepSpeed expects optimizer and dataloader during ``accelerator.prepare()``, which we do not provide during eval. It is recommended to pass in a DDP config.
@@ -44,5 +44,3 @@ OpenTau currently supports the `LIBERO benchmark <https://libero-project.github.
     }
 
 This will run the 0th task and 2nd task in ``libero_spatial``. Each task will run for 8 simulations in parallel.
-
-When launched with accelerate, each GPU process will only work on its fraction of the tasks, improving throughput.
