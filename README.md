@@ -44,12 +44,13 @@ For using local notebooks to train and evaluate models, find the notebooks at `n
 For using the Google Colab notebooks to train and evaluate models, find the colab notebooks here: [pi05_training](https://colab.research.google.com/drive/1DeU0lNnEzs1KHo0Nkgh4YKBr-xu9moBM?usp=sharing) and [pi05_evaluation_only](https://colab.research.google.com/drive/1U_AyuH9WYMT4anEWvsOtIT7g01jA0WGm?usp=sharing) respectively.
 
 ## Checkpoints
-We provide fully functioning $\pi_{0.5}$ checkpoints trained on the LIBERO dataset with high success rates. We plan to release more models in the near future.
+We provide fully functioning $\pi_{0.5}$ checkpoints trained with high success rates. We plan to release more models in the near future.
 
-| Model Checkpoint              | Description                                                                                                  | Success Rate (%)                                                   |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------ |
-| [TensorAuto/tPi0.5-libero][2] | A $\pi_{0.5}$ model checkpoint trained on the LIBERO dataset with discrete actions and knowledge insulation. | 98.4% (10) <br> 97.6% (Goal) <br> 100% (Object) <br> 98% (Spatial) |
-| More coming soon...           |                                                                                                              |                                                                    |
+| Model Checkpoint              | Description                                                                                                   | Success Rate (%)                                                   |
+|-------------------------------|---------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------|
+| [TensorAuto/tPi0.5-libero][2] | A $\pi_{0.5}$ model checkpoint trained on the LIBERO dataset with discrete actions and knowledge insulation.  | 98.4% (10) <br> 97.6% (Goal) <br> 100% (Object) <br> 98% (Spatial) |
+| [TensorAuto/pi05_base][5]     | A $\pi_{0.5}$ model checkpoint converted from the official openpi checkpoint, with language embeddings added. | N/A                                                                |
+| More coming soon...           |                                                                                                               |                                                                    |
 
 ## Acknowledgements
 
@@ -59,3 +60,4 @@ This project builds on the $\pi$ series of [papers][3] and many other open-sourc
 [2]:	https://huggingface.co/TensorAuto/tPi0.5-libero
 [3]:	https://www.pi.website/blog
 [4]:	https://huggingface.co/lerobot
+[5]:    https://huggingface.co/TensorAuto/pi05_base
