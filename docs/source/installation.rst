@@ -29,8 +29,27 @@ GPU Requirements
 - Multi-GPU setups (A100, H100, etc.) should be used for large-scale training.
 
 
+Installation with PyPI
+----------------------
+
+You can install OpenTau directly from PyPI using pip:
+
+.. code-block:: bash
+
+    pip install opentau
+
+To install with extra dependencies (e.g., ``dev``, ``openai``, ``libero``), use brackets:
+
+.. code-block:: bash
+
+    pip install opentau[dev,openai,libero]
+
+
+Installation with Source Code
+-----------------------------
+
 Download Source Code
----------------------
+^^^^^^^^^^^^^^^^^^^^
 
 Download the source code:
 
@@ -41,7 +60,7 @@ Download the source code:
 
 
 Environment Setup
------------------
+^^^^^^^^^^^^^^^^^
 
 We recommend using `uv <https://docs.astral.sh/uv/>`_ for fast and simple Python dependency management.
 
@@ -49,11 +68,17 @@ We recommend using `uv <https://docs.astral.sh/uv/>`_ for fast and simple Python
    Follow the `official uv installation instructions <https://docs.astral.sh/uv/getting-started/installation/>`_.
 
 2. **Install dependencies**
-   Sync all required dependencies and optional extras with:
+   Sync all required dependencies. To install all extras:
 
    .. code-block:: bash
 
-      uv sync --all-extras
+      uv sync
+
+   To install specific extras (e.g., ``dev``, ``openai``, ``libero``):
+
+   .. code-block:: bash
+
+      uv sync --extra dev --extra openai --extra libero
 
 3. **Activate the virtual environment**
 
@@ -63,7 +88,7 @@ We recommend using `uv <https://docs.astral.sh/uv/>`_ for fast and simple Python
 
 
 Docker Installation (Optional)
--------------------------------------------
+------------------------------
 
 You can also use Docker to install and run OpenTau.
 
