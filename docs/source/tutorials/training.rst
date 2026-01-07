@@ -7,7 +7,7 @@ Training and Checkpointing
 Distributed Training Configuration
 ----------------------------------
 
-For an accelerate config example, see `this config file <../../examples/accelerate_ci_config.yaml>`_ used for our CI pipelines.
+For an accelerate config example, see `this config file <https://github.com/TensorAuto/OpenTau/blob/main/configs/examples/accelerate_deepspeed_config.yaml>`_ used for our CI pipelines.
 
 To train a model, run the following command:
 
@@ -21,14 +21,14 @@ Optionally, to use a specific accelerate config file (instead of the default), r
 
 .. code-block:: bash
 
-    opentau-train --accelerate-config=examples/accelerate_ci_config.yaml --config_path=examples/pi05_config.json
+    opentau-train --accelerate-config=configs/examples/accelerate_deepspeed_config.yaml --config_path=configs/examples/pi05_config.json
 
 .. note::
    For advanced users: ``opentau-train`` is a convenience wrapper that invokes ``accelerate launch`` and ``src/opentau/scripts/train.py``. The command above is equivalent to running:
 
    .. code-block:: bash
 
-       accelerate launch --config_file examples/accelerate_ci_config.yaml src/opentau/scripts/train.py --config_path=examples/pi05_config.json
+       accelerate launch --config_file configs/examples/accelerate_deepspeed_config.yaml src/opentau/scripts/train.py --config_path=configs/examples/pi05_config.json
 
 Checkpointing and Resuming Training
 -----------------------------------

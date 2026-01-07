@@ -51,7 +51,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          uv sync --extra dev --extra openai
+          uv sync --all-extras
 
       - name: Activate virtual environment and verify Python
         run: |

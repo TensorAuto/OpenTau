@@ -443,13 +443,6 @@ def on_accelerate_main_proc(*, local=False, _sync=False):
     """
 
     def decorator(func):
-        if local and _sync:
-            warnings.warn(
-                f"Using local=True with _sync=True when decorating {func.__qualname__} forces a wait_for_everyone. "
-                "But the broadcast is not necessary returning the correct result on all nodes.",
-                stacklevel=2,
-            )
-
         @wraps(func)
         def wrapper(*args, **kwargs):
             state = accelerate.state.PartialState()

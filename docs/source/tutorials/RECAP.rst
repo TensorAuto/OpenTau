@@ -5,26 +5,26 @@ RECAP Training on pi0 policy
 Introduction
 ^^^^^^^^^^^^^^^
 
-This tutorial demonstrates how we train a pi0 policy on libero dataset using offline RL that closely follows the training procedure of Physical Intelligence on pi06-star.
-Currently, we only support offline RL training on pi0 policy. In the future, we will make it compatible with pi05 policy .
+This tutorial demonstrates how we train a pi0 policy on libero dataset using offline RL that closely follows the training procedure of Physical Intelligence on :math:`\pi_{0.6}^{*}`.
+Currently, we only support offline RL training on pi0 policy. In the future, we will make it compatible with more :math:`\pi` policies.
 
 The procedure is as follows:
 
-1. SFT Training the VLA policy on whole libero dataset till convergence.
-2. Fine-tuning the value function on whole libero dataset till convergence.
+1. SFT train the VLA policy on whole libero dataset till convergence.
+2. Fine-tune the value function on whole libero dataset till convergence.
 3. Repeat the below steps for 1-3 times:
     i. Collect the dataset by rolling out the VLA policy on the single libero task
-    ii. Fine Tune the value function on collection of original dataset and all the previously rolled out dataset
-    iii. Compute the advantage for each data point using the fine-tuned value function and calculate the epsilon threshold for setting I\ :sub:`t`\ (Indicator) for VLA policy training.
-    iv. Fine Tune the VLA policy on collection of original dataset and all the previously rolled out dataset
+    ii. Finetune the value function on collection of original dataset and all the previously rolled out datasets
+    iii. Compute the advantage for each data point using the finetuned value function and calculate the epsilon threshold for setting :math:`I_t` (indicator) for VLA policy training.
+    iv. Finetune the VLA policy on collection of original dataset and all the previously rolled out datasets
 
 
 Stage 1: SFT Training the VLA policy on whole libero dataset till convergence.
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Pi0 pretrained checkpoint is used as starting point for this step.
-Pi0 is trained on whole libero dataset (physical intelligence/libero) for around 10k steps before it converges to 80% success rate on moka pot libero-10 task.
-During the whole training, I\ :sub:`t`\ Indicator is set to True for all the data points, i.e assuming that the expert policy is always taking optimal action for a given state.
+Pi0 is trained on whole libero dataset (physical-intelligence/libero) for around 10k steps before it converges to 80% success rate on moka pot libero-10 task.
+During the whole training, :math:`I_t` indicator is set to True for all the data points, i.e. assuming that the expert policy is always taking optimal action for a given state.
 Training the policy on whole libero tasks gives a better baseline for the offline RL training compared to just training on a single task.
 
 Example of important config fields for SFT training:
@@ -72,7 +72,7 @@ Command line to run the SFT training:
 Stage 2: Fine-tuning the value function on whole libero dataset till convergence.
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Instead of training the value function on huge pre training dataset of pi05 policy, we consider training it on whole libero dataset (physical intelligence/libero) as a pre-training step.
+Instead of training the value function on the huge pretraining dataset of pi05 policy, we consider training it on whole libero dataset (physical intelligence/libero) as a pre-training step.
 This helps to have a good baseline for value function training in the offline RL training, avoiding overfitting by training on multiple tasks, thus providing multi task value function.
 Value function was trained for approximately 80k steps to achieve close to 100% accuracy on whole libero dataset.
 
@@ -90,7 +90,7 @@ Recipe for value function training:
          -1 & \text{otherwise}
       \end{cases}
 
-   where :math:`t` is the timestep, :math:`T` is the final timestep of the episode, and :math:`C_{\text{fail}}` is a large negative constant for failed episodes.
+   where :math:`t` is the timestep, :math:`T` is the final timestep of the episode, and :math:`-C_{\text{fail}}` is a large negative constant for failed episodes.
 
    The value function is trained to predict the negative number of remaining steps until success or a large negative value for failed episodes, with values normalized between :math:`(-1, 0)`.
 
@@ -119,7 +119,7 @@ Example of important config fields for value function training:
             }
         ],
         "weights": [
-            2.0
+            1.0
         ],
         "action_freq": 10.0,
         "image_resample_strategy": "nearest",
@@ -221,7 +221,7 @@ Command line to run the value function fine-tuning:
     opentau-train --accelerate-config=<path/to/accelerate_config.yaml> --config_path=<path/to/config.json>
 
 
-Sub-stage 3: Compute the advantage for each data point using the fine-tuned value function and calculate the epsilon threshold for setting I\ :sub:`t`\ (Indicator) VLA policy training.
+Sub-stage 3: Compute the advantage for each data point using the fine-tuned value function and calculate the epsilon threshold for setting :math:`I_t` (Indicator) VLA policy training.
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 The advantage is computed using the classic RL advantage formula:
 
@@ -257,7 +257,7 @@ Sub-stage 4: Fine Tune the VLA policy on collection of original dataset and all 
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 The VLA policy is fine-tuned on the collection of original dataset and all the previously rolled out dataset using the above mentioned procedure.
 Pretained VLA policy is used as a starting point for the fine-tuning and not the latest iteration VLA policy as mentioned in the PI paper.
-The I\ :sub:`t`\ (Indicator) VLA policy training is set to True (I\ :sub:`t`\ = "Advantage : Positive") for all the data points where the advantage is greater than the epsilon threshold.
+The :math:`I_t` (Indicator) VLA policy training is set to True (:math:`I_t` = "Advantage : Positive") for all the data points where the advantage is greater than the epsilon threshold.
 
 Example of important config fields for VLA policy fine-tuning:
 
@@ -276,6 +276,7 @@ Example of important config fields for VLA policy fine-tuning:
 
         ],
         "weights": [
+            1.0,
             1.0
         ],
         "action_freq": 10.0,
