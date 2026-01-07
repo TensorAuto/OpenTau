@@ -126,4 +126,4 @@ Configure accelerate for your distributed training setup:
 
     accelerate config
 
-This will create an accelerate config file at `~/.cache/huggingface/accelerate/default_config.yaml`. We are currently using DeepSpeed ZeRO2 for model parallelism distributed training. For an accelerate config example, see `this config file <../../examples/accelerate_ci_config.yaml>`_ used for our CI pipelines.
+This will create an accelerate config file at `~/.cache/huggingface/accelerate/default_config.yaml`. We are currently using DeepSpeed ZeRO2 for model parallelism distributed training. For an accelerate config example, see `this config file <https://github.com/TensorAuto/OpenTau/blob/main/configs/examples/accelerate_deepspeed_config.yaml>`_ used for our CI pipelines.
