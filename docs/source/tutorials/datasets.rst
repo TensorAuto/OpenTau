@@ -30,7 +30,7 @@ You can define a dataset mixture in your configuration file using the ``dataset_
         ...
     }
 
-For each new dataset, you must add an entry to ``src/opentau/datasets/standard_data_format_mapping.py`` to map the dataset features to the Standard Data Format.
+For each new dataset, you must add an entry to `src/opentau/datasets/standard_data_format_mapping.py <https://github.com/TensorAuto/OpenTau/blob/main/src/opentau/datasets/standard_data_format_mapping.py>`_ to map the dataset features to the Standard Data Format.
 Alternatively, you can provide a custom mapping in the dataset config using the ``data_features_name_mapping`` and ``loss_type_mapping`` keys.
 For example:
 

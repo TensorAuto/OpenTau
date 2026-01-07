@@ -24,7 +24,7 @@ Optionally, to use a specific accelerate config file (instead of the default), r
     opentau-train --accelerate-config=configs/examples/accelerate_deepspeed_config.yaml --config_path=configs/examples/pi05_config.json
 
 .. note::
-   For advanced users: ``opentau-train`` is a convenience wrapper that invokes ``accelerate launch`` and ``src/opentau/scripts/train.py``. The command above is equivalent to running:
+   For advanced users: ``opentau-train`` is a convenience wrapper that invokes ``accelerate launch`` and `src/opentau/scripts/train.py <https://github.com/TensorAuto/OpenTau/blob/main/src/opentau/scripts/train.py>`_. The command above is equivalent to running:
 
    .. code-block:: bash
 

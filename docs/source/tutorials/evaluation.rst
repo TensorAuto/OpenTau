@@ -7,7 +7,7 @@ Evaluation
 Evaluating a policy in Simulation
 ---------------------------------
 
-OpenTau supports evaluation in asynchronous vectorized simulation environments. To evaluate a policy in simulation, you can launch the ``src/opentau/scripts/eval.py`` script with ``accelerate launch``.
+OpenTau supports evaluation in asynchronous vectorized simulation environments. To evaluate a policy in simulation, you can launch the `src/opentau/scripts/eval.py <https://github.com/TensorAuto/OpenTau/blob/main/src/opentau/scripts/eval.py>`_ script with ``accelerate launch``.
 Each accelerate process will only work on its fraction of the tasks, improving throughput.
 For example, to evaluate a policy on the LIBERO 10, run:
 

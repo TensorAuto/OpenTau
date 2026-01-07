@@ -82,5 +82,5 @@ policy configuration, and environment setup. Configs can be loaded from pretrain
 Environments
 ------------
 Environments wrap simulation or real-robot interfaces compatible with OpenAI Gym/Gymnasium.
-The factory ``src/opentau/envs/factory.py`` creates vectorized environments for efficient training and evaluation.
+The factory `src/opentau/envs/factory.py <https://github.com/TensorAuto/OpenTau/blob/main/src/opentau/envs/factory.py>`_ creates vectorized environments for efficient training and evaluation.
 Currently, only `Libero <https://libero-project.github.io/main.html>`_ is supported and it is configured via ``opentau.envs.configs.LiberoEnv``.
