@@ -36,10 +36,10 @@ OpenTau ($\tau$) is a tool developed by *[Tensor][1]* to bridge this gap, and we
 ## Quick Start
 If you are familiar with LeRobot, getting started with OpenTau is very easy.
 Because OpenTau is a fork of the popular LeRobot repository, any LeRobot-compliant policy and dataset can be used directly with OpenTau.
-Check out our documentation to get started quickly.
-We provide a quick start guide to help you get started with OpenTau.
+Check out our [documentation](https://opentau.readthedocs.io/) to get started quickly.
+We provide a [quick start guide](https://opentau.readthedocs.io/en/latest/getting_started.html) to help you get started with OpenTau.
 
-For using local notebooks to train and evaluate models, find the notebooks at `notebooks/pi05_training.ipynb` and `notebooks/pi05_evaluation_only.ipynb`.
+For using local notebooks to train and evaluate models, find the notebooks at [notebooks/pi05_training.ipynb](https://github.com/TensorAuto/OpenTau/blob/main/notebooks/pi05_training.ipynb) and [notebooks/pi05_evaluation_only.ipynb](https://github.com/TensorAuto/OpenTau/blob/main/notebooks/pi05_evaluation_only.ipynb).
 
 For using the Google Colab notebooks to train and evaluate models, find the colab notebooks here: [pi05_training](https://colab.research.google.com/drive/1DeU0lNnEzs1KHo0Nkgh4YKBr-xu9moBM?usp=sharing) and [pi05_evaluation_only](https://colab.research.google.com/drive/1U_AyuH9WYMT4anEWvsOtIT7g01jA0WGm?usp=sharing) respectively.
 
