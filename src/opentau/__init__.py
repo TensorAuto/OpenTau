@@ -55,6 +55,7 @@ When implementing a new policy class (e.g., `DiffusionPolicy`), follow these ste
 
 import itertools
 
+from opentau.utils import transformers_patch  # noqa: F401
 from opentau.__version__ import __version__  # noqa: F401
 
 # TODO(rcadene): Improve policies and envs. As of now, an item in `available_policies`
