@@ -98,6 +98,7 @@ jobs:
           mkdir -p /tmp/libero-assets/libero/libero
           export LIBERO_CONFIG_PATH="$(pwd)/.github/assets/libero"
           echo LIBERO_CONFIG_PATH is $LIBERO_CONFIG_PATH
+          python3 -c "import sys; print(sys.path)"
           python3 -c "import libero.libero" && echo "LIBERO config set successfully."
 
       - name: Run CPU tests with coverage
