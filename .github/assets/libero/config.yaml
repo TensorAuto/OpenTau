@@ -1,0 +1,5 @@
+assets: /tmp/libero-assets/libero/libero/./assets
+bddl_files: /tmp/libero-assets/libero/libero/./bddl_files
+benchmark_root: /tmp/libero-assets/libero/libero
+datasets: /tmp/libero-assets/libero/libero/../datasets
+init_states: /tmp/libero-assets/libero/libero/./init_files
