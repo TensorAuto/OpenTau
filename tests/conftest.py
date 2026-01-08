@@ -23,13 +23,13 @@ from huggingface_hub import HfApi
 from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
 from tests.utils import device
 
-# Set OpenGL platform to OSMESA for headless environments
+# Set OpenGL platform to EGL for headless environments
 # This must be done before any OpenGL imports
 if "PYOPENGL_PLATFORM" not in os.environ:
-    os.environ["PYOPENGL_PLATFORM"] = "osmesa"
+    os.environ["PYOPENGL_PLATFORM"] = "egl"
 
 # Ensure the environment variable is set for subprocesses
-os.environ["PYOPENGL_PLATFORM"] = "osmesa"
+os.environ["PYOPENGL_PLATFORM"] = "egl"
 
 
 # Patch the problematic EGLDeviceEXT attribute that doesn't exist in some OpenGL versions
