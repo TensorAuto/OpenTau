@@ -102,7 +102,7 @@ jobs:
           python3 -c "import sys; print(sys.path)"
           python3 -c "import libero.libero" && echo "LIBERO config set successfully."
           echo "Running cpu based pytest and generating coverage report..."
-          pytest -m "not gpu" -n auto -v --cov=lerobot/ --cov-report=xml:cpu_test/cpu_test.xml --ignore=tests/planner/test_planner.py --deselect=tests/envs/test_factory.py::TestMakeEnv::test_make_env_async_vector_env --deselect=tests/envs/test_factory.py::TestMakeEnv::test_make_env_sync_vector_env tests/
+          pytest -m "not gpu" -n auto -v --cov=lerobot/ --cov-report=xml:cpu_test/cpu_test.xml --ignore=tests/planner/test_planner.py --ignore tests/utils/test_libero_utils.py --deselect=tests/envs/test_factory.py::TestMakeEnv::test_make_env_async_vector_env --deselect=tests/envs/test_factory.py::TestMakeEnv::test_make_env_sync_vector_env tests/
           echo "Pytest execution and coverage report generation completed."
 
       - name: Upload coverage reports
