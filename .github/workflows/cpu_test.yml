@@ -96,8 +96,6 @@ jobs:
       - name: Run CPU tests with coverage
         run: |
           source .venv/bin/activate
-          export MUJOCO_GL=osmesa
-          export PYOPENGL_PLATFORM=osmesa
           echo "Running cpu based pytest and generating coverage report..."
           pytest -m "not gpu" -n auto -v --cov=lerobot/ --cov-report=xml:cpu_test/cpu_test.xml --ignore=tests/planner/test_planner.py --ignore=tests/envs/test_factory.py::TestMakeEnv::test_make_env_async_vector_env --ignore=tests/envs/test_factory.py::TestMakeEnv::test_make_env_sync_vector_env tests/
           echo "Pytest execution and coverage report generation completed."
