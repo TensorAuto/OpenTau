@@ -93,20 +93,14 @@ jobs:
       - name: Check disk space
         run: df -h /dev/shm
 
-      - name: set LIBERO config
+      - name: Run CPU tests with coverage
         run: |
           source .venv/bin/activate
-          echo $PATH
-          which python3
           mkdir -p /tmp/libero-assets/libero/libero
           export LIBERO_CONFIG_PATH="$(pwd)/.github/assets/libero"
           echo LIBERO_CONFIG_PATH is $LIBERO_CONFIG_PATH
           python3 -c "import sys; print(sys.path)"
           python3 -c "import libero.libero" && echo "LIBERO config set successfully."
-
-      - name: Run CPU tests with coverage
-        run: |
-          source .venv/bin/activate
           echo "Running cpu based pytest and generating coverage report..."
           pytest -m "not gpu" -n auto -v --cov=lerobot/ --cov-report=xml:cpu_test/cpu_test.xml --ignore=tests/planner/test_planner.py --deselect=tests/envs/test_factory.py::TestMakeEnv::test_make_env_async_vector_env --deselect=tests/envs/test_factory.py::TestMakeEnv::test_make_env_sync_vector_env tests/
           echo "Pytest execution and coverage report generation completed."
