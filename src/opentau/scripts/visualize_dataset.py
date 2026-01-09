@@ -14,7 +14,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-""" Visualize data of **all** frames of any episode of a dataset of type LeRobotDataset.
+"""Visualize data of **all** frames of any episode of a dataset of type LeRobotDataset.
 
 Note: The last frame of the episode doesn't always correspond to a final state.
 That's because our datasets are composed of transition from state to state up to
@@ -30,34 +30,21 @@ Examples:
 
 - Visualize data stored on a local machine:
 ```
-local$ python src/opentau/scripts/visualize_dataset.py \
-    --repo-id lerobot/pusht \
-    --episode-index 0
+local$ opentau-dataset-viz --repo-id lerobot/pusht --episode-index 0
 ```
 
 - Visualize data stored on a distant machine with a local viewer:
 ```
-distant$ python src/opentau/scripts/visualize_dataset.py \
-    --repo-id lerobot/pusht \
-    --episode-index 0 \
-    --save 1 \
-    --output-dir path/to/directory
+distant$ opentau-dataset-viz --repo-id lerobot/pusht --episode-index 0 --save 1 --output-dir path/to/directory
 
 local$ scp distant:path/to/directory/lerobot_pusht_episode_0.rrd .
 local$ rerun lerobot_pusht_episode_0.rrd
 ```
 
 - Visualize data stored on a distant machine through streaming:
-(You need to forward the websocket port to the distant machine, with
-`ssh -L 9087:localhost:9087 username@remote-host`)
 ```
-distant$ python src/opentau/scripts/visualize_dataset.py \
-    --repo-id lerobot/pusht \
-    --episode-index 0 \
-    --mode distant \
-    --ws-port 9087
 
-local$ rerun ws://localhost:9087
+distant$ opentau-dataset-viz --repo-id lerobot/pusht --episode-index 0 --mode distant --web-port 9090
 ```
 
 """
@@ -134,7 +121,6 @@ def visualize_dataset(
     num_workers: int = 0,
     mode: str = "local",
     web_port: int = 9090,
-    ws_port: int = 9087,
     save: bool = False,
     output_dir: Path | None = None,
 ) -> Path | None:
@@ -168,7 +154,7 @@ def visualize_dataset(
     gc.collect()
 
     if mode == "distant":
-        rr.serve(open_browser=False, web_port=web_port, ws_port=ws_port)
+        rr.serve_web_viewer(open_browser=False, web_port=web_port)
 
     logging.info("Logging to Rerun")
 
@@ -275,12 +261,6 @@ def parse_args() -> dict:
         type=int,
         default=9090,
         help="Web port for rerun.io when `--mode distant` is set.",
-    )
-    parser.add_argument(
-        "--ws-port",
-        type=int,
-        default=9087,
-        help="Web socket port for rerun.io when `--mode distant` is set.",
     )
     parser.add_argument(
         "--save",
