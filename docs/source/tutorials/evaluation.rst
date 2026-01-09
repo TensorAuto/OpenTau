@@ -7,13 +7,13 @@ Evaluation
 Evaluating a policy in Simulation
 ---------------------------------
 
-OpenTau supports evaluation in asynchronous vectorized simulation environments. To evaluate a policy in simulation, you can launch the `src/opentau/scripts/eval.py <https://github.com/TensorAuto/OpenTau/blob/main/src/opentau/scripts/eval.py>`_ script with ``accelerate launch``.
+OpenTau supports evaluation in asynchronous vectorized simulation environments. To evaluate a policy in simulation, you can launch the `src/opentau/scripts/eval.py <https://github.com/TensorAuto/OpenTau/blob/main/src/opentau/scripts/eval.py>`_ script with ``opentau-eval``.
 Each accelerate process will only work on its fraction of the tasks, improving throughput.
 For example, to evaluate a policy on the LIBERO 10, run:
 
 .. code-block:: bash
 
-    accelerate launch --config_file <ACCELERATE_CONFIG_PATH> src/opentau/scripts/eval.py --config_path=outputs/train/pi05/checkpoints/000040/train_config.json
+    opentau-eval --accelerate-config <ACCELERATE_CONFIG_PATH> --config_path=outputs/train/pi05/checkpoints/000040/train_config.json
 
 .. note::
    You can't pass in an DeepSpeed accelerate config file to ``eval.py`` as DeepSpeed expects optimizer and dataloader during ``accelerator.prepare()``, which we do not provide during eval. It is recommended to pass in a DDP config.
