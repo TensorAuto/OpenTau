@@ -14,7 +14,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-""" Visualize data of **all** frames of any episode of a dataset of type LeRobotDataset.
+"""Visualize data of **all** frames of any episode of a dataset of type LeRobotDataset.
 
 Note: The last frame of the episode doesn't always correspond to a final state.
 That's because our datasets are composed of transition from state to state up to
@@ -30,34 +30,21 @@ Examples:
 
 - Visualize data stored on a local machine:
 ```
-local$ python src/opentau/scripts/visualize_dataset.py \
-    --repo-id lerobot/pusht \
-    --episode-index 0
+local$ opentau-dataset-viz --repo-id lerobot/pusht --episode-index 0
 ```
 
 - Visualize data stored on a distant machine with a local viewer:
 ```
-distant$ python src/opentau/scripts/visualize_dataset.py \
-    --repo-id lerobot/pusht \
-    --episode-index 0 \
-    --save 1 \
-    --output-dir path/to/directory
+distant$ opentau-dataset-viz --repo-id lerobot/pusht --episode-index 0 --save 1 --output-dir path/to/directory
 
 local$ scp distant:path/to/directory/lerobot_pusht_episode_0.rrd .
 local$ rerun lerobot_pusht_episode_0.rrd
 ```
 
 - Visualize data stored on a distant machine through streaming:
-(You need to forward the websocket port to the distant machine, with
-`ssh -L 9087:localhost:9087 username@remote-host`)
 ```
-distant$ python src/opentau/scripts/visualize_dataset.py \
-    --repo-id lerobot/pusht \
-    --episode-index 0 \
-    --mode distant \
-    --ws-port 9087
 
-local$ rerun ws://localhost:9087
+distant$ opentau-dataset-viz --repo-id lerobot/pusht --episode-index 0 --mode distant --web-port 9090
 ```
 
 """
@@ -75,8 +62,34 @@ import torch
 import torch.utils.data
 import tqdm
 
+from opentau.configs.default import DatasetMixtureConfig, WandBConfig
+from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.lerobot_dataset import LeRobotDataset
-from opentau.scripts.visualize_dataset_html import create_mock_train_config
+
+
+def create_mock_train_config() -> TrainPipelineConfig:
+    """Create a mock TrainPipelineConfig for dataset visualization.
+
+    Returns:
+        TrainPipelineConfig: A mock config with default values.
+    """
+    return TrainPipelineConfig(
+        dataset_mixture=DatasetMixtureConfig(),  # Will be set by the dataset
+        resolution=(224, 224),
+        num_cams=2,
+        max_state_dim=32,
+        max_action_dim=32,
+        action_chunk=50,
+        loss_weighting={"MSE": 1, "CE": 1},
+        num_workers=4,
+        batch_size=8,
+        steps=100_000,
+        log_freq=200,
+        save_checkpoint=True,
+        save_freq=20_000,
+        use_policy_training_preset=True,
+        wandb=WandBConfig(),
+    )
 
 
 class EpisodeSampler(torch.utils.data.Sampler):
@@ -108,7 +121,6 @@ def visualize_dataset(
     num_workers: int = 0,
     mode: str = "local",
     web_port: int = 9090,
-    ws_port: int = 9087,
     save: bool = False,
     output_dir: Path | None = None,
 ) -> Path | None:
@@ -142,7 +154,7 @@ def visualize_dataset(
     gc.collect()
 
     if mode == "distant":
-        rr.serve(open_browser=False, web_port=web_port, ws_port=ws_port)
+        rr.serve_web_viewer(open_browser=False, web_port=web_port)
 
     logging.info("Logging to Rerun")
 
@@ -194,7 +206,7 @@ def visualize_dataset(
             print("Ctrl-C received. Exiting.")
 
 
-def main():
+def parse_args() -> dict:
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
@@ -251,12 +263,6 @@ def main():
         help="Web port for rerun.io when `--mode distant` is set.",
     )
     parser.add_argument(
-        "--ws-port",
-        type=int,
-        default=9087,
-        help="Web socket port for rerun.io when `--mode distant` is set.",
-    )
-    parser.add_argument(
         "--save",
         type=int,
         default=0,
@@ -279,15 +285,25 @@ def main():
     )
 
     args = parser.parse_args()
-    kwargs = vars(args)
+    return vars(args)
+
+
+def main():
+    kwargs = parse_args()
     repo_id = kwargs.pop("repo_id")
     root = kwargs.pop("root")
     tolerance_s = kwargs.pop("tolerance_s")
 
     logging.info("Loading dataset")
-    dataset = LeRobotDataset(create_mock_train_config(), repo_id, root=root, tolerance_s=tolerance_s)
+    dataset = LeRobotDataset(
+        create_mock_train_config(),
+        repo_id,
+        root=root,
+        tolerance_s=tolerance_s,
+        standardize=False,
+    )
 
-    visualize_dataset(dataset, **vars(args))
+    visualize_dataset(dataset, **kwargs)
 
 
 if __name__ == "__main__":

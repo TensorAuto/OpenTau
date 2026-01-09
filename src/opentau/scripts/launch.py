@@ -21,6 +21,7 @@ from types import ModuleType
 import opentau.scripts.eval as eval_script
 import opentau.scripts.export_to_onnx as export_script
 import opentau.scripts.train as train_script
+import opentau.scripts.visualize_dataset as visualize_script
 
 
 def launch(script_module: ModuleType, description: str, use_accelerate: bool = True):
@@ -77,3 +78,7 @@ def eval():
 
 def export():
     launch(export_script, "Launch OpenTau ONNX export", use_accelerate=False)
+
+
+def visualize():
+    launch(visualize_script, "Launch OpenTau visualization", use_accelerate=False)
