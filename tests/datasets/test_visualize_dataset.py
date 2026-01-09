@@ -15,16 +15,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from opentau.scripts.visualize_dataset_html import visualize_dataset_html
+from opentau.scripts.visualize_dataset import visualize_dataset
 
 
 def test_visualize_local_dataset(tmp_path, lerobot_dataset_factory):
     root = tmp_path / "dataset"
     output_dir = tmp_path / "outputs"
     dataset = lerobot_dataset_factory(root=root)
-    visualize_dataset_html(
+    visualize_dataset(
         dataset,
-        episodes=[0],
+        episode_index=0,
         output_dir=output_dir,
-        serve=False,
     )
