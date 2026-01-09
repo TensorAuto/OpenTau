@@ -17,7 +17,7 @@
 Most patches come from the branch fix/lerobot-openpi
 """
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 from torch import nn
@@ -33,7 +33,15 @@ _original_gemma_config_init = GemmaConfig.__init__
 def patched_gemma_config_init(
     self, *args, use_adarms: bool = False, adarms_cond_dim: Optional[int] = None, **kwargs
 ):
-    """Initializes the GemmaConfig with added ADARMS support."""
+    """Initializes the GemmaConfig with added ADARMS support.
+
+    Args:
+        self: The GemmaConfig instance.
+        *args: Variable length argument list.
+        use_adarms: Whether to use Adaptive RMS normalization.
+        adarms_cond_dim: The dimension of the conditioning vector for ADARMS.
+        **kwargs: Arbitrary keyword arguments.
+    """
     # Call the original init with all other arguments
     _original_gemma_config_init(self, *args, **kwargs)
 
@@ -78,7 +86,16 @@ modeling_gemma._gated_residual = _gated_residual
 
 
 class PatchedGemmaRMSNorm(nn.Module):
+    """RMS normalization with optional adaptive support (ADARMS)."""
+
     def __init__(self, dim: int, eps: float = 1e-6, cond_dim: Optional[int] = None):
+        """Initializes the PatchedGemmaRMSNorm.
+
+        Args:
+            dim: The dimension of the input tensor.
+            eps: The epsilon value for numerical stability.
+            cond_dim: The dimension of the conditioning vector (if using ADARMS).
+        """
         super().__init__()
         self.eps = eps
         self.dim = dim
@@ -93,14 +110,37 @@ class PatchedGemmaRMSNorm(nn.Module):
             self.weight = nn.Parameter(torch.zeros(dim))
             self.dense = None
 
-    def _norm(self, x):
+    def _norm(self, x: torch.Tensor) -> torch.Tensor:
+        """Applies RMS normalization.
+
+        Args:
+            x: The input tensor.
+
+        Returns:
+            The normalized tensor.
+        """
         # Compute variance in float32 (like the source implementation)
         var = torch.mean(torch.square(x.float()), dim=-1, keepdim=True)
         # Compute normalization in float32
         normed_inputs = x * torch.rsqrt(var + self.eps)
         return normed_inputs
 
-    def forward(self, x, cond=None):
+    def forward(
+        self, x: torch.Tensor, cond: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Forward pass of the normalization layer.
+
+        Args:
+            x: The input tensor.
+            cond: The conditioning tensor for adaptive normalization.
+
+        Returns:
+            A tuple containing the normalized tensor and the gate tensor (if applicable).
+            If cond is None, the gate tensor will be None.
+
+        Raises:
+            ValueError: If cond dimension does not match the configured cond_dim.
+        """
         dtype = x.dtype  # original dtype, could be half-precision
         normed_inputs = self._norm(x)
 
@@ -125,7 +165,8 @@ class PatchedGemmaRMSNorm(nn.Module):
 
         return normed_inputs.to(dtype), gate.to(dtype)
 
-    def extra_repr(self):
+    def extra_repr(self) -> str:
+        """Returns the extra representation of the module."""
         repr_str = f"{tuple(self.weight.shape)}, eps={self.eps}"
         if self.dense is not None:
             repr_str += f", adaptive=True, cond_dim={self.cond_dim}"
@@ -137,6 +178,13 @@ modeling_gemma.GemmaRMSNorm = PatchedGemmaRMSNorm
 
 
 def patched_gemma_decoder_layer_init(self, config: GemmaConfig, layer_idx: int):
+    """Initializes a GemmaDecoderLayer with potential ADARMS support.
+
+    Args:
+        self: The GemmaDecoderLayer instance.
+        config: The configuration object.
+        layer_idx: The index of the layer.
+    """
     modeling_gemma.GradientCheckpointingLayer.__init__(self)
     self.hidden_size = config.hidden_size
 
@@ -157,6 +205,12 @@ modeling_gemma.GemmaDecoderLayer.__init__ = patched_gemma_decoder_layer_init
 
 
 def patched_gemma_model_init(self, config: GemmaConfig):
+    """Initializes the GemmaModel with potential ADARMS support.
+
+    Args:
+        self: The GemmaModel instance.
+        config: The configuration object.
+    """
     modeling_gemma.GemmaPreTrainedModel.__init__(self, config)
     self.padding_idx = config.pad_token_id
     self.vocab_size = config.vocab_size
@@ -178,7 +232,13 @@ def patched_gemma_model_init(self, config: GemmaConfig):
 modeling_gemma.GemmaModel.__init__ = patched_gemma_model_init
 
 
-def patched_gemma_pretrained_model_init_weights(self, module):
+def patched_gemma_pretrained_model_init_weights(self, module: nn.Module):
+    """Initializes the weights of the GemmaPreTrainedModel.
+
+    Args:
+        self: The GemmaPreTrainedModel instance.
+        module: The module to initialize.
+    """
     std = self.config.initializer_range
     if isinstance(module, nn.Linear):
         module.weight.data.normal_(mean=0.0, std=std)
@@ -196,15 +256,16 @@ def patched_gemma_pretrained_model_init_weights(self, module):
 modeling_gemma.GemmaPreTrainedModel._init_weights = patched_gemma_pretrained_model_init_weights
 
 
-def patched_paligemma_model_get_image_features(self, pixel_values: torch.FloatTensor):
-    """
-    Obtains image last hidden states from the vision tower and apply multimodal projection.
+def patched_paligemma_model_get_image_features(self, pixel_values: torch.FloatTensor) -> torch.Tensor:
+    """Obtains image last hidden states from the vision tower and apply multimodal projection.
 
     Args:
-        pixel_values (`torch.FloatTensor]` of shape `(batch_size, channels, height, width)`)
-           The tensors corresponding to the input images.
+        self: The PaliGemmaModel instance.
+        pixel_values: The tensors corresponding to the input images.
+            Shape: (batch_size, channels, height, width).
+
     Returns:
-        image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
+        Image feature tensor of shape (num_images, image_length, embed_dim).
     """
     image_outputs = self.vision_tower(pixel_values)
     selected_image_feature = image_outputs.last_hidden_state
