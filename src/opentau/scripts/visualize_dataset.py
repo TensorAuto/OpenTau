@@ -285,7 +285,13 @@ def main():
     tolerance_s = kwargs.pop("tolerance_s")
 
     logging.info("Loading dataset")
-    dataset = LeRobotDataset(create_mock_train_config(), repo_id, root=root, tolerance_s=tolerance_s)
+    dataset = LeRobotDataset(
+        create_mock_train_config(),
+        repo_id,
+        root=root,
+        tolerance_s=tolerance_s,
+        standardize=False,
+    )
 
     visualize_dataset(dataset, **vars(args))
 

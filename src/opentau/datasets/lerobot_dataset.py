@@ -633,7 +633,9 @@ class BaseDataset(torch.utils.data.Dataset):
         For example, {"image_key": torch.zeros(2, 3, 224, 224), "image_key_is_pad": [False, True] } will become
         {
             "image_key": torch.zeros(3, 224, 224),
+            "local_image_key": torch.zeros(3, 224, 224),
             "image_key_is_pad: False,
+            "local_image_key_is_pad": True,
         }.
         """
         raise NotImplementedError
@@ -1787,16 +1789,12 @@ class LeRobotDataset(BaseDataset):
         cam_keys = {v for k, v in name_map.items() if k.startswith("camera")}
         for k in cam_keys:
             images = item.pop(k)
-            assert len(images) == 2, (
-                f"{k} in {self.__class__} is expected to have length 2, got shape={images.shape}"
-            )
-            item[k + "_local"], item[k] = images
+            if len(images) == 2:
+                item[k + "_local"], item[k] = images
 
-            pads = item.pop(k + "_is_pad")
-            assert len(pads) == 2, (
-                f"{k} in {self.__class__} is expected to have length 2, got shape={pads.shape}"
-            )
-            item[k + "_local_is_pad"], item[k + "_is_pad"] = pads
+            pads = item.get(k + "_is_pad")
+            if hasattr(pads, "__len__") and len(pads) == 2:
+                item[k + "_local_is_pad"], item[k + "_is_pad"] = pads
 
     @staticmethod
     def compute_delta_params(
