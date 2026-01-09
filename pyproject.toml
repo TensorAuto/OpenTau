@@ -89,7 +89,9 @@ dependencies = [
 ]
 
 [project.scripts]
-opentau-train = "opentau.scripts.launch_train:main"
+opentau-train = "opentau.scripts.launch:train"
+opentau-eval = "opentau.scripts.launch:eval"
+opentau-export = "opentau.scripts.launch:export"
 
 [project.optional-dependencies]
 dev = ["pre-commit>=3.7.0",

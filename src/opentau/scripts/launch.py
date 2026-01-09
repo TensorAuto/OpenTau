@@ -16,20 +16,24 @@ import argparse
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
 
+import opentau.scripts.eval as eval_script
+import opentau.scripts.export_to_onnx as export_script
 import opentau.scripts.train as train_script
 
 
-def main():
+def launch(script_module: ModuleType, description: str):
+    """Generic launcher for OpenTau scripts using Accelerate."""
     parser = argparse.ArgumentParser(
-        description="Launch OpenTau training with Accelerate",
-        usage="opentau-train [--accelerate-config CONFIG] [TRAINING_ARGS]",
+        description=description,
+        usage=f"{Path(sys.argv[0]).name} [--accelerate-config CONFIG] [ARGS]",
     )
     parser.add_argument(
         "--accelerate-config", type=str, help="Path to accelerate config file (yaml)", default=None
     )
     # We use parse_known_args so that all other arguments are collected
-    # These will be passed to the training script
+    # These will be passed to the target script
     args, unknown_args = parser.parse_known_args()
 
     # Base command
@@ -39,12 +43,12 @@ def main():
     if args.accelerate_config:
         cmd.extend(["--config_file", args.accelerate_config])
 
-    # Add the path to the training script
+    # Add the path to the target script
     # We resolve the path to ensure it's absolute
-    train_script_path = Path(train_script.__file__).resolve()
-    cmd.append(str(train_script_path))
+    script_path = Path(script_module.__file__).resolve()
+    cmd.append(str(script_path))
 
-    # Add all other arguments (passed to the training script)
+    # Add all other arguments (passed to the target script)
     cmd.extend(unknown_args)
 
     # Print the command for transparency
@@ -59,5 +63,13 @@ def main():
         sys.exit(130)
 
 
-if __name__ == "__main__":
-    main()
+def train():
+    launch(train_script, "Launch OpenTau training with Accelerate")
+
+
+def eval():
+    launch(eval_script, "Launch OpenTau evaluation with Accelerate")
+
+
+def export():
+    launch(export_script, "Launch OpenTau ONNX export with Accelerate")
