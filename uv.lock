@@ -1930,7 +1930,7 @@ wheels = [
 
 [[package]]
 name = "opentau"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "accelerate" },
@@ -1956,7 +1956,6 @@ dependencies = [
     { name = "onnxruntime-gpu", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (platform_machine == 'x86_64' and sys_platform == 'win32')" },
     { name = "onnxscript" },
     { name = "opencv-python-headless" },
-    { name = "opentau-transformers" },
     { name = "packaging" },
     { name = "pandas" },
     { name = "pymunk" },
@@ -1974,6 +1973,7 @@ dependencies = [
     { name = "torch" },
     { name = "torchcodec", marker = "(platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l' and sys_platform == 'linux') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32')" },
     { name = "torchvision" },
+    { name = "transformers" },
     { name = "wandb" },
     { name = "zarr" },
 ]
@@ -2056,7 +2056,6 @@ requires-dist = [
     { name = "onnxscript", specifier = ">=0.3.1" },
     { name = "openai", marker = "extra == 'openai'", specifier = ">=1.0.0" },
     { name = "opencv-python-headless", specifier = ">=4.9.0" },
-    { name = "opentau-transformers", specifier = "==4.53.3" },
     { name = "packaging", specifier = ">=24.2" },
     { name = "pandas", specifier = ">=2.2.2" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.7.0" },
@@ -2090,31 +2089,11 @@ requires-dist = [
     { name = "torch", specifier = ">=2.7.1,<2.8.0" },
     { name = "torchcodec", marker = "(platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l' and sys_platform == 'linux') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32')", specifier = ">=0.4.0,<0.5.0" },
     { name = "torchvision", specifier = ">=0.22.1,<0.23.0" },
+    { name = "transformers", specifier = "==4.53.3" },
     { name = "wandb", specifier = ">=0.16.3" },
     { name = "zarr", specifier = ">=2.17.0" },
 ]
 provides-extras = ["dev", "openai", "libero"]
-
-[[package]]
-name = "opentau-transformers"
-version = "4.53.3"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "filelock" },
-    { name = "huggingface-hub" },
-    { name = "numpy" },
-    { name = "packaging" },
-    { name = "pyyaml" },
-    { name = "regex" },
-    { name = "requests" },
-    { name = "safetensors" },
-    { name = "tokenizers" },
-    { name = "tqdm" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/8a/58/c5c3d08b808281420a4cbe31688913702391b25d4251146d2ce0ab281b15/opentau_transformers-4.53.3.tar.gz", hash = "sha256:2b8396bef4e3230943863820a635f2118bf5427258498a7c13d014c4b46d10ac", size = 9191643, upload-time = "2026-01-07T21:07:00.85Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/7d/e1/5e2e419c0a62f283066922ad777095106e41793ad2019b35a01ad5343b34/opentau_transformers-4.53.3-py3-none-any.whl", hash = "sha256:84ab04c7fa2f00ce38b145ad98608a55e582b24b34cb164bec7061b4bd9a2db6", size = 10828049, upload-time = "2026-01-07T21:05:42.28Z" },
-]
 
 [[package]]
 name = "orderly-set"
@@ -3350,6 +3329,27 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/eb/79/72064e6a701c2183016abbbfedaba506d81e30e232a68c9f0d6f6fcd1574/traitlets-5.14.3.tar.gz", hash = "sha256:9ed0579d3502c94b4b3732ac120375cda96f923114522847de4b3bb98b96b6b7", size = 161621, upload-time = "2024-04-19T11:11:49.746Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/00/c0/8f5d070730d7836adc9c9b6408dec68c6ced86b304a9b26a14df072a6e8c/traitlets-5.14.3-py3-none-any.whl", hash = "sha256:b74e89e397b1ed28cc831db7aea759ba6640cb3de13090ca145426688ff1ac4f", size = 85359, upload-time = "2024-04-19T11:11:46.763Z" },
+]
+
+[[package]]
+name = "transformers"
+version = "4.53.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "filelock" },
+    { name = "huggingface-hub" },
+    { name = "numpy" },
+    { name = "packaging" },
+    { name = "pyyaml" },
+    { name = "regex" },
+    { name = "requests" },
+    { name = "safetensors" },
+    { name = "tokenizers" },
+    { name = "tqdm" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f1/5c/49182918b58eaa0b4c954fd0e37c79fc299e5643e69d70089d0b0eb0cd9b/transformers-4.53.3.tar.gz", hash = "sha256:b2eda1a261de79b78b97f7888fe2005fc0c3fabf5dad33d52cc02983f9f675d8", size = 9197478, upload-time = "2025-07-22T07:30:51.51Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/41/b1/d7520cc5cb69c825599042eb3a7c986fa9baa8a8d2dea9acd78e152c81e2/transformers-4.53.3-py3-none-any.whl", hash = "sha256:5aba81c92095806b6baf12df35d756cf23b66c356975fb2a7fa9e536138d7c75", size = 10826382, upload-time = "2025-07-22T07:30:48.458Z" },
 ]
 
 [[package]]
