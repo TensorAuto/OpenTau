@@ -75,8 +75,34 @@ import torch
 import torch.utils.data
 import tqdm
 
+from opentau.configs.default import DatasetMixtureConfig, WandBConfig
+from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.lerobot_dataset import LeRobotDataset
-from opentau.scripts.visualize_dataset_html import create_mock_train_config
+
+
+def create_mock_train_config() -> TrainPipelineConfig:
+    """Create a mock TrainPipelineConfig for dataset visualization.
+
+    Returns:
+        TrainPipelineConfig: A mock config with default values.
+    """
+    return TrainPipelineConfig(
+        dataset_mixture=DatasetMixtureConfig(),  # Will be set by the dataset
+        resolution=(224, 224),
+        num_cams=2,
+        max_state_dim=32,
+        max_action_dim=32,
+        action_chunk=50,
+        loss_weighting={"MSE": 1, "CE": 1},
+        num_workers=4,
+        batch_size=8,
+        steps=100_000,
+        log_freq=200,
+        save_checkpoint=True,
+        save_freq=20_000,
+        use_policy_training_preset=True,
+        wandb=WandBConfig(),
+    )
 
 
 class EpisodeSampler(torch.utils.data.Sampler):
