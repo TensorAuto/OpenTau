@@ -16,8 +16,8 @@ name: GPU Tests
 
 on:
   workflow_dispatch:
-  pull_request:
-  push:
+  schedule:
+    - cron: "0 8 * * *" # 12:00 AM PST (08:00 UTC)
 
 permissions:
   contents: read
