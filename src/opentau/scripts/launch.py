@@ -23,25 +23,29 @@ import opentau.scripts.export_to_onnx as export_script
 import opentau.scripts.train as train_script
 
 
-def launch(script_module: ModuleType, description: str):
-    """Generic launcher for OpenTau scripts using Accelerate."""
+def launch(script_module: ModuleType, description: str, use_accelerate: bool = True):
+    """Generic launcher for OpenTau scripts using Accelerate or Python."""
     parser = argparse.ArgumentParser(
         description=description,
-        usage=f"{Path(sys.argv[0]).name} [--accelerate-config CONFIG] [ARGS]",
+        usage=f"{Path(sys.argv[0]).name} {'[--accelerate-config CONFIG] ' if use_accelerate else ''}[ARGS]",
     )
-    parser.add_argument(
-        "--accelerate-config", type=str, help="Path to accelerate config file (yaml)", default=None
-    )
+    if use_accelerate:
+        parser.add_argument(
+            "--accelerate-config", type=str, help="Path to accelerate config file (yaml)", default=None
+        )
+
     # We use parse_known_args so that all other arguments are collected
     # These will be passed to the target script
     args, unknown_args = parser.parse_known_args()
 
     # Base command
-    cmd = ["accelerate", "launch"]
-
-    # Add accelerate config if provided
-    if args.accelerate_config:
-        cmd.extend(["--config_file", args.accelerate_config])
+    if use_accelerate:
+        cmd = ["accelerate", "launch"]
+        # Add accelerate config if provided
+        if args.accelerate_config:
+            cmd.extend(["--config_file", args.accelerate_config])
+    else:
+        cmd = [sys.executable]
 
     # Add the path to the target script
     # We resolve the path to ensure it's absolute
@@ -72,4 +76,4 @@ def eval():
 
 
 def export():
-    launch(export_script, "Launch OpenTau ONNX export with Accelerate")
+    launch(export_script, "Launch OpenTau ONNX export", use_accelerate=False)
