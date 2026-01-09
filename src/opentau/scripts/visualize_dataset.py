@@ -220,7 +220,7 @@ def visualize_dataset(
             print("Ctrl-C received. Exiting.")
 
 
-def main():
+def parse_args() -> dict:
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
@@ -305,10 +305,14 @@ def main():
     )
 
     args = parser.parse_args()
-    kwargs = vars(args)
-    repo_id = kwargs.pop("repo_id")
-    root = kwargs.pop("root")
-    tolerance_s = kwargs.pop("tolerance_s")
+    return vars(args)
+
+
+def main():
+    kwargs = parse_args()
+    repo_id = kwargs.get("repo_id")
+    root = kwargs.get("root")
+    tolerance_s = kwargs.get("tolerance_s")
 
     logging.info("Loading dataset")
     dataset = LeRobotDataset(
@@ -319,7 +323,7 @@ def main():
         standardize=False,
     )
 
-    visualize_dataset(dataset, **vars(args))
+    visualize_dataset(dataset, **kwargs)
 
 
 if __name__ == "__main__":
