@@ -633,9 +633,9 @@ class BaseDataset(torch.utils.data.Dataset):
         For example, {"image_key": torch.zeros(2, 3, 224, 224), "image_key_is_pad": [False, True] } will become
         {
             "image_key": torch.zeros(3, 224, 224),
-            "local_image_key": torch.zeros(3, 224, 224),
+            "image_key_local": torch.zeros(3, 224, 224),
             "image_key_is_pad: False,
-            "local_image_key_is_pad": True,
+            "image_key_local_is_pad": True,
         }.
         """
         raise NotImplementedError
