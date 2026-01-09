@@ -12,12 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Module for patching transformers metadata lookup.
+"""Module for patching transformers
 
-This module monkey patches `importlib.metadata.distribution` to redirect
-'transformers' lookups to 'opentau-transformers'. This ensures that the custom
-transformers fork is correctly recognized by libraries checking for transformers
-installation.
+Most patches come from the branch fix/lerobot-openpi
 """
 
 from typing import Optional
@@ -26,6 +23,7 @@ import torch
 from torch import nn
 from transformers.models.gemma import modeling_gemma
 from transformers.models.gemma.configuration_gemma import GemmaConfig
+from transformers.models.paligemma.modeling_paligemma import PaliGemmaModel
 
 # Monkey patch __init__ of GemmaConfig to fix or modify its behavior as needed.
 
@@ -196,3 +194,22 @@ def patched_gemma_pretrained_model_init_weights(self, module):
 
 
 modeling_gemma.GemmaPreTrainedModel._init_weights = patched_gemma_pretrained_model_init_weights
+
+
+def patched_paligemma_model_get_image_features(self, pixel_values: torch.FloatTensor):
+    """
+    Obtains image last hidden states from the vision tower and apply multimodal projection.
+
+    Args:
+        pixel_values (`torch.FloatTensor]` of shape `(batch_size, channels, height, width)`)
+           The tensors corresponding to the input images.
+    Returns:
+        image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
+    """
+    image_outputs = self.vision_tower(pixel_values)
+    selected_image_feature = image_outputs.last_hidden_state
+    image_features = self.multi_modal_projector(selected_image_feature)
+    return image_features
+
+
+PaliGemmaModel.get_image_features = patched_paligemma_model_get_image_features
