@@ -310,9 +310,9 @@ def parse_args() -> dict:
 
 def main():
     kwargs = parse_args()
-    repo_id = kwargs.get("repo_id")
-    root = kwargs.get("root")
-    tolerance_s = kwargs.get("tolerance_s")
+    repo_id = kwargs.pop("repo_id")
+    root = kwargs.pop("root")
+    tolerance_s = kwargs.pop("tolerance_s")
 
     logging.info("Loading dataset")
     dataset = LeRobotDataset(
