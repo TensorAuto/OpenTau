@@ -596,6 +596,9 @@ class PI05Policy(PreTrainedPolicy):
         lang_tokens, lang_masks = self.prepare_language(
             batch
         )  # in lang_masks we have True for real tokens and False for padded tokens
+        sublang_tokens, sublang_masks = self.prepare_sub_task(
+            batch
+        )
         discrete_actions, discrete_action_masks = self.prepare_discrete_actions(
             batch
         )  # in discrete_action_masks we have True for real tokens and False for padded tokens
@@ -609,6 +612,8 @@ class PI05Policy(PreTrainedPolicy):
             img_masks,
             lang_tokens,
             lang_masks,
+            sublang_tokens,
+            sublang_masks,
             actions,
             noise,
             time,
@@ -757,7 +762,10 @@ class PI05Policy(PreTrainedPolicy):
 
         # add state to the prompt
         state = self.prepare_discrete_state(batch)
-        prompt = [f"Task: {task}State: {state}\nActions:" for task, state in zip(tasks, state, strict=False)]
+        if 'subtask' in batch:
+            prompt = [f"Task: {task}State: {state}\nSubtask:" for task, state in zip(tasks, state, strict=False)]
+        else:
+            prompt = [f"Task: {task}State: {state}\nActions:" for task, state in zip(tasks, state, strict=False)] 
 
         tokenized_prompt = self.language_tokenizer.__call__(
             prompt,
@@ -771,6 +779,38 @@ class PI05Policy(PreTrainedPolicy):
         lang_masks = tokenized_prompt["attention_mask"].to(device=device, dtype=torch.bool)
 
         return lang_tokens, lang_masks
+
+    def prepare_sub_task(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+        """Tokenize the subtask input.
+
+        Args:
+            batch: Batch of data containing the key "subtask".
+
+        Returns:
+            A tuple containing:
+                - sublang_tokens: Tensor of subtask language tokens.
+                - sublang_masks: Tensor of subtask language attention masks.
+        """
+        device = batch["subtask"].device
+        subtasks = batch["subtask"]
+
+        # PaliGemma subtask has to end with a new line
+        subtasks = [subtask if subtask.endswith("\n") else f"{subtask}\n" for subtask in subtasks]
+
+        sub_prompt = [f"Task: {subtask}\nActions: {subtask}" for subtask in subtasks]
+
+        tokenized_subtask = self.language_tokenizer.__call__(
+            sub_prompt,
+            padding="max_length",
+            padding_side="right",
+            max_length=self.config.tokenizer_max_length,
+            return_tensors="pt",
+            truncation=True,
+        )
+        sublang_tokens = tokenized_subtask["input_ids"].to(device=device)
+        sublang_masks = tokenized_subtask["attention_mask"].to(device=device, dtype=torch.bool)
+
+        return sublang_tokens, sublang_masks
 
 
 class PI05FlowMatching(nn.Module):
@@ -897,6 +937,8 @@ class PI05FlowMatching(nn.Module):
         img_masks: list[Tensor],
         lang_tokens: Tensor,
         lang_masks: Tensor,
+        sublang_tokens: Tensor,
+        sublang_masks: Tensor,
         discrete_actions: Tensor | None = None,
         discrete_action_masks: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
@@ -908,6 +950,8 @@ class PI05FlowMatching(nn.Module):
             img_masks: List of image mask tensors.
             lang_tokens: Language token tensor.
             lang_masks: Language mask tensor.
+            sublang_tokens: Subtask language token tensor.
+            sublang_masks: Subtask language mask tensor.
             discrete_actions: Optional discrete action tensor.
             discrete_action_masks: Optional discrete action mask tensor.
 
@@ -955,6 +999,20 @@ class PI05FlowMatching(nn.Module):
         # full attention between image and language inputs
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
+
+        if sublang_tokens is not None:
+            sublang_emb = self.paligemma_with_expert.embed_language_tokens(sublang_tokens)
+
+            # Normalize subtask language embeddings
+            sublang_emb_dim = sublang_emb.shape[-1]
+            sublang_emb = sublang_emb * math.sqrt(sublang_emb_dim)
+
+            embs.append(sublang_emb)
+            pad_masks.append(sublang_masks)
+
+            # full attention between image, language and subtask inputs
+            num_sublang_embs = sublang_emb.shape[1]
+            att_masks += [1] * num_sublang_embs
 
         if discrete_actions is not None:
             discrete_action_emb = self.paligemma_with_expert.embed_discrete_actions(discrete_actions)
@@ -1032,6 +1090,8 @@ class PI05FlowMatching(nn.Module):
         img_masks: list[Tensor],
         lang_tokens: Tensor,
         lang_masks: Tensor,
+        sublang_tokens: Tensor,
+        sublang_masks: Tensor,
         actions: Tensor,
         noise: Tensor | None = None,
         time: Tensor | None = None,
@@ -1045,6 +1105,8 @@ class PI05FlowMatching(nn.Module):
             img_masks: List of image mask tensors.
             lang_tokens: Language token tensor.
             lang_masks: Language mask tensor.
+            sublang_tokens: Subtask language token tensor.
+            sublang_masks: Subtask language mask tensor.
             actions: Action tensor.
             noise: Optional noise tensor.
             time: Optional time tensor.
@@ -1056,13 +1118,14 @@ class PI05FlowMatching(nn.Module):
         """
         # Run VLM first to get key value cache
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, discrete_actions, discrete_action_masks
+            images, img_masks, lang_tokens, lang_masks, sublang_tokens, sublang_masks, discrete_actions, discrete_action_masks
         )
 
         vlm_2d_attention_mask = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         vlm_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
-        num_cross_att_tokens = prefix_embs.shape[1] - self.config.discrete_action_max_length
+        # avoids using discrete action and subtask tokens for predicting continuous flow matching action
+        num_cross_att_tokens = prefix_embs.shape[1] - self.config.discrete_action_max_length - self.config.tokenizer_max_length
 
         (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
             attention_mask=vlm_2d_attention_mask,
@@ -1093,8 +1156,8 @@ class PI05FlowMatching(nn.Module):
             n_cross_att_tokens=num_cross_att_tokens,
             cross_att_pad_masks=prefix_pad_masks[:, :num_cross_att_tokens],
         )
-        # We should skip the response tokens when numbering the position ids for the action expert
-        prefix_offsets = torch.sum(prefix_pad_masks[:, : -self.config.discrete_action_max_length], dim=-1)[
+        # We should skip the sub task tokens and discrete actions when numbering the position ids for the action expert
+        prefix_offsets = torch.sum(prefix_pad_masks[:, : -self.config.discrete_action_max_length - self.config.tokenizer_max_length], dim=-1)[
             :, None
         ]  # action expert position ids start after prefix
         action_expert_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
@@ -1188,6 +1251,7 @@ class PI05FlowMatching(nn.Module):
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
         )
+
 
         dt = -1.0 / self.config.num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)

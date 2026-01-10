@@ -726,7 +726,7 @@ class BaseDataset(torch.utils.data.Dataset):
                 standard_item[key] = value.to(dtype=torch.bfloat16)
 
         # ensure that non-empty strings contain exactly one newline character at the end of the string
-        for key in ["prompt", "response"]:
+        for key in ["prompt", "subtask"]:
             if standard_item[key].endswith(
                 "\n"
             ):  # ensure there isn't going to be an extra space at the end after calling replace

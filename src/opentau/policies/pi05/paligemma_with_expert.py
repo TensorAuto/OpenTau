@@ -437,6 +437,11 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
                     value_states = torch.cat(
                         [value_states, past_key_values[layer_idx]["value_states"]], dim=1
                     )
+                    past_key_values[layer_idx] = {
+                        # save the first n_cross_att_tokens for action expert cross attention
+                        "key_states": key_states,
+                        "value_states": value_states,
+                    }
 
             attention_interface = self.get_attention_interface()
             att_output = attention_interface(
