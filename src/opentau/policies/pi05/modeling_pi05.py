@@ -596,9 +596,7 @@ class PI05Policy(PreTrainedPolicy):
         lang_tokens, lang_masks = self.prepare_language(
             batch
         )  # in lang_masks we have True for real tokens and False for padded tokens
-        sublang_tokens, sublang_masks = self.prepare_sub_task(
-            batch
-        )
+        sublang_tokens, sublang_masks = self.prepare_sub_task(batch)
         discrete_actions, discrete_action_masks = self.prepare_discrete_actions(
             batch
         )  # in discrete_action_masks we have True for real tokens and False for padded tokens
@@ -762,10 +760,14 @@ class PI05Policy(PreTrainedPolicy):
 
         # add state to the prompt
         state = self.prepare_discrete_state(batch)
-        if 'subtask' in batch:
-            prompt = [f"Task: {task}State: {state}\nSubtask:" for task, state in zip(tasks, state, strict=False)]
+        if "subtask" in batch:
+            prompt = [
+                f"Task: {task}State: {state}\nSubtask:" for task, state in zip(tasks, state, strict=False)
+            ]
         else:
-            prompt = [f"Task: {task}State: {state}\nActions:" for task, state in zip(tasks, state, strict=False)] 
+            prompt = [
+                f"Task: {task}State: {state}\nActions:" for task, state in zip(tasks, state, strict=False)
+            ]
 
         tokenized_prompt = self.language_tokenizer.__call__(
             prompt,
@@ -1118,14 +1120,23 @@ class PI05FlowMatching(nn.Module):
         """
         # Run VLM first to get key value cache
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, sublang_tokens, sublang_masks, discrete_actions, discrete_action_masks
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            sublang_tokens,
+            sublang_masks,
+            discrete_actions,
+            discrete_action_masks,
         )
 
         vlm_2d_attention_mask = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         vlm_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
         # avoids using discrete action and subtask tokens for predicting continuous flow matching action
-        num_cross_att_tokens = prefix_embs.shape[1] - self.config.discrete_action_max_length - self.config.tokenizer_max_length
+        num_cross_att_tokens = (
+            prefix_embs.shape[1] - self.config.discrete_action_max_length - self.config.tokenizer_max_length
+        )
 
         (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
             attention_mask=vlm_2d_attention_mask,
@@ -1157,9 +1168,10 @@ class PI05FlowMatching(nn.Module):
             cross_att_pad_masks=prefix_pad_masks[:, :num_cross_att_tokens],
         )
         # We should skip the sub task tokens and discrete actions when numbering the position ids for the action expert
-        prefix_offsets = torch.sum(prefix_pad_masks[:, : -self.config.discrete_action_max_length - self.config.tokenizer_max_length], dim=-1)[
-            :, None
-        ]  # action expert position ids start after prefix
+        prefix_offsets = torch.sum(
+            prefix_pad_masks[:, : -self.config.discrete_action_max_length - self.config.tokenizer_max_length],
+            dim=-1,
+        )[:, None]  # action expert position ids start after prefix
         action_expert_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
         # stop gradient to avoid backpropagating from action expert to VLM
@@ -1251,7 +1263,6 @@ class PI05FlowMatching(nn.Module):
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
         )
-
 
         dt = -1.0 / self.config.num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
