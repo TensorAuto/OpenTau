@@ -596,7 +596,11 @@ class PI05Policy(PreTrainedPolicy):
         lang_tokens, lang_masks = self.prepare_language(
             batch
         )  # in lang_masks we have True for real tokens and False for padded tokens
-        sublang_tokens, sublang_masks = self.prepare_sub_task(batch)
+        if self.config.subtask_prediction:
+            sublang_tokens, sublang_masks = self.prepare_sub_task(batch)
+        else:
+            sublang_tokens = None
+            sublang_masks = None
         discrete_actions, discrete_action_masks = self.prepare_discrete_actions(
             batch
         )  # in discrete_action_masks we have True for real tokens and False for padded tokens
@@ -760,7 +764,7 @@ class PI05Policy(PreTrainedPolicy):
 
         # add state to the prompt
         state = self.prepare_discrete_state(batch)
-        if "subtask" in batch:
+        if self.config.subtask_prediction:
             prompt = [
                 f"Task: {task}State: {state}\nSubtask:" for task, state in zip(tasks, state, strict=False)
             ]
@@ -939,8 +943,8 @@ class PI05FlowMatching(nn.Module):
         img_masks: list[Tensor],
         lang_tokens: Tensor,
         lang_masks: Tensor,
-        sublang_tokens: Tensor,
-        sublang_masks: Tensor,
+        sublang_tokens: Tensor | None = None,
+        sublang_masks: Tensor | None = None,
         discrete_actions: Tensor | None = None,
         discrete_action_masks: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
@@ -1002,7 +1006,7 @@ class PI05FlowMatching(nn.Module):
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
-        if sublang_tokens is not None:
+        if self.config.subtask_prediction:
             sublang_emb = self.paligemma_with_expert.embed_language_tokens(sublang_tokens)
 
             # Normalize subtask language embeddings
@@ -1215,30 +1219,34 @@ class PI05FlowMatching(nn.Module):
         ce_loss = ce_loss.mean()
 
         # compute cross entropy loss for sub task language
-        batch_size, seq_len = sublang_tokens.shape
-        sublang_out = prefix_out[
-            :,
-            -self.config.tokenizer_max_length
-            - self.config.discrete_action_max_length
-            - 1 : -self.config.discrete_action_max_length - 1,
-        ]
-        subtask_logits = self.paligemma_with_expert.paligemma.lm_head(sublang_out)
+        if self.config.subtask_prediction:
+            batch_size, seq_len = sublang_tokens.shape
+            sublang_out = prefix_out[
+                :,
+                -self.config.tokenizer_max_length
+                - self.config.discrete_action_max_length
+                - 1 : -self.config.discrete_action_max_length - 1,
+            ]
+            subtask_logits = self.paligemma_with_expert.paligemma.lm_head(sublang_out)
 
-        subtask_logits = subtask_logits.to(dtype=torch.float32)  # upcast to float32 for loss calculation
-        subtask_logits = rearrange(subtask_logits, "b s d -> (b s) d")
-        subtask_labels = rearrange(sublang_tokens, "b s -> (b s)")
-        subtask_ce_loss = F.cross_entropy(subtask_logits, subtask_labels, reduction="none")
+            subtask_logits = subtask_logits.to(dtype=torch.float32)  # upcast to float32 for loss calculation
+            subtask_logits = rearrange(subtask_logits, "b s d -> (b s) d")
+            subtask_labels = rearrange(sublang_tokens, "b s -> (b s)")
+            subtask_ce_loss = F.cross_entropy(subtask_logits, subtask_labels, reduction="none")
 
-        subtask_ce_loss = rearrange(subtask_ce_loss, "(b s) -> b s", b=batch_size, s=seq_len)
+            subtask_ce_loss = rearrange(subtask_ce_loss, "(b s) -> b s", b=batch_size, s=seq_len)
 
-        # remove pad tokens
-        sublang_is_pad = ~sublang_masks  # convert into format where value for pad is True
-        subtask_ce_loss = subtask_ce_loss * ~sublang_is_pad
+            # remove pad tokens
+            sublang_is_pad = ~sublang_masks  # convert into format where value for pad is True
+            subtask_ce_loss = subtask_ce_loss * ~sublang_is_pad
 
-        # compute mean
-        subtask_ce_loss = subtask_ce_loss.mean()
+            # compute mean
+            subtask_ce_loss = subtask_ce_loss.mean()
 
-        return {"MSE": losses, "CE": ce_loss + subtask_ce_loss}
+        return {
+            "MSE": losses,
+            "CE": (ce_loss + subtask_ce_loss if self.config.subtask_prediction else ce_loss),
+        }
 
     def sample_actions(
         self,
