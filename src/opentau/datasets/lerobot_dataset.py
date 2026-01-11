@@ -726,7 +726,7 @@ class BaseDataset(torch.utils.data.Dataset):
                 standard_item[key] = value.to(dtype=torch.bfloat16)
 
         # ensure that non-empty strings contain exactly one newline character at the end of the string
-        for key in ["prompt", "subtask"]:
+        for key in ["prompt"]:
             if standard_item[key].endswith(
                 "\n"
             ):  # ensure there isn't going to be an extra space at the end after calling replace
@@ -1505,6 +1505,8 @@ class LeRobotDataset(BaseDataset):
 
             # change data naming to standard data format
             item = self._to_standard_data_format(item)
+
+            item["subtask"] = item["prompt"]
 
             if self.meta.advantages is not None:
                 advantage = self.meta.advantages.get((episode_index, timestamp), 0)

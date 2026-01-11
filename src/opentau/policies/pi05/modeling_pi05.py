@@ -793,7 +793,7 @@ class PI05Policy(PreTrainedPolicy):
                 - sublang_tokens: Tensor of subtask language tokens.
                 - sublang_masks: Tensor of subtask language attention masks.
         """
-        device = batch["subtask"].device
+        device = batch["state"].device
         subtasks = batch["subtask"]
 
         # PaliGemma subtask has to end with a new line
@@ -1133,10 +1133,8 @@ class PI05FlowMatching(nn.Module):
         vlm_2d_attention_mask = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         vlm_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
-        # avoids using discrete action and subtask tokens for predicting continuous flow matching action
-        num_cross_att_tokens = (
-            prefix_embs.shape[1] - self.config.discrete_action_max_length - self.config.tokenizer_max_length
-        )
+        # avoids using discrete action for predicting continuous flow matching action
+        num_cross_att_tokens = prefix_embs.shape[1] - self.config.discrete_action_max_length
 
         (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
             attention_mask=vlm_2d_attention_mask,
@@ -1167,9 +1165,9 @@ class PI05FlowMatching(nn.Module):
             n_cross_att_tokens=num_cross_att_tokens,
             cross_att_pad_masks=prefix_pad_masks[:, :num_cross_att_tokens],
         )
-        # We should skip the sub task tokens and discrete actions when numbering the position ids for the action expert
+        # We should skip the discrete actions when numbering the position ids for the action expert
         prefix_offsets = torch.sum(
-            prefix_pad_masks[:, : -self.config.discrete_action_max_length - self.config.tokenizer_max_length],
+            prefix_pad_masks[:, : -self.config.discrete_action_max_length],
             dim=-1,
         )[:, None]  # action expert position ids start after prefix
         action_expert_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
@@ -1216,7 +1214,31 @@ class PI05FlowMatching(nn.Module):
         # compute mean
         ce_loss = ce_loss.mean()
 
-        return {"MSE": losses, "CE": ce_loss}
+        # compute cross entropy loss for sub task language
+        batch_size, seq_len = sublang_tokens.shape
+        sublang_out = prefix_out[
+            :,
+            -self.config.tokenizer_max_length
+            - self.config.discrete_action_max_length
+            - 1 : -self.config.discrete_action_max_length - 1,
+        ]
+        subtask_logits = self.paligemma_with_expert.paligemma.lm_head(sublang_out)
+
+        subtask_logits = subtask_logits.to(dtype=torch.float32)  # upcast to float32 for loss calculation
+        subtask_logits = rearrange(subtask_logits, "b s d -> (b s) d")
+        subtask_labels = rearrange(sublang_tokens, "b s -> (b s)")
+        subtask_ce_loss = F.cross_entropy(subtask_logits, subtask_labels, reduction="none")
+
+        subtask_ce_loss = rearrange(subtask_ce_loss, "(b s) -> b s", b=batch_size, s=seq_len)
+
+        # remove pad tokens
+        sublang_is_pad = ~sublang_masks  # convert into format where value for pad is True
+        subtask_ce_loss = subtask_ce_loss * ~sublang_is_pad
+
+        # compute mean
+        subtask_ce_loss = subtask_ce_loss.mean()
+
+        return {"MSE": losses, "CE": ce_loss + subtask_ce_loss}
 
     def sample_actions(
         self,
