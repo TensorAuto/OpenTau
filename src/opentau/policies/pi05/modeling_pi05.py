@@ -874,6 +874,8 @@ class PI05FlowMatching(nn.Module):
         self.time_mlp_in = nn.Linear(self.config.proj_width, self.config.proj_width)
         self.time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
 
+        self.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
+
         self._init_model()
 
     def _init_weights(self, module: nn.Module) -> None:
@@ -1006,7 +1008,7 @@ class PI05FlowMatching(nn.Module):
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
-        if self.config.subtask_prediction:
+        if self.config.subtask_prediction and sublang_tokens is not None:
             sublang_emb = self.paligemma_with_expert.embed_language_tokens(sublang_tokens)
 
             # Normalize subtask language embeddings
@@ -1284,7 +1286,7 @@ class PI05FlowMatching(nn.Module):
         num_cross_att_tokens = prefix_embs.shape[1]
 
         # Compute image and language key value cache
-        _, past_key_values = self.paligemma_with_expert.forward(
+        (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
             position_ids=prefix_position_ids,
             past_key_values=None,
@@ -1293,6 +1295,40 @@ class PI05FlowMatching(nn.Module):
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
         )
+
+        sublang_tokens = []
+        sublang_masks = []
+        # To Do: Optimize the autoregressive inference for subtask prediction
+        if self.config.subtask_prediction:
+            for _ in range(self.config.tokenizer_max_length):
+                sublang_token = prefix_out[:, -1:]
+                sublang_token = self.paligemma_with_expert.paligemma.lm_head(sublang_token).argmax(dim=-1)
+                sublang_tokens.append(sublang_token)
+                sublang_masks.append(torch.tensor([True]).to(device=device, dtype=torch.bool))
+
+                prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+                    images,
+                    img_masks,
+                    lang_tokens,
+                    lang_masks,
+                    torch.concat(sublang_tokens).reshape(1, -1),
+                    torch.concat(sublang_masks).reshape(1, -1),
+                )
+                prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+                prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+
+                num_cross_att_tokens = prefix_embs.shape[1]
+
+                # Compute image and language key value cache
+                (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
+                    attention_mask=prefix_att_2d_masks,
+                    position_ids=prefix_position_ids,
+                    past_key_values=None,
+                    inputs_embeds=[prefix_embs, None],
+                    n_cross_att_tokens=num_cross_att_tokens,
+                    use_cache=self.config.use_cache,
+                    fill_kv_cache=True,
+                )
 
         dt = -1.0 / self.config.num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
