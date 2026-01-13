@@ -129,9 +129,21 @@ libero = [
     "pyopengl==3.1.7 ; sys_platform == 'linux'",
     "numpy==1.26.4 ; sys_platform == 'linux'",
 ]
+urdf = [
+    "rerun-sdk>=0.28.2",
+]
 
 [tool.uv.sources]
 libero = { git = "https://github.com/shuheng-liu/LIBERO" , branch = "master" }  # the official libero repo is misconfigured for pip install with git
+
+# libero depends on gym, which depends on numpy 1.x, while rerun only supports urdf in v0.28 which requires numpy 2.x
+[tool.uv]
+conflicts = [
+  [
+    { extra = "libero" },
+    { extra = "urdf" },
+  ],
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
