@@ -69,7 +69,7 @@ from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.lerobot_dataset import LeRobotDataset
 
 PERMIT_URDF = hasattr(rr, "urdf")
-if PERMIT_URDF:
+if not PERMIT_URDF:
     warnings.warn(
         "`rerun.urdf` module not found. Make sure you have rerun >= 0.28.2 installed. "
         " One way to ensure this is to install OpenTau with the '[urdf]' extra: `pip install opentau[urdf]`.",
