@@ -52,7 +52,9 @@ distant$ opentau-dataset-viz --repo-id lerobot/pusht --episode-index 0 --mode di
 import argparse
 import gc
 import logging
+import os
 import time
+import warnings
 from pathlib import Path
 from typing import Iterator
 
@@ -65,6 +67,51 @@ import tqdm
 from opentau.configs.default import DatasetMixtureConfig, WandBConfig
 from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.lerobot_dataset import LeRobotDataset
+
+if not hasattr(rr, "urdf"):
+    warnings.warn(
+        "`rerun.urdf` module not found. Make sure you have rerun >= 0.28.2 installed."
+        "One way to ensure this is install OpenTau with the '[urdf]' extra: `pip install opentau[urdf]`.",
+        stacklevel=2,
+    )
+
+
+# Older and newer versions of rerun have different APIs for setting time / sequence
+def _rr_set_sequence(timeline: str, value: int):
+    if hasattr(rr, "set_time_sequence"):
+        rr.set_time_sequence(timeline, value)
+    else:
+        rr.set_time(timeline, sequence=value)
+
+
+def _rr_set_seconds(timeline: str, value: float):
+    if hasattr(rr, "set_time_seconds"):
+        rr.set_time_seconds(timeline, value)
+    else:
+        rr.set_time(timeline, timestamp=value)
+
+
+def _rr_scalar(value: float):
+    """Return a rerun scalar archetype that works across rerun versions.
+
+    Older rerun versions expose `rr.Scalar`, while newer versions expose `rr.Scalars`.
+    This wrapper returns an object suitable for `rr.log(path, ...)` for a single value.
+    """
+    v = float(value)
+
+    # Old API
+    if hasattr(rr, "Scalar"):
+        return rr.Scalar(v)
+
+    # New API (plural archetype)
+    if hasattr(rr, "Scalars"):
+        try:
+            return rr.Scalars(v)
+        except TypeError:
+            # Some versions expect a sequence/array for Scalars.
+            return rr.Scalars([v])
+
+    raise AttributeError("rerun has neither `Scalar` nor `Scalars` - please upgrade `rerun-sdk`.")
 
 
 def create_mock_train_config() -> TrainPipelineConfig:
@@ -123,6 +170,7 @@ def visualize_dataset(
     web_port: int = 9090,
     save: bool = False,
     output_dir: Path | None = None,
+    urdf: Path | None = None,
 ) -> Path | None:
     if save:
         assert output_dir is not None, (
@@ -153,6 +201,17 @@ def visualize_dataset(
     # TODO(rcadene): remove `gc.collect` when rerun version 0.16 is out, which includes a fix
     gc.collect()
 
+    if urdf:
+        rr.log_file_from_path(urdf, static=True)
+        urdf_tree = rr.urdf.UrdfTree.from_file_path(urdf)
+        urdf_joints = [jnt for jnt in urdf_tree.joints() if jnt.joint_type != "fixed"]
+        print(
+            "Assuming the dataset state dimensions correspond to URDF joints in order:",
+            "\n".join(f"{i:3d}: {jnt.name}" for i, jnt in enumerate(urdf_joints)),
+        )
+    else:
+        urdf_joints = []
+
     if mode == "distant":
         rr.serve_web_viewer(open_browser=False, web_port=web_port)
 
@@ -161,8 +220,8 @@ def visualize_dataset(
     for batch in tqdm.tqdm(dataloader, total=len(dataloader)):
         # iterate over the batch
         for i in range(len(batch["index"])):
-            rr.set_time_sequence("frame_index", batch["frame_index"][i].item())
-            rr.set_time_seconds("timestamp", batch["timestamp"][i].item())
+            _rr_set_sequence("frame_index", batch["frame_index"][i].item())
+            _rr_set_seconds("timestamp", batch["timestamp"][i].item())
 
             # display each camera image
             for key in dataset.meta.camera_keys:
@@ -172,21 +231,27 @@ def visualize_dataset(
             # display each dimension of action space (e.g. actuators command)
             if "action" in batch:
                 for dim_idx, val in enumerate(batch["action"][i]):
-                    rr.log(f"action/{dim_idx}", rr.Scalar(val.item()))
+                    rr.log(f"action/{dim_idx}", _rr_scalar(val.item()))
 
             # display each dimension of observed state space (e.g. agent position in joint space)
             if "observation.state" in batch:
                 for dim_idx, val in enumerate(batch["observation.state"][i]):
-                    rr.log(f"state/{dim_idx}", rr.Scalar(val.item()))
+                    rr.log(f"state/{dim_idx}", _rr_scalar(val.item()))
+                    # Assuming the state dimensions correspond to URDF joints in order.
+                    # TODO(shuheng): allow overriding with a mapping from state dim to joint name.
+                    if dim_idx < len(urdf_joints):
+                        joint = urdf_joints[dim_idx]
+                        transform = joint.compute_transform(float(val))
+                        rr.log("URDF", transform)
 
             if "next.done" in batch:
-                rr.log("next.done", rr.Scalar(batch["next.done"][i].item()))
+                rr.log("next.done", _rr_scalar(batch["next.done"][i].item()))
 
             if "next.reward" in batch:
-                rr.log("next.reward", rr.Scalar(batch["next.reward"][i].item()))
+                rr.log("next.reward", _rr_scalar(batch["next.reward"][i].item()))
 
             if "next.success" in batch:
-                rr.log("next.success", rr.Scalar(batch["next.success"][i].item()))
+                rr.log("next.success", _rr_scalar(batch["next.success"][i].item()))
 
     if mode == "local" and save:
         # save .rrd locally
@@ -272,7 +337,6 @@ def parse_args() -> dict:
             "Visualize the data by running `rerun path/to/file.rrd` on your local machine."
         ),
     )
-
     parser.add_argument(
         "--tolerance-s",
         type=float,
@@ -281,6 +345,22 @@ def parse_args() -> dict:
             "Tolerance in seconds used to ensure data timestamps respect the dataset fps value"
             "This is argument passed to the constructor of LeRobotDataset and maps to its tolerance_s constructor argument"
             "If not given, defaults to 1e-4."
+        ),
+    )
+    parser.add_argument(
+        "--urdf",
+        type=Path,
+        default=None,
+        help="Path to a URDF file to load and visualize alongside the dataset.",
+    )
+    parser.add_argument(
+        "--urdf-package-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Root directory of the URDF package to resolve package:// paths. "
+            "You can also set the ROS_PACKAGE_PATH environment variable, "
+            "which will be used if this argument is not provided."
         ),
     )
 
@@ -293,6 +373,9 @@ def main():
     repo_id = kwargs.pop("repo_id")
     root = kwargs.pop("root")
     tolerance_s = kwargs.pop("tolerance_s")
+    urdf_package_dir = kwargs.pop("urdf_package_dir")
+    if urdf_package_dir:
+        os.environ["ROS_PACKAGE_PATH"] = urdf_package_dir.resolve().as_posix()
 
     logging.info("Loading dataset")
     dataset = LeRobotDataset(
