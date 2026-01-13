@@ -68,7 +68,8 @@ from opentau.configs.default import DatasetMixtureConfig, WandBConfig
 from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.lerobot_dataset import LeRobotDataset
 
-if not hasattr(rr, "urdf"):
+PERMIT_URDF = hasattr(rr, "urdf")
+if PERMIT_URDF:
     warnings.warn(
         "`rerun.urdf` module not found. Make sure you have rerun >= 0.28.2 installed."
         "One way to ensure this is install OpenTau with the '[urdf]' extra: `pip install opentau[urdf]`.",
@@ -99,10 +100,6 @@ def _rr_scalar(value: float):
     """
     v = float(value)
 
-    # Old API
-    if hasattr(rr, "Scalar"):
-        return rr.Scalar(v)
-
     # New API (plural archetype)
     if hasattr(rr, "Scalars"):
         try:
@@ -110,6 +107,10 @@ def _rr_scalar(value: float):
         except TypeError:
             # Some versions expect a sequence/array for Scalars.
             return rr.Scalars([v])
+
+    # Old API
+    if hasattr(rr, "Scalar"):
+        return rr.Scalar(v)
 
     raise AttributeError("rerun has neither `Scalar` nor `Scalars` - please upgrade `rerun-sdk`.")
 
@@ -206,7 +207,7 @@ def visualize_dataset(
         urdf_tree = rr.urdf.UrdfTree.from_file_path(urdf)
         urdf_joints = [jnt for jnt in urdf_tree.joints() if jnt.joint_type != "fixed"]
         print(
-            "Assuming the dataset state dimensions correspond to URDF joints in order:",
+            "Assuming the dataset state dimensions correspond to URDF joints in order:\n",
             "\n".join(f"{i:3d}: {jnt.name}" for i, jnt in enumerate(urdf_joints)),
         )
     else:
@@ -376,6 +377,9 @@ def main():
     urdf_package_dir = kwargs.pop("urdf_package_dir")
     if urdf_package_dir:
         os.environ["ROS_PACKAGE_PATH"] = urdf_package_dir.resolve().as_posix()
+
+    if not PERMIT_URDF:
+        kwargs["urdf"] = None
 
     logging.info("Loading dataset")
     dataset = LeRobotDataset(
