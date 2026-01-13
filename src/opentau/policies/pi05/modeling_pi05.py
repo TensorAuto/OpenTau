@@ -596,11 +596,11 @@ class PI05Policy(PreTrainedPolicy):
         lang_tokens, lang_masks = self.prepare_language(
             batch
         )  # in lang_masks we have True for real tokens and False for padded tokens
-        if self.config.subtask_prediction:
-            sublang_tokens, sublang_masks = self.prepare_sub_task(batch)
-        else:
-            sublang_tokens = None
-            sublang_masks = None
+        # subtask prediction is to predict the subtask . It will attend to image and language inputs.
+        sublang_tokens, sublang_masks = self.prepare_sub_task(
+            batch
+        )  # in sublang_masks we have True for real tokens and False for padded tokens
+        # discrete actions are to predict actions using autoregressive technique and not flow matching. It will attend to image, language and subtask inputs.
         discrete_actions, discrete_action_masks = self.prepare_discrete_actions(
             batch
         )  # in discrete_action_masks we have True for real tokens and False for padded tokens
@@ -614,9 +614,9 @@ class PI05Policy(PreTrainedPolicy):
             img_masks,
             lang_tokens,
             lang_masks,
+            actions,
             sublang_tokens,
             sublang_masks,
-            actions,
             noise,
             time,
             discrete_actions,
@@ -764,6 +764,7 @@ class PI05Policy(PreTrainedPolicy):
 
         # add state to the prompt
         state = self.prepare_discrete_state(batch)
+        # we use \n as a end of token indictaor. The task always ends with \n , so no need to add it between State and Task. But for subtask prediction, we need to add it between Task and Subtask.
         if self.config.subtask_prediction:
             prompt = [
                 f"Task: {task}State: {state}\nSubtask:" for task, state in zip(tasks, state, strict=False)
@@ -797,13 +798,16 @@ class PI05Policy(PreTrainedPolicy):
                 - sublang_tokens: Tensor of subtask language tokens.
                 - sublang_masks: Tensor of subtask language attention masks.
         """
+
+        if not self.config.subtask_prediction:
+            return None, None
         device = batch["state"].device
         subtasks = batch["subtask"]
 
         # PaliGemma subtask has to end with a new line
         subtasks = [subtask if subtask.endswith("\n") else f"{subtask}\n" for subtask in subtasks]
 
-        sub_prompt = [f"Task: {subtask}\nActions: {subtask}" for subtask in subtasks]
+        sub_prompt = [f"Task: {subtask}\nActions:" for subtask in subtasks]
 
         tokenized_subtask = self.language_tokenizer.__call__(
             sub_prompt,
@@ -958,8 +962,8 @@ class PI05FlowMatching(nn.Module):
             img_masks: List of image mask tensors.
             lang_tokens: Language token tensor.
             lang_masks: Language mask tensor.
-            sublang_tokens: Subtask language token tensor.
-            sublang_masks: Subtask language mask tensor.
+            sublang_tokens: Optional Subtask language token tensor.
+            sublang_masks: Optional Subtask language mask tensor.
             discrete_actions: Optional discrete action tensor.
             discrete_action_masks: Optional discrete action mask tensor.
 
@@ -1098,9 +1102,9 @@ class PI05FlowMatching(nn.Module):
         img_masks: list[Tensor],
         lang_tokens: Tensor,
         lang_masks: Tensor,
-        sublang_tokens: Tensor,
-        sublang_masks: Tensor,
         actions: Tensor,
+        sublang_tokens: Tensor | None = None,
+        sublang_masks: Tensor | None = None,
         noise: Tensor | None = None,
         time: Tensor | None = None,
         discrete_actions: Tensor | None = None,
@@ -1298,11 +1302,14 @@ class PI05FlowMatching(nn.Module):
 
         sublang_tokens = []
         sublang_masks = []
-        # To Do: Optimize the autoregressive inference for subtask prediction
+        # TODO: Optimize the autoregressive inference for subtask prediction
         if self.config.subtask_prediction:
             for _ in range(self.config.tokenizer_max_length):
                 sublang_token = prefix_out[:, -1:]
                 sublang_token = self.paligemma_with_expert.paligemma.lm_head(sublang_token).argmax(dim=-1)
+                # Auto regressive inference will stop when the \n token is predicted
+                if sublang_token.item() == 108:
+                    break
                 sublang_tokens.append(sublang_token)
                 sublang_masks.append(torch.tensor([True]).to(device=device, dtype=torch.bool))
 
