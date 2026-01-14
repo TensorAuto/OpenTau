@@ -3,6 +3,8 @@
     "output_path": "/akshay/rosbag",
     "fps": 10,
     "joint_order":[],
+    "robot_type": "unknown",
+    "use_videos": true,
     "dataset_features": {
             "observation.state": {
                 "ros_topic": "/joint_states",
@@ -20,5 +22,8 @@
                     25
                 ]
             }
-        }
+        },
+    "ros_topic_mapping":{
+        "/joint_states": "/joint_states"
+    }
 }
