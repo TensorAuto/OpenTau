@@ -1236,7 +1236,7 @@ class PI05FlowMatching(nn.Module):
             cross_att_pad_masks=prefix_pad_masks[:, :num_cross_att_tokens],
         )
         # We should skip the response tokens when numbering the position ids for the action expert
-        prefix_offsets = torch.sum(prefix_pad_masks[:, : -self.config.discrete_action_max_length], dim=-1)[
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[
             :, None
         ]  # action expert position ids start after prefix
         action_expert_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
