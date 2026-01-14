@@ -22,6 +22,19 @@ class RosToLeRobotConfig:
     """Configuration for ROS to LeRobot conversion settings.
 
     This configuration is used for converting ROS bags to LeRobot dataset format.
+
+    Attributes:
+        input_path (str): Path to the directory containing input ROS bags.
+            Defaults to "input_path".
+        output_path (str): Path where the converted LeRobot dataset will be saved.
+            Defaults to "output_path".
+        fps (int): Frames per second for the output dataset. Timestamps will be
+            synchronized to this frequency. Defaults to 10.
+        joint_order (list[str]): List of joint names defining the order of elements
+            in joint state vectors. Defaults to an empty list.
+        dataset_features (dict[str, ROSFeature]): Dictionary mapping dataset feature
+            names (e.g., "observation.state") to their corresponding ROS topic
+            configuration. Defaults to an empty dictionary.
     """
 
     input_path: str = "input_path"

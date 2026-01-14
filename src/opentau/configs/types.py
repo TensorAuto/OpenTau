@@ -79,8 +79,16 @@ class PolicyFeature:
 @dataclass
 class ROSFeature:
     """Configuration for a dataset feature.
-    This class describes a single feature used in a dataset, including its
-    type and shape information.
+
+    This class describes a single feature used in a dataset, mapping a ROS topic
+    to a LeRobot dataset feature.
+
+    Attributes:
+        ros_topic (str): The ROS topic name (e.g., "/joint_states").
+        topic_attribute (str): The attribute of the ROS message to extract
+            (e.g., "position", "velocity").
+        dtype (str): The data type of the feature (e.g., "float32").
+        shape (tuple): The shape of the feature data (e.g., (25,)).
     """
 
     ros_topic: str
