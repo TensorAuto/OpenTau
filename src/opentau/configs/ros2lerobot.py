@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from opentau.configs.types import ROSFeature
 
 
 @dataclass
@@ -25,4 +27,5 @@ class RosToLeRobotConfig:
     input_path: str = "input_path"
     output_path: str = "output_path"
     fps: int = 10
-    joint_order: list[str] = []
+    joint_order: list[str] = field(default_factory=list)
+    dataset_features: dict[str, ROSFeature] = field(default_factory=dict)

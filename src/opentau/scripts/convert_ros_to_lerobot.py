@@ -22,6 +22,7 @@
 # lerobot.finalize() (look into this from upstream lerobot)
 
 
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -33,12 +34,28 @@ from opentau.datasets.lerobot_dataset import LeRobotDataset
 
 
 def get_sec_from_timestamp(timestamp):
+    """Converts a ROS timestamp object to seconds.
+
+    Args:
+        timestamp: A ROS timestamp object containing 'sec' and 'nanosec' attributes.
+
+    Returns:
+        float: Time in seconds.
+    """
     return timestamp.sec + timestamp.nanosec / 1e9
 
 
 def synchronize_sensor_data(data, fps):
-    """
-    Synchronize sensor data timestamps to a common FPS.
+    """Synchronize sensor data timestamps to a common FPS.
+
+    Assumes the stream is recorded in increasing order of timestamps.
+
+    Args:
+        data (list): List of (timestamp, value) tuples.
+        fps (int): Frames per second to target for synchronization.
+
+    Returns:
+        list: List of synchronized values.
     """
     # assuming the stream is recorded in increasing order of timestamps
 
@@ -68,8 +85,14 @@ def synchronize_sensor_data(data, fps):
 
 
 def batch_synchronize_sensor_data(topic_data, fps):
-    """
-    Synchronize sensor data timestamps to a common FPS. Batch version.
+    """Synchronize sensor data timestamps to a common FPS. Batch version.
+
+    Args:
+        topic_data (dict): Dictionary mapping topic names to lists of (timestamp, value) tuples.
+        fps (int): Frames per second to target for synchronization.
+
+    Returns:
+        dict: Dictionary mapping topic names to lists of synchronized values.
     """
     sync_data = {}
     for topic, data in topic_data.items():
@@ -78,17 +101,28 @@ def batch_synchronize_sensor_data(topic_data, fps):
 
 
 def read_mcap_to_lerobot(cfg, mcap_path, output_path):
-    """
-    Reads a ROS 2 MCAP bag and converts /joint_states to a dictionary format
-    suitable for loading into LeRobot (or converting to HF Dataset).
-    """
+    """Reads a ROS 2 MCAP bag and converts /joint_states to a dictionary format.
 
+    Suitable for loading into LeRobot (or converting to HF Dataset).
+
+    Args:
+        cfg (RosToLeRobotConfig): Configuration object containing joint ordering.
+        mcap_path (str | Path): Path to the input MCAP file.
+        output_path (str | Path): Path for output (currently unused).
+
+    Returns:
+        dict: Dictionary mapping topics to lists of (timestamp, value) tuples.
+    """
     mcap_path = Path(mcap_path)
     print(f"Scanning {mcap_path}...")
 
     # Data buffers
     # Stores lists of (timestamp, value) tuples for each topic
-    topic_data = {}
+    topic_data = defaultdict(list)
+
+    required_topics = defaultdict(list)
+    for _, v in cfg.dataset_features.items():
+        required_topics[v.ros_topic].append(v.topic_attribute)
 
     # 1. Setup Reader
     with AnyReader([mcap_path]) as reader:
@@ -107,11 +141,8 @@ def read_mcap_to_lerobot(cfg, mcap_path, output_path):
             # Try to get the header timestamp, otherwise fall back to bag timestamp
             ts = msg.header.stamp if hasattr(msg, "header") and hasattr(msg.header, "stamp") else timestamp
 
-            if connection.topic not in topic_data:
-                topic_data[connection.topic] = []
-
             # Extract values based on topic type/name
-            if connection.topic == "/joint_states":
+            if connection.topic == "/joint_states" and connection.topic in required_topics:
                 # --- Handle Joint Ordering ---
                 if first_joint_msg:
                     if not joint_order:
@@ -123,25 +154,31 @@ def read_mcap_to_lerobot(cfg, mcap_path, output_path):
                 current_map = {name: i for i, name in enumerate(msg.name)}
 
                 # Extract data in the correct fixed order
-                pos_vec = []
+                extracted_data = {}
+                attributes = required_topics[connection.topic]
+                for attribute in attributes:
+                    extracted_data[attribute] = []
 
                 try:
                     for j_name in joint_order:
                         idx = current_map[j_name]
 
                         # Safe extraction
-                        p = msg.position[idx] if len(msg.position) > idx else 0.0
-
-                        pos_vec.append(p)
+                        for attribute in attributes:
+                            extracted_data[attribute].append(
+                                getattr(msg, attribute)[idx] if len(getattr(msg, attribute)) > idx else 0.0
+                            )
 
                     # Store extracted values instead of raw message
-                    topic_data[connection.topic].append((ts, pos_vec))
+
+                    for attribute in attributes:
+                        topic_data[(connection.topic, attribute)].append((ts, extracted_data[attribute]))
 
                 except KeyError:
                     pass
 
             # Add handlers for other topics here (e.g. images)
-            elif "image" in connection.topic:
+            elif "image" in connection.topic and connection.topic in required_topics:
                 # Placeholder for image handling
                 topic_data[connection.topic].append((ts, msg))  # Keep msg for now if extraction not defined
             else:
@@ -152,8 +189,14 @@ def read_mcap_to_lerobot(cfg, mcap_path, output_path):
 
 @parser.wrap()
 def batch_convert_ros_bags(cfg: RosToLeRobotConfig):
-    """
-    Batch convert ROS bags to LeRobot dataset.
+    """Batch convert ROS bags to LeRobot dataset.
+
+    Iterates through a directory of ROS bags, extracts necessary features, synchronizes them,
+    and creates a LeRobot dataset with the given features.
+
+    Args:
+        cfg (RosToLeRobotConfig): Configuration object specifying input/output paths,
+            FPS, joint order, and dataset features.
     """
     input_path = Path(cfg.input_path)
     output_path = Path(cfg.output_path)
@@ -164,21 +207,20 @@ def batch_convert_ros_bags(cfg: RosToLeRobotConfig):
         root=output_path,
         robot_type="unknown",  # You might want to make this configurable
         features={
-            "observation.state": {
-                "dtype": "float32",
-                "shape": (25,),  # Based on your joint_order list length (25 joints)
-                "names": cfg.joint_order,
-            },
+            k: {
+                "dtype": v.dtype,
+                "shape": tuple(v.shape),
+                "names": cfg.joint_order if k == "observation.state" else None,
+            }
+            for k, v in cfg.dataset_features.items()
         },
         use_videos=False,  # Set to True if you are extracting images
     )
 
-    # Iterate over all subdirectories in the input path
+    # Iterate over all ros bags in the input path and store them as a dataset
     for bag_path in [p for p in input_path.iterdir() if p.is_dir()]:
         print(f"Processing bag: {bag_path}")
         try:
-            # We don't need output_path here anymore for individual pickles,
-            # we just need the data to add to the dataset
             topic_data = read_mcap_to_lerobot(cfg, bag_path, None)
 
             if topic_data is None:
@@ -188,30 +230,24 @@ def batch_convert_ros_bags(cfg: RosToLeRobotConfig):
 
             # Assuming '/joint_states' is the primary data source
             # We need to iterate through the synchronized data and add frames
-            if "/joint_states" in sync_data:
-                joint_states = sync_data["/joint_states"]
-                num_frames = len(joint_states)
+            for _, data in sync_data.items():
+                num_frames = len(data)
 
-                print(f"Adding {num_frames} frames to dataset...")
-
-                for i in range(num_frames):
-                    # Prepare frame dictionary
-                    # sync_data['/joint_states'][i] is just the value list/array now,
-                    # because synchronize_sensor_data returns list of values.
-                    # Wait, read_mcap_to_lerobot returns (ts, pos_vec) for joint_states.
-                    # synchronize_sensor_data returns a list of values (pos_vecs).
-
-                    # We need to reconstruct the frame dict expected by LeRobotDataset
-
-                    frame = {
-                        "observation.state": np.array(joint_states[i], dtype=np.float32),
+            for i in range(num_frames):
+                frame = {
+                    k: np.array(sync_data[(v.ros_topic, v.topic_attribute)][i], dtype=v.dtype)
+                    for k, v in cfg.dataset_features.items()
+                }
+                frame.update(
+                    {
                         "task": "dummy_task",  # Required field
                     }
+                )
 
-                    dataset.add_frame(frame)
+                dataset.add_frame(frame)
 
-                dataset.save_episode()
-                print(f"Episode saved for {bag_path.name}")
+            dataset.save_episode()
+            print(f"Episode saved for {bag_path.name}")
 
         except Exception as e:
             print(f"Failed to convert {bag_path}: {e}")
@@ -221,7 +257,6 @@ def batch_convert_ros_bags(cfg: RosToLeRobotConfig):
 
     print(f"Batch conversion complete. Saved to {output_path}")
     dataset.encode_videos()  # If videos were used
-    # Finalize/push if needed, but save_episode writes to disk.
 
 
 if __name__ == "__main__":
