@@ -74,3 +74,16 @@ class PolicyFeature:
 
     type: FeatureType
     shape: tuple
+
+
+@dataclass
+class ROSFeature:
+    """Configuration for a dataset feature.
+    This class describes a single feature used in a dataset, including its
+    type and shape information.
+    """
+
+    ros_topic: str
+    topic_attribute: str
+    dtype: str
+    shape: tuple

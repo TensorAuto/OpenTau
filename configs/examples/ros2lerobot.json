@@ -1,0 +1,24 @@
+{
+    "input_path": "/akshay/ros_bags",
+    "output_path": "/akshay/rosbag",
+    "fps": 10,
+    "joint_order":[],
+    "dataset_features": {
+            "observation.state": {
+                "ros_topic": "/joint_states",
+                "topic_attribute":"position",
+                "dtype":"float32",
+                "shape": [
+                    25
+                ]
+            },
+            "observation.velocity": {
+                "ros_topic": "/joint_states",
+                "topic_attribute":"velocity",
+                "dtype":"float32",
+                "shape": [
+                    25
+                ]
+            }
+        }
+}
