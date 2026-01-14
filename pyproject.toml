@@ -106,6 +106,7 @@ dev = ["pre-commit>=3.7.0",
     "sphinx-copybutton>=0.5.2",
     "sphinx-design>=0.6.1",
     "myst-parser>=4.0.0",
+    "rosbags>=0.10.4"
 ]
 openai = ["openai>=1.0.0", "python-dotenv>=1.0.0"]
 libero = [
