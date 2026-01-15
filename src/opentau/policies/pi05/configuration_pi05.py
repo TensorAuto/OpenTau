@@ -99,8 +99,11 @@ class PI05Config(PreTrainedConfig):
     # left and right wrist cameras in addition to the top camera.
     empty_cameras: int = 0
 
-    # Tokenizer
+    # Language Tokenizer
     tokenizer_max_length: int = 256
+
+    # Response Tokenizer
+    response_max_length: int = 52
 
     # Maximum length of the action tokens
     discrete_action_max_length: int = 32

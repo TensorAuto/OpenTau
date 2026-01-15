@@ -597,9 +597,9 @@ class PI05Policy(PreTrainedPolicy):
             batch
         )  # in lang_masks we have True for real tokens and False for padded tokens
         # subtask prediction is to predict the subtask . It will attend to image and language inputs.
-        sublang_tokens, sublang_masks = self.prepare_sub_task(
+        response_tokens, response_masks = self.prepare_response(
             batch
-        )  # in sublang_masks we have True for real tokens and False for padded tokens
+        )  # in response_masks we have True for real tokens and False for padded tokens
         # discrete actions are to predict actions using autoregressive technique and not flow matching. It will attend to image, language and subtask inputs.
         discrete_actions, discrete_action_masks = self.prepare_discrete_actions(
             batch
@@ -615,8 +615,8 @@ class PI05Policy(PreTrainedPolicy):
             lang_tokens,
             lang_masks,
             actions,
-            sublang_tokens,
-            sublang_masks,
+            response_tokens,
+            response_masks,
             noise,
             time,
             discrete_actions,
@@ -787,40 +787,40 @@ class PI05Policy(PreTrainedPolicy):
 
         return lang_tokens, lang_masks
 
-    def prepare_sub_task(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
-        """Tokenize the subtask input.
+    def prepare_response(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+        """Tokenize the response input.
 
         Args:
-            batch: Batch of data containing the key "subtask".
+            batch: Batch of data containing the key "response".
 
         Returns:
             A tuple containing:
-                - sublang_tokens: Tensor of subtask language tokens.
-                - sublang_masks: Tensor of subtask language attention masks.
+                - response_tokens: Tensor of response language tokens.
+                - response_masks: Tensor of response language attention masks.
         """
 
         if not self.config.subtask_prediction:
             return None, None
         device = batch["state"].device
-        subtasks = batch["subtask"]
+        responses = batch["response"]
 
         # PaliGemma subtask has to end with a new line
-        subtasks = [subtask if subtask.endswith("\n") else f"{subtask}\n" for subtask in subtasks]
+        responses = [response if response.endswith("\n") else f"{response}\n" for response in responses]
 
-        sub_prompt = [f"Task: {subtask}\nActions:" for subtask in subtasks]
+        sub_prompt = [f"Task: {response}\nActions:" for response in responses]
 
-        tokenized_subtask = self.language_tokenizer.__call__(
+        tokenized_response = self.language_tokenizer.__call__(
             sub_prompt,
             padding="max_length",
             padding_side="right",
-            max_length=self.config.tokenizer_max_length,
+            max_length=self.config.response_max_length,
             return_tensors="pt",
             truncation=True,
         )
-        sublang_tokens = tokenized_subtask["input_ids"].to(device=device)
-        sublang_masks = tokenized_subtask["attention_mask"].to(device=device, dtype=torch.bool)
+        response_tokens = tokenized_response["input_ids"].to(device=device)
+        response_masks = tokenized_response["attention_mask"].to(device=device, dtype=torch.bool)
 
-        return sublang_tokens, sublang_masks
+        return response_tokens, response_masks
 
 
 class PI05FlowMatching(nn.Module):
@@ -949,8 +949,8 @@ class PI05FlowMatching(nn.Module):
         img_masks: list[Tensor],
         lang_tokens: Tensor,
         lang_masks: Tensor,
-        sublang_tokens: Tensor | None = None,
-        sublang_masks: Tensor | None = None,
+        response_tokens: Tensor | None = None,
+        response_masks: Tensor | None = None,
         discrete_actions: Tensor | None = None,
         discrete_action_masks: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
@@ -962,8 +962,8 @@ class PI05FlowMatching(nn.Module):
             img_masks: List of image mask tensors.
             lang_tokens: Language token tensor.
             lang_masks: Language mask tensor.
-            sublang_tokens: Optional Subtask language token tensor.
-            sublang_masks: Optional Subtask language mask tensor.
+            response_tokens: Optional Response language token tensor.
+            response_masks: Optional Response language mask tensor.
             discrete_actions: Optional discrete action tensor.
             discrete_action_masks: Optional discrete action mask tensor.
 
@@ -1012,19 +1012,18 @@ class PI05FlowMatching(nn.Module):
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
-        if self.config.subtask_prediction and sublang_tokens is not None:
-            sublang_emb = self.paligemma_with_expert.embed_language_tokens(sublang_tokens)
+        response_emb = self.paligemma_with_expert.embed_language_tokens(response_tokens)
 
-            # Normalize subtask language embeddings
-            sublang_emb_dim = sublang_emb.shape[-1]
-            sublang_emb = sublang_emb * math.sqrt(sublang_emb_dim)
+        # Normalize subtask language embeddings
+        response_emb_dim = response_emb.shape[-1]
+        response_emb = response_emb * math.sqrt(response_emb_dim)
 
-            embs.append(sublang_emb)
-            pad_masks.append(sublang_masks)
+        embs.append(response_emb)
+        pad_masks.append(response_masks)
 
-            # full attention between image, language and subtask inputs
-            num_sublang_embs = sublang_emb.shape[1]
-            att_masks += [1] * num_sublang_embs
+        # full attention between image, language and subtask inputs
+        num_response_embs = response_emb.shape[1]
+        att_masks += [1] * num_response_embs
 
         if discrete_actions is not None:
             discrete_action_emb = self.paligemma_with_expert.embed_discrete_actions(discrete_actions)
@@ -1103,8 +1102,8 @@ class PI05FlowMatching(nn.Module):
         lang_tokens: Tensor,
         lang_masks: Tensor,
         actions: Tensor,
-        sublang_tokens: Tensor | None = None,
-        sublang_masks: Tensor | None = None,
+        response_tokens: Tensor | None = None,
+        response_masks: Tensor | None = None,
         noise: Tensor | None = None,
         time: Tensor | None = None,
         discrete_actions: Tensor | None = None,
@@ -1117,8 +1116,8 @@ class PI05FlowMatching(nn.Module):
             img_masks: List of image mask tensors.
             lang_tokens: Language token tensor.
             lang_masks: Language mask tensor.
-            sublang_tokens: Subtask language token tensor.
-            sublang_masks: Subtask language mask tensor.
+            response_tokens: Response language token tensor.
+            response_masks: Response language mask tensor.
             actions: Action tensor.
             noise: Optional noise tensor.
             time: Optional time tensor.
@@ -1134,8 +1133,8 @@ class PI05FlowMatching(nn.Module):
             img_masks,
             lang_tokens,
             lang_masks,
-            sublang_tokens,
-            sublang_masks,
+            response_tokens,
+            response_masks,
             discrete_actions,
             discrete_action_masks,
         )
@@ -1225,33 +1224,32 @@ class PI05FlowMatching(nn.Module):
         ce_loss = ce_loss.mean()
 
         # compute cross entropy loss for sub task language
-        if self.config.subtask_prediction:
-            batch_size, seq_len = sublang_tokens.shape
-            sublang_out = prefix_out[
-                :,
-                -self.config.tokenizer_max_length
-                - self.config.discrete_action_max_length
-                - 1 : -self.config.discrete_action_max_length - 1,
-            ]
-            subtask_logits = self.paligemma_with_expert.paligemma.lm_head(sublang_out)
+        batch_size, seq_len = response_tokens.shape
+        response_out = prefix_out[
+            :,
+            -self.config.response_max_length
+            - self.config.discrete_action_max_length
+            - 1 : -self.config.discrete_action_max_length - 1,
+        ]
+        response_logits = self.paligemma_with_expert.paligemma.lm_head(response_out)
 
-            subtask_logits = subtask_logits.to(dtype=torch.float32)  # upcast to float32 for loss calculation
-            subtask_logits = rearrange(subtask_logits, "b s d -> (b s) d")
-            subtask_labels = rearrange(sublang_tokens, "b s -> (b s)")
-            subtask_ce_loss = F.cross_entropy(subtask_logits, subtask_labels, reduction="none")
+        response_logits = response_logits.to(dtype=torch.float32)  # upcast to float32 for loss calculation
+        response_logits = rearrange(response_logits, "b s d -> (b s) d")
+        response_labels = rearrange(response_tokens, "b s -> (b s)")
+        response_ce_loss = F.cross_entropy(response_logits, response_labels, reduction="none")
 
-            subtask_ce_loss = rearrange(subtask_ce_loss, "(b s) -> b s", b=batch_size, s=seq_len)
+        response_ce_loss = rearrange(response_ce_loss, "(b s) -> b s", b=batch_size, s=seq_len)
 
-            # remove pad tokens
-            sublang_is_pad = ~sublang_masks  # convert into format where value for pad is True
-            subtask_ce_loss = subtask_ce_loss * ~sublang_is_pad
+        # remove pad tokens
+        response_is_pad = ~response_masks  # convert into format where value for pad is True
+        response_ce_loss = response_ce_loss * ~response_is_pad
 
-            # compute mean
-            subtask_ce_loss = subtask_ce_loss.mean()
+        # compute mean
+        response_ce_loss = response_ce_loss.mean()
 
         return {
             "MSE": losses,
-            "CE": (ce_loss + subtask_ce_loss if self.config.subtask_prediction else ce_loss),
+            "CE": (ce_loss + response_ce_loss),
         }
 
     def sample_actions(
@@ -1304,7 +1302,7 @@ class PI05FlowMatching(nn.Module):
         sublang_masks = []
         # TODO: Optimize the autoregressive inference for subtask prediction
         if self.config.subtask_prediction:
-            for _ in range(self.config.tokenizer_max_length):
+            for _ in range(self.config.response_max_length):
                 sublang_token = prefix_out[:, -1:]
                 sublang_token = self.paligemma_with_expert.paligemma.lm_head(sublang_token).argmax(dim=-1)
                 # Auto regressive inference will stop when the \n token is predicted
@@ -1384,7 +1382,7 @@ class PI05FlowMatching(nn.Module):
             cross_att_pad_masks=prefix_pad_masks[:, :num_cross_att_tokens],
         )
         # We should skip the response tokens when numbering the position ids for the action expert
-        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[
+        prefix_offsets = torch.sum(prefix_pad_masks[:, : -self.config.discrete_action_max_length], dim=-1)[
             :, None
         ]  # action expert position ids start after prefix
         action_expert_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
