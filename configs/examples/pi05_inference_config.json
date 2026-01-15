@@ -71,7 +71,6 @@
         "dropout": 0.1,
         "num_steps": 10,
         "init_strategy": "no_init",
-        "use_cache": true,
         "attention_implementation": "eager",
         "freeze_vision_encoder": true,
         "train_expert_only": true,

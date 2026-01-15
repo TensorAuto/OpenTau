@@ -596,11 +596,11 @@ class PI05Policy(PreTrainedPolicy):
         lang_tokens, lang_masks = self.prepare_language(
             batch
         )  # in lang_masks we have True for real tokens and False for padded tokens
-        # subtask prediction is to predict the subtask . It will attend to image and language inputs.
+        # response prediction is to predict the response . It will attend to image and language inputs.
         response_tokens, response_masks = self.prepare_response(
             batch
         )  # in response_masks we have True for real tokens and False for padded tokens
-        # discrete actions are to predict actions using autoregressive technique and not flow matching. It will attend to image, language and subtask inputs.
+        # discrete actions are to predict actions using autoregressive technique and not flow matching. It will attend to image, language and response inputs.
         discrete_actions, discrete_action_masks = self.prepare_discrete_actions(
             batch
         )  # in discrete_action_masks we have True for real tokens and False for padded tokens
@@ -764,10 +764,10 @@ class PI05Policy(PreTrainedPolicy):
 
         # add state to the prompt
         state = self.prepare_discrete_state(batch)
-        # we use \n as a end of token indictaor. The task always ends with \n , so no need to add it between State and Task. But for subtask prediction, we need to add it between Task and Subtask.
-        if self.config.subtask_prediction:
+        # we use \n as a end of token indictaor. The task always ends with \n , so no need to add it between State and Task. But for response prediction, we need to add it between Task and response.
+        if self.config.response_prediction:
             prompt = [
-                f"Task: {task}State: {state}\nSubtask:" for task, state in zip(tasks, state, strict=False)
+                f"Task: {task}State: {state}\nResponse:" for task, state in zip(tasks, state, strict=False)
             ]
         else:
             prompt = [
@@ -799,18 +799,18 @@ class PI05Policy(PreTrainedPolicy):
                 - response_masks: Tensor of response language attention masks.
         """
 
-        if not self.config.subtask_prediction:
+        if not self.config.response_prediction:
             return None, None
         device = batch["state"].device
         responses = batch["response"]
 
-        # PaliGemma subtask has to end with a new line
+        # PaliGemma response has to end with a new line
         responses = [response if response.endswith("\n") else f"{response}\n" for response in responses]
 
-        sub_prompt = [f"Task: {response}\nActions:" for response in responses]
+        response_prompt = [f"Task: {response}\nActions:" for response in responses]
 
         tokenized_response = self.language_tokenizer.__call__(
-            sub_prompt,
+            response_prompt,
             padding="max_length",
             padding_side="right",
             max_length=self.config.response_max_length,
@@ -1012,18 +1012,19 @@ class PI05FlowMatching(nn.Module):
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
-        response_emb = self.paligemma_with_expert.embed_language_tokens(response_tokens)
+        if response_tokens is not None:
+            response_emb = self.paligemma_with_expert.embed_language_tokens(response_tokens)
 
-        # Normalize subtask language embeddings
-        response_emb_dim = response_emb.shape[-1]
-        response_emb = response_emb * math.sqrt(response_emb_dim)
+            # Normalize response language embeddings
+            response_emb_dim = response_emb.shape[-1]
+            response_emb = response_emb * math.sqrt(response_emb_dim)
 
-        embs.append(response_emb)
-        pad_masks.append(response_masks)
+            embs.append(response_emb)
+            pad_masks.append(response_masks)
 
-        # full attention between image, language and subtask inputs
-        num_response_embs = response_emb.shape[1]
-        att_masks += [1] * num_response_embs
+            # full attention between image, language and response inputs
+            num_response_embs = response_emb.shape[1]
+            att_masks += [1] * num_response_embs
 
         if discrete_actions is not None:
             discrete_action_emb = self.paligemma_with_expert.embed_discrete_actions(discrete_actions)
@@ -1151,7 +1152,7 @@ class PI05FlowMatching(nn.Module):
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
             n_cross_att_tokens=num_cross_att_tokens,
-            use_cache=True,
+            use_cache=False,
             fill_kv_cache=True,
         )
 
@@ -1294,44 +1295,48 @@ class PI05FlowMatching(nn.Module):
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
             n_cross_att_tokens=num_cross_att_tokens,
-            use_cache=self.config.use_cache,
+            use_cache=False,
             fill_kv_cache=True,
         )
 
-        sublang_tokens = []
-        sublang_masks = []
-        # TODO: Optimize the autoregressive inference for subtask prediction
-        if self.config.subtask_prediction:
+        response_tokens = []
+        response_masks = []
+        if self.config.response_prediction:
             for _ in range(self.config.response_max_length):
-                sublang_token = prefix_out[:, -1:]
-                sublang_token = self.paligemma_with_expert.paligemma.lm_head(sublang_token).argmax(dim=-1)
+                response_token = prefix_out[:, -1:]
+                response_token = self.paligemma_with_expert.paligemma.lm_head(response_token).argmax(dim=-1)
                 # Auto regressive inference will stop when the \n token is predicted
-                if sublang_token.item() == 108:
+                if response_token.item() == 108:
                     break
-                sublang_tokens.append(sublang_token)
-                sublang_masks.append(torch.tensor([True]).to(device=device, dtype=torch.bool))
+                response_tokens.append(response_token)
+                response_masks.append(torch.tensor([True]).to(device=device, dtype=torch.bool))
 
                 prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
                     images,
                     img_masks,
                     lang_tokens,
                     lang_masks,
-                    torch.concat(sublang_tokens).reshape(1, -1),
-                    torch.concat(sublang_masks).reshape(1, -1),
+                    torch.concat(response_tokens).reshape(1, -1),
+                    torch.concat(response_masks).reshape(1, -1),
                 )
-                prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-                prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
-                num_cross_att_tokens = prefix_embs.shape[1]
+                num_cross_att_tokens = prefix_pad_masks.shape[1]
+                response_att_2d_masks = make_att_2d_masks(
+                    prefix_pad_masks[:, -1:],
+                    prefix_att_masks[:, -1:],
+                    n_cross_att_tokens=num_cross_att_tokens - 1,
+                    cross_att_pad_masks=prefix_pad_masks[:, : num_cross_att_tokens - 1],
+                )
+                prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1)[:, -1:] - 1
 
                 # Compute image and language key value cache
                 (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
-                    attention_mask=prefix_att_2d_masks,
+                    attention_mask=response_att_2d_masks,
                     position_ids=prefix_position_ids,
-                    past_key_values=None,
-                    inputs_embeds=[prefix_embs, None],
+                    past_key_values=past_key_values,
+                    inputs_embeds=[prefix_embs[:, -1:, :], None],
                     n_cross_att_tokens=num_cross_att_tokens,
-                    use_cache=self.config.use_cache,
+                    use_cache=True,
                     fill_kv_cache=True,
                 )
 

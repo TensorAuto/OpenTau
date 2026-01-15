@@ -386,6 +386,7 @@ def create_dummy_observation(cfg, device, dtype=torch.bfloat16) -> dict:
         **camera_observations,
         "state": torch.zeros((1, cfg.max_state_dim), dtype=dtype, device=device),
         "prompt": ["Pick up yellow lego block and put it in the bin"],
+        "response": ["Pick up yellow lego block and put it in the bin"],
         "img_is_pad": torch.zeros((1, cfg.num_cams), dtype=torch.bool, device=device),
         "action_is_pad": torch.zeros((1, cfg.action_chunk), dtype=torch.bool, device=device),
     }
