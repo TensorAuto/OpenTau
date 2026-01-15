@@ -37,8 +37,6 @@ class RosToLeRobotConfig:
         dataset_features (dict[str, ROSFeature]): Dictionary mapping dataset feature
             names (e.g., "observation.state") to their corresponding ROS topic
             configuration. Defaults to an empty dictionary.
-        ros_topic_mapping (dict[str, str]): Dictionary mapping users ROS topic names to
-            universal ROS topic names. Defaults to an empty dictionary.
     """
 
     input_path: str = "input_path"
@@ -48,4 +46,3 @@ class RosToLeRobotConfig:
     robot_type: str = "unknown"
     use_videos: bool = False
     dataset_features: dict[str, ROSFeature] = field(default_factory=dict)
-    ros_topic_mapping: dict[str, str] = field(default_factory=dict)

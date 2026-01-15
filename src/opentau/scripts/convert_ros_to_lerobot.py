@@ -24,33 +24,7 @@ from rosbags.highlevel import AnyReader
 from opentau.configs import parser
 from opentau.configs.ros2lerobot import RosToLeRobotConfig
 from opentau.datasets.lerobot_dataset import LeRobotDataset
-
-
-def get_nested_item(obj: Any, flattened_key: str, sep: str = ".") -> Any:
-    """Get a nested item from a dictionary-like object using a flattened key.
-
-    Args:
-        obj: Dictionary-like object to access.
-        flattened_key: Flattened key path (e.g., "a/b/c").
-        sep: Separator used in the flattened key. Defaults to ".".
-
-    Returns:
-        The value at the nested path specified by the flattened key.
-
-    Example:
-        >>> dct = {"a": {"b": {"c": 42}}}
-        >>> get_nested_item(dct, "a.b.c")
-        42
-    """
-    split_keys = flattened_key.split(sep)
-    getter = getattr(obj, split_keys[0])
-    if len(split_keys) == 1:
-        return getter
-
-    for key in split_keys[1:]:
-        getter = getattr(getter, key)
-
-    return getter
+from opentau.utils.ros2lerobot import EXTRACTORS
 
 
 def get_sec_from_timestamp(timestamp: Any) -> float:
@@ -143,8 +117,10 @@ def extract_topics_from_mcap(cfg: RosToLeRobotConfig, mcap_path: Path) -> dict[t
     topic_data = defaultdict(list)
 
     required_topics = defaultdict(list)
+    required_topics_enum = defaultdict(str)
     for _, v in cfg.dataset_features.items():
         required_topics[v.ros_topic].append(v.topic_attribute)
+        required_topics_enum[v.topic_attribute] = v.enum_values
 
     # 1. Setup Reader
     with AnyReader([mcap_path]) as reader:
@@ -153,9 +129,8 @@ def extract_topics_from_mcap(cfg: RosToLeRobotConfig, mcap_path: Path) -> dict[t
             logging.info("No connections found in bag!")
             return
 
-        # Initialize joint state tracking
-        joint_order = cfg.joint_order
-        first_joint_msg = True
+        # Initialize extractors
+        extractors = {k: v(cfg) for k, v in EXTRACTORS.items()}
 
         for connection, timestamp, rawdata in reader.messages(connections=connections):
             msg = reader.deserialize(rawdata, connection.msgtype)
@@ -163,58 +138,18 @@ def extract_topics_from_mcap(cfg: RosToLeRobotConfig, mcap_path: Path) -> dict[t
             # Try to get the header timestamp, otherwise fall back to bag timestamp
             ts = msg.header.stamp if hasattr(msg, "header") and hasattr(msg.header, "stamp") else timestamp
 
-            # Extract values based on topic type/name
-            if (
-                cfg.ros_topic_mapping.get(connection.topic, "/joint_states") == "/joint_states"
-                and connection.topic in required_topics
-            ):
-                # --- Handle Joint Ordering ---
-                if first_joint_msg:
-                    if not joint_order:
-                        joint_order = msg.name
-                        logging.info(f"Auto-detected joint order ({len(joint_order)} joints): {joint_order}")
-                    first_joint_msg = False
-
-                # Create a map for this message {name: index}
-                current_map = {name: i for i, name in enumerate(msg.name)}
-
-                # Extract data in the correct fixed order
-                extracted_data = {}
+            if connection.topic in required_topics:
                 attributes = required_topics[connection.topic]
+
                 for attribute in attributes:
-                    extracted_data[attribute] = []
-
-                try:
-                    for j_name in joint_order:
-                        idx = current_map[j_name]
-
-                        # Safe extraction
-                        for attribute in attributes:
-                            extracted_data[attribute].append(
-                                get_nested_item(msg, attribute, sep=".")[idx]
-                                if len(get_nested_item(msg, attribute, sep=".")) > idx
-                                else 0.0
-                            )
-
-                    # Store extracted values instead of raw message
-
-                    for attribute in attributes:
-                        topic_data[(connection.topic, attribute)].append((ts, extracted_data[attribute]))
-
-                except KeyError:
-                    logging.warning(
-                        f"KeyError: {connection.topic} {attribute} not found in ROS message for timestamp {ts}"
-                    )
-
-            # Add handlers for other topics here (e.g. images)
-            elif (
-                "image" in cfg.ros_topic_mapping.get(connection.topic, "image1")
-                and connection.topic in required_topics
-            ):
-                # Placeholder for image handling
-                topic_data[connection.topic].append((ts, msg))  # Keep msg for now if extraction not defined
-            else:
-                topic_data[connection.topic].append((ts, msg))
+                    if required_topics_enum[attribute] in extractors:
+                        extracted_data = extractors[required_topics_enum[attribute]](
+                            msg, connection.topic, attribute
+                        )
+                        if extracted_data:
+                            topic_data[(connection.topic, attribute)].append((ts, extracted_data))
+                    else:
+                        logging.exception(f"Extractor for {required_topics_enum[attribute]} not implemented")
 
     return topic_data
 
