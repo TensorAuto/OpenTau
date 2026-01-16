@@ -26,7 +26,7 @@
             "ACTION": "MEAN_STD"
         },
         "chunk_size": 10,
-        "response_prediction": true,
+        "predict_response": true,
         "n_action_steps": 10,
         "max_state_dim": 32,
         "max_action_dim": 32,

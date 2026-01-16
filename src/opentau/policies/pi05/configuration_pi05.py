@@ -49,7 +49,7 @@ class PI05Config(PreTrainedConfig):
             Defaults to identity for visual features and mean-std for state and action.
         max_state_dim: Maximum dimension for state vectors. Shorter vectors are padded. Defaults to 32.
         max_action_dim: Maximum dimension for action vectors. Shorter vectors are padded. Defaults to 32.
-        response_prediction: Whether to predict the response. Defaults to False.
+        predict_response: Whether to predict the response. Defaults to False.
         resize_imgs_with_padding: Target size (height, width) for image resizing with padding.
             Defaults to (224, 224).
         empty_cameras: Number of empty camera inputs to add. Used for specific adaptations like
@@ -89,7 +89,7 @@ class PI05Config(PreTrainedConfig):
     # Shorter state and action vectors will be padded
     max_state_dim: int = 32
     max_action_dim: int = 32
-    response_prediction: bool = False
+    predict_response: bool = False
 
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (224, 224)

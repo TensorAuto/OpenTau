@@ -416,9 +416,6 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             query_states = apply_rope(query_states, position_ids)
             key_states = apply_rope(key_states, position_ids)
 
-            if past_key_values is None:
-                past_key_values = {}
-
             if use_cache:
                 # TODO here, some optimization can be done - similar to a `StaticCache` we can declare the `max_len` before.
                 # so we create an empty cache, with just one cuda malloc, and if (in autoregressive case) we reach
@@ -427,6 +424,8 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
                 key_states = torch.cat([key_states, past_key_values[layer_idx]["key_states"]], dim=1)
                 value_states = torch.cat([value_states, past_key_values[layer_idx]["value_states"]], dim=1)
             if fill_kv_cache:
+                if past_key_values is None:
+                    past_key_values = {}
                 if n_cross_att_tokens is None:
                     raise ValueError("n_cross_att_tokens must be provided when fill_kv_cache is True")
                 past_key_values[layer_idx] = {
