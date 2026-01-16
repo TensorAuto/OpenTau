@@ -1,0 +1,28 @@
+{
+    "input_path": "/akshay/ros_bags",
+    "output_path": "/akshay/rosbag",
+    "fps": 10,
+    "joint_order":[],
+    "robot_type": "unknown",
+    "use_videos": true,
+    "dataset_features": {
+            "observation.state": {
+                "ros_topic": "/joint_states",
+                "topic_attribute":"position",
+                "enum_values": "state",
+                "dtype":"float32",
+                "shape": [
+                    25
+                ]
+            },
+            "observation.velocity": {
+                "ros_topic": "/joint_states",
+                "topic_attribute":"velocity",
+                "enum_values": "state",
+                "dtype":"float32",
+                "shape": [
+                    25
+                ]
+            }
+        }
+}
