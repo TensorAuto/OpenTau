@@ -28,4 +28,10 @@ pytest -sx tests/test_stuff.py::test_something
 python lerobot/scripts/train.py --some.option=true
 ```
 
+## Checklist
+
+- [ ] I have added Google-style docstrings to important functions and ensured function parameters are typed.
+- [ ] My PR includes policy-related changes.
+  - [ ] If the above is checked: I have run the GPU pytests (pytest -m "gpu") and regression tests.
+
 ### Note: Before submitting this PR, please read the [contributor guideline](https://github.com/TensorAuto/OpenTau/blob/main/CONTRIBUTING.md).

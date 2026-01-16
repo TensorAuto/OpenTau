@@ -208,7 +208,7 @@ def main():
             continue
 
         # Only process Python files
-        if file_path.suffix != ".py":
+        if file_path.suffix not in [".py", ".yaml", ".yml"]:
             continue
 
         if add_license_header(file_path):
