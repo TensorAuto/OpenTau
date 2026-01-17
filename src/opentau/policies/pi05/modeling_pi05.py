@@ -1347,7 +1347,7 @@ class PI05FlowMatching(nn.Module):
                 response_emb_dim = response_emb.shape[-1]
                 response_emb = response_emb * math.sqrt(response_emb_dim)
 
-                response_att_masks = torch.ones((bsize, 1), device=device, dtype=torch.bool)
+                response_att_masks = torch.ones((bsize, 1), device=device, dtype=response_emb.dtype)
 
                 prefix_embs = torch.cat([prefix_embs, response_emb], dim=1)
                 prefix_pad_masks = torch.cat([prefix_pad_masks, response_pad_masks], dim=1)
