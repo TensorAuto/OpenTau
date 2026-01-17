@@ -54,7 +54,7 @@ class PI05Config(PreTrainedConfig):
             Defaults to (224, 224).
         empty_cameras: Number of empty camera inputs to add. Used for specific adaptations like
             Aloha simulation. Defaults to 0.
-        tokenizer_max_length: Maximum length for tokenizer. Defaults to 256.
+        prompt_max_length: Maximum length for tokenizer. Defaults to 256.
         discrete_action_max_length: Maximum length for discrete action tokens. Defaults to 32.
         proj_width: Width of the projection layer. Defaults to 1024.
         dropout: Dropout rate. Defaults to 0.1.
@@ -99,7 +99,7 @@ class PI05Config(PreTrainedConfig):
     empty_cameras: int = 0
 
     # Language Tokenizer
-    tokenizer_max_length: int = 256
+    prompt_max_length: int = 256
 
     # Response Tokenizer
     response_max_length: int = 52
