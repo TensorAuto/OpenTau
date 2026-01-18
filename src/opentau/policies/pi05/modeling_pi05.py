@@ -152,7 +152,7 @@ def make_att_2d_masks(
         # Apply padding masks: pad_masks for rows, cross_att_pad_masks for columns
         cross_att_mask = cross_att_mask & pad_masks[:, :, None] & cross_att_pad_masks[:, None, :]
 
-        att_2d_masks = torch.cat((att_2d_masks, cross_att_mask), dim=2)
+        att_2d_masks = torch.cat((cross_att_mask, att_2d_masks), dim=2)
 
     return att_2d_masks
 
@@ -805,7 +805,8 @@ class PI05Policy(PreTrainedPolicy):
         device = batch["state"].device
         responses = batch["response"]
 
-        response_prompt = [f"{response}<eos>Actions:" for response in responses]
+        # if '\n' is found in response then response is not for loss calculation, so add pad token to the response.
+        response_prompt = [f"{response}<eos>Actions:" if response != "\n" else "" for response in responses]
 
         tokenized_response = self.language_tokenizer.__call__(
             response_prompt,
@@ -1306,6 +1307,7 @@ class PI05FlowMatching(nn.Module):
         eos_token = self.language_tokenizer.convert_tokens_to_ids(self.language_tokenizer.eos_token)
         if self.config.predict_response:
             for auto_step in range(self.config.response_max_length):
+                # Start the autoregressive inference with <bos> token
                 if auto_step == 0:
                     response_token = torch.full(
                         (bsize, 1),
@@ -1314,6 +1316,7 @@ class PI05FlowMatching(nn.Module):
                         dtype=torch.long,
                     )
                 else:
+                    # get the last predicted token from the prefix output
                     response_token = prefix_out[:, -1:]
                     response_token = self.paligemma_with_expert.paligemma.lm_head(response_token).argmax(
                         dim=-1
@@ -1329,7 +1332,9 @@ class PI05FlowMatching(nn.Module):
                         if pad_token is not None
                         else False
                     )
+                    # check if the previous token was EOS or PAD. If so, then the current token should be padded, so its not attneded by flow matching action expert.
                     response_pad_masks = ~(has_eos | has_pad)
+                    # if
                     response_token = torch.where(
                         response_pad_masks,
                         response_token,
@@ -1338,9 +1343,10 @@ class PI05FlowMatching(nn.Module):
                 else:
                     response_pad_masks = torch.ones((bsize, 1), device=device, dtype=torch.bool)
 
-                # Auto regressive inference will stop when the <eos> token is predicted
+                # Updating response tokens with current predicted token
                 response_tokens = torch.cat([response_tokens, response_token], dim=1)
 
+                # Embed the current predicted token
                 response_emb = self.paligemma_with_expert.embed_language_tokens(response_token)
 
                 # Normalize response language embeddings

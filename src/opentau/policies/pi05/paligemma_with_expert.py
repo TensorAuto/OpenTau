@@ -421,8 +421,8 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
                 # so we create an empty cache, with just one cuda malloc, and if (in autoregressive case) we reach
                 # the max len, then we (for instance) double the cache size. This implementation already exists
                 # in `transformers`. (molbap)
-                key_states = torch.cat([key_states, past_key_values[layer_idx]["key_states"]], dim=1)
-                value_states = torch.cat([value_states, past_key_values[layer_idx]["value_states"]], dim=1)
+                key_states = torch.cat([past_key_values[layer_idx]["key_states"], key_states], dim=1)
+                value_states = torch.cat([past_key_values[layer_idx]["value_states"], value_states], dim=1)
             if fill_kv_cache:
                 if past_key_values is None:
                     past_key_values = {}
