@@ -806,7 +806,7 @@ class PI05Policy(PreTrainedPolicy):
         responses = batch["response"]
 
         # if '\n' is found in response then response is not for loss calculation, so add pad token to the response.
-        response_prompt = [f"{response}<eos>Actions:" if response != "\n" else "" for response in responses]
+        response_prompt = [f"{response}<eos>Actions:" if response != "" else "" for response in responses]
 
         tokenized_response = self.language_tokenizer.__call__(
             response_prompt,
@@ -1426,7 +1426,7 @@ class PI05FlowMatching(nn.Module):
         if response_tokens.shape[1] > 1:
             prev_tokens = response_tokens
             has_eos = (prev_tokens == eos_token).any(dim=1, keepdim=True)
-            has_pad = (prev_tokens == pad_token).any(dim=1, keepdim=True) if pad_token is not None else False
+            has_pad = (prev_tokens == pad_token).any(dim=1, keepdim=True)
             # check if the previous token was EOS or PAD. If so, then the current token should be padded, so its not attneded by flow matching action expert.
             response_pad_masks = ~(has_eos | has_pad)
             # if

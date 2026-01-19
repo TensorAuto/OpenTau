@@ -20,17 +20,23 @@ from opentau.policies.pi05.modeling_pi05 import (
     PI05Policy,
 )
 
+paligemma_tokenizer_eos_ids = 1
+paligemma_tokenizer_pad_ids = 0
+
 
 class TestPI05Integration:
     """Integration tests for the complete PI05 pipeline."""
 
-    def _check_autoregressive_prefix_pads(self, prefix_pad_masks, response_tokens, prev_prefix_pad_masks):
+    def _check_autoregressive_prefix_pads(
+        self, prefix_pad_masks, response_tokens, prev_prefix_pad_masks, prefix_embs
+    ):
         assert prefix_pad_masks.shape[0] == 1
         assert prefix_pad_masks.shape[1] == prev_prefix_pad_masks.shape[1] + 1
         assert prefix_pad_masks.dtype == torch.bool
+        assert prefix_embs.shape[1] == prefix_pad_masks.shape[1]
 
-        has_eos = (response_tokens == 1).any(dim=1, keepdim=True)
-        has_pad = (response_tokens == 0).any(dim=1, keepdim=True)
+        has_eos = (response_tokens == paligemma_tokenizer_eos_ids).any(dim=1, keepdim=True)
+        has_pad = (response_tokens == paligemma_tokenizer_pad_ids).any(dim=1, keepdim=True)
 
         response_pad_masks = ~(has_eos | has_pad)
         assert torch.all(torch.cat((prev_prefix_pad_masks, response_pad_masks), dim=1) == prefix_pad_masks)
@@ -40,8 +46,8 @@ class TestPI05Integration:
         assert prefix_offsets.shape[1] == 1
         assert prefix_offsets.dtype == torch.long
 
-        response_token_position_id = (~(response_tokens[:, -1] == 0)).long()
-        assert torch.all(prefix_offsets == prev_prefix_offsets + response_token_position_id)
+        response_token_position_id_increment = (~(response_tokens[:, -1] == 0)).long()
+        assert torch.all(prefix_offsets == prev_prefix_offsets + response_token_position_id_increment)
 
     def _check_autoregressive_prefix_attention_mask(
         self, prefix_att_masks, response_tokens, prev_prefix_att_masks
@@ -354,7 +360,6 @@ class TestPI05Integration:
         # Also capture prefix_pad_masks and suffix_pad_masks by monkey-patching the embed methods
         original_embed_prefix = policy.model.embed_prefix
         original_embed_suffix = policy.model.embed_suffix
-        original_infer_response = policy.model.infer_response
 
         def capture_embed_prefix(*args, **kwargs):
             # workaround to have paddings in discrete actions, otherwise the tokenizer creates 1500 non-padded tokens, which can't be handled in given gpu memory
@@ -425,21 +430,21 @@ class TestPI05Integration:
             "Suffix pad masks should be boolean"
         )
 
-        # self._verify_pad_masks(captured_variables["prefix_pad_masks"], captured_variables["suffix_pad_masks"])
-        # self._verify_position_ids(
-        #     captured_variables["vlm_position_ids"],
-        #     captured_variables["action_expert_position_ids"],
-        #     captured_variables["prefix_pad_masks"],
-        #     captured_variables["suffix_pad_masks"],
-        # )
-        # self._verify_vlm_attention_mask(
-        #     captured_variables["vlm_2d_attention_mask"], captured_variables["prefix_pad_masks"]
-        # )
-        # self._verify_action_expert_attention_mask(
-        #     captured_variables["action_expert_2d_attention_mask"],
-        #     captured_variables["prefix_pad_masks"],
-        #     captured_variables["suffix_pad_masks"],
-        # )
+        self._verify_pad_masks(captured_variables["prefix_pad_masks"], captured_variables["suffix_pad_masks"])
+        self._verify_position_ids(
+            captured_variables["vlm_position_ids"],
+            captured_variables["action_expert_position_ids"],
+            captured_variables["prefix_pad_masks"],
+            captured_variables["suffix_pad_masks"],
+        )
+        self._verify_vlm_attention_mask(
+            captured_variables["vlm_2d_attention_mask"], captured_variables["prefix_pad_masks"]
+        )
+        self._verify_action_expert_attention_mask(
+            captured_variables["action_expert_2d_attention_mask"],
+            captured_variables["prefix_pad_masks"],
+            captured_variables["suffix_pad_masks"],
+        )
 
         assert isinstance(loss, dict)
         assert "MSE" in loss
@@ -456,14 +461,17 @@ class TestPI05Integration:
 
         # --------------------------------- Run the same test but for select_action --------------------------------------
         captured_variables_select_action = {}
+        original_infer_response = policy.model.infer_response
 
         def capture_infer_response(*args, **kwargs):
             prev_prefix_pad_masks = args[2]
             prev_prefix_offsets = args[5]
             prev_prefix_att_masks = args[3]
             result = original_infer_response(*args, **kwargs)
-            _, _, prefix_pad_masks, prefix_att_masks, prefix_offsets, response_tokens, _ = result
-            self._check_autoregressive_prefix_pads(prefix_pad_masks, response_tokens, prev_prefix_pad_masks)
+            _, prefix_embs, prefix_pad_masks, prefix_att_masks, prefix_offsets, response_tokens, _ = result
+            self._check_autoregressive_prefix_pads(
+                prefix_pad_masks, response_tokens, prev_prefix_pad_masks, prefix_embs
+            )
             self._check_autoregressive_prefix_position_ids(
                 prefix_offsets, response_tokens, prev_prefix_offsets
             )
