@@ -1304,80 +1304,27 @@ class PI05FlowMatching(nn.Module):
         )
 
         response_tokens = torch.empty((bsize, 0), device=device, dtype=torch.long)
-        eos_token = self.language_tokenizer.convert_tokens_to_ids(self.language_tokenizer.eos_token)
         if self.config.predict_response:
             for auto_step in range(self.config.response_max_length):
-                # Start the autoregressive inference with <bos> token
-                if auto_step == 0:
-                    response_token = torch.full(
-                        (bsize, 1),
-                        self.language_tokenizer.bos_token_id,
-                        device=device,
-                        dtype=torch.long,
-                    )
-                else:
-                    # get the last predicted token from the prefix output
-                    response_token = prefix_out[:, -1:]
-                    response_token = self.paligemma_with_expert.paligemma.lm_head(response_token).argmax(
-                        dim=-1
-                    )
-
-                pad_token = self.language_tokenizer.pad_token_id
-                # Create pad masks: False if previous token was EOS or PAD
-                if response_tokens.shape[1] > 1:
-                    prev_tokens = response_tokens
-                    has_eos = (prev_tokens == eos_token).any(dim=1, keepdim=True)
-                    has_pad = (
-                        (prev_tokens == pad_token).any(dim=1, keepdim=True)
-                        if pad_token is not None
-                        else False
-                    )
-                    # check if the previous token was EOS or PAD. If so, then the current token should be padded, so its not attneded by flow matching action expert.
-                    response_pad_masks = ~(has_eos | has_pad)
-                    # if
-                    response_token = torch.where(
-                        response_pad_masks,
-                        response_token,
-                        torch.tensor(pad_token, device=device, dtype=response_token.dtype),
-                    )
-                else:
-                    response_pad_masks = torch.ones((bsize, 1), device=device, dtype=torch.bool)
-
-                # Updating response tokens with current predicted token
-                response_tokens = torch.cat([response_tokens, response_token], dim=1)
-
-                # Embed the current predicted token
-                response_emb = self.paligemma_with_expert.embed_language_tokens(response_token)
-
-                # Normalize response language embeddings
-                response_emb_dim = response_emb.shape[-1]
-                response_emb = response_emb * math.sqrt(response_emb_dim)
-
-                response_att_masks = torch.ones((bsize, 1), device=device, dtype=response_emb.dtype)
-
-                prefix_embs = torch.cat([prefix_embs, response_emb], dim=1)
-                prefix_pad_masks = torch.cat([prefix_pad_masks, response_pad_masks], dim=1)
-                prefix_att_masks = torch.cat([prefix_att_masks, response_att_masks], dim=1)
-
-                num_cross_att_tokens = prefix_pad_masks.shape[1]
-                response_att_2d_masks = make_att_2d_masks(
-                    response_pad_masks,
-                    response_att_masks,
-                    n_cross_att_tokens=num_cross_att_tokens - 1,
-                    cross_att_pad_masks=prefix_pad_masks[:, : num_cross_att_tokens - 1],
-                )
-                prefix_offsets = prefix_offsets + response_pad_masks.long()
-                prefix_position_ids = prefix_offsets
-
-                # Compute image and language key value cache
-                (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
-                    attention_mask=response_att_2d_masks,
-                    position_ids=prefix_position_ids,
-                    past_key_values=past_key_values,
-                    inputs_embeds=[response_emb, None],
-                    n_cross_att_tokens=num_cross_att_tokens,
-                    use_cache=True,
-                    fill_kv_cache=True,
+                (
+                    prefix_out,
+                    prefix_embs,
+                    prefix_pad_masks,
+                    prefix_att_masks,
+                    prefix_offsets,
+                    response_tokens,
+                    past_key_values,
+                ) = self.infer_response(
+                    prefix_out,
+                    prefix_embs,
+                    prefix_pad_masks,
+                    prefix_att_masks,
+                    past_key_values,
+                    prefix_offsets,
+                    response_tokens,
+                    auto_step,
+                    bsize,
+                    device,
                 )
 
         dt = -1.0 / self.config.num_steps
@@ -1427,7 +1374,7 @@ class PI05FlowMatching(nn.Module):
             cross_att_pad_masks=prefix_pad_masks[:, :num_cross_att_tokens],
         )
         # We should skip the response tokens when numbering the position ids for the action expert
-        prefix_offsets = torch.sum(prefix_pad_masks[:, : -self.config.discrete_action_max_length], dim=-1)[
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[
             :, None
         ]  # action expert position ids start after prefix
         action_expert_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
@@ -1446,3 +1393,94 @@ class PI05FlowMatching(nn.Module):
         v_t = self.action_out_proj(suffix_out)
         v_t = v_t.to(dtype=torch.float32)
         return v_t
+
+    def infer_response(
+        self,
+        prefix_out,
+        prefix_embs,
+        prefix_pad_masks,
+        prefix_att_masks,
+        past_key_values,
+        prefix_offsets,
+        response_tokens,
+        auto_step,
+        bsize,
+        device,
+    ):
+        # Start the autoregressive inference with <bos> token
+        eos_token = self.language_tokenizer.convert_tokens_to_ids(self.language_tokenizer.eos_token)
+        if auto_step == 0:
+            response_token = torch.full(
+                (bsize, 1),
+                self.language_tokenizer.bos_token_id,
+                device=device,
+                dtype=torch.long,
+            )
+        else:
+            # get the last predicted token from the prefix output
+            response_token = prefix_out[:, -1:]
+            response_token = self.paligemma_with_expert.paligemma.lm_head(response_token).argmax(dim=-1)
+
+        pad_token = self.language_tokenizer.pad_token_id
+        # Create pad masks: False if previous token was EOS or PAD
+        if response_tokens.shape[1] > 1:
+            prev_tokens = response_tokens
+            has_eos = (prev_tokens == eos_token).any(dim=1, keepdim=True)
+            has_pad = (prev_tokens == pad_token).any(dim=1, keepdim=True) if pad_token is not None else False
+            # check if the previous token was EOS or PAD. If so, then the current token should be padded, so its not attneded by flow matching action expert.
+            response_pad_masks = ~(has_eos | has_pad)
+            # if
+            response_token = torch.where(
+                response_pad_masks,
+                response_token,
+                torch.tensor(pad_token, device=device, dtype=response_token.dtype),
+            )
+        else:
+            response_pad_masks = torch.ones((bsize, 1), device=device, dtype=torch.bool)
+
+        # Updating response tokens with current predicted token
+        response_tokens = torch.cat([response_tokens, response_token], dim=1)
+
+        # Embed the current predicted token
+        response_emb = self.paligemma_with_expert.embed_language_tokens(response_token)
+
+        # Normalize response language embeddings
+        response_emb_dim = response_emb.shape[-1]
+        response_emb = response_emb * math.sqrt(response_emb_dim)
+
+        response_att_masks = torch.ones((bsize, 1), device=device, dtype=response_emb.dtype)
+
+        prefix_embs = torch.cat([prefix_embs, response_emb], dim=1)
+        prefix_pad_masks = torch.cat([prefix_pad_masks, response_pad_masks], dim=1)
+        prefix_att_masks = torch.cat([prefix_att_masks, response_att_masks], dim=1)
+
+        num_cross_att_tokens = prefix_pad_masks.shape[1]
+        response_att_2d_masks = make_att_2d_masks(
+            response_pad_masks,
+            response_att_masks,
+            n_cross_att_tokens=num_cross_att_tokens - 1,
+            cross_att_pad_masks=prefix_pad_masks[:, : num_cross_att_tokens - 1],
+        )
+        prefix_offsets = prefix_offsets + response_pad_masks.long()
+        prefix_position_ids = prefix_offsets
+
+        # Compute image and language key value cache
+        (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=response_att_2d_masks,
+            position_ids=prefix_position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=[response_emb, None],
+            n_cross_att_tokens=num_cross_att_tokens,
+            use_cache=True,
+            fill_kv_cache=True,
+        )
+
+        return (
+            prefix_out,
+            prefix_embs,
+            prefix_pad_masks,
+            prefix_att_masks,
+            prefix_offsets,
+            response_tokens,
+            past_key_values,
+        )
