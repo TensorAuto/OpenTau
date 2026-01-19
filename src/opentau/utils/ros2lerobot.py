@@ -77,16 +77,65 @@ class StateExtractor(FeatureExtractor):
             return []
 
         extracted_values = []
+        extracted_velocities = []
         try:
             # Check if attribute exists on msg (at top level or nested?)
 
             raw_values = get_nested_item(msg, attribute, sep=".")
-
+            raw_velocities = get_nested_item(msg, "velocity", sep=".")
             for j_name in self.cfg.joint_order:
                 if j_name in current_map:
                     idx = current_map[j_name]
                     if len(raw_values) > idx:
                         extracted_values.append(raw_values[idx])
+                        extracted_velocities.append(raw_velocities[idx])
+                    else:
+                        extracted_values.append(0.0)
+                        extracted_velocities.append(0.0)
+                else:
+                    # Joint missing in this message
+                    extracted_values.append(0.0)
+                    extracted_velocities.append(0.0)
+            return extracted_values + extracted_velocities
+
+        except (KeyError, AttributeError, TypeError) as e:
+            logging.warning(f"Error extracting {attribute} from {ros_topic}: {e}")
+            return []
+
+
+class ActionExtractor(FeatureExtractor):
+    def __call__(self, msg: Any, ros_topic: str, attribute: str) -> Any:
+        # Handle Joint Ordering
+        if not self.cfg.joint_order:
+            if hasattr(msg, "joint_names"):
+                self.cfg.joint_order = msg.joint_names
+                logging.info(
+                    f"Auto-detected joint order ({len(self.cfg.joint_order)} joints): {self.cfg.joint_order}"
+                )
+            else:
+                logging.warning("Message does not have 'name' attribute, cannot auto-detect joint order.")
+                return []
+
+        # Create a map for this message {name: index}
+        if hasattr(msg, "joint_names"):
+            current_map = {name: i for i, name in enumerate(msg.joint_names)}
+        else:
+            # Fallback if msg doesn't have names but we have joint_order and data seems to match?
+            # For now assume joint_states structure
+            return []
+
+        extracted_values = []
+        try:
+            # Check if attribute exists on msg (at top level or nested?)
+
+            raw_values = get_nested_item(msg, attribute, sep=".")
+            raw_q = [raw_value.q for raw_value in raw_values]
+
+            for j_name in self.cfg.joint_order:
+                if j_name in current_map:
+                    idx = current_map[j_name]
+                    if len(raw_values) > idx:
+                        extracted_values.append(raw_q[idx])
                     else:
                         extracted_values.append(0.0)
                 else:
@@ -103,4 +152,5 @@ class StateExtractor(FeatureExtractor):
 # Mapping of enum values to extractors
 EXTRACTORS = {
     "state": StateExtractor,
+    "action": ActionExtractor,
 }

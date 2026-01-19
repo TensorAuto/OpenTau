@@ -1,7 +1,7 @@
 {
-    "input_path": "/akshay/ros_bags",
-    "output_path": "/akshay/rosbag",
-    "fps": 10,
+    "input_path": "/akshay/rosbags",
+    "output_path": "/akshay/rosbag_actions",
+    "fps": 30,
     "joint_order":[],
     "robot_type": "unknown",
     "use_videos": true,
@@ -12,13 +12,13 @@
                 "enum_values": "state",
                 "dtype":"float32",
                 "shape": [
-                    25
+                    50
                 ]
             },
-            "observation.velocity": {
-                "ros_topic": "/joint_states",
-                "topic_attribute":"velocity",
-                "enum_values": "state",
+            "observation.action": {
+                "ros_topic": "/motor_command_controller/motor_commands",
+                "topic_attribute":"commands",
+                "enum_values": "action",
                 "dtype":"float32",
                 "shape": [
                     25

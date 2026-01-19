@@ -177,7 +177,7 @@ def batch_convert_ros_bags(cfg: RosToLeRobotConfig) -> None:
             k: {
                 "dtype": v.dtype,
                 "shape": tuple(v.shape),
-                "names": cfg.joint_order if "state" in k else None,
+                "names": cfg.joint_order if "state" in k or "action" in k else None,
             }
             for k, v in cfg.dataset_features.items()
         },
