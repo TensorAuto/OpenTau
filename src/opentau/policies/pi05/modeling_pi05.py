@@ -1205,7 +1205,7 @@ class PI05FlowMatching(nn.Module):
         batch_size, seq_len = discrete_actions.shape
         discrete_token_start = -self.config.discrete_action_max_length
         # The last token of response will predict the first token of discrete actions , so we need to slice from discrete_token_start -1.
-        # The last toekn of discrete action is useless, so no need to include for loss calculation.
+        # The last token of discrete action is useless, so no need to include for loss calculation.
         discrete_action_slice_object = slice(discrete_token_start - 1, -1)
         discrete_action_out = prefix_out[:, discrete_action_slice_object]
         logits = self.paligemma_with_expert.da_head(discrete_action_out)
@@ -1227,7 +1227,7 @@ class PI05FlowMatching(nn.Module):
         # compute cross entropy loss for response language
         batch_size, seq_len = response_tokens.shape
         response_token_start = -self.config.response_max_length - self.config.discrete_action_max_length
-        #The last token of language will predict <BOS> token of response, so no need to include for loss calculation. Hence slice starts from -self.config.discrete_action_max_length - self.config.response_max_length.
+        # The last token of language will predict <BOS> token of response, so no need to include for loss calculation. Hence slice starts from -self.config.discrete_action_max_length - self.config.response_max_length.
         # The last token of response predicts first token  of discrete actions, so no need to include for loss calculation. Hence slice ends at -self.config.discrete_action_max_length - 1.
         response_token_end = -self.config.discrete_action_max_length - 1
         response_slice_object = slice(response_token_start, response_token_end)
@@ -1331,7 +1331,7 @@ class PI05FlowMatching(nn.Module):
                     bsize,
                     device,
                 )
-        
+
         # perform denoising steps to get the action
         dt = -1.0 / self.config.num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
