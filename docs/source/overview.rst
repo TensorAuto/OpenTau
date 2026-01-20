@@ -20,6 +20,7 @@ OpenTau aims to make it easy to train VLAs on your own datasets while including 
 - Co-training on an adjustable mixture of heterogeneous datasets
 - Discrete actions for fast VLM convergence in :math:`\pi_{0.5}`
 - Knowledge insulation between the VLM backbone and the action expert
+- Response prediction in :math:`\pi_{0.5}` for training on VQA datasets and high level planning while inferencing.
 - Dropout layers in the VLM that prevent overfitting
 - A reinforcement learning pipeline described in :math:`\pi^*_{0.6}`
 - Multi-node and multi-GPU training
