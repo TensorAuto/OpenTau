@@ -151,7 +151,7 @@ def make_att_2d_masks(
 
         # Apply padding masks: pad_masks for rows, cross_att_pad_masks for columns
         cross_att_mask = cross_att_mask & pad_masks[:, :, None] & cross_att_pad_masks[:, None, :]
-
+        # The cross_att_masks are concatenated before the att_2d_masks
         att_2d_masks = torch.cat((cross_att_mask, att_2d_masks), dim=2)
 
     return att_2d_masks
@@ -759,8 +759,6 @@ class PI05Policy(PreTrainedPolicy):
         device = batch["state"].device
         tasks = batch["prompt"]
 
-        # PaliGemma prompt has to end with a new line
-
         # add state to the prompt
         state = self.prepare_discrete_state(batch)
         # using <eos> to separate each modality
@@ -805,7 +803,7 @@ class PI05Policy(PreTrainedPolicy):
         device = batch["state"].device
         responses = batch["response"]
 
-        # if '\n' is found in response then response is not for loss calculation, so add pad token to the response.
+        # if '' is found in response then response is not for loss calculation (used for robotic dataset with no subtask), so add pad token to the response.
         response_prompt = [f"{response}<eos>Actions:" if response != "" else "" for response in responses]
 
         tokenized_response = self.language_tokenizer.__call__(
@@ -1206,6 +1204,8 @@ class PI05FlowMatching(nn.Module):
         # compute cross entropy loss for discrete actions
         batch_size, seq_len = discrete_actions.shape
         discrete_token_start = -self.config.discrete_action_max_length
+        # The last token of response will predict the first token of discrete actions , so we need to slice from discrete_token_start -1.
+        # The last toekn of discrete action is useless, so no need to include for loss calculation.
         discrete_action_slice_object = slice(discrete_token_start - 1, -1)
         discrete_action_out = prefix_out[:, discrete_action_slice_object]
         logits = self.paligemma_with_expert.da_head(discrete_action_out)
@@ -1224,9 +1224,11 @@ class PI05FlowMatching(nn.Module):
         # compute mean
         discrete_action_ce_loss = discrete_action_ce_loss.mean()
 
-        # compute cross entropy loss for sub task language
+        # compute cross entropy loss for response language
         batch_size, seq_len = response_tokens.shape
         response_token_start = -self.config.response_max_length - self.config.discrete_action_max_length
+        #The last token of language will predict <BOS> token of response, so no need to include for loss calculation. Hence slice starts from -self.config.discrete_action_max_length - self.config.response_max_length.
+        # The last token of response predicts first token  of discrete actions, so no need to include for loss calculation. Hence slice ends at -self.config.discrete_action_max_length - 1.
         response_token_end = -self.config.discrete_action_max_length - 1
         response_slice_object = slice(response_token_start, response_token_end)
         response_out = prefix_out[
@@ -1234,6 +1236,7 @@ class PI05FlowMatching(nn.Module):
             response_slice_object,
         ]
         response_logits = self.paligemma_with_expert.paligemma.lm_head(response_out)
+        # response slice to exclude the <BOS> token from response while calculating loss.
         response_slice = slice(1, None)
         response_logits = response_logits.to(dtype=torch.float32)  # upcast to float32 for loss calculation
         response_logits = rearrange(response_logits, "b s d -> (b s) d")
@@ -1244,6 +1247,7 @@ class PI05FlowMatching(nn.Module):
 
         # remove pad tokens
         response_is_pad = ~response_masks  # convert into format where value for pad is True
+        # helps to control loss for response tokens in case of robotic data and VQA data
         response_ce_loss = response_ce_loss * ~response_is_pad[:, response_slice]
 
         # compute mean
@@ -1302,7 +1306,9 @@ class PI05FlowMatching(nn.Module):
             fill_kv_cache=True,
         )
 
+        # initialize response tokens to empty tensor for storing response tokens during inference
         response_tokens = torch.empty((bsize, 0), device=device, dtype=torch.long)
+        # if response prediction is enabled, then predict response tokens autoregressively
         if self.config.predict_response:
             for auto_step in range(self.config.response_max_length):
                 (
@@ -1325,7 +1331,8 @@ class PI05FlowMatching(nn.Module):
                     bsize,
                     device,
                 )
-
+        
+        # perform denoising steps to get the action
         dt = -1.0 / self.config.num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
 
@@ -1394,20 +1401,44 @@ class PI05FlowMatching(nn.Module):
 
     def infer_response(
         self,
-        prefix_out,
-        prefix_embs,
-        prefix_pad_masks,
-        prefix_att_masks,
-        past_key_values,
-        prefix_offsets,
-        response_tokens,
-        auto_step,
-        bsize,
-        device,
-    ):
-        # Start the autoregressive inference with <bos> token
+        prefix_out: Tensor,
+        prefix_embs: Tensor,
+        prefix_pad_masks: Tensor,
+        prefix_att_masks: Tensor,
+        past_key_values: list[dict[str, Tensor]],
+        prefix_offsets: Tensor,
+        response_tokens: Tensor,
+        auto_step: int,
+        bsize: int,
+        device: torch.device,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, list[dict[str, Tensor]], Tensor]:
+        """Perform autoregressive inference for response generation.
+
+        This method generates the next token in the response sequence, updating the
+        various state tensors required for maintaining the generation context. It handles
+        the initial BOS token generation as well as subsequent tokens, and manages
+        padding masks to handle variable-length sequences properly.
+
+        Args:
+            prefix_out: Output tensor from the previous step.
+            prefix_embs: Embeddings for the current prefix context.
+            prefix_pad_masks: Boolean mask indicating valid (non-padding) tokens in the prefix.
+            prefix_att_masks: Attention mask for the prefix.
+            past_key_values: KV cache from previous transformer steps.
+            prefix_offsets: Position offsets for the current generation step.
+            response_tokens: Accumulated tokens generated so far.
+            auto_step: Current autoregressive step index (0 for first token).
+            bsize: Batch size.
+            device: Device to run the computation on.
+
+        Returns:
+            A tuple containing updated tensors for the next step:
+            (prefix_out, prefix_embs, prefix_pad_masks, prefix_att_masks,
+             prefix_offsets, response_tokens, past_key_values, response_token)
+        """
         eos_token = self.language_tokenizer.convert_tokens_to_ids(self.language_tokenizer.eos_token)
         if auto_step == 0:
+            # Start the autoregressive inference with <bos> token
             response_token = torch.full(
                 (bsize, 1),
                 self.language_tokenizer.bos_token_id,
@@ -1415,7 +1446,7 @@ class PI05FlowMatching(nn.Module):
                 dtype=torch.long,
             )
         else:
-            # get the last predicted token from the prefix output
+            # get the last predicted token from the prefix output which is predicted response
             response_token = prefix_out[:, -1:]
             response_token = self.paligemma_with_expert.paligemma.lm_head(response_token).argmax(dim=-1)
 
@@ -1425,9 +1456,8 @@ class PI05FlowMatching(nn.Module):
             prev_tokens = response_tokens
             has_eos = (prev_tokens == eos_token).any(dim=1, keepdim=True)
             has_pad = (prev_tokens == pad_token).any(dim=1, keepdim=True)
-            # check if the previous token was EOS or PAD. If so, then the current token should be padded, so its not attneded by flow matching action expert.
+            # check if the previous token was EOS or PAD. If so, then the current token should be padded, so its not attended by flow matching action expert.
             response_pad_masks = ~(has_eos | has_pad)
-            # if
             response_token = torch.where(
                 response_pad_masks,
                 response_token,
@@ -1448,11 +1478,13 @@ class PI05FlowMatching(nn.Module):
 
         response_att_masks = torch.ones((bsize, 1), device=device, dtype=response_emb.dtype)
 
+        # update the prefix embs, pad masks and att masks, so it can be used by action experts
         prefix_embs = torch.cat([prefix_embs, response_emb], dim=1)
         prefix_pad_masks = torch.cat([prefix_pad_masks, response_pad_masks], dim=1)
         prefix_att_masks = torch.cat([prefix_att_masks, response_att_masks], dim=1)
 
         num_cross_att_tokens = prefix_pad_masks.shape[1]
+        # create the attention mask for the response tokens
         response_att_2d_masks = make_att_2d_masks(
             response_pad_masks,
             response_att_masks,
