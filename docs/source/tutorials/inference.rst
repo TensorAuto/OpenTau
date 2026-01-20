@@ -22,6 +22,7 @@ Running inference with autoregressive response prediction
 
 To run inference with autoregressive response prediction, you will need to use the ``pi05_inference_config.json`` file.
 Set the predict_response flag to true in the policy config.
+For now, we only support greedy encoding for response prediction.
 Example of important config fields for inference with autoregressive response prediction:
 
 .. code-block:: javascript
