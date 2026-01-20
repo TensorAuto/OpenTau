@@ -1174,11 +1174,10 @@ class PI05FlowMatching(nn.Module):
             n_cross_att_tokens=num_cross_att_tokens,
             cross_att_pad_masks=prefix_pad_masks[:, :num_cross_att_tokens],
         )
-        # We should skip the discrete actions when numbering the position ids for the action expert
-        prefix_offsets = torch.sum(
-            prefix_pad_masks[:, : -self.config.discrete_action_max_length],
-            dim=-1,
-        )[:, None]  # action expert position ids start after prefix
+        # We should skip the discrete action tokens when numbering the position ids for the action expert
+        prefix_offsets = torch.sum(prefix_pad_masks[:, : -self.config.discrete_action_max_length], dim=-1)[
+            :, None
+        ]  # action expert position ids start after prefix
         action_expert_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
         # stop gradient to avoid backpropagating from action expert to VLM
@@ -1373,7 +1372,6 @@ class PI05FlowMatching(nn.Module):
             n_cross_att_tokens=num_cross_att_tokens,
             cross_att_pad_masks=prefix_pad_masks[:, :num_cross_att_tokens],
         )
-        # We should skip the response tokens when numbering the position ids for the action expert
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[
             :, None
         ]  # action expert position ids start after prefix

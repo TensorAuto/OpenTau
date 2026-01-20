@@ -21,17 +21,18 @@ Whether you use the official OpenPi codebase or LeRobot’s reimplementation, yo
 
 OpenTau ($\tau$) is a tool developed by *[Tensor][1]* to bridge this gap, and we also use it internally to train our proprietary in-house models. Our goal is to help you train VLAs on any dataset while fully leveraging state-of-the-art techniques. We plan to continuously upgrade this repository to keep pace with the state of the art in the robotics community.
 
-| Features                                                 | OpenPi                  | LeRobot                          | **OpenTau** |
-| -------------------------------------------------------: | :---------------------: | :------------------------------: | :---------: |
-| Co-training with Heterogeneous Datasets                  | ❌                       | ❌                                | ✅           |
-| Discrete Actions Training in $\pi_{0.5}$                 | ❌                       | ❌                                | ✅           |
-| Knowledge Insulation (KI) between VLM and Action Decoder | ❌                       | ❌                                | ✅           |
-| Dropout Layers in PaliGemma                              | ✅ (Jax) <br>❌ (PyTorch) | ❌                                | ✅           |
-| Multi-Node and Multi-GPU Training                        | ❌                       | ✅                                | ✅           |
-| Fully Functioning $\pi_{0.5}$ Checkpoint                 | ✅                       | ❌ <br> (Missing Text Embeddings) | ✅           |
-| Simulation Environments for Evaluating Models            | ❌                       | ✅                                | ✅           |
-| $\pi^{*}_{0.6}$ style Reinforcement Learning Pipeline    | ❌                       | ❌                                | ✅           |
-| Framework                                                | Jax / PyTorch           | PyTorch                          | PyTorch     |
+|                                                 Features |         OpenPi          |             LeRobot              | **OpenTau** |
+|---------------------------------------------------------:|:-----------------------:|:--------------------------------:|:-----------:|
+|                  Co-training with Heterogeneous Datasets |            ❌            |                ❌                 |      ✅      |
+|                 Discrete Actions Training in $\pi_{0.5}$ |            ❌            |                ❌                 |      ✅      |
+| Knowledge Insulation (KI) between VLM and Action Decoder |            ❌            |                ❌                 |      ✅      |
+|                              Dropout Layers in PaliGemma | ✅ (Jax) <br>❌ (PyTorch) |                ❌                 |      ✅      |
+|                        Multi-Node and Multi-GPU Training |            ❌            |                ✅                 |      ✅      |
+|                 Fully Functioning $\pi_{0.5}$ Checkpoint |            ✅            | ❌ <br> (Missing Text Embeddings) |      ✅      |
+|                       Visualize dataset with URDF models |            ❌            |                ❌                 |      ✅      |
+|            Simulation Environments for Evaluating Models |            ❌            |                ✅                 |      ✅      |
+|    $\pi^{*}_{0.6}$ style Reinforcement Learning Pipeline |            ❌            |                ❌                 |      ✅      |
+|                                                Framework |      Jax / PyTorch      |             PyTorch              |   PyTorch   |
 
 ## Quick Start
 If you are familiar with LeRobot, getting started with OpenTau is very easy.

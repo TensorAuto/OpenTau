@@ -1,0 +1,67 @@
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Check PR Checklist
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  check-checklist:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate Checklist
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const body = context.payload.pull_request.body;
+            if (!body) return;
+
+            // Helper to check if a specific line/task is checked
+            // Matches start of line, optional whitespace, "- [x]" or "- [X]", whitespace, then the phrase
+            function isChecked(searchPhrase) {
+              // Escape special regex chars in the phrase
+              const escapedPhrase = searchPhrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+              const regex = new RegExp(`^\\s*-\\s*\\[[xX]\\]\\s+${escapedPhrase}`, 'm');
+              return regex.test(body);
+            }
+
+            // The exact phrases from PULL_REQUEST_TEMPLATE.md
+            const docStringPhrase = "I have added Google-style docstrings to important functions and ensured function parameters are typed.";
+            const policyPhrase = "My PR includes policy-related changes.";
+            const gpuTestPhrase = 'If the above is checked: I have run the GPU pytests (pytest -m "gpu") and regression tests.';
+
+            const docStringChecked = isChecked(docStringPhrase);
+            const policyChecked = isChecked(policyPhrase);
+            const gpuTestChecked = isChecked(gpuTestPhrase);
+
+            let messages = [];
+
+            // 1. Docstrings check is mandatory
+            if (!docStringChecked) {
+              messages.push("❌ You must confirm: I have added Google-style docstrings to important functions and ensured function parameters are typed.");
+            }
+
+            // 2. Policy changes check is optional, BUT if checked, GPU tests are mandatory
+            if (policyChecked && !gpuTestChecked) {
+              messages.push('❌ You checked \'My PR includes policy-related changes\', so you must also check: If the above is checked: I have run the GPU pytests (pytest -m "gpu") and regression tests.');
+            }
+
+            if (messages.length > 0) {
+              core.setFailed("Please complete the required checklist items in the PR description:\n\n" + messages.join("\n"));
+            }
