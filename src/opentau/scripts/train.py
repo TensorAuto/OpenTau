@@ -76,16 +76,16 @@ def update_policy(
         train_config.loss_weighting["MSE"] * losses["MSE"] + train_config.loss_weighting["CE"] * losses["CE"]
     )
 
-    # accelerator.backward(loss)
-    # accelerator.unscale_gradients(optimizer=optimizer)
+    accelerator.backward(loss)
+    accelerator.unscale_gradients(optimizer=optimizer)
 
-    # if accelerator.sync_gradients:
-    #     grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
-    #     if accelerator.is_main_process:
-    #         train_metrics.grad_norm = grad_norm
+    if accelerator.sync_gradients:
+        grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+        if accelerator.is_main_process:
+            train_metrics.grad_norm = grad_norm
 
-    # optimizer.step()
-    # optimizer.zero_grad()
+    optimizer.step()
+    optimizer.zero_grad()
 
     # Step through pytorch scheduler at every batch instead of epoch
     if lr_scheduler is not None:
