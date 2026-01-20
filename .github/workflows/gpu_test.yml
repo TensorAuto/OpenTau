@@ -1,112 +1,76 @@
-# Copyright 2026 Tensor Auto Inc. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-name: GPU Tests
-
+name: Nightly GPU Tests
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "0 8 * * *" # 12:00 AM PST (08:00 UTC)
+    # Run at 2:00 AM PST every day (10:00 AM UTC)
+    - cron: '0 10 * * *'
+  workflow_dispatch:
 
 permissions:
-  contents: read
-
-env:
-  GIT_LFS_SKIP_SMUDGE: "1"
-  GIT_CLEAN_FLAGS: "-ffdx -e .venv/"
-  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
-  UV_LINK_MODE: "copy"
-  MUJOCO_GL: "egl"
-  PYOPENGL_PLATFORM: "egl"
-  PRE_COMMIT_HOME: "/pre-commit-cache"
+  contents: read  # Required for actions/checkout
 
 jobs:
-  gpu-tests:
-    name: GPU Tests
-    runs-on: [self-hosted, linux, gpu]
+  start-runner:
+    name: Start GPU Runner
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # Required for requesting the JWT
+      contents: read
     steps:
-      - name: Checkout Repository
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-west-1
+
+      - name: Start Instance
+        run: |
+          aws autoscaling set-desired-capacity --auto-scaling-group-name github-runner-asg --desired-capacity 1
+          echo "Waiting for instance to be ready..."
+
+  gpu-test:
+    name: Run Pytest on GPU
+    needs: start-runner
+    runs-on: [g6.xlarge]
+    timeout-minutes: 60
+
+    container:
+      image: nvidia/cuda:12.2.0-devel-ubuntu22.04
+      options: --gpus all
+
+    steps:
+      - name: Checkout code
         uses: actions/checkout@v4
         with:
           persist-credentials: false
-          lfs: false
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - name: Install Python and dependencies
+        run: |
+          apt-get update && apt-get install -y python3 python3-pip git
+          pip3 install pytest torch torchvision --index-url https://download.pytorch.org/whl/cu121
+          # Install other dependencies
+          if [ -f requirements.txt ]; then pip3 install -r requirements.txt; fi
+
+      - name: Check GPU
+        run: nvidia-smi
+
+      - name: Run Tests
+        run: pytest -m "gpu" -n 0 -v tests/
+
+  stop-runner:
+    name: Stop GPU Runner
+    needs: [start-runner, gpu-test]
+    if: always() # Run even if tests fail
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # Required for requesting the JWT
+      contents: read
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          python-version: "3.10"
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-west-1
 
-      - name: Install system dependencies
+      - name: Stop Instance
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg libegl1 libegl-mesa0 libgl1 libglx-mesa0 libgles2 mesa-utils
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          version: "latest"
-
-      - name: Verify uv installation
-        run: |
-          which uv
-          uv --version
-
-      - name: Install dependencies
-        run: |
-          uv sync --all-extras
-
-      - name: Activate virtual environment and verify Python
-        run: |
-          source .venv/bin/activate
-          which python3
-          python3 --version
-
-      - name: Verify ffmpeg
-        run: ffmpeg -version
-
-      - name: Verify GPU availability
-        run: |
-          source .venv/bin/activate
-          python3 -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'Device count: {torch.cuda.device_count()}'); print(f'Device name: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"None\"}')"
-
-      - name: Set up HuggingFace authentication
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          source .venv/bin/activate
-          hf auth login --token $HF_TOKEN
-
-      - name: Configure wandb
-        run: |
-          source .venv/bin/activate
-          wandb offline
-
-      - name: Check disk space
-        run: df -h /dev/shm
-
-      - name: Run GPU tests with coverage
-        run: |
-          source .venv/bin/activate
-          echo "Running gpu based pytest and generating coverage report..."
-          pytest -m "gpu" -n auto -v --cov=src/opentau/ --cov-report=xml:gpu_test/gpu_test.xml --ignore=tests/planner/test_planner.py --ignore tests/utils/test_libero_utils.py --deselect=tests/envs/test_factory.py::TestMakeEnv::test_make_env_async_vector_env --deselect=tests/envs/test_factory.py::TestMakeEnv::test_make_env_sync_vector_env tests/
-          echo "Pytest execution and coverage report generation completed."
-
-      - name: Upload coverage reports
-        uses: codecov/codecov-action@v4
-        if: always()
-        with:
-          file: ./gpu_test/gpu_test.xml
-          flags: gpu
-          name: gpu-coverage
-          fail_ci_if_error: false
+          aws autoscaling set-desired-capacity --auto-scaling-group-name github-runner-asg --desired-capacity 0
