@@ -163,6 +163,7 @@ class TrainPipelineConfig(HubMixin):
     env: EnvConfig | None = None
     eval: EvalConfig | None = field(default_factory=EvalConfig)
     eval_freq: int = 0  # evaluate every eval_freq steps
+    val_freq: int = 0  # validate every val_freq steps, if 0, then a validation split is not created
     last_checkpoint_only: bool = True
 
     def __post_init__(self):

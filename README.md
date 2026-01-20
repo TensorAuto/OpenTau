@@ -31,6 +31,7 @@ OpenTau ($\tau$) is a tool developed by *[Tensor][1]* to bridge this gap, and we
 |                 Fully Functioning $\pi_{0.5}$ Checkpoint |            ✅            | ❌ <br> (Missing Text Embeddings) |      ✅      |
 |                       Visualize dataset with URDF models |            ❌            |                ❌                 |      ✅      |
 |            Simulation Environments for Evaluating Models |            ❌            |                ✅                 |      ✅      |
+|                 Create Validation Splits During Training |            ❌            |                ❌                 |      ✅      |
 |    $\pi^{*}_{0.6}$ style Reinforcement Learning Pipeline |            ❌            |                ❌                 |      ✅      |
 |                                                Framework |      Jax / PyTorch      |             PyTorch              |   PyTorch   |
 

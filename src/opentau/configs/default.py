@@ -96,6 +96,11 @@ class DatasetConfig:
     data_features_name_mapping: dict[str, str] | None = None
     loss_type_mapping: str | None = None
 
+    # Ratio of the dataset to be used for validation. Please specify a value.
+    # If `val_freq` is set to 0, a validation dataset will not be created and this value will be ignored.
+    # Defaults to 0.05.
+    val_split_ratio: float = 0.05
+
     def __post_init__(self):
         """Validate dataset configuration and register custom mappings if provided."""
         if (self.repo_id is None) == (self.grounding is None):
@@ -148,6 +153,11 @@ class DatasetMixtureConfig:
     image_resample_strategy: str = "nearest"
     # Resample strategy for non-image features, such as action or state
     vector_resample_strategy: str = "nearest"
+    # Ratio of the dataset to be used for validation. Please specify a value.
+    # If `val_freq` is set to 0, a validation dataset will not be created and this value will be ignored.
+    # This value is applied to all datasets in the mixture.
+    # Defaults to 0.05.
+    val_split_ratio: float = 0.05
 
     def __post_init__(self):
         """Validate dataset mixture configuration."""
@@ -163,6 +173,12 @@ class DatasetMixtureConfig:
             raise ValueError(
                 f"`vector_resample_strategy` must be one of ['linear', 'nearest'], got {self.vector_resample_strategy}."
             )
+        if self.val_split_ratio < 0 or self.val_split_ratio > 1:
+            raise ValueError(f"`val_split_ratio` must be between 0 and 1, got {self.val_split_ratio}.")
+
+        # set the val_split_ratio for all datasets in the mixture
+        for dataset_cfg in self.datasets:
+            dataset_cfg.val_split_ratio = self.val_split_ratio
 
 
 @dataclass
