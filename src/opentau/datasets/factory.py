@@ -61,7 +61,11 @@ Example:
         >>> dataloader = mixture.get_dataloader()
 """
 
+import copy
+from typing import Tuple, Union
+
 import numpy as np
+import torch
 
 # NOTE: Don't delete; imported for side effects.
 import opentau.datasets.grounding.clevr  # noqa: F401
@@ -151,8 +155,12 @@ def make_dataset(
     cfg: DatasetConfig,
     train_cfg: TrainPipelineConfig,
     return_advantage_input: bool = False,
-) -> BaseDataset:
+) -> Union[BaseDataset, Tuple[BaseDataset, BaseDataset]]:
     """Handles the logic of setting up delta timestamps and image transforms before creating a dataset.
+
+    A train and validation dataset are returned if `train_cfg.val_freq` is greater than 0.
+    The validation dataset is a subset of the train dataset, and is used for evaluation during training.
+    The validation dataset is created by splitting the train dataset into train and validation sets based on `cfg.val_split_ratio`.
 
     Args:
         cfg (DatasetConfig): A DatasetConfig used to create a LeRobotDataset.
@@ -161,10 +169,11 @@ def make_dataset(
             "episode_end_idx", "current_idx", "last_step", "episode_index", and "timestamp". Defaults to False.
 
     Raises:
-        NotImplementedError: The MultiLeRobotDataset is currently deactivated.
+        ValueError: If exactly one of `cfg.grounding` and `cfg.repo_id` is not provided.
+        ValueError: If `cfg.grounding` is not a supported grounding dataset.
 
     Returns:
-        BaseDataset
+        BaseDataset or Tuple[BaseDataset, BaseDataset]: A single dataset or a tuple of (train_dataset, val_dataset) if val_freq > 0.
     """
     image_transforms = ImageTransforms(cfg.image_transforms) if cfg.image_transforms.enable else None
 
@@ -209,12 +218,20 @@ def make_dataset(
                     dataset.meta.stats[key] = {}
                 dataset.meta.stats[key][stats_type] = np.array(stats, dtype=np.float32)
 
+    if train_cfg.val_freq > 0:
+        val_size = int(len(dataset) * cfg.val_split_ratio)
+        train_size = len(dataset) - val_size
+        train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+        train_dataset.meta = copy.deepcopy(dataset.meta)
+        val_dataset.meta = copy.deepcopy(dataset.meta)
+        return train_dataset, val_dataset
+
     return dataset
 
 
 def make_dataset_mixture(
     cfg: TrainPipelineConfig, return_advantage_input: bool = False
-) -> WeightedDatasetMixture:
+) -> Union[WeightedDatasetMixture, Tuple[WeightedDatasetMixture, WeightedDatasetMixture]]:
     """Creates a dataset mixture from the provided TrainPipelineConfig.
 
     Args:
@@ -223,10 +240,26 @@ def make_dataset_mixture(
             "episode_end_idx", "current_idx", "last_step", "episode_index", and "timestamp". Defaults to False.
 
     Returns:
-        WeightedDatasetMixture: An instance of WeightedDatasetMixture containing the datasets.
+        WeightedDatasetMixture or Tuple[WeightedDatasetMixture, WeightedDatasetMixture]: An instance of WeightedDatasetMixture containing the datasets, or a tuple of (train_mixture, val_mixture) if val_freq > 0.
     """
-    datasets = [
-        make_dataset(dataset_cfg, cfg, return_advantage_input=return_advantage_input)
-        for dataset_cfg in cfg.dataset_mixture.datasets
-    ]
-    return WeightedDatasetMixture(cfg, datasets, cfg.dataset_mixture.weights, cfg.dataset_mixture.action_freq)
+    datasets = []
+    val_datasets = []
+    for dataset_cfg in cfg.dataset_mixture.datasets:
+        res = make_dataset(dataset_cfg, cfg, return_advantage_input=return_advantage_input)
+        if isinstance(res, tuple):
+            datasets.append(res[0])
+            val_datasets.append(res[1])
+        else:
+            datasets.append(res)
+
+    train_mixture = WeightedDatasetMixture(
+        cfg, datasets, cfg.dataset_mixture.weights, cfg.dataset_mixture.action_freq
+    )
+
+    if val_datasets:
+        val_mixture = WeightedDatasetMixture(
+            cfg, val_datasets, cfg.dataset_mixture.weights, cfg.dataset_mixture.action_freq
+        )
+        return train_mixture, val_mixture
+
+    return train_mixture

@@ -61,10 +61,11 @@
     "gradient_accumulation_steps": 1,
     "dataloader_batch_size": 2,
     "prefetch_factor": 8,
-    "steps": 10,
+    "steps": 40,
     "log_freq": 5,
     "save_checkpoint": true,
-    "save_freq": 10,
+    "save_freq": 40,
+    "val_freq": 10,
     "use_policy_training_preset": false,
     "trace_nans": false,
     "optimizer": {

@@ -17,6 +17,9 @@
 import json
 import logging
 import os
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 from contextlib import nullcontext
 from pprint import pformat
 from typing import Any
@@ -73,16 +76,16 @@ def update_policy(
         train_config.loss_weighting["MSE"] * losses["MSE"] + train_config.loss_weighting["CE"] * losses["CE"]
     )
 
-    accelerator.backward(loss)
-    accelerator.unscale_gradients(optimizer=optimizer)
+    # accelerator.backward(loss)
+    # accelerator.unscale_gradients(optimizer=optimizer)
 
-    if accelerator.sync_gradients:
-        grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
-        if accelerator.is_main_process:
-            train_metrics.grad_norm = grad_norm
+    # if accelerator.sync_gradients:
+    #     grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+    #     if accelerator.is_main_process:
+    #         train_metrics.grad_norm = grad_norm
 
-    optimizer.step()
-    optimizer.zero_grad()
+    # optimizer.step()
+    # optimizer.zero_grad()
 
     # Step through pytorch scheduler at every batch instead of epoch
     if lr_scheduler is not None:
@@ -176,7 +179,10 @@ def train(cfg: TrainPipelineConfig):
         logging.info("Anomaly detection is disabled.")
 
     logging.info("Creating dataset")
-    dataset = make_dataset_mixture(cfg)
+    if cfg.val_freq > 0:
+        train_dataset, val_dataset = make_dataset_mixture(cfg)
+    else:
+        train_dataset = make_dataset_mixture(cfg)
 
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
@@ -188,7 +194,7 @@ def train(cfg: TrainPipelineConfig):
         )
 
     logging.info("Creating policy")
-    policy = make_policy(cfg=cfg.policy, ds_meta=dataset.meta)
+    policy = make_policy(cfg=cfg.policy, ds_meta=train_dataset.meta)
     policy.to(torch.bfloat16)
     logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
@@ -203,11 +209,18 @@ def train(cfg: TrainPipelineConfig):
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
-    dataloader = dataset.get_dataloader()
-    policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-        policy, optimizer, dataloader, lr_scheduler
-    )
-    dl_iter = cycle(dataloader)
+    if cfg.val_freq > 0:
+        train_dataloader = train_dataset.get_dataloader()
+        val_dataloader = val_dataset.get_dataloader()
+        policy, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
+            policy, optimizer, train_dataloader, val_dataloader, lr_scheduler
+        )
+    else:
+        train_dataloader = train_dataset.get_dataloader()
+        policy, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            policy, optimizer, train_dataloader, lr_scheduler
+        )
+    train_dl_iter = cycle(train_dataloader)
 
     # Register the LR scheduler for checkpointing
     accelerator.register_for_checkpointing(lr_scheduler)
@@ -246,7 +259,7 @@ def train(cfg: TrainPipelineConfig):
         for _ in range(cfg.gradient_accumulation_steps):
             with accelerator.accumulate(policy) if cfg.gradient_accumulation_steps > 1 else nullcontext():
                 logging.debug(f"{step=}, {accelerator.sync_gradients=}")
-                batch = next(dl_iter)
+                batch = next(train_dl_iter)
 
                 train_tracker = update_policy(
                     cfg,
@@ -266,20 +279,21 @@ def train(cfg: TrainPipelineConfig):
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
         is_saving_step = (step % cfg.save_freq == 0 or step == cfg.steps) and cfg.save_checkpoint
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
+        is_val_step = cfg.val_freq > 0 and step % cfg.val_freq == 0
 
         # Only `train_tracker` on the main process keeps useful statistics,
         #  because we guarded it with if accelerator.is_main_process in the `update_policy` function.
         if is_log_step and accelerator.is_main_process:
             logging.info(train_tracker)
             log_dict = train_tracker.to_dict(use_avg=True)
-            accelerator.log({"Training Loss": log_dict["loss"]}, step=step)
-            accelerator.log({"MSE Loss": log_dict["mse_loss"]}, step=step)
-            accelerator.log({"CE Loss": log_dict["ce_loss"]}, step=step)
-            accelerator.log({"L1 Loss": log_dict["l1_loss"]}, step=step)
-            accelerator.log({"Accuracy": log_dict["accuracy"]}, step=step)
-            accelerator.log({"Learning Rate": log_dict["lr"]}, step=step)
-            accelerator.log({"Grad Norm": log_dict["grad_norm"]}, step=step)
-            accelerator.log({"Num Samples": log_dict["samples"]}, step=step)
+            accelerator.log({"Training/Loss": log_dict["loss"]}, step=step)
+            accelerator.log({"Training/MSE Loss": log_dict["mse_loss"]}, step=step)
+            accelerator.log({"Training/CE Loss": log_dict["ce_loss"]}, step=step)
+            accelerator.log({"Training/L1 Loss": log_dict["l1_loss"]}, step=step)
+            accelerator.log({"Training/Accuracy": log_dict["accuracy"]}, step=step)
+            accelerator.log({"Training/Learning Rate": log_dict["lr"]}, step=step)
+            accelerator.log({"Training/Grad Norm": log_dict["grad_norm"]}, step=step)
+            accelerator.log({"Training/Num Samples": log_dict["samples"]}, step=step)
             train_tracker.reset_averages()
 
         if is_saving_step:
@@ -298,6 +312,72 @@ def train(cfg: TrainPipelineConfig):
                 save_checkpoint(checkpoint_dir, step, cfg)
                 if cfg.last_checkpoint_only:
                     prune_old_checkpoints(checkpoint_dir)
+
+            # This barrier is probably necessary to ensure
+            # other processes wait for the main process to finish saving
+            accelerator.wait_for_everyone()
+
+        if is_val_step:
+            policy.eval()
+            val_metrics = {
+                "loss": AverageMeter("val_total_loss", ":.3f"),
+                "mse_loss": AverageMeter("val_mse_loss", ":.3f"),
+                "ce_loss": AverageMeter("val_ce_loss", ":.3f"),
+                "l1_loss": AverageMeter("val_l1_loss", ":.3f"),
+                "accuracy": AverageMeter("val_accuracy", ":.3f"),
+            }
+            val_tracker = MetricsTracker(
+                cfg.batch_size * accelerator.num_processes,
+                val_metrics,
+                initial_step=step,
+            )
+
+            logging.info(f"Validation at step {step}...")
+
+            with torch.no_grad():
+                for batch in val_dataloader:
+                    losses = policy.forward(batch)
+                    loss = cfg.loss_weighting["MSE"] * losses["MSE"] + cfg.loss_weighting["CE"] * losses["CE"]
+
+                    # Gather and average metrics across processes
+                    _first_loss_tensor = next(lt for lt in losses.values() if isinstance(lt, torch.Tensor))
+                    zero = torch.tensor(0.0, device=_first_loss_tensor.device, dtype=_first_loss_tensor.dtype)
+
+                    loss = accelerator.gather_for_metrics(loss).mean().item()
+                    mse_loss = (
+                        accelerator.gather_for_metrics(losses["MSE"]).to(dtype=torch.float32).mean().item()
+                    )
+                    ce_loss = (
+                        accelerator.gather_for_metrics(losses["CE"]).to(dtype=torch.float32).mean().item()
+                    )
+                    l1_loss = (
+                        accelerator.gather_for_metrics(losses.get("L1", zero))
+                        .to(dtype=torch.float32)
+                        .mean()
+                        .item()
+                    )
+                    accuracy = (
+                        accelerator.gather_for_metrics(losses.get("Accuracy", zero))
+                        .to(dtype=torch.float32)
+                        .mean()
+                        .item()
+                    )
+
+                    if accelerator.is_main_process:
+                        val_tracker.loss = loss
+                        val_tracker.mse_loss = mse_loss
+                        val_tracker.ce_loss = ce_loss
+                        val_tracker.l1_loss = l1_loss
+                        val_tracker.accuracy = accuracy
+
+            if accelerator.is_main_process:
+                logging.info(val_tracker)
+                val_dict = val_tracker.to_dict(use_avg=True)
+                accelerator.log({"Validation/Loss": val_dict["loss"]}, step=step)
+                accelerator.log({"Validation/MSE Loss": val_dict["mse_loss"]}, step=step)
+                accelerator.log({"Validation/CE Loss": val_dict["ce_loss"]}, step=step)
+                accelerator.log({"Validation/L1 Loss": val_dict["l1_loss"]}, step=step)
+                accelerator.log({"Validation/Accuracy": val_dict["accuracy"]}, step=step)
 
             # This barrier is probably necessary to ensure
             # other processes wait for the main process to finish saving
@@ -357,7 +437,6 @@ def train(cfg: TrainPipelineConfig):
                 with open(videos_dir / "eval_info.json", "w") as f:
                     json.dump(eval_info, f, indent=2)
 
-        if is_eval_step:
             # This barrier is to ensure all processes finishes evaluation before the next training step
             # Some processes might be slower than others
             accelerator.wait_for_everyone()
