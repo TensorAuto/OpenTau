@@ -313,8 +313,6 @@ def train(cfg: TrainPipelineConfig):
                 if cfg.last_checkpoint_only:
                     prune_old_checkpoints(checkpoint_dir)
 
-            # This barrier is probably necessary to ensure
-            # other processes wait for the main process to finish saving
             accelerator.wait_for_everyone()
 
         if is_val_step:
