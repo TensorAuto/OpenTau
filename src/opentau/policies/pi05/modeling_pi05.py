@@ -1450,7 +1450,7 @@ class PI05FlowMatching(nn.Module):
             response_token = prefix_out[:, -1:]
             response_token = self.paligemma_with_expert.paligemma.lm_head(response_token).argmax(dim=-1)
 
-            PAD_TOKEN = self.language_tokenizer.pad_token_id  # noqa: N806
+        PAD_TOKEN = self.language_tokenizer.pad_token_id  # noqa: N806
         # Create pad masks: False if previous token was EOS or PAD
         if response_tokens.shape[1] > 1:
             prev_tokens = response_tokens
