@@ -82,6 +82,8 @@ jobs:
         shell: bash
         run: |
           source .venv/bin/activate
+          mkdir -p /tmp/libero-assets/libero/libero
+          export LIBERO_CONFIG_PATH="$(pwd)/.github/assets/libero"
           pytest -m "gpu" -n 0 -v tests/
 
   stop-runner:
