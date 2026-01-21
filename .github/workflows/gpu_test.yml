@@ -23,6 +23,10 @@ on:
 permissions:
   contents: read  # Required for actions/checkout
 
+env:
+  MUJOCO_GL: "egl"
+  PYOPENGL_PLATFORM: "egl"
+
 jobs:
   start-runner:
     name: Start GPU Runner
@@ -58,18 +62,26 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Python and dependencies
+      - name: Install system dependencies
         run: |
-          apt-get update && apt-get install -y python3 python3-pip git
-          pip3 install pytest torch torchvision --extra-index-url https://download.pytorch.org/whl/cu128
-          # Install other dependencies
-          if [ -f requirements.txt ]; then pip3 install -r requirements.txt; fi
+          apt-get update && apt-get install -y python3 python3-pip git ffmpeg libegl1 libegl-mesa0 libgl1 libglx-mesa0 libgles2 mesa-utils curl
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+
+      - name: Install dependencies
+        run: |
+          uv sync --extra dev --extra libero
 
       - name: Check GPU
         run: nvidia-smi
 
       - name: Run Tests
-        run: pytest -m "gpu" -n 0 -v tests/
+        run: |
+          source .venv/bin/activate
+          pytest -m "gpu" -n 0 -v tests/
 
   stop-runner:
     name: Stop GPU Runner
