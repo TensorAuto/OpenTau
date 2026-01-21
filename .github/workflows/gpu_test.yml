@@ -1,0 +1,90 @@
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Nightly GPU Tests
+on:
+  schedule:
+    # Run at 2:00 AM PST every day (10:00 AM UTC)
+    - cron: '0 10 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read  # Required for actions/checkout
+
+jobs:
+  start-runner:
+    name: Start GPU Runner
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # Required for requesting the JWT
+      contents: read
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-west-1
+
+      - name: Start Instance
+        run: |
+          aws autoscaling set-desired-capacity --auto-scaling-group-name github-runner-asg --desired-capacity 1
+          echo "Waiting for instance to be ready..."
+
+  gpu-test:
+    name: Run Pytest on GPU
+    needs: start-runner
+    runs-on: [g6.xlarge]
+    timeout-minutes: 60
+
+    container:
+      image: nvidia/cuda:12.2.0-devel-ubuntu22.04
+      options: --gpus all
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Python and dependencies
+        run: |
+          apt-get update && apt-get install -y python3 python3-pip git
+          pip3 install pytest torch torchvision --index-url https://download.pytorch.org/whl/cu121
+          # Install other dependencies
+          if [ -f requirements.txt ]; then pip3 install -r requirements.txt; fi
+
+      - name: Check GPU
+        run: nvidia-smi
+
+      - name: Run Tests
+        run: pytest -m "gpu" -n 0 -v tests/
+
+  stop-runner:
+    name: Stop GPU Runner
+    needs: [start-runner, gpu-test]
+    if: always() # Run even if tests fail
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # Required for requesting the JWT
+      contents: read
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-west-1
+
+      - name: Stop Instance
+        run: |
+          aws autoscaling set-desired-capacity --auto-scaling-group-name github-runner-asg --desired-capacity 0
