@@ -73,7 +73,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          uv sync --extra dev --extra libero
+          uv sync --extra dev
 
       - name: Check GPU
         run: nvidia-smi
