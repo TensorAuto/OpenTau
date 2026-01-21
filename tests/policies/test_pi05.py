@@ -20,8 +20,8 @@ from opentau.policies.pi05.modeling_pi05 import (
     PI05Policy,
 )
 
-paligemma_tokenizer_eos_ids = 1
-paligemma_tokenizer_pad_ids = 0
+PALIGEMMA_TOKENIZER_EOS_IDS = 1
+PALIGEMMA_TOKENIZER_PAD_IDS = 0
 
 
 class TestPI05Integration:
@@ -35,8 +35,8 @@ class TestPI05Integration:
         assert prefix_pad_masks.dtype == torch.bool
         assert prefix_embs.shape[1] == prefix_pad_masks.shape[1]
 
-        has_eos = (response_tokens == paligemma_tokenizer_eos_ids).any(dim=1, keepdim=True)
-        has_pad = (response_tokens == paligemma_tokenizer_pad_ids).any(dim=1, keepdim=True)
+        has_eos = (response_tokens == PALIGEMMA_TOKENIZER_EOS_IDS).any(dim=1, keepdim=True)
+        has_pad = (response_tokens == PALIGEMMA_TOKENIZER_PAD_IDS).any(dim=1, keepdim=True)
 
         response_pad_masks = ~(has_eos | has_pad)
         assert torch.all(torch.cat((prev_prefix_pad_masks, response_pad_masks), dim=1) == prefix_pad_masks)

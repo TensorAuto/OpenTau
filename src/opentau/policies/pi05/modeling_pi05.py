@@ -804,7 +804,7 @@ class PI05Policy(PreTrainedPolicy):
         responses = batch["response"]
 
         # if '' is found in response then response is not for loss calculation (used for robotic dataset with no subtask), so add pad token to the response.
-        response_prompt = [f"{response}<eos>Actions:" if response != "" else "" for response in responses]
+        response_prompt = [f"{response}<eos>Actions:" for response in responses]
 
         tokenized_response = self.language_tokenizer.__call__(
             response_prompt,
@@ -1205,7 +1205,7 @@ class PI05FlowMatching(nn.Module):
         batch_size, seq_len = discrete_actions.shape
         discrete_token_start = -self.config.discrete_action_max_length
         # The last token of response will predict the first token of discrete actions , so we need to slice from discrete_token_start -1.
-        # The last token of discrete action is useless, so no need to include for loss calculation.
+        # The predicted last token of discrete action is useless, so no need to include for loss calculation.
         discrete_action_slice_object = slice(discrete_token_start - 1, -1)
         discrete_action_out = prefix_out[:, discrete_action_slice_object]
         logits = self.paligemma_with_expert.da_head(discrete_action_out)
@@ -1436,7 +1436,7 @@ class PI05FlowMatching(nn.Module):
             (prefix_out, prefix_embs, prefix_pad_masks, prefix_att_masks,
              prefix_offsets, response_tokens, past_key_values, response_token)
         """
-        eos_token = self.language_tokenizer.convert_tokens_to_ids(self.language_tokenizer.eos_token)
+        EOS_TOKEN = self.language_tokenizer.convert_tokens_to_ids(self.language_tokenizer.eos_token)  # noqa: N806
         if auto_step == 0:
             # Start the autoregressive inference with <bos> token
             response_token = torch.full(
@@ -1450,18 +1450,18 @@ class PI05FlowMatching(nn.Module):
             response_token = prefix_out[:, -1:]
             response_token = self.paligemma_with_expert.paligemma.lm_head(response_token).argmax(dim=-1)
 
-        pad_token = self.language_tokenizer.pad_token_id
+            PAD_TOKEN = self.language_tokenizer.pad_token_id  # noqa: N806
         # Create pad masks: False if previous token was EOS or PAD
         if response_tokens.shape[1] > 1:
             prev_tokens = response_tokens
-            has_eos = (prev_tokens == eos_token).any(dim=1, keepdim=True)
-            has_pad = (prev_tokens == pad_token).any(dim=1, keepdim=True)
+            has_eos = (prev_tokens == EOS_TOKEN).any(dim=1, keepdim=True)
+            has_pad = (prev_tokens == PAD_TOKEN).any(dim=1, keepdim=True)
             # check if the previous token was EOS or PAD. If so, then the current token should be padded, so its not attended by flow matching action expert.
             response_pad_masks = ~(has_eos | has_pad)
             response_token = torch.where(
                 response_pad_masks,
                 response_token,
-                torch.tensor(pad_token, device=device, dtype=response_token.dtype),
+                torch.tensor(PAD_TOKEN, device=device, dtype=response_token.dtype),
             )
         else:
             response_pad_masks = torch.ones((bsize, 1), device=device, dtype=torch.bool)

@@ -20,28 +20,14 @@ To run inference, run the following command:
 Running inference with autoregressive response prediction
 ----------------------------------------------------------
 
-To run inference with autoregressive response prediction, you will need to use the ``pi05_inference_config.json`` file.
-Set the predict_response flag to true in the policy config.
-For now, we only support greedy encoding for response prediction.
+To run inference with autoregressive response prediction, set the predict_response flag to true in the policy config as shown below.
+For now, we only support greedy decoding for response prediction.
 Example of important config fields for inference with autoregressive response prediction:
 
 .. code-block:: javascript
 
    {
-    "dataset_mixture": {
-        "datasets": [
-            {
-                "repo_id": "physical-intelligence/libero"
-            }
-
-        ],
-        "weights": [
-            1.0
-        ],
-        "action_freq": 10.0,
-        "image_resample_strategy": "nearest",
-        "vector_resample_strategy": "nearest"
-    },
+    ...
     "policy": {
         "type": "pi05",
         "pretrained_path": "TensorAuto/pi05_base",
@@ -50,3 +36,5 @@ Example of important config fields for inference with autoregressive response pr
         "predict_response": true,
         ...
     }
+    ...
+   }
