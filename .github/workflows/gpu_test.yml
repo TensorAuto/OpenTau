@@ -18,6 +18,7 @@ on:
     # Run at 2:00 AM PST every day (10:00 AM UTC)
     - cron: '0 10 * * *'
   workflow_dispatch:
+  pull_request:
 
 permissions:
   contents: read  # Required for actions/checkout
@@ -34,7 +35,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: us-west-1
+          aws-region: us-west-2
 
       - name: Start Instance
         run: |
@@ -83,7 +84,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: us-west-1
+          aws-region: us-west-2
 
       - name: Stop Instance
         run: |
