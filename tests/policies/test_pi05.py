@@ -14,14 +14,52 @@
 
 import pytest
 import torch
+from einops import rearrange
 
 from opentau.policies.pi05.modeling_pi05 import (
     PI05Policy,
 )
 
+PALIGEMMA_TOKENIZER_EOS_IDS = 1
+PALIGEMMA_TOKENIZER_PAD_IDS = 0
+
 
 class TestPI05Integration:
     """Integration tests for the complete PI05 pipeline."""
+
+    def _check_autoregressive_prefix_pads(
+        self, prefix_pad_masks, response_tokens, prev_prefix_pad_masks, prefix_embs
+    ):
+        assert prefix_pad_masks.shape[0] == 1
+        assert prefix_pad_masks.shape[1] == prev_prefix_pad_masks.shape[1] + 1
+        assert prefix_pad_masks.dtype == torch.bool
+        assert prefix_embs.shape[1] == prefix_pad_masks.shape[1]
+
+        has_eos = (response_tokens == PALIGEMMA_TOKENIZER_EOS_IDS).any(dim=1, keepdim=True)
+        has_pad = (response_tokens == PALIGEMMA_TOKENIZER_PAD_IDS).any(dim=1, keepdim=True)
+
+        response_pad_masks = ~(has_eos | has_pad)
+        assert torch.all(torch.cat((prev_prefix_pad_masks, response_pad_masks), dim=1) == prefix_pad_masks)
+
+    def _check_autoregressive_prefix_position_ids(self, prefix_offsets, response_tokens, prev_prefix_offsets):
+        assert prefix_offsets.shape[0] == 1
+        assert prefix_offsets.shape[1] == 1
+        assert prefix_offsets.dtype == torch.long
+
+        response_token_position_id_increment = (~(response_tokens[:, -1] == 0)).long()
+        assert torch.all(prefix_offsets == prev_prefix_offsets + response_token_position_id_increment)
+
+    def _check_autoregressive_prefix_attention_mask(
+        self, prefix_att_masks, response_tokens, prev_prefix_att_masks
+    ):
+        assert prefix_att_masks.shape[0] == 1
+        assert prefix_att_masks.shape[1] == prev_prefix_att_masks.shape[1] + 1
+        assert prefix_att_masks.dtype == torch.bfloat16
+
+        response_token_attention_mask = rearrange((~(response_tokens[:, -1] == 0)).bfloat16(), "s -> 1 s")
+        assert torch.all(
+            torch.cat((prev_prefix_att_masks, response_token_attention_mask), dim=1) == prefix_att_masks
+        )
 
     def _verify_pad_masks(self, prefix_pad_masks, suffix_pad_masks, inference_mode=False):
         """Verify the pad masks are correct. This assumes all images are not padded. Language embeddings and action chunks can be padded.
@@ -31,7 +69,7 @@ class TestPI05Integration:
         inference_mode: boolean indicating if the pad masks were created using the forward method (training) or select_action method (inference)
         """
         assert prefix_pad_masks.shape[0] == 1
-        assert prefix_pad_masks.shape[1] == 800 if not inference_mode else 768
+        assert prefix_pad_masks.shape[1] == 852 if not inference_mode else 768
         assert prefix_pad_masks.dtype == torch.bool
         assert suffix_pad_masks.shape[0] == 1
         assert suffix_pad_masks.shape[1] == 50
@@ -59,7 +97,8 @@ class TestPI05Integration:
             assert torch.all(prefix_pad_masks[i, :512] == 1)  # image tokens should not be padded
             _check_ones_before_zeros(prefix_pad_masks[i, 512:768])  # prompt tokens
             if not inference_mode:
-                _check_ones_before_zeros(prefix_pad_masks[i, 768:800])  # discrete action tokens
+                _check_ones_before_zeros(prefix_pad_masks[i, 820:852])  # discrete action tokens
+                _check_ones_before_zeros(prefix_pad_masks[i, 768:820])  # response tokens
 
             _check_ones_before_zeros(suffix_pad_masks[i, 0:50])  # action chunks
 
@@ -69,6 +108,7 @@ class TestPI05Integration:
         suffix_position_ids,
         prefix_pad_masks,
         suffix_pad_masks,
+        last_prefix_offsets=None,
         inference_mode=False,
     ):
         """Verify the position ids are correct. They should increment by 1 for each non-padded token and stay the same for padded tokens.
@@ -80,7 +120,7 @@ class TestPI05Integration:
         inference_mode: boolean indicating if the position ids were created using the forward method (training) or select_action method (inference)
         """
         assert prefix_position_ids.shape[0] == 1
-        assert prefix_position_ids.shape[1] == 800 if not inference_mode else 768
+        assert prefix_position_ids.shape[1] == 852 if not inference_mode else 768
         assert prefix_position_ids.dtype == torch.long
         assert suffix_position_ids.shape[0] == 1
         assert suffix_position_ids.shape[1] == 50
@@ -112,9 +152,9 @@ class TestPI05Integration:
             # check that the prefix offset is correct
             # the suffix position ids should start after the prefix position ids (minus the response tokens)
             if not inference_mode:
-                assert suffix_position_ids[i, 0] == prefix_position_ids[i, 768]
+                assert suffix_position_ids[i, 0] == prefix_position_ids[i, 820]
             else:
-                assert suffix_position_ids[i, 0] == prefix_position_ids[i, 767] + 1
+                assert suffix_position_ids[i, 0] == last_prefix_offsets.item() + 1
 
     def _verify_vlm_attention_mask(self, vlm_attention_mask, prefix_pad_masks, inference_mode=False):
         """Verify the VLM attention mask is correct.
@@ -124,46 +164,57 @@ class TestPI05Integration:
         inference_mode: boolean indicating if the attention mask were created using the forward method (training) or select_action method (inference)
         """
         assert vlm_attention_mask.shape[0] == 1
-        assert vlm_attention_mask.shape[1] == 800 if not inference_mode else 768
-        assert vlm_attention_mask.shape[2] == 800 if not inference_mode else 768
+        assert vlm_attention_mask.shape[1] == 852 if not inference_mode else 768
+        assert vlm_attention_mask.shape[2] == 852 if not inference_mode else 768
         assert vlm_attention_mask.dtype == torch.bool
 
         batch_size = vlm_attention_mask.shape[0]
         for i in range(batch_size):
             # construct correct attention mask
             # see diagram here: https://drive.google.com/file/d/1x3pM8SoIf9rqAG4-rZxmVvrqkorqhU-s/view?usp=sharing
-            correct_vlm_attention_mask = torch.ones(800, 800, dtype=torch.bool)
+            correct_vlm_attention_mask = torch.ones(852, 852, dtype=torch.bool)
 
             # pad tokens should not be attended to or attend to any other tokens
             num_non_padded_prompt_tokens = prefix_pad_masks[i, 512:768].sum()
-            num_non_padded_discrete_action_tokens = prefix_pad_masks[i, 768:800].sum()
-            prompt_start_idx, discrete_action_start_idx = 512, 768
+            num_non_padded_response_tokens = prefix_pad_masks[i, 768:820].sum()
+            num_non_padded_discrete_action_tokens = prefix_pad_masks[i, 820:852].sum()
+            prompt_start_idx, response_start_idx, discrete_action_start_idx = 512, 768, 820
 
             # set the masks for pad tokens in prompt to 0
             correct_vlm_attention_mask[
-                prompt_start_idx + num_non_padded_prompt_tokens : discrete_action_start_idx, :
+                prompt_start_idx + num_non_padded_prompt_tokens : response_start_idx, :
             ] = 0
             correct_vlm_attention_mask[
-                :, prompt_start_idx + num_non_padded_prompt_tokens : discrete_action_start_idx
+                response_start_idx + num_non_padded_response_tokens : discrete_action_start_idx, :
+            ] = 0
+            correct_vlm_attention_mask[
+                discrete_action_start_idx + num_non_padded_discrete_action_tokens : 852, :
             ] = 0
 
-            # set the mask for pad tokens in discrete action to 0
             correct_vlm_attention_mask[
-                discrete_action_start_idx + num_non_padded_discrete_action_tokens : 800, :
+                :, prompt_start_idx + num_non_padded_prompt_tokens : response_start_idx
             ] = 0
             correct_vlm_attention_mask[
-                :, discrete_action_start_idx + num_non_padded_discrete_action_tokens : 800
+                :, response_start_idx + num_non_padded_response_tokens : discrete_action_start_idx
+            ] = 0
+            correct_vlm_attention_mask[
+                :, discrete_action_start_idx + num_non_padded_discrete_action_tokens : 852
             ] = 0
 
             # nothing should attend to discrete action tokens (other than discrete action tokens)
             correct_vlm_attention_mask[
-                :discrete_action_start_idx,
-                discrete_action_start_idx : discrete_action_start_idx + num_non_padded_discrete_action_tokens,
+                :,
+                response_start_idx:,
             ] = 0
+
+            correct_vlm_attention_mask[
+                discrete_action_start_idx : discrete_action_start_idx + num_non_padded_discrete_action_tokens,
+                response_start_idx : response_start_idx + num_non_padded_response_tokens,
+            ] = 1
 
             # discrete action tokens should have a causal attention mask when attending to other discrete action tokens
             # Create causal mask: each token can attend to itself and all previous tokens
-            causal_mask = torch.tril(
+            discrete_action_causal_mask = torch.tril(
                 torch.ones(
                     num_non_padded_discrete_action_tokens,
                     num_non_padded_discrete_action_tokens,
@@ -173,7 +224,19 @@ class TestPI05Integration:
             correct_vlm_attention_mask[
                 discrete_action_start_idx : discrete_action_start_idx + num_non_padded_discrete_action_tokens,
                 discrete_action_start_idx : discrete_action_start_idx + num_non_padded_discrete_action_tokens,
-            ] = causal_mask
+            ] = discrete_action_causal_mask
+
+            response_causal_mask = torch.tril(
+                torch.ones(
+                    num_non_padded_response_tokens,
+                    num_non_padded_response_tokens,
+                    dtype=torch.bool,
+                )
+            )
+            correct_vlm_attention_mask[
+                response_start_idx : response_start_idx + num_non_padded_response_tokens,
+                response_start_idx : response_start_idx + num_non_padded_response_tokens,
+            ] = response_causal_mask
 
             # discrete action tokens are not used in inference
             if inference_mode:
@@ -192,27 +255,32 @@ class TestPI05Integration:
         """
         assert action_expert_attention_mask.shape[0] == 1
         assert action_expert_attention_mask.shape[1] == 50
-        assert action_expert_attention_mask.shape[2] == 818
+        assert action_expert_attention_mask.shape[2] == 870
         assert action_expert_attention_mask.dtype == torch.bool
 
         batch_size = action_expert_attention_mask.shape[0]
         for i in range(batch_size):
             # construct correct attention mask
             # see diagram here: https://drive.google.com/file/d/19oKbjVdPBQzXF_Wt6PhfIRY3RaAxUGnd/view?usp=sharing
-            correct_action_expert_attention_mask = torch.ones(50, 818, dtype=torch.bool)
+            correct_action_expert_attention_mask = torch.ones(50, 870, dtype=torch.bool)
 
             # pad tokens should not be attended to or attend to any other tokens
             num_non_padded_action_tokens = suffix_pad_masks[i, 0:50].sum()
             num_non_padded_prompt_tokens = prefix_pad_masks[i, 512:768].sum()
-            action_start_idx, kv_cache_start_idx, prompt_start_idx = 0, 50, 562
+            num_non_padded_response_tokens = prefix_pad_masks[i, 768:820].sum()
+            action_start_idx, prompt_start_idx, response_start_idx = 820, 512, 768
             # set attention mask for prompt pad tokens to 0
-            correct_action_expert_attention_mask[:, prompt_start_idx + num_non_padded_prompt_tokens :] = 0
+            correct_action_expert_attention_mask[
+                :, prompt_start_idx + num_non_padded_prompt_tokens : response_start_idx
+            ] = 0
+
+            correct_action_expert_attention_mask[
+                :, response_start_idx + num_non_padded_response_tokens : action_start_idx
+            ] = 0
 
             # set attention mask for action pad tokens to 0
-            correct_action_expert_attention_mask[action_start_idx + num_non_padded_action_tokens :, :] = 0
-            correct_action_expert_attention_mask[
-                :, action_start_idx + num_non_padded_action_tokens : kv_cache_start_idx
-            ] = 0
+            correct_action_expert_attention_mask[num_non_padded_action_tokens:, :] = 0
+            correct_action_expert_attention_mask[:, action_start_idx + num_non_padded_action_tokens :] = 0
 
             assert torch.all(
                 action_expert_attention_mask[i].cpu() == correct_action_expert_attention_mask.cpu()
@@ -235,6 +303,7 @@ class TestPI05Integration:
             "state": torch.randn(batch_size, config.max_state_dim),
             "actions": torch.randn(batch_size, config.chunk_size, config.max_action_dim),
             "prompt": ["Pick up the red block"],
+            "response": ["Pick up the red block"],
             "img_is_pad": torch.zeros(batch_size, 2, dtype=torch.bool),
             "action_is_pad": torch.cat(
                 [
@@ -392,10 +461,31 @@ class TestPI05Integration:
 
         # --------------------------------- Run the same test but for select_action --------------------------------------
         captured_variables_select_action = {}
+        original_infer_response = policy.model.infer_response
+
+        def capture_infer_response(*args, **kwargs):
+            prev_prefix_pad_masks = args[2]
+            prev_prefix_offsets = args[5]
+            prev_prefix_att_masks = args[3]
+            result = original_infer_response(*args, **kwargs)
+            _, prefix_embs, prefix_pad_masks, prefix_att_masks, prefix_offsets, response_tokens, _ = result
+            self._check_autoregressive_prefix_pads(
+                prefix_pad_masks, response_tokens, prev_prefix_pad_masks, prefix_embs
+            )
+            self._check_autoregressive_prefix_position_ids(
+                prefix_offsets, response_tokens, prev_prefix_offsets
+            )
+            self._check_autoregressive_prefix_attention_mask(
+                prefix_att_masks, response_tokens, prev_prefix_att_masks
+            )
+            captured_variables_select_action["last_prefix_pad_masks"] = prefix_pad_masks.clone()
+            captured_variables_select_action["last_prefix_att_masks"] = prefix_att_masks.clone()
+            captured_variables_select_action["last_prefix_offsets"] = prefix_offsets.clone()
+            return result
 
         def capture_variables_forward_select_action(*args, **kwargs):
             # Extract the variables we want to capture from the kwargs
-            if kwargs["inputs_embeds"][0] is not None:
+            if kwargs["inputs_embeds"][0] is not None and kwargs.get("past_key_values") is None:
                 vlm_attention_mask = kwargs.get("attention_mask")
                 vlm_position_ids = kwargs.get("position_ids")
                 action_expert_attention_mask = None
@@ -426,6 +516,7 @@ class TestPI05Integration:
         # Store original paligemma forward method and replace it for select_action
         original_paligemma_forward_select_action = policy.model.paligemma_with_expert.forward
         policy.model.paligemma_with_expert.forward = capture_variables_forward_select_action
+        policy.model.infer_response = capture_infer_response
 
         # Also capture prefix_pad_masks and suffix_pad_masks by monkey-patching the embed methods for select_action
         original_embed_prefix_select_action = policy.model.embed_prefix
@@ -462,6 +553,9 @@ class TestPI05Integration:
             "action_expert_position_ids",
             "vlm_2d_attention_mask",
             "action_expert_2d_attention_mask",
+            "last_prefix_pad_masks",
+            "last_prefix_att_masks",
+            "last_prefix_offsets",
         ]
 
         for var_name in expected_vars_select_action:
@@ -494,6 +588,7 @@ class TestPI05Integration:
             captured_variables_select_action["action_expert_position_ids"],
             captured_variables_select_action["prefix_pad_masks"],
             captured_variables_select_action["suffix_pad_masks"],
+            captured_variables_select_action["last_prefix_offsets"],
             inference_mode=True,
         )
         self._verify_vlm_attention_mask(
@@ -503,7 +598,7 @@ class TestPI05Integration:
         )
         self._verify_action_expert_attention_mask(
             captured_variables_select_action["action_expert_2d_attention_mask"],
-            captured_variables_select_action["prefix_pad_masks"],
+            captured_variables_select_action["last_prefix_pad_masks"],
             captured_variables_select_action["suffix_pad_masks"],
         )
 

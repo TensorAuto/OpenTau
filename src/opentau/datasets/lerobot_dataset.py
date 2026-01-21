@@ -725,14 +725,6 @@ class BaseDataset(torch.utils.data.Dataset):
             if isinstance(value, torch.Tensor) and value.dtype.is_floating_point:
                 standard_item[key] = value.to(dtype=torch.bfloat16)
 
-        # ensure that non-empty strings contain exactly one newline character at the end of the string
-        for key in ["prompt", "response"]:
-            if standard_item[key].endswith(
-                "\n"
-            ):  # ensure there isn't going to be an extra space at the end after calling replace
-                standard_item[key] = standard_item[key][:-1]
-            standard_item[key] = standard_item[key].replace("\n", " ") + "\n"
-
         return standard_item
 
     def resize_with_pad(self, img, width, height, pad_value=0) -> torch.Tensor:

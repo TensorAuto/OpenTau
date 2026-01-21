@@ -49,18 +49,18 @@ class PI05Config(PreTrainedConfig):
             Defaults to identity for visual features and mean-std for state and action.
         max_state_dim: Maximum dimension for state vectors. Shorter vectors are padded. Defaults to 32.
         max_action_dim: Maximum dimension for action vectors. Shorter vectors are padded. Defaults to 32.
+        predict_response: Whether to predict the response. Defaults to False.
         resize_imgs_with_padding: Target size (height, width) for image resizing with padding.
             Defaults to (224, 224).
         empty_cameras: Number of empty camera inputs to add. Used for specific adaptations like
             Aloha simulation. Defaults to 0.
-        tokenizer_max_length: Maximum length for tokenizer. Defaults to 256.
+        prompt_max_length: Maximum length for tokenizer. Defaults to 256.
         discrete_action_max_length: Maximum length for discrete action tokens. Defaults to 32.
         proj_width: Width of the projection layer. Defaults to 1024.
         dropout: Dropout rate. Defaults to 0.1.
         num_steps: Number of flow matching steps for decoding. Defaults to 10.
         init_strategy: Initialization strategy. One of "no_init", "full_he_init", "expert_only_he_init".
             Defaults to "full_he_init".
-        use_cache: Whether to use KV cache during inference. Defaults to True.
         attention_implementation: Attention implementation to use ("eager" or "fa2"). Defaults to "eager".
         freeze_vision_encoder: Whether to freeze the vision encoder during fine-tuning. Defaults to True.
         train_expert_only: Whether to train only the expert module. Defaults to False.
@@ -89,6 +89,7 @@ class PI05Config(PreTrainedConfig):
     # Shorter state and action vectors will be padded
     max_state_dim: int = 32
     max_action_dim: int = 32
+    predict_response: bool = False
 
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (224, 224)
@@ -97,8 +98,11 @@ class PI05Config(PreTrainedConfig):
     # left and right wrist cameras in addition to the top camera.
     empty_cameras: int = 0
 
-    # Tokenizer
-    tokenizer_max_length: int = 256
+    # Language Tokenizer
+    prompt_max_length: int = 256
+
+    # Response Tokenizer
+    response_max_length: int = 52
 
     # Maximum length of the action tokens
     discrete_action_max_length: int = 32
@@ -116,8 +120,7 @@ class PI05Config(PreTrainedConfig):
     init_strategy: Literal["no_init", "full_he_init", "expert_only_he_init"] = "full_he_init"
 
     # Attention utils
-    use_cache: bool = True
-    attention_implementation: str = "eager"  # or fa2
+    attention_implementation: str = "eager"
 
     # Finetuning settings
     freeze_vision_encoder: bool = True

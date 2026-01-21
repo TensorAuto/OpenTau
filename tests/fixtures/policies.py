@@ -126,6 +126,7 @@ def pi05_training_config(train_pipeline_config: TrainPipelineConfig) -> TrainPip
             "STATE": NormalizationMode.MIN_MAX,
             "ACTION": NormalizationMode.MEAN_STD,
         },
+        predict_response=True,
     )
     cfg.dataset_mixture.datasets = [
         DatasetConfig(repo_id="lerobot/droid_100", episodes=[0]),

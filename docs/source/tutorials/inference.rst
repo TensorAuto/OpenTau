@@ -15,3 +15,26 @@ To run inference, run the following command:
 .. code-block:: bash
 
     python lerobot/scripts/inference.py --config_path=outputs/train/pi05/checkpoints/000040/train_config.json
+
+
+Running inference with autoregressive response prediction
+----------------------------------------------------------
+
+To run inference with autoregressive response prediction, set the predict_response flag to true in the policy config as shown below.
+For now, we only support greedy decoding for response prediction.
+Example of important config fields for inference with autoregressive response prediction:
+
+.. code-block:: javascript
+
+   {
+    ...
+    "policy": {
+        "type": "pi05",
+        "pretrained_path": "TensorAuto/pi05_base",
+        "n_obs_steps": 1,
+        ...
+        "predict_response": true,
+        ...
+    }
+    ...
+   }

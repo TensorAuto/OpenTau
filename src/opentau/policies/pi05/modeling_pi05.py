@@ -151,8 +151,8 @@ def make_att_2d_masks(
 
         # Apply padding masks: pad_masks for rows, cross_att_pad_masks for columns
         cross_att_mask = cross_att_mask & pad_masks[:, :, None] & cross_att_pad_masks[:, None, :]
-
-        att_2d_masks = torch.cat((att_2d_masks, cross_att_mask), dim=2)
+        # The cross_att_masks are concatenated before the att_2d_masks
+        att_2d_masks = torch.cat((cross_att_mask, att_2d_masks), dim=2)
 
     return att_2d_masks
 
@@ -596,6 +596,11 @@ class PI05Policy(PreTrainedPolicy):
         lang_tokens, lang_masks = self.prepare_language(
             batch
         )  # in lang_masks we have True for real tokens and False for padded tokens
+        # response prediction is to predict the response . It will attend to image and language inputs.
+        response_tokens, response_masks = self.prepare_response(
+            batch
+        )  # in response_masks we have True for real tokens and False for padded tokens
+        # discrete actions are to predict actions using autoregressive technique and not flow matching. It will attend to image, language and response inputs.
         discrete_actions, discrete_action_masks = self.prepare_discrete_actions(
             batch
         )  # in discrete_action_masks we have True for real tokens and False for padded tokens
@@ -610,6 +615,8 @@ class PI05Policy(PreTrainedPolicy):
             lang_tokens,
             lang_masks,
             actions,
+            response_tokens,
+            response_masks,
             noise,
             time,
             discrete_actions,
@@ -752,18 +759,25 @@ class PI05Policy(PreTrainedPolicy):
         device = batch["state"].device
         tasks = batch["prompt"]
 
-        # PaliGemma prompt has to end with a new line
-        tasks = [task if task.endswith("\n") else f"{task}\n" for task in tasks]
-
         # add state to the prompt
         state = self.prepare_discrete_state(batch)
-        prompt = [f"Task: {task}State: {state}\nActions:" for task, state in zip(tasks, state, strict=False)]
+        # using <eos> to separate each modality
+        if self.config.predict_response:
+            prompt = [
+                f"Task: {task}<eos>State: {state}<eos>Response:"
+                for task, state in zip(tasks, state, strict=False)
+            ]
+        else:
+            prompt = [
+                f"Task: {task}<eos>State: {state}<eos>Actions:"
+                for task, state in zip(tasks, state, strict=False)
+            ]
 
         tokenized_prompt = self.language_tokenizer.__call__(
             prompt,
             padding="max_length",
             padding_side="right",
-            max_length=self.config.tokenizer_max_length,
+            max_length=self.config.prompt_max_length,
             return_tensors="pt",
             truncation=True,
         )
@@ -771,6 +785,39 @@ class PI05Policy(PreTrainedPolicy):
         lang_masks = tokenized_prompt["attention_mask"].to(device=device, dtype=torch.bool)
 
         return lang_tokens, lang_masks
+
+    def prepare_response(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+        """Tokenize the response input.
+
+        Args:
+            batch: Batch of data containing the key "response".
+
+        Returns:
+            A tuple containing:
+                - response_tokens: Tensor of response language tokens.
+                - response_masks: Tensor of response language attention masks.
+        """
+
+        if not self.config.predict_response:
+            return None, None
+        device = batch["state"].device
+        responses = batch["response"]
+
+        # if '' is found in response then response is not for loss calculation (used for robotic dataset with no subtask), so add pad token to the response.
+        response_prompt = [f"{response}<eos>Actions:" for response in responses]
+
+        tokenized_response = self.language_tokenizer.__call__(
+            response_prompt,
+            padding="max_length",
+            padding_side="right",
+            max_length=self.config.response_max_length,
+            return_tensors="pt",
+            truncation=True,
+        )
+        response_tokens = tokenized_response["input_ids"].to(device=device)
+        response_masks = tokenized_response["attention_mask"].to(device=device, dtype=torch.bool)
+
+        return response_tokens, response_masks
 
 
 class PI05FlowMatching(nn.Module):
@@ -827,6 +874,8 @@ class PI05FlowMatching(nn.Module):
 
         self.time_mlp_in = nn.Linear(self.config.proj_width, self.config.proj_width)
         self.time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
+
+        self.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
 
         self._init_model()
 
@@ -897,6 +946,8 @@ class PI05FlowMatching(nn.Module):
         img_masks: list[Tensor],
         lang_tokens: Tensor,
         lang_masks: Tensor,
+        response_tokens: Tensor | None = None,
+        response_masks: Tensor | None = None,
         discrete_actions: Tensor | None = None,
         discrete_action_masks: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
@@ -908,6 +959,8 @@ class PI05FlowMatching(nn.Module):
             img_masks: List of image mask tensors.
             lang_tokens: Language token tensor.
             lang_masks: Language mask tensor.
+            response_tokens: Optional Response language token tensor.
+            response_masks: Optional Response language mask tensor.
             discrete_actions: Optional discrete action tensor.
             discrete_action_masks: Optional discrete action mask tensor.
 
@@ -955,6 +1008,20 @@ class PI05FlowMatching(nn.Module):
         # full attention between image and language inputs
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
+
+        if response_tokens is not None:
+            response_emb = self.paligemma_with_expert.embed_language_tokens(response_tokens)
+
+            # Normalize response language embeddings
+            response_emb_dim = response_emb.shape[-1]
+            response_emb = response_emb * math.sqrt(response_emb_dim)
+
+            embs.append(response_emb)
+            pad_masks.append(response_masks)
+
+            # full attention between image, language and response inputs
+            num_response_embs = response_emb.shape[1]
+            att_masks += [1] * num_response_embs
 
         if discrete_actions is not None:
             discrete_action_emb = self.paligemma_with_expert.embed_discrete_actions(discrete_actions)
@@ -1033,6 +1100,8 @@ class PI05FlowMatching(nn.Module):
         lang_tokens: Tensor,
         lang_masks: Tensor,
         actions: Tensor,
+        response_tokens: Tensor | None = None,
+        response_masks: Tensor | None = None,
         noise: Tensor | None = None,
         time: Tensor | None = None,
         discrete_actions: Tensor | None = None,
@@ -1045,6 +1114,8 @@ class PI05FlowMatching(nn.Module):
             img_masks: List of image mask tensors.
             lang_tokens: Language token tensor.
             lang_masks: Language mask tensor.
+            response_tokens: Response language token tensor.
+            response_masks: Response language mask tensor.
             actions: Action tensor.
             noise: Optional noise tensor.
             time: Optional time tensor.
@@ -1056,12 +1127,20 @@ class PI05FlowMatching(nn.Module):
         """
         # Run VLM first to get key value cache
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, discrete_actions, discrete_action_masks
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            response_tokens,
+            response_masks,
+            discrete_actions,
+            discrete_action_masks,
         )
 
         vlm_2d_attention_mask = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         vlm_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
+        # avoids using discrete action for predicting continuous flow matching action
         num_cross_att_tokens = prefix_embs.shape[1] - self.config.discrete_action_max_length
 
         (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
@@ -1070,7 +1149,7 @@ class PI05FlowMatching(nn.Module):
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
             n_cross_att_tokens=num_cross_att_tokens,
-            use_cache=True,
+            use_cache=False,
             fill_kv_cache=True,
         )
 
@@ -1124,24 +1203,60 @@ class PI05FlowMatching(nn.Module):
 
         # compute cross entropy loss for discrete actions
         batch_size, seq_len = discrete_actions.shape
-        discrete_action_out = prefix_out[:, -self.config.discrete_action_max_length - 1 : -1]
+        discrete_token_start = -self.config.discrete_action_max_length
+        # The last token of response will predict the first token of discrete actions , so we need to slice from discrete_token_start -1.
+        # The predicted last token of discrete action is useless, so no need to include for loss calculation.
+        discrete_action_slice_object = slice(discrete_token_start - 1, -1)
+        discrete_action_out = prefix_out[:, discrete_action_slice_object]
         logits = self.paligemma_with_expert.da_head(discrete_action_out)
 
         logits = logits.to(dtype=torch.float32)  # upcast to float32 for loss calculation
         logits = rearrange(logits, "b s d -> (b s) d")
         labels = rearrange(discrete_actions, "b s -> (b s)")
-        ce_loss = F.cross_entropy(logits, labels, reduction="none")
+        discrete_action_ce_loss = F.cross_entropy(logits, labels, reduction="none")
 
-        ce_loss = rearrange(ce_loss, "(b s) -> b s", b=batch_size, s=seq_len)
+        discrete_action_ce_loss = rearrange(discrete_action_ce_loss, "(b s) -> b s", b=batch_size, s=seq_len)
 
         # remove pad tokens
         discrete_action_is_pad = ~discrete_action_masks  # convert into format where value for pad is True
-        ce_loss = ce_loss * ~discrete_action_is_pad
+        discrete_action_ce_loss = discrete_action_ce_loss * ~discrete_action_is_pad
 
         # compute mean
-        ce_loss = ce_loss.mean()
+        discrete_action_ce_loss = discrete_action_ce_loss.mean()
 
-        return {"MSE": losses, "CE": ce_loss}
+        # compute cross entropy loss for response language
+        batch_size, seq_len = response_tokens.shape
+        response_token_start = -self.config.response_max_length - self.config.discrete_action_max_length
+        # The last token of language will predict <BOS> token of response, so no need to include for loss calculation. Hence slice starts from -self.config.discrete_action_max_length - self.config.response_max_length.
+        # The last token of response predicts first token  of discrete actions, so no need to include for loss calculation. Hence slice ends at -self.config.discrete_action_max_length - 1.
+        response_token_end = -self.config.discrete_action_max_length - 1
+        response_slice_object = slice(response_token_start, response_token_end)
+        response_out = prefix_out[
+            :,
+            response_slice_object,
+        ]
+        response_logits = self.paligemma_with_expert.paligemma.lm_head(response_out)
+        # response slice to exclude the <BOS> token from response while calculating loss.
+        response_slice = slice(1, None)
+        response_logits = response_logits.to(dtype=torch.float32)  # upcast to float32 for loss calculation
+        response_logits = rearrange(response_logits, "b s d -> (b s) d")
+        response_labels = rearrange(response_tokens[:, response_slice], "b s -> (b s)")
+        response_ce_loss = F.cross_entropy(response_logits, response_labels, reduction="none")
+
+        response_ce_loss = rearrange(response_ce_loss, "(b s) -> b s", b=batch_size, s=seq_len - 1)
+
+        # remove pad tokens
+        response_is_pad = ~response_masks  # convert into format where value for pad is True
+        # helps to control loss for response tokens in case of robotic data and VQA data
+        response_ce_loss = response_ce_loss * ~response_is_pad[:, response_slice]
+
+        # compute mean
+        response_ce_loss = response_ce_loss.mean()
+
+        return {
+            "MSE": losses,
+            "CE": (discrete_action_ce_loss + response_ce_loss),
+        }
 
     def sample_actions(
         self,
@@ -1176,19 +1291,48 @@ class PI05FlowMatching(nn.Module):
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None] - 1
+
         num_cross_att_tokens = prefix_embs.shape[1]
 
         # Compute image and language key value cache
-        _, past_key_values = self.paligemma_with_expert.forward(
+        (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
             position_ids=prefix_position_ids,
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
             n_cross_att_tokens=num_cross_att_tokens,
-            use_cache=self.config.use_cache,
+            use_cache=False,
             fill_kv_cache=True,
         )
 
+        # initialize response tokens to empty tensor for storing response tokens during inference
+        response_tokens = torch.empty((bsize, 0), device=device, dtype=torch.long)
+        # if response prediction is enabled, then predict response tokens autoregressively
+        if self.config.predict_response:
+            for auto_step in range(self.config.response_max_length):
+                (
+                    prefix_out,
+                    prefix_embs,
+                    prefix_pad_masks,
+                    prefix_att_masks,
+                    prefix_offsets,
+                    response_tokens,
+                    past_key_values,
+                ) = self.infer_response(
+                    prefix_out,
+                    prefix_embs,
+                    prefix_pad_masks,
+                    prefix_att_masks,
+                    past_key_values,
+                    prefix_offsets,
+                    response_tokens,
+                    auto_step,
+                    bsize,
+                    device,
+                )
+
+        # perform denoising steps to get the action
         dt = -1.0 / self.config.num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
 
@@ -1254,3 +1398,119 @@ class PI05FlowMatching(nn.Module):
         v_t = self.action_out_proj(suffix_out)
         v_t = v_t.to(dtype=torch.float32)
         return v_t
+
+    def infer_response(
+        self,
+        prefix_out: Tensor,
+        prefix_embs: Tensor,
+        prefix_pad_masks: Tensor,
+        prefix_att_masks: Tensor,
+        past_key_values: list[dict[str, Tensor]],
+        prefix_offsets: Tensor,
+        response_tokens: Tensor,
+        auto_step: int,
+        bsize: int,
+        device: torch.device,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, list[dict[str, Tensor]], Tensor]:
+        """Perform autoregressive inference for response generation.
+
+        This method generates the next token in the response sequence, updating the
+        various state tensors required for maintaining the generation context. It handles
+        the initial BOS token generation as well as subsequent tokens, and manages
+        padding masks to handle variable-length sequences properly.
+
+        Args:
+            prefix_out: Output tensor from the previous step.
+            prefix_embs: Embeddings for the current prefix context.
+            prefix_pad_masks: Boolean mask indicating valid (non-padding) tokens in the prefix.
+            prefix_att_masks: Attention mask for the prefix.
+            past_key_values: KV cache from previous transformer steps.
+            prefix_offsets: Position offsets for the current generation step.
+            response_tokens: Accumulated tokens generated so far.
+            auto_step: Current autoregressive step index (0 for first token).
+            bsize: Batch size.
+            device: Device to run the computation on.
+
+        Returns:
+            A tuple containing updated tensors for the next step:
+            (prefix_out, prefix_embs, prefix_pad_masks, prefix_att_masks,
+             prefix_offsets, response_tokens, past_key_values, response_token)
+        """
+        EOS_TOKEN = self.language_tokenizer.convert_tokens_to_ids(self.language_tokenizer.eos_token)  # noqa: N806
+        if auto_step == 0:
+            # Start the autoregressive inference with <bos> token
+            response_token = torch.full(
+                (bsize, 1),
+                self.language_tokenizer.bos_token_id,
+                device=device,
+                dtype=torch.long,
+            )
+        else:
+            # get the last predicted token from the prefix output which is predicted response
+            response_token = prefix_out[:, -1:]
+            response_token = self.paligemma_with_expert.paligemma.lm_head(response_token).argmax(dim=-1)
+
+        PAD_TOKEN = self.language_tokenizer.pad_token_id  # noqa: N806
+        # Create pad masks: False if previous token was EOS or PAD
+        if response_tokens.shape[1] > 1:
+            prev_tokens = response_tokens
+            has_eos = (prev_tokens == EOS_TOKEN).any(dim=1, keepdim=True)
+            has_pad = (prev_tokens == PAD_TOKEN).any(dim=1, keepdim=True)
+            # check if the previous token was EOS or PAD. If so, then the current token should be padded, so its not attended by flow matching action expert.
+            response_pad_masks = ~(has_eos | has_pad)
+            response_token = torch.where(
+                response_pad_masks,
+                response_token,
+                torch.tensor(PAD_TOKEN, device=device, dtype=response_token.dtype),
+            )
+        else:
+            response_pad_masks = torch.ones((bsize, 1), device=device, dtype=torch.bool)
+
+        # Updating response tokens with current predicted token
+        response_tokens = torch.cat([response_tokens, response_token], dim=1)
+
+        # Embed the current predicted token
+        response_emb = self.paligemma_with_expert.embed_language_tokens(response_token)
+
+        # Normalize response language embeddings
+        response_emb_dim = response_emb.shape[-1]
+        response_emb = response_emb * math.sqrt(response_emb_dim)
+
+        response_att_masks = torch.ones((bsize, 1), device=device, dtype=response_emb.dtype)
+
+        # update the prefix embs, pad masks and att masks, so it can be used by action experts
+        prefix_embs = torch.cat([prefix_embs, response_emb], dim=1)
+        prefix_pad_masks = torch.cat([prefix_pad_masks, response_pad_masks], dim=1)
+        prefix_att_masks = torch.cat([prefix_att_masks, response_att_masks], dim=1)
+
+        num_cross_att_tokens = prefix_pad_masks.shape[1]
+        # create the attention mask for the response tokens
+        response_att_2d_masks = make_att_2d_masks(
+            response_pad_masks,
+            response_att_masks,
+            n_cross_att_tokens=num_cross_att_tokens - 1,
+            cross_att_pad_masks=prefix_pad_masks[:, : num_cross_att_tokens - 1],
+        )
+        prefix_offsets = prefix_offsets + response_pad_masks.long()
+        prefix_position_ids = prefix_offsets
+
+        # Compute image and language key value cache
+        (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=response_att_2d_masks,
+            position_ids=prefix_position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=[response_emb, None],
+            n_cross_att_tokens=num_cross_att_tokens,
+            use_cache=True,
+            fill_kv_cache=True,
+        )
+
+        return (
+            prefix_out,
+            prefix_embs,
+            prefix_pad_masks,
+            prefix_att_masks,
+            prefix_offsets,
+            response_tokens,
+            past_key_values,
+        )

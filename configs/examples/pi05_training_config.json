@@ -26,6 +26,7 @@
             "ACTION": "MEAN_STD"
         },
         "chunk_size": 10,
+        "predict_response": true,
         "n_action_steps": 10,
         "max_state_dim": 32,
         "max_action_dim": 32,
@@ -35,7 +36,7 @@
         "attention_implementation": "eager",
         "freeze_vision_encoder": true,
         "train_expert_only": true,
-        "tokenizer_max_length": 256,
+        "prompt_max_length": 256,
         "discrete_action_max_length": 60,
         "optimizer_lr": 2.5e-05,
         "optimizer_betas": [
@@ -56,7 +57,7 @@
     "max_action_dim": 32,
     "action_chunk": 10,
     "loss_weighting": {"MSE": 1, "CE": 1},
-    "num_workers": 16,
+    "num_workers": 0,
     "batch_size": 2,
     "gradient_accumulation_steps": 1,
     "dataloader_batch_size": 2,
