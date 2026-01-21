@@ -64,7 +64,7 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          apt-get update && apt-get install -y python3 python3-pip git ffmpeg libegl1 libegl-mesa0 libgl1 libglx-mesa0 libgles2 mesa-utils curl
+          apt-get update && apt-get install -y python3 python3-pip git ffmpeg libegl1 libegl-mesa0 libegl-dev libgl1 libglx-mesa0 libgles2 mesa-utils curl
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
@@ -73,12 +73,13 @@ jobs:
 
       - name: Install dependencies
         run: |
-          uv sync --extra dev
+          uv sync --extra dev --extra libero --extra openai
 
       - name: Check GPU
         run: nvidia-smi
 
       - name: Run Tests
+        shell: bash
         run: |
           source .venv/bin/activate
           pytest -m "gpu" -n 0 -v tests/
