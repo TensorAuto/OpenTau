@@ -17,6 +17,7 @@
 import json
 import logging
 import os
+import time
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -255,6 +256,7 @@ def train(cfg: TrainPipelineConfig):
     if accelerator.is_main_process:
         logging.info("Start offline training on a fixed dataset")
 
+    start_time = time.time()
     for _ in range(step, cfg.steps):
         for _ in range(cfg.gradient_accumulation_steps):
             with accelerator.accumulate(policy) if cfg.gradient_accumulation_steps > 1 else nullcontext():
@@ -294,7 +296,9 @@ def train(cfg: TrainPipelineConfig):
             accelerator.log({"Training/Learning Rate": log_dict["lr"]}, step=step)
             accelerator.log({"Training/Grad Norm": log_dict["grad_norm"]}, step=step)
             accelerator.log({"Training/Num Samples": log_dict["samples"]}, step=step)
+            accelerator.log({"Training time": time.time() - start_time}, step=step)
             train_tracker.reset_averages()
+            start_time = time.time()
 
         if is_saving_step:
             checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
