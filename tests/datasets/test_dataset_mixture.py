@@ -356,6 +356,7 @@ class TestWeightedDatasetMixtureIntegration:
         dataset_config = DatasetConfig(
             repo_id="lerobot/droid_100",
             episodes=[0, 1],
+            video_backend="pyav",
         )
 
         # set fps to same as droid_100 dataset and resample strategy to nearest

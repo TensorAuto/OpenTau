@@ -117,13 +117,7 @@ def get_safe_default_codec() -> str:
     Returns:
         Backend name: "torchcodec" if available, otherwise "pyav".
     """
-    if importlib.util.find_spec("torchcodec"):
-        return "torchcodec"
-    else:
-        logging.warning(
-            "'torchcodec' is not available in your platform, falling back to 'pyav' as a default decoder"
-        )
-        return "pyav"
+    return "pyav"
 
 
 def decode_video_frames(
