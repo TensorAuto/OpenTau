@@ -297,8 +297,6 @@ def train(cfg: TrainPipelineConfig):
             train_tracker.reset_averages()
 
         if is_saving_step:
-            # TODO: investigate whether this barrier is needed
-            accelerator.wait_for_everyone()
             checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
 
             # save the accelerator state
@@ -312,8 +310,6 @@ def train(cfg: TrainPipelineConfig):
                 save_checkpoint(checkpoint_dir, step, cfg)
                 if cfg.last_checkpoint_only:
                     prune_old_checkpoints(checkpoint_dir)
-
-            accelerator.wait_for_everyone()
 
         if is_val_step:
             policy.eval()
@@ -377,10 +373,6 @@ def train(cfg: TrainPipelineConfig):
                 accelerator.log({"Validation/L1 Loss": val_dict["l1_loss"]}, step=step)
                 accelerator.log({"Validation/Accuracy": val_dict["accuracy"]}, step=step)
 
-            # This barrier is probably necessary to ensure
-            # other processes wait for the main process to finish saving
-            accelerator.wait_for_everyone()
-
         if is_eval_step and eval_envs:
             step_id = get_step_identifier(step, cfg.steps)
             logging.info(f"Eval policy at step {step}")
@@ -434,10 +426,6 @@ def train(cfg: TrainPipelineConfig):
                 videos_dir = cfg.output_dir / "eval" / f"videos_step_{step_id}"
                 with open(videos_dir / "eval_info.json", "w") as f:
                     json.dump(eval_info, f, indent=2)
-
-            # This barrier is to ensure all processes finishes evaluation before the next training step
-            # Some processes might be slower than others
-            accelerator.wait_for_everyone()
 
     if cfg.eval_freq > 0 and eval_envs:
         close_envs(eval_envs)
