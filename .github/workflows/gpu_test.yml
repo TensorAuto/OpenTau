@@ -79,6 +79,7 @@ jobs:
         run: nvidia-smi
 
       - name: Set up HuggingFace authentication
+        shell: bash
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
