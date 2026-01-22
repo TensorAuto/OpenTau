@@ -108,6 +108,7 @@ import pyarrow as pa
 import torch
 import torchvision
 from datasets.features.features import register_feature
+from packaging import version
 from PIL import Image
 
 
@@ -117,13 +118,17 @@ def get_safe_default_codec() -> str:
     Returns:
         Backend name: "torchcodec" if available, otherwise "pyav".
     """
-    if importlib.util.find_spec("torchcodec"):
-        return "torchcodec"
-    else:
-        logging.warning(
-            "'torchcodec' is not available in your platform, falling back to 'pyav' as a default decoder"
-        )
+
+    if version.parse(torch.__version__) >= version.parse("2.8.0"):
         return "pyav"
+    else:
+        if importlib.util.find_spec("torchcodec"):
+            return "torchcodec"
+        else:
+            logging.warning(
+                "'torchcodec' is not available in your platform, falling back to 'pyav' as a default decoder"
+            )
+            return "pyav"
 
 
 def decode_video_frames(

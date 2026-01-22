@@ -57,7 +57,7 @@
     "max_action_dim": 32,
     "action_chunk": 10,
     "loss_weighting": {"MSE": 1, "CE": 1},
-    "num_workers": 0,
+    "num_workers": 4,
     "batch_size": 2,
     "gradient_accumulation_steps": 1,
     "dataloader_batch_size": 2,

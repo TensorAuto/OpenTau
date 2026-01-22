@@ -353,10 +353,7 @@ class TestWeightedDatasetMixtureIntegration:
     ):
         """Test that the mixture with no latency and same fps as datasets actually uses the samples from the datasets."""
         # Create dataset
-        dataset_config = DatasetConfig(
-            repo_id="lerobot/droid_100",
-            episodes=[0, 1],
-        )
+        dataset_config = DatasetConfig(repo_id="lerobot/droid_100", episodes=[0, 1])
 
         # set fps to same as droid_100 dataset and resample strategy to nearest
         train_pipeline_config.dataset_mixture.action_freq = 15.0  # same fps as droid_100 dataset
