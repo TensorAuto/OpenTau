@@ -1489,7 +1489,7 @@ class LeRobotDataset(BaseDataset):
         if self.standardize:
             # Add response as a string
             if "response" not in item:
-                item["response"] = ""
+                item["response"] = item["task"]
 
             episode_index = item["episode_index"].item()
             # don't convert to timestamp to `float`, because torch.float64 is not supported on MPS
