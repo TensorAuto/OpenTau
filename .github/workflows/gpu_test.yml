@@ -49,7 +49,7 @@ jobs:
   gpu-test:
     name: Run Pytest on GPU
     needs: start-runner
-    runs-on: [g6.xlarge]
+    runs-on: [g6.2xlarge]
     timeout-minutes: 60
 
     container:
