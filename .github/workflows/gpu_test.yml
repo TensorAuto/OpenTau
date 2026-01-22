@@ -78,6 +78,13 @@ jobs:
       - name: Check GPU
         run: nvidia-smi
 
+      - name: Set up HuggingFace authentication
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          source .venv/bin/activate
+          hf auth login --token $HF_TOKEN
+
       - name: Run Tests
         shell: bash
         run: |
