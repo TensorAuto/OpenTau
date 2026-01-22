@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import torch
+from packaging import version
 from torch.optim.lr_scheduler import LambdaLR
 
 from opentau.constants import SCHEDULER_STATE
@@ -33,7 +34,7 @@ def test_diffuser_scheduler(optimizer):
 
     optimizer.step()  # so that we don't get torch warning
     scheduler.step()
-    if torch.__version__ >= "2.8.0":
+    if version.parse(torch.__version__) >= version.parse("2.8.0"):
         expected_state_dict = {
             "_get_lr_called_within_step": False,
             "_last_lr": [0.0002],
@@ -62,7 +63,7 @@ def test_vqbet_scheduler(optimizer):
 
     optimizer.step()
     scheduler.step()
-    if torch.__version__ >= "2.8.0":
+    if version.parse(torch.__version__) >= version.parse("2.8.0"):
         expected_state_dict = {
             "_get_lr_called_within_step": False,
             "_last_lr": [0.001],
@@ -93,7 +94,7 @@ def test_cosine_decay_with_warmup_scheduler(optimizer):
 
     optimizer.step()
     scheduler.step()
-    if torch.__version__ >= "2.8.0":
+    if version.parse(torch.__version__) >= version.parse("2.8.0"):
         expected_state_dict = {
             "_get_lr_called_within_step": False,
             "_last_lr": [0.0001818181818181819],
@@ -135,7 +136,7 @@ def test_constant_scheduler(optimizer):
         current_lr = optimizer.param_groups[0]["lr"]
         assert current_lr == initial_lr
 
-    if torch.__version__ >= "2.8.0":
+    if version.parse(torch.__version__) >= version.parse("2.8.0"):
         expected_state_dict = {
             "_get_lr_called_within_step": False,
             "_last_lr": [0.001],
