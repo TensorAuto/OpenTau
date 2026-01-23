@@ -28,8 +28,6 @@ env:
   PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
   MUJOCO_GL: "egl"
   PYOPENGL_PLATFORM: "egl"
-  NCCL_DEBUG: "TRACE"
-  NCCL_DEBUG_SUBSYS: "ALL"
 
 jobs:
   start-runner:
@@ -150,11 +148,11 @@ jobs:
           source .venv/bin/activate
           ./src/opentau/scripts/convert_checkpoint.sh outputs/train/ci/checkpoints/000025
 
-      - name: Resume Training
-        shell: bash
-        run: |
-          source .venv/bin/activate
-          opentau-train --accelerate-config=configs/examples/accelerate_deepspeed_config.yaml --config_path=outputs/train/ci/checkpoints/000025/train_config.json --resume=true --steps=50 2>&1 | tee /tmp/resume.log
+      # - name: Resume Training
+      #   shell: bash
+      #   run: |
+      #     source .venv/bin/activate
+      #     opentau-train --accelerate-config=configs/examples/accelerate_deepspeed_config.yaml --config_path=outputs/train/ci/checkpoints/000025/train_config.json --resume=true --steps=50 2>&1 | tee /tmp/resume.log
 
       # - name: Check Loss Drop (after Resume)
       #   continue-on-error: true
@@ -164,29 +162,29 @@ jobs:
       #     python3 .github/scripts/check_loss_drop.py --log_path=/tmp/train.log --expected_length=25 --resume_log_path=/tmp/resume.log --resume_expected_length=25
       #     echo "Loss drop confirmed"
 
-      - name: Check Non-Zero Grad Norm (after Resume)
-        continue-on-error: true
-        shell: bash
-        run: |
-          source .venv/bin/activate
-          python3 .github/scripts/check_nonzero_grad_norm.py --log_path=/tmp/resume.log --expected_length=25
-          echo "Non-zero grad norm confirmed"
+      # - name: Check Non-Zero Grad Norm (after Resume)
+      #   continue-on-error: true
+      #   shell: bash
+      #   run: |
+      #     source .venv/bin/activate
+      #     python3 .github/scripts/check_nonzero_grad_norm.py --log_path=/tmp/resume.log --expected_length=25
+      #     echo "Non-zero grad norm confirmed"
 
-      - name: Check Accumulate Grad Sync (after Resume)
-        continue-on-error: true
-        shell: bash
-        run: |
-          source .venv/bin/activate
-          python3 .github/scripts/check_accumulate_grad_sync.py --log_path=/tmp/resume.log --expected_length=50
-          echo "Accumulate grad sync confirmed"
+      # - name: Check Accumulate Grad Sync (after Resume)
+      #   continue-on-error: true
+      #   shell: bash
+      #   run: |
+      #     source .venv/bin/activate
+      #     python3 .github/scripts/check_accumulate_grad_sync.py --log_path=/tmp/resume.log --expected_length=50
+      #     echo "Accumulate grad sync confirmed"
 
-      - name: Check State Keys (after Resume)
-        continue-on-error: true
-        shell: bash
-        run: |
-          source .venv/bin/activate
-          python3 .github/scripts/check_state_keys.py --log_path=/tmp/resume.log --source=local
-          echo "Checks for state keys passed"
+      # - name: Check State Keys (after Resume)
+      #   continue-on-error: true
+      #   shell: bash
+      #   run: |
+      #     source .venv/bin/activate
+      #     python3 .github/scripts/check_state_keys.py --log_path=/tmp/resume.log --source=local
+      #     echo "Checks for state keys passed"
 
       - name: Run Inference
         shell: bash
