@@ -111,6 +111,7 @@ jobs:
           opentau-train --accelerate-config=configs/examples/accelerate_deepspeed_config.yaml --config_path=configs/dev/ci_config.json --output_dir=outputs/train/ci/ 2>&1 | tee /tmp/train.log
 
       - name: Check Loss Drop
+        id: check-loss-drop
         continue-on-error: true
         shell: bash
         run: |
@@ -119,6 +120,7 @@ jobs:
           echo "Loss drop confirmed"
 
       - name: Check Non-Zero Grad Norm
+        id: check-grad-norm
         continue-on-error: true
         shell: bash
         run: |
@@ -127,6 +129,7 @@ jobs:
           echo "Non-zero grad norm confirmed"
 
       - name: Check Accumulate Grad Sync
+        id: check-grad-sync
         continue-on-error: true
         shell: bash
         run: |
@@ -135,6 +138,7 @@ jobs:
           echo "Accumulate grad sync confirmed"
 
       - name: Check State Keys
+        id: check-state-keys
         continue-on-error: true
         shell: bash
         run: |
@@ -191,6 +195,24 @@ jobs:
         run: |
           source .venv/bin/activate
           python src/opentau/scripts/inference.py --config_path=outputs/train/ci/checkpoints/000025/train_config.json
+
+      - name: Fail if checks failed
+        if: always()
+        env:
+          LOSS_DROP: ${{ steps.check-loss-drop.outcome }}
+          GRAD_NORM: ${{ steps.check-grad-norm.outcome }}
+          GRAD_SYNC: ${{ steps.check-grad-sync.outcome }}
+          STATE_KEYS: ${{ steps.check-state-keys.outcome }}
+        run: |
+          failed=""
+          [ "$LOSS_DROP" == "failure" ] && failed="$failed check-loss-drop"
+          [ "$GRAD_NORM" == "failure" ] && failed="$failed check-grad-norm"
+          [ "$GRAD_SYNC" == "failure" ] && failed="$failed check-grad-sync"
+          [ "$STATE_KEYS" == "failure" ] && failed="$failed check-state-keys"
+          if [ -n "$failed" ]; then
+            echo "The following checks failed:$failed"
+            exit 1
+          fi
 
   stop-runner:
     name: Stop GPU Runner
