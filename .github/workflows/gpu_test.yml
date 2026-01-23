@@ -18,6 +18,7 @@ on:
     # Run at 2:00 AM PST every day (10:00 AM UTC)
     - cron: '0 10 * * *'
   workflow_dispatch:
+  pull_request:
 
 permissions:
   contents: read  # Required for actions/checkout
@@ -42,7 +43,7 @@ jobs:
 
       - name: Start Instance
         run: |
-          aws autoscaling set-desired-capacity --auto-scaling-group-name github-runner-asg --desired-capacity 1
+          aws autoscaling set-desired-capacity --auto-scaling-group-name github-runner-asg-g6-2xlarge --desired-capacity 1
           echo "Waiting for instance to be ready..."
 
   gpu-test:
@@ -110,4 +111,4 @@ jobs:
 
       - name: Stop Instance
         run: |
-          aws autoscaling set-desired-capacity --auto-scaling-group-name github-runner-asg --desired-capacity 0
+          aws autoscaling set-desired-capacity --auto-scaling-group-name github-runner-asg-g6-2xlarge --desired-capacity 0

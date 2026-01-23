@@ -1,0 +1,195 @@
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Nightly Regression Tests
+
+on:
+  schedule:
+    # Run at 2:00 AM PST every day (10:00 AM UTC)
+    - cron: '0 10 * * *'
+  workflow_dispatch:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  MUJOCO_GL: "egl"
+  PYOPENGL_PLATFORM: "egl"
+
+jobs:
+  start-runner:
+    name: Start GPU Runner
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-west-2
+
+      - name: Start Instance
+        run: |
+          aws autoscaling set-desired-capacity --auto-scaling-group-name github-runner-asg-g6-12xlarge --desired-capacity 1
+          echo "Waiting for instance to be ready..."
+
+  train-regression:
+    name: Train with Model Parallelism
+    needs: start-runner
+    runs-on: [g6.12xlarge]
+    timeout-minutes: 120
+
+    container:
+      image: nvidia/cuda:12.2.0-devel-ubuntu22.04
+      options: --gpus all
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install system dependencies
+        run: |
+          apt-get update && apt-get install -y python3 python3-pip git ffmpeg libegl1 libegl-mesa0 libegl-dev libgl1 libglx-mesa0 libgles2 mesa-utils curl cmake build-essential
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+
+      - name: Install dependencies
+        run: |
+          uv sync --extra dev --extra libero --extra openai
+
+      - name: Check GPU
+        run: nvidia-smi
+
+      - name: Set up HuggingFace authentication
+        shell: bash
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          source .venv/bin/activate
+          huggingface-cli login --token $HF_TOKEN
+
+      - name: Set up Libero Configs
+        shell: bash
+        run: |
+          source .venv/bin/activate
+          mkdir -p /tmp/libero-assets/libero/libero
+          export LIBERO_CONFIG_PATH="$(pwd)/.github/assets/libero"
+
+      - name: Run Training
+        shell: bash
+        run: |
+          source .venv/bin/activate
+          opentau-train --accelerate-config=configs/examples/accelerate_deepspeed_config.yaml --config_path=configs/dev/ci_config.json --output_dir=outputs/train/ci/ 2>&1 | tee /tmp/train.log
+
+      - name: Check Loss Drop
+        shell: bash
+        run: |
+          source .venv/bin/activate
+          python3 .github/scripts/check_loss_drop.py --log_path=/tmp/train.log --expected_length=25
+          echo "Loss drop confirmed"
+
+      - name: Check Non-Zero Grad Norm
+        shell: bash
+        run: |
+          source .venv/bin/activate
+          python3 .github/scripts/check_nonzero_grad_norm.py --log_path=/tmp/train.log --expected_length=25
+          echo "Non-zero grad norm confirmed"
+
+      - name: Check Accumulate Grad Sync
+        shell: bash
+        run: |
+          source .venv/bin/activate
+          python3 .github/scripts/check_accumulate_grad_sync.py --log_path=/tmp/train.log --expected_length=50
+          echo "Accumulate grad sync confirmed"
+
+      - name: Check State Keys
+        shell: bash
+        run: |
+          source .venv/bin/activate
+          python3 .github/scripts/check_state_keys.py --log_path=/tmp/train.log --source=hf
+          echo "Checks for state keys passed"
+
+      - name: Convert Checkpoint
+        shell: bash
+        run: |
+          source .venv/bin/activate
+          ./src/opentau/scripts/convert_checkpoint.sh outputs/train/ci/checkpoints/000025
+
+      - name: Resume Training
+        shell: bash
+        run: |
+          source .venv/bin/activate
+          opentau-train --accelerate-config=configs/examples/accelerate_deepspeed_config.yaml --config_path=outputs/train/ci/checkpoints/000025/train_config.json --resume=true --steps=50 2>&1 | tee /tmp/resume.log
+
+      # - name: Check Loss Drop (after Resume)
+      #   shell: bash
+      #   run: |
+      #     source .venv/bin/activate
+      #     python3 .github/scripts/check_loss_drop.py --log_path=/tmp/train.log --expected_length=25 --resume_log_path=/tmp/resume.log --resume_expected_length=25
+      #     echo "Loss drop confirmed"
+
+      - name: Check Non-Zero Grad Norm (after Resume)
+        shell: bash
+        run: |
+          source .venv/bin/activate
+          python3 .github/scripts/check_nonzero_grad_norm.py --log_path=/tmp/resume.log --expected_length=25
+          echo "Non-zero grad norm confirmed"
+
+      - name: Check Accumulate Grad Sync (after Resume)
+        shell: bash
+        run: |
+          source .venv/bin/activate
+          python3 .github/scripts/check_accumulate_grad_sync.py --log_path=/tmp/resume.log --expected_length=50
+          echo "Accumulate grad sync confirmed"
+
+      - name: Check State Keys (after Resume)
+        shell: bash
+        run: |
+          source .venv/bin/activate
+          python3 .github/scripts/check_state_keys.py --log_path=/tmp/resume.log --source=local
+          echo "Checks for state keys passed"
+
+      - name: Run Inference
+        shell: bash
+        run: |
+          source .venv/bin/activate
+          python src/opentau/scripts/inference.py --config_path=outputs/train/ci/checkpoints/000025/train_config.json
+
+  stop-runner:
+    name: Stop GPU Runner
+    needs: [start-runner, train-regression]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-west-2
+
+      - name: Stop Instance
+        run: |
+          aws autoscaling set-desired-capacity --auto-scaling-group-name github-runner-asg-g6-12xlarge --desired-capacity 0

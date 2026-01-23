@@ -14,7 +14,7 @@ To run inference, run the following command:
 
 .. code-block:: bash
 
-    python lerobot/scripts/inference.py --config_path=outputs/train/pi05/checkpoints/000040/train_config.json
+    python src/opentau/scripts/inference.py --config_path=outputs/train/pi05/checkpoints/000040/train_config.json
 
 
 Running inference with autoregressive response prediction
