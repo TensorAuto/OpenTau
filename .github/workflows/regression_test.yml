@@ -28,7 +28,7 @@ env:
   PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
   MUJOCO_GL: "egl"
   PYOPENGL_PLATFORM: "egl"
-  NCCL_DEBUG: "INFO"
+  NCCL_DEBUG: "TRACE"
   NCCL_DEBUG_SUBSYS: "ALL"
 
 jobs:
