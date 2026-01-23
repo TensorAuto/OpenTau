@@ -88,6 +88,14 @@ jobs:
           source .venv/bin/activate
           huggingface-cli login --token $HF_TOKEN
 
+      - name: Set up Wandb authentication
+        shell: bash
+        env:
+          WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
+        run: |
+          source .venv/bin/activate
+          wandb login $WANDB_API_KEY
+
       - name: Set up Libero Configs
         shell: bash
         run: |
