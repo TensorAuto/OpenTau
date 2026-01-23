@@ -42,6 +42,7 @@ from opentau.policies.pi05.paligemma_with_expert import (
     PaliGemmaWithExpertModel,
 )
 from opentau.policies.pretrained import PreTrainedPolicy, T
+from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
 
 
@@ -351,9 +352,11 @@ class PI05Policy(PreTrainedPolicy):
         model = cls(config, **kwargs)
 
         # Now manually load and remap the state dict
+        is_main_process = get_proc_accelerator().is_main_process
         try:
             # Try to load the pytorch_model.bin or model.safetensors file
-            print(f"Loading model from: {pretrained_name_or_path}")
+            if is_main_process:
+                print(f"Loading model from: {pretrained_name_or_path}")
             try:
                 from transformers.utils import cached_file
 
@@ -372,10 +375,12 @@ class PI05Policy(PreTrainedPolicy):
                 from safetensors.torch import load_file
 
                 original_state_dict = load_file(resolved_file)
-                print("✓ Loaded state dict from model.safetensors")
+                if is_main_process:
+                    print("✓ Loaded state dict from model.safetensors")
             except Exception as e:
-                print(f"Could not load state dict from remote files: {e}")
-                print("Returning model without loading pretrained weights")
+                if is_main_process:
+                    print(f"Could not load state dict from remote files: {e}")
+                    print("Returning model without loading pretrained weights")
                 return model
 
             # First, fix any key differences # see openpi `model.py, _fix_pytorch_state_dict_keys`
@@ -390,18 +395,18 @@ class PI05Policy(PreTrainedPolicy):
                     new_key = f"model.{key}"
                     remapped_state_dict[new_key] = value
                     remap_count += 1
-                    if remap_count <= 10:  # Only print first 10 to avoid spam
+                    if remap_count <= 10 and is_main_process:  # Only print first 10 to avoid spam
                         print(f"Remapped: {key} -> {new_key}")
                 else:
                     remapped_state_dict[key] = value
 
-            if remap_count > 0:
+            if remap_count > 0 and is_main_process:
                 print(f"Remapped {remap_count} state dict keys")
 
             # Load the remapped state dict into the model
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
 
-            if missing_keys:
+            if missing_keys and is_main_process:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
                 if len(missing_keys) <= 20:
                     for key in missing_keys:
@@ -411,7 +416,7 @@ class PI05Policy(PreTrainedPolicy):
                         print(f"  - {key}")
                     print(f"  ... and {len(missing_keys) - 20} more")
 
-            if unexpected_keys:
+            if unexpected_keys and is_main_process:
                 print(f"Unexpected keys when loading state dict: {len(unexpected_keys)} keys")
                 if len(unexpected_keys) <= 20:
                     for key in unexpected_keys:
@@ -421,11 +426,12 @@ class PI05Policy(PreTrainedPolicy):
                         print(f"  - {key}")
                     print(f"  ... and {len(unexpected_keys) - 20} more")
 
-            if not missing_keys and not unexpected_keys:
+            if not missing_keys and not unexpected_keys and is_main_process:
                 print("All keys loaded successfully!")
 
         except Exception as e:
-            print(f"Warning: Could not remap state dict keys: {e}")
+            if is_main_process:
+                print(f"Warning: Could not remap state dict keys: {e}")
 
         return model
 
