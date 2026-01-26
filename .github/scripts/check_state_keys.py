@@ -41,7 +41,7 @@ class Arg:
 
     def __post_init__(self):
         if self.source not in MISSING_KEYS:
-            raise ValueError(f"--source must present in {MISSING_KEYS.keys()}. Got {self.source}")
+            raise ValueError(f"--source must be one of {MISSING_KEYS.keys()}. Got {self.source}")
 
 
 def parse_missing_keys(log_path: str) -> list[set[str]]:

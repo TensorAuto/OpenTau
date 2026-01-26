@@ -352,7 +352,8 @@ class PI05Policy(PreTrainedPolicy):
         model = cls(config, **kwargs)
 
         # Now manually load and remap the state dict
-        is_main_process = get_proc_accelerator().is_main_process if get_proc_accelerator() else True
+        acc = get_proc_accelerator()
+        is_main_process = acc.is_main_process if acc else True
         try:
             # Try to load the pytorch_model.bin or model.safetensors file
             if is_main_process:
