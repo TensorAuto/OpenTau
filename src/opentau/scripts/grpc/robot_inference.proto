@@ -1,0 +1,71 @@
+// Copyright 2026 Tensor Auto Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package robot_inference;
+
+// Service for robot policy inference
+service RobotPolicyService {
+    // Get action chunk from observations (single request-response)
+    rpc GetActionChunk(ObservationRequest) returns (ActionChunkResponse);
+
+    // Streaming version for continuous inference (robot sends observations, server sends action chunks)
+    rpc StreamActionChunks(stream ObservationRequest) returns (stream ActionChunkResponse);
+
+    // Health check
+    rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+// Image data for a single camera
+message CameraImage {
+    bytes image_data = 1;             // Raw image bytes (JPEG or PNG encoded)
+    string encoding = 2;              // "jpeg", "png", or "raw"
+}
+
+// Robot state vector
+message RobotState {
+    repeated float state = 1;         // State vector (e.g., joint positions, velocities)
+}
+
+// Full observation from the robot
+message ObservationRequest {
+    repeated CameraImage images = 1;  // Camera images
+    RobotState robot_state = 2;       // Robot state
+    string prompt = 3;                // Language instruction/prompt
+    int64 timestamp_ns = 4;           // Timestamp in nanoseconds
+    string request_id = 5;            // Unique request identifier
+}
+
+// Action chunk response from the policy
+message ActionChunkResponse {
+    repeated float action_chunk = 1; // Action chunk vector
+    int64 timestamp_ns = 2;          // Server timestamp
+    string request_id = 3;           // Matching request ID
+    float inference_time_ms = 4;     // Time taken for inference
+}
+
+// Health check request
+message HealthCheckRequest {
+}
+
+// Health check response
+message HealthCheckResponse {
+    bool healthy = 1;
+    string status = 2;
+    string model_name = 3;
+    string device = 4;
+    float gpu_memory_used_gb = 5;
+    float gpu_memory_total_gb = 6;
+}

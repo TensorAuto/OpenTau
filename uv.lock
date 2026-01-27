@@ -895,6 +895,29 @@ wheels = [
 ]
 
 [[package]]
+name = "grpcio-tools"
+version = "1.76.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "grpcio" },
+    { name = "protobuf" },
+    { name = "setuptools" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a0/77/17d60d636ccd86a0db0eccc24d02967bbc3eea86b9db7324b04507ebaa40/grpcio_tools-1.76.0.tar.gz", hash = "sha256:ce80169b5e6adf3e8302f3ebb6cb0c3a9f08089133abca4b76ad67f751f5ad88", size = 5390807, upload-time = "2025-10-21T16:26:55.416Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/57/4b/6fceb806f6d5055793f5db0d7a1e3449ea16482c2aec3ad93b05678c325a/grpcio_tools-1.76.0-cp310-cp310-linux_armv7l.whl", hash = "sha256:9b99086080ca394f1da9894ee20dedf7292dd614e985dcba58209a86a42de602", size = 2545596, upload-time = "2025-10-21T16:24:25.134Z" },
+    { url = "https://files.pythonhosted.org/packages/3b/11/57af2f3f32016e6e2aae063a533aae2c0e6c577bc834bef97277a7fa9733/grpcio_tools-1.76.0-cp310-cp310-macosx_11_0_universal2.whl", hash = "sha256:8d95b5c2394bbbe911cbfc88d15e24c9e174958cb44dad6aa8c46fe367f6cc2a", size = 5843462, upload-time = "2025-10-21T16:24:31.046Z" },
+    { url = "https://files.pythonhosted.org/packages/3f/8b/470bedaf7fb75fb19500b4c160856659746dcf53e3d9241fcc17e3af7155/grpcio_tools-1.76.0-cp310-cp310-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:d54e9ce2ffc5d01341f0c8898c1471d887ae93d77451884797776e0a505bd503", size = 2591938, upload-time = "2025-10-21T16:24:33.219Z" },
+    { url = "https://files.pythonhosted.org/packages/77/3e/530e848e00d6fe2db152984b2c9432bb8497a3699719fd7898d05cb7d95e/grpcio_tools-1.76.0-cp310-cp310-manylinux2014_i686.manylinux_2_17_i686.whl", hash = "sha256:c83f39f64c2531336bd8d5c846a2159c9ea6635508b0f8ed3ad0d433e25b53c9", size = 2905296, upload-time = "2025-10-21T16:24:34.938Z" },
+    { url = "https://files.pythonhosted.org/packages/75/b5/632229d17364eb7db5d3d793131172b2380323c4e6500f528743e477267c/grpcio_tools-1.76.0-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:be480142fae0d986d127d6cb5cbc0357e4124ba22e96bb8b9ece32c48bc2c8ea", size = 2656266, upload-time = "2025-10-21T16:24:37.485Z" },
+    { url = "https://files.pythonhosted.org/packages/ff/71/5756aa9a14d16738b04677b89af8612112d69fb098ffdbc5666020933f23/grpcio_tools-1.76.0-cp310-cp310-musllinux_1_2_aarch64.whl", hash = "sha256:7fefd41fc4ca11fab36f42bdf0f3812252988f8798fca8bec8eae049418deacd", size = 3105798, upload-time = "2025-10-21T16:24:40.408Z" },
+    { url = "https://files.pythonhosted.org/packages/ab/de/9058021da11be399abe6c5d2a9a2abad1b00d367111018637195d107539b/grpcio_tools-1.76.0-cp310-cp310-musllinux_1_2_i686.whl", hash = "sha256:63551f371082173e259e7f6ec24b5f1fe7d66040fadd975c966647bca605a2d3", size = 3654923, upload-time = "2025-10-21T16:24:42.52Z" },
+    { url = "https://files.pythonhosted.org/packages/8e/93/29f04cc18f1023b2a4342374a45b1cd87a0e1458fc44aea74baad5431dcd/grpcio_tools-1.76.0-cp310-cp310-musllinux_1_2_x86_64.whl", hash = "sha256:75a2c34584c99ff47e5bb267866e7dec68d30cd3b2158e1ee495bfd6db5ad4f0", size = 3322558, upload-time = "2025-10-21T16:24:44.356Z" },
+    { url = "https://files.pythonhosted.org/packages/d9/ab/8936708d30b9a2484f6b093dfc57843c1d0380de0eba78a8ad8693535f26/grpcio_tools-1.76.0-cp310-cp310-win32.whl", hash = "sha256:908758789b0a612102c88e8055b7191eb2c4290d5d6fc50fb9cac737f8011ef1", size = 993621, upload-time = "2025-10-21T16:24:46.7Z" },
+    { url = "https://files.pythonhosted.org/packages/3d/d2/c5211feb81a532eca2c4dddd00d4971b91c10837cd083781f6ab3a6fdb5b/grpcio_tools-1.76.0-cp310-cp310-win_amd64.whl", hash = "sha256:ec6e49e7c4b2a222eb26d1e1726a07a572b6e629b2cf37e6bb784c9687904a52", size = 1158401, upload-time = "2025-10-21T16:24:48.416Z" },
+]
+
+[[package]]
 name = "gym"
 version = "0.26.2"
 source = { registry = "https://pypi.org/simple" }
@@ -1993,13 +2016,13 @@ name = "onnxruntime-gpu"
 version = "1.23.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "coloredlogs" },
-    { name = "flatbuffers" },
-    { name = "numpy", version = "1.26.4", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-opentau-libero'" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-opentau-urdf' or extra != 'extra-7-opentau-libero'" },
-    { name = "packaging" },
-    { name = "protobuf" },
-    { name = "sympy" },
+    { name = "coloredlogs", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux') or (sys_platform == 'darwin' and extra == 'extra-7-opentau-urdf') or (sys_platform == 'darwin' and extra != 'extra-7-opentau-libero') or (sys_platform == 'linux' and extra != 'extra-7-opentau-libero') or (sys_platform == 'emscripten' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform == 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
+    { name = "flatbuffers", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux') or (sys_platform == 'darwin' and extra == 'extra-7-opentau-urdf') or (sys_platform == 'darwin' and extra != 'extra-7-opentau-libero') or (sys_platform == 'linux' and extra != 'extra-7-opentau-libero') or (sys_platform == 'emscripten' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform == 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
+    { name = "numpy", version = "1.26.4", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-opentau-libero') or (sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and extra == 'extra-7-opentau-libero') or (sys_platform == 'darwin' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform == 'emscripten' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform == 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'emscripten' and extra != 'extra-7-opentau-libero') or (extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
+    { name = "packaging", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux') or (sys_platform == 'darwin' and extra == 'extra-7-opentau-urdf') or (sys_platform == 'darwin' and extra != 'extra-7-opentau-libero') or (sys_platform == 'linux' and extra != 'extra-7-opentau-libero') or (sys_platform == 'emscripten' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform == 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
+    { name = "protobuf", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux') or (sys_platform == 'darwin' and extra == 'extra-7-opentau-urdf') or (sys_platform == 'darwin' and extra != 'extra-7-opentau-libero') or (sys_platform == 'linux' and extra != 'extra-7-opentau-libero') or (sys_platform == 'emscripten' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform == 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
+    { name = "sympy", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux') or (sys_platform == 'darwin' and extra == 'extra-7-opentau-urdf') or (sys_platform == 'darwin' and extra != 'extra-7-opentau-libero') or (sys_platform == 'linux' and extra != 'extra-7-opentau-libero') or (sys_platform == 'emscripten' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform == 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/cb/ae/39283748c68a96be4f5f8a9561e0e3ca92af1eae6c2b1c07fb1da5f65cd1/onnxruntime_gpu-1.23.2-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:18de50c6c8eea50acc405ea13d299aec593e46478d7a22cd32cdbbdf7c42899d", size = 300525411, upload-time = "2025-10-22T16:56:08.415Z" },
@@ -2205,6 +2228,11 @@ dev = [
     { name = "sphinx-design" },
     { name = "sphinx-rtd-theme" },
 ]
+grpc = [
+    { name = "grpcio" },
+    { name = "grpcio-tools" },
+    { name = "protobuf" },
+]
 libero = [
     { name = "bddl" },
     { name = "cmake", version = "3.31.10", source = { registry = "https://pypi.org/simple" } },
@@ -2248,6 +2276,8 @@ requires-dist = [
     { name = "flask", specifier = ">=3.0.3" },
     { name = "future", marker = "extra == 'libero'", specifier = "==0.18.2" },
     { name = "gdown", specifier = ">=5.1.0" },
+    { name = "grpcio", marker = "extra == 'grpc'", specifier = ">=1.60.0" },
+    { name = "grpcio-tools", marker = "extra == 'grpc'", specifier = ">=1.60.0" },
     { name = "gym", marker = "extra == 'libero'", specifier = ">=0.25,<0.27" },
     { name = "gymnasium", extras = ["other"], specifier = ">=0.29" },
     { name = "h5py", specifier = ">=3.10.0" },
@@ -2274,6 +2304,7 @@ requires-dist = [
     { name = "packaging", specifier = ">=24.2" },
     { name = "pandas", specifier = ">=2.2.2" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.7.0" },
+    { name = "protobuf", marker = "extra == 'grpc'", specifier = ">=4.25.0" },
     { name = "pymunk", specifier = ">=6.6.0" },
     { name = "pynput", specifier = ">=1.7.7" },
     { name = "pyopengl", marker = "sys_platform == 'linux' and extra == 'libero'", specifier = "==3.1.7" },
@@ -2309,7 +2340,7 @@ requires-dist = [
     { name = "wandb", specifier = ">=0.16.3" },
     { name = "zarr", specifier = ">=2.17.0" },
 ]
-provides-extras = ["dev", "openai", "libero", "urdf"]
+provides-extras = ["dev", "openai", "libero", "urdf", "grpc"]
 
 [[package]]
 name = "orderly-set"
@@ -2636,10 +2667,10 @@ name = "pyobjc-framework-applicationservices"
 version = "12.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pyobjc-core", marker = "(sys_platform != 'emscripten' and sys_platform != 'linux') or (sys_platform == 'linux' and extra == 'extra-7-opentau-urdf') or (sys_platform == 'linux' and extra != 'extra-7-opentau-libero') or (sys_platform == 'emscripten' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
-    { name = "pyobjc-framework-cocoa", marker = "(sys_platform != 'emscripten' and sys_platform != 'linux') or (sys_platform == 'linux' and extra == 'extra-7-opentau-urdf') or (sys_platform == 'linux' and extra != 'extra-7-opentau-libero') or (sys_platform == 'emscripten' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
-    { name = "pyobjc-framework-coretext", marker = "(sys_platform != 'emscripten' and sys_platform != 'linux') or (sys_platform == 'linux' and extra == 'extra-7-opentau-urdf') or (sys_platform == 'linux' and extra != 'extra-7-opentau-libero') or (sys_platform == 'emscripten' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
-    { name = "pyobjc-framework-quartz", marker = "(sys_platform != 'emscripten' and sys_platform != 'linux') or (sys_platform == 'linux' and extra == 'extra-7-opentau-urdf') or (sys_platform == 'linux' and extra != 'extra-7-opentau-libero') or (sys_platform == 'emscripten' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
+    { name = "pyobjc-core", marker = "sys_platform == 'darwin' or (sys_platform != 'emscripten' and sys_platform != 'linux' and extra != 'extra-7-opentau-libero') or (extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
+    { name = "pyobjc-framework-cocoa", marker = "sys_platform == 'darwin' or (sys_platform != 'emscripten' and sys_platform != 'linux' and extra != 'extra-7-opentau-libero') or (extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
+    { name = "pyobjc-framework-coretext", marker = "sys_platform == 'darwin' or (sys_platform != 'emscripten' and sys_platform != 'linux' and extra != 'extra-7-opentau-libero') or (extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
+    { name = "pyobjc-framework-quartz", marker = "sys_platform == 'darwin' or (sys_platform != 'emscripten' and sys_platform != 'linux' and extra != 'extra-7-opentau-libero') or (extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/be/6a/d4e613c8e926a5744fc47a9e9fea08384a510dc4f27d844f7ad7a2d793bd/pyobjc_framework_applicationservices-12.1.tar.gz", hash = "sha256:c06abb74f119bc27aeb41bf1aef8102c0ae1288aec1ac8665ea186a067a8945b", size = 103247, upload-time = "2025-11-14T10:08:52.18Z" }
 wheels = [
@@ -2651,7 +2682,7 @@ name = "pyobjc-framework-cocoa"
 version = "12.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pyobjc-core", marker = "(sys_platform != 'emscripten' and sys_platform != 'linux') or (sys_platform == 'linux' and extra == 'extra-7-opentau-urdf') or (sys_platform == 'linux' and extra != 'extra-7-opentau-libero') or (sys_platform == 'emscripten' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
+    { name = "pyobjc-core", marker = "sys_platform == 'darwin' or (sys_platform != 'emscripten' and sys_platform != 'linux' and extra != 'extra-7-opentau-libero') or (extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/02/a3/16ca9a15e77c061a9250afbae2eae26f2e1579eb8ca9462ae2d2c71e1169/pyobjc_framework_cocoa-12.1.tar.gz", hash = "sha256:5556c87db95711b985d5efdaaf01c917ddd41d148b1e52a0c66b1a2e2c5c1640", size = 2772191, upload-time = "2025-11-14T10:13:02.069Z" }
 wheels = [
@@ -2663,9 +2694,9 @@ name = "pyobjc-framework-coretext"
 version = "12.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pyobjc-core", marker = "(sys_platform != 'emscripten' and sys_platform != 'linux') or (sys_platform == 'linux' and extra == 'extra-7-opentau-urdf') or (sys_platform == 'linux' and extra != 'extra-7-opentau-libero') or (sys_platform == 'emscripten' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
-    { name = "pyobjc-framework-cocoa", marker = "(sys_platform != 'emscripten' and sys_platform != 'linux') or (sys_platform == 'linux' and extra == 'extra-7-opentau-urdf') or (sys_platform == 'linux' and extra != 'extra-7-opentau-libero') or (sys_platform == 'emscripten' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
-    { name = "pyobjc-framework-quartz", marker = "(sys_platform != 'emscripten' and sys_platform != 'linux') or (sys_platform == 'linux' and extra == 'extra-7-opentau-urdf') or (sys_platform == 'linux' and extra != 'extra-7-opentau-libero') or (sys_platform == 'emscripten' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
+    { name = "pyobjc-core", marker = "sys_platform == 'darwin' or (sys_platform != 'emscripten' and sys_platform != 'linux' and extra != 'extra-7-opentau-libero') or (extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
+    { name = "pyobjc-framework-cocoa", marker = "sys_platform == 'darwin' or (sys_platform != 'emscripten' and sys_platform != 'linux' and extra != 'extra-7-opentau-libero') or (extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
+    { name = "pyobjc-framework-quartz", marker = "sys_platform == 'darwin' or (sys_platform != 'emscripten' and sys_platform != 'linux' and extra != 'extra-7-opentau-libero') or (extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/29/da/682c9c92a39f713bd3c56e7375fa8f1b10ad558ecb075258ab6f1cdd4a6d/pyobjc_framework_coretext-12.1.tar.gz", hash = "sha256:e0adb717738fae395dc645c9e8a10bb5f6a4277e73cba8fa2a57f3b518e71da5", size = 90124, upload-time = "2025-11-14T10:14:38.596Z" }
 wheels = [
@@ -2677,8 +2708,8 @@ name = "pyobjc-framework-quartz"
 version = "12.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pyobjc-core", marker = "(sys_platform != 'emscripten' and sys_platform != 'linux') or (sys_platform == 'linux' and extra == 'extra-7-opentau-urdf') or (sys_platform == 'linux' and extra != 'extra-7-opentau-libero') or (sys_platform == 'emscripten' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
-    { name = "pyobjc-framework-cocoa", marker = "(sys_platform != 'emscripten' and sys_platform != 'linux') or (sys_platform == 'linux' and extra == 'extra-7-opentau-urdf') or (sys_platform == 'linux' and extra != 'extra-7-opentau-libero') or (sys_platform == 'emscripten' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
+    { name = "pyobjc-core", marker = "sys_platform == 'darwin' or (sys_platform != 'emscripten' and sys_platform != 'linux' and extra != 'extra-7-opentau-libero') or (extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
+    { name = "pyobjc-framework-cocoa", marker = "sys_platform == 'darwin' or (sys_platform != 'emscripten' and sys_platform != 'linux' and extra != 'extra-7-opentau-libero') or (extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/94/18/cc59f3d4355c9456fc945eae7fe8797003c4da99212dd531ad1b0de8a0c6/pyobjc_framework_quartz-12.1.tar.gz", hash = "sha256:27f782f3513ac88ec9b6c82d9767eef95a5cf4175ce88a1e5a65875fee799608", size = 3159099, upload-time = "2025-11-14T10:21:24.31Z" }
 wheels = [

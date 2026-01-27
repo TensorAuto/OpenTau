@@ -132,6 +132,11 @@ libero = [
 urdf = [
     "rerun-sdk>=0.28.2",
 ]
+grpc = [
+    "grpcio>=1.60.0",
+    "grpcio-tools>=1.60.0",
+    "protobuf>=4.25.0",
+]
 
 [tool.uv.sources]
 libero = { git = "https://github.com/shuheng-liu/LIBERO" , branch = "master" }  # the official libero repo is misconfigured for pip install with git
@@ -154,6 +159,12 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "I", "N", "B", "C4", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# Auto-generated gRPC files use PascalCase method names (gRPC convention)
+"src/opentau/scripts/grpc/robot_inference_pb2*.py" = ["N802"]
+# Server must implement gRPC interface with PascalCase method names
+"src/opentau/scripts/grpc/server.py" = ["N802"]
 
 [tool.bandit]
 exclude_dirs = [
