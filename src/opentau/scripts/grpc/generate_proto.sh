@@ -19,9 +19,7 @@
 # Usage:
 #   cd /path/to/OpenTau
 #   ./src/opentau/scripts/grpc/generate_proto.sh
-#
-# Requirements:
-#   pip install grpcio grpcio-tools
+
 
 set -e
 
