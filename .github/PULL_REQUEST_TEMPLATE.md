@@ -25,7 +25,10 @@ Examples:
 pytest -sx tests/test_stuff.py::test_something
 ```
 ```bash
-python lerobot/scripts/train.py --some.option=true
+python src/opentau/scripts/train.py --some.option=true
+```
+```bash
+opentau-train --config_path=configs/examples/pi05_training_config.json
 ```
 
 ## Checklist
