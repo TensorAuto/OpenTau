@@ -67,10 +67,17 @@ jobs:
         run: |
           apt-get update && apt-get install -y python3 python3-pip git ffmpeg libegl1 libegl-mesa0 libegl-dev libgl1 libglx-mesa0 libgles2 mesa-utils curl cmake build-essential
 
+      - name: Restore uv cache
+        uses: actions/cache/restore@v3
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
           version: "latest"
+          enable-cache: false
 
       - name: Install dependencies
         run: |
@@ -103,8 +110,8 @@ jobs:
           mkdir -p /tmp/libero-assets/libero/libero
           export LIBERO_CONFIG_PATH="$(pwd)/.github/assets/libero"
 
-      - name: Cache HF datasets
-        uses: actions/cache@v3
+      - name: Restore HF datasets cache
+        uses: actions/cache/restore@v3
         with:
           path: ~/.cache/huggingface
           key: ${{ runner.os }}-hf-datasets-${{ hashFiles('**/config.json') }}
