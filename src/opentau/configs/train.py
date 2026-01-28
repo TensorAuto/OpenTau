@@ -32,6 +32,7 @@ from huggingface_hub.errors import HfHubHTTPError
 
 from opentau.configs import parser
 from opentau.configs.default import DatasetMixtureConfig, EvalConfig, WandBConfig
+from opentau.configs.deployment import ServerConfig
 from opentau.configs.policies import PreTrainedConfig
 from opentau.envs.configs import EnvConfig
 from opentau.optim import OptimizerConfig
@@ -116,6 +117,7 @@ class TrainPipelineConfig(HubMixin):
             is disabled. Defaults to 0.
         last_checkpoint_only: If True, only evaluate the last checkpoint.
             Defaults to True.
+        server: Configuration for the gRPC inference server. Defaults to ServerConfig().
     """
 
     dataset_mixture: DatasetMixtureConfig
@@ -165,6 +167,8 @@ class TrainPipelineConfig(HubMixin):
     eval_freq: int = 0  # evaluate every eval_freq steps
     val_freq: int = 0  # validate every val_freq steps, if 0, then a validation split is not created
     last_checkpoint_only: bool = True
+    # gRPC inference server configuration
+    server: ServerConfig = field(default_factory=ServerConfig)
 
     def __post_init__(self):
         """Initialize post-creation attributes and validate batch size configuration."""

@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-
 # Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,31 +15,56 @@
 """gRPC client for robot policy inference.
 
 This client runs on the robot and sends observations to a remote gRPC server
-for ML inference. Designed to integrate with ROS 2 Humble.
+for ML inference. It subscribes to /joint_states for robot state, creates
+fake images for inference, and publishes motor commands to
+/motor_command_controller/motor_commands.
 
 Usage:
-    # Standalone test
-    python src/opentau/scripts/grpc/client.py --server_address 192.168.1.100:50051
-
-    # With ROS 2 (see ROS2PolicyClient class)
+    python src/opentau/scripts/grpc/client.py \
+        --server_address 192.168.1.100:50051 \
+        --prompt "pick up the red block"
 """
 
 import argparse
 import io
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
+import rclpy
+
+# Import ROS 2 message types
+from interfaces.msg import MotorCommands, RawMotorCommand
 from PIL import Image
+from rclpy.node import Node
+from sensor_msgs.msg import JointState
 
 import grpc
-
-# Import generated protobuf classes
 from opentau.scripts.grpc import robot_inference_pb2, robot_inference_pb2_grpc
 
 logger = logging.getLogger(__name__)
+
+# Topics
+MOTOR_COMMANDS_TOPIC = "/motor_command_controller/motor_commands"
+JOINT_STATES_TOPIC = "/joint_states"
+
+# Joint configuration (example robot).
+JOINT_NAMES: list[str] = [
+    "base_yaw_joint",
+    "shoulder_pitch_joint",
+    "shoulder_roll_joint",
+    "elbow_flex_joint",
+    "wrist_roll_joint",
+    "wrist_yaw_joint",
+    "hip_pitch_joint",
+    "hip_roll_joint",
+    "knee_joint",
+    "ankle_pitch_joint",
+    "ankle_roll_joint",
+    "gripper_finger_joint",
+]
 
 
 @dataclass
@@ -200,7 +223,18 @@ class PolicyClient:
             try:
                 response = self._stub.GetActionChunk(request, timeout=self.config.timeout_seconds)
 
-                action_chunk = np.array(response.action_chunk, dtype=np.float32)
+                # Convert repeated ActionVector messages into a 2D numpy array:
+                # shape = (chunk_length, action_dim)
+                if not response.action_chunk:
+                    action_chunk = np.zeros((0,), dtype=np.float32)
+                else:
+                    action_vectors = [
+                        np.asarray(action_vector.values, dtype=np.float32)
+                        for action_vector in response.action_chunk
+                    ]
+                    # Stack into (T, D) array where T is chunk length.
+                    action_chunk = np.stack(action_vectors, axis=0)
+
                 return action_chunk, response.inference_time_ms
 
             except grpc.RpcError as e:
@@ -241,20 +275,6 @@ class PolicyClient:
 # ROS 2 Integration
 # =============================================================================
 
-# ROS 2 imports are optional - only imported when ROS2PolicyClient is used
-ROS2_AVAILABLE = False
-try:
-    import rclpy  # noqa: F401
-    from cv_bridge import CvBridge
-    from rclpy.node import Node
-    from sensor_msgs.msg import Image as RosImage
-    from sensor_msgs.msg import JointState
-    from std_msgs.msg import Float64MultiArray, String
-
-    ROS2_AVAILABLE = True
-except ImportError:
-    pass
-
 
 @dataclass
 class ROS2Config:
@@ -262,190 +282,264 @@ class ROS2Config:
 
     # gRPC settings
     server_address: str = "localhost:50051"
-    timeout_seconds: float = 2.0
+    timeout_seconds: float = 30.0  # Allow longer timeout for ML inference warmup
 
     # Topic names
-    camera_topics: list[str] = field(default_factory=lambda: ["/camera0/image_raw", "/camera1/image_raw"])
-    state_topic: str = "/joint_states"
-    prompt_topic: str = "/policy/prompt"
-    action_topic: str = "/policy/action"
+    state_topic: str = JOINT_STATES_TOPIC
+    motor_commands_topic: str = MOTOR_COMMANDS_TOPIC
 
     # Control settings
     control_frequency_hz: float = 10.0
-    default_prompt: str = ""
+    prompt: str = ""
+
+    # Fake image settings
+    num_cameras: int = 2
+    image_height: int = 224
+    image_width: int = 224
 
 
-if ROS2_AVAILABLE:
+class ROS2PolicyClient(Node):
+    """ROS 2 node that interfaces with the gRPC policy server.
 
-    class ROS2PolicyClient(Node):
-        """ROS 2 node that interfaces with the gRPC policy server.
+    This node subscribes to joint states, creates fake images for inference,
+    sends them to the gRPC server, and publishes the resulting actions as
+    motor commands. The prompt is provided via command-line argument.
 
-        This node subscribes to camera images and robot state, sends them to
-        the gRPC server, and publishes the resulting action chunks.
+    Example usage:
+        ```python
+        import rclpy
+        from motor_command_controller.grpc.client import ROS2PolicyClient, ROS2Config
 
-        Example usage:
-            ```python
-            import rclpy
-            from opentau.grpc.client import ROS2PolicyClient, ROS2Config
+        rclpy.init()
+        config = ROS2Config(
+            server_address="192.168.1.100:50051",
+            control_frequency_hz=30.0,
+            prompt="pick up the red block",
+        )
+        node = ROS2PolicyClient(config)
+        rclpy.spin(node)
+        ```
+    """
 
-            rclpy.init()
-            config = ROS2Config(
-                server_address="192.168.1.100:50051",
-                camera_topics=["/camera/color/image_raw"],
-                control_frequency_hz=30.0,
-            )
-            node = ROS2PolicyClient(config)
-            rclpy.spin(node)
-            ```
+    def __init__(self, config: ROS2Config):
+        """Initialize the ROS 2 policy client node.
+
+        Args:
+            config: ROS 2 configuration.
         """
+        super().__init__("policy_client")
+        self.config = config
+        # Fixed joint ordering for this example robot.
+        self.joint_names: list[str] = JOINT_NAMES
 
-        def __init__(self, config: ROS2Config):
-            """Initialize the ROS 2 policy client node.
+        # Initialize gRPC client
+        client_config = ClientConfig(
+            server_address=config.server_address,
+            timeout_seconds=config.timeout_seconds,
+        )
+        self.policy_client = PolicyClient(client_config)
 
-            Args:
-                config: ROS 2 configuration.
-            """
-            super().__init__("policy_client")
-            self.config = config
-            self.cv_bridge = CvBridge()
+        # State storage
+        self._latest_positions: Optional[list[float]] = None
+        self._latest_velocities: Optional[list[float]] = None
+        self._prompt: str = config.prompt
 
-            # Initialize gRPC client
-            client_config = ClientConfig(
-                server_address=config.server_address,
-                timeout_seconds=config.timeout_seconds,
+        # Create subscriber for joint states
+        self._state_sub = self.create_subscription(
+            JointState,
+            config.state_topic,
+            self._state_callback,
+            10,
+        )
+        self.get_logger().info(f"Subscribed to {config.state_topic}")
+        self.get_logger().info(f"Using prompt: {self._prompt}")
+
+        # Create publisher for motor commands
+        self._motor_commands_pub = self.create_publisher(
+            MotorCommands,
+            config.motor_commands_topic,
+            10,
+        )
+        self.get_logger().info(f"Publishing to {config.motor_commands_topic}")
+
+        # Create control timer
+        self._control_timer = self.create_timer(
+            # 1.0 / config.control_frequency_hz,
+            1,
+            self._control_callback,
+        )
+
+        # Connect to server
+        self.get_logger().info(f"Connecting to gRPC server at {config.server_address}")
+        if not self.policy_client.connect():
+            self.get_logger().error("Failed to connect to gRPC server")
+        else:
+            self.get_logger().info("Connected to gRPC server")
+
+    def _create_fake_images(self) -> list[np.ndarray]:
+        """Create fake images for inference.
+
+        Returns:
+            List of fake RGB images.
+        """
+        images = []
+        for _ in range(self.config.num_cameras):
+            # Create a random RGB image
+            image = np.random.randint(
+                0,
+                255,
+                (self.config.image_height, self.config.image_width, 3),
+                dtype=np.uint8,
             )
-            self.policy_client = PolicyClient(client_config)
+            images.append(image)
+        return images
 
-            # State storage - use list to maintain camera order
-            self._latest_images: list[Optional[np.ndarray]] = [None] * len(config.camera_topics)
-            self._latest_state: Optional[np.ndarray] = None
-            self._current_prompt: str = config.default_prompt
+    def _state_callback(self, msg: JointState):
+        """Handle incoming joint state messages.
 
-            # Create subscribers
-            self._image_subs = []
-            for i, topic in enumerate(config.camera_topics):
-                sub = self.create_subscription(
-                    RosImage,
-                    topic,
-                    lambda msg, idx=i: self._image_callback(msg, idx),
-                    10,
-                )
-                self._image_subs.append(sub)
-                self.get_logger().info(f"Subscribed to {topic} as camera{i}")
+        Args:
+            msg: JointState message.
+        """
+        # For this example script, we simply take the first N joints from the
+        # incoming message, where N is the number of fake joints.
+        num_joints = len(self.joint_names)
+        if len(msg.position) < num_joints or len(msg.velocity) < num_joints:
+            self.get_logger().warning(
+                f"Received joint_states with fewer than {num_joints} joints; waiting for full state.",
+                throttle_duration_sec=5.0,
+            )
+            return
 
-            self._state_sub = self.create_subscription(
-                JointState,
-                config.state_topic,
-                self._state_callback,
-                10,
+        self._latest_positions = list(msg.position[:num_joints])
+        self._latest_velocities = list(msg.velocity[:num_joints])
+
+    def _control_callback(self):
+        """Main control loop callback."""
+        if not self.policy_client.is_connected():
+            self.get_logger().warning(
+                "Not connected to gRPC server",
+                throttle_duration_sec=5.0,
+            )
+            return
+
+        # Check if we have joint state data
+        if self._latest_positions is None or self._latest_velocities is None:
+            self.get_logger().warning(
+                "Waiting for joint_states...",
+                throttle_duration_sec=5.0,
+            )
+            return
+
+        # Check if we have a prompt
+        if not self._prompt:
+            self.get_logger().warning(
+                "No prompt provided. Use --prompt argument.",
+                throttle_duration_sec=5.0,
+            )
+            return
+
+        try:
+            # Create state vector (positions + velocities)
+            state = np.array(
+                self._latest_positions + self._latest_velocities,
+                dtype=np.float32,
             )
 
-            self._prompt_sub = self.create_subscription(
-                String,
-                config.prompt_topic,
-                self._prompt_callback,
-                10,
-            )
+            # Create fake images
+            images = self._create_fake_images()
 
-            # Create publisher
-            self._action_pub = self.create_publisher(
-                Float64MultiArray,
-                config.action_topic,
-                10,
-            )
-
-            # Create control timer
-            self._control_timer = self.create_timer(
-                1.0 / config.control_frequency_hz,
-                self._control_callback,
-            )
-
-            # Connect to server
-            self.get_logger().info(f"Connecting to gRPC server at {config.server_address}")
-            if not self.policy_client.connect():
-                self.get_logger().error("Failed to connect to gRPC server")
+            self.get_logger().info("Sending request to server")
+            self.get_logger().info(f"Images list length: {len(images)}")
+            if images:
+                self.get_logger().info(f"First image shape: {images[0].shape}")
             else:
-                self.get_logger().info("Connected to gRPC server")
+                self.get_logger().info("Images list is empty")
+            self.get_logger().info(f"State shape: {state.shape}")
 
-        def _image_callback(self, msg: RosImage, camera_idx: int):
-            """Handle incoming image messages.
+            # Get action chunk from server
+            action_chunk, inference_time_ms = self.policy_client.get_action_chunk(
+                images=images,
+                state=state,
+                prompt=self._prompt,
+            )
+            self.get_logger().info("Received action chunk from server")
+            self.get_logger().info(f"Action chunk shape: {action_chunk.shape}")
+            self.get_logger().info(f"Inference time: {inference_time_ms:.1f} ms")
 
-            Args:
-                msg: ROS Image message.
-                camera_idx: Index of the camera.
-            """
-            try:
-                # Convert ROS image to numpy array
-                cv_image = self.cv_bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
-                self._latest_images[camera_idx] = cv_image
-            except Exception as e:
-                self.get_logger().error(f"Failed to convert image: {e}")
+            # Publish motor commands
+            self._publish_motor_commands(action_chunk)
 
-        def _state_callback(self, msg: JointState):
-            """Handle incoming joint state messages.
+            self.get_logger().debug(
+                f"Action chunk: {action_chunk[:3]}..., inference time: {inference_time_ms:.1f}ms"
+            )
 
-            Args:
-                msg: JointState message.
-            """
-            # Combine positions and velocities into state vector
-            positions = list(msg.position) if msg.position else []
-            velocities = list(msg.velocity) if msg.velocity else []
-            self._latest_state = np.array(positions + velocities, dtype=np.float32)
+        except Exception as e:
+            self.get_logger().error(f"Failed to get action chunk: {e}")
 
-        def _prompt_callback(self, msg: String):
-            """Handle incoming prompt messages.
+    def _publish_motor_commands(self, action_chunk: np.ndarray):
+        """Publish motor commands from action chunk.
 
-            Args:
-                msg: String message containing the prompt.
-            """
-            self._current_prompt = msg.data
-            self.get_logger().info(f"Updated prompt: {self._current_prompt}")
+        Args:
+            action_chunk: Action chunk from the policy server.
+                Expected to be either:
+                - A 2D array of shape (chunk_length, num_joints) where each row
+                  is a full action vector for all joints, or
+                - A 1D array of shape (num_joints,) for a single action vector.
+        """
+        msg = MotorCommands()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.joint_names = self.joint_names
 
-        def _control_callback(self):
-            """Main control loop callback."""
-            if not self.policy_client.is_connected():
-                self.get_logger().warn_throttle(self.get_clock(), 5000, "Not connected to gRPC server")
+        # Select the action vector to apply.
+        # If we have a chunk of actions, use the most recent one.
+        if action_chunk.ndim == 2:
+            if action_chunk.shape[0] == 0:
+                self.get_logger().error("Received empty action chunk (no timesteps)")
                 return
+            action = action_chunk[-1]
+        elif action_chunk.ndim == 1:
+            action = action_chunk
+        else:
+            self.get_logger().error(
+                f"Unexpected action_chunk shape: {action_chunk.shape} (ndim={action_chunk.ndim})"
+            )
+            return
 
-            # Check if we have all required data
-            if any(img is None for img in self._latest_images):
-                return
+        # Create motor commands for each joint
+        # Assumes action contains target positions for each joint
+        num_joints = len(self.joint_names)
+        if len(action) < num_joints:
+            self.get_logger().error(f"Action vector too small: {len(action)} < {num_joints}")
+            return
 
-            if self._latest_state is None:
-                return
+        msg.commands = [RawMotorCommand(q=float(action[i])) for i, joint_name in enumerate(self.joint_names)]
 
-            if not self._current_prompt:
-                return
+        self._motor_commands_pub.publish(msg)
 
-            try:
-                # Get action chunk from server
-                action_chunk, inference_time_ms = self.policy_client.get_action_chunk(
-                    images=self._latest_images.copy(),
-                    state=self._latest_state,
-                    prompt=self._current_prompt,
-                )
+    def publish_damping_command(self):
+        """Publish a damping command to safely stop the robot."""
+        if self._latest_positions is None:
+            return
 
-                # Publish action chunk
-                action_msg = Float64MultiArray()
-                action_msg.data = action_chunk.tolist()
-                self._action_pub.publish(action_msg)
+        msg = MotorCommands()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.joint_names = self.joint_names
+        msg.commands = [
+            RawMotorCommand(q=self._latest_positions[i]) for i, joint_name in enumerate(self.joint_names)
+        ]
+        self._motor_commands_pub.publish(msg)
 
-                self.get_logger().debug(
-                    f"Action chunk: {action_chunk[:3]}..., inference time: {inference_time_ms:.1f}ms"
-                )
-
-            except Exception as e:
-                self.get_logger().error(f"Failed to get action chunk: {e}")
-
-        def destroy_node(self):
-            """Clean up resources when node is destroyed."""
-            self.policy_client.disconnect()
-            super().destroy_node()
+    def destroy_node(self):
+        """Clean up resources when node is destroyed."""
+        # Send damping command before shutting down
+        self.publish_damping_command()
+        self.policy_client.disconnect()
+        super().destroy_node()
 
 
 def main():
-    """Main entry point for standalone client testing."""
-    parser = argparse.ArgumentParser(description="gRPC Robot Policy Client")
+    """Main entry point for the ROS 2 gRPC policy client."""
+    parser = argparse.ArgumentParser(description="gRPC Robot Policy Client (ROS 2)")
     parser.add_argument(
         "--server_address",
         type=str,
@@ -453,53 +547,54 @@ def main():
         help="Server address (host:port)",
     )
     parser.add_argument(
-        "--test",
-        action="store_true",
-        help="Run a test inference with dummy data",
+        "--control_frequency",
+        type=float,
+        default=30.0,
+        help="Control loop frequency in Hz",
+    )
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default="",
+        help="Language prompt for the policy (required)",
+    )
+    parser.add_argument(
+        "--num_cameras",
+        type=int,
+        default=2,
+        help="Number of fake cameras to simulate",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=30.0,
+        help="gRPC timeout in seconds (increase for slow inference)",
     )
 
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
 
-    config = ClientConfig(server_address=args.server_address)
-    client = PolicyClient(config)
+    # Initialize ROS 2
+    rclpy.init()
 
-    if not client.connect():
-        logger.error("Failed to connect to server")
-        return
+    config = ROS2Config(
+        server_address=args.server_address,
+        timeout_seconds=args.timeout,
+        control_frequency_hz=args.control_frequency,
+        prompt=args.prompt,
+        num_cameras=args.num_cameras,
+    )
 
-    # Health check
-    health = client.health_check()
-    logger.info(f"Server health: {health}")
+    node = ROS2PolicyClient(config)
 
-    if args.test:
-        # Test with dummy data
-        logger.info("Running test inference...")
-
-        # Create dummy images (224x224 RGB) as a list
-        images = [
-            np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8),
-            np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8),
-        ]
-
-        # Create dummy state
-        state = np.random.randn(32).astype(np.float32)
-
-        # Get action chunk
-        try:
-            action_chunk, inference_time = client.get_action_chunk(
-                images=images,
-                state=state,
-                prompt="Pick up the red block",
-            )
-            logger.info(f"Action chunk shape: {action_chunk.shape}")
-            logger.info(f"Action chunk (first 5): {action_chunk}")
-            logger.info(f"Inference time: {inference_time:.2f}ms")
-        except Exception as e:
-            logger.error(f"Test failed: {e}")
-
-    client.disconnect()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":

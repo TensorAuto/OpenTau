@@ -15,7 +15,8 @@
 exclude: >-
     (?x)^(
         tests/artifacts/.*\.safetensors$|
-        src/opentau/scripts/zero_to_fp32\.py$
+        src/opentau/scripts/zero_to_fp32\.py$|
+        src/opentau/scripts/grpc/robot_inference_pb2.*\.py$
     )|\.cache/
 
 default_language_version:

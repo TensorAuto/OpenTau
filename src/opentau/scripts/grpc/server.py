@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-
 # Copyright 2026 Tensor Auto Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,7 +18,8 @@ This server loads an ML policy model and serves inference requests from
 robots running ROS 2. Designed to run on a server with a ML GPU.
 
 Usage:
-    python src/opentau/grpc/server.py --config_path=/path/to/config.json
+    python src/opentau/scripts/grpc/server.py --config_path=/path/to/config.json \\
+        --server.port=50051 --server.max_workers=4
 """
 
 import io
@@ -189,10 +188,16 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
 
             # Run inference
             with torch.inference_mode():
-                action = self.policy.select_action(batch)
-                action = action.to("cpu", torch.float32).numpy().flatten()
+                action_chunk = self.policy.sample_actions(batch)
+                # action_chunk shape: (n_action_steps, batch_size=1, action_dim)
+                # Remove batch dimension and convert to numpy
+                action_chunk = action_chunk.squeeze(1).to("cpu", torch.float32).numpy()
 
-            response.action_chunk.extend(action.tolist())
+            # Populate 2D action chunk structure
+            for action_vector in action_chunk:
+                action_vec_msg = robot_inference_pb2.ActionVector()
+                action_vec_msg.values.extend(action_vector.tolist())
+                response.action_chunk.append(action_vec_msg)
 
         except ValueError as e:
             # Invalid request (e.g., missing required fields)
@@ -254,31 +259,31 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
         return response
 
 
-def serve(cfg: TrainPipelineConfig, port: int = 50051, max_workers: int = 4):
+def serve(cfg: TrainPipelineConfig):
     """Start the gRPC server.
 
     Args:
-        cfg: Training pipeline configuration.
-        port: Port to serve on.
-        max_workers: Maximum number of gRPC worker threads.
+        cfg: Training pipeline configuration including server settings.
     """
+    server_cfg = cfg.server
     server = grpc.server(
-        futures.ThreadPoolExecutor(max_workers=max_workers),
+        futures.ThreadPoolExecutor(max_workers=server_cfg.max_workers),
         options=[
-            ("grpc.max_send_message_length", 100 * 1024 * 1024),  # 100MB
-            ("grpc.max_receive_message_length", 100 * 1024 * 1024),  # 100MB
+            ("grpc.max_send_message_length", server_cfg.max_send_message_length),
+            ("grpc.max_receive_message_length", server_cfg.max_receive_message_length),
         ],
     )
 
     servicer = RobotPolicyServicer(cfg)
     robot_inference_pb2_grpc.add_RobotPolicyServiceServicer_to_server(servicer, server)
 
-    server.add_insecure_port(f"[::]:{port}")
+    server.add_insecure_port(f"[::]:{server_cfg.port}")
     server.start()
 
-    logger.info(f"Server started on port {port}")
+    logger.info(f"Server started on port {server_cfg.port}")
     logger.info(f"Policy: {cfg.policy.type}")
     logger.info(f"Device: {servicer.device}")
+    logger.info(f"Max workers: {server_cfg.max_workers}")
     logger.info("Waiting for requests...")
 
     try:
@@ -289,20 +294,18 @@ def serve(cfg: TrainPipelineConfig, port: int = 50051, max_workers: int = 4):
 
 
 @parser.wrap()
-def server_main(cfg: TrainPipelineConfig, port: int = 50051, max_workers: int = 4):
+def server_main(cfg: TrainPipelineConfig):
     """Main entry point for the gRPC server.
 
     Args:
         cfg: Training pipeline configuration parsed from CLI/config file.
-        port: Port to serve on. Defaults to 50051.
-        max_workers: Maximum number of gRPC worker threads. Defaults to 4.
     """
     logging.info(pformat(asdict(cfg)))
 
     if cfg.seed is not None:
         set_seed(cfg.seed)
 
-    serve(cfg, port=port, max_workers=max_workers)
+    serve(cfg)
 
 
 if __name__ == "__main__":

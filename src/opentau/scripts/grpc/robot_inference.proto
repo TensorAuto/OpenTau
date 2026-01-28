@@ -48,9 +48,14 @@ message ObservationRequest {
     string request_id = 5;            // Unique request identifier
 }
 
+// Single action vector at a timestep
+message ActionVector {
+    repeated float values = 1;        // Action vector values (max_action_dim)
+}
+
 // Action chunk response from the policy
 message ActionChunkResponse {
-    repeated float action_chunk = 1; // Action chunk vector
+    repeated ActionVector action_chunk = 1; // Action chunk (action_chunk_length x max_action_dim)
     int64 timestamp_ns = 2;          // Server timestamp
     string request_id = 3;           // Matching request ID
     float inference_time_ms = 4;     // Time taken for inference
