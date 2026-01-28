@@ -10,6 +10,7 @@ This section provides step-by-step guides for common tasks in OpenTau, including
    tutorials/training
    tutorials/inference
    tutorials/evaluation
+   tutorials/deployment
    tutorials/datasets
    tutorials/visualization
    RL

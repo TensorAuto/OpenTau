@@ -87,6 +87,9 @@ dependencies = [
     "accelerate>=1.4.0",
     "deepspeed>=0.17.1",
     "gymnasium[other]>=0.29",
+    "grpcio>=1.60.0",
+    "grpcio-tools>=1.60.0",
+    "protobuf>=4.25.0",
 ]
 
 [project.scripts]
@@ -131,11 +134,6 @@ libero = [
 ]
 urdf = [
     "rerun-sdk>=0.28.2",
-]
-grpc = [
-    "grpcio>=1.60.0",
-    "grpcio-tools>=1.60.0",
-    "protobuf>=4.25.0",
 ]
 
 [tool.uv.sources]
