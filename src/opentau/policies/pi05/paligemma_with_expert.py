@@ -255,11 +255,19 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             self.paligemma.vision_tower.eval()
             for params in self.paligemma.vision_tower.parameters():
                 params.requires_grad = False
+            for param in self.da_head.parameters():
+                param.requires_grad = False
+            for param in self.discrete_action_embedding.parameters():
+                param.requires_grad = False
 
         if self.config.train_expert_only:
             self.paligemma.eval()
             for params in self.paligemma.parameters():
                 params.requires_grad = False
+            for param in self.da_head.parameters():
+                param.requires_grad = False
+            for param in self.discrete_action_embedding.parameters():
+                param.requires_grad = False
 
     def train(self, mode: bool = True) -> None:
         """Sets the module in training mode.
