@@ -16,6 +16,8 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Any
 
+import numpy as np
+
 from opentau.configs.ros2lerobot import RosToLeRobotConfig
 
 
@@ -149,8 +151,31 @@ class ActionExtractor(FeatureExtractor):
             return []
 
 
+class ImageExtractor(FeatureExtractor):
+    def __call__(self, msg: Any, ros_topic: str, attribute: str) -> Any:
+        try:
+            import io
+
+            from PIL import Image
+
+            image = Image.open(io.BytesIO(msg.data))
+            # Convert to numpy array
+            image_np = np.array(image)
+            # Handle RGBA if necessary, or just ensure RGB
+            if image_np.shape[-1] == 4:
+                image_np = image_np[..., :3]
+            # Transpose to channel-first (C, H, W)
+            # image_np = np.transpose(image_np, (2, 0, 1))
+            return image_np
+
+        except (KeyError, AttributeError, TypeError, Exception) as e:
+            logging.warning(f"Error extracting {attribute} from {ros_topic}: {e}")
+            return None
+
+
 # Mapping of enum values to extractors
 EXTRACTORS = {
     "state": StateExtractor,
     "action": ActionExtractor,
+    "image": ImageExtractor,
 }

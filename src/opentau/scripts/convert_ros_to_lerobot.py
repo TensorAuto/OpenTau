@@ -134,7 +134,6 @@ def extract_topics_from_mcap(cfg: RosToLeRobotConfig, mcap_path: Path) -> dict[t
 
         for connection, timestamp, rawdata in reader.messages(connections=connections):
             msg = reader.deserialize(rawdata, connection.msgtype)
-
             # Try to get the header timestamp, otherwise fall back to bag timestamp
             ts = msg.header.stamp if hasattr(msg, "header") and hasattr(msg.header, "stamp") else timestamp
 
@@ -146,7 +145,9 @@ def extract_topics_from_mcap(cfg: RosToLeRobotConfig, mcap_path: Path) -> dict[t
                         extracted_data = extractors[required_topics_enum[attribute]](
                             msg, connection.topic, attribute
                         )
-                        if extracted_data:
+                        if extracted_data is not None:
+                            if isinstance(extracted_data, (list, np.ndarray)) and len(extracted_data) == 0:
+                                continue
                             topic_data[(connection.topic, attribute)].append((ts, extracted_data))
                     else:
                         logging.exception(f"Extractor for {required_topics_enum[attribute]} not implemented")
@@ -210,6 +211,8 @@ def batch_convert_ros_bags(cfg: RosToLeRobotConfig) -> None:
             for i in range(num_frames):
                 frame = {
                     k: np.array(sync_data[(v.ros_topic, v.topic_attribute)][i], dtype=v.dtype)
+                    if k != "observation.image"
+                    else sync_data[(v.ros_topic, v.topic_attribute)][i]
                     for k, v in cfg.dataset_features.items()
                 }
                 frame.update(

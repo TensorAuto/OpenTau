@@ -4,6 +4,10 @@
   </a>
 </p>
 
+[![Tests](https://github.com/TensorAuto/OpenTau/actions/workflows/gpu_test.yml/badge.svg?branch=main)](https://github.com/TensorAuto/OpenTau/actions/workflows/gpu_test.yml?query=branch%3Amain)
+[![Tests](https://github.com/TensorAuto/OpenTau/actions/workflows/regression_test.yml/badge.svg?branch=main)](https://github.com/TensorAuto/OpenTau/actions/workflows/regression_test.yml?query=branch%3Amain)
+\[![Tests](https://github.com/TensorAuto/OpenTau/actions/workflows/gpu_test.yml/badge.svg?branch=main)](https://github.com/TensorAuto/OpenTau/actions/workflows/gpu_test.yml?query=branch%3Amain)
+[![Tests](https://github.com/TensorAuto/OpenTau/actions/workflows/pre-commit.yml/badge.svg?branch=main)](https://github.com/TensorAuto/OpenTau/actions/workflows/pre-commit.yml?query=branch%3Amain)
 # OpenTau - Train VLA models with state-of-the-art techniques by Tensor
 
 At Tensor, we are pushing the frontier of large foundation models for physical AI. In robot learning, a vision-language-action (VLA) model is a multimodal foundation model that integrates vision, language, and action. Today, VLA represents the leading approach for embodied AI, spanning autonomous driving, robot manipulation, and navigation.

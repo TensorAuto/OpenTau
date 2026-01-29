@@ -1,21 +1,34 @@
 {
-    "input_path": "/akshay/rosbags",
-    "output_path": "/akshay/rosbag_actions",
+    "input_path": "/home/ashah/Documents/OpenTau/data/salute",
+    "output_path": "/home/ashah/Documents/OpenTau/salute_data",
     "fps": 30,
-    "joint_order":[],
+    "joint_order":[
+        "base_yaw_joint",
+        "shoulder_pitch_joint",
+        "shoulder_roll_joint",
+        "elbow_flex_joint",
+        "wrist_roll_joint",
+        "wrist_yaw_joint",
+        "hip_pitch_joint",
+        "hip_roll_joint",
+        "knee_joint",
+        "ankle_pitch_joint",
+        "ankle_roll_joint",
+        "gripper_finger_joint"
+        ],
     "robot_type": "unknown",
-    "use_videos": true,
+    "use_videos": false,
     "dataset_features": {
-            "observation.state": {
+        "observation.state": {
                 "ros_topic": "/joint_states",
                 "topic_attribute":"position",
                 "enum_values": "state",
                 "dtype":"float32",
                 "shape": [
-                    50
+                    25
                 ]
             },
-            "observation.action": {
+        "observation.action": {
                 "ros_topic": "/motor_command_controller/motor_commands",
                 "topic_attribute":"commands",
                 "enum_values": "action",
@@ -23,6 +36,15 @@
                 "shape": [
                     25
                 ]
-            }
+            },
+        "observation.image": {
+            "ros_topic": "/camera1/image_compressed",
+            "topic_attribute":"data",
+            "enum_values": "image",
+            "dtype":"image",
+            "shape": [
+                3, 480, 640
+            ]
         }
+    }
 }
