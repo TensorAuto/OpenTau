@@ -21,14 +21,15 @@ A value function model that estimates state values for reinforcement learning.
 Uses SIGLIP for vision encoding and Gemma 3 270M for language processing.
 """
 
+import logging
+import math
+
+import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
 from einops import rearrange
 from torch import Tensor, nn
-from transformers import AutoTokenizer  
-import numpy as np
-import logging
-import math
+from transformers import AutoTokenizer
 
 from opentau.policies.normalize import Normalize
 from opentau.policies.pretrained import PreTrainedPolicy
@@ -251,7 +252,9 @@ class ValueFunction(PreTrainedPolicy):
         lang_tokens, lang_masks = self.prepare_language(batch)
         response_tokens, response_masks = self.prepare_response(batch)
 
-        ce_logits, response_logits = self.model.forward(images, img_masks, lang_tokens, lang_masks, response_tokens, response_masks)
+        ce_logits, response_logits = self.model.forward(
+            images, img_masks, lang_tokens, lang_masks, response_tokens, response_masks
+        )
         values = self.calculate_value(ce_logits)
         # Compute Cross-Entropy loss
         ce_logits = ce_logits.to(dtype=torch.float32)  # upcast to float32 for loss calculation
@@ -341,7 +344,6 @@ class ValueFunction(PreTrainedPolicy):
 
         return images, img_masks
 
-    
     def prepare_discrete_state(self, batch: dict[str, Tensor]) -> list[str]:
         """Discretizes the state into bins and converts it to a string representation.
 
@@ -385,10 +387,7 @@ class ValueFunction(PreTrainedPolicy):
 
         state = self.prepare_discrete_state(batch)
         # using <eos> to separate each modality
-        prompt = [
-            f"Task: {task}<eos>State: {state}<eos>"
-            for task, state in zip(tasks, state, strict=False)
-        ]
+        prompt = [f"Task: {task}<eos>State: {state}<eos>" for task, state in zip(tasks, state, strict=False)]
 
         tokenized_prompt = self.language_tokenizer.__call__(
             prompt,
@@ -486,7 +485,13 @@ class ValueModel(nn.Module):
         self.c_neg = config.reward_config.C_neg
 
     def embed_sequence(
-        self, images, img_masks, lang_tokens, lang_masks, response_tokens: torch.Tensor | None = None, response_masks: torch.Tensor | None = None
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        response_tokens: torch.Tensor | None = None,
+        response_masks: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embeds sequence of images and language tokens.
 
@@ -580,7 +585,9 @@ class ValueModel(nn.Module):
         Returns:
             Tensor of shape [batch_size, 1] containing value estimates
         """
-        embs, pad_masks, att_masks = self.embed_sequence(images, img_masks, lang_tokens, lang_masks, response_tokens, response_masks)
+        embs, pad_masks, att_masks = self.embed_sequence(
+            images, img_masks, lang_tokens, lang_masks, response_tokens, response_masks
+        )
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1

@@ -217,9 +217,9 @@ class SiglipGemmaValueModel(PreTrainedModel):
         # Extract the last token's hidden state for value prediction
         # Use the last token (which should be the last language token)
 
-        # 
-        classification_hidden = hidden_states[:, -self.config.response_max_length - 1,:]
-        response_hidden = hidden_states[:, -self.config.response_max_length : -1,:]
+        #
+        classification_hidden = hidden_states[:, -self.config.response_max_length - 1, :]
+        response_hidden = hidden_states[:, -self.config.response_max_length : -1, :]
 
         # Project to logits for discretized values
         ce_logits = self.value_head(classification_hidden)
