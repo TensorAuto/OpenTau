@@ -22,7 +22,8 @@
             "VALUE": "MEAN_STD"
         },
         "max_state_dim": 32,
-        "tokenizer_max_length": 52,
+        "prompt_max_length": 256,
+        "response_max_length": 52,
         "reward_config": {
             "number_of_bins": 201,
             "C_neg": -1000.0,

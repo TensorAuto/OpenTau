@@ -50,9 +50,11 @@ class SiglipGemmaValueConfig(PretrainedConfig):
         siglip_config: dict | None = None,
         gemma_config: dict | None = None,
         num_value_bins: int = 201,
+        response_max_length: int = 52,
         **kwargs,
     ):
         self.num_value_bins = num_value_bins
+        self.response_max_length = response_max_length
 
         if siglip_config is None:
             # Default SIGLIP config similar to PaliGemma vision config
@@ -152,6 +154,7 @@ class SiglipGemmaValueModel(PreTrainedModel):
 
         # Value head: projects final hidden state to discretized value bins
         self.value_head = nn.Linear(640, config.num_value_bins)
+        self.response_head = nn.Linear(640, self.gemma.config.vocab_size, bias=False)
 
     def embed_image(self, image: torch.Tensor) -> torch.Tensor:
         """Embeds images using the SIGLIP vision encoder.
@@ -213,9 +216,14 @@ class SiglipGemmaValueModel(PreTrainedModel):
 
         # Extract the last token's hidden state for value prediction
         # Use the last token (which should be the last language token)
-        final_hidden = hidden_states[:, -1]
+
+        # 
+        classification_hidden = hidden_states[:, -self.config.response_max_length - 1,:]
+        response_hidden = hidden_states[:, -self.config.response_max_length : -1,:]
 
         # Project to logits for discretized values
-        logits = self.value_head(final_hidden)
+        ce_logits = self.value_head(classification_hidden)
 
-        return logits
+        response_logits = self.response_head(response_hidden)
+
+        return ce_logits, response_logits

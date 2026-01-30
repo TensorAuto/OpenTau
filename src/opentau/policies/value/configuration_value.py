@@ -77,7 +77,8 @@ class ValueConfig(PreTrainedConfig):
     empty_cameras: int = 0
 
     # Tokenizer
-    tokenizer_max_length: int = 48
+    prompt_max_length: int = 48
+    response_max_length: int = 52
 
     # Reward config
     reward_config: RewardConfig = field(default_factory=RewardConfig)
