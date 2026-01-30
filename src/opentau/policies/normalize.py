@@ -32,6 +32,22 @@ from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
 EPS = 1e-8  # Small epsilon value for numerical stability in normalization
 
 
+def _is_tracing() -> bool:
+    """Check if we're currently in a tracing context (e.g., ONNX export, torch.compile).
+
+    During tracing, data-dependent operations like assert with .any() cannot be evaluated,
+    so we skip these assertions to allow ONNX export to succeed.
+
+    Returns:
+        bool: True if in a tracing/compilation context, False otherwise.
+    """
+    # Check for torch.compile/dynamo tracing
+    if torch.compiler.is_compiling():
+        return True
+    # Check for ONNX export context
+    return torch.onnx.is_in_onnx_export()
+
+
 def warn_missing_keys(features: dict[str, PolicyFeature], batch: dict[str, Tensor], mode: str) -> None:
     """Warns if expected features are missing from the batch.
 
@@ -221,14 +237,18 @@ class Normalize(nn.Module):
             if norm_mode is NormalizationMode.MEAN_STD:
                 mean = buffer["mean"]
                 std = buffer["std"]
-                assert not torch.isinf(mean).any(), _no_stats_error_str("mean")
-                assert not torch.isinf(std).any(), _no_stats_error_str("std")
+                # Skip data-dependent assertions during tracing (ONNX export)
+                if not _is_tracing():
+                    assert not torch.isinf(mean).any(), _no_stats_error_str("mean")
+                    assert not torch.isinf(std).any(), _no_stats_error_str("std")
                 batch[key] = (batch[key] - mean) / (std + EPS)
             elif norm_mode is NormalizationMode.MIN_MAX:
                 min = buffer["min"]
                 max = buffer["max"]
-                assert not torch.isinf(min).any(), _no_stats_error_str("min")
-                assert not torch.isinf(max).any(), _no_stats_error_str("max")
+                # Skip data-dependent assertions during tracing (ONNX export)
+                if not _is_tracing():
+                    assert not torch.isinf(min).any(), _no_stats_error_str("min")
+                    assert not torch.isinf(max).any(), _no_stats_error_str("max")
                 batch[key] = (batch[key] - min) / (max - min + EPS)
                 # normalize to [-1, 1]
                 batch[key] = batch[key] * 2 - 1
@@ -300,14 +320,18 @@ class Unnormalize(nn.Module):
             if norm_mode is NormalizationMode.MEAN_STD:
                 mean = buffer["mean"]
                 std = buffer["std"]
-                assert not torch.isinf(mean).any(), _no_stats_error_str("mean")
-                assert not torch.isinf(std).any(), _no_stats_error_str("std")
+                # Skip data-dependent assertions during tracing (ONNX export)
+                if not _is_tracing():
+                    assert not torch.isinf(mean).any(), _no_stats_error_str("mean")
+                    assert not torch.isinf(std).any(), _no_stats_error_str("std")
                 batch[key] = batch[key] * (std + EPS) + mean
             elif norm_mode is NormalizationMode.MIN_MAX:
                 min = buffer["min"]
                 max = buffer["max"]
-                assert not torch.isinf(min).any(), _no_stats_error_str("min")
-                assert not torch.isinf(max).any(), _no_stats_error_str("max")
+                # Skip data-dependent assertions during tracing (ONNX export)
+                if not _is_tracing():
+                    assert not torch.isinf(min).any(), _no_stats_error_str("min")
+                    assert not torch.isinf(max).any(), _no_stats_error_str("max")
                 batch[key] = (batch[key] + 1) / 2
                 batch[key] = batch[key] * (max - min + EPS) + min
             else:
