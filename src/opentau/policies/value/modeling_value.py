@@ -232,9 +232,8 @@ class ValueFunction(PreTrainedPolicy):
 
         images, img_masks = self.prepare_images(batch)
         lang_tokens, lang_masks = self.prepare_language(batch)
-        state = batch.get("state")
 
-        logits = self.model.forward(images, img_masks, lang_tokens, lang_masks, state)
+        logits = self.model.get_value(images, img_masks, lang_tokens, lang_masks)
         return self.calculate_value(logits)
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict[str, Tensor] | None]:
@@ -259,7 +258,13 @@ class ValueFunction(PreTrainedPolicy):
         # Compute Cross-Entropy loss
         ce_logits = ce_logits.to(dtype=torch.float32)  # upcast to float32 for loss calculation
         batch["return_bin_idx"] = batch["return_bin_idx"].to(dtype=torch.long)
-        ce_loss = F.cross_entropy(ce_logits, batch["return_bin_idx"])
+        ce_loss = F.cross_entropy(ce_logits, batch["return_bin_idx"], reduction="none")
+
+        # Mask CE loss if all response_pad are true
+        response_is_pad = ~response_masks
+        ce_loss = ce_loss * (response_is_pad[:, 1:].all(dim=1)).float()
+
+        ce_loss = ce_loss.mean()
 
         l1_loss = F.l1_loss(values, batch["return_continuous"])
 
@@ -418,7 +423,7 @@ class ValueFunction(PreTrainedPolicy):
         responses = batch["response"]
 
         # if '' is found in response then response is not for loss calculation (used for robotic dataset with no subtask), so add pad token to the response.
-        response_prompt = [f"{response}<eos>" for response in responses]
+        response_prompt = [f"{response}" for response in responses]
 
         tokenized_response = self.language_tokenizer.__call__(
             response_prompt,
@@ -599,3 +604,35 @@ class ValueModel(nn.Module):
         )
 
         return ce_logits, response_logits
+
+    def get_value(
+        self,
+        images: list[torch.Tensor],
+        img_masks: list[torch.Tensor],
+        lang_tokens: torch.Tensor,
+        lang_masks: torch.Tensor,
+    ) -> torch.Tensor:
+        """Predict value estimates given observations.
+
+        Args:
+            images: List of image tensors
+            img_masks: List of image masks
+            lang_tokens: Language token IDs
+            lang_masks: Language attention masks
+            state: Optional state tensor
+
+        Returns:
+            Tensor of shape [batch_size, 1] containing value estimates
+        """
+        embs, pad_masks, att_masks = self.embed_sequence(images, img_masks, lang_tokens, lang_masks)
+
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+
+        value_logits = self.siglip_gemma_value.get_value(
+            inputs_embeds=embs,
+            attention_mask=att_2d_masks,
+            position_ids=position_ids,
+        )
+
+        return value_logits

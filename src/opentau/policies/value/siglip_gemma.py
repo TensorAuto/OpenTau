@@ -227,3 +227,45 @@ class SiglipGemmaValueModel(PreTrainedModel):
         response_logits = self.response_head(response_hidden)
 
         return ce_logits, response_logits
+
+    def get_value(
+        self,
+        inputs_embeds: torch.FloatTensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.LongTensor,
+    ) -> torch.Tensor:
+        """Forward pass that processes vision and language inputs and outputs a value.
+
+        Args:
+            inputs_embeds: Tensor of shape [batch_size, sequence_length, embedding_dim]
+                containing the combined embeddings of images and text.
+            attention_mask: Attention mask for the sequence.
+            position_ids: Position IDs for RoPE.
+
+        Returns:
+            torch.Tensor: Logits for discretized values of shape [batch_size, num_value_bins].
+        """
+
+        attention_mask = rearrange(attention_mask, "b n1 n2 -> b 1 n1 n2")  # support multihead attention
+        # HACK: use full attention for sliding attention as well since our context length is almost the same size as the sliding window
+        mask_mapping = {
+            "full_attention": attention_mask,
+            "sliding_attention": attention_mask,
+        }
+        outputs = self.gemma(
+            inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+            attention_mask=mask_mapping,
+        )
+        hidden_states = outputs.last_hidden_state
+
+        # Extract the last token's hidden state for value prediction
+        # Use the last token (which should be the last language token)
+
+        #
+        value_hidden = hidden_states[:, -1, :]
+
+        # Project to logits for discretized values
+        value_logits = self.value_head(value_hidden)
+
+        return value_logits
