@@ -2,11 +2,14 @@
     "dataset_mixture": {
         "datasets": [
             {
-                "repo_id": "physical-intelligence/libero",
-                "episodes": [0,1,2,3,4,5,6,7,8,9]
+                "repo_id": "physical-intelligence/libero"
+            },
+            {
+                "grounding": "clevr"
             }
         ],
         "weights": [
+            1.0,
             1.0
         ],
         "action_freq": 30.0,
@@ -42,10 +45,11 @@
     "gradient_accumulation_steps": 1,
     "dataloader_batch_size": 2,
     "prefetch_factor": 2,
-    "steps": 100,
-    "log_freq": 1,
+    "steps": 10000,
+    "log_freq": 100,
+    "val_freq": 500,
     "save_checkpoint": true,
-    "save_freq": 100,
+    "save_freq": 1000,
     "use_policy_training_preset": false,
     "trace_nans": true,
     "optimizer": {

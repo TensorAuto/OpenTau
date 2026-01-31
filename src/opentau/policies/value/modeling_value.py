@@ -260,9 +260,9 @@ class ValueFunction(PreTrainedPolicy):
         batch["return_bin_idx"] = batch["return_bin_idx"].to(dtype=torch.long)
         ce_loss = F.cross_entropy(ce_logits, batch["return_bin_idx"], reduction="none")
 
+        action_is_pad = batch.get("action_is_pad")
         # Mask CE loss if all response_pad are true
-        response_is_pad = ~response_masks
-        ce_loss = ce_loss * (response_is_pad[:, 1:].all(dim=1)).float()
+        ce_loss = ce_loss * (~action_is_pad.all(dim=1)).float()
 
         ce_loss = ce_loss.mean()
 
@@ -283,6 +283,7 @@ class ValueFunction(PreTrainedPolicy):
         response_is_pad = ~response_masks  # convert into format where value for pad is True
         # helps to control loss for response tokens in case of robotic data and VQA data
         response_ce_loss = response_ce_loss * ~response_is_pad[:, response_slice]
+        response_ce_loss = response_ce_loss * rearrange((action_is_pad.all(dim=1)).float(), "b -> b 1")
 
         # compute mean
         response_ce_loss = response_ce_loss.mean()

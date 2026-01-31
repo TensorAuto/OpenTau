@@ -58,7 +58,7 @@ def inference_main(cfg: TrainPipelineConfig):
 
     with torch.inference_mode():
         for _ in range(1000):
-            action = policy.select_action(observation)
+            action = policy.predict_value(observation)
             action = action.to("cpu", torch.float32).numpy()
             print(f"Output shape: {action.shape}")
 
