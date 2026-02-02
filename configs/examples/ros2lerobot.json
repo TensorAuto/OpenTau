@@ -24,7 +24,7 @@
                 "enum_values": "state",
                 "dtype":"float32",
                 "shape": [
-                    25
+                    50
                 ]
             },
         "observation.action": {
