@@ -169,24 +169,28 @@ def batch_convert_ros_bags(cfg: RosToLeRobotConfig) -> None:
     input_path = Path(cfg.input_path)
     output_path = Path(cfg.output_path)
 
+    # Use "video" dtype for image features so frames are encoded to MP4
+    features = {}
+    for k, v in cfg.dataset_features.items():
+        dtype = v.dtype
+        features[k] = {
+            "dtype": dtype,
+            "shape": tuple(v.shape),
+            "names": cfg.joint_order if "state" in k or "action" in k else None,
+        }
+
     dataset = LeRobotDataset.create(
         repo_id=str(output_path.name),
         fps=cfg.fps,
         root=output_path,
         robot_type="unknown",  # You might want to make this configurable
-        features={
-            k: {
-                "dtype": v.dtype,
-                "shape": tuple(v.shape),
-                "names": cfg.joint_order if "state" in k or "action" in k else None,
-            }
-            for k, v in cfg.dataset_features.items()
-        },
-        use_videos=cfg.use_videos,  # Set to True if you are extracting images
+        features=features,
+        use_videos=True,
     )
 
     # Iterate over all ros bags in the input path and store them as a dataset
     for bag_path in [p for p in input_path.iterdir() if p.is_dir()]:
+        bag_path = bag_path / "recording"
         logging.info(f"Processing bag: {bag_path}")
         try:
             topic_data = extract_topics_from_mcap(cfg, bag_path)
@@ -209,17 +213,15 @@ def batch_convert_ros_bags(cfg: RosToLeRobotConfig) -> None:
                 num_frames = min(num_frames, len(data))
 
             for i in range(num_frames):
-                frame = {
-                    k: np.array(sync_data[(v.ros_topic, v.topic_attribute)][i], dtype=v.dtype)
-                    if k != "observation.image"
-                    else sync_data[(v.ros_topic, v.topic_attribute)][i]
-                    for k, v in cfg.dataset_features.items()
-                }
-                frame.update(
-                    {
-                        "task": task,  # Required field
-                    }
-                )
+                frame = {}
+                for k, v in cfg.dataset_features.items():
+                    val = sync_data[(v.ros_topic, v.topic_attribute)][i]
+                    if v.dtype in ("image", "video"):
+                        # Keep as numpy array (H, W, C) for add_frame / write_image
+                        frame[k] = np.array(val) if not isinstance(val, np.ndarray) else val
+                    else:
+                        frame[k] = np.array(val, dtype=v.dtype)
+                frame["task"] = task
 
                 dataset.add_frame(frame)
 
@@ -228,10 +230,12 @@ def batch_convert_ros_bags(cfg: RosToLeRobotConfig) -> None:
 
         except Exception as e:
             logging.exception(f"Failed to convert {bag_path}: {e}")
+            # save_episode() mutates episode_buffer (pops "size"/"task") before encoding;
+            # on failure the buffer is left corrupted. Reset so the next episode can add frames.
+            dataset.episode_buffer = dataset.create_episode_buffer()
 
     logging.info(f"Batch conversion complete. Saved to {output_path}")
-    if cfg.use_videos:
-        dataset.encode_videos()  # If videos were used
+    dataset.encode_videos()  # If videos were used
 
 
 if __name__ == "__main__":

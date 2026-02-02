@@ -17,7 +17,6 @@
         "gripper_finger_joint"
         ],
     "robot_type": "unknown",
-    "use_videos": false,
     "dataset_features": {
         "observation.state": {
                 "ros_topic": "/joint_states",
@@ -41,7 +40,7 @@
             "ros_topic": "/camera1/image_compressed",
             "topic_attribute":"data",
             "enum_values": "image",
-            "dtype":"image",
+            "dtype":"video",
             "shape": [
                 3, 480, 640
             ]

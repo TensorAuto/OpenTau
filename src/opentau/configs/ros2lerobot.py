@@ -33,7 +33,6 @@ class RosToLeRobotConfig:
         joint_order (list[str]): List of joint names defining the order of elements
             in joint state vectors. Defaults to an empty list.
         robot_type (str): Type of robot being used. Defaults to "unknown".
-        use_videos (bool): Whether to use videos in the output dataset. Defaults to False.
         dataset_features (dict[str, ROSFeature]): Dictionary mapping dataset feature
             names (e.g., "observation.state") to their corresponding ROS topic
             configuration. Defaults to an empty dictionary.
@@ -44,5 +43,4 @@ class RosToLeRobotConfig:
     fps: int = 10
     joint_order: list[str] = field(default_factory=list)
     robot_type: str = "unknown"
-    use_videos: bool = False
     dataset_features: dict[str, ROSFeature] = field(default_factory=dict)

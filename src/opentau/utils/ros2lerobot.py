@@ -164,8 +164,6 @@ class ImageExtractor(FeatureExtractor):
             # Handle RGBA if necessary, or just ensure RGB
             if image_np.shape[-1] == 4:
                 image_np = image_np[..., :3]
-            # Transpose to channel-first (C, H, W)
-            # image_np = np.transpose(image_np, (2, 0, 1))
             return image_np
 
         except (KeyError, AttributeError, TypeError, Exception) as e:
