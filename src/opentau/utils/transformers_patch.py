@@ -167,7 +167,10 @@ class PatchedGemmaRMSNorm(nn.Module):
 
     def extra_repr(self) -> str:
         """Returns the extra representation of the module."""
-        repr_str = f"{tuple(self.weight.shape)}, eps={self.eps}"
+        if hasattr(self, "weight") and self.weight is not None:
+            repr_str = f"{tuple(self.weight.shape)}, eps={self.eps}"
+        else:
+            repr_str = f"dim={self.dim}, eps={self.eps}"
         if self.dense is not None:
             repr_str += f", adaptive=True, cond_dim={self.cond_dim}"
         return repr_str
