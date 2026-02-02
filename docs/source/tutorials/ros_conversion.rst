@@ -37,7 +37,7 @@ The following structure for ros bags should be followed:
             - <bag_file>.mcap
             - metadata.yaml
 
-The metadata.yaml file should contain the task name for the dataset else "task not defined" will be used as task name/
+The metadata.yaml file should contain the task name for the dataset else error will be raised.
 
 The script will process all the bag files in the input path and create a LeRobot dataset in the output path. Each ros bag will be converted to a single episode in the dataset.
 
