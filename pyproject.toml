@@ -26,7 +26,6 @@ authors = [
     { name = "Shuheng Liu", email = "wish1104@icloud.com" },
     { name = "William Yue", email = "williamyue37@gmail.com" },
     { name = "Akshay Shah", email = "akshayhitendrashah@gmail.com" },
-    { name = "Xingrui Gu", email = "xingrui_gu@berkeley.edu" }
 ]
 readme = "README.md"
 license = { text = "Apache-2.0" }
