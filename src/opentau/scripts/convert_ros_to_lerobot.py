@@ -196,7 +196,7 @@ def batch_convert_ros_bags(cfg: RosToLeRobotConfig) -> None:
             topic_data = extract_topics_from_mcap(cfg, bag_path)
             with open(bag_path / "metadata.yaml") as f:
                 metadata = yaml.safe_load(f)
-            task = metadata.get("task", "task not defined")
+            task = metadata.get("task")
             start_time = (
                 metadata["rosbag2_bagfile_information"]["starting_time"]["nanoseconds_since_epoch"] / 1e9
             )

@@ -41,8 +41,10 @@ The metadata.yaml file should contain the task name for the dataset else "task n
 
 The script will process all the bag files in the input path and create a LeRobot dataset in the output path. Each ros bag will be converted to a single episode in the dataset.
 
-
 Each features should have enum values to parse the field and apply appropriate preprocessing. The function to parse the field is located in ``src/opentau/utils/ros2lerobot.py``.
+
+To add a custom preprocessing, create a new class that inherits from ``FeatureExtractor`` and implement the ``__call__`` method. Generate your own enum type for the feature and map it to the class in the ``EXTRACTORS`` dictionary.
+Mention the enum type in the config file for the feature.
 
 Example of enum values for a feature:
 

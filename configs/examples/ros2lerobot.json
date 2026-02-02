@@ -27,7 +27,7 @@
                     50
                 ]
             },
-        "observation.action": {
+        "action": {
                 "ros_topic": "/motor_command_controller/motor_commands",
                 "topic_attribute":"commands",
                 "enum_values": "action",
