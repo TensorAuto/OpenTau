@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""ROS 2 to LeRobot dataset extractors and utilities.
+
+This module provides feature extractors for converting ROS 2 topic messages
+(e.g., joint_states, images) into LeRobot dataset features. Extractors are
+keyed by enum value in EXTRACTORS and used by the convert_ros_to_lerobot script.
+"""
+
 import logging
 from abc import ABC, abstractmethod
 from typing import Any
@@ -22,11 +29,11 @@ from opentau.configs.ros2lerobot import RosToLeRobotConfig
 
 
 def get_nested_item(obj: Any, flattened_key: str, sep: str = ".") -> Any:
-    """Get a nested item from a dictionary-like object using a flattened key.
+    """Get a nested item from an object using a flattened attribute path.
 
     Args:
-        obj: Dictionary-like object to access.
-        flattened_key: Flattened key path (e.g., "a/b/c").
+        obj: Object with nested attributes to access (e.g., ROS message).
+        flattened_key: Dot-separated path to the attribute (e.g., "a.b.c").
         sep: Separator used in the flattened key. Defaults to ".".
 
     Returns:
@@ -49,16 +56,47 @@ def get_nested_item(obj: Any, flattened_key: str, sep: str = ".") -> Any:
 
 
 class FeatureExtractor(ABC):
+    """Abstract base class for extracting a dataset feature from a ROS 2 message."""
+
     def __init__(self, cfg: RosToLeRobotConfig):
+        """Initialize the extractor with conversion config.
+
+        Args:
+            cfg: ROS to LeRobot conversion config (joint order, features, etc.).
+        """
         self.cfg = cfg
 
     @abstractmethod
     def __call__(self, msg: Any, ros_topic: str, attribute: str) -> Any:
+        """Extract the feature value from a single message.
+
+        Args:
+            msg: Deserialized ROS 2 message.
+            ros_topic: Topic name the message was received on.
+            attribute: Message attribute path to extract (e.g., "position", "data").
+
+        Returns:
+            Extracted value (e.g., list of floats, numpy array), or None/empty
+            on failure.
+        """
         pass
 
 
 class StateExtractor(FeatureExtractor):
+    """Extracts observation.state from ROS 2 joint_states (position + velocity)."""
+
     def __call__(self, msg: Any, ros_topic: str, attribute: str) -> Any:
+        """Extract state as position and velocity ordered by config joint_order.
+
+        Args:
+            msg: Joint state message with name, position, velocity (e.g., sensor_msgs/JointState).
+            ros_topic: Topic name the message was received on.
+            attribute: Attribute path for values (e.g., "position").
+
+        Returns:
+            List of floats: positions for each joint in joint_order, then velocities,
+            or empty list if extraction fails.
+        """
         # Handle Joint Ordering
         if not self.cfg.joint_order:
             if hasattr(msg, "name"):
@@ -106,7 +144,19 @@ class StateExtractor(FeatureExtractor):
 
 
 class ActionExtractor(FeatureExtractor):
+    """Extracts action (e.g., target joint positions) from ROS 2 control messages."""
+
     def __call__(self, msg: Any, ros_topic: str, attribute: str) -> Any:
+        """Extract action values ordered by config joint_order.
+
+        Args:
+            msg: Message with joint_names and attribute (e.g., trajectory point with .q).
+            ros_topic: Topic name the message was received on.
+            attribute: Attribute path to joint values (e.g., "points.positions" or similar).
+
+        Returns:
+            List of floats for each joint in joint_order, or empty list if extraction fails.
+        """
         # Handle Joint Ordering
         if not self.cfg.joint_order:
             if hasattr(msg, "joint_names"):
@@ -152,7 +202,20 @@ class ActionExtractor(FeatureExtractor):
 
 
 class ImageExtractor(FeatureExtractor):
+    """Extracts observation.image from ROS 2 compressed or raw image messages."""
+
     def __call__(self, msg: Any, ros_topic: str, attribute: str) -> Any:
+        """Decode image bytes to a numpy array (H, W, C) in RGB.
+
+        Args:
+            msg: Image message with .data (bytes), e.g., sensor_msgs/CompressedImage.
+            ros_topic: Topic name the message was received on.
+            attribute: Attribute path (e.g., "data"); typically "data" for image payload.
+
+        Returns:
+            numpy array of shape (H, W, 3) uint8 RGB, or None if decoding fails.
+            RGBA is converted to RGB by dropping the alpha channel.
+        """
         try:
             import io
 
@@ -171,7 +234,8 @@ class ImageExtractor(FeatureExtractor):
             return None
 
 
-# Mapping of enum values to extractors
+# Mapping of dataset feature enum values to extractor classes.
+# Used by convert_ros_to_lerobot to dispatch per-topic extraction.
 EXTRACTORS = {
     "state": StateExtractor,
     "action": ActionExtractor,
