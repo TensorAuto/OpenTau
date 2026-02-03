@@ -563,6 +563,8 @@ class PI05Policy(PreTrainedPolicy):
         Returns:
             The sampled actions tensor of shape (batch_size, action_dim).
         """
+        assert 0 <= delay <= self.config.max_delay, f"Delay must be between 0 and {self.config.max_delay}"
+
         batch = self.normalize_inputs(batch)
 
         images, img_masks = self.prepare_images(batch)
