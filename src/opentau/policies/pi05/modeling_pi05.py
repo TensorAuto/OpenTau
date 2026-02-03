@@ -546,13 +546,20 @@ class PI05Policy(PreTrainedPolicy):
         return self._action_queue.popleft()
 
     @torch.no_grad()
-    def sample_actions(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+    def sample_actions(
+        self,
+        batch: dict[str, Tensor],
+        noise: Tensor | None = None,
+        action_prefix: Tensor | None = None,
+        delay: int = 0,
+    ) -> Tensor:
         """Sample actions from the policy given environment observations.
 
         Args:
             batch: Batch of data containing environment observations.
             noise: Optional noise tensor.
-
+            action_prefix: Optional action prefix tensor.
+            delay: number of delay actions.
         Returns:
             The sampled actions tensor of shape (batch_size, action_dim).
         """
@@ -566,6 +573,8 @@ class PI05Policy(PreTrainedPolicy):
             img_masks,
             lang_tokens,
             lang_masks,
+            action_prefix=action_prefix,
+            delay=delay,
             noise=noise,
         )
 
@@ -1376,15 +1385,17 @@ class PI05FlowMatching(nn.Module):
 
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
-        prefix_mask = rearrange(torch.arange(self.config.chunk_size), "c -> 1 c") < delay
+        prefix_mask = rearrange(torch.arange(self.config.chunk_size, device=device), "c -> 1 c") < delay
         while time >= -dt / 2:
-            x_t = torch.where(rearrange(prefix_mask, "b c -> b c 1"), action_prefix, x_t)
-            time_masked = torch.where(prefix_mask, 0, time)
+            # if delay is greater than 0, then freeze the action prefix at the beginning of action chunk
+            if delay > 0:
+                x_t = torch.where(rearrange(prefix_mask, "b c -> b c 1"), action_prefix, x_t)
+            masked_time = torch.where(prefix_mask, 0, time)
             v_t = self.denoise_step(
                 prefix_pad_masks,
                 past_key_values,
                 x_t,
-                time_masked,
+                masked_time,
             )
 
             # Euler step
