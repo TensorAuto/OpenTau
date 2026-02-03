@@ -36,8 +36,8 @@
         "attention_implementation": "eager",
         "freeze_vision_encoder": true,
         "train_expert_only": true,
-        "prompt_max_length": 10,
-        "discrete_action_max_length": 10,
+        "prompt_max_length": 256,
+        "discrete_action_max_length": 60,
         "optimizer_lr": 2.5e-05,
         "optimizer_betas": [
             0.9,
