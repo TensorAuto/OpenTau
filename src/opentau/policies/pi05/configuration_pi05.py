@@ -116,6 +116,10 @@ class PI05Config(PreTrainedConfig):
     # Decoding
     num_steps: int = 10
 
+    # Real Time Inference
+    # maximum number of frozen actions
+    max_delay: int = 0
+
     # Initialization strategy
     init_strategy: Literal["no_init", "full_he_init", "expert_only_he_init"] = "full_he_init"
 

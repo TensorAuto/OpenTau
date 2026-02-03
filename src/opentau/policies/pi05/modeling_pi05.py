@@ -29,7 +29,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
-from einops import rearrange
+from einops import rearrange, repeat
 from torch import Tensor, nn
 from transformers import AutoProcessor, AutoTokenizer
 
@@ -622,6 +622,7 @@ class PI05Policy(PreTrainedPolicy):
             lang_tokens,
             lang_masks,
             actions,
+            actions_is_pad,
             response_tokens,
             response_masks,
             noise,
@@ -632,17 +633,8 @@ class PI05Policy(PreTrainedPolicy):
 
         mse_loss = losses["MSE"]
         ce_loss = losses["CE"]
-        if actions_is_pad is not None:
-            in_episode_bound = ~actions_is_pad
-            mse_loss = mse_loss * in_episode_bound.unsqueeze(-1)
 
-        # Remove padding
-        mse_loss = mse_loss[:, :, : self.config.max_action_dim]
-
-        # For backward pass
-        loss = mse_loss.mean()
-
-        return {"MSE": loss, "CE": ce_loss}
+        return {"MSE": mse_loss, "CE": ce_loss}
 
     def prepare_discrete_state(self, batch: dict[str, Tensor]) -> list[str]:
         """Discretizes the state into bins and converts it to a string representation.
@@ -1107,6 +1099,7 @@ class PI05FlowMatching(nn.Module):
         lang_tokens: Tensor,
         lang_masks: Tensor,
         actions: Tensor,
+        actions_is_pad: Tensor | None = None,
         response_tokens: Tensor | None = None,
         response_masks: Tensor | None = None,
         noise: Tensor | None = None,
@@ -1124,6 +1117,7 @@ class PI05FlowMatching(nn.Module):
             response_tokens: Response language token tensor.
             response_masks: Response language mask tensor.
             actions: Action tensor.
+            actions_is_pad: Optional action is padded mask tensor.
             noise: Optional noise tensor.
             time: Optional time tensor.
             discrete_actions: Optional discrete action tensor.
@@ -1161,13 +1155,21 @@ class PI05FlowMatching(nn.Module):
         )
 
         # Now run action expert
+        batch_size = actions.shape[0]
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
 
         if time is None:
-            time = self.sample_time(actions.shape[0], actions.device)
+            time = self.sample_time(batch_size, actions.device)
 
-        time_expanded = time[:, None, None]
+        # handle real time inference delay
+        delay = torch.randint(0, self.config.max_delay + 1, (batch_size,))
+        prefix_mask = rearrange(torch.arange(self.config.chunk_size), "c -> 1 c") < rearrange(
+            delay, "b -> b 1"
+        )
+        time = torch.where(prefix_mask, 1, rearrange(time, "b -> b 1"))
+
+        time_expanded = rearrange(time, "b c -> b c 1")
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
@@ -1206,7 +1208,28 @@ class PI05FlowMatching(nn.Module):
         v_t = self.action_out_proj(suffix_out)
         v_t = v_t.to(dtype=torch.float32)
 
-        losses = F.mse_loss(u_t, v_t, reduction="none")
+        mse_loss = F.mse_loss(u_t, v_t, reduction="none")
+
+        # mask out frozen actions and padded actions
+        postfix_mask = rearrange(
+            torch.logical_not(prefix_mask), "b c -> b c 1"
+        )  # 0 for frozen actions, 1 for non-frozen actions
+
+        if actions_is_pad is not None:
+            in_episode_bound = ~actions_is_pad
+            in_episode_bound = rearrange(
+                in_episode_bound, "b c -> b c 1"
+            )  # 0 for padded actions, 1 for non-padded actions
+            postfix_mask = torch.logical_and(postfix_mask, in_episode_bound)
+
+        mse_loss = mse_loss * postfix_mask
+
+        # Remove padding
+        mse_loss = mse_loss[:, :, : self.config.max_action_dim]
+
+        # Do not include frozen actions and padded actions in the mean loss calculation
+        postfix_mask_expanded = repeat(postfix_mask, "b c 1 -> b c d", d=mse_loss.shape[-1])
+        mse_loss = mse_loss.sum() / (postfix_mask_expanded.sum() + 1e-8)
 
         # compute cross entropy loss for discrete actions
         batch_size, seq_len = discrete_actions.shape
