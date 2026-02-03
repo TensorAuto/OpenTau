@@ -558,7 +558,7 @@ class PI05Policy(PreTrainedPolicy):
         Args:
             batch: Batch of data containing environment observations.
             noise: Optional noise tensor.
-            action_prefix: Optional action prefix tensor.
+            action_prefix: Optional action prefix tensor of shape (batch_size, action_chunk_length, action_dim).
             delay: number of delay actions.
         Returns:
             The sampled actions tensor of shape (batch_size, action_dim).
