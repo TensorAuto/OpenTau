@@ -46,7 +46,7 @@ from opentau.utils.monkey_patch import (
     torch_full_patch,
     torch_pow_patch,
 )
-from opentau.utils.utils import auto_torch_device
+from opentau.utils.utils import auto_torch_device, init_logging
 
 # Some patches are necessary only for dynamo export, which has current upstream bugs.
 # Nonetheless, we apply them here to ensure future compatibility.
@@ -212,7 +212,7 @@ def create_onnx_inputs(policy: PI05Policy, cfg, device, dtype):
 def main(cfg: TrainPipelineConfig):
     """Main export function."""
     device = auto_torch_device()
-    dtype = torch.bfloat16
+    dtype = torch.float32
 
     logging.info("Applying monkey patches...")
     for patch in patches:
@@ -249,22 +249,17 @@ def main(cfg: TrainPipelineConfig):
     output_path = output_path.resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     # External data file is saved alongside the .onnx file with .onnx_data suffix
-    weights_path = output_path.with_suffix(".onnx_data")
+    weights_path = output_path.with_suffix(".onnx.data")
 
     with torch.inference_mode():
-        logging.info("Running standard ONNX export...")
-        # Use standard export instead of dynamo for better compatibility
-        # Dynamo export can sometimes produce invalid graphs for bfloat16
+        logging.info("Running dynamo ONNX export...")
         torch.onnx.export(
             wrapper,
             args,
             str(output_path),
-            verbose=False,
-            opset_version=19,
             input_names=input_names,
             output_names=["actions"],
-            do_constant_folding=True,
-            dynamo=False,
+            dynamo=True,
         )
 
         logging.info(f"Successfully exported model to '{output_path}'")
@@ -286,4 +281,5 @@ def main(cfg: TrainPipelineConfig):
 
 
 if __name__ == "__main__":
+    init_logging()
     main()
