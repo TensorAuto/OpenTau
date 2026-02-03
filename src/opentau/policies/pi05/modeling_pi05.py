@@ -52,23 +52,23 @@ def create_sinusoidal_pos_embedding(
     """Computes sine-cosine positional embedding vectors for scalar positions.
 
     Args:
-        time: A 1-D tensor of shape (batch_size,).
+        time: A 2-D tensor of shape (batch_size, action_chunk_length).
         dimension: The dimension of the embedding vectors. Must be divisible by 2.
         min_period: The minimum period of the sinusoidal functions.
         max_period: The maximum period of the sinusoidal functions.
         device: The device to create the tensors on. Defaults to "cpu".
 
     Returns:
-        A tensor of shape (batch_size, dimension) containing the positional embeddings.
+        A tensor of shape (batch_size, action_chunk_length, dimension) containing the positional embeddings.
 
     Raises:
-        ValueError: If dimension is not divisible by 2 or if time tensor is not 1-D.
+        ValueError: If dimension is not divisible by 2 or if time tensor is not 2-D with shape (batch_size, action_chunk_length).
     """
     if dimension % 2 != 0:
         raise ValueError(f"dimension ({dimension}) must be divisible by 2")
 
-    if time.ndim != 1:
-        raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
+    if time.ndim != 2:
+        raise ValueError("The time tensor is expected to be of shape `(batch_size, action_chunk_length)`.")
 
     dtype = (
         get_safe_dtype(torch.float64, device.type)
@@ -80,8 +80,8 @@ def create_sinusoidal_pos_embedding(
 
     # Compute the outer product
     scaling_factor = 1.0 / period * 2 * math.pi
-    sin_input = scaling_factor[None, :] * time[:, None]
-    pos_emb = torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
+    sin_input = rearrange(scaling_factor, "d -> 1 1 d") * rearrange(time, "b c -> b c 1")
+    pos_emb = torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=2)
     return pos_emb
 
 
@@ -1040,7 +1040,7 @@ class PI05FlowMatching(nn.Module):
 
         Args:
             noisy_actions: Tensor containing noisy actions.
-            timestep: Tensor containing timesteps.
+            timestep: Tensor containing timesteps of shape (batch_size, action_chunk_length).
 
         Returns:
             A tuple containing:
@@ -1167,7 +1167,10 @@ class PI05FlowMatching(nn.Module):
         prefix_mask = rearrange(torch.arange(self.config.chunk_size), "c -> 1 c") < rearrange(
             delay, "b -> b 1"
         )
-        time = torch.where(prefix_mask, 1, rearrange(time, "b -> b 1"))
+        prefix_mask = prefix_mask.to(device=actions.device)
+        time = torch.where(
+            prefix_mask, 0, rearrange(time, "b -> b 1")
+        )  # using diffusion time 0 instead of flow matching time 1
 
         time_expanded = rearrange(time, "b c -> b c 1")
         x_t = time_expanded * noise + (1 - time_expanded) * actions
@@ -1296,6 +1299,8 @@ class PI05FlowMatching(nn.Module):
         img_masks: list[Tensor],
         lang_tokens: Tensor,
         lang_masks: Tensor,
+        action_prefix: Tensor | None = None,
+        delay: int = 0,
         noise: Tensor | None = None,
     ) -> Tensor:
         """Do a full inference forward and compute the action.
@@ -1306,7 +1311,8 @@ class PI05FlowMatching(nn.Module):
             lang_tokens: Language token tensor.
             lang_masks: Language mask tensor.
             noise: Optional noise tensor.
-
+            action_prefix: Optional action prefix tensor.
+            delay: number of delay actions.
         Returns:
             The sampled action tensor.
         """
@@ -1370,13 +1376,15 @@ class PI05FlowMatching(nn.Module):
 
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
+        prefix_mask = rearrange(torch.arange(self.config.chunk_size), "c -> 1 c") < delay
         while time >= -dt / 2:
-            expanded_time = time.expand(bsize)
+            x_t = torch.where(rearrange(prefix_mask, "b c -> b c 1"), action_prefix, x_t)
+            time_masked = torch.where(prefix_mask, 0, time)
             v_t = self.denoise_step(
                 prefix_pad_masks,
                 past_key_values,
                 x_t,
-                expanded_time,
+                time_masked,
             )
 
             # Euler step
@@ -1389,7 +1397,7 @@ class PI05FlowMatching(nn.Module):
         prefix_pad_masks: Tensor,
         past_key_values: list[dict[str, Tensor]],
         x_t: Tensor,
-        timestep: Tensor,
+        time: Tensor,
     ) -> Tensor:
         """Apply one denoising step of the noise `x_t` at a given timestep.
 
@@ -1397,12 +1405,11 @@ class PI05FlowMatching(nn.Module):
             prefix_pad_masks: Prefix padding masks.
             past_key_values: Past key values from the VLM.
             x_t: Current noise tensor.
-            timestep: Current timestep.
-
+            time: Time tensor of shape (batch_size, action_chunk_length).
         Returns:
             The predicted velocity tensor (v_t).
         """
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
 
         num_cross_att_tokens = prefix_pad_masks.shape[1]
         action_expert_2d_attention_mask = make_att_2d_masks(
