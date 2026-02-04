@@ -64,6 +64,7 @@
     "save_freq": 100,
     "use_policy_training_preset": true,
     "trace_nans": true,
+    "val_freq": 10,
     "optimizer": {
         "type": "adamw",
         "lr": 2.5e-05,

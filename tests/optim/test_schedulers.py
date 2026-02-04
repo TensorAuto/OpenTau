@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import torch
+from packaging import version
 from torch.optim.lr_scheduler import LambdaLR
 
 from opentau.constants import SCHEDULER_STATE
@@ -32,14 +34,25 @@ def test_diffuser_scheduler(optimizer):
 
     optimizer.step()  # so that we don't get torch warning
     scheduler.step()
-    expected_state_dict = {
-        "_get_lr_called_within_step": False,
-        "_last_lr": [0.0002],
-        "_step_count": 2,
-        "base_lrs": [0.001],
-        "last_epoch": 1,
-        "lr_lambdas": [None],
-    }
+    if version.parse(torch.__version__) >= version.parse("2.8.0"):
+        expected_state_dict = {
+            "_get_lr_called_within_step": False,
+            "_last_lr": [0.0002],
+            "_step_count": 2,
+            "base_lrs": [0.001],
+            "last_epoch": 1,
+            "lr_lambdas": [None],
+            "_is_initial": False,
+        }
+    else:
+        expected_state_dict = {
+            "_get_lr_called_within_step": False,
+            "_last_lr": [0.0002],
+            "_step_count": 2,
+            "base_lrs": [0.001],
+            "last_epoch": 1,
+            "lr_lambdas": [None],
+        }
     assert scheduler.state_dict() == expected_state_dict
 
 
@@ -50,14 +63,25 @@ def test_vqbet_scheduler(optimizer):
 
     optimizer.step()
     scheduler.step()
-    expected_state_dict = {
-        "_get_lr_called_within_step": False,
-        "_last_lr": [0.001],
-        "_step_count": 2,
-        "base_lrs": [0.001],
-        "last_epoch": 1,
-        "lr_lambdas": [None],
-    }
+    if version.parse(torch.__version__) >= version.parse("2.8.0"):
+        expected_state_dict = {
+            "_get_lr_called_within_step": False,
+            "_last_lr": [0.001],
+            "_step_count": 2,
+            "base_lrs": [0.001],
+            "last_epoch": 1,
+            "lr_lambdas": [None],
+            "_is_initial": False,
+        }
+    else:
+        expected_state_dict = {
+            "_get_lr_called_within_step": False,
+            "_last_lr": [0.001],
+            "_step_count": 2,
+            "base_lrs": [0.001],
+            "last_epoch": 1,
+            "lr_lambdas": [None],
+        }
     assert scheduler.state_dict() == expected_state_dict
 
 
@@ -70,14 +94,25 @@ def test_cosine_decay_with_warmup_scheduler(optimizer):
 
     optimizer.step()
     scheduler.step()
-    expected_state_dict = {
-        "_get_lr_called_within_step": False,
-        "_last_lr": [0.0001818181818181819],
-        "_step_count": 2,
-        "base_lrs": [0.001],
-        "last_epoch": 1,
-        "lr_lambdas": [None],
-    }
+    if version.parse(torch.__version__) >= version.parse("2.8.0"):
+        expected_state_dict = {
+            "_get_lr_called_within_step": False,
+            "_last_lr": [0.0001818181818181819],
+            "_step_count": 2,
+            "base_lrs": [0.001],
+            "last_epoch": 1,
+            "lr_lambdas": [None],
+            "_is_initial": False,
+        }
+    else:
+        expected_state_dict = {
+            "_get_lr_called_within_step": False,
+            "_last_lr": [0.0001818181818181819],
+            "_step_count": 2,
+            "base_lrs": [0.001],
+            "last_epoch": 1,
+            "lr_lambdas": [None],
+        }
     assert scheduler.state_dict() == expected_state_dict
 
 
@@ -101,14 +136,25 @@ def test_constant_scheduler(optimizer):
         current_lr = optimizer.param_groups[0]["lr"]
         assert current_lr == initial_lr
 
-    expected_state_dict = {
-        "_get_lr_called_within_step": False,
-        "_last_lr": [0.001],
-        "_step_count": 7,
-        "base_lrs": [0.001],
-        "last_epoch": 6,
-        "lr_lambdas": [None],
-    }
+    if version.parse(torch.__version__) >= version.parse("2.8.0"):
+        expected_state_dict = {
+            "_get_lr_called_within_step": False,
+            "_last_lr": [0.001],
+            "_step_count": 7,
+            "base_lrs": [0.001],
+            "last_epoch": 6,
+            "lr_lambdas": [None],
+            "_is_initial": False,
+        }
+    else:
+        expected_state_dict = {
+            "_get_lr_called_within_step": False,
+            "_last_lr": [0.001],
+            "_step_count": 7,
+            "base_lrs": [0.001],
+            "last_epoch": 6,
+            "lr_lambdas": [None],
+        }
     assert scheduler.state_dict() == expected_state_dict
 
 

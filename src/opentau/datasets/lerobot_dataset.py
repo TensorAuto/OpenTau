@@ -150,6 +150,7 @@ from opentau.policies.value.configuration_value import ValueConfig
 from opentau.policies.value.reward import (
     calculate_return_bins_with_equal_width,
 )
+from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import on_accelerate_main_proc
 
 
@@ -324,8 +325,17 @@ class LeRobotDatasetMetadata(DatasetMetadata):
             if is_valid_version(self.revision):
                 self.revision = get_safe_version(self.repo_id, self.revision)
 
-            (self.root / "meta").mkdir(exist_ok=True, parents=True)
-            self.pull_from_repo(allow_patterns="meta/")
+            # In distributed training, only rank 0 downloads to avoid race conditions
+            # where other ranks read metadata before the download has finished.
+            acc = get_proc_accelerator()
+            if acc is not None and acc.num_processes > 1:
+                if acc.is_main_process:
+                    (self.root / "meta").mkdir(exist_ok=True, parents=True)
+                    self.pull_from_repo(allow_patterns="meta/")
+                acc.wait_for_everyone()
+            else:
+                (self.root / "meta").mkdir(exist_ok=True, parents=True)
+                self.pull_from_repo(allow_patterns="meta/")
             self.load_metadata()
 
     def load_metadata(self) -> None:
@@ -724,14 +734,6 @@ class BaseDataset(torch.utils.data.Dataset):
         for key, value in standard_item.items():
             if isinstance(value, torch.Tensor) and value.dtype.is_floating_point:
                 standard_item[key] = value.to(dtype=torch.bfloat16)
-
-        # ensure that non-empty strings contain exactly one newline character at the end of the string
-        for key in ["prompt", "response"]:
-            if standard_item[key].endswith(
-                "\n"
-            ):  # ensure there isn't going to be an extra space at the end after calling replace
-                standard_item[key] = standard_item[key][:-1]
-            standard_item[key] = standard_item[key].replace("\n", " ") + "\n"
 
         return standard_item
 

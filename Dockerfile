@@ -34,7 +34,7 @@ COPY . .
 # We explicitly use the system python 3.10 for the venv
 RUN uv venv .venv --python /usr/bin/python3.10 && \
     . .venv/bin/activate && \
-    uv sync --all-extras
+    uv sync --extra libero --extra dev --extra openai
 
 # Set environment variables
 ENV PATH=".venv/bin:$PATH"

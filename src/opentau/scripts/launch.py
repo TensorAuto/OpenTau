@@ -18,11 +18,6 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
-import opentau.scripts.eval as eval_script
-import opentau.scripts.export_to_onnx as export_script
-import opentau.scripts.train as train_script
-import opentau.scripts.visualize_dataset as visualize_script
-
 
 def launch(script_module: ModuleType, description: str, use_accelerate: bool = True):
     """Generic launcher for OpenTau scripts using Accelerate or Python."""
@@ -69,16 +64,24 @@ def launch(script_module: ModuleType, description: str, use_accelerate: bool = T
 
 
 def train():
+    import opentau.scripts.train as train_script
+
     launch(train_script, "Launch OpenTau training with Accelerate")
 
 
 def eval():
+    import opentau.scripts.eval as eval_script
+
     launch(eval_script, "Launch OpenTau evaluation with Accelerate")
 
 
 def export():
+    import opentau.scripts.export_to_onnx as export_script
+
     launch(export_script, "Launch OpenTau ONNX export", use_accelerate=False)
 
 
 def visualize():
+    import opentau.scripts.visualize_dataset as visualize_script
+
     launch(visualize_script, "Launch OpenTau visualization", use_accelerate=False)

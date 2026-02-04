@@ -260,6 +260,10 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             self.paligemma.eval()
             for params in self.paligemma.parameters():
                 params.requires_grad = False
+            for param in self.da_head.parameters():
+                param.requires_grad = False
+            for param in self.discrete_action_embedding.parameters():
+                param.requires_grad = False
 
     def train(self, mode: bool = True) -> None:
         """Sets the module in training mode.
@@ -416,27 +420,23 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             query_states = apply_rope(query_states, position_ids)
             key_states = apply_rope(key_states, position_ids)
 
-            if use_cache and past_key_values is None:
-                past_key_values = {}
-
             if use_cache:
-                if fill_kv_cache:
-                    if n_cross_att_tokens is None:
-                        raise ValueError("n_cross_att_tokens must be provided when fill_kv_cache is True")
-                    past_key_values[layer_idx] = {
-                        # save the first n_cross_att_tokens for action expert cross attention
-                        "key_states": key_states[:, :n_cross_att_tokens, :, :],
-                        "value_states": value_states[:, :n_cross_att_tokens, :, :],
-                    }
-                else:
-                    # TODO here, some optimization can be done - similar to a `StaticCache` we can declare the `max_len` before.
-                    # so we create an empty cache, with just one cuda malloc, and if (in autoregressive case) we reach
-                    # the max len, then we (for instance) double the cache size. This implementation already exists
-                    # in `transformers`. (molbap)
-                    key_states = torch.cat([key_states, past_key_values[layer_idx]["key_states"]], dim=1)
-                    value_states = torch.cat(
-                        [value_states, past_key_values[layer_idx]["value_states"]], dim=1
-                    )
+                # TODO here, some optimization can be done - similar to a `StaticCache` we can declare the `max_len` before.
+                # so we create an empty cache, with just one cuda malloc, and if (in autoregressive case) we reach
+                # the max len, then we (for instance) double the cache size. This implementation already exists
+                # in `transformers`. (molbap)
+                key_states = torch.cat([past_key_values[layer_idx]["key_states"], key_states], dim=1)
+                value_states = torch.cat([past_key_values[layer_idx]["value_states"], value_states], dim=1)
+            if fill_kv_cache:
+                if past_key_values is None:
+                    past_key_values = {}
+                if n_cross_att_tokens is None:
+                    raise ValueError("n_cross_att_tokens must be provided when fill_kv_cache is True")
+                past_key_values[layer_idx] = {
+                    # save the first n_cross_att_tokens for action expert cross attention
+                    "key_states": key_states[:, :n_cross_att_tokens, :, :],
+                    "value_states": value_states[:, :n_cross_att_tokens, :, :],
+                }
 
             attention_interface = self.get_attention_interface()
             att_output = attention_interface(
