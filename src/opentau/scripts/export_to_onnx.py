@@ -40,7 +40,7 @@ from torch import Tensor
 from opentau.configs import parser
 from opentau.configs.train import TrainPipelineConfig
 from opentau.policies.factory import get_policy_class
-from opentau.policies.pi05.modeling_pi05 import PI05Policy, resize_with_pad
+from opentau.policies.pi05.modeling_pi05 import PI05Policy
 from opentau.utils.monkey_patch import (
     torch_cumsum_patch,
     torch_full_patch,
@@ -70,10 +70,7 @@ class PI05OnnxWrapper(torch.nn.Module):
     3. Runs the flow matching denoising with a fixed number of steps
     """
 
-    def __init__(
-            self,
-            policy: PI05Policy,
-    ):
+    def __init__(self, policy: PI05Policy):
         """Initialize the ONNX wrapper.
 
         Args:
@@ -82,44 +79,8 @@ class PI05OnnxWrapper(torch.nn.Module):
         """
         super().__init__()
         self.policy = policy
-        self.config = policy.config
 
-    def _preprocess_images(self, images: list[Tensor]) -> tuple[list[Tensor], list[Tensor]]:
-        """Preprocess images for the model (pure PyTorch operations).
-
-        Args:
-            images: List of image tensors, each of shape (batch, 3, H, W) in range [0, 1].
-
-        Returns:
-            Tuple of (processed_images, image_masks).
-        """
-        processed_images = []
-        img_masks = []
-
-        for img in images:
-            # Resize with padding if configured
-            if self.config.resize_imgs_with_padding is not None:
-                img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
-
-            # Normalize from [0,1] to [-1,1] as expected by SigLIP
-            img = img * 2.0 - 1.0
-
-            bsize = img.shape[0]
-            device = img.device
-            mask = torch.ones(bsize, dtype=torch.bool, device=device)
-
-            processed_images.append(img)
-            img_masks.append(mask)
-
-        return processed_images, img_masks
-
-    def forward(
-            self,
-            lang_tokens: Tensor,
-            lang_masks: Tensor,
-            noise: Tensor,
-            *images: Tensor,
-    ) -> Tensor:
+    def forward(self, lang_tokens: Tensor, lang_masks: Tensor, noise: Tensor, *images: Tensor) -> Tensor:
         """Forward pass for ONNX export.
 
         Args:
@@ -132,9 +93,11 @@ class PI05OnnxWrapper(torch.nn.Module):
         Returns:
             Action tensor of shape (batch, n_action_steps, action_dim).
         """
-        # Process images
         print("Starting forward pass of the wrapper...")
-        processed_images, img_masks = self._preprocess_images(list(images))
+
+        # Process images
+        image_batch = {f"camera{i}": img for i, img in enumerate(images)}
+        processed_images, img_masks = self.policy.prepare_images(image_batch)
 
         actions = self.policy.model.sample_actions(
             processed_images,
@@ -145,7 +108,7 @@ class PI05OnnxWrapper(torch.nn.Module):
         )
 
         # Unpad actions
-        original_action_dim = self.config.action_feature.shape[0]
+        original_action_dim = self.policy.config.action_feature.shape[0]
         actions = actions[:, :, :original_action_dim]
 
         actions = self.policy.unnormalize_outputs({"actions": actions})["actions"]

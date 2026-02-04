@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""ONNX inference script for Pi0.5 (PI05) policies.
+"""Inference script for exported ONNX models.
 
 Loads an exported ONNX model (model.onnx + model.onnx.data) and runs inference.
 Required shapes and settings are passed via command line.
@@ -67,23 +67,14 @@ def _prepare_discrete_state(state: np.ndarray) -> list[str]:
     return [" ".join(map(str, row)) for row in discretized]
 
 
-def _build_prompt(
-    task: str,
-    state_str: str,
-    predict_response: bool,
-) -> str:
+def _build_prompt(task: str, state_str: str, predict_response: bool) -> str:
     """Build the full prompt string as expected by the PI05 tokenizer."""
     if predict_response:
         return f"Task: {task}<eos>State: {state_str}<eos>Response:"
     return f"Task: {task}<eos>State: {state_str}<eos>Actions:"
 
 
-def _tokenize_prompt(
-    tokenizer,
-    prompt: str,
-    prompt_max_length: int,
-    device: str = "cpu",
-) -> tuple[np.ndarray, np.ndarray]:
+def _tokenize_prompt(tokenizer, prompt: str, prompt_max_length: int) -> tuple[np.ndarray, np.ndarray]:
     """Tokenize a single prompt and return input_ids and attention_mask as numpy."""
     tokenized = tokenizer(
         [prompt],
@@ -98,8 +89,14 @@ def _tokenize_prompt(
 
 def load_onnx_session(checkpoint_dir: Path, provider: str | None = None) -> ort.InferenceSession:
     """Load ONNX model from checkpoint directory.
-
     Expects model.onnx (and optionally model.onnx.data for external weights) in checkpoint_dir.
+
+    Args:
+        checkpoint_dir: Path to the checkpoint directory containing the ONNX model.
+        provider: ONNX runtime provider to use. If None, will use the default provider.
+
+    Returns:
+        ONNX inference session.
     """
     onnx_path = checkpoint_dir / "model.onnx"
     if not onnx_path.is_file():
@@ -151,13 +148,9 @@ def run_inference(
     rng = rng or np.random.default_rng()
 
     state_strs = _prepare_discrete_state(state)
-    full_prompts = [
-        _build_prompt(prompt, s, args.predict_response) for s in state_strs
-    ]
+    full_prompts = [_build_prompt(prompt, s, args.predict_response) for s in state_strs]
     p = full_prompts[0]
-    lang_tokens, lang_masks = _tokenize_prompt(
-        tokenizer, p, args.prompt_max_length
-    )
+    lang_tokens, lang_masks = _tokenize_prompt(tokenizer, p, args.prompt_max_length)
     if batch_size > 1:
         lang_tokens = np.repeat(lang_tokens, batch_size, axis=0)
         lang_masks = np.repeat(lang_masks, batch_size, axis=0)
@@ -170,19 +163,13 @@ def run_inference(
 
     num_cams = args.num_cams
     if len(images) != num_cams:
-        raise ValueError(
-            f"Expected {num_cams} images (num_cams), got {len(images)}"
-        )
+        raise ValueError(f"Expected {num_cams} images (num_cams), got {len(images)}")
     resolution = (args.resolution_height, args.resolution_width)
     for i, img in enumerate(images):
         if img.shape[2:] != resolution:
-            raise ValueError(
-                f"Image {i} shape {img.shape}: expected H,W={resolution}"
-            )
+            raise ValueError(f"Image {i} shape {img.shape}: expected H,W={resolution}")
         if img.shape[0] != batch_size:
-            raise ValueError(
-                f"Image {i} batch size {img.shape[0]} != state batch size {batch_size}"
-            )
+            raise ValueError(f"Image {i} batch size {img.shape[0]} != state batch size {batch_size}")
 
     # Build input dict: lang_tokens, lang_masks, noise, image0, image1, ...
     input_feed = {
