@@ -46,6 +46,10 @@ from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
 
 
+def _preferred_dtype():
+    return torch.float32 if torch.onnx.is_in_onnx_export() else torch.bfloat16
+
+
 def create_sinusoidal_pos_embedding(
     time: Tensor, dimension: int, min_period: float, max_period: float, device: torch.device | str = "cpu"
 ) -> Tensor:
@@ -988,7 +992,7 @@ class PI05FlowMatching(nn.Module):
             img_mask,
         ) in zip(images, img_masks, strict=False):
             img_emb = self.paligemma_with_expert.embed_image(img)
-            img_emb = img_emb.to(dtype=torch.bfloat16)
+            img_emb = img_emb.to(dtype=_preferred_dtype())
 
             # image embeddings don't need to be unnormalized because `fix/lerobot_openpi` branch of huggingface
             # already removed the normalization inside PaliGemma
@@ -1032,7 +1036,7 @@ class PI05FlowMatching(nn.Module):
 
         if discrete_actions is not None:
             discrete_action_emb = self.paligemma_with_expert.embed_discrete_actions(discrete_actions)
-            embs.append(discrete_action_emb.to(dtype=torch.bfloat16))
+            embs.append(discrete_action_emb.to(dtype=_preferred_dtype()))
             pad_masks.append(discrete_action_masks)
             att_masks += [1] * discrete_action_emb.shape[1]
 
@@ -1062,7 +1066,7 @@ class PI05FlowMatching(nn.Module):
         att_masks = []
 
         bsize = noisy_actions.shape[0]
-        dtype = torch.bfloat16
+        dtype = _preferred_dtype()
         device = noisy_actions.device
 
         # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]

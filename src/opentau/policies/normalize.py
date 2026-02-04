@@ -300,14 +300,14 @@ class Unnormalize(nn.Module):
             if norm_mode is NormalizationMode.MEAN_STD:
                 mean = buffer["mean"]
                 std = buffer["std"]
-                if not torch.compiler.is_compiling():
+                if not (torch.compiler.is_compiling() or torch.onnx.is_in_onnx_export()):
                     assert not torch.isinf(mean).any(), _no_stats_error_str("mean")
                     assert not torch.isinf(std).any(), _no_stats_error_str("std")
                 batch[key] = batch[key] * (std + EPS) + mean
             elif norm_mode is NormalizationMode.MIN_MAX:
                 min = buffer["min"]
                 max = buffer["max"]
-                if not torch.compiler.is_compiling():
+                if not (torch.compiler.is_compiling() or torch.onnx.is_in_onnx_export()):
                     assert not torch.isinf(min).any(), _no_stats_error_str("min")
                     assert not torch.isinf(max).any(), _no_stats_error_str("max")
                 batch[key] = (batch[key] + 1) / 2
