@@ -228,13 +228,21 @@ def main(args: OnnxInferenceArgs):
                 "Output actions shape: %s (batch, n_action_steps, action_dim)",
                 actions.shape,
             )
-    total_s = sum(step_times)
-    mean_ms = (total_s / len(step_times)) * 1000
+    times_ms = np.array(step_times) * 1000
     logging.info(
-        "ONNX inference: %d runs, total %.3f s, mean %.2f ms/run",
+        "ONNX inference: %d runs, total %.3f s, mean %.2f ms/run, std %.2f ms",
         args.n_repeats,
-        total_s,
-        mean_ms,
+        np.sum(step_times),
+        np.mean(times_ms),
+        np.std(times_ms),
+    )
+    logging.info(
+        "ONNX inference latency (ms): min %.2f, max %.2f, median %.2f, p5 %.2f, p95 %.2f",
+        np.min(times_ms),
+        np.max(times_ms),
+        np.median(times_ms),
+        np.percentile(times_ms, 5),
+        np.percentile(times_ms, 95),
     )
 
 
