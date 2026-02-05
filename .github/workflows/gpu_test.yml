@@ -30,6 +30,7 @@ jobs:
   start-runner:
     name: Start GPU Runner
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # Fail fast if ASG/runner never becomes ready
     permissions:
       id-token: write # Required for requesting the JWT
       contents: read
@@ -42,8 +43,26 @@ jobs:
 
       - name: Start Instance
         run: |
-          aws autoscaling set-desired-capacity --auto-scaling-group-name github-runner-asg-g6-2xlarge --desired-capacity 1
-          echo "Waiting for instance to be ready..."
+          ASG_NAME="github-runner-asg-g6-2xlarge"
+          aws autoscaling set-desired-capacity --auto-scaling-group-name "$ASG_NAME" --desired-capacity 1
+          echo "Waiting for instance to be InService (max 10 min)..."
+          for i in $(seq 1 40); do
+            COUNT=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG_NAME" \
+              --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' --output text | wc -w)
+            [ "$COUNT" -ge 1 ] && break
+            echo "Instance not ready yet ($i/40)..."
+            sleep 15
+          done
+          if [ "$COUNT" -lt 1 ]; then
+            echo "Timeout: instance did not become InService"
+            exit 1
+          fi
+          INSTANCE_ID=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG_NAME" \
+            --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' --output text | awk '{print $1}')
+          echo "Waiting for EC2 status checks on $INSTANCE_ID..."
+          aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
+          echo "Instance ready. Waiting 3 min for GitHub runner to register..."
+          sleep 180
 
   gpu-test:
     name: Run Pytest on GPU
