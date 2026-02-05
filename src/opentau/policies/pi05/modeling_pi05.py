@@ -292,7 +292,6 @@ class PI05Policy(PreTrainedPolicy):
     def reset(self) -> None:
         """This should be called whenever the environment is reset."""
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
-        self._executed_actions: deque[Tensor] = deque([], maxlen=self.config.max_delay)
 
     @classmethod
     def from_pretrained(
@@ -526,10 +525,9 @@ class PI05Policy(PreTrainedPolicy):
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """Select a single action given environment observations.
 
-        This method calls sample_actions every step and returns one action at a time from the new chunk.
-        The queue is replaced with the new chunk each time. The last config.max_delay executed actions
-        are passed to sample_actions as action_prefix; at episode start (no previous actions), delay
-        is 0.
+        This method uses an action queue that is replenished when it has config.max_delay or fewer actions (or is empty).
+        When replenishing, the current queue contents are used as action_prefix for sample_actions,
+        then the queue is refilled with the new chunk.
 
         Note: This method should only be called when running a policy in simulation. For real world inference,
         this method should be written in the ROS client node.
@@ -543,30 +541,36 @@ class PI05Policy(PreTrainedPolicy):
         """
         self.eval()
 
-        action_prefix = None
-        delay = 0
-        if self.config.max_delay > 0 and len(self._executed_actions) > 0:
-            action_prefix = torch.stack(list(self._executed_actions), dim=1)
-            delay = action_prefix.shape[1]
-            action_prefix = self.normalize_actions({"actions": action_prefix})["actions"]
-            original_action_dim = self.config.action_feature.shape[0]
-            if original_action_dim < self.config.max_action_dim:
-                action_prefix = F.pad(
-                    action_prefix,
-                    (0, self.config.max_action_dim - original_action_dim),
-                )
-            if delay < self.config.chunk_size:
-                action_prefix = F.pad(
-                    action_prefix,
-                    (0, 0, 0, self.config.chunk_size - delay),
-                )
-        actions = self.sample_actions(batch, noise=noise, action_prefix=action_prefix, delay=delay)
-        actions = rearrange(actions, "b c d -> c b d")
-        self._action_queue.clear()
-        self._action_queue.extend(actions[delay:])
+        if len(self._action_queue) == 0 or len(self._action_queue) <= self.config.max_delay:
+            # Use current queue as action prefix to replenish
+            action_prefix = None
+            delay = 0
+            if len(self._action_queue) > 0:
+                prefix_actions = list(self._action_queue)
+                delay = min(len(prefix_actions), self.config.max_delay)
+                assert delay == self.config.max_delay, f"Delay must be equal to {self.config.max_delay}"
+                prefix_actions = prefix_actions[-delay:]
+                action_prefix = torch.stack(prefix_actions, dim=1)
+                action_prefix = self.normalize_actions({"actions": action_prefix})["actions"]
+                original_action_dim = self.config.action_feature.shape[0]
+                if original_action_dim < self.config.max_action_dim:
+                    action_prefix = F.pad(
+                        action_prefix,
+                        (0, self.config.max_action_dim - original_action_dim),
+                    )
+                if delay < self.config.chunk_size:
+                    action_prefix = F.pad(
+                        action_prefix,
+                        (0, 0, 0, self.config.chunk_size - delay),
+                    )
+            actions = self.sample_actions(batch, noise=noise, action_prefix=action_prefix, delay=delay)
+            actions = rearrange(actions, "b c d -> c b d")
+            self._action_queue.extend(actions[delay:])
+            assert len(self._action_queue) == self.config.n_action_steps, (
+                f"Action queue must have {self.config.n_action_steps} actions"
+            )
+
         action = self._action_queue.popleft()
-        if self.config.max_delay > 0:
-            self._executed_actions.append(action)
         return action
 
     @torch.no_grad()
