@@ -1262,13 +1262,10 @@ class PI05FlowMatching(nn.Module):
 
             # compute mean
             response_ce_loss = response_ce_loss.mean()
+        else:
+            response_ce_loss = torch.tensor(0.0, device=losses.device)
 
-        return {
-            "MSE": losses,
-            "CE": discrete_action_ce_loss + response_ce_loss
-            if self.config.predict_response
-            else discrete_action_ce_loss,
-        }
+        return {"MSE": losses, "CE": discrete_action_ce_loss + response_ce_loss}
 
     def sample_actions(
         self,
