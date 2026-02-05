@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-#!/usr/bin/env python
-
 import logging
+import time
 from dataclasses import asdict
 from pprint import pformat
 
@@ -47,7 +46,7 @@ def inference_main(cfg: TrainPipelineConfig):
     policy = policy_class.from_pretrained(cfg.policy.pretrained_path, config=cfg.policy)
     policy.to(device=device, dtype=torch.bfloat16)
     policy.eval()
-    policy = attempt_torch_compile(policy, device_hint=device)
+    policy.sample_actions = attempt_torch_compile(policy.sample_actions, device_hint=device)
 
     # Always reset policy before episode to clear out action cache.
     policy.reset()
@@ -57,10 +56,25 @@ def inference_main(cfg: TrainPipelineConfig):
     print(observation.keys())
 
     with torch.inference_mode():
-        for _ in range(1000):
-            action = policy.select_action(observation)
-            action = action.to("cpu", torch.float32).numpy()
-            print(f"Output shape: {action.shape}")
+        # One warmup call right after compiling
+        _ = policy.sample_actions(observation)
+
+        # Run 10 times and record inference times
+        n_runs = 10
+        times_ms = []
+        for _ in range(n_runs):
+            t0 = time.perf_counter()
+            actions = policy.sample_actions(observation)
+            t1 = time.perf_counter()
+            times_ms.append((t1 - t0) * 1000.0)
+
+        actions = actions.to("cpu", torch.float32).numpy()
+        print(f"Output shape: {actions.shape}")
+
+        times_ms = torch.tensor(times_ms)
+        print(
+            f"Inference time (ms) over {n_runs} runs: min={times_ms.min().item():.2f}, max={times_ms.max().item():.2f}, avg={times_ms.mean().item():.2f}, std={times_ms.std().item():.2f}"
+        )
 
     logging.info("End of inference")
 

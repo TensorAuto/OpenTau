@@ -662,13 +662,15 @@ class PI05Policy(PreTrainedPolicy):
             ValueError: If the state values are not normalized between -1 and 1.
         """
         state = batch["state"]
-        state_np = state.to(device="cpu", dtype=torch.float32).numpy()
-        if np.any(state_np < -1.0) or np.any(state_np > 1.0):
+        state_cpu = state.to(device="cpu", dtype=torch.float32)
+        if torch.any(state_cpu < -1.0) or torch.any(state_cpu > 1.0):
             logging.warning(
-                f"State values are not normalized between -1 and 1. Min: {state_np.min()}, Max: {state_np.max()}"
+                f"State values are not normalized between -1 and 1. Min: {state_cpu.min().item()}, Max: {state_cpu.max().item()}"
             )
-        state_np = np.clip(state_np, -1.0, 1.0)
-        discretized_states = np.digitize(state_np, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+        state_clipped = torch.clamp(state_cpu, -1.0, 1.0)
+        # replicate np.digitize with torch for torch.compile compatibility
+        bin_indices = ((state_clipped + 1.0) * 128.0).long().clamp(0, 255)
+        discretized_states = bin_indices.cpu().tolist()
         return [
             " ".join(map(str, row)) for row in discretized_states
         ]  # TODO: return a tensor instead of a list of strings?
