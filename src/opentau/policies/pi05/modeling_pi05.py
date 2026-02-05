@@ -1424,6 +1424,10 @@ class PI05FlowMatching(nn.Module):
             # Euler step
             x_t += dt * v_t
             time += dt
+
+        # we need to ensure the frozen actions are not modified before returning the denoised actions
+        if delay > 0:
+            x_t = torch.where(rearrange(prefix_mask, "b c -> b c 1"), action_prefix, x_t)
         return x_t
 
     def denoise_step(
