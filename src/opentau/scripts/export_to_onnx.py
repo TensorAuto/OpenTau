@@ -75,7 +75,6 @@ class PI05OnnxWrapper(torch.nn.Module):
 
         Args:
             policy: The PI05Policy to wrap.
-            num_cameras: Number of camera inputs.
         """
         super().__init__()
         self.policy = policy
