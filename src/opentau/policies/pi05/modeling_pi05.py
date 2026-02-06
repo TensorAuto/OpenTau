@@ -271,7 +271,7 @@ class PI05Policy(PreTrainedPolicy):
         self.normalize_targets = Normalize(
             config.output_features, config.normalization_mapping, dataset_stats
         )
-        self.normalize_actions = Normalize(
+        self.normalize_discrete_actions = Normalize(
             config.output_features, {"ACTION": NormalizationMode.MIN_MAX}, dataset_stats
         )
         self.unnormalize_outputs = Unnormalize(
@@ -551,7 +551,7 @@ class PI05Policy(PreTrainedPolicy):
                 assert delay == self.config.max_delay, f"Delay must be equal to {self.config.max_delay}"
                 prefix_actions = prefix_actions[-delay:]
                 action_prefix = torch.stack(prefix_actions, dim=1)
-                action_prefix = self.normalize_actions({"actions": action_prefix})["actions"]
+                action_prefix = self.normalize_targets({"actions": action_prefix})["actions"]
                 original_action_dim = self.config.action_feature.shape[0]
                 if original_action_dim < self.config.max_action_dim:
                     action_prefix = F.pad(
@@ -630,7 +630,7 @@ class PI05Policy(PreTrainedPolicy):
             A dictionary containing the loss components ("MSE" and "CE").
         """
         batch = self.normalize_inputs(batch)
-        batch["discrete_actions"] = self.normalize_actions(dict(batch))["actions"]
+        batch["discrete_actions"] = self.normalize_discrete_actions(dict(batch))["actions"]
         batch = self.normalize_targets(batch)
 
         images, img_masks = self.prepare_images(
