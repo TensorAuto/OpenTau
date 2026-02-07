@@ -174,6 +174,21 @@ def visualize_dataset(
     urdf: Path | None = None,
     joint_names: list[str] | None = None,
 ) -> Path | None:
+    r"""
+    Visualize data of a given episode of a LeRobotDataset with rerun.
+
+    Args:
+        dataset: The dataset to visualize.
+        episode_index: The index of the episode to visualize.
+        batch_size: Batch size for loading data. Defaults to 32.
+        num_workers: Number of workers for data loading. Defaults to 0.
+        mode: Visualization mode, either "local" or "distant". Defaults to "local".
+        web_port: Web port for rerun when in "distant" mode. Defaults to 9090.
+        save: Whether to save the visualization as a .rrd file instead of spawning a viewer. Defaults to False.
+        output_dir: Directory to save the .rrd file if `save` is True. Required if `save` is True. Defaults to None.
+        urdf: Path to a URDF file to load and visualize alongside the dataset. Defaults to None.
+        joint_names: List of joint names for each state dimension, in order. Used for associating state dimensions with URDF joints. If not provided, state names from dataset metadata will be used. Defaults to None.
+    """
     if save:
         assert output_dir is not None, (
             "Set an output directory where to write .rrd files with `--output-dir path/to/directory`."
