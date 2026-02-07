@@ -154,6 +154,7 @@ class SiglipGemmaValueModel(PreTrainedModel):
 
         # Value head: projects final hidden state to discretized value bins
         self.value_head = nn.Linear(640, config.num_value_bins)
+        # Response head: projects response hidden states to logits for response language
         self.response_head = nn.Linear(640, self.gemma.config.vocab_size, bias=False)
 
     def embed_image(self, image: torch.Tensor) -> torch.Tensor:
@@ -217,13 +218,14 @@ class SiglipGemmaValueModel(PreTrainedModel):
         # Extract the last token's hidden state for value prediction
         # Use the last token (which should be the last language token)
 
-        #
+        # extract token just before response <bos> token
         classification_hidden = hidden_states[:, -self.config.response_max_length - 1, :]
+        # extract tokens from response <bos> token to just before last token
         response_hidden = hidden_states[:, -self.config.response_max_length : -1, :]
 
         # Project to logits for discretized values
         ce_logits = self.value_head(classification_hidden)
-
+        # project response hidden states to logits for response language
         response_logits = self.response_head(response_hidden)
 
         return ce_logits, response_logits
@@ -262,7 +264,7 @@ class SiglipGemmaValueModel(PreTrainedModel):
         # Extract the last token's hidden state for value prediction
         # Use the last token (which should be the last language token)
 
-        #
+        # extract last token while inference
         value_hidden = hidden_states[:, -1, :]
 
         # Project to logits for discretized values

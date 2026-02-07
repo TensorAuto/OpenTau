@@ -261,7 +261,7 @@ class ValueFunction(PreTrainedPolicy):
         ce_loss = F.cross_entropy(ce_logits, batch["return_bin_idx"], reduction="none")
 
         action_is_pad = batch.get("action_is_pad")
-        # Mask CE loss if all response_pad are true
+        # Mask CE loss if all action_is_pad are true. This is used for VQA dataset where we don't have actions tokens.
         ce_loss = ce_loss * (~action_is_pad.all(dim=1)).float()
 
         ce_loss = ce_loss.mean()
@@ -281,8 +281,9 @@ class ValueFunction(PreTrainedPolicy):
 
         # remove pad tokens
         response_is_pad = ~response_masks  # convert into format where value for pad is True
-        # helps to control loss for response tokens in case of robotic data and VQA data
+        # Mask response loss if response is padded
         response_ce_loss = response_ce_loss * ~response_is_pad[:, response_slice]
+        # Mask response loss if all action_is_pad are true. This is used for Robotic dataset where we have at least one actions tokens.
         response_ce_loss = response_ce_loss * rearrange((action_is_pad.all(dim=1)).float(), "b -> b 1")
 
         # compute mean
@@ -466,8 +467,6 @@ class ValueModel(nn.Module):
     │                              │
     └──────────────────────────────┘
     """
-
-    CLASSIFICATION_TOKEN_ID = 6  # unused token id in Gemma 3 270M that we repurpose for classification
 
     def __init__(self, config):
         """Initializes the ValueModel.
