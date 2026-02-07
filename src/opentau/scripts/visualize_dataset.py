@@ -172,7 +172,7 @@ def visualize_dataset(
     save: bool = False,
     output_dir: Path | None = None,
     urdf: Path | None = None,
-    joint_names: list[str] = None,
+    joint_names: list[str] | None = None,
 ) -> Path | None:
     if save:
         assert output_dir is not None, (
