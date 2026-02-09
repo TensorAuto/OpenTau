@@ -592,6 +592,9 @@ class PI05Policy(PreTrainedPolicy):
             The sampled actions tensor of shape (batch_size, action_chunk_length, action_dim).
         """
         assert 0 <= delay <= self.config.max_delay, f"Delay must be between 0 and {self.config.max_delay}"
+        assert action_prefix is None or action_prefix.shape[1] == self.config.chunk_size, (
+            f"Action prefix must have {self.config.chunk_size} steps"
+        )
 
         batch = self.normalize_inputs(batch)
 
