@@ -56,7 +56,10 @@ def inference_main(cfg: TrainPipelineConfig):
     print(observation.keys())
 
     with torch.inference_mode():
-        # One warmup call right after compiling
+        # two warmup calls are needed right after compiling
+        # the first warmup call is needed for compiling
+        # the second warmup call is needed for kernel autotuning
+        _ = policy.sample_actions(observation)
         _ = policy.sample_actions(observation)
 
         # Run 10 times and record inference times
