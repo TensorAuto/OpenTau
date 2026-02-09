@@ -169,6 +169,11 @@ class PI05Config(PreTrainedConfig):
             logging.info("Setting init_strategy to 'no_init' because we are resuming from a checkpoint.")
             self.init_strategy = "no_init"
 
+        if self.max_delay > self.chunk_size:
+            raise ValueError(
+                f"The max delay must be less than or equal to the chunk size. Got {self.max_delay} for `max_delay` and {self.chunk_size} for `chunk_size`."
+            )
+
     def validate_features(self) -> None:
         """Validates the features and adds empty cameras if configured.
 
