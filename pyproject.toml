@@ -20,13 +20,12 @@ huggingface = "https://huggingface.co/TensorAuto"
 
 [project]
 name = "opentau"
-version = "0.1.2"
+version = "0.2.0"
 description = "OpenTau: Tensor's VLA Training Infrastructure for Real-World Robotics in Pytorch"
 authors = [
     { name = "Shuheng Liu", email = "wish1104@icloud.com" },
     { name = "William Yue", email = "williamyue37@gmail.com" },
     { name = "Akshay Shah", email = "akshayhitendrashah@gmail.com" },
-    { name = "Xingrui Gu", email = "xingrui_gu@berkeley.edu" }
 ]
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -90,6 +89,8 @@ dependencies = [
     "grpcio>=1.60.0",
     "grpcio-tools>=1.60.0",
     "protobuf>=4.25.0",
+    "deepspeed>=0.17.1",
+    "rosbags>=0.10.4"
 ]
 
 [project.scripts]

@@ -97,6 +97,7 @@ Example:
 import importlib
 import json
 import logging
+import shutil
 import subprocess
 import warnings
 from collections import OrderedDict
@@ -129,6 +130,44 @@ def get_safe_default_codec() -> str:
                 "'torchcodec' is not available in your platform, falling back to 'pyav' as a default decoder"
             )
             return "pyav"
+
+
+_safe_encoding_vcodec: str | None = None
+
+
+def get_safe_encoding_vcodec() -> str:
+    """Return an ffmpeg encoding codec that is available on this system.
+
+    Prefers libsvtav1; falls back to libx264 if libsvtav1 is not available
+    (e.g. ffmpeg built without SVT-AV1).
+
+    Returns:
+        "libsvtav1" or "libx264".
+    """
+    global _safe_encoding_vcodec
+    if _safe_encoding_vcodec is not None:
+        return _safe_encoding_vcodec
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        logging.warning("ffmpeg not found in PATH, using 'libx264' for video encoding")
+        _safe_encoding_vcodec = "libx264"
+        return _safe_encoding_vcodec
+    try:
+        result = subprocess.run(
+            [ffmpeg_path, "-encoders"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0 and "libsvtav1" in (result.stdout or ""):
+            _safe_encoding_vcodec = "libsvtav1"
+        else:
+            _safe_encoding_vcodec = "libx264"
+            logging.warning("ffmpeg encoder 'libsvtav1' is not available, using 'libx264' for video encoding")
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        logging.warning("Could not detect ffmpeg encoders (%s), using 'libx264'", e)
+        _safe_encoding_vcodec = "libx264"
+    return _safe_encoding_vcodec
 
 
 def decode_video_frames(
@@ -371,6 +410,13 @@ def encode_video_frames(
     imgs_dir = Path(imgs_dir)
     video_path.parent.mkdir(parents=True, exist_ok=True)
 
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        raise OSError("ffmpeg not found in PATH. Install ffmpeg to encode videos.")
+
+    if vcodec == "libsvtav1":
+        vcodec = get_safe_encoding_vcodec()
+
     ffmpeg_args = OrderedDict(
         [
             ("-f", "image2"),
@@ -399,7 +445,7 @@ def encode_video_frames(
     if overwrite:
         ffmpeg_args.append("-y")
 
-    ffmpeg_cmd = ["ffmpeg"] + ffmpeg_args + [str(video_path)]
+    ffmpeg_cmd = [ffmpeg_path] + ffmpeg_args + [str(video_path)]
     # redirect stdin to subprocess.DEVNULL to prevent reading random keyboard inputs from terminal
     subprocess.run(ffmpeg_cmd, check=True, stdin=subprocess.DEVNULL)
 

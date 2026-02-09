@@ -189,9 +189,9 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
             # Run inference
             with torch.inference_mode():
                 action_chunk = self.policy.sample_actions(batch)
-                # action_chunk shape: (n_action_steps, batch_size=1, action_dim)
+                # action_chunk shape: (batch_size=1, n_action_steps, action_dim)
                 # Remove batch dimension and convert to numpy
-                action_chunk = action_chunk.squeeze(1).to("cpu", torch.float32).numpy()
+                action_chunk = action_chunk.squeeze(0).to("cpu", torch.float32).numpy()
 
             # Populate 2D action chunk structure
             for action_vector in action_chunk:

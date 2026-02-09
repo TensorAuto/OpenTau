@@ -116,6 +116,10 @@ class PI05Config(PreTrainedConfig):
     # Decoding
     num_steps: int = 10
 
+    # Real Time Inference
+    # maximum number of frozen actions
+    max_delay: int = 0
+
     # Initialization strategy
     init_strategy: Literal["no_init", "full_he_init", "expert_only_he_init"] = "full_he_init"
 
@@ -164,6 +168,11 @@ class PI05Config(PreTrainedConfig):
         if self.pretrained_path is not None and self.pretrained_path != "lerobot/pi05":
             logging.info("Setting init_strategy to 'no_init' because we are resuming from a checkpoint.")
             self.init_strategy = "no_init"
+
+        if self.max_delay > self.chunk_size:
+            raise ValueError(
+                f"The max delay must be less than or equal to the chunk size. Got {self.max_delay} for `max_delay` and {self.chunk_size} for `chunk_size`."
+            )
 
     def validate_features(self) -> None:
         """Validates the features and adds empty cameras if configured.

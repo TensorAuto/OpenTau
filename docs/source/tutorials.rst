@@ -14,3 +14,4 @@ This section provides step-by-step guides for common tasks in OpenTau, including
    tutorials/datasets
    tutorials/visualization
    RL
+   tutorials/ros_conversion
