@@ -106,11 +106,12 @@ def load_onnx_session(checkpoint_dir: Path, provider: str | None = None) -> ort.
     if not onnx_path.is_file():
         raise FileNotFoundError(f"ONNX model not found: {onnx_path}")
 
-    providers = provider or (
-        ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        if ort.get_device() == "GPU"
-        else ["CPUExecutionProvider"]
-    )
+    if provider:
+        providers = [provider]
+    elif ort.get_device() == "GPU":
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    else:
+        providers = ["CPUExecutionProvider"]
     sess_options = ort.SessionOptions()
     sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
