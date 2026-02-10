@@ -567,6 +567,7 @@ class PI05Policy(PreTrainedPolicy):
                         action_prefix,
                         (0, 0, 0, self.config.chunk_size - delay),
                     )
+            delay = torch.tensor(delay, dtype=torch.long, device=noise.device)
             actions = self.sample_actions(batch, noise=noise, action_prefix=action_prefix, delay=delay)
             actions = rearrange(actions, "b c d -> c b d")
             self._action_queue.extend(actions[delay:])
@@ -581,21 +582,23 @@ class PI05Policy(PreTrainedPolicy):
     def sample_actions(
         self,
         batch: dict[str, Tensor],
-        noise: Tensor | None = None,
         action_prefix: Tensor | None = None,
-        delay: int = 0,
+        delay: Tensor | None = None,
+        noise: Tensor | None = None,
     ) -> Tensor:
         """Sample actions from the policy given environment observations.
 
         Args:
             batch: Batch of data containing environment observations.
-            noise: Optional noise tensor.
             action_prefix: Optional action prefix tensor of shape (batch_size, action_chunk_length, action_dim).
-            delay: number of frozen delay actions from action_prefix.
+            delay: Optional number of frozen delay actions from action_prefix.
+            noise: Optional noise tensor.
         Returns:
             The sampled actions tensor of shape (batch_size, action_chunk_length, action_dim).
         """
-        assert 0 <= delay <= self.config.max_delay, f"Delay must be between 0 and {self.config.max_delay}"
+        assert delay is None or 0 <= delay.item() <= self.config.max_delay, (
+            f"Delay must be None or between 0 and {self.config.max_delay}"
+        )
         assert action_prefix is None or action_prefix.shape[1] == self.config.chunk_size, (
             f"Action prefix must have {self.config.chunk_size} steps"
         )
@@ -605,13 +608,21 @@ class PI05Policy(PreTrainedPolicy):
         images, img_masks = self.prepare_images(batch)
         lang_tokens, lang_masks = self.prepare_language(batch)
 
+        if delay is None:
+            delay = torch.tensor(0, dtype=torch.long, device=lang_tokens.device)
+
+        if action_prefix is None:
+            bsize = lang_tokens.shape[0]
+            actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
+            action_prefix = torch.zeros(actions_shape, dtype=lang_tokens.dtype, device=lang_tokens.device)
+
         actions = self.model.sample_actions(
             images,
             img_masks,
             lang_tokens,
             lang_masks,
-            action_prefix=action_prefix,
-            delay=delay,
+            action_prefix,
+            delay,
             noise=noise,
         )
 
@@ -1344,8 +1355,8 @@ class PI05FlowMatching(nn.Module):
         img_masks: list[Tensor],
         lang_tokens: Tensor,
         lang_masks: Tensor,
-        action_prefix: Tensor | None = None,
-        delay: int = 0,
+        action_prefix: Tensor,
+        delay: Tensor,
         noise: Tensor | None = None,
     ) -> Tensor:
         """Do a full inference forward and compute the action.
@@ -1355,9 +1366,9 @@ class PI05FlowMatching(nn.Module):
             img_masks: List of image mask tensors.
             lang_tokens: Language token tensor.
             lang_masks: Language mask tensor.
+            action_prefix: Action prefix tensor.
+            delay: Number of delay actions, aka number of actions frozen from the action_prefix.
             noise: Optional noise tensor.
-            action_prefix: Optional action prefix tensor.
-            delay: number of delay actions.
         Returns:
             The sampled action tensor.
         """
@@ -1424,8 +1435,7 @@ class PI05FlowMatching(nn.Module):
         prefix_mask = rearrange(torch.arange(self.config.chunk_size, device=device), "c -> 1 c") < delay
         while time >= -dt / 2:
             # if delay is greater than 0, then freeze the action prefix at the beginning of action chunk
-            if delay > 0:
-                x_t = torch.where(rearrange(prefix_mask, "b c -> b c 1"), action_prefix, x_t)
+            x_t = torch.where(rearrange(prefix_mask, "b c -> b c 1"), action_prefix, x_t)
             masked_time = torch.where(prefix_mask, 0, time)
             v_t = self.denoise_step(
                 prefix_pad_masks,
@@ -1439,8 +1449,7 @@ class PI05FlowMatching(nn.Module):
             time += dt
 
         # we need to ensure the frozen actions are not modified before returning the denoised actions
-        if delay > 0:
-            x_t = torch.where(rearrange(prefix_mask, "b c -> b c 1"), action_prefix, x_t)
+        x_t = torch.where(rearrange(prefix_mask, "b c -> b c 1"), action_prefix, x_t)
         return x_t
 
     def denoise_step(
