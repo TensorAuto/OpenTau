@@ -31,6 +31,8 @@ from typing import Iterator
 
 import numpy as np
 import torch
+import torch.nn.functional as F  # noqa: N812
+from einops import rearrange
 from PIL import Image
 
 import grpc
@@ -158,6 +160,33 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
 
         # Process prompt
         batch["prompt"] = [request.prompt] if request.prompt else [""]
+        if request.prefix_action:
+            prefix_action = rearrange(
+                torch.tensor(
+                    np.stack(
+                        [
+                            np.array(request.prefix_action[i * 37 : (i + 1) * 37], dtype=np.float32).reshape(
+                                1, 37
+                            )
+                            for i in range(len(request.prefix_action) // 37)
+                        ],
+                        axis=0,
+                    ),
+                    dtype=self.dtype,
+                    device=self.device,
+                ),
+                "c b d -> b c d",
+            )
+
+            prefix_action = F.pad(
+                prefix_action,
+                (0, 0, 0, self.cfg.action_chunk - prefix_action.shape[1]),
+            )
+            batch["action_prefix"] = prefix_action
+            batch["delay"] = request.delay
+        else:
+            batch["action_prefix"] = None
+            batch["delay"] = 0
 
         return batch
 
