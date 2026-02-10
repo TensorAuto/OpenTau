@@ -25,6 +25,7 @@ Usage:
 """
 
 import logging
+import pickle  # nosec: CWE-502
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,6 +55,9 @@ class OnnxInferenceArgs:
     n_repeats: int = 3
     provider: str | None = None
     seed: int = 42
+    dump_path: Path | None = (
+        None  # if provided, will dump input and output of the first run to this pickle file
+    )
 
 
 def _prepare_discrete_state(state: np.ndarray) -> list[str]:
@@ -127,7 +131,9 @@ def run_inference(
     state: np.ndarray,
     images: list[np.ndarray],
     noise: np.ndarray | None = None,
+    action_prefix: np.ndarray | None = None,
     rng: np.random.Generator | None = None,
+    dump_path: Path | None = None,
 ) -> np.ndarray:
     """Run one ONNX inference step.
 
@@ -161,6 +167,9 @@ def run_inference(
             dtype=np.float32,
         )
 
+    if action_prefix is None:
+        action_prefix = rng.standard_normal(noise.shape, dtype=np.float32)
+
     num_cams = args.num_cams
     if len(images) != num_cams:
         raise ValueError(f"Expected {num_cams} images (num_cams), got {len(images)}")
@@ -176,6 +185,7 @@ def run_inference(
         "lang_tokens": lang_tokens,
         "lang_masks": lang_masks.astype(np.bool_),
         "noise": noise,
+        "action_prefix": action_prefix,
     }
     for i in range(num_cams):
         input_feed[f"image{i}"] = images[i].astype(np.float32)
@@ -183,8 +193,14 @@ def run_inference(
     # Output is "actions" with shape (n_action_steps, batch_size, action_dim)
     outputs = session.run(None, input_feed)
     actions = outputs[0]
-    # Transpose to (batch_size, n_action_steps, action_dim)
-    actions = np.transpose(actions, (1, 0, 2))
+
+    if dump_path:
+        assert not dump_path.is_dir(), "Expected a file path, not a directory"
+        dump_path.parent.mkdir(parents=True, exist_ok=True)
+        logging.info("Saving inference input and results to %s", dump_path)
+        with open(dump_path, "wb") as f:
+            pickle.dump((input_feed, actions), f)
+
     return actions
 
 
@@ -221,6 +237,7 @@ def main(args: OnnxInferenceArgs):
             state=state,
             images=images,
             rng=rng,
+            dump_path=args.dump_path if step == 0 else None,  # only dump the first run
         )
         step_times.append(time.perf_counter() - t0)
         if step == 0:
