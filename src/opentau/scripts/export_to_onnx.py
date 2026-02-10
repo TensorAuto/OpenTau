@@ -220,7 +220,7 @@ def main(cfg: TrainPipelineConfig):
     output_path = Path(cfg.policy.pretrained_path) / "model.onnx"
     output_path = output_path.resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    # External data file is saved alongside the .onnx file with .onnx_data suffix
+    # External data file is saved alongside the .onnx file with .onnx.data suffix
     weights_path = output_path.with_suffix(".onnx.data")
 
     with torch.inference_mode():

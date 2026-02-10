@@ -191,7 +191,7 @@ def run_inference(
     for i in range(num_cams):
         input_feed[f"image{i}"] = images[i].astype(np.float32)
 
-    # Output is "actions" with shape (n_action_steps, batch_size, action_dim)
+    # Output is "actions" with shape (batch_size, n_action_steps, action_dim)
     outputs = session.run(None, input_feed)
     actions = outputs[0]
 
