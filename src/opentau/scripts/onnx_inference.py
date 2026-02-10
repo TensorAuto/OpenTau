@@ -50,9 +50,10 @@ class OnnxInferenceArgs:
     n_action_steps: int = 10
     max_action_dim: int = 32
     max_state_dim: int = 32
+    delay: int = 1
     predict_response: bool = False
     prompt: str = "Pick up the object and place it in the target location"
-    n_repeats: int = 3
+    n_repeats: int = 10
     provider: str | None = None
     seed: int = 42
     dump_path: Path | None = (
@@ -133,6 +134,7 @@ def run_inference(
     images: list[np.ndarray],
     noise: np.ndarray | None = None,
     action_prefix: np.ndarray | None = None,
+    delay: int = 1,
     rng: np.random.Generator | None = None,
     dump_path: Path | None = None,
 ) -> np.ndarray:
@@ -171,6 +173,8 @@ def run_inference(
     if action_prefix is None:
         action_prefix = rng.standard_normal(noise.shape, dtype=np.float32)
 
+    delay = np.array([delay], dtype=np.int64)
+
     num_cams = args.num_cams
     if len(images) != num_cams:
         raise ValueError(f"Expected {num_cams} images (num_cams), got {len(images)}")
@@ -186,6 +190,7 @@ def run_inference(
         "lang_tokens": lang_tokens,
         "lang_masks": lang_masks.astype(np.bool_),
         "noise": noise,
+        "delay": delay,
         "action_prefix": action_prefix,
     }
     for i in range(num_cams):
@@ -207,6 +212,7 @@ def run_inference(
 
 @parser.wrap()
 def main(args: OnnxInferenceArgs):
+    print("Running inference with:", args)
     init_logging()
     checkpoint_dir = Path(args.checkpoint_dir).resolve()
     if not checkpoint_dir.is_dir():
@@ -238,6 +244,7 @@ def main(args: OnnxInferenceArgs):
             state=state,
             images=images,
             rng=rng,
+            delay=args.delay,
             dump_path=args.dump_path if step == 0 else None,  # only dump the first run
         )
         step_times.append(time.perf_counter() - t0)

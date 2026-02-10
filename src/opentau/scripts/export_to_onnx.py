@@ -85,6 +85,7 @@ class PI05OnnxWrapper(torch.nn.Module):
         lang_masks: Tensor,
         noise: Tensor,
         action_prefix: Tensor,
+        delay: Tensor,
         *images: Tensor,
     ) -> Tensor:
         """Forward pass for ONNX export.
@@ -94,6 +95,8 @@ class PI05OnnxWrapper(torch.nn.Module):
             lang_masks: Language attention masks of shape (batch, seq_len).
             noise: Initial noise tensor of shape (batch, n_action_steps, max_action_dim).
                    This should be sampled from N(0, 1) externally.
+            action_prefix: Action prefix tensor of shape (batch, n_action_steps, max_action_dim).
+            delay: Delay tensor of shape (1,).
             *images: Variable number of image tensors, each of shape (batch, 3, H, W).
 
         Returns:
@@ -109,7 +112,7 @@ class PI05OnnxWrapper(torch.nn.Module):
             lang_tokens,
             lang_masks,
             action_prefix,
-            self.policy.config.max_delay,
+            delay,
             noise=noise,
         )
 
@@ -169,12 +172,14 @@ def create_onnx_inputs(policy: PI05Policy, cfg, device, dtype):
         img = torch.zeros((1, 3, *resolution), dtype=dtype, device=device)
         images.append(img)
 
+    delay = torch.ones(1, dtype=torch.long, device=device)
+
     # Build input names: lang_tokens, lang_masks, noise, image0, image1, ...
-    input_names = ["lang_tokens", "lang_masks", "noise", "action_prefix"] + [
+    input_names = ["lang_tokens", "lang_masks", "noise", "action_prefix", "delay"] + [
         f"image{i}" for i in range(len(images))
     ]
 
-    return lang_tokens, lang_masks, noise, action_prefix, images, input_names
+    return lang_tokens, lang_masks, noise, action_prefix, delay, images, input_names
 
 
 @parser.wrap()
@@ -204,17 +209,18 @@ def main(cfg: TrainPipelineConfig):
     logging.info("Created ONNX inference wrapper")
 
     # Create dummy inputs by pre-tokenizing
-    lang_tokens, lang_masks, noise, action_prefix, images, input_names = create_onnx_inputs(
+    lang_tokens, lang_masks, noise, action_prefix, delay, images, input_names = create_onnx_inputs(
         policy, cfg, device, dtype
     )
     logging.info(f"Generated example inputs with {len(images)} cameras")
     logging.info(f"Language tokens shape: {lang_tokens.shape}")
     logging.info(f"Noise shape: {noise.shape}")
     logging.info(f"Action prefix shape: {action_prefix.shape}")
+    logging.info(f"Delay: {delay}")
     logging.info(f"Input names: {input_names}")
 
     # Build args tuple: (lang_tokens, lang_masks, noise, image0, image1, ...)
-    args = (lang_tokens, lang_masks, noise, action_prefix) + tuple(images)
+    args = (lang_tokens, lang_masks, noise, action_prefix, delay) + tuple(images)
 
     logging.info("Exporting model to ONNX with Dynamo exporter...")
     output_path = Path(cfg.policy.pretrained_path) / "model.onnx"
