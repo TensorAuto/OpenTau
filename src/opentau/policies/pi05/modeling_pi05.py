@@ -567,7 +567,7 @@ class PI05Policy(PreTrainedPolicy):
                         action_prefix,
                         (0, 0, 0, self.config.chunk_size - delay),
                     )
-            delay = torch.tensor(delay, dtype=torch.long, device=noise.device)
+            delay = torch.tensor(delay, dtype=torch.long, device=batch["state"].device)
             actions = self.sample_actions(batch, noise=noise, action_prefix=action_prefix, delay=delay)
             actions = rearrange(actions, "b c d -> c b d")
             self._action_queue.extend(actions[delay:])
