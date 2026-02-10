@@ -79,7 +79,14 @@ class PI05OnnxWrapper(torch.nn.Module):
         super().__init__()
         self.policy = policy
 
-    def forward(self, lang_tokens: Tensor, lang_masks: Tensor, noise: Tensor, *images: Tensor) -> Tensor:
+    def forward(
+        self,
+        lang_tokens: Tensor,
+        lang_masks: Tensor,
+        noise: Tensor,
+        action_prefix: Tensor,
+        *images: Tensor,
+    ) -> Tensor:
         """Forward pass for ONNX export.
 
         Args:
@@ -92,8 +99,6 @@ class PI05OnnxWrapper(torch.nn.Module):
         Returns:
             Action tensor of shape (batch, n_action_steps, action_dim).
         """
-        print("Starting forward pass of the wrapper...")
-
         # Process images
         image_batch = {f"camera{i}": img for i, img in enumerate(images)}
         processed_images, img_masks = self.policy.prepare_images(image_batch)
@@ -103,6 +108,8 @@ class PI05OnnxWrapper(torch.nn.Module):
             img_masks,
             lang_tokens,
             lang_masks,
+            action_prefix,
+            self.policy.config.max_delay,
             noise=noise,
         )
 
@@ -111,11 +118,6 @@ class PI05OnnxWrapper(torch.nn.Module):
         actions = actions[:, :, :original_action_dim]
 
         actions = self.policy.unnormalize_outputs({"actions": actions})["actions"]
-
-        # `policy.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
-        # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
-        actions = actions.transpose(0, 1)
-        print("Finished forward pass of the wrapper")
         return actions
 
 
@@ -157,6 +159,9 @@ def create_onnx_inputs(policy: PI05Policy, cfg, device, dtype):
     noise_shape = (1, policy.config.n_action_steps, policy.config.max_action_dim)
     noise = torch.randn(noise_shape, dtype=dtype, device=device)
 
+    # Create action prefix
+    action_prefix = torch.zeros(noise_shape, dtype=dtype, device=device)
+
     # Create dummy images
     resolution = cfg.resolution if hasattr(cfg, "resolution") else (224, 224)
     images = []
@@ -165,9 +170,11 @@ def create_onnx_inputs(policy: PI05Policy, cfg, device, dtype):
         images.append(img)
 
     # Build input names: lang_tokens, lang_masks, noise, image0, image1, ...
-    input_names = ["lang_tokens", "lang_masks", "noise"] + [f"image{i}" for i in range(len(images))]
+    input_names = ["lang_tokens", "lang_masks", "noise", "action_prefix"] + [
+        f"image{i}" for i in range(len(images))
+    ]
 
-    return lang_tokens, lang_masks, noise, images, input_names
+    return lang_tokens, lang_masks, noise, action_prefix, images, input_names
 
 
 @parser.wrap()
@@ -197,14 +204,17 @@ def main(cfg: TrainPipelineConfig):
     logging.info("Created ONNX inference wrapper")
 
     # Create dummy inputs by pre-tokenizing
-    lang_tokens, lang_masks, noise, images, input_names = create_onnx_inputs(policy, cfg, device, dtype)
+    lang_tokens, lang_masks, noise, action_prefix, images, input_names = create_onnx_inputs(
+        policy, cfg, device, dtype
+    )
     logging.info(f"Generated example inputs with {len(images)} cameras")
     logging.info(f"Language tokens shape: {lang_tokens.shape}")
     logging.info(f"Noise shape: {noise.shape}")
+    logging.info(f"Action prefix shape: {action_prefix.shape}")
     logging.info(f"Input names: {input_names}")
 
     # Build args tuple: (lang_tokens, lang_masks, noise, image0, image1, ...)
-    args = (lang_tokens, lang_masks, noise) + tuple(images)
+    args = (lang_tokens, lang_masks, noise, action_prefix) + tuple(images)
 
     logging.info("Exporting model to ONNX with Dynamo exporter...")
     output_path = Path(cfg.policy.pretrained_path) / "model.onnx"
