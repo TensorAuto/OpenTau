@@ -352,8 +352,7 @@ def attempt_torch_compile(fn: callable, device_hint=None) -> callable:
     if hasattr(torch, "compile"):
         logging.info("Attempting to compile the policy with torch.compile()...")
         try:
-            # Other options: "default", "max-autotune" (longer compile time)
-            fn = torch.compile(fn)
+            fn = torch.compile(fn, mode="max-autotune")
             logging.info("Policy compiled successfully.")
         except Exception as e:
             logging.warning(f"torch.compile failed with error: {e}. Proceeding without compilation.")
