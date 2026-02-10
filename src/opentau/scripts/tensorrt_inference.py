@@ -101,8 +101,6 @@ def load_tensorrt_session(
 
     providers = [
         ("TensorrtExecutionProvider", trt_options),
-        "CUDAExecutionProvider",
-        "CPUExecutionProvider",
     ]
 
     sess_options = ort.SessionOptions()
