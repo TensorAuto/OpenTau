@@ -207,7 +207,7 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
                 (0, 0, 0, self.cfg.action_chunk - prefix_action.shape[1]),
             )
             action_prefix = prefix_action
-            delay = request.delay
+            delay = torch.tensor(request.delay, dtype=torch.long, device=self.device)
         else:
             action_prefix = torch.zeros(
                 (1, self.cfg.action_chunk, self.cfg.max_action_dim), dtype=self.dtype, device=self.device
