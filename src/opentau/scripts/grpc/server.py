@@ -24,6 +24,7 @@ Usage:
 
 import io
 import logging
+import traceback
 from concurrent import futures
 from dataclasses import asdict
 from pprint import pformat
@@ -75,27 +76,26 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
         self.policy = policy_class.from_pretrained(self.cfg.policy.pretrained_path, config=self.cfg.policy)
         self.policy.to(device=self.device, dtype=self.dtype)
         self.policy.eval()
-        self.policy.sample_actions = attempt_torch_compile(
-            self.policy.sample_actions, device_hint=self.device
+        self.policy.model.sample_actions = attempt_torch_compile(
+            self.policy.model.sample_actions, device_hint=self.device
         )
 
         self.policy.reset()
 
         camera_observations = {
             f"camera{i}": torch.zeros((1, 3, *self.cfg.resolution), dtype=self.dtype, device=self.device)
-            for i in range(1)
+            for i in range(self.cfg.num_cams)
         }
         observation = {
             **camera_observations,
             "state": torch.zeros((1, self.cfg.max_state_dim), dtype=self.dtype, device=self.device),
             "prompt": ["Pick up yellow lego block and put it in the bin"],
             "img_is_pad": torch.zeros((1, 1), dtype=torch.bool, device=self.device),
-            "action_is_pad": torch.zeros((1, self.cfg.action_chunk), dtype=torch.bool, device=self.device),
         }
         action_prefix = torch.zeros(
             (1, self.cfg.action_chunk, self.cfg.max_action_dim), dtype=self.dtype, device=self.device
         )
-        delay = 0
+        delay = torch.tensor(0, dtype=torch.long, device=self.device)
 
         with torch.inference_mode():
             # One warmup call right after compiling
@@ -212,7 +212,7 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
             action_prefix = torch.zeros(
                 (1, self.cfg.action_chunk, self.cfg.max_action_dim), dtype=self.dtype, device=self.device
             )
-            delay = 0
+            delay = torch.tensor(0, dtype=torch.long, device=self.device)
 
         return batch, action_prefix, delay
 
@@ -261,6 +261,7 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
 
         except Exception as e:
             # Unexpected error during inference
+            traceback.print_exc()
             logger.exception("Error during inference")
             context.abort(grpc.StatusCode.INTERNAL, f"Inference error: {e}")
 

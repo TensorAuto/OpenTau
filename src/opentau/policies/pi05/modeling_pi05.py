@@ -596,12 +596,13 @@ class PI05Policy(PreTrainedPolicy):
         Returns:
             The sampled actions tensor of shape (batch_size, action_chunk_length, action_dim).
         """
-        assert delay is None or 0 <= delay.item() <= self.config.max_delay, (
-            f"Delay must be None or between 0 and {self.config.max_delay}"
-        )
-        assert action_prefix is None or action_prefix.shape[1] == self.config.chunk_size, (
-            f"Action prefix must have {self.config.chunk_size} steps"
-        )
+        if not (torch.compiler.is_compiling() or torch.onnx.is_in_onnx_export()):
+            assert delay is None or 0 <= delay.item() <= self.config.max_delay, (
+                f"Delay must be None or between 0 and {self.config.max_delay}"
+            )
+            assert action_prefix is None or action_prefix.shape[1] == self.config.chunk_size, (
+                f"Action prefix must have {self.config.chunk_size} steps"
+            )
 
         batch = self.normalize_inputs(batch)
 
