@@ -75,9 +75,36 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
         self.policy = policy_class.from_pretrained(self.cfg.policy.pretrained_path, config=self.cfg.policy)
         self.policy.to(device=self.device, dtype=self.dtype)
         self.policy.eval()
-        self.policy = attempt_torch_compile(self.policy, device_hint=self.device)
+        self.policy.sample_actions = attempt_torch_compile(
+            self.policy.sample_actions, device_hint=self.device
+        )
+
         self.policy.reset()
-        logger.info("Policy loaded successfully")
+
+        camera_observations = {
+            f"camera{i}": torch.zeros((1, 3, *self.cfg.resolution), dtype=self.dtype, device=self.device)
+            for i in range(1)
+        }
+        observation = {
+            **camera_observations,
+            "state": torch.zeros((1, self.cfg.max_state_dim), dtype=self.dtype, device=self.device),
+            "prompt": ["Pick up yellow lego block and put it in the bin"],
+            "img_is_pad": torch.zeros((1, 1), dtype=torch.bool, device=self.device),
+            "action_is_pad": torch.zeros((1, self.cfg.action_chunk), dtype=torch.bool, device=self.device),
+        }
+        action_prefix = torch.zeros(
+            (1, self.cfg.action_chunk, self.cfg.max_action_dim), dtype=self.dtype, device=self.device
+        )
+        delay = 0
+
+        with torch.inference_mode():
+            # One warmup call right after compiling
+            # two warmup calls are needed right after compiling
+            # the first warmup call is needed for compiling
+            # the second warmup call is needed for kernel autotuning
+            _ = self.policy.sample_actions(observation, action_prefix=action_prefix, delay=delay)
+            _ = self.policy.sample_actions(observation, action_prefix=action_prefix, delay=delay)
+            logger.info("Policy loaded successfully")
 
     def _decode_image(self, camera_image: robot_inference_pb2.CameraImage) -> torch.Tensor:
         """Decode an image from the protobuf message.
@@ -169,17 +196,25 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
                 device=self.device,
             )
 
+            if prefix_action.shape[2] < self.cfg.max_action_dim:
+                prefix_action = F.pad(
+                    prefix_action,
+                    (0, self.cfg.max_action_dim - prefix_action.shape[2]),
+                )
+
             prefix_action = F.pad(
                 prefix_action,
                 (0, 0, 0, self.cfg.action_chunk - prefix_action.shape[1]),
             )
-            batch["action_prefix"] = prefix_action
-            batch["delay"] = request.delay
+            action_prefix = prefix_action
+            delay = request.delay
         else:
-            batch["action_prefix"] = None
-            batch["delay"] = 0
+            action_prefix = torch.zeros(
+                (1, self.cfg.action_chunk, self.cfg.max_action_dim), dtype=self.dtype, device=self.device
+            )
+            delay = 0
 
-        return batch
+        return batch, action_prefix, delay
 
     def GetActionChunk(
         self,
@@ -204,11 +239,11 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
 
         try:
             # Prepare observation batch
-            batch = self._prepare_observation(request)
+            batch, action_prefix, delay = self._prepare_observation(request)
 
             # Run inference
             with torch.inference_mode():
-                action_chunk = self.policy.sample_actions(batch)
+                action_chunk = self.policy.sample_actions(batch, action_prefix=action_prefix, delay=delay)
                 # action_chunk shape: (batch_size=1, n_action_steps, action_dim)
                 # Remove batch dimension and convert to numpy
                 action_chunk = action_chunk.squeeze(0).to("cpu", torch.float32).numpy()
