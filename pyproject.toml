@@ -136,6 +136,10 @@ libero = [
 urdf = [
     "rerun-sdk>=0.28.2",
 ]
+trt = [
+    "tensorrt>=10.15.1.29",
+    "tensorrt>=10.9.0 ; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and (platform_machine == 'AMD64' or platform_machine == 'x86_64'))",
+]
 
 [tool.uv.sources]
 libero = { git = "https://github.com/shuheng-liu/LIBERO" , branch = "master" }  # the official libero repo is misconfigured for pip install with git

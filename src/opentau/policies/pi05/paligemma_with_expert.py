@@ -23,11 +23,10 @@ action generation and conditioning.
 """
 
 import torch
-import torch.version
-from pytest import Cache
 from torch import nn
 from transformers import (
     AutoConfig,
+    Cache,
     GemmaForCausalLM,
     PaliGemmaForConditionalGeneration,
     PretrainedConfig,
@@ -35,6 +34,10 @@ from transformers import (
 )
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
+
+
+def _preferred_dtype():
+    return torch.float32 if torch.onnx.is_in_onnx_export() else torch.bfloat16
 
 
 def apply_rope(x: torch.Tensor, positions: torch.Tensor, max_wavelength: int = 10_000) -> torch.Tensor:
@@ -246,7 +249,8 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
 
         self.dropout = nn.Dropout(config.dropout)
 
-        self.to_bfloat16_like_physical_intelligence()
+        if not torch.compiler.is_compiling():  # Only cast to bfloat16 if not compiling
+            self.to_bfloat16_like_physical_intelligence()
         self.set_requires_grad()
 
     def set_requires_grad(self) -> None:
@@ -402,7 +406,7 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
                 input_shape = hidden_states.shape[:-1]
                 hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
 
-                hidden_states = hidden_states.to(dtype=torch.bfloat16)
+                hidden_states = hidden_states.to(dtype=_preferred_dtype())
                 query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape)
                 key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape)
                 value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape)
@@ -442,7 +446,7 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             att_output = attention_interface(
                 attention_mask, batch_size, head_dim, query_states, key_states, value_states
             )
-            att_output = att_output.to(dtype=torch.bfloat16)
+            att_output = att_output.to(dtype=_preferred_dtype())
 
             # first part of att_output is prefix (up to sequence length, [:, 0:prefix_seq_len])
             outputs_embeds = []
