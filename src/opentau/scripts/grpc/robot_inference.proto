@@ -44,8 +44,10 @@ message ObservationRequest {
     repeated CameraImage images = 1;  // Camera images
     RobotState robot_state = 2;       // Robot state
     string prompt = 3;                // Language instruction/prompt
-    int64 timestamp_ns = 4;           // Timestamp in nanoseconds
-    string request_id = 5;            // Unique request identifier
+    repeated ActionVector prefix_action = 4;  // Optional prefix actions, shape (steps, 1, action_dim) sent as list of vectors
+    int32 delay = 5;                  // Delay (e.g. actions to be freezed)
+    int64 timestamp_ns = 6;            // Timestamp in nanoseconds
+    string request_id = 7;            // Unique request identifier
 }
 
 // Single action vector at a timestep

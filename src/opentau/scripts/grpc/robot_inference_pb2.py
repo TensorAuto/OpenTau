@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x15robot_inference.proto\x12\x0frobot_inference\"3\n\x0b\x43\x61meraImage\x12\x12\n\nimage_data\x18\x01 \x01(\x0c\x12\x10\n\x08\x65ncoding\x18\x02 \x01(\t\"\x1b\n\nRobotState\x12\r\n\x05state\x18\x01 \x03(\x02\"\xd4\x01\n\x12ObservationRequest\x12,\n\x06images\x18\x01 \x03(\x0b\x32\x1c.robot_inference.CameraImage\x12\x30\n\x0brobot_state\x18\x02 \x01(\x0b\x32\x1b.robot_inference.RobotState\x12\x0e\n\x06prompt\x18\x03 \x01(\t\x12\x15\n\rprefix_action\x18\x04 \x03(\x02\x12\r\n\x05\x64\x65lay\x18\x05 \x01(\x05\x12\x14\n\x0ctimestamp_ns\x18\x06 \x01(\x03\x12\x12\n\nrequest_id\x18\x07 \x01(\t\"\x1e\n\x0c\x41\x63tionVector\x12\x0e\n\x06values\x18\x01 \x03(\x02\"\x8f\x01\n\x13\x41\x63tionChunkResponse\x12\x33\n\x0c\x61\x63tion_chunk\x18\x01 \x03(\x0b\x32\x1d.robot_inference.ActionVector\x12\x14\n\x0ctimestamp_ns\x18\x02 \x01(\x03\x12\x12\n\nrequest_id\x18\x03 \x01(\t\x12\x19\n\x11inference_time_ms\x18\x04 \x01(\x02\"\x14\n\x12HealthCheckRequest\"\x93\x01\n\x13HealthCheckResponse\x12\x0f\n\x07healthy\x18\x01 \x01(\x08\x12\x0e\n\x06status\x18\x02 \x01(\t\x12\x12\n\nmodel_name\x18\x03 \x01(\t\x12\x0e\n\x06\x64\x65vice\x18\x04 \x01(\t\x12\x1a\n\x12gpu_memory_used_gb\x18\x05 \x01(\x02\x12\x1b\n\x13gpu_memory_total_gb\x18\x06 \x01(\x02\x32\xb0\x02\n\x12RobotPolicyService\x12[\n\x0eGetActionChunk\x12#.robot_inference.ObservationRequest\x1a$.robot_inference.ActionChunkResponse\x12\x63\n\x12StreamActionChunks\x12#.robot_inference.ObservationRequest\x1a$.robot_inference.ActionChunkResponse(\x01\x30\x01\x12X\n\x0bHealthCheck\x12#.robot_inference.HealthCheckRequest\x1a$.robot_inference.HealthCheckResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x15robot_inference.proto\x12\x0frobot_inference\"3\n\x0b\x43\x61meraImage\x12\x12\n\nimage_data\x18\x01 \x01(\x0c\x12\x10\n\x08\x65ncoding\x18\x02 \x01(\t\"\x1b\n\nRobotState\x12\r\n\x05state\x18\x01 \x03(\x02\"\xf3\x01\n\x12ObservationRequest\x12,\n\x06images\x18\x01 \x03(\x0b\x32\x1c.robot_inference.CameraImage\x12\x30\n\x0brobot_state\x18\x02 \x01(\x0b\x32\x1b.robot_inference.RobotState\x12\x0e\n\x06prompt\x18\x03 \x01(\t\x12\x34\n\rprefix_action\x18\x04 \x03(\x0b\x32\x1d.robot_inference.ActionVector\x12\r\n\x05\x64\x65lay\x18\x05 \x01(\x05\x12\x14\n\x0ctimestamp_ns\x18\x06 \x01(\x03\x12\x12\n\nrequest_id\x18\x07 \x01(\t\"\x1e\n\x0c\x41\x63tionVector\x12\x0e\n\x06values\x18\x01 \x03(\x02\"\x8f\x01\n\x13\x41\x63tionChunkResponse\x12\x33\n\x0c\x61\x63tion_chunk\x18\x01 \x03(\x0b\x32\x1d.robot_inference.ActionVector\x12\x14\n\x0ctimestamp_ns\x18\x02 \x01(\x03\x12\x12\n\nrequest_id\x18\x03 \x01(\t\x12\x19\n\x11inference_time_ms\x18\x04 \x01(\x02\"\x14\n\x12HealthCheckRequest\"\x93\x01\n\x13HealthCheckResponse\x12\x0f\n\x07healthy\x18\x01 \x01(\x08\x12\x0e\n\x06status\x18\x02 \x01(\t\x12\x12\n\nmodel_name\x18\x03 \x01(\t\x12\x0e\n\x06\x64\x65vice\x18\x04 \x01(\t\x12\x1a\n\x12gpu_memory_used_gb\x18\x05 \x01(\x02\x12\x1b\n\x13gpu_memory_total_gb\x18\x06 \x01(\x02\x32\xb0\x02\n\x12RobotPolicyService\x12[\n\x0eGetActionChunk\x12#.robot_inference.ObservationRequest\x1a$.robot_inference.ActionChunkResponse\x12\x63\n\x12StreamActionChunks\x12#.robot_inference.ObservationRequest\x1a$.robot_inference.ActionChunkResponse(\x01\x30\x01\x12X\n\x0bHealthCheck\x12#.robot_inference.HealthCheckRequest\x1a$.robot_inference.HealthCheckResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -36,15 +36,15 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_ROBOTSTATE']._serialized_start=95
   _globals['_ROBOTSTATE']._serialized_end=122
   _globals['_OBSERVATIONREQUEST']._serialized_start=125
-  _globals['_OBSERVATIONREQUEST']._serialized_end=337
-  _globals['_ACTIONVECTOR']._serialized_start=339
-  _globals['_ACTIONVECTOR']._serialized_end=369
-  _globals['_ACTIONCHUNKRESPONSE']._serialized_start=372
-  _globals['_ACTIONCHUNKRESPONSE']._serialized_end=515
-  _globals['_HEALTHCHECKREQUEST']._serialized_start=517
-  _globals['_HEALTHCHECKREQUEST']._serialized_end=537
-  _globals['_HEALTHCHECKRESPONSE']._serialized_start=540
-  _globals['_HEALTHCHECKRESPONSE']._serialized_end=687
-  _globals['_ROBOTPOLICYSERVICE']._serialized_start=690
-  _globals['_ROBOTPOLICYSERVICE']._serialized_end=994
+  _globals['_OBSERVATIONREQUEST']._serialized_end=368
+  _globals['_ACTIONVECTOR']._serialized_start=370
+  _globals['_ACTIONVECTOR']._serialized_end=400
+  _globals['_ACTIONCHUNKRESPONSE']._serialized_start=403
+  _globals['_ACTIONCHUNKRESPONSE']._serialized_end=546
+  _globals['_HEALTHCHECKREQUEST']._serialized_start=548
+  _globals['_HEALTHCHECKREQUEST']._serialized_end=568
+  _globals['_HEALTHCHECKRESPONSE']._serialized_start=571
+  _globals['_HEALTHCHECKRESPONSE']._serialized_end=718
+  _globals['_ROBOTPOLICYSERVICE']._serialized_start=721
+  _globals['_ROBOTPOLICYSERVICE']._serialized_end=1025
 # @@protoc_insertion_point(module_scope)
