@@ -20,7 +20,7 @@ huggingface = "https://huggingface.co/TensorAuto"
 
 [project]
 name = "opentau"
-version = "0.2.1"
+version = "0.3.0"
 description = "OpenTau: Tensor's VLA Training Infrastructure for Real-World Robotics in Pytorch"
 authors = [
     { name = "Shuheng Liu", email = "wish1104@icloud.com" },
