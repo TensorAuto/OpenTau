@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = "==3.10.*"
 resolution-markers = [
     "platform_machine == 'x86_64' and sys_platform == 'linux' and extra != 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf'",
@@ -462,7 +462,7 @@ name = "cuda-bindings"
 version = "12.9.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cuda-pathfinder", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform != 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
+    { name = "cuda-pathfinder", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/37/31/bfcc870f69c6a017c4ad5c42316207fc7551940db6f3639aa4466ec5faf3/cuda_bindings-12.9.4-cp310-cp310-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:a022c96b8bd847e8dc0675523431149a4c3e872f440e3002213dbb9e08f0331a", size = 11800959, upload-time = "2025-10-21T14:51:26.458Z" },
@@ -1857,7 +1857,7 @@ name = "nvidia-cudnn-cu12"
 version = "9.10.2.21"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-cublas-cu12", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform != 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
+    { name = "nvidia-cublas-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/fa/41/e79269ce215c857c935fd86bcfe91a451a584dfc27f1e068f568b9ad1ab7/nvidia_cudnn_cu12-9.10.2.21-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:c9132cc3f8958447b4910a1720036d9eff5928cc3179b0a51fb6d167c6cc87d8", size = 705026878, upload-time = "2025-06-06T21:52:51.348Z" },
@@ -1870,7 +1870,7 @@ name = "nvidia-cufft-cu12"
 version = "11.3.3.83"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-nvjitlink-cu12", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform != 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
+    { name = "nvidia-nvjitlink-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/60/bc/7771846d3a0272026c416fbb7e5f4c1f146d6d80704534d0b187dd6f4800/nvidia_cufft_cu12-11.3.3.83-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:848ef7224d6305cdb2a4df928759dca7b1201874787083b6e7550dd6765ce69a", size = 193109211, upload-time = "2025-03-07T01:44:56.873Z" },
@@ -1902,9 +1902,9 @@ name = "nvidia-cusolver-cu12"
 version = "11.7.3.90"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-cublas-cu12", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform != 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
-    { name = "nvidia-cusparse-cu12", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform != 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
-    { name = "nvidia-nvjitlink-cu12", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform != 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
+    { name = "nvidia-cublas-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "nvidia-cusparse-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "nvidia-nvjitlink-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c8/32/f7cd6ce8a7690544d084ea21c26e910a97e077c9b7f07bf5de623ee19981/nvidia_cusolver_cu12-11.7.3.90-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:db9ed69dbef9715071232caa9b69c52ac7de3a95773c2db65bdba85916e4e5c0", size = 267229841, upload-time = "2025-03-07T01:46:54.356Z" },
@@ -1917,7 +1917,7 @@ name = "nvidia-cusparse-cu12"
 version = "12.5.8.93"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-nvjitlink-cu12", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform != 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
+    { name = "nvidia-nvjitlink-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/bc/f7/cd777c4109681367721b00a106f491e0d0d15cfa1fd59672ce580ce42a97/nvidia_cusparse_cu12-12.5.8.93-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:9b6c161cb130be1a07a27ea6923df8141f3c295852f4b260c65f18f3e0a091dc", size = 288117129, upload-time = "2025-03-07T01:47:40.407Z" },
@@ -2208,7 +2208,7 @@ wheels = [
 
 [[package]]
 name = "opentau"
-version = "0.2.0"
+version = "0.2.1"
 source = { editable = "." }
 dependencies = [
     { name = "accelerate" },
@@ -2237,6 +2237,7 @@ dependencies = [
     { name = "onnxruntime", marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or (platform_machine != 'aarch64' and platform_machine != 'arm64' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or sys_platform == 'darwin'" },
     { name = "onnxruntime-gpu", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (platform_machine == 'x86_64' and sys_platform == 'win32') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform == 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform == 'win32' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
     { name = "onnxscript" },
+    { name = "openai" },
     { name = "opencv-python-headless", version = "4.11.0.86", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-opentau-libero'" },
     { name = "opencv-python-headless", version = "4.13.0.90", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-opentau-urdf' or extra != 'extra-7-opentau-libero'" },
     { name = "packaging" },
@@ -2248,6 +2249,7 @@ dependencies = [
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "pytest-xdist" },
+    { name = "python-dotenv" },
     { name = "pyzmq" },
     { name = "rerun-sdk", version = "0.23.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-opentau-libero'" },
     { name = "rerun-sdk", version = "0.29.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-opentau-urdf' or extra != 'extra-7-opentau-libero'" },
@@ -2295,10 +2297,6 @@ libero = [
     { name = "robosuite" },
     { name = "thop" },
 ]
-openai = [
-    { name = "openai" },
-    { name = "python-dotenv" },
-]
 trt = [
     { name = "tensorrt" },
 ]
@@ -2329,7 +2327,7 @@ requires-dist = [
     { name = "gym", marker = "extra == 'libero'", specifier = ">=0.25,<0.27" },
     { name = "gymnasium", extras = ["other"], specifier = ">=0.29" },
     { name = "h5py", specifier = ">=3.10.0" },
-    { name = "huggingface-hub", extras = ["hf-transfer", "cli"], marker = "python_full_version < '4'", specifier = ">=0.27.1" },
+    { name = "huggingface-hub", extras = ["hf-transfer", "cli"], marker = "python_full_version < '4.0'", specifier = ">=0.27.1" },
     { name = "imageio", extras = ["ffmpeg"], specifier = ">=2.34.0" },
     { name = "jsonlines", specifier = ">=4.0.0" },
     { name = "libero", marker = "extra == 'libero'", git = "https://github.com/shuheng-liu/LIBERO?branch=master" },
@@ -2347,7 +2345,7 @@ requires-dist = [
     { name = "onnxruntime", marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or sys_platform == 'darwin'", specifier = ">=1.22.1" },
     { name = "onnxruntime-gpu", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (platform_machine == 'x86_64' and sys_platform == 'win32')", specifier = ">=1.22.0" },
     { name = "onnxscript", specifier = ">=0.3.1" },
-    { name = "openai", marker = "extra == 'openai'", specifier = ">=1.0.0" },
+    { name = "openai", specifier = ">=2.16.0" },
     { name = "opencv-python-headless", specifier = ">=4.9.0" },
     { name = "packaging", specifier = ">=24.2" },
     { name = "pandas", specifier = ">=2.2.2" },
@@ -2366,7 +2364,7 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0.0" },
     { name = "pytest-xdist", specifier = ">=3.8.0" },
     { name = "pytest-xdist", marker = "extra == 'dev'", specifier = ">=3.8.0" },
-    { name = "python-dotenv", marker = "extra == 'openai'", specifier = ">=1.0.0" },
+    { name = "python-dotenv", specifier = ">=1.2.1" },
     { name = "pyzmq", specifier = ">=26.2.1" },
     { name = "rerun-sdk", specifier = ">=0.21.0" },
     { name = "rerun-sdk", marker = "extra == 'urdf'", specifier = ">=0.28.2" },
@@ -2391,7 +2389,7 @@ requires-dist = [
     { name = "wandb", specifier = ">=0.16.3" },
     { name = "zarr", specifier = ">=2.17.0" },
 ]
-provides-extras = ["dev", "openai", "libero", "urdf", "trt"]
+provides-extras = ["dev", "libero", "urdf", "trt"]
 
 [[package]]
 name = "orderly-set"
@@ -2832,7 +2830,7 @@ name = "pytest"
 version = "9.0.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
+    { name = "colorama", marker = "sys_platform == 'win32'" },
     { name = "exceptiongroup" },
     { name = "iniconfig" },
     { name = "packaging" },
@@ -3078,11 +3076,11 @@ resolution-markers = [
     "sys_platform == 'emscripten'",
 ]
 dependencies = [
-    { name = "attrs", marker = "extra == 'extra-7-opentau-urdf' or extra != 'extra-7-opentau-libero'" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-opentau-urdf' or extra != 'extra-7-opentau-libero'" },
-    { name = "pillow", marker = "extra == 'extra-7-opentau-urdf' or extra != 'extra-7-opentau-libero'" },
-    { name = "pyarrow", marker = "extra == 'extra-7-opentau-urdf' or extra != 'extra-7-opentau-libero'" },
-    { name = "typing-extensions", marker = "extra == 'extra-7-opentau-urdf' or extra != 'extra-7-opentau-libero'" },
+    { name = "attrs" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" } },
+    { name = "pillow" },
+    { name = "pyarrow" },
+    { name = "typing-extensions" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/16/b9/cbde1f19a2b2b148cc0335d27e26b0aa1cbd886b619658c8659bc35f83bd/rerun_sdk-0.29.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:8e52f466a21e2a4fa71755e48fb767dcff6d6854561dcc12a9c1cd1b8fc58a7e", size = 112354388, upload-time = "2026-01-30T10:04:42.093Z" },
@@ -3662,31 +3660,32 @@ name = "torch"
 version = "2.10.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cuda-bindings", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform != 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
+    { name = "cuda-bindings", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "filelock" },
     { name = "fsspec" },
     { name = "jinja2" },
     { name = "networkx" },
-    { name = "nvidia-cublas-cu12", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform != 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
-    { name = "nvidia-cuda-cupti-cu12", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform != 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
-    { name = "nvidia-cuda-nvrtc-cu12", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform != 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
-    { name = "nvidia-cuda-runtime-cu12", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform != 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
-    { name = "nvidia-cudnn-cu12", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform != 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
-    { name = "nvidia-cufft-cu12", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform != 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
-    { name = "nvidia-cufile-cu12", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform != 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
-    { name = "nvidia-curand-cu12", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform != 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
-    { name = "nvidia-cusolver-cu12", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform != 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
-    { name = "nvidia-cusparse-cu12", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform != 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
-    { name = "nvidia-cusparselt-cu12", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform != 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
-    { name = "nvidia-nccl-cu12", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform != 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
-    { name = "nvidia-nvjitlink-cu12", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform != 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
-    { name = "nvidia-nvshmem-cu12", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform != 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
-    { name = "nvidia-nvtx-cu12", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform != 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
+    { name = "nvidia-cublas-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "nvidia-cuda-cupti-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "nvidia-cuda-nvrtc-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "nvidia-cuda-runtime-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "nvidia-cudnn-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "nvidia-cufft-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "nvidia-cufile-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "nvidia-curand-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "nvidia-cusolver-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "nvidia-cusparse-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "nvidia-cusparselt-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "nvidia-nccl-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "nvidia-nvjitlink-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "nvidia-nvshmem-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "nvidia-nvtx-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "sympy" },
-    { name = "triton", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf') or (sys_platform != 'linux' and extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
+    { name = "triton", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "typing-extensions" },
 ]
 wheels = [
+    { url = "https://files.pythonhosted.org/packages/5b/30/bfebdd8ec77db9a79775121789992d6b3b75ee5494971294d7b4b7c999bc/torch-2.10.0-2-cp310-none-macosx_11_0_arm64.whl", hash = "sha256:2b980edd8d7c0a68c4e951ee1856334a43193f98730d97408fbd148c1a933313", size = 79411457, upload-time = "2026-02-10T21:44:59.189Z" },
     { url = "https://files.pythonhosted.org/packages/0c/1a/c61f36cfd446170ec27b3a4984f072fd06dab6b5d7ce27e11adb35d6c838/torch-2.10.0-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:5276fa790a666ee8becaffff8acb711922252521b28fbce5db7db5cf9cb2026d", size = 145992962, upload-time = "2026-01-21T16:24:14.04Z" },
     { url = "https://files.pythonhosted.org/packages/b5/60/6662535354191e2d1555296045b63e4279e5a9dbad49acf55a5d38655a39/torch-2.10.0-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:aaf663927bcd490ae971469a624c322202a2a1e68936eb952535ca4cd3b90444", size = 915599237, upload-time = "2026-01-21T16:23:25.497Z" },
     { url = "https://files.pythonhosted.org/packages/40/b8/66bbe96f0d79be2b5c697b2e0b187ed792a15c6c4b8904613454651db848/torch-2.10.0-cp310-cp310-win_amd64.whl", hash = "sha256:a4be6a2a190b32ff5c8002a0977a25ea60e64f7ba46b1be37093c141d9c49aeb", size = 113720931, upload-time = "2026-01-21T16:24:23.743Z" },
@@ -3724,7 +3723,7 @@ name = "tqdm"
 version = "4.67.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-7-opentau-libero' and extra == 'extra-7-opentau-urdf')" },
+    { name = "colorama", marker = "sys_platform == 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/09/a9/6ba95a270c6f1fbcd8dac228323f2777d886cb206987444e4bce66338dd4/tqdm-4.67.3.tar.gz", hash = "sha256:7d825f03f89244ef73f1d4ce193cb1774a8179fd96f31d7e1dcde62092b960bb", size = 169598, upload-time = "2026-02-03T17:35:53.048Z" }
 wheels = [
