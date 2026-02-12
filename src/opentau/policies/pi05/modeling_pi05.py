@@ -555,18 +555,6 @@ class PI05Policy(PreTrainedPolicy):
                 assert delay == self.config.max_delay, f"Delay must be equal to {self.config.max_delay}"
                 prefix_actions = prefix_actions[-delay:]
                 action_prefix = torch.stack(prefix_actions, dim=1)
-                action_prefix = self.normalize_targets({"actions": action_prefix})["actions"]
-                original_action_dim = self.config.action_feature.shape[0]
-                if original_action_dim < self.config.max_action_dim:
-                    action_prefix = F.pad(
-                        action_prefix,
-                        (0, self.config.max_action_dim - original_action_dim),
-                    )
-                if delay < self.config.chunk_size:
-                    action_prefix = F.pad(
-                        action_prefix,
-                        (0, 0, 0, self.config.chunk_size - delay),
-                    )
             delay = torch.tensor(delay, dtype=torch.long, device=batch["state"].device)
             actions = self.sample_actions(batch, noise=noise, action_prefix=action_prefix, delay=delay)
             actions = rearrange(actions, "b c d -> c b d")
@@ -587,6 +575,9 @@ class PI05Policy(PreTrainedPolicy):
         noise: Tensor | None = None,
     ) -> Tensor:
         """Sample actions from the policy given environment observations.
+
+        Note: The provided action_prefix should NOT be normalized or padded, as this method will handle normalization and padding internally.
+        The action_prefix should have shape (batch_size, action_chunk_length, action_dim) where action_chunk_length is less than or equal to config.chunk_size.
 
         Args:
             batch: Batch of data containing environment observations.
@@ -616,6 +607,19 @@ class PI05Policy(PreTrainedPolicy):
             bsize = lang_tokens.shape[0]
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             action_prefix = torch.zeros(actions_shape, dtype=lang_tokens.dtype, device=lang_tokens.device)
+        else:
+            action_prefix = self.normalize_targets({"actions": action_prefix})["actions"]
+            original_action_dim = self.config.action_feature.shape[0]
+            if original_action_dim < self.config.max_action_dim:
+                action_prefix = F.pad(
+                    action_prefix,
+                    (0, self.config.max_action_dim - original_action_dim),
+                )
+            if delay < self.config.chunk_size:
+                action_prefix = F.pad(
+                    action_prefix,
+                    (0, 0, 0, self.config.chunk_size - delay),
+                )
 
         actions = self.model.sample_actions(
             images,
