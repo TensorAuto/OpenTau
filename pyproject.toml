@@ -20,7 +20,7 @@ huggingface = "https://huggingface.co/TensorAuto"
 
 [project]
 name = "opentau"
-version = "0.2.0"
+version = "0.2.1"
 description = "OpenTau: Tensor's VLA Training Infrastructure for Real-World Robotics in Pytorch"
 authors = [
     { name = "Shuheng Liu", email = "wish1104@icloud.com" },
@@ -90,7 +90,9 @@ dependencies = [
     "grpcio-tools>=1.60.0",
     "protobuf>=4.25.0",
     "deepspeed>=0.17.1",
-    "rosbags>=0.10.4"
+    "rosbags>=0.10.4",
+    "openai>=2.16.0",
+    "python-dotenv>=1.2.1",
 ]
 
 [project.scripts]
@@ -112,7 +114,6 @@ dev = ["pre-commit>=3.7.0",
     "sphinx-design>=0.6.1",
     "myst-parser>=4.0.0",
 ]
-openai = ["openai>=1.0.0", "python-dotenv>=1.0.0"]
 libero = [
     "cmake<4",
     "ninja",
