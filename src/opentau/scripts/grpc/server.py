@@ -190,12 +190,12 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
         if request.prefix_action:
             prefix_action = torch.tensor(
                 np.array(
-                    [[av.values for av in request.prefix_action]],
+                    [av.values for av in request.prefix_action],
                     dtype=np.float32,
                 ),
                 dtype=self.dtype,
                 device=self.device,
-            )
+            ).unsqueeze(0)
 
             prefix_action = BaseDataset.pad_vector(prefix_action, self.cfg.max_action_dim)
 
