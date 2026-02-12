@@ -155,27 +155,6 @@ def resize_with_pad(img: Tensor, width: int, height: int, pad_value: int = -1) -
     return padded_img
 
 
-def pad_vector(vector: Tensor, new_dim: int) -> Tensor:
-    """Pads the last dimension of a vector to a new size with zeros.
-
-    Args:
-        vector: Input tensor. Can be (batch_size x sequence_length x features_dimension)
-            or (batch_size x features_dimension).
-        new_dim: The new size for the last dimension.
-
-    Returns:
-        The padded tensor.
-    """
-    if vector.shape[-1] == new_dim:
-        return vector
-    shape = list(vector.shape)
-    current_dim = shape[-1]
-    shape[-1] = new_dim
-    new_vector = torch.zeros(*shape, dtype=vector.dtype, device=vector.device)
-    new_vector[..., :current_dim] = vector
-    return new_vector
-
-
 class PI0Policy(PreTrainedPolicy):
     """Wrapper class around PI0FlowMatching model to train and run inference within OpenTau."""
 
