@@ -199,27 +199,6 @@ def resize_with_pad(img: Tensor, width: int, height: int, pad_value: int = -1) -
     return padded_img
 
 
-def pad_vector(vector: Tensor, new_dim: int) -> Tensor:
-    """Pads the last dimension of a vector to a new size with zeros.
-
-    Args:
-        vector: Input tensor. Can be (batch_size x sequence_length x features_dimension)
-            or (batch_size x features_dimension).
-        new_dim: The new size for the last dimension.
-
-    Returns:
-        The padded tensor.
-    """
-    if vector.shape[-1] == new_dim:
-        return vector
-    shape = list(vector.shape)
-    current_dim = shape[-1]
-    shape[-1] = new_dim
-    new_vector = torch.zeros(*shape, dtype=vector.dtype, device=vector.device)
-    new_vector[..., :current_dim] = vector
-    return new_vector
-
-
 def pad_discrete_tokens(tokens: list[list[int]], max_length: int) -> tuple[np.ndarray, np.ndarray]:
     """Pads or truncates a list of discrete action token sequences to a fixed length.
 
@@ -576,7 +555,7 @@ class PI05Policy(PreTrainedPolicy):
     ) -> Tensor:
         """Sample actions from the policy given environment observations.
 
-        Note: The provided action_prefix should NOT be normalized or padded, as this method will handle normalization and padding internally.
+        Note: The provided action_prefix should NOT be normalized, as this method will handle normalization internally.
         The action_prefix should have shape (batch_size, action_chunk_length, action_dim) where action_chunk_length is less than or equal to config.chunk_size.
 
         Args:
@@ -600,26 +579,22 @@ class PI05Policy(PreTrainedPolicy):
         images, img_masks = self.prepare_images(batch)
         lang_tokens, lang_masks = self.prepare_language(batch)
 
+        # if delay is not provided, set it to 0
         if delay is None:
             delay = torch.tensor(0, dtype=torch.long, device=lang_tokens.device)
 
         if action_prefix is None:
+            # create a zero filled action_prefix
             bsize = lang_tokens.shape[0]
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             action_prefix = torch.zeros(actions_shape, dtype=lang_tokens.dtype, device=lang_tokens.device)
         else:
+            # normalize action_prefix and pad chunk dimension to config.chunk_size
             action_prefix = self.normalize_targets({"actions": action_prefix})["actions"]
-            original_action_dim = self.config.action_feature.shape[0]
-            if original_action_dim < self.config.max_action_dim:
-                action_prefix = F.pad(
-                    action_prefix,
-                    (0, self.config.max_action_dim - original_action_dim),
-                )
-            if delay < self.config.chunk_size:
-                action_prefix = F.pad(
-                    action_prefix,
-                    (0, 0, 0, self.config.chunk_size - delay),
-                )
+            action_prefix = F.pad(  # noop if chunk_size is already the same as action_prefix.shape[1]
+                action_prefix,
+                (0, 0, 0, self.config.chunk_size - action_prefix.shape[1]),
+            )
 
         actions = self.model.sample_actions(
             images,

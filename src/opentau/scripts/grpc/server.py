@@ -38,6 +38,7 @@ from PIL import Image
 import grpc
 from opentau.configs import parser
 from opentau.configs.train import TrainPipelineConfig
+from opentau.datasets.lerobot_dataset import BaseDataset
 from opentau.policies.factory import get_policy_class
 from opentau.scripts.grpc import robot_inference_pb2, robot_inference_pb2_grpc
 from opentau.utils.random_utils import set_seed
@@ -196,11 +197,7 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
                 device=self.device,
             )
 
-            if prefix_action.shape[2] < self.cfg.max_action_dim:
-                prefix_action = F.pad(
-                    prefix_action,
-                    (0, self.cfg.max_action_dim - prefix_action.shape[2]),
-                )
+            prefix_action = BaseDataset.pad_vector(prefix_action, self.cfg.max_action_dim)
 
             prefix_action = F.pad(
                 prefix_action,
