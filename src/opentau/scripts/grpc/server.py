@@ -33,6 +33,7 @@ from typing import Iterator
 import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
+from einops import rearrange
 from PIL import Image
 
 import grpc
@@ -195,7 +196,9 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
                 ),
                 dtype=self.dtype,
                 device=self.device,
-            ).unsqueeze(0)
+            )
+
+            prefix_action = rearrange(prefix_action, "c d -> 1 c d")
 
             prefix_action = BaseDataset.pad_vector(prefix_action, self.cfg.max_action_dim)
 
