@@ -215,6 +215,9 @@ def pad_discrete_tokens(tokens: list[list[int]], max_length: int) -> tuple[np.nd
     discrete_action_masks = []
     for token in tokens:
         if len(token) > max_length:
+            logging.warning(
+                f"Discrete action token length {len(token)} is greater than max_length {max_length}, truncating"
+            )
             discrete_action_tokens.append(np.array(token[:max_length]))
             discrete_action_masks.append(np.ones(max_length, dtype=bool))
         else:
