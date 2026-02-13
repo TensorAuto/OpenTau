@@ -47,23 +47,12 @@ Constants:
         - "prompt": Task descriptions or prompts
         - "response": Expected responses or labels
 
-    LOSS_TYPE_MAPPING
-        Dictionary mapping dataset repository IDs to loss type strings. Valid
-        values are:
-
-        - "MSE": Mean Squared Error (typically for continuous robotic actions)
-        - "CE": Cross Entropy (typically for discrete classification tasks
-          like VQA)
-
 Example:
     Access feature name mapping for a dataset:
         >>> mapping = DATA_FEATURES_NAME_MAPPING["lerobot/aloha_mobile_cabinet"]
         >>> mapping["camera0"]  # Returns "observation.images.cam_right_wrist"
         >>> mapping["actions"]  # Returns "action"
 
-    Access loss type for a dataset:
-        >>> loss_type = LOSS_TYPE_MAPPING["lerobot/aloha_mobile_cabinet"]
-        >>> loss_type  # Returns "MSE"
 """
 
 DATA_FEATURES_NAME_MAPPING = {
@@ -246,33 +235,4 @@ DATA_FEATURES_NAME_MAPPING = {
         "prompt": "task",
         "response": "response",
     },
-}
-
-"""
-Use "MSE" for mean squared error and "CE" for cross entropy.
-Usually robotic data with actions will have an MSE loss while
-VQA tasks will have a CE loss.
-"""
-LOSS_TYPE_MAPPING = {
-    "ML-GOD/mt-button-press": "MSE",
-    "ML-GOD/libero_spatial_no_noops_1.0.0_lerobot": "MSE",
-    "ML-GOD/libero": "MSE",
-    "physical-intelligence/libero": "MSE",
-    "danaaubakirova/koch_test": "MSE",
-    "lerobot/droid_100": "MSE",
-    "lerobot/aloha_mobile_cabinet": "MSE",
-    "autox/agibot-sample": "MSE",
-    "bi-so100-block-manipulation": "MSE",
-    "cube-on-cylinder": "MSE",
-    "cylinder-on-cube": "MSE",
-    "l-shape-on-cross-shape": "MSE",
-    "lerobot/svla_so101_pickplace": "MSE",
-    "lerobot/svla_so100_pickplace": "MSE",
-    "lerobot/svla_so100_stacking": "MSE",
-    "pixmo": "CE",
-    "dummy": "CE",
-    "vsr": "CE",
-    "clevr": "CE",
-    "cocoqa": "CE",
-    "lerobot_dummy": "MSE",
 }

@@ -108,7 +108,7 @@ from opentau.configs.train import TrainPipelineConfig
 from opentau.constants import HF_OPENTAU_HOME
 from opentau.datasets.compute_stats import aggregate_stats, compute_episode_stats
 from opentau.datasets.image_writer import AsyncImageWriter, write_image
-from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING, LOSS_TYPE_MAPPING
+from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
 from opentau.datasets.utils import (
     DEFAULT_FEATURES,
     DEFAULT_IMAGE_PATH,
@@ -726,9 +726,6 @@ class BaseDataset(torch.utils.data.Dataset):
 
         standard_item["img_is_pad"] = torch.tensor(img_is_pad, dtype=torch.bool)
         standard_item["action_is_pad"] = item[name_map["actions"] + "_is_pad"]
-
-        # add loss type
-        standard_item["loss_type"] = LOSS_TYPE_MAPPING[self._get_feature_mapping_key()]
 
         # cast all tensors in standard_item to bfloat16
         for key, value in standard_item.items():
