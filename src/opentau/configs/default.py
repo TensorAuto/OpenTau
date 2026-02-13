@@ -31,7 +31,6 @@ from draccus.parsers.encoding import encode_dataclass
 from opentau import (
     policies,  # noqa: F401
 )
-from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING, LOSS_TYPE_MAPPING
 from opentau.datasets.transforms import ImageTransformsConfig
 from opentau.datasets.video_utils import get_safe_default_codec
 
@@ -70,14 +69,11 @@ class DatasetConfig:
         stats: Dictionary of statistics for normalization, keyed by feature name.
             Each value is a dictionary with 'mean' and 'std' arrays. Defaults to None.
         data_features_name_mapping: Optional mapping from dataset feature names to
-            standard feature names. Must be provided together with `loss_type_mapping`.
-            Defaults to None.
-        loss_type_mapping: Optional loss type mapping for the dataset. Must be
-            provided together with `data_features_name_mapping`. Defaults to None.
+            standard feature names. Defaults to None.
 
     Raises:
         ValueError: If both or neither of `repo_id` and `grounding` are set, or
-            if only one of `data_features_name_mapping` and `loss_type_mapping`
+            if `data_features_name_mapping` is provided.
             is provided.
     """
 
@@ -94,7 +90,6 @@ class DatasetConfig:
 
     # optional standard data format mapping for the dataset if mapping is not already in standard_data_format_mapping.py
     data_features_name_mapping: dict[str, str] | None = None
-    loss_type_mapping: str | None = None
 
     # Ratio of the dataset to be used for validation. Please specify a value.
     # If `val_freq` is set to 0, a validation dataset will not be created and this value will be ignored.
@@ -106,16 +101,7 @@ class DatasetConfig:
         if (self.repo_id is None) == (self.grounding is None):
             raise ValueError("Exactly one of `repo_id` or `grounding` for Dataset config should be set.")
 
-        # data_features_name_mapping and loss_type_mapping have to be provided together
-        if (self.data_features_name_mapping is None) != (self.loss_type_mapping is None):
-            raise ValueError(
-                "`data_features_name_mapping` and `loss_type_mapping` have to be provided together."
-            )
-
-        # add data_features_name_mapping and loss_type_mapping to standard_data_format_mapping.py if they are provided
-        if self.data_features_name_mapping is not None and self.loss_type_mapping is not None:
-            DATA_FEATURES_NAME_MAPPING[self.repo_id] = self.data_features_name_mapping
-            LOSS_TYPE_MAPPING[self.repo_id] = self.loss_type_mapping
+        # data_features_name_mapping have to be provided if it is not already in standard_data_format_mapping.py
 
 
 @dataclass

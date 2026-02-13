@@ -310,7 +310,6 @@ def check_standard_data_format(item, delta_timestamps_params, dataset, train_pip
         ("actions", (train_pipeline_config.action_chunk, train_pipeline_config.max_action_dim)),
         ("prompt", None),
         ("response", None),
-        ("loss_type", None),
         ("img_is_pad", (train_pipeline_config.num_cams,)),
         ("action_is_pad", (train_pipeline_config.action_chunk,)),
     ]
@@ -329,7 +328,7 @@ def check_standard_data_format(item, delta_timestamps_params, dataset, train_pip
             assert item[key].shape == shape, f"{key}"
         elif key == "state" or key == "actions":
             assert item[key].shape == shape, f"{key}"
-        elif key == "prompt" or key == "response" or key == "loss_type":
+        elif key == "prompt" or key == "response":
             assert type(item[key]) is str, f"{key}"
         elif key == "img_is_pad" or key == "action_is_pad":
             assert item[key].shape == shape, f"{key}"
