@@ -38,6 +38,8 @@
         "train_state_proj": true,
         "tokenizer_max_length": 100,
         "optimizer_lr": 2.5e-05,
+        "use_awr": false,
+        "awr_max_weight": 10.0,
         "optimizer_betas": [
             0.9,
             0.95
