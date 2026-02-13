@@ -155,9 +155,6 @@ class PatchedGemmaRMSNorm(nn.Module):
             raise ValueError(f"Expected cond dimension {self.cond_dim}, got {cond.shape[-1]}")
 
         modulation = self.dense(cond)
-        # Reshape modulation to broadcast properly: [batch, 1, features] for [batch, seq, features]
-        if len(x.shape) == 3:  # [batch, seq, features]
-            modulation = modulation.unsqueeze(1)
 
         scale, shift, gate = torch.chunk(modulation, 3, dim=-1)
 
@@ -167,7 +164,10 @@ class PatchedGemmaRMSNorm(nn.Module):
 
     def extra_repr(self) -> str:
         """Returns the extra representation of the module."""
-        repr_str = f"{tuple(self.weight.shape)}, eps={self.eps}"
+        if hasattr(self, "weight") and self.weight is not None:
+            repr_str = f"{tuple(self.weight.shape)}, eps={self.eps}"
+        else:
+            repr_str = f"dim={self.dim}, eps={self.eps}"
         if self.dense is not None:
             repr_str += f", adaptive=True, cond_dim={self.cond_dim}"
         return repr_str

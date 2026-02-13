@@ -24,6 +24,7 @@ Usage:
 
 import io
 import logging
+import traceback
 from concurrent import futures
 from dataclasses import asdict
 from pprint import pformat
@@ -31,11 +32,14 @@ from typing import Iterator
 
 import numpy as np
 import torch
+import torch.nn.functional as F  # noqa: N812
+from einops import rearrange
 from PIL import Image
 
 import grpc
 from opentau.configs import parser
 from opentau.configs.train import TrainPipelineConfig
+from opentau.datasets.lerobot_dataset import BaseDataset
 from opentau.policies.factory import get_policy_class
 from opentau.scripts.grpc import robot_inference_pb2, robot_inference_pb2_grpc
 from opentau.utils.random_utils import set_seed
@@ -74,9 +78,35 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
         self.policy = policy_class.from_pretrained(self.cfg.policy.pretrained_path, config=self.cfg.policy)
         self.policy.to(device=self.device, dtype=self.dtype)
         self.policy.eval()
-        self.policy = attempt_torch_compile(self.policy, device_hint=self.device)
+        self.policy.model.sample_actions = attempt_torch_compile(
+            self.policy.model.sample_actions, device_hint=self.device
+        )
+
         self.policy.reset()
-        logger.info("Policy loaded successfully")
+
+        camera_observations = {
+            f"camera{i}": torch.zeros((1, 3, *self.cfg.resolution), dtype=self.dtype, device=self.device)
+            for i in range(self.cfg.num_cams)
+        }
+        observation = {
+            **camera_observations,
+            "state": torch.zeros((1, self.cfg.max_state_dim), dtype=self.dtype, device=self.device),
+            "prompt": ["Pick up yellow lego block and put it in the bin"],
+            "img_is_pad": torch.zeros((1, 1), dtype=torch.bool, device=self.device),
+        }
+        action_prefix = torch.zeros(
+            (1, self.cfg.action_chunk, self.cfg.max_action_dim), dtype=self.dtype, device=self.device
+        )
+        delay = torch.tensor(0, dtype=torch.long, device=self.device)
+
+        with torch.inference_mode():
+            # One warmup call right after compiling
+            # two warmup calls are needed right after compiling
+            # the first warmup call is needed for compiling
+            # the second warmup call is needed for kernel autotuning
+            _ = self.policy.sample_actions(observation, action_prefix=action_prefix, delay=delay)
+            _ = self.policy.sample_actions(observation, action_prefix=action_prefix, delay=delay)
+            logger.info("Policy loaded successfully")
 
     def _decode_image(self, camera_image: robot_inference_pb2.CameraImage) -> torch.Tensor:
         """Decode an image from the protobuf message.
@@ -158,8 +188,33 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
 
         # Process prompt
         batch["prompt"] = [request.prompt] if request.prompt else [""]
+        if request.prefix_action:
+            prefix_action = torch.tensor(
+                np.array(
+                    [av.values for av in request.prefix_action],
+                    dtype=np.float32,
+                ),
+                dtype=self.dtype,
+                device=self.device,
+            )
 
-        return batch
+            prefix_action = rearrange(prefix_action, "c d -> 1 c d")
+
+            prefix_action = BaseDataset.pad_vector(prefix_action, self.cfg.max_action_dim)
+
+            prefix_action = F.pad(
+                prefix_action,
+                (0, 0, 0, self.cfg.action_chunk - prefix_action.shape[1]),
+            )
+            action_prefix = prefix_action
+            delay = torch.tensor(request.delay, dtype=torch.long, device=self.device)
+        else:
+            action_prefix = torch.zeros(
+                (1, self.cfg.action_chunk, self.cfg.max_action_dim), dtype=self.dtype, device=self.device
+            )
+            delay = torch.tensor(0, dtype=torch.long, device=self.device)
+
+        return batch, action_prefix, delay
 
     def GetActionChunk(
         self,
@@ -184,14 +239,14 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
 
         try:
             # Prepare observation batch
-            batch = self._prepare_observation(request)
+            batch, action_prefix, delay = self._prepare_observation(request)
 
             # Run inference
             with torch.inference_mode():
-                action_chunk = self.policy.sample_actions(batch)
-                # action_chunk shape: (n_action_steps, batch_size=1, action_dim)
+                action_chunk = self.policy.sample_actions(batch, action_prefix=action_prefix, delay=delay)
+                # action_chunk shape: (batch_size=1, n_action_steps, action_dim)
                 # Remove batch dimension and convert to numpy
-                action_chunk = action_chunk.squeeze(1).to("cpu", torch.float32).numpy()
+                action_chunk = action_chunk.squeeze(0).to("cpu", torch.float32).numpy()
 
             # Populate 2D action chunk structure
             for action_vector in action_chunk:
@@ -206,6 +261,7 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
 
         except Exception as e:
             # Unexpected error during inference
+            traceback.print_exc()
             logger.exception("Error during inference")
             context.abort(grpc.StatusCode.INTERNAL, f"Inference error: {e}")
 

@@ -38,11 +38,11 @@ You can install OpenTau directly from PyPI using pip:
 
     pip install opentau
 
-To install with extra dependencies (e.g., ``dev``, ``openai``, ``libero``), use brackets:
+To install with extra dependencies (e.g., ``dev``, ``trt``, ``libero``), use brackets:
 
 .. code-block:: bash
 
-    pip install opentau[dev,openai,libero]
+    pip install opentau[dev,libero,trt]
 
 
 Installation with Source Code
@@ -74,11 +74,11 @@ We recommend using `uv <https://docs.astral.sh/uv/>`_ for fast and simple Python
 
       uv sync
 
-   To install specific extras (e.g., ``dev``, ``openai``, ``libero``):
+   To install specific extras (e.g., ``dev``, ``libero``):
 
    .. code-block:: bash
 
-      uv sync --extra dev --extra openai --extra libero
+      uv sync --extra dev --extra libero
 
 3. **Activate the virtual environment**
 

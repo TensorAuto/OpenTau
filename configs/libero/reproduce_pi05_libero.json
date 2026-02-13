@@ -2,10 +2,7 @@
     "dataset_mixture": {
         "datasets": [
             {
-                "repo_id": "physical-intelligence/libero",
-                "episodes": [
-                    0,1,2,3,4,5,6,7,8,9
-                ]
+                "repo_id": "physical-intelligence/libero"
             }
 
         ],
@@ -26,7 +23,7 @@
             "ACTION": "MEAN_STD"
         },
         "chunk_size": 10,
-        "predict_response": true,
+        "predict_response": false,
         "n_action_steps": 10,
         "max_state_dim": 32,
         "max_action_dim": 32,
@@ -34,10 +31,11 @@
         "num_steps": 10,
         "init_strategy": "expert_only_he_init",
         "attention_implementation": "eager",
-        "freeze_vision_encoder": true,
-        "train_expert_only": true,
+        "freeze_vision_encoder": false,
+        "train_expert_only": false,
         "prompt_max_length": 256,
-        "discrete_action_max_length": 100,
+        "discrete_action_max_length": 60,
+        "max_delay": 0,
         "optimizer_lr": 2.5e-05,
         "optimizer_betas": [
             0.9,
@@ -57,16 +55,16 @@
     "max_action_dim": 32,
     "action_chunk": 10,
     "loss_weighting": {"MSE": 1, "CE": 1},
-    "num_workers": 4,
-    "batch_size": 2,
+    "num_workers": 16,
+    "batch_size": 12,
     "gradient_accumulation_steps": 1,
-    "dataloader_batch_size": 2,
+    "dataloader_batch_size": 12,
     "prefetch_factor": 8,
-    "steps": 40,
-    "log_freq": 5,
+    "steps": 1000000,
+    "log_freq": 100,
     "save_checkpoint": true,
-    "save_freq": 40,
-    "val_freq": 10,
+    "save_freq": 1000,
+    "val_freq": 1000,
     "use_policy_training_preset": false,
     "trace_nans": false,
     "optimizer": {
@@ -100,5 +98,26 @@
         "mode": null,
         "allow_resume": true,
         "disable_artifact": false
-    }
+    },
+    "env": {
+        "type": "libero",
+        "task": "libero_10",
+        "fps": 10,
+        "max_parallel_tasks": 1,
+        "task_ids": [0,1,2,3,4,5,6,8],
+        "episode_length": 700,
+        "obs_type": "pixels_agent_pos",
+        "render_mode": "rgb_array",
+        "camera_name": "agentview_image,robot0_eye_in_hand_image",
+        "init_states": true,
+        "camera_name_mapping": null
+    },
+    "eval": {
+        "n_episodes": 16,
+        "batch_size": 16,
+        "use_async_envs": true,
+        "max_episodes_rendered": 16,
+        "grid_size": null
+    },
+    "eval_freq": 1000
 }
