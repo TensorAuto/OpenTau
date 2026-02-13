@@ -224,11 +224,11 @@ class SiglipGemmaValueModel(PreTrainedModel):
         response_hidden = hidden_states[:, -self.config.response_max_length : -1, :]
 
         # Project to logits for discretized values
-        ce_logits = self.value_head(classification_hidden)
+        value_logits = self.value_head(classification_hidden)
         # project response hidden states to logits for response language
         response_logits = self.response_head(response_hidden)
 
-        return ce_logits, response_logits
+        return value_logits, response_logits
 
     def get_value(
         self,

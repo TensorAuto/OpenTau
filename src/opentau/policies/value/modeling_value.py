@@ -251,24 +251,27 @@ class ValueFunction(PreTrainedPolicy):
         lang_tokens, lang_masks = self.prepare_language(batch)
         response_tokens, response_masks = self.prepare_response(batch)
 
-        ce_logits, response_logits = self.model.forward(
+        value_logits, response_logits = self.model.forward(
             images, img_masks, lang_tokens, lang_masks, response_tokens, response_masks
         )
-        values = self.calculate_value(ce_logits)
+        values = self.calculate_value(value_logits)
         # Compute Cross-Entropy loss
-        ce_logits = ce_logits.to(dtype=torch.float32)  # upcast to float32 for loss calculation
+        value_logits = value_logits.to(dtype=torch.float32)  # upcast to float32 for loss calculation
         batch["return_bin_idx"] = batch["return_bin_idx"].to(dtype=torch.long)
-        ce_loss = F.cross_entropy(ce_logits, batch["return_bin_idx"], reduction="none")
+        value_ce_loss = F.cross_entropy(value_logits, batch["return_bin_idx"], reduction="none")
 
         action_is_pad = batch.get("action_is_pad")
-        # Mask CE loss if all action_is_pad are true. This is used for VQA dataset where we don't have actions tokens.
-        ce_loss = ce_loss * (~action_is_pad.all(dim=1)).float()
 
-        ce_loss = ce_loss.mean()
+        # mask for differentiating between robotic and VQA datasets
+        diff_mask = action_is_pad.all(dim=1)
+        # Mask CE loss if all action_is_pad are true. This is used for VQA dataset where we don't have actions tokens.
+        value_ce_loss = value_ce_loss * ~diff_mask.float()
+
+        value_ce_loss = value_ce_loss.mean()
 
         l1_loss = F.l1_loss(values, batch["return_continuous"])
 
-        accuracy = (ce_logits.argmax(dim=-1) == batch["return_bin_idx"]).float().mean()
+        accuracy = (value_logits.argmax(dim=-1) == batch["return_bin_idx"]).float().mean()
 
         batch_size, seq_len = response_logits.shape[0], response_logits.shape[1]
         response_slice = slice(1, None)
@@ -284,14 +287,14 @@ class ValueFunction(PreTrainedPolicy):
         # Mask response loss if response is padded
         response_ce_loss = response_ce_loss * ~response_is_pad[:, response_slice]
         # Mask response loss if all action_is_pad are true. This is used for Robotic dataset where we have at least one actions tokens.
-        response_ce_loss = response_ce_loss * rearrange((action_is_pad.all(dim=1)).float(), "b -> b 1")
+        response_ce_loss = response_ce_loss * rearrange(diff_mask.float(), "b -> b 1")
 
         # compute mean
         response_ce_loss = response_ce_loss.mean()
 
         return {
-            "MSE": torch.zeros_like(ce_loss, requires_grad=False),
-            "CE": ce_loss + response_ce_loss,
+            "MSE": torch.zeros_like(value_ce_loss, requires_grad=False),
+            "CE": value_ce_loss + response_ce_loss,
             "L1": l1_loss,
             "Accuracy": accuracy,
         }
@@ -597,13 +600,13 @@ class ValueModel(nn.Module):
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
-        ce_logits, response_logits = self.siglip_gemma_value.forward(
+        value_logits, response_logits = self.siglip_gemma_value.forward(
             inputs_embeds=embs,
             attention_mask=att_2d_masks,
             position_ids=position_ids,
         )
 
-        return ce_logits, response_logits
+        return value_logits, response_logits
 
     def get_value(
         self,
