@@ -62,11 +62,12 @@ def value_function_training_config(train_pipeline_config: TrainPipelineConfig) -
         n_obs_steps=1,
         normalization_mapping={
             "VISUAL": NormalizationMode.IDENTITY,
-            "STATE": NormalizationMode.MEAN_STD,
+            "STATE": NormalizationMode.MIN_MAX,
             "VALUE": NormalizationMode.MEAN_STD,
         },
         max_state_dim=32,
-        tokenizer_max_length=52,
+        prompt_max_length=256,
+        response_max_length=52,
         reward_config=RewardConfig(
             number_of_bins=201,
             C_neg=-1000.0,

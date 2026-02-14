@@ -265,7 +265,7 @@ class ValueFunction(PreTrainedPolicy):
         # mask for differentiating between robotic and VQA datasets
         diff_mask = action_is_pad.all(dim=1)
         # Mask CE loss if all action_is_pad are true. This is used for VQA dataset where we don't have actions tokens.
-        value_ce_loss = value_ce_loss * ~diff_mask.float()
+        value_ce_loss = value_ce_loss * (~diff_mask).float()
 
         value_ce_loss = value_ce_loss.mean()
 
