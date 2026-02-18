@@ -271,7 +271,11 @@ class ValueFunction(PreTrainedPolicy):
 
         l1_loss = F.l1_loss(values, batch["return_continuous"])
 
-        accuracy = (value_logits.argmax(dim=-1) == batch["return_bin_idx"]).float().mean()
+        # Accuracy only over robotic samples (exclude VQA where diff_mask is True)
+        robotic_mask = ~diff_mask
+        correct = (value_logits.argmax(dim=-1) == batch["return_bin_idx"]).float() * robotic_mask.float()
+        num_robotic = robotic_mask.float().sum()
+        accuracy = correct.sum() / num_robotic.clamp(min=1)
 
         batch_size, seq_len = response_logits.shape[0], response_logits.shape[1]
         response_slice = slice(1, None)
