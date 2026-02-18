@@ -21,13 +21,16 @@ from opentau.policies.value.modeling_value import ValueFunction
 class TestValueFunctionIntegration:
     """Integration tests for the complete Value Function pipeline."""
 
-    def _verify_pad_masks(self, pad_masks):
+    def _verify_pad_masks(self, pad_masks, inference_mode=False):
         """Verify the pad masks are correct. This assumes all images are not padded. Language embeddings can be padded.
 
         prefix_pad_masks: tensor with shape (batch_size, seq_len)
         """
         assert pad_masks.shape[0] == 1
-        assert pad_masks.shape[1] == 566
+        if inference_mode:
+            assert pad_masks.shape[1] == 768
+        else:
+            assert pad_masks.shape[1] == 820
         assert pad_masks.dtype == torch.bool
 
         def _check_ones_before_zeros(mask_slice):
@@ -50,17 +53,21 @@ class TestValueFunctionIntegration:
         batch_size = pad_masks.shape[0]
         for i in range(batch_size):
             assert torch.all(pad_masks[i, :512] == 1)  # image tokens should not be padded
-            _check_ones_before_zeros(pad_masks[i, 512:564])  # prompt tokens
-            assert torch.all(pad_masks[i, 565:] == 1)  # state and cls token should not be padded
+            _check_ones_before_zeros(pad_masks[i, 512:768])  # prompt tokens
+            if not inference_mode:
+                _check_ones_before_zeros(pad_masks[i, 768:820])  # response tokens
 
-    def _verify_position_ids(self, position_ids, pad_masks):
+    def _verify_position_ids(self, position_ids, pad_masks, inference_mode=False):
         """Verify the position ids are correct. They should increment by 1 for each non-padded token and stay the same for padded tokens.
 
         position_ids: tensor with shape (batch_size, seq_len)
         pad_masks: tensor with shape (batch_size, seq_len)
         """
         assert position_ids.shape[0] == 1
-        assert position_ids.shape[1] == 566
+        if inference_mode:
+            assert position_ids.shape[1] == 768
+        else:
+            assert position_ids.shape[1] == 820
         assert position_ids.dtype == torch.long
 
         def _check_position_ids_with_padding(position_ids, pad_masks):
@@ -83,32 +90,56 @@ class TestValueFunctionIntegration:
             # Check entire prefix position IDs array
             _check_position_ids_with_padding(position_ids[i], pad_masks[i])
 
-    def _verify_vlm_attention_mask(self, vlm_attention_mask, pad_masks):
+    def _verify_vlm_attention_mask(self, vlm_attention_mask, pad_masks, inference_mode=False):
         """Verify the VLM attention mask is correct.
 
         vlm_attention_mask: tensor with shape (batch_size, seq_len, seq_len)
         pad_masks: tensor with shape (batch_size, seq_len)
         """
         assert vlm_attention_mask.shape[0] == 1
-        assert vlm_attention_mask.shape[1] == 566
-        assert vlm_attention_mask.shape[2] == 566
+        if inference_mode:
+            assert vlm_attention_mask.shape[1] == 768
+            assert vlm_attention_mask.shape[2] == 768
+        else:
+            assert vlm_attention_mask.shape[1] == 820
+            assert vlm_attention_mask.shape[2] == 820
         assert vlm_attention_mask.dtype == torch.bool
 
         batch_size = vlm_attention_mask.shape[0]
         for i in range(batch_size):
             # construct correct attention mask
             # see diagram here: https://drive.google.com/file/d/12lhS72bnQrKyL4iCfEj6SDRSPi1NABBj/view?usp=sharing
-            correct_vlm_attention_mask = torch.ones(566, 566, dtype=torch.bool)
+            correct_vlm_attention_mask = torch.ones(820, 820, dtype=torch.bool)
 
             # pad tokens should not be attended to or attend to any other tokens
-            prompt_start_idx, state_start_idx = 512, 564
-            num_non_padded_prompt_tokens = pad_masks[i, prompt_start_idx:state_start_idx].sum()
+            prompt_start_idx, response_start_idx = 512, 768
+            num_non_padded_prompt_tokens = pad_masks[i, prompt_start_idx:response_start_idx].sum()
+            num_non_padded_response_tokens = pad_masks[i, response_start_idx:].sum()
             correct_vlm_attention_mask[
-                prompt_start_idx + num_non_padded_prompt_tokens : state_start_idx, :
+                prompt_start_idx + num_non_padded_prompt_tokens : response_start_idx, :
             ] = 0
             correct_vlm_attention_mask[
-                :, prompt_start_idx + num_non_padded_prompt_tokens : state_start_idx
+                :, prompt_start_idx + num_non_padded_prompt_tokens : response_start_idx
             ] = 0
+            correct_vlm_attention_mask[response_start_idx + num_non_padded_response_tokens :, :] = 0
+            correct_vlm_attention_mask[:, response_start_idx + num_non_padded_response_tokens :] = 0
+
+            correct_vlm_attention_mask[:response_start_idx, response_start_idx:] = 0
+
+            response_causal_mask = torch.tril(
+                torch.ones(
+                    num_non_padded_response_tokens,
+                    num_non_padded_response_tokens,
+                    dtype=torch.bool,
+                )
+            )
+            correct_vlm_attention_mask[
+                response_start_idx : response_start_idx + num_non_padded_response_tokens,
+                response_start_idx : response_start_idx + num_non_padded_response_tokens,
+            ] = response_causal_mask
+
+            if inference_mode:
+                correct_vlm_attention_mask = correct_vlm_attention_mask[:768, :768]
 
             assert torch.all(vlm_attention_mask[i].cpu() == correct_vlm_attention_mask.cpu())
 
@@ -133,7 +164,6 @@ class TestValueFunctionIntegration:
             "actions": torch.randn(batch_size, config.chunk_size, config.max_action_dim),
             "prompt": ["Pick up the red block"],
             "response": ["I will pick up the red block"],
-            "loss_type": ["MSE"],
             "img_is_pad": torch.zeros(batch_size, 2, dtype=torch.bool),
             "action_is_pad": torch.cat(
                 [
@@ -242,11 +272,11 @@ class TestValueFunctionIntegration:
                 captured_variables["position_ids"] = position_ids.clone()
 
             # Call the original forward method
-            return original_siglip_gemma_value_forward(*args, **kwargs)
+            return original_siglip_gemma_value_get_value(*args, **kwargs)
 
         # Store original siglip_gemma_value forward method and replace it
-        original_siglip_gemma_value_forward = value_function.model.siglip_gemma_value.forward
-        value_function.model.siglip_gemma_value.forward = capture_variables_forward
+        original_siglip_gemma_value_get_value = value_function.model.siglip_gemma_value.get_value
+        value_function.model.siglip_gemma_value.get_value = capture_variables_forward
 
         # Also capture pad_masks by monkey-patching the embed_sequence method
         original_embed_sequence = value_function.model.embed_sequence
@@ -263,7 +293,7 @@ class TestValueFunctionIntegration:
         value = value_function.predict_value(batch_cuda)
 
         # Restore original methods
-        value_function.model.siglip_gemma_value.forward = original_siglip_gemma_value_forward
+        value_function.model.siglip_gemma_value.get_value = original_siglip_gemma_value_get_value
         value_function.model.embed_sequence = original_embed_sequence
 
         # Inspect all captured variables
@@ -282,12 +312,15 @@ class TestValueFunctionIntegration:
         )
         assert captured_variables["pad_masks"].dtype == torch.bool, "Pad masks should be boolean"
 
-        self._verify_pad_masks(captured_variables["pad_masks"])
+        self._verify_pad_masks(captured_variables["pad_masks"], inference_mode=True)
         self._verify_position_ids(
             captured_variables["position_ids"],
             captured_variables["pad_masks"],
+            inference_mode=True,
         )
-        self._verify_vlm_attention_mask(captured_variables["attention_mask"], captured_variables["pad_masks"])
+        self._verify_vlm_attention_mask(
+            captured_variables["attention_mask"], captured_variables["pad_masks"], inference_mode=True
+        )
 
         assert isinstance(value, torch.Tensor)
         assert value.shape == (1,)
