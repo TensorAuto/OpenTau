@@ -222,6 +222,10 @@ def visualize_dataset(
     if joint_names is None:
         joint_names = dataset.meta.info.get("features", {}).get("observation.state", {}).get("names", [])
 
+    # In case the info.json lists the state names in a nested dictionary
+    if not (isinstance(joint_names, list) and all(isinstance(name, str) for name in joint_names)):
+        joint_names = []
+
     if urdf:
         rr.log_file_from_path(urdf, static=True)
         urdf_tree = rr.urdf.UrdfTree.from_file_path(urdf)
