@@ -1,7 +1,12 @@
 .. _human_demo:
 
-Converting Human Demos to LeRobot Format
-========================================
+Converting Human Demos to LeRobot Format (Beta)
+===============================================
+
+.. note::
+
+   This feature is **still in beta**. The pose estimation methods for generating the state and actions will likely change in future OpenTau releases.
+
 
 This tutorial describes how to convert human demonstration videos into LeRobot-format datasets for training VLAs. The script uses MediaPipe for pose (third-person / exo) or hand (first-person / ego) landmark detection and writes frames, 3D landmarks as state, and next-step landmarks as action.
 

@@ -46,6 +46,7 @@ OpenTau ($\tau$) is a tool developed by *[Tensor][1]* to bridge this gap, and we
 |            Simulation Environments for Evaluating Models |            ❌            |                ✅                 |      ✅      |
 |                 Create Validation Splits During Training |            ❌            |                ❌                 |      ✅      |
 |    $\pi^{*}_{0.6}$ style Reinforcement Learning Pipeline |            ❌            |                ❌                 |      ✅      |
+|                        Post-training on Human Data (Beta)|            ❌            |                ❌                 |      ✅      |
 |                                                Framework |      Jax / PyTorch       |             PyTorch               |   PyTorch    |
 
 ## Quick Start
