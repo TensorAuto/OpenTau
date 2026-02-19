@@ -25,7 +25,7 @@ instantiating datasets.
 The factory supports two types of datasets:
     1. LeRobot datasets: Standard robot learning datasets loaded from HuggingFace
        repositories with configurable delta timestamps for temporal alignment.
-    2. Grounding datasets: Vision-language grounding datasets (CLEVR, COCO-QA,
+    2. VQA datasets: Vision-language vqa datasets (CLEVR, COCO-QA,
        PIXMO, VSR, etc.) for multimodal learning tasks.
 
 Key Features:
@@ -36,7 +36,7 @@ Key Features:
       during dataset creation.
     - Imagenet stats override: Optionally replaces dataset statistics with
       ImageNet normalization statistics for camera features.
-    - Grounding dataset registration: Supports extensible grounding dataset
+    - VQA dataset registration: Supports extensible vqa dataset
       registration through side-effect imports.
 
 Functions:
@@ -68,12 +68,12 @@ import numpy as np
 import torch
 
 # NOTE: Don't delete; imported for side effects.
-import opentau.datasets.grounding.clevr  # noqa: F401
-import opentau.datasets.grounding.cocoqa  # noqa: F401
-import opentau.datasets.grounding.dummy  # noqa: F401
-import opentau.datasets.grounding.pixmo  # noqa: F401
-import opentau.datasets.grounding.vsr  # noqa: F401
-from opentau import available_grounding_datasets
+import opentau.datasets.vqa.clevr  # noqa: F401
+import opentau.datasets.vqa.cocoqa  # noqa: F401
+import opentau.datasets.vqa.dummy  # noqa: F401
+import opentau.datasets.vqa.pixmo  # noqa: F401
+import opentau.datasets.vqa.vsr  # noqa: F401
+from opentau import available_vqa_datasets
 from opentau.configs.default import DatasetConfig
 from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.dataset_mixture import WeightedDatasetMixture
@@ -169,23 +169,22 @@ def make_dataset(
             "episode_end_idx", "current_idx", "last_step", "episode_index", and "timestamp". Defaults to False.
 
     Raises:
-        ValueError: If exactly one of `cfg.grounding` and `cfg.repo_id` is not provided.
-        ValueError: If `cfg.grounding` is not a supported grounding dataset.
+        ValueError: If exactly one of `cfg.vqa` and `cfg.repo_id` is not provided.
+        ValueError: If `cfg.vqa` is not a supported vqa dataset.
 
     Returns:
         BaseDataset or Tuple[BaseDataset, BaseDataset]: A single dataset or a tuple of (train_dataset, val_dataset) if val_freq > 0.
     """
     image_transforms = ImageTransforms(cfg.image_transforms) if cfg.image_transforms.enable else None
 
-    if isinstance(cfg.grounding, str) + isinstance(cfg.repo_id, str) != 1:
-        raise ValueError("Exactly one of `cfg.grounding` and `cfg.repo_id` should be provided.")
+    if isinstance(cfg.vqa, str) + isinstance(cfg.repo_id, str) != 1:
+        raise ValueError("Exactly one of `cfg.vqa` and `cfg.repo_id` should be provided.")
 
-    if isinstance(cfg.grounding, str):
-        ds_cls = available_grounding_datasets.get(cfg.grounding)
+    if isinstance(cfg.vqa, str):
+        ds_cls = available_vqa_datasets.get(cfg.vqa)
         if ds_cls is None:
             raise ValueError(
-                f"Unknown grounding dataset '{cfg.grounding}'. "
-                f"Supported datasets are: {available_grounding_datasets.keys()}"
+                f"Unknown vqa dataset '{cfg.vqa}'. Supported datasets are: {available_vqa_datasets.keys()}"
             )
         # TODO support dataset-specific arg / kwargs
         dataset = ds_cls(train_cfg)
@@ -210,8 +209,8 @@ def make_dataset(
             return_advantage_input=return_advantage_input,
         )
 
-    # TODO grounding datasets implement stats in original feature names, but camera_keys are standardized names
-    if not isinstance(cfg.grounding, str) and "dummy" not in cfg.repo_id and cfg.use_imagenet_stats:
+    # TODO vqa datasets implement stats in original feature names, but camera_keys are standardized names
+    if not isinstance(cfg.vqa, str) and "dummy" not in cfg.repo_id and cfg.use_imagenet_stats:
         for key in dataset.meta.camera_keys:
             for stats_type, stats in IMAGENET_STATS.items():
                 if key not in dataset.meta.stats:

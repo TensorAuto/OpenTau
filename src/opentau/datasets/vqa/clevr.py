@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CLEVR dataset for visual reasoning and grounding tasks.
+"""CLEVR dataset for visual reasoning and vqa tasks.
 
 This module provides the CLEVR (Compositional Language and Elementary Visual
 Reasoning) dataset implementation for training vision-language models on
 compositional visual reasoning tasks. The dataset contains synthetic scenes
 with geometric objects and questions requiring compositional reasoning.
 
-The dataset is loaded from HuggingFace and formatted for grounding tasks,
+The dataset is loaded from HuggingFace and formatted for vqa tasks,
 providing images, questions, and answers for visual reasoning.
 
 Classes:
@@ -33,7 +33,7 @@ Functions:
 Example:
     Use CLEVR dataset in training:
         >>> from opentau.configs.default import DatasetConfig
-        >>> cfg = DatasetConfig(grounding="clevr")
+        >>> cfg = DatasetConfig(vqa="clevr")
         >>> dataset = make_dataset(cfg, train_cfg)
 """
 
@@ -44,9 +44,9 @@ import torch
 from datasets import load_dataset
 from PIL import Image
 
-from opentau import register_grounding_dataset
+from opentau import register_vqa_dataset
 from opentau.configs.train import TrainPipelineConfig
-from opentau.datasets.grounding.base import GroundingDataset
+from opentau.datasets.vqa.base import VQADataset
 
 logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 
@@ -70,12 +70,12 @@ def _img_to_normalized_tensor(img: Image.Image, img_shape: tuple) -> torch.Tenso
     return torch.from_numpy(np.array(img))[:, :, :3].permute(2, 0, 1).float() / 255.0
 
 
-@register_grounding_dataset("clevr")
-class CLEVRDataset(GroundingDataset):
-    """CLEVR dataset for visual reasoning and grounding tasks.
+@register_vqa_dataset("clevr")
+class CLEVRDataset(VQADataset):
+    """CLEVR dataset for visual reasoning and vqa tasks.
 
     Loads the MMInstruction/Clevr_CoGenT_TrainA_70K_Complex dataset from
-    HuggingFace and formats it for grounding tasks.
+    HuggingFace and formats it for vqa tasks.
     """
 
     def __init__(self, cfg: TrainPipelineConfig, consecutive_bad_tolerance=100):
@@ -103,8 +103,8 @@ class CLEVRDataset(GroundingDataset):
 
         return {
             "image": _img_to_normalized_tensor(img, self.resolution),
-            "task": "grounding",
+            "task": "vqa",
             "postfix": f"The answer is {sample['solution'].split('<answer>')[1].split('</answer>')[0]}",
-            "task_type": "grounding",
-            "prompt": f'{{"task": "grounding", "description": "Using the Image, Answer the following question. \n  {sample["problem"]}"}}',
+            "task_type": "vqa",
+            "prompt": f'{{"task": "vqa", "description": "Using the Image, Answer the following question. \n  {sample["problem"]}"}}',
         }

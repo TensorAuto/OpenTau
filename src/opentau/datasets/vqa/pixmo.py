@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Datasets for Image-Text Point Set grounding tasks.
+"""Datasets for Image-Text Point Set vqa tasks.
 
 This module provides the PIXMO (Pixel-level Manipulation) dataset implementation
-for training vision-language models on part localization and object grounding tasks.
+for training vision-language models on part localization and object vqa tasks.
 """
 
 import json
@@ -31,9 +31,9 @@ from PIL import Image
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from opentau import register_grounding_dataset
+from opentau import register_vqa_dataset
 from opentau.configs.train import TrainPipelineConfig
-from opentau.datasets.grounding.base import GroundingDataset
+from opentau.datasets.vqa.base import VQADataset
 
 # TODO: add a config to filter the warnings
 logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
@@ -123,8 +123,8 @@ def _img_to_normalized_tensor(img: Image.Image) -> torch.Tensor:
     return torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0
 
 
-@register_grounding_dataset("pixmo")
-class PixmoDataset(GroundingDataset):
+@register_vqa_dataset("pixmo")
+class PixmoDataset(VQADataset):
     r"""Dataset for the iterable PixMo dataset implementation, recommended to be used together with PrefetchWrapper"""
 
     def __init__(self, cfg: TrainPipelineConfig, consecutive_bad_tolerance=100):
