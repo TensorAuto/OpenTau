@@ -8,7 +8,7 @@
                 "repo_id": "lerobot/aloha_mobile_cabinet"
             },
             {
-                "grounding": "dummy"
+                "vqa": "dummy"
             }
         ],
         "weights": [

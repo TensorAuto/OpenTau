@@ -680,7 +680,7 @@ DATASETS = {
                 year = {2022}
             }
             @inproceedings{mees23hulc2,
-                title={VQA  Language  with  Visual  Affordances  over  Unstructured  Data},
+                title={Grounding  Language  with  Visual  Affordances  over  Unstructured  Data},
                 author={Oier Mees and Jessica Borja-Diaz and Wolfram Burgard},
                 booktitle = {Proceedings of the IEEE International Conference on Robotics and Automation (ICRA)},
                 year={2023},
