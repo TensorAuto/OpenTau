@@ -222,8 +222,12 @@ def visualize_dataset(
     if joint_names is None:
         joint_names = dataset.meta.info.get("features", {}).get("observation.state", {}).get("names", [])
 
-    # In case the info.json lists the state names in a nested dictionary
+    # Guard against invalid state names from info.json (ensure it's a list of strings)
     if not (isinstance(joint_names, list) and all(isinstance(name, str) for name in joint_names)):
+        logging.warning(
+            "Invalid joint_names type in info.json: %s. Expected list of strings. Using numeric indices instead.",
+            type(joint_names),
+        )
         joint_names = []
 
     if urdf:
