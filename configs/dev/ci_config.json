@@ -2,7 +2,7 @@
     "dataset_mixture": {
         "datasets": [
             {
-                "grounding": "dummy"
+                "vqa": "dummy"
             },
             {
                 "repo_id": "lerobot/droid_100",
