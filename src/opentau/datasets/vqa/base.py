@@ -150,5 +150,5 @@ class VQADataset(BaseDataset):
         Args:
             item: Item dictionary (unmodified).
         """
-        # VQA datasets has nothing to separate.
+        # VQA datasets have nothing to separate.
         pass
