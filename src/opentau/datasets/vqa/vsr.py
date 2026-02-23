@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""VSR (Visual Spatial Reasoning) dataset for true/false statement grounding.
+"""VSR (Visual Spatial Reasoning) dataset for true/false statement vqa.
 
 This module provides the VSR dataset implementation for training vision-language
 models on visual spatial reasoning tasks. The dataset contains images with
@@ -30,9 +30,9 @@ from PIL import Image
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from opentau import register_grounding_dataset
+from opentau import register_vqa_dataset
 from opentau.configs.train import TrainPipelineConfig
-from opentau.datasets.grounding.base import GroundingDataset
+from opentau.datasets.vqa.base import VQADataset
 
 logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 
@@ -81,9 +81,9 @@ def _img_to_normalized_tensor(img: Image.Image, img_shape: tuple) -> torch.Tenso
     return torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0
 
 
-@register_grounding_dataset("vsr")
-class VSRDataset(GroundingDataset):
-    """Visual Spatial Reasoning (VSR) dataset for true/false statement grounding.
+@register_vqa_dataset("vsr")
+class VSRDataset(VQADataset):
+    """Visual Spatial Reasoning (VSR) dataset for true/false statement vqa.
 
     Loads the cambridgeltl/vsr_random dataset from HuggingFace and formats it
     for visual reasoning tasks where models must determine if statements about
@@ -134,8 +134,8 @@ class VSRDataset(GroundingDataset):
                 "image": _img_to_normalized_tensor(img, self.resolution),
                 "task": sample["label"],
                 "postfix": f"The statement is {self.mapping[sample['label']]}",
-                "task_type": "grounding",
-                "prompt": f'{{"task": "grounding", "description": "Using the Image, Tell me if following statement is true or false. \n  {sample["caption"]}"}}',
+                "task_type": "vqa",
+                "prompt": f'{{"task": "vqa", "description": "Using the Image, Tell me if following statement is true or false. \n  {sample["caption"]}"}}',
             }
 
         raise RuntimeError("Too many consecutive bad items. Please check dataset or increase the tolerance.")

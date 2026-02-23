@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""COCO-QA dataset for visual question answering and grounding tasks.
+"""COCO-QA dataset for visual question answering and vqa tasks.
 
 This module provides the COCO-QA dataset implementation for training
 vision-language models on visual question answering tasks. The dataset is
@@ -24,7 +24,7 @@ filtered to retain only spatial reasoning questions.
 
 Classes:
     COCODataset: Dataset class that loads, filters, and formats COCO-QA data
-        for grounding tasks.
+        for vqa tasks.
 
 Functions:
     _img_to_normalized_tensor: Convert PIL Image to normalized torch tensor
@@ -35,7 +35,7 @@ Functions:
 Example:
     Use COCO-QA dataset in training:
         >>> from opentau.configs.default import DatasetConfig
-        >>> cfg = DatasetConfig(grounding="cocoqa")
+        >>> cfg = DatasetConfig(vqa="cocoqa")
         >>> dataset = make_dataset(cfg, train_cfg)
 """
 
@@ -47,9 +47,9 @@ import torch
 from datasets import load_dataset
 from PIL import Image
 
-from opentau import register_grounding_dataset
+from opentau import register_vqa_dataset
 from opentau.configs.train import TrainPipelineConfig
-from opentau.datasets.grounding.base import GroundingDataset
+from opentau.datasets.vqa.base import VQADataset
 
 logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 
@@ -88,9 +88,9 @@ def _filter_dataset(dataset: List) -> List:
     return filtered_dataset
 
 
-@register_grounding_dataset("cocoqa")
-class COCODataset(GroundingDataset):
-    """COCO-QA dataset for visual question answering and grounding tasks.
+@register_vqa_dataset("cocoqa")
+class COCODataset(VQADataset):
+    """COCO-QA dataset for visual question answering and vqa tasks.
 
     Loads the ThucPD/coco-qa-vi dataset from HuggingFace and filters it to
     only include 'where' questions for spatial reasoning tasks.
@@ -123,8 +123,8 @@ class COCODataset(GroundingDataset):
 
         return {
             "image": _img_to_normalized_tensor(img, self.resolution),
-            "task": "grounding",
+            "task": "vqa",
             "postfix": f"The answer is {sample['answer']}",
-            "task_type": "grounding",
-            "prompt": f'{{"task": "grounding", "description": "Using the Image, Answer the following question. \n  {sample["question"]}"}}',
+            "task_type": "vqa",
+            "prompt": f'{{"task": "vqa", "description": "Using the Image, Answer the following question. \n  {sample["question"]}"}}',
         }

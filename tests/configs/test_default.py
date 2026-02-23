@@ -19,17 +19,17 @@ from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAP
 
 
 @pytest.mark.parametrize(
-    "repo_id, grounding, ground_truth", [("", None, True), (None, "", True), (None, None, False)]
+    "repo_id, vqa, ground_truth", [("", None, True), (None, "", True), (None, None, False)]
 )
-def test_datasetconfig(repo_id, grounding, ground_truth):
+def test_datasetconfig(repo_id, vqa, ground_truth):
     """
     Tests if datasetConfig object is successfully created
     """
     if ground_truth:
-        DatasetConfig(repo_id=repo_id, grounding=grounding)
+        DatasetConfig(repo_id=repo_id, vqa=vqa)
     else:
         with pytest.raises(ValueError):
-            DatasetConfig(repo_id=repo_id, grounding=grounding)
+            DatasetConfig(repo_id=repo_id, vqa=vqa)
 
 
 def test_valid_instantiation_with_data():

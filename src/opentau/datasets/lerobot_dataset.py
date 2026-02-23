@@ -52,8 +52,8 @@ Classes:
         Metadata manager for LeRobot datasets with Hub integration, version
         checking, and statistics loading.
 
-    GroundingDatasetMetadata
-        Metadata manager for grounding datasets.
+    VQADatasetMetadata
+        Metadata manager for vqa datasets.
 
     BaseDataset
         Base PyTorch Dataset class with common functionality.
@@ -259,8 +259,8 @@ class DatasetMetadata:
         return {key: tuple(ft["shape"]) for key, ft in self.features.items()}
 
 
-class GroundingDatasetMetadata(DatasetMetadata):
-    """Metadata class for grounding datasets (vision-language datasets)."""
+class VQADatasetMetadata(DatasetMetadata):
+    """Metadata class for vqa datasets (vision-language datasets)."""
 
     pass
 
@@ -585,7 +585,7 @@ class BaseDataset(torch.utils.data.Dataset):
     """Base class for all robot learning datasets.
 
     This abstract base class provides common functionality for both LeRobotDataset
-    and GroundingDataset, including data format standardization, image processing,
+    and VQADataset, including data format standardization, image processing,
     and vector padding. It ensures all datasets conform to a standard format
     regardless of their source or structure.
 

@@ -16,7 +16,7 @@ The dataset format is versioned (currently v2.1) and utilizes parquet files for 
 There are currently two types of datasets:
 
 *   ``LeRobotDataset``: For robotic data.
-*   ``GroundingDataset``: For VLM datasets such as Visual Question Answering (VQA) or visual grounding.
+*   ``VQADataset``: For VLM training datasets.
 
 These datasets are used to train policies.
 
@@ -25,7 +25,7 @@ DatasetMixture
 To train policies on multiple datasets simultaneously, OpenTau uses ``opentau.datasets.dataset_mixture.WeightedDatasetMixture``.
 This class:
 
-*   Combines multiple ``LeRobotDataset`` and ``GroundingDataset`` instances.
+*   Combines multiple ``LeRobotDataset`` and ``VQADataset`` instances.
 *   Different weights can be assigned to each dataset to control the sampling frequency.
 *   Aggregates statistics from all constituent datasets to ensure consistent normalization across the mixture.
 *   Resamples the action output frequency to match the action frequency specified in the configuration.

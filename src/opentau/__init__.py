@@ -25,7 +25,7 @@ The module maintains several key registries:
 - `available_tasks_per_env`: Mapping of environments to their available tasks
 - `available_datasets_per_env`: Mapping of environments to their compatible datasets
 - `available_real_world_datasets`: List of real-world robot datasets
-- `available_grounding_datasets`: Registry for grounding datasets (populated via decorator)
+- `available_vqa_datasets`: Registry for vqa datasets (populated via decorator)
 - `available_policies`: List of available policy types (e.g., "pi0", "pi05", "value")
 - `available_policies_per_env`: Mapping of environments to their compatible policies
 
@@ -142,7 +142,7 @@ available_real_world_datasets = [
     "lerobot/usc_cloth_sim",
 ]
 
-available_grounding_datasets = {}
+available_vqa_datasets = {}
 
 available_datasets = sorted(
     set(itertools.chain(*available_datasets_per_env.values(), available_real_world_datasets))
@@ -177,4 +177,4 @@ def registry_factory(global_dict):
     return register
 
 
-register_grounding_dataset = registry_factory(available_grounding_datasets)
+register_vqa_dataset = registry_factory(available_vqa_datasets)

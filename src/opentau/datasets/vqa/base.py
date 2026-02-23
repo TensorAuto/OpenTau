@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Base class for vision-language grounding datasets.
+"""Base class for vision-language vqa datasets.
 
-This module provides the base class for all grounding datasets, which are used
+This module provides the base class for all vqa datasets, which are used
 for training vision-language-action models on image-text tasks without robot
-actions. Grounding datasets provide images, prompts, and responses for tasks
-like visual question answering, spatial reasoning, and object grounding.
+actions. VQA datasets provide images, prompts, and responses for tasks
+like visual question answering, spatial reasoning, and object vqa.
 
 The base class handles common functionality including:
     - Metadata creation with ImageNet statistics for images
@@ -26,15 +26,15 @@ The base class handles common functionality including:
     - Integration with the dataset mixture system
 
 Classes:
-    GroundingDataset: Abstract base class that all grounding datasets inherit
+    VQADataset: Abstract base class that all vqa datasets inherit
         from. Provides common functionality for metadata creation, data format
         conversion, and zero-padding of missing features.
 
 Example:
-    Create a custom grounding dataset:
-        >>> from opentau import register_grounding_dataset
-        >>> @register_grounding_dataset("my_dataset")
-        >>> class MyGroundingDataset(GroundingDataset):
+    Create a custom vqa dataset:
+        >>> from opentau import register_vqa_dataset
+        >>> @register_vqa_dataset("my_dataset")
+        >>> class MyVQADataset(VQADataset):
         ...     def __getitem_helper__(self, item):
         ...         return {"image": ..., "task": ..., "postfix": ...}
 """
@@ -46,19 +46,19 @@ from typing import final
 import torch
 
 from opentau.configs.train import TrainPipelineConfig
-from opentau.datasets.lerobot_dataset import CODEBASE_VERSION, BaseDataset, GroundingDatasetMetadata
+from opentau.datasets.lerobot_dataset import CODEBASE_VERSION, BaseDataset, VQADatasetMetadata
 
 
-class GroundingDataset(BaseDataset):
-    """Base class for vision-language grounding datasets.
+class VQADataset(BaseDataset):
+    """Base class for vision-language vqa datasets.
 
-    Grounding datasets are used for training vision-language-action models on
+    VQA datasets are used for training vision-language-action models on
     image-text tasks without robot actions. They provide images, prompts, and
-    responses for grounding tasks.
+    responses for vqa tasks.
 
     Attributes:
         num_frames: Number of frames in the dataset.
-        num_episodes: Number of episodes (always 1 for grounding datasets).
+        num_episodes: Number of episodes (always 1 for vqa datasets).
         meta: Dataset metadata containing features and statistics.
     """
 
@@ -68,14 +68,14 @@ class GroundingDataset(BaseDataset):
         self.num_episodes = num_episodes
         self.meta = self.create_meta()
 
-    def create_meta(self) -> GroundingDatasetMetadata:
-        """Create metadata for the grounding dataset.
+    def create_meta(self) -> VQADatasetMetadata:
+        """Create metadata for the vqa dataset.
 
         Initializes metadata with ImageNet statistics for images and zero
-        statistics for state and actions (since grounding datasets don't have them).
+        statistics for state and actions (since vqa datasets don't have them).
 
         Returns:
-            GroundingDatasetMetadata object with initialized info and stats.
+            VQADatasetMetadata object with initialized info and stats.
         """
         from opentau.datasets.factory import IMAGENET_STATS
 
@@ -111,7 +111,7 @@ class GroundingDataset(BaseDataset):
                 "count": [len(self)],
             },
         }
-        metadata = GroundingDatasetMetadata(info=info, stats=stats)
+        metadata = VQADatasetMetadata(info=info, stats=stats)
         metadata.repo_id = self._get_feature_mapping_key()
         return metadata
 
@@ -132,7 +132,7 @@ class GroundingDataset(BaseDataset):
     def __getitem__(self, item):
         item = self.__getitem_helper__(item)
 
-        # Grounding datasets don't have states or actions. 0-padding is used.
+        # VQA datasets don't have states or actions. 0-padding is used.
         item["state"] = torch.zeros(self.max_state_dim)
         item["actions"] = torch.zeros(self.action_chunk, self.max_action_dim)
         item["actions_is_pad"] = torch.ones(self.action_chunk, dtype=torch.bool)
@@ -143,12 +143,12 @@ class GroundingDataset(BaseDataset):
         return item
 
     def _separate_image_in_time(self, item: dict) -> None:
-        """Separate images in time (no-op for grounding datasets).
+        """Separate images in time (no-op for vqa datasets).
 
-        Grounding datasets don't have temporal image sequences, so this is a no-op.
+        VQA datasets don't have temporal image sequences, so this is a no-op.
 
         Args:
             item: Item dictionary (unmodified).
         """
-        # Grounding datasets has nothing to separate.
+        # VQA datasets have nothing to separate.
         pass
