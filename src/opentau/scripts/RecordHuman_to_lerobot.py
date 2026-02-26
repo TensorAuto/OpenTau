@@ -125,7 +125,7 @@ def quat_to_rotation_matrix(q):
 def rotation_matrix_to_quat(R):
     """Convert a 3x3 rotation matrix to an (x, y, z, w) quaternion.
 
-    Uses Shepperd's method, which selects the numerically stable branch
+    Selects the numerically stable branch
     based on the matrix diagonal.
 
     Note:
