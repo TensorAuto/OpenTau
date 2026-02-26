@@ -169,7 +169,7 @@ select = ["E4", "E7", "E9", "F", "I", "N", "B", "C4", "SIM"]
 # Server must implement gRPC interface with PascalCase method names
 "src/opentau/scripts/grpc/server.py" = ["N802"]
 # Uppercase names for rotation matrices follow standard math convention
-"src/opentau/scripts/RecordHuman_to_lerobot.py" = ["N803", "N806"]
+"src/opentau/scripts/recordhuman_to_lerobot.py" = ["N803", "N806"]
 
 [tool.bandit]
 exclude_dirs = [

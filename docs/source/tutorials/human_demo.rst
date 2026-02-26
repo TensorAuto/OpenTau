@@ -35,13 +35,13 @@ Launch RecordHuman on the headset and perform the task you want to demonstrate. 
 Step 3: Convert to LeRobot format
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Use ``RecordHuman_to_lerobot.py`` to convert the recorded data into a LeRobot dataset that OpenTau can train on.
+Use ``recordhuman_to_lerobot.py`` to convert the recorded data into a LeRobot dataset that OpenTau can train on.
 
 **Basic usage:**
 
 .. code-block:: bash
 
-   python -m opentau.scripts.RecordHuman_to_lerobot \
+   python -m opentau.scripts.recordhuman_to_lerobot \
        --video recording.mp4 \
        --poses recording.json \
        --output ./datasets/my_vr_dataset \
@@ -51,7 +51,7 @@ Use ``RecordHuman_to_lerobot.py`` to convert the recorded data into a LeRobot da
 
 .. code-block:: bash
 
-   python -m opentau.scripts.RecordHuman_to_lerobot \
+   python -m opentau.scripts.recordhuman_to_lerobot \
        --video recording.mp4 \
        --poses recording.json \
        --output ./datasets/my_vr_dataset \
@@ -62,7 +62,7 @@ Use ``RecordHuman_to_lerobot.py`` to convert the recorded data into a LeRobot da
 
 .. code-block:: bash
 
-   python -m opentau.scripts.RecordHuman_to_lerobot \
+   python -m opentau.scripts.recordhuman_to_lerobot \
        --video recording.mp4 \
        --poses recording.json \
        --output ./datasets/my_vr_dataset \

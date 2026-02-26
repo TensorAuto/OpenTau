@@ -28,12 +28,12 @@ Video frames are stored as observation.images.camera.
 Optionally generates a skeleton overlay video with --overlay.
 
 Example:
-    python src/opentau/scripts/RecordHuman_to_lerobot.py \\
+    python src/opentau/scripts/recordhuman_to_lerobot.py \\
         --video recording.mp4 --poses recording.json \\
         --output ./my_dataset --prompt "Pick up the snack bag"
 
     # With overlay video
-    python src/opentau/scripts/RecordHuman_to_lerobot.py \\
+    python src/opentau/scripts/recordhuman_to_lerobot.py \\
         --video recording.mp4 --poses recording.json \\
         --output ./my_dataset --prompt "Pick up the snack bag" \\
         --overlay overlay.mp4
