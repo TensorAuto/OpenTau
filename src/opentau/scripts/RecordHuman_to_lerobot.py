@@ -18,7 +18,10 @@ State vector (364-D): camera-space pose of each hand joint (26 joints × 7 float
 [pos_x, pos_y, pos_z, quat_x, quat_y, quat_z, quat_w]) for left hand (182)
 concatenated with right hand (182). Zeros when a hand is not tracked.
 
-Action: the next frame's state (last frame repeats its own state).
+Action vector (371-D): next frame's state (364) concatenated with the delta head
+pose (7 = delta_pos(3) + delta_rot(4)). Delta position is pos_{t+1} - pos_{t}.
+Delta rotation is the relative quaternion q_{t+1} * q_t^{-1}. The last frame
+uses zero delta position and identity quaternion [0,0,0,1].
 
 Video frames are stored as observation.images.camera.
 
@@ -50,6 +53,8 @@ JOINTS_PER_HAND = 26
 FLOATS_PER_JOINT = 7  # pos(3) + rot(4)
 STATE_DIM_PER_HAND = JOINTS_PER_HAND * FLOATS_PER_JOINT  # 182
 STATE_DIM = STATE_DIM_PER_HAND * 2  # 364: left(182) + right(182)
+HEAD_POSE_DIM = 7  # pos(3) + rot(4)
+ACTION_DIM = STATE_DIM + HEAD_POSE_DIM  # 371: next-state(364) + delta head pose(7)
 
 FINGERTIP_INDICES = {5, 10, 15, 20, 25}
 
@@ -95,6 +100,18 @@ HEAD_AXIS_DISPLAY_LEN = 40
 
 
 def quat_to_rotation_matrix(q):
+    """Convert an (x, y, z, w) quaternion to a 3x3 rotation matrix.
+
+    The returned matrix R rotates column vectors from the local frame into the
+    world frame: ``p_world = R @ p_local``.
+
+    Args:
+        q: Quaternion as a 4-element array-like in (x, y, z, w) order.
+            Normalized internally.
+
+    Returns:
+        A (3, 3) numpy rotation matrix.
+    """
     x, y, z, w = q / np.linalg.norm(q)
     return np.array(
         [
@@ -106,7 +123,22 @@ def quat_to_rotation_matrix(q):
 
 
 def rotation_matrix_to_quat(R):
-    """Convert a 3×3 rotation matrix to (x, y, z, w) quaternion."""
+    """Convert a 3x3 rotation matrix to an (x, y, z, w) quaternion.
+
+    Uses Shepperd's method, which selects the numerically stable branch
+    based on the matrix diagonal.
+
+    Note:
+        The sign of the returned quaternion is arbitrary (q and -q represent
+        the same rotation). Avoid round-tripping through this function when
+        sign consistency matters; use ``quat_inverse`` directly instead.
+
+    Args:
+        R: A (3, 3) rotation matrix.
+
+    Returns:
+        A length-4 numpy array ``[x, y, z, w]``.
+    """
     trace = R[0, 0] + R[1, 1] + R[2, 2]
     if trace > 0:
         s = 0.5 / np.sqrt(trace + 1.0)
@@ -135,20 +167,32 @@ def rotation_matrix_to_quat(R):
     return np.array([x, y, z, w])
 
 
-def rotate_quaternions_by_matrix(R, quats):
-    """Rotate an array of (N, 4) quaternions (x,y,z,w) by rotation matrix R.
+def quat_inverse(q):
+    """Return the inverse of a unit quaternion (its conjugate).
 
-    Computes q_out = R_as_quat * q_in for each row.
+    Args:
+        q: Unit quaternion as a 4-element array-like in (x, y, z, w) order.
+
+    Returns:
+        A length-4 numpy array ``[-x, -y, -z, w]``.
     """
-    r_q = rotation_matrix_to_quat(R)
-    out = np.empty_like(quats)
-    for i in range(len(quats)):
-        out[i] = quat_multiply(r_q, quats[i])
-    return out
+    x, y, z, w = q
+    return np.array([-x, -y, -z, w])
 
 
 def quat_multiply(q1, q2):
-    """Hamilton product of two (x,y,z,w) quaternions."""
+    """Compute the Hamilton product of two quaternions.
+
+    The result represents rotation q1 applied *after* q2:
+    ``q_out = q1 * q2`` means "first rotate by q2, then by q1".
+
+    Args:
+        q1: Left quaternion, (x, y, z, w).
+        q2: Right quaternion, (x, y, z, w).
+
+    Returns:
+        A length-4 numpy array ``[x, y, z, w]``.
+    """
     x1, y1, z1, w1 = q1
     x2, y2, z2, w2 = q2
     return np.array(
@@ -162,6 +206,23 @@ def quat_multiply(q1, q2):
 
 
 def world_to_camera(points_tracking, head_pos_tracking, head_rot_q, eye_offset=None):
+    """Transform 3-D points from tracking (world) space to camera (head-local) space.
+
+    Computes ``p_cam = R_world_to_cam @ (p_world - eye_pos)`` using row-vector
+    convention internally (``(N,3) @ (3,3)``).
+
+    Args:
+        points_tracking: (N, 3) array of points in tracking/world coordinates.
+        head_pos_tracking: (3,) head position in tracking space (after origin
+            subtraction).
+        head_rot_q: (4,) head orientation quaternion (x, y, z, w) mapping local
+            to world.
+        eye_offset: Optional (3,) offset from head center to the eye in head-
+            local coordinates. Applied after rotating by head orientation.
+
+    Returns:
+        (N, 3) array of points in camera space.
+    """
     R_local_to_world = quat_to_rotation_matrix(head_rot_q)
     R_world_to_local = R_local_to_world.T
     eye_pos = head_pos_tracking
@@ -171,6 +232,22 @@ def world_to_camera(points_tracking, head_pos_tracking, head_rot_q, eye_offset=N
 
 
 def project_camera_to_pixel(points_cam, fx, fy, cx, cy):
+    """Project camera-space 3-D points to 2-D pixel coordinates (pinhole model).
+
+    Y is negated so that camera-up maps to image-down (standard image coords).
+    Points behind the camera (Z <= 0.01) are marked invalid and set to NaN.
+
+    Args:
+        points_cam: (N, 3) array in camera coordinates (Z forward, Y up).
+        fx: Horizontal focal length in pixels.
+        fy: Vertical focal length in pixels.
+        cx: Principal point x (pixels).
+        cy: Principal point y (pixels).
+
+    Returns:
+        Tuple of ``(px, py, valid)`` where ``px`` and ``py`` are (N,) float
+        arrays (NaN for invalid points), and ``valid`` is a boolean mask.
+    """
     valid = points_cam[:, 2] > 0.01
     px = np.full(len(points_cam), np.nan)
     py = np.full(len(points_cam), np.nan)
@@ -181,12 +258,27 @@ def project_camera_to_pixel(points_cam, fx, fy, cx, cy):
 
 
 def parse_hand_joints(flat_array):
-    """Return (26, 7) array of [pos_x, pos_y, pos_z, quat_x, quat_y, quat_z, quat_w]."""
+    """Parse a flat joint array into a structured (26, 7) array.
+
+    Args:
+        flat_array: Flat sequence of 182 floats (26 joints x 7 values per
+            joint: pos_x, pos_y, pos_z, quat_x, quat_y, quat_z, quat_w).
+
+    Returns:
+        (26, 7) float64 numpy array.
+    """
     return np.array(flat_array, dtype=np.float64).reshape(JOINTS_PER_HAND, FLOATS_PER_JOINT)
 
 
 def parse_hand_positions(flat_array):
-    """Return (26, 3) positions only — used for overlay projection."""
+    """Parse a flat joint array and return only the 3-D positions.
+
+    Args:
+        flat_array: Flat sequence of 182 floats (see ``parse_hand_joints``).
+
+    Returns:
+        (26, 3) float64 numpy array of joint positions.
+    """
     return parse_hand_joints(flat_array)[:, :3]
 
 
@@ -196,6 +288,14 @@ def parse_hand_positions(flat_array):
 
 
 def draw_hand(frame, positions_2d, valid, color):
+    """Draw a hand skeleton (bones and joints) onto an image.
+
+    Args:
+        frame: BGR image (H, W, 3), modified in place.
+        positions_2d: (26, 2) array of pixel coordinates per joint.
+        valid: (26,) boolean mask indicating which joints are visible.
+        color: BGR tuple for the skeleton color.
+    """
     h, w = frame.shape[:2]
     for a, b in SKELETON_BONES:
         if not (valid[a] and valid[b]):
@@ -216,6 +316,16 @@ def draw_hand(frame, positions_2d, valid, color):
 
 
 def draw_head_gizmo(frame, head_rot_q):
+    """Draw a 3-axis orientation gizmo showing how world axes appear in camera view.
+
+    Renders X (red), Y (green), Z (blue) arrows in the upper-left corner of
+    the frame. Each arrow shows the direction of the corresponding world axis
+    as seen from the head's local frame.
+
+    Args:
+        frame: BGR image (H, W, 3), modified in place.
+        head_rot_q: (4,) head orientation quaternion (x, y, z, w), local-to-world.
+    """
     R = quat_to_rotation_matrix(head_rot_q)
     Rw2l = R.T
     ox, oy = 60, 60
@@ -242,6 +352,17 @@ def draw_head_gizmo(frame, head_rot_q):
 
 
 def draw_hud(frame, video_time, pose_time, frame_idx, total_frames, left_tracked, right_tracked):
+    """Draw a heads-up display with timing and hand-tracking status.
+
+    Args:
+        frame: BGR image (H, W, 3), modified in place.
+        video_time: Current video timestamp in seconds.
+        pose_time: Matched pose-data timestamp in seconds.
+        frame_idx: Current video frame index.
+        total_frames: Total number of video frames.
+        left_tracked: Whether the left hand is currently tracked.
+        right_tracked: Whether the right hand is currently tracked.
+    """
     h, w = frame.shape[:2]
     info = f"t={video_time:.2f}s  pose_t={pose_time:.2f}s  frame {frame_idx}/{total_frames}"
     cv2.putText(frame, info, (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
@@ -262,17 +383,39 @@ def draw_hud(frame, video_time, pose_time, frame_idx, total_frames, left_tracked
 
 
 def compute_frame_state(pf, head_pos_tracking, head_rot, eye_offset):
-    """Return (state_vector[364], left_cam_pos[26,3]|None, right_cam_pos[26,3]|None).
+    """Build the 364-D camera-space state vector for one pose frame.
 
-    State layout per hand (182 floats):
-        joint_0_pos(3) joint_0_quat(4) joint_1_pos(3) joint_1_quat(4) ... joint_25_pos(3) joint_25_quat(4)
-    Both positions and quaternions are in camera space.
+    Each hand contributes 182 floats (26 joints x 7: pos(3) + quat(4)), all
+    expressed in head/camera space. An untracked hand is left as zeros.
+
+    Joint positions are transformed via ``world_to_camera``. Joint quaternions
+    are rotated by ``q_head^{-1}`` (directly, without a matrix round-trip) to
+    convert from world orientation to camera-local orientation.
+
+    Note:
+        ``head_pos_tracking`` is expected to already have the XR tracking
+        origin subtracted. The raw joint positions from ``pf`` are used
+        as-is because the Pico recording format stores them in a coordinate
+        system that does not require the same origin correction.
+
+    Args:
+        pf: Single frame dict from the pose JSON (must contain ``left_joints``
+            / ``right_joints`` and ``left_tracked`` / ``right_tracked``).
+        head_pos_tracking: (3,) head position in tracking space (origin-
+            subtracted).
+        head_rot: (4,) head orientation quaternion (x, y, z, w), local-to-world.
+        eye_offset: Optional (3,) eye offset in head-local coords, or ``None``.
+
+    Returns:
+        Tuple of ``(state, left_cam_pos, right_cam_pos)`` where ``state`` is a
+        float32 array of shape ``(364,)``, and each ``*_cam_pos`` is either a
+        ``(26, 3)`` float64 array of camera-space joint positions or ``None``
+        if that hand is untracked.
     """
     state = np.zeros(STATE_DIM, dtype=np.float32)
     left_cam_pos = right_cam_pos = None
 
-    R_head = quat_to_rotation_matrix(head_rot)
-    R_inv = R_head.T
+    q_head_inv = quat_inverse(head_rot)
 
     for hand_idx, (jkey, tkey) in enumerate(
         [
@@ -288,9 +431,7 @@ def compute_frame_state(pf, head_pos_tracking, head_rot, eye_offset):
 
         cam_pos = world_to_camera(pos_tracking, head_pos_tracking, head_rot, eye_offset)
 
-        # Rotate each joint quaternion into camera frame:
-        # q_cam = q_head_inv * q_joint
-        cam_quat = rotate_quaternions_by_matrix(R_inv, quat)
+        cam_quat = np.array([quat_multiply(q_head_inv, quat[i]) for i in range(len(quat))])
 
         hand_state = np.hstack([cam_pos, cam_quat])  # (26, 7)
         offset = hand_idx * STATE_DIM_PER_HAND
@@ -310,6 +451,7 @@ def compute_frame_state(pf, head_pos_tracking, head_rot, eye_offset):
 
 
 def main():
+    """Entry point: parse CLI args, process video + poses, write LeRobot dataset."""
     parser = argparse.ArgumentParser(
         description="Convert Pico recordings to a LeRobot dataset (with optional overlay video).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -412,6 +554,7 @@ def main():
         overlay_writer = cv2.VideoWriter(str(overlay_path), fourcc, video_fps, (video_w, video_h))
 
     states: list[np.ndarray] = []
+    head_poses: list[np.ndarray] = []
     cap = cv2.VideoCapture(str(video_path))
 
     if overlay_writer:
@@ -455,6 +598,7 @@ def main():
 
             if next_sample < len(sampled_indices) and frame_idx == sampled_indices[next_sample]:
                 states.append(state)
+                head_poses.append(np.concatenate([head_pos_tracking, head_rot]).astype(np.float32))
                 next_sample += 1
 
         overlay_writer.release()
@@ -480,6 +624,7 @@ def main():
 
             state, _, _ = compute_frame_state(pf, head_pos_tracking, head_rot, eye_offset)
             states.append(state)
+            head_poses.append(np.concatenate([head_pos_tracking, head_rot]).astype(np.float32))
 
     cap.release()
 
@@ -488,7 +633,13 @@ def main():
         print("Error: no frames processed.", file=sys.stderr)
         sys.exit(1)
 
-    actions = [states[i + 1].copy() for i in range(num_frames - 1)] + [states[-1].copy()]
+    actions = []
+    for i in range(num_frames - 1):
+        delta_pos = head_poses[i + 1][:3] - head_poses[i][:3]
+        delta_rot = quat_multiply(head_poses[i + 1][3:], quat_inverse(head_poses[i][3:]))
+        actions.append(np.concatenate([states[i + 1], delta_pos, delta_rot]).astype(np.float32))
+    delta_zero = np.array([0, 0, 0, 0, 0, 0, 1], dtype=np.float32)
+    actions.append(np.concatenate([states[-1], delta_zero]))
 
     # --- Create LeRobot dataset ---
     image_key = "observation.images.camera"
@@ -508,7 +659,7 @@ def main():
         },
         action_key: {
             "dtype": "float32",
-            "shape": (STATE_DIM,),
+            "shape": (ACTION_DIM,),
             "names": None,
         },
     }
