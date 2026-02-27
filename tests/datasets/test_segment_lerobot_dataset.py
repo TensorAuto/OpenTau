@@ -102,11 +102,15 @@ def test_segment_lerobot_v21_dataset(tmp_path: Path, empty_lerobot_dataset_facto
     assert ep0["frame_index"] == [0, 1, 2]
     assert ep0["episode_index"] == [0, 0, 0]
     assert ep0["index"] == [0, 1, 2]
+    assert np.isclose(float(ep0["timestamp"][0]), 0.0)
+    assert np.allclose(np.diff(np.asarray(ep0["timestamp"], dtype=np.float64)), 1.0 / dataset.fps)
     assert [float(x) for x in ep0["state"]] == [2.0, 3.0, 4.0]
 
     assert ep1["frame_index"] == [0, 1, 2, 3, 4]
     assert ep1["episode_index"] == [1, 1, 1, 1, 1]
     assert ep1["index"] == [3, 4, 5, 6, 7]
+    assert np.isclose(float(ep1["timestamp"][0]), 0.0)
+    assert np.allclose(np.diff(np.asarray(ep1["timestamp"], dtype=np.float64)), 1.0 / dataset.fps)
     assert [float(x) for x in ep1["state"]] == [5.0, 6.0, 7.0, 8.0, 9.0]
 
 
@@ -221,6 +225,11 @@ def test_segment_lerobot_non_consecutive_and_overlapping_ranges(
     assert ep0["index"] == list(range(0, 10))
     assert ep1["index"] == list(range(10, 15))
     assert ep2["index"] == list(range(15, 25))
+
+    # Timestamps are rebased per output episode.
+    assert np.isclose(float(ep0["timestamp"][0]), 0.0)
+    assert np.isclose(float(ep1["timestamp"][0]), 0.0)
+    assert np.isclose(float(ep2["timestamp"][0]), 0.0)
 
     # Data slices match requested source windows.
     assert [float(x) for x in ep0["state"]] == [float(i) for i in range(0, 10)]

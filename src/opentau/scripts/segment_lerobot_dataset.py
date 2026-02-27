@@ -335,6 +335,16 @@ def segment_dataset(
             if col_idx >= 0:
                 seg_table = seg_table.set_column(col_idx, key, arr)
 
+        # Recompute timestamps from local frame_index to avoid subtraction drift.
+        if "timestamp" in seg_table.column_names:
+            ts_idx = seg_table.schema.get_field_index("timestamp")
+            recomputed_ts = np.arange(seg_len, dtype=np.float64) / float(source_meta.fps)
+            seg_table = seg_table.set_column(
+                ts_idx,
+                "timestamp",
+                pa.array(recomputed_ts, type=seg_table.schema.field("timestamp").type),
+            )
+
         # For image-based datasets, copy only the segment frames and rewrite image references.
         image_keys = [k for k, ft in source_meta.features.items() if ft["dtype"] == "image"]
         for image_key in image_keys:
