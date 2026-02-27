@@ -52,6 +52,17 @@ from opentau.datasets.utils import (
 
 
 def _parse_segment(text: str) -> tuple[int, int]:
+    """Parse one CLI segment token.
+
+    Args:
+        text: Segment string formatted as ``START:END``.
+
+    Returns:
+        A 2-tuple ``(start, end)`` where ``start >= 0`` and ``end > start``.
+
+    Raises:
+        argparse.ArgumentTypeError: If the value is malformed or out of range.
+    """
     parts = text.split(":")
     if len(parts) != 2:
         raise argparse.ArgumentTypeError(f"Invalid segment '{text}'. Expected START:END with integer values.")
@@ -72,6 +83,12 @@ def _parse_segment(text: str) -> tuple[int, int]:
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments for dataset segmentation.
+
+    Returns:
+        Parsed CLI namespace containing input/output roots, source episode id,
+        and the list of frame-range segments.
+    """
     parser = argparse.ArgumentParser(
         description="Create a segmented LeRobot v2.1 dataset from one source episode.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -95,6 +112,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def _to_numpy_for_stats(column: pa.ChunkedArray) -> np.ndarray:
+    """Convert an Arrow chunked column to a NumPy array for stats.
+
+    Args:
+        column: Arrow chunked column extracted from an episode parquet table.
+
+    Returns:
+        NumPy representation of the column values.
+    """
     # For list/fixed-size-list numeric columns, `to_pylist` keeps the nested shape,
     # and `np.asarray` reconstructs the expected dense ndarray.
     return np.asarray(column.to_pylist())
@@ -106,6 +131,18 @@ def segment_dataset(
     episode_id: int,
     segments: list[tuple[int, int]],
 ) -> None:
+    """Create a new segmented dataset from a source episode.
+
+    Args:
+        input_root: Source LeRobot dataset directory (v2.0 or v2.1).
+        output_root: Destination directory for the new dataset. Must not exist.
+        episode_id: Source episode index to slice.
+        segments: List of ``(start, end)`` frame ranges in ``[start, end)`` form.
+
+    Raises:
+        ValueError: If inputs are invalid, source files are missing, or segment
+            ranges are out of bounds.
+    """
     input_root = input_root.resolve()
     output_root = output_root.resolve()
 
@@ -258,6 +295,7 @@ def segment_dataset(
 
 
 def main() -> None:
+    """CLI entry point."""
     args = parse_args()
     segment_dataset(
         input_root=args.input_root,

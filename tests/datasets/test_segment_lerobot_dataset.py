@@ -14,6 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
+from typing import Any
+
 import numpy as np
 import pyarrow.parquet as pq
 
@@ -22,7 +25,13 @@ from opentau.datasets.utils import load_episodes, load_episodes_stats, load_info
 from opentau.scripts.segment_lerobot_dataset import segment_dataset
 
 
-def test_segment_lerobot_v21_dataset(tmp_path, empty_lerobot_dataset_factory):
+def test_segment_lerobot_v21_dataset(tmp_path: Path, empty_lerobot_dataset_factory: Any) -> None:
+    """Validate baseline segmentation behavior for v2.1 input.
+
+    Args:
+        tmp_path: Temporary directory fixture provided by pytest.
+        empty_lerobot_dataset_factory: Fixture that creates a writable dataset.
+    """
     input_root = tmp_path / "source_dataset"
     output_root = tmp_path / "segmented_dataset"
 
@@ -82,7 +91,13 @@ def test_segment_lerobot_v21_dataset(tmp_path, empty_lerobot_dataset_factory):
     assert [float(x) for x in ep1["state"]] == [5.0, 6.0, 7.0, 8.0, 9.0]
 
 
-def test_segment_lerobot_v20_input_outputs_v21(tmp_path, empty_lerobot_dataset_factory):
+def test_segment_lerobot_v20_input_outputs_v21(tmp_path: Path, empty_lerobot_dataset_factory: Any) -> None:
+    """Ensure v2.0 input is accepted and output stays v2.1.
+
+    Args:
+        tmp_path: Temporary directory fixture provided by pytest.
+        empty_lerobot_dataset_factory: Fixture that creates a writable dataset.
+    """
     input_root = tmp_path / "source_v20_dataset"
     output_root = tmp_path / "segmented_from_v20"
 
@@ -128,7 +143,15 @@ def test_segment_lerobot_v20_input_outputs_v21(tmp_path, empty_lerobot_dataset_f
     assert len(out_stats) == 2
 
 
-def test_segment_lerobot_non_consecutive_and_overlapping_ranges(tmp_path, empty_lerobot_dataset_factory):
+def test_segment_lerobot_non_consecutive_and_overlapping_ranges(
+    tmp_path: Path, empty_lerobot_dataset_factory: Any
+) -> None:
+    """Cover non-consecutive and overlapping segment ranges.
+
+    Args:
+        tmp_path: Temporary directory fixture provided by pytest.
+        empty_lerobot_dataset_factory: Fixture that creates a writable dataset.
+    """
     input_root = tmp_path / "source_edge_case_dataset"
     output_root = tmp_path / "segmented_edge_case_dataset"
 
