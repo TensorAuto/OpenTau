@@ -31,6 +31,7 @@ Example:
 import argparse
 import math
 import shutil
+import subprocess
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, cast
@@ -42,8 +43,8 @@ import pyarrow.parquet as pq
 from opentau.datasets.compute_stats import compute_episode_stats
 from opentau.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDatasetMetadata
 from opentau.datasets.utils import (
+    DEFAULT_IMAGE_PATH,
     EPISODES_PATH,
-    EPISODES_STATS_PATH,
     TASKS_PATH,
     append_jsonlines,
     write_episode_stats,
@@ -125,6 +126,127 @@ def _to_numpy_for_stats(column: pa.ChunkedArray) -> np.ndarray:
     return np.asarray(column.to_pylist())
 
 
+def _trim_video_segment(src_video_path: Path, dst_video_path: Path, start_frame: int, end_frame: int) -> None:
+    """Trim a source video to the requested frame interval.
+
+    Args:
+        src_video_path: Source episode video path.
+        dst_video_path: Output path for the trimmed segment video.
+        start_frame: Inclusive start frame index.
+        end_frame: Exclusive end frame index.
+
+    Raises:
+        RuntimeError: If ffmpeg is unavailable or the trim command fails.
+    """
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg is required to trim segmented videos but was not found in PATH.")
+
+    # Trim by exact frame indices and reset timeline to start at zero.
+    vf = f"trim=start_frame={start_frame}:end_frame={end_frame},setpts=PTS-STARTPTS"
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(src_video_path),
+        "-vf",
+        vf,
+        "-an",
+        str(dst_video_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to trim video segment {start_frame}:{end_frame} from '{src_video_path}'. "
+            f"ffmpeg stderr: {result.stderr.strip()}"
+        )
+
+
+def _copy_segment_images_and_rewrite_column(
+    image_cells: list[Any],
+    input_root: Path,
+    output_root: Path,
+    image_key: str,
+    output_episode_index: int,
+    source_episode_index: int,
+    source_segment_start: int,
+) -> list[Any]:
+    """Copy image files for a segment and rewrite per-row image references.
+
+    Args:
+        image_cells: Image column values from the sliced source table.
+        input_root: Source dataset root path.
+        output_root: Output dataset root path.
+        image_key: Feature key for this image stream.
+        output_episode_index: Output episode index receiving this segment.
+        source_episode_index: Source episode index for image path fallback.
+        source_segment_start: Start frame index of this segment in source episode.
+
+    Returns:
+        New image column values with updated file paths for copied images.
+
+    Raises:
+        FileNotFoundError: If a referenced source image file does not exist.
+    """
+    rewritten_cells: list[Any] = []
+    for frame_index, cell in enumerate(image_cells):
+        rel_dst = DEFAULT_IMAGE_PATH.format(
+            image_key=image_key,
+            episode_index=output_episode_index,
+            frame_index=frame_index,
+        )
+        dst_path = output_root / rel_dst
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if isinstance(cell, dict):
+            image_bytes = cell.get("bytes")
+            if isinstance(image_bytes, (bytes, bytearray)) and len(image_bytes) > 0:
+                dst_path.write_bytes(bytes(image_bytes))
+                new_cell = dict(cell)
+                new_cell["path"] = str(dst_path)
+                rewritten_cells.append(new_cell)
+                continue
+
+        src_path: Path | None = None
+        if isinstance(cell, str):
+            src_path = Path(cell)
+        elif isinstance(cell, dict):
+            path_val = cell.get("path")
+            if isinstance(path_val, str) and path_val:
+                src_path = Path(path_val)
+
+        # Embedded-image rows may not require copying when path is empty.
+        if src_path is None:
+            rewritten_cells.append(cell)
+            continue
+
+        if not src_path.is_absolute():
+            src_path = input_root / src_path
+        if not src_path.is_file():
+            # Fallback to canonical image location under input root.
+            source_frame_index = source_segment_start + frame_index
+            src_path = input_root / DEFAULT_IMAGE_PATH.format(
+                image_key=image_key,
+                episode_index=source_episode_index,
+                frame_index=source_frame_index,
+            )
+        if not src_path.is_file():
+            raise FileNotFoundError(f"Missing source image for key '{image_key}': {src_path}")
+
+        shutil.copy2(src_path, dst_path)
+
+        if isinstance(cell, str):
+            rewritten_cells.append(str(dst_path))
+        else:
+            new_cell = dict(cell)
+            new_cell["path"] = str(dst_path)
+            rewritten_cells.append(new_cell)
+
+    return rewritten_cells
+
+
 def segment_dataset(
     input_root: Path,
     output_root: Path,
@@ -138,6 +260,12 @@ def segment_dataset(
         output_root: Destination directory for the new dataset. Must not exist.
         episode_id: Source episode index to slice.
         segments: List of ``(start, end)`` frame ranges in ``[start, end)`` form.
+
+    Notes:
+        For visual features (``dtype`` in ``{"image", "video"}``), per-episode
+        statistics (``min``, ``max``, ``mean``, ``std``) are inherited from the
+        source episode statistics and only the ``count`` is updated to the segment
+        length. They are not recomputed from the segmented visual data.
 
     Raises:
         ValueError: If inputs are invalid, source files are missing, or segment
@@ -207,6 +335,26 @@ def segment_dataset(
             if col_idx >= 0:
                 seg_table = seg_table.set_column(col_idx, key, arr)
 
+        # For image-based datasets, copy only the segment frames and rewrite image references.
+        image_keys = [k for k, ft in source_meta.features.items() if ft["dtype"] == "image"]
+        for image_key in image_keys:
+            if image_key not in seg_table.column_names:
+                continue
+            col_idx = seg_table.schema.get_field_index(image_key)
+            image_cells = seg_table.column(image_key).to_pylist()
+            rewritten = _copy_segment_images_and_rewrite_column(
+                image_cells=image_cells,
+                input_root=input_root,
+                output_root=output_root,
+                image_key=image_key,
+                output_episode_index=output_episode_index,
+                source_episode_index=episode_id,
+                source_segment_start=start,
+            )
+            seg_table = seg_table.set_column(
+                col_idx, image_key, pa.array(rewritten, type=seg_table.schema.field(image_key).type)
+            )
+
         episode_chunk = output_episode_index // chunks_size
         output_parquet_path = output_root / source_meta.data_path.format(
             episode_chunk=episode_chunk,
@@ -267,7 +415,7 @@ def segment_dataset(
         src_video_path = input_root / source_meta.get_video_file_path(episode_id, video_key)
         if not src_video_path.is_file():
             raise ValueError(f"Missing source video for key '{video_key}': {src_video_path}")
-        for output_episode_index in range(len(segments)):
+        for output_episode_index, (start, end) in enumerate(segments):
             episode_chunk = output_episode_index // chunks_size
             dst_video_path = output_root / video_path_template_str.format(
                 episode_chunk=episode_chunk,
@@ -275,7 +423,7 @@ def segment_dataset(
                 episode_index=output_episode_index,
             )
             dst_video_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_video_path, dst_video_path)
+            _trim_video_segment(src_video_path, dst_video_path, start, end)
 
     for episode in output_episodes:
         append_jsonlines(episode, output_root / EPISODES_PATH)
@@ -289,9 +437,6 @@ def segment_dataset(
     info["total_videos"] = total_episodes * len(source_meta.video_keys)
     info["splits"] = {"train": f"0:{total_episodes}"}
     write_json(info, output_root / "meta" / "info.json")
-
-    # Ensure expected meta files exist and are explicit outputs.
-    _ = output_root / EPISODES_STATS_PATH
 
 
 def main() -> None:

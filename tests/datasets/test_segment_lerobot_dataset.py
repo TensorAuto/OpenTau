@@ -16,6 +16,7 @@
 
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -23,6 +24,24 @@ import pyarrow.parquet as pq
 from opentau.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from opentau.datasets.utils import load_episodes, load_episodes_stats, load_info, write_json, write_stats
 from opentau.scripts.segment_lerobot_dataset import segment_dataset
+
+
+def _extract_image_path(cell: Any) -> str | None:
+    """Extract image path from a parquet image cell.
+
+    Args:
+        cell: A parquet image value (string path or dict with `path`/`bytes`).
+
+    Returns:
+        Image path string if present, otherwise None.
+    """
+    if isinstance(cell, str):
+        return cell
+    if isinstance(cell, dict):
+        path = cell.get("path")
+        if isinstance(path, str) and path:
+            return path
+    return None
 
 
 def test_segment_lerobot_v21_dataset(tmp_path: Path, empty_lerobot_dataset_factory: Any) -> None:
@@ -207,3 +226,91 @@ def test_segment_lerobot_non_consecutive_and_overlapping_ranges(
     assert [float(x) for x in ep0["state"]] == [float(i) for i in range(0, 10)]
     assert [float(x) for x in ep1["state"]] == [float(i) for i in range(18, 23)]
     assert [float(x) for x in ep2["state"]] == [float(i) for i in range(5, 15)]
+
+
+def test_segment_lerobot_copies_image_files_for_segments(
+    tmp_path: Path, empty_lerobot_dataset_factory: Any
+) -> None:
+    """Ensure segmented datasets copy and rewrite image file references.
+
+    Args:
+        tmp_path: Temporary directory fixture provided by pytest.
+        empty_lerobot_dataset_factory: Fixture that creates a writable dataset.
+    """
+    input_root = tmp_path / "source_image_dataset"
+    output_root = tmp_path / "segmented_image_dataset"
+    image_key = "observation.images.camera"
+
+    features = {
+        "state": {"dtype": "float32", "shape": (1,), "names": None},
+        "actions": {"dtype": "float32", "shape": (1,), "names": None},
+        image_key: {"dtype": "image", "shape": (3, 8, 8), "names": ["channel", "height", "width"]},
+    }
+    dataset = empty_lerobot_dataset_factory(root=input_root, features=features, use_videos=False)
+    for i in range(8):
+        dataset.add_frame(
+            {
+                "state": np.array([float(i)], dtype=np.float32),
+                "actions": np.array([float(i) + 1.0], dtype=np.float32),
+                "observation.images.camera": np.full((8, 8, 3), i / 8.0, dtype=np.float32),
+                "task": "image task",
+            }
+        )
+    dataset.save_episode()
+
+    segment_dataset(
+        input_root=input_root,
+        output_root=output_root,
+        episode_id=0,
+        segments=[(1, 4), (4, 8)],
+    )
+
+    out_meta = LeRobotDatasetMetadata(repo_id=output_root.name, root=output_root)
+    ep0 = pq.read_table(output_root / out_meta.get_data_file_path(0)).to_pydict()
+    ep1 = pq.read_table(output_root / out_meta.get_data_file_path(1)).to_pydict()
+
+    ep0_paths = [_extract_image_path(cell) for cell in ep0[image_key]]
+    ep1_paths = [_extract_image_path(cell) for cell in ep1[image_key]]
+    assert all(path is not None for path in ep0_paths)
+    assert all(path is not None for path in ep1_paths)
+
+    for frame_idx, path in enumerate(ep0_paths):
+        assert path is not None
+        expected = output_root / f"images/{image_key}/episode_000000/frame_{frame_idx:06d}.png"
+        assert Path(path) == expected
+        assert expected.is_file()
+
+    for frame_idx, path in enumerate(ep1_paths):
+        assert path is not None
+        expected = output_root / f"images/{image_key}/episode_000001/frame_{frame_idx:06d}.png"
+        assert Path(path) == expected
+        assert expected.is_file()
+
+
+def test_trim_video_segment_uses_frame_range_filter(tmp_path: Path) -> None:
+    """Ensure ffmpeg trim command uses frame-range segmentation.
+
+    Args:
+        tmp_path: Temporary directory fixture provided by pytest.
+    """
+    src = tmp_path / "src.mp4"
+    dst = tmp_path / "dst.mp4"
+    src.write_bytes(b"fake")
+
+    with (
+        patch("opentau.scripts.segment_lerobot_dataset.shutil.which", return_value="/usr/bin/ffmpeg"),
+        patch("opentau.scripts.segment_lerobot_dataset.subprocess.run") as run_mock,
+    ):
+        run_mock.return_value.returncode = 0
+        run_mock.return_value.stderr = ""
+
+        from opentau.scripts.segment_lerobot_dataset import _trim_video_segment
+
+        _trim_video_segment(src, dst, 5, 15)
+
+    assert run_mock.call_count == 1
+    cmd = run_mock.call_args.args[0]
+    assert "ffmpeg" in cmd[0]
+    assert "-vf" in cmd
+    vf_expr = cmd[cmd.index("-vf") + 1]
+    assert "trim=start_frame=5:end_frame=15" in vf_expr
