@@ -192,40 +192,61 @@ def get_feature_stats(array: np.ndarray, axis: tuple, keepdims: bool) -> dict[st
     }
 
 
-def compute_episode_stats(episode_data: dict[str, list[str] | np.ndarray], features: dict) -> dict:
+def compute_episode_stats(
+    episode_data: dict[str, list[str] | np.ndarray],
+    features: dict,
+    skip_video_stats: bool = False,
+) -> dict:
     """Compute statistics for a single episode.
 
-    For image/video features, samples and downsamples images before computing stats.
+    For image/video features, samples and downsamples images before computing stats
+    (unless skip_video_stats is True, in which case placeholder stats are used).
     For other features, computes stats directly on the array data.
 
     Args:
         episode_data: Dictionary mapping feature names to their data (arrays or image paths).
         features: Dictionary of feature specifications with 'dtype' keys.
+        skip_video_stats: If True, do not compute real stats for image/video features;
+            instead use placeholder stats (min=0, max=1, mean=0.5, std=0.5, count from data)
+            so the output format remains valid.
 
     Returns:
         Dictionary mapping feature names to their statistics (min, max, mean, std, count).
-        Image statistics are normalized to [0, 1] range.
+        Image statistics are normalized to [0, 1] range (or placeholders when skip_video_stats).
     """
     ep_stats = {}
     for key, data in episode_data.items():
         if features[key]["dtype"] == "string":
             continue  # HACK: we should receive np.arrays of strings
         elif features[key]["dtype"] in ["image", "video"]:
-            ep_ft_array = sample_images(data)  # data is a list of image paths
-            axes_to_reduce = (0, 2, 3)  # keep channel dim
-            keepdims = True
+            if skip_video_stats:
+                # Placeholder stats: shape (3, 1, 1) for min/max/mean/std, count from length
+                n_frames = len(data) if isinstance(data, list) else data.shape[0]
+                shape = features[key]["shape"]
+                # Expected shape for video is (C, H, W) e.g. (3, H, W)
+                c = shape[0] if len(shape) >= 3 else 3
+                ep_stats[key] = {
+                    "min": np.zeros((c, 1, 1), dtype=np.float64),
+                    "max": np.ones((c, 1, 1), dtype=np.float64),
+                    "mean": np.full((c, 1, 1), 0.5, dtype=np.float64),
+                    "std": np.full((c, 1, 1), 0.5, dtype=np.float64),
+                    "count": np.array([n_frames]),
+                }
+            else:
+                image_paths = data.tolist() if isinstance(data, np.ndarray) else data
+                ep_ft_array = sample_images(image_paths)  # image_paths is list[str]
+                axes_to_reduce = (0, 2, 3)  # keep channel dim
+                keepdims = True
+                ep_stats[key] = get_feature_stats(ep_ft_array, axis=axes_to_reduce, keepdims=keepdims)
+                # normalize and remove batch dim for images
+                ep_stats[key] = {
+                    k: v if k == "count" else np.squeeze(v / 255.0, axis=0) for k, v in ep_stats[key].items()
+                }
         else:
-            ep_ft_array = data  # data is already a np.ndarray
-            axes_to_reduce = 0  # compute stats over the first axis
-            keepdims = data.ndim == 1  # keep as np.array
-
-        ep_stats[key] = get_feature_stats(ep_ft_array, axis=axes_to_reduce, keepdims=keepdims)
-
-        # finally, we normalize and remove batch dim for images
-        if features[key]["dtype"] in ["image", "video"]:
-            ep_stats[key] = {
-                k: v if k == "count" else np.squeeze(v / 255.0, axis=0) for k, v in ep_stats[key].items()
-            }
+            ep_ft_array = data if isinstance(data, np.ndarray) else np.asarray(data)
+            axes_to_reduce = (0,)  # compute stats over the first axis
+            keepdims = ep_ft_array.ndim == 1  # keep as np.array
+            ep_stats[key] = get_feature_stats(ep_ft_array, axis=axes_to_reduce, keepdims=keepdims)
 
     return ep_stats
 

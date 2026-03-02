@@ -1670,7 +1670,9 @@ class LeRobotDataset(BaseDataset):
 
         self._wait_image_writer()
         self._save_episode_table(episode_buffer, episode_index)
-        ep_stats = compute_episode_stats(episode_buffer, self.features)
+        ep_stats = compute_episode_stats(
+            episode_buffer, self.features, skip_video_stats=getattr(self, "skip_video_stats", False)
+        )
 
         if len(self.meta.video_keys) > 0:
             video_paths = self.encode_episode_videos(episode_index)
@@ -1682,9 +1684,11 @@ class LeRobotDataset(BaseDataset):
 
         ep_data_index, _ = get_episode_data_index(self.meta.episodes, [episode_index])
         ep_data_index_np = {k: t.numpy() for k, t in ep_data_index.items()}
+        timestamps = np.asarray(episode_buffer["timestamp"]).reshape(-1)
+        episode_indices = np.full(episode_length, episode_index)
         check_timestamps_sync(
-            episode_buffer["timestamp"],
-            episode_buffer["episode_index"],
+            timestamps,
+            episode_indices,
             ep_data_index_np,
             self.fps,
             self.tolerance_s,
@@ -1870,6 +1874,7 @@ class LeRobotDataset(BaseDataset):
         image_resample_strategy: str = "nearest",
         vector_resample_strategy: str = "nearest",
         standardize: bool = True,
+        skip_video_stats: bool = False,
     ) -> "LeRobotDataset":
         """Create a LeRobot Dataset from scratch in order to record data."""
         obj = cls.__new__(cls)
@@ -1903,5 +1908,6 @@ class LeRobotDataset(BaseDataset):
         obj.image_resample_strategy = image_resample_strategy
         obj.vector_resample_strategy = vector_resample_strategy
         obj.standardize = standardize
+        obj.skip_video_stats = skip_video_stats
         obj.episode_data_index, obj.epi2idx = get_episode_data_index(obj.meta.episodes, obj.episodes)
         return obj
