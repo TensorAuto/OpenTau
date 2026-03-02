@@ -20,10 +20,11 @@ from unittest.mock import patch
 
 import numpy as np
 import pyarrow.parquet as pq
+import pytest
 
 from opentau.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from opentau.datasets.utils import load_episodes, load_episodes_stats, load_info, write_json, write_stats
-from opentau.scripts.segment_lerobot_dataset import segment_dataset
+from opentau.scripts.segment_lerobot_dataset import _load_segments_by_episode, segment_dataset
 
 
 def _extract_image_path(cell: Any) -> str | None:
@@ -73,8 +74,7 @@ def test_segment_lerobot_v21_dataset(tmp_path: Path, empty_lerobot_dataset_facto
     segment_dataset(
         input_root=input_root,
         output_root=output_root,
-        episode_id=0,
-        segments=[(2, 5), (5, 10)],
+        segments_by_episode={0: [(2, 5), (5, 10)]},
     )
 
     info = load_info(output_root)
@@ -150,8 +150,7 @@ def test_segment_lerobot_v20_input_outputs_v21(tmp_path: Path, empty_lerobot_dat
     segment_dataset(
         input_root=input_root,
         output_root=output_root,
-        episode_id=0,
-        segments=[(0, 3), (3, 8)],
+        segments_by_episode={0: [(0, 3), (3, 8)]},
     )
 
     out_info = load_info(output_root)
@@ -199,8 +198,7 @@ def test_segment_lerobot_non_consecutive_and_overlapping_ranges(
     segment_dataset(
         input_root=input_root,
         output_root=output_root,
-        episode_id=0,
-        segments=[(0, 10), (18, 23), (5, 15)],
+        segments_by_episode={0: [(0, 10), (18, 23), (5, 15)]},
     )
 
     info = load_info(output_root)
@@ -270,8 +268,7 @@ def test_segment_lerobot_copies_image_files_for_segments(
     segment_dataset(
         input_root=input_root,
         output_root=output_root,
-        episode_id=0,
-        segments=[(1, 4), (4, 8)],
+        segments_by_episode={0: [(1, 4), (4, 8)]},
     )
 
     out_meta = LeRobotDatasetMetadata(repo_id=output_root.name, root=output_root)
@@ -282,6 +279,9 @@ def test_segment_lerobot_copies_image_files_for_segments(
     ep1_paths = [_extract_image_path(cell) for cell in ep1[image_key]]
     assert all(path is not None for path in ep0_paths)
     assert all(path is not None for path in ep1_paths)
+    for cell in ep0[image_key] + ep1[image_key]:
+        if isinstance(cell, dict):
+            assert cell.get("bytes") in (None, b"")
 
     for frame_idx, path in enumerate(ep0_paths):
         assert path is not None
@@ -294,6 +294,114 @@ def test_segment_lerobot_copies_image_files_for_segments(
         expected = output_root / f"images/{image_key}/episode_000001/frame_{frame_idx:06d}.png"
         assert Path(path) == expected
         assert expected.is_file()
+
+
+def test_load_segments_by_episode_from_json(tmp_path: Path) -> None:
+    """Validate JSON segmentation-plan parsing.
+
+    Args:
+        tmp_path: Temporary directory fixture provided by pytest.
+    """
+    plan_path = tmp_path / "segments.json"
+    plan_path.write_text('{"0": [[0, 3], [5, 8]], "2": [[10, 12]]}')
+    parsed = _load_segments_by_episode(plan_path)
+    assert parsed == {0: [(0, 3), (5, 8)], 2: [(10, 12)]}
+
+
+def test_segment_lerobot_json_plan_with_two_source_episodes(
+    tmp_path: Path, empty_lerobot_dataset_factory: Any
+) -> None:
+    """Ensure JSON plan can segment multiple source episodes in one run.
+
+    Args:
+        tmp_path: Temporary directory fixture provided by pytest.
+        empty_lerobot_dataset_factory: Fixture that creates a writable dataset.
+    """
+    input_root = tmp_path / "source_two_episode_dataset"
+    output_root = tmp_path / "segmented_two_episode_dataset"
+
+    features = {
+        "state": {"dtype": "float32", "shape": (1,), "names": None},
+        "actions": {"dtype": "float32", "shape": (1,), "names": None},
+    }
+    dataset = empty_lerobot_dataset_factory(root=input_root, features=features, use_videos=False)
+
+    # Episode 0
+    for i in range(6):
+        dataset.add_frame(
+            {
+                "state": np.array([float(i)], dtype=np.float32),
+                "actions": np.array([float(i) + 100.0], dtype=np.float32),
+                "task": "ep0",
+            }
+        )
+    dataset.save_episode()
+
+    # Episode 1
+    for i in range(6):
+        dataset.add_frame(
+            {
+                "state": np.array([float(i + 10)], dtype=np.float32),
+                "actions": np.array([float(i) + 200.0], dtype=np.float32),
+                "task": "ep1",
+            }
+        )
+    dataset.save_episode()
+
+    plan_path = tmp_path / "segments_two_episodes.json"
+    plan_path.write_text('{"0": [[1, 4]], "1": [[2, 6]]}')
+    segments_by_episode = _load_segments_by_episode(plan_path)
+    segment_dataset(
+        input_root=input_root,
+        output_root=output_root,
+        segments_by_episode=segments_by_episode,
+    )
+
+    info = load_info(output_root)
+    episodes = load_episodes(output_root)
+    out_meta = LeRobotDatasetMetadata(repo_id=output_root.name, root=output_root)
+
+    assert info["total_episodes"] == 2
+    assert [episodes[i]["length"] for i in sorted(episodes)] == [3, 4]
+
+    ep0 = pq.read_table(output_root / out_meta.get_data_file_path(0)).to_pydict()
+    ep1 = pq.read_table(output_root / out_meta.get_data_file_path(1)).to_pydict()
+    assert [float(x) for x in ep0["state"]] == [1.0, 2.0, 3.0]
+    assert [float(x) for x in ep1["state"]] == [12.0, 13.0, 14.0, 15.0]
+
+
+def test_segment_lerobot_rejects_invalid_segment_bounds(
+    tmp_path: Path, empty_lerobot_dataset_factory: Any
+) -> None:
+    """Ensure segment bounds are validated in segment_dataset().
+
+    Args:
+        tmp_path: Temporary directory fixture provided by pytest.
+        empty_lerobot_dataset_factory: Fixture that creates a writable dataset.
+    """
+    input_root = tmp_path / "source_invalid_segment_dataset"
+    output_root = tmp_path / "segmented_invalid_segment_dataset"
+    features = {
+        "state": {"dtype": "float32", "shape": (1,), "names": None},
+        "actions": {"dtype": "float32", "shape": (1,), "names": None},
+    }
+    dataset = empty_lerobot_dataset_factory(root=input_root, features=features, use_videos=False)
+    for i in range(5):
+        dataset.add_frame(
+            {
+                "state": np.array([float(i)], dtype=np.float32),
+                "actions": np.array([float(i)], dtype=np.float32),
+                "task": "invalid-bounds",
+            }
+        )
+    dataset.save_episode()
+
+    with pytest.raises(ValueError, match="Expected 0 <= start < end <= source_length"):
+        segment_dataset(
+            input_root=input_root,
+            output_root=output_root,
+            segments_by_episode={0: [(-1, 2)]},
+        )
 
 
 def test_trim_video_segment_uses_frame_range_filter(tmp_path: Path) -> None:
