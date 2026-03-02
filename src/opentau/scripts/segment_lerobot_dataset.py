@@ -23,6 +23,8 @@ Output format: always LeRobot v2.1.
 
 Example:
     python segment_lerobot_dataset.py ./input_dataset ./output_dataset ./segments.json
+
+An example of segments.json can be found in `configs/examples/segments.json`.
 """
 
 import argparse
