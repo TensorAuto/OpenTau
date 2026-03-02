@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Create a segmented LeRobot v2.1 dataset from a source episode.
+"""Create a segmented LeRobot v2.1 dataset from source episodes.
 
 This script builds a brand-new dataset where each output episode corresponds to one
 `[start, end)` frame segment from source episodes defined in a JSON plan.
@@ -58,7 +58,7 @@ def parse_args() -> argparse.Namespace:
         mapping source episode ids to frame-range segments.
     """
     parser = argparse.ArgumentParser(
-        description="Create a segmented LeRobot v2.1 dataset from one source episode.",
+        description="Create a segmented LeRobot v2.1 dataset from one or more source episodes.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("input_root", type=Path, help="Path to source LeRobot dataset root.")
@@ -277,7 +277,7 @@ def segment_dataset(
     output_root: Path,
     segments_by_episode: dict[int, list[tuple[int, int]]],
 ) -> None:
-    """Create a new segmented dataset from a source episode.
+    """Create a new segmented dataset from one or more source episodes.
 
     Args:
         input_root: Source LeRobot dataset directory (v2.0 or v2.1).
