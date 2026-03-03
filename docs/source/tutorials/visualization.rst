@@ -11,6 +11,32 @@ The following example shows how to visualize the first episode (index 0) of the 
 
 This command will open a `rerun <https://rerun.io>`_ window displaying the selected episode, allowing you to explore the episode interactively.
 
+Camera Logging Mode
+-------------------
+
+For datasets that include camera streams stored as MP4 files, ``opentau-dataset-viz`` supports different camera logging modes:
+
+- ``frames``: logs decoded frames with ``rr.Image``.
+- ``asset_video``: logs source MP4 files with ``rr.AssetVideo`` and synchronizes playback using ``rr.VideoFrameReference``.
+- ``auto`` (default): same behavior as ``asset_video`` with graceful fallback to ``frames`` when MP4 assets or required Rerun APIs are unavailable.
+
+If your episodes contain one or more videos and the generated ``.rrd`` files are large, prefer ``asset_video`` (or ``auto``) to take advantage of video compression.
+
+.. code-block:: bash
+
+   # Prefer MP4 assets (smaller .rrd when videos are available)
+   opentau-dataset-viz --repo-id lerobot/droid_100 --episode-index 0 --camera-log-mode asset_video
+
+   # Always log decoded frames (existing behavior)
+   opentau-dataset-viz --repo-id lerobot/droid_100 --episode-index 0 --camera-log-mode frames
+
+To compare storage size, save both outputs and compare the resulting files:
+
+.. code-block:: bash
+
+   opentau-dataset-viz --repo-id lerobot/droid_100 --episode-index 0 --save 1 --output-dir ./rrd_frames --camera-log-mode frames
+   opentau-dataset-viz --repo-id lerobot/droid_100 --episode-index 0 --save 1 --output-dir ./rrd_asset --camera-log-mode asset_video
+
 OpenTau also supports visualizing a dataset with URDF models. To do this, you need to first install ``opentau`` with optional URDF support:
 
 .. code-block:: bash

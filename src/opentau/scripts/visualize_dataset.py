@@ -33,6 +33,16 @@ Examples:
 local$ opentau-dataset-viz --repo-id lerobot/pusht --episode-index 0
 ```
 
+- Visualize using source MP4 assets when available (smaller .rrd files):
+```
+local$ opentau-dataset-viz --repo-id lerobot/pusht --episode-index 0 --camera-log-mode asset_video
+```
+
+- Keep frame-by-frame image logging explicitly (previous default behavior):
+```
+local$ opentau-dataset-viz --repo-id lerobot/pusht --episode-index 0 --camera-log-mode frames
+```
+
 - Visualize data stored on a distant machine with a local viewer:
 ```
 distant$ opentau-dataset-viz --repo-id lerobot/pusht --episode-index 0 --save 1 --output-dir path/to/directory
@@ -69,10 +79,17 @@ from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.lerobot_dataset import LeRobotDataset
 
 PERMIT_URDF = hasattr(rr, "urdf")
+PERMIT_ASSET_VIDEO = hasattr(rr, "AssetVideo") and hasattr(rr, "VideoFrameReference")
 if not PERMIT_URDF:
     warnings.warn(
         "`rerun.urdf` module not found. Make sure you have rerun >= 0.28.2 installed. "
         " One way to ensure this is to install OpenTau with the '[urdf]' extra: `pip install opentau[urdf]`.",
+        stacklevel=2,
+    )
+if not PERMIT_ASSET_VIDEO:
+    warnings.warn(
+        "Rerun video asset APIs are unavailable (need AssetVideo + VideoFrameReference). "
+        "Falling back to per-frame image logging for camera streams.",
         stacklevel=2,
     )
 
@@ -142,8 +159,8 @@ def create_mock_train_config() -> TrainPipelineConfig:
 
 class EpisodeSampler(torch.utils.data.Sampler):
     def __init__(self, dataset: LeRobotDataset, episode_index: int):
-        from_idx = dataset.episode_data_index["from"][episode_index].item()
-        to_idx = dataset.episode_data_index["to"][episode_index].item()
+        from_idx = int(dataset.episode_data_index["from"][episode_index].item())
+        to_idx = int(dataset.episode_data_index["to"][episode_index].item())
         self.frame_ids = range(from_idx, to_idx)
 
     def __iter__(self) -> Iterator:
@@ -173,6 +190,7 @@ def visualize_dataset(
     output_dir: Path | None = None,
     urdf: Path | None = None,
     joint_names: list[str] | None = None,
+    camera_log_mode: str = "frames",
 ) -> Path | None:
     r"""
     Visualize data of a given episode of a LeRobotDataset with rerun.
@@ -188,6 +206,10 @@ def visualize_dataset(
         output_dir: Directory to save the .rrd file if `save` is True. Required if `save` is True. Defaults to None.
         urdf: Path to a URDF file to load and visualize alongside the dataset. Defaults to None.
         joint_names: List of joint names for each state dimension, in order. Used for associating state dimensions with URDF joints. If not provided, state names from dataset metadata will be used. Defaults to None.
+        camera_log_mode: Camera logging strategy.
+            - "frames": always log decoded image frames (existing behavior)
+            - "asset_video": prefer logging source mp4 videos through rerun AssetVideo
+            - "auto": same as asset_video with graceful fallback to frame logging
     """
     if save:
         assert output_dir is not None, (
@@ -209,6 +231,8 @@ def visualize_dataset(
 
     if mode not in ["local", "distant"]:
         raise ValueError(mode)
+    if camera_log_mode not in ["frames", "asset_video", "auto"]:
+        raise ValueError(camera_log_mode)
 
     spawn_local_viewer = mode == "local" and not save
     rr.init(f"{repo_id}/episode_{episode_index}", spawn=spawn_local_viewer)
@@ -239,18 +263,63 @@ def visualize_dataset(
     if mode == "distant":
         rr.serve_web_viewer(open_browser=False, web_port=web_port)
 
+    camera_features = dataset.meta.features
+    video_asset_keys: set[str] = set()
+    use_asset_video = camera_log_mode in ["asset_video", "auto"] and PERMIT_ASSET_VIDEO
+    if camera_log_mode in ["asset_video", "auto"] and not PERMIT_ASSET_VIDEO:
+        logging.warning(
+            "camera_log_mode=%s requested but rerun video asset APIs are unavailable. "
+            "Falling back to frame logging.",
+            camera_log_mode,
+        )
+
+    if use_asset_video:
+        for key in dataset.meta.camera_keys:
+            dtype = camera_features.get(key, {}).get("dtype")
+            if dtype != "video":
+                continue
+
+            video_path = dataset.root / dataset.meta.get_video_file_path(ep_index=episode_index, vid_key=key)
+            if not video_path.exists():
+                logging.warning(
+                    "Video file missing for %s: %s. Falling back to frame logging.", key, video_path
+                )
+                continue
+            if video_path.suffix.lower() != ".mp4":
+                logging.warning(
+                    "Video file for %s is not mp4 (%s). Falling back to frame logging.", key, video_path
+                )
+                continue
+
+            try:
+                rr.log(key, rr.AssetVideo(path=video_path), static=True)
+                video_asset_keys.add(key)
+            except Exception:
+                logging.exception(
+                    "Failed to log AssetVideo for %s (%s). Falling back to frame logging.", key, video_path
+                )
+
     logging.info("Logging to Rerun")
+    episode_start_ts: float | None = None
 
     for batch in tqdm.tqdm(dataloader, total=len(dataloader)):
         # iterate over the batch
         for i in range(len(batch["index"])):
-            _rr_set_sequence("frame_index", batch["frame_index"][i].item())
-            _rr_set_seconds("timestamp", batch["timestamp"][i].item())
+            frame_index = batch["frame_index"][i].item()
+            timestamp_s = batch["timestamp"][i].item()
+            _rr_set_sequence("frame_index", frame_index)
+            _rr_set_seconds("timestamp", timestamp_s)
+            if episode_start_ts is None:
+                episode_start_ts = timestamp_s
+            episode_video_t = max(0.0, timestamp_s - episode_start_ts)
 
             # display each camera image
             for key in dataset.meta.camera_keys:
-                # TODO(rcadene): add `.compress()`? is it lossless?
-                rr.log(key, rr.Image(to_hwc_uint8_numpy(batch[key][i])))
+                if key in video_asset_keys:
+                    rr.log(key, rr.VideoFrameReference(seconds=episode_video_t, video_reference=key))
+                else:
+                    # TODO(rcadene): add `.compress()`? is it lossless?
+                    rr.log(key, rr.Image(to_hwc_uint8_numpy(batch[key][i])))
 
             # display each dimension of action space (e.g. actuators command)
             if "action" in batch:
@@ -279,6 +348,7 @@ def visualize_dataset(
 
     if mode == "local" and save:
         # save .rrd locally
+        assert output_dir is not None
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         repo_id_str = repo_id.replace("/", "_")
@@ -359,6 +429,18 @@ def parse_args() -> dict:
             "Save a .rrd file in the directory provided by `--output-dir`. "
             "It also deactivates the spawning of a viewer. "
             "Visualize the data by running `rerun path/to/file.rrd` on your local machine."
+        ),
+    )
+    parser.add_argument(
+        "--camera-log-mode",
+        type=str,
+        default="auto",
+        choices=["frames", "asset_video", "auto"],
+        help=(
+            "Camera logging strategy. "
+            "'frames' logs decoded frames with rr.Image (larger .rrd). "
+            "'asset_video' logs source MP4 for video features via rr.AssetVideo + rr.VideoFrameReference. "
+            "'auto' behaves like 'asset_video' with graceful fallback to frames if unavailable."
         ),
     )
     parser.add_argument(
