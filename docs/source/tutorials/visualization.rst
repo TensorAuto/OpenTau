@@ -9,6 +9,12 @@ The following example shows how to visualize the first episode (index 0) of the 
 
    opentau-dataset-viz --repo-id lerobot/droid_100 --episode-index 0
 
+When the dataset is already available in a local directory, ``--repo-id`` is optional and you can point directly to it with ``--root``:
+
+.. code-block:: bash
+
+   opentau-dataset-viz --root ~/.cache/huggingface/lerobot/lerobot/droid_100 --episode-index 0
+
 This command will open a `rerun <https://rerun.io>`_ window displaying the selected episode, allowing you to explore the episode interactively.
 
 Camera Logging Mode

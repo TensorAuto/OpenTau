@@ -33,6 +33,11 @@ Examples:
 local$ opentau-dataset-viz --repo-id lerobot/pusht --episode-index 0
 ```
 
+- Visualize a local dataset directory without specifying `repo_id`:
+```
+local$ opentau-dataset-viz --root data/lerobot/pusht --episode-index 0
+```
+
 - Visualize using source MP4 assets when available (smaller .rrd files):
 ```
 local$ opentau-dataset-viz --repo-id lerobot/pusht --episode-index 0 --camera-log-mode asset_video
@@ -443,8 +448,11 @@ def parse_args() -> dict:
     parser.add_argument(
         "--repo-id",
         type=str,
-        required=True,
-        help="Name of hugging face repository containing a LeRobotDataset dataset (e.g. `lerobot/pusht`).",
+        default=None,
+        help=(
+            "Name of hugging face repository containing a LeRobotDataset dataset "
+            "(e.g. `lerobot/pusht`). Optional when `--root` points to a local dataset directory."
+        ),
     )
     parser.add_argument(
         "--episode-index",
@@ -555,6 +563,8 @@ def parse_args() -> dict:
     )
 
     args = parser.parse_args()
+    if args.repo_id is None and args.root is None:
+        parser.error("Either `--repo-id` or `--root` must be provided.")
     return vars(args)
 
 
@@ -571,6 +581,12 @@ def main():
 
     if not PERMIT_URDF:
         kwargs["urdf"] = None
+
+    if repo_id is None:
+        assert root is not None  # guarded in parse_args
+        # LeRobotDataset requires a repo_id; synthesize one for local-only visualization.
+        local_name = Path(root).expanduser().resolve().name or "dataset"
+        repo_id = f"local/{local_name}"
 
     logging.info("Loading dataset")
     tolerance_schedule = [tolerance_s]
