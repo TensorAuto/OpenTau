@@ -218,15 +218,6 @@ def visualize_dataset(
 
     repo_id = dataset.repo_id
 
-    logging.info("Loading dataloader")
-    episode_sampler = EpisodeSampler(dataset, episode_index)
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        num_workers=num_workers,
-        batch_size=batch_size,
-        sampler=episode_sampler,
-    )
-
     logging.info("Starting Rerun")
 
     if mode not in ["local", "distant"]:
@@ -299,52 +290,133 @@ def visualize_dataset(
                     "Failed to log AssetVideo for %s (%s). Falling back to frame logging.", key, video_path
                 )
 
+    # Fast path: when every camera stream is logged as AssetVideo, avoid dataset.__getitem__,
+    # which would decode video frames for each sample.
+    can_skip_decode = len(dataset.meta.camera_keys) == len(video_asset_keys)
+
+    logging.info("Loading iteration source")
+    row_indices: list[int] | None = None
+    no_transform_ds = None
+    dataloader = None
+    has_action = False
+    has_observation_state = False
+    has_next_done = False
+    has_next_reward = False
+    has_next_success = False
+    if can_skip_decode:
+        logging.info("Using metadata-only iteration path (no frame decoding).")
+        epi_idx = dataset.epi2idx[episode_index]
+        from_idx = int(dataset.episode_data_index["from"][epi_idx].item())
+        to_idx = int(dataset.episode_data_index["to"][epi_idx].item())
+        row_indices = list(range(from_idx, to_idx))
+        no_transform_ds = dataset.hf_dataset.with_transform(None).with_format("numpy")
+        no_transform_columns = set(no_transform_ds.column_names)
+        has_action = "action" in no_transform_columns
+        has_observation_state = "observation.state" in no_transform_columns
+        has_next_done = "next.done" in no_transform_columns
+        has_next_reward = "next.reward" in no_transform_columns
+        has_next_success = "next.success" in no_transform_columns
+    else:
+        logging.info("Loading dataloader")
+        episode_sampler = EpisodeSampler(dataset, episode_index)
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            num_workers=num_workers,
+            batch_size=batch_size,
+            sampler=episode_sampler,
+        )
+
     logging.info("Logging to Rerun")
     episode_start_ts: float | None = None
 
-    for batch in tqdm.tqdm(dataloader, total=len(dataloader)):
-        # iterate over the batch
-        for i in range(len(batch["index"])):
-            frame_index = batch["frame_index"][i].item()
-            timestamp_s = batch["timestamp"][i].item()
-            _rr_set_sequence("frame_index", frame_index)
-            _rr_set_seconds("timestamp", timestamp_s)
-            if episode_start_ts is None:
-                episode_start_ts = timestamp_s
-            episode_video_t = max(0.0, timestamp_s - episode_start_ts)
+    if can_skip_decode:
+        assert row_indices is not None
+        assert no_transform_ds is not None
+        total_batches = max(1, (len(row_indices) + batch_size - 1) // batch_size)
+        for start in tqdm.tqdm(range(0, len(row_indices), batch_size), total=total_batches):
+            batch_indices = row_indices[start : start + batch_size]
+            batch = no_transform_ds.select(batch_indices)
 
-            # display each camera image
-            for key in dataset.meta.camera_keys:
-                if key in video_asset_keys:
-                    rr.log(key, rr.VideoFrameReference(seconds=episode_video_t, video_reference=key))
-                else:
-                    # TODO(rcadene): add `.compress()`? is it lossless?
-                    rr.log(key, rr.Image(to_hwc_uint8_numpy(batch[key][i])))
+            for i in range(len(batch["index"])):
+                frame_index = int(np.asarray(batch["frame_index"][i]).item())
+                timestamp_s = float(np.asarray(batch["timestamp"][i]).item())
+                _rr_set_sequence("frame_index", frame_index)
+                _rr_set_seconds("timestamp", timestamp_s)
+                if episode_start_ts is None:
+                    episode_start_ts = timestamp_s
+                episode_video_t = max(0.0, timestamp_s - episode_start_ts)
 
-            # display each dimension of action space (e.g. actuators command)
-            if "action" in batch:
-                for dim_idx, val in enumerate(batch["action"][i]):
-                    rr.log(f"action/{dim_idx}", _rr_scalar(val.item()))
+                for key in dataset.meta.camera_keys:
+                    if key in video_asset_keys:
+                        rr.log(key, rr.VideoFrameReference(seconds=episode_video_t, video_reference=key))
 
-            # display each dimension of observed state space (e.g. agent position in joint space)
-            if "observation.state" in batch:
-                states = batch["observation.state"][i]
-                for dim_idx, val in enumerate(states):
-                    jnt_name = joint_names[dim_idx] if dim_idx < len(joint_names) else str(dim_idx)
-                    rr.log(f"state/{jnt_name}", _rr_scalar(val.item()))
-                    if jnt_name in urdf_joints:
-                        joint = urdf_joints[jnt_name]
-                        transform = joint.compute_transform(float(val))
-                        rr.log("URDF", transform)
+                if has_action:
+                    for dim_idx, val in enumerate(np.asarray(batch["action"][i]).reshape(-1)):
+                        rr.log(f"action/{dim_idx}", _rr_scalar(float(val)))
 
-            if "next.done" in batch:
-                rr.log("next.done", _rr_scalar(batch["next.done"][i].item()))
+                if has_observation_state:
+                    states = np.asarray(batch["observation.state"][i]).reshape(-1)
+                    for dim_idx, val in enumerate(states):
+                        jnt_name = joint_names[dim_idx] if dim_idx < len(joint_names) else str(dim_idx)
+                        rr.log(f"state/{jnt_name}", _rr_scalar(float(val)))
+                        if jnt_name in urdf_joints:
+                            joint = urdf_joints[jnt_name]
+                            transform = joint.compute_transform(float(val))
+                            rr.log("URDF", transform)
 
-            if "next.reward" in batch:
-                rr.log("next.reward", _rr_scalar(batch["next.reward"][i].item()))
+                if has_next_done:
+                    rr.log("next.done", _rr_scalar(float(np.asarray(batch["next.done"][i]).item())))
 
-            if "next.success" in batch:
-                rr.log("next.success", _rr_scalar(batch["next.success"][i].item()))
+                if has_next_reward:
+                    rr.log("next.reward", _rr_scalar(float(np.asarray(batch["next.reward"][i]).item())))
+
+                if has_next_success:
+                    rr.log("next.success", _rr_scalar(float(np.asarray(batch["next.success"][i]).item())))
+    else:
+        assert dataloader is not None
+        for batch in tqdm.tqdm(dataloader, total=len(dataloader)):
+            # iterate over the batch
+            for i in range(len(batch["index"])):
+                frame_index = batch["frame_index"][i].item()
+                timestamp_s = batch["timestamp"][i].item()
+                _rr_set_sequence("frame_index", frame_index)
+                _rr_set_seconds("timestamp", timestamp_s)
+                if episode_start_ts is None:
+                    episode_start_ts = timestamp_s
+                episode_video_t = max(0.0, timestamp_s - episode_start_ts)
+
+                # display each camera image
+                for key in dataset.meta.camera_keys:
+                    if key in video_asset_keys:
+                        rr.log(key, rr.VideoFrameReference(seconds=episode_video_t, video_reference=key))
+                    else:
+                        # TODO(rcadene): add `.compress()`? is it lossless?
+                        rr.log(key, rr.Image(to_hwc_uint8_numpy(batch[key][i])))
+
+                # display each dimension of action space (e.g. actuators command)
+                if "action" in batch:
+                    for dim_idx, val in enumerate(batch["action"][i]):
+                        rr.log(f"action/{dim_idx}", _rr_scalar(val.item()))
+
+                # display each dimension of observed state space (e.g. agent position in joint space)
+                if "observation.state" in batch:
+                    states = batch["observation.state"][i]
+                    for dim_idx, val in enumerate(states):
+                        jnt_name = joint_names[dim_idx] if dim_idx < len(joint_names) else str(dim_idx)
+                        rr.log(f"state/{jnt_name}", _rr_scalar(val.item()))
+                        if jnt_name in urdf_joints:
+                            joint = urdf_joints[jnt_name]
+                            transform = joint.compute_transform(float(val))
+                            rr.log("URDF", transform)
+
+                if "next.done" in batch:
+                    rr.log("next.done", _rr_scalar(batch["next.done"][i].item()))
+
+                if "next.reward" in batch:
+                    rr.log("next.reward", _rr_scalar(batch["next.reward"][i].item()))
+
+                if "next.success" in batch:
+                    rr.log("next.success", _rr_scalar(batch["next.success"][i].item()))
 
     if mode == "local" and save:
         # save .rrd locally
@@ -445,12 +517,14 @@ def parse_args() -> dict:
     )
     parser.add_argument(
         "--tolerance-s",
+        "--tolerance",
+        dest="tolerance_s",
         type=float,
         default=1e-4,
         help=(
             "Tolerance in seconds used to ensure data timestamps respect the dataset fps value"
             "This is argument passed to the constructor of LeRobotDataset and maps to its tolerance_s constructor argument"
-            "If not given, defaults to 1e-4."
+            "If not given, defaults to 1e-4. `--tolerance` is kept as an alias."
         ),
     )
     parser.add_argument(
@@ -499,13 +573,43 @@ def main():
         kwargs["urdf"] = None
 
     logging.info("Loading dataset")
-    dataset = LeRobotDataset(
-        create_mock_train_config(),
-        repo_id,
-        root=root,
-        tolerance_s=tolerance_s,
-        standardize=False,
-    )
+    tolerance_schedule = [tolerance_s]
+    for candidate in [1e-3, 3e-3, 1e-2]:
+        if candidate > tolerance_schedule[-1]:
+            tolerance_schedule.append(candidate)
+
+    dataset = None
+    last_timestamp_error = None
+    for tol in tolerance_schedule:
+        try:
+            dataset = LeRobotDataset(
+                create_mock_train_config(),
+                repo_id,
+                root=root,
+                tolerance_s=tol,
+                standardize=False,
+            )
+            if tol != tolerance_s:
+                logging.warning(
+                    "Dataset timestamp check required relaxed tolerance. "
+                    "Requested=%s, using=%s for visualization.",
+                    tolerance_s,
+                    tol,
+                )
+            break
+        except ValueError as e:
+            # Visualization should be resilient to small timestamp quantization jitter.
+            if "timestamps unexpectedly violate the tolerance" not in str(e):
+                raise
+            last_timestamp_error = e
+            logging.warning(
+                "Timestamp sync check failed with tolerance_s=%s. Retrying with a looser tolerance.",
+                tol,
+            )
+
+    if dataset is None:
+        assert last_timestamp_error is not None
+        raise last_timestamp_error
 
     visualize_dataset(dataset, **kwargs)
 
