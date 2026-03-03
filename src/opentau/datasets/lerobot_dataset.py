@@ -1694,11 +1694,21 @@ class LeRobotDataset(BaseDataset):
             self.tolerance_s,
         )
 
-        video_files = list(self.root.rglob("*.mp4"))
-        assert len(video_files) == self.num_episodes * len(self.meta.video_keys)
+        expected_episodes = self.meta.total_episodes
+        missing_videos: list[str] = []
+        for ep_idx in range(expected_episodes):
+            for vid_key in self.meta.video_keys:
+                video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
+                if not video_path.is_file():
+                    missing_videos.append(str(video_path))
+        assert not missing_videos, "Missing expected encoded videos:\n" + "\n".join(missing_videos)
 
-        parquet_files = list(self.root.rglob("*.parquet"))
-        assert len(parquet_files) == self.num_episodes
+        missing_parquet: list[str] = []
+        for ep_idx in range(expected_episodes):
+            parquet_path = self.root / self.meta.get_data_file_path(ep_idx)
+            if not parquet_path.is_file():
+                missing_parquet.append(str(parquet_path))
+        assert not missing_parquet, "Missing expected parquet episode files:\n" + "\n".join(missing_parquet)
 
         # delete images
         img_dir = self.root / "images"
