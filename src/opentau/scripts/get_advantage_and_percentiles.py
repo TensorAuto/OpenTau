@@ -44,7 +44,7 @@ from opentau.utils.utils import (
     auto_torch_device,
     init_logging,
 )
-
+from tqdm import tqdm
 
 def ensure_primitive(maybe_tensor):
     if isinstance(maybe_tensor, np.ndarray):
@@ -152,7 +152,7 @@ def main(cfg: TrainPipelineConfig):
         ds_advantage = {}  # per-dataset advantages
         with torch.inference_mode():
             # First pass to get the values
-            for batch in dataloader:
+            for batch in tqdm(dataloader, desc="Computing values"):
                 for key, value in batch.items():
                     if isinstance(value, torch.Tensor):
                         batch[key] = value.to(device)
@@ -172,15 +172,15 @@ def main(cfg: TrainPipelineConfig):
                         success=success,
                         n_steps_look_ahead=cfg.policy.reward_config.N_steps_look_ahead,
                         episode_end_idx=episode_end_idx,
-                        max_episode_length=cfg.policy.reward_config.reward_normalizer,
+                        reward_normalizer=cfg.policy.reward_config.reward_normalizer,
                         current_idx=current_idx,
                         c_neg=cfg.policy.reward_config.C_neg,
                     )
 
-                    values[(episode_index, current_idx)] = {"v0": v0, "reward": reward}
+                    values[(episode_index.item(), current_idx.item())] = {"v0": v0, "reward": reward}
 
             # Second pass to compute the advantages
-            for batch in dataloader:
+            for batch in tqdm(dataloader, desc="Computing advantages"):
                 for episode_index, current_idx, timestamp in zip(
                     batch["episode_index"],
                     batch["current_idx"],
@@ -192,13 +192,12 @@ def main(cfg: TrainPipelineConfig):
                     )
                     # check if the value for the next n_steps_look_ahead steps is available, else set it to 0
                     look_ahead_idx = current_idx + cfg.policy.reward_config.N_steps_look_ahead
-                    vn = values.get((episode_index, look_ahead_idx), _default0)["v0"]
-                    reward = values.get((episode_index, current_idx), _default0)["reward"]
-                    v0 = values.get((episode_index, current_idx), _default0)["v0"]
+                    vn = values.get((episode_index.item(), look_ahead_idx.item()), _default0)["v0"]
+                    reward = values.get((episode_index.item(), current_idx.item()), _default0)["reward"]
+                    v0 = values.get((episode_index.item(), current_idx.item()), _default0)["v0"]
                     advantage = ensure_primitive(reward + vn - v0)
-                    advantages.append(advantage)
-                    ds_advantage[(episode_index, timestamp)] = advantage
-
+                    advantages.append(advantage.item())
+                    ds_advantage[(episode_index.item(), timestamp.item())] = advantage.item()
         # Convert tuple keys to strings for JSON serialization
         advantage_data_json = {f"{ep_idx},{ts}": val for (ep_idx, ts), val in ds_advantage.items()}
 
