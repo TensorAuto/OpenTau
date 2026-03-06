@@ -1506,7 +1506,7 @@ class LeRobotDataset(BaseDataset):
             item = self._to_standard_data_format(item)
 
             if self.meta.advantages is not None:
-                advantage = self.meta.advantages.get((episode_index, timestamp), 0)
+                advantage = self.meta.advantages.get((episode_index, float(timestamp)), 0)
                 item["advantage"] = torch.tensor(advantage, dtype=torch.bfloat16)
             else:
                 item["advantage"] = torch.tensor(0.0, dtype=torch.bfloat16)
