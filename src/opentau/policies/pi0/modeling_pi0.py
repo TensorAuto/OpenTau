@@ -433,6 +433,15 @@ class PI0Policy(PreTrainedPolicy):
             in_episode_bound = ~actions_is_pad
             losses = losses * in_episode_bound.unsqueeze(-1)
 
+        if self.config.use_awr:
+            # weight loss based on exponent of advantage. Also clamp at awr_max_weight.
+            losses = losses * rearrange(
+                torch.min(
+                    torch.exp(batch["advantage"]),
+                    torch.tensor(self.config.awr_max_weight, device=losses.device),
+                ),
+                "b -> b 1 1",
+            )
         # Remove padding
         losses = losses[:, :, : self.config.max_action_dim]
 
