@@ -1506,7 +1506,7 @@ class LeRobotDataset(BaseDataset):
             item = self._to_standard_data_format(item)
 
             if self.meta.advantages is not None:
-                advantage = self.meta.advantages.get((episode_index, timestamp), 0)
+                advantage = self.meta.advantages.get((episode_index, timestamp.item()), 0)
                 item["advantage"] = torch.tensor(advantage, dtype=torch.bfloat16)
             else:
                 item["advantage"] = torch.tensor(0.0, dtype=torch.bfloat16)
@@ -1538,6 +1538,10 @@ class LeRobotDataset(BaseDataset):
                 item["return_bin_idx"] = torch.tensor(0, dtype=torch.long)
                 item["return_continuous"] = torch.tensor(0, dtype=torch.float32)
 
+            if "episode_index" not in item:
+                item["episode_index"] = torch.tensor(episode_index, dtype=torch.long)
+            if "timestamp" not in item:
+                item["timestamp"] = timestamp
             # sanity check for action chunk lengths
             assert item["actions"].shape[0] == self.cfg.action_chunk
             assert item["action_is_pad"].shape[0] == self.cfg.action_chunk
