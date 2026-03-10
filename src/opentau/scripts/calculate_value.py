@@ -57,7 +57,6 @@ from opentau.configs import parser
 from opentau.configs.default import DatasetMixtureConfig
 from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.factory import make_dataset
-from opentau.datasets.lerobot_dataset import LeRobotDataset
 from opentau.policies.factory import get_policy_class
 from opentau.utils.random_utils import set_seed
 from opentau.utils.utils import auto_torch_device, init_logging
@@ -80,10 +79,11 @@ _dataset_mixture_path_value = None
 _train_config_path_value = None
 _output_file_value = None
 for arg in sys.argv:
-    if arg.startswith("--dataset_mixture_path="):
-        _dataset_mixture_path_value = arg.split("=", 1)[1]
-        break
-    elif arg.startswith("--dataset_mixture=") and "." not in arg.split("=", 1)[0]:
+    if (
+        arg.startswith("--dataset_mixture_path=")
+        or arg.startswith("--dataset_mixture=")
+        and "." not in arg.split("=", 1)[0]
+    ):
         _dataset_mixture_path_value = arg.split("=", 1)[1]
         break
 for arg in sys.argv:
@@ -118,8 +118,10 @@ def _filter_script_args(fn):
                     a.startswith("--dataset_mixture=") and "." not in a.split("=", 1)[0]
                 ):
                     continue
-                if a.startswith("--output_file=") or a.startswith("--train_config=") or a.startswith(
-                    "--checkpoint_path="
+                if (
+                    a.startswith("--output_file=")
+                    or a.startswith("--train_config=")
+                    or a.startswith("--checkpoint_path=")
                 ):
                     continue
                 if a.startswith("--batch_size="):
@@ -224,13 +226,12 @@ def main(cfg: TrainPipelineConfig):
     logging.info(f"Saved values to {out_path}")
 
     arr = np.array(values_list)
-    logging.info(
-        f"Value stats: min={arr.min():.4f}, max={arr.max():.4f}, mean={arr.mean():.4f}, count={n}"
-    )
+    logging.info(f"Value stats: min={arr.min():.4f}, max={arr.max():.4f}, mean={arr.mean():.4f}, count={n}")
 
     # Plot value over timestamp
     try:
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
@@ -294,10 +295,7 @@ if __name__ == "__main__":
                 or a.startswith("--output_file=")
                 or a.startswith("--checkpoint_path=")
                 or a.startswith("--dataset_mixture_path=")
-                or (
-                    a.startswith("--dataset_mixture=")
-                    and "." not in a.split("=", 1)[0]
-                )
+                or (a.startswith("--dataset_mixture=") and "." not in a.split("=", 1)[0])
             )
         ]
         batch_val = next((a.split("=", 1)[1] for a in cli_args if a.startswith("--batch_size=")), None)
