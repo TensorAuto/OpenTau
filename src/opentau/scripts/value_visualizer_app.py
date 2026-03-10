@@ -58,10 +58,7 @@ def load_dataset_config(path: Path) -> tuple[Path, str, list[int]]:
     root = Path(first["root"]).resolve()
     repo_id = first.get("repo_id", "physical-intelligence/libero")
     episodes = first.get("episodes", [0])
-    if isinstance(episodes, list):
-        episodes = sorted(episodes)
-    else:
-        episodes = list(range(episodes))
+    episodes = sorted(episodes) if isinstance(episodes, list) else list(range(episodes))
     return root, repo_id, episodes
 
 
@@ -159,7 +156,15 @@ def load_frames_lerobot_cached(
                 key_round = (ep, round(ts, 6))
                 value = value_lookup.get(key_round, value_lookup.get((ep, ts), np.nan))
                 pil_img = _tensor_or_array_to_pil(item.get(camera_key))
-                all_rows.append({"step": len(all_rows), "episode_index": ep, "timestamp": ts, "value": value, "image": pil_img})
+                all_rows.append(
+                    {
+                        "step": len(all_rows),
+                        "episode_index": ep,
+                        "timestamp": ts,
+                        "value": value,
+                        "image": pil_img,
+                    }
+                )
             continue
         ep_b = batch["episode_index"]
         ts_b = batch["timestamp"]
@@ -176,13 +181,15 @@ def load_frames_lerobot_cached(
             key_round = (ep, round(ts, 6))
             value = value_lookup.get(key_round, value_lookup.get((ep, ts), np.nan))
             pil_img = _tensor_or_array_to_pil(imgs_b[i])
-            all_rows.append({
-                "step": len(all_rows),
-                "episode_index": ep,
-                "timestamp": ts,
-                "value": value,
-                "image": pil_img,
-            })
+            all_rows.append(
+                {
+                    "step": len(all_rows),
+                    "episode_index": ep,
+                    "timestamp": ts,
+                    "value": value,
+                    "image": pil_img,
+                }
+            )
     df = pd.DataFrame(all_rows)
     df = df.sort_values("timestamp").reset_index(drop=True)
     df["step"] = np.arange(len(df))
@@ -231,36 +238,40 @@ def run_app(df: pd.DataFrame) -> None:
         else:
             st.info("No image for this frame.")
         with st.container(border=True):
-            st.metric("Predicted Value", f"{row['value']:.3f}" if np.isfinite(row['value']) else "—")
+            st.metric("Predicted Value", f"{row['value']:.3f}" if np.isfinite(row["value"]) else "—")
             st.caption(f"Episode {int(row['episode_index'])}, t = {row['timestamp']:.2f}s")
 
     with col2:
         st.subheader("Value Function $V(s)$")
         fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=df["step"],
-            y=df["display_value"],
-            mode="lines",
-            line=dict(color="#1f77b4", width=3),
-            name="Value Function",
-        ))
+        fig.add_trace(
+            go.Scatter(
+                x=df["step"],
+                y=df["display_value"],
+                mode="lines",
+                line={"color": "#1f77b4", "width": 3},
+                name="Value Function",
+            )
+        )
         fig.add_vline(x=current_step, line_width=2, line_dash="dash", line_color="red")
         y_cur = df["display_value"].iloc[current_step]
-        fig.add_trace(go.Scatter(
-            x=[current_step],
-            y=[y_cur],
-            mode="markers",
-            marker=dict(color="red", size=10),
-            showlegend=False,
-        ))
+        fig.add_trace(
+            go.Scatter(
+                x=[current_step],
+                y=[y_cur],
+                mode="markers",
+                marker={"color": "red", "size": 10},
+                showlegend=False,
+            )
+        )
         y_min = df["display_value"].min()
         y_max = df["display_value"].max()
         y_range = [y_min - 0.05 * (y_max - y_min + 1e-6), y_max + 0.05 * (y_max - y_min + 1e-6)]
         fig.update_layout(
             xaxis_title="Timestep (t)",
             yaxis_title="Value V(s)",
-            yaxis=dict(range=y_range),
-            margin=dict(l=0, r=0, t=0, b=0),
+            yaxis={"range": y_range},
+            margin={"l": 0, "r": 0, "t": 0, "b": 0},
             height=400,
             hovermode="x unified",
         )
