@@ -20,31 +20,32 @@ the dataset mixture in the config. Saves (episode_index, timestamp) -> value to 
 
 Usage:
   # From checkpoint dir (has train_config.json and policy weights)
-  python src/opentau/scripts/calculate_value.py \\
-    --config_path=/path/to/checkpoints/00520000 \\
-    [--batch_size=20] [--output_file=values.json]
+  python -m opentau.scripts.calculate_value \\
+    --config_path /path/to/checkpoints/00520000 \\
+    [--batch_size 20] [--output_file values.json]
 
-  # Use checkpoint but override dataset (config + policy from checkpoint, data from file)
-  python src/opentau/scripts/calculate_value.py \\
-    --config_path=/path/to/checkpoints/00520000 \\
-    --dataset_mixture=examples/my_datasets.json \\
-    [--output_file=values.json]
+  # Override dataset (config + policy from checkpoint, data from dataset_mixture)
+  python -m opentau.scripts.calculate_value \\
+    --config_path /path/to/checkpoints/00520000 \\
+    --dataset_mixture examples/my_datasets.json \\
+    [--output_file values.json]
 
   # From full train config file (policy.pretrained_path must point to checkpoint)
-  python src/opentau/scripts/calculate_value.py \\
-    --train_config=configs/train/value_config.json \\
-    [--output_file=./values.json]
+  python -m opentau.scripts.calculate_value \\
+    --train_config configs/train/value_config.json \\
+    [--output_file values.json]
 
   # Override checkpoint when using train config
-  python ... --train_config=configs/train/value_config.json --checkpoint_path=/path/to/checkpoints/00520000
+  python -m opentau.scripts.calculate_value --train_config configs/train/value_config.json \\
+    --checkpoint_path /path/to/checkpoints/00520000
 
   # Override dataset mixture (works with either --config_path or --train_config)
-  python ... --dataset_mixture=examples/advantage_config.json
+  python -m opentau.scripts.calculate_value --config_path /path/to/ckpt --dataset_mixture examples/advantage_config.json
 """
 
+import argparse
 import json
 import logging
-import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -53,7 +54,6 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from opentau.configs import parser
 from opentau.configs.default import DatasetMixtureConfig
 from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.factory import make_dataset
@@ -75,76 +75,56 @@ def _to_scalar(x):
     return x
 
 
-_dataset_mixture_path_value = None
-_train_config_path_value = None
-_output_file_value = None
-for arg in sys.argv:
-    if (
-        arg.startswith("--dataset_mixture_path=")
-        or arg.startswith("--dataset_mixture=")
-        and "." not in arg.split("=", 1)[0]
-    ):
-        _dataset_mixture_path_value = arg.split("=", 1)[1]
-        break
-for arg in sys.argv:
-    if arg.startswith("--train_config="):
-        _train_config_path_value = arg.split("=", 1)[1]
-        break
-for arg in sys.argv:
-    if arg.startswith("--output_file="):
-        _output_file_value = arg.split("=", 1)[1]
-        break
-
-_checkpoint_path_value = None
-for arg in sys.argv:
-    if arg.startswith("--checkpoint_path="):
-        _checkpoint_path_value = arg.split("=", 1)[1]
-        break
-
-_original_wrap = parser.wrap()
-
-
-def _filter_script_args(fn):
-    def wrapped(*args, **kwargs):
-        if len(args) > 0:
-            return _original_wrap(fn)(*args, **kwargs)
-        original_argv = sys.argv.copy()
-        try:
-            filtered = []
-            batch_size_val = None
-            has_dataloader_batch_size = False
-            for a in sys.argv:
-                if a.startswith("--dataset_mixture_path=") or (
-                    a.startswith("--dataset_mixture=") and "." not in a.split("=", 1)[0]
-                ):
-                    continue
-                if (
-                    a.startswith("--output_file=")
-                    or a.startswith("--train_config=")
-                    or a.startswith("--checkpoint_path=")
-                ):
-                    continue
-                if a.startswith("--batch_size="):
-                    batch_size_val = a.split("=", 1)[1]
-                if a.startswith("--dataloader_batch_size="):
-                    has_dataloader_batch_size = True
-                filtered.append(a)
-            if batch_size_val is not None and not has_dataloader_batch_size:
-                filtered.append(f"--dataloader_batch_size={batch_size_val}")
-            sys.argv = filtered
-            return _original_wrap(fn)(*args, **kwargs)
-        finally:
-            sys.argv = original_argv
-
-    return wrapped
+def _parse_args():
+    parser = argparse.ArgumentParser(
+        description="Compute value function outputs for a value policy over a configured dataset.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
+        "--config_path",
+        type=Path,
+        default=None,
+        help="Path to checkpoint directory (contains train_config.json) or config file.",
+    )
+    group.add_argument(
+        "--train_config",
+        type=Path,
+        default=None,
+        help="Path to full train config JSON (policy.pretrained_path must point to checkpoint).",
+    )
+    parser.add_argument(
+        "--dataset_mixture",
+        type=Path,
+        default=None,
+        help="Override dataset: path to dataset mixture JSON (e.g. dataset_config.json).",
+    )
+    parser.add_argument(
+        "--output_file",
+        type=Path,
+        default=Path("values.json"),
+        help="Output JSON file for (episode_index,timestamp) -> value.",
+    )
+    parser.add_argument(
+        "--checkpoint_path",
+        type=Path,
+        default=None,
+        help="Override checkpoint directory when using --train_config.",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=None,
+        help="Dataloader batch size (overrides config).",
+    )
+    return parser.parse_args()
 
 
-@_filter_script_args
-def main(cfg: TrainPipelineConfig):
-    output_file = _output_file_value or "values.json"
-    dataset_mixture_path = _dataset_mixture_path_value
-    if _train_config_path_value:
-        logging.info(f"Using full train config: {_train_config_path_value}")
+def main(cfg: TrainPipelineConfig, args: argparse.Namespace):
+    output_file = args.output_file
+    dataset_mixture_path = args.dataset_mixture
+    if args.train_config:
+        logging.info("Using full train config: %s", args.train_config)
 
     if dataset_mixture_path:
         logging.info(f"Overriding dataset: loading mixture from {dataset_mixture_path}")
@@ -161,7 +141,7 @@ def main(cfg: TrainPipelineConfig):
         set_seed(cfg.seed)
 
     device = auto_torch_device()
-    checkpoint_path = _checkpoint_path_value or cfg.policy.pretrained_path
+    checkpoint_path = args.checkpoint_path or cfg.policy.pretrained_path
     logging.info("Loading value policy from checkpoint: %s", checkpoint_path)
     policy_class = get_policy_class(cfg.policy.type)
     policy = policy_class.from_pretrained(checkpoint_path, config=cfg.policy)
@@ -176,9 +156,10 @@ def main(cfg: TrainPipelineConfig):
         result = make_dataset(dataset_cfg, cfg, return_advantage_input=True)
         dataset = result[0] if isinstance(result, tuple) else result
 
+        batch_size = args.batch_size if args.batch_size is not None else cfg.batch_size
         dataloader = DataLoader(
             dataset,
-            batch_size=cfg.batch_size,
+            batch_size=batch_size,
             shuffle=False,
             drop_last=False,
             num_workers=cfg.num_workers,
@@ -286,26 +267,14 @@ def main(cfg: TrainPipelineConfig):
 
 if __name__ == "__main__":
     init_logging()
-    if _train_config_path_value:
-        cli_args = [
-            a
-            for a in sys.argv[1:]
-            if not (
-                a.startswith("--train_config=")
-                or a.startswith("--output_file=")
-                or a.startswith("--checkpoint_path=")
-                or a.startswith("--dataset_mixture_path=")
-                or (a.startswith("--dataset_mixture=") and "." not in a.split("=", 1)[0])
-            )
-        ]
-        batch_val = next((a.split("=", 1)[1] for a in cli_args if a.startswith("--batch_size=")), None)
-        if batch_val and not any(a.startswith("--dataloader_batch_size=") for a in cli_args):
-            cli_args.append(f"--dataloader_batch_size={batch_val}")
-        cfg = draccus.parse(
-            config_class=TrainPipelineConfig,
-            config_path=_train_config_path_value,
-            args=cli_args,
-        )
-        main(cfg)
+    args = _parse_args()
+
+    if args.train_config is not None:
+        cfg = TrainPipelineConfig.from_pretrained(args.train_config, local_files_only=True)
     else:
-        main()
+        cfg = TrainPipelineConfig.from_pretrained(args.config_path, local_files_only=True)
+
+    if args.checkpoint_path is not None:
+        cfg.policy.pretrained_path = args.checkpoint_path
+
+    main(cfg, args)

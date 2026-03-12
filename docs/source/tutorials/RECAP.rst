@@ -304,3 +304,50 @@ Command line to run the VLA policy fine-tuning:
 .. code-block:: bash
 
     opentau-train --accelerate-config=<path/to/accelerate_config.yaml> --config_path=<path/to/config.json>
+
+
+Value function visualization
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+The value_visualizer_app is a streamlit app that allows you to visualize the value function of the VLA policy.
+
+Generate a dataset_mixture.json file which specifies the dataset path and the episodes to calculate the value function.
+Example:
+
+.. code-block:: javascript
+
+   {
+    "datasets": [
+        {
+            "repo_id": "physical-intelligence/libero",
+            "root": "/home/autox/akshay/OpenTau/libero_rollout_0_rank0/rank0",
+            "episodes": [4]
+            }
+    ],
+    "weights": [
+        1.0
+    ],
+    "action_freq": 10.0,
+    "image_resample_strategy": "nearest",
+    "vector_resample_strategy": "nearest",
+    "val_split_ratio": 0
+}
+
+Then, generate the values.json file using the following command:
+
+.. code-block:: bash
+
+    python -m opentau.scripts.calculate_value --config_path=<path/to/value_function_config.json>  --dataset_mixture=<path/to/dataset_mixture.json> --batch_size=20 --output_file=values.json
+
+
+Then, run the value_visualizer_app:
+
+.. code-block:: bash
+
+    python -m opentau.scripts.value_visualizer_app --dataset_config=<path/to/dataset_mixture.json> --values=<path/to/values.json>
+
+
+The front looks like this:
+
+.. image:: ../assets/value_visualizer_app.png
+    :width: 100%
+    :alt: Value Visualizer App

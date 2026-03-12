@@ -43,7 +43,7 @@ from opentau.configs.default import DatasetConfig
 from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.factory import make_dataset
 
-# Hardcoded path to logo image shown in the header (change to your logo file).
+# Hardcoded path to logo image shown in the header.
 LOGO_PATH = Path("assets/logo.png")
 
 
@@ -106,6 +106,7 @@ def load_frames_lerobot_cached(
     train_config_path: Path | None,
     values_path: Path,
     episode_index: int,
+    camera_key: str,
 ) -> pd.DataFrame:
     """Load a single episode via LeRobotDataset and attach values. Returns DataFrame with step, value, image."""
     root, repo_id, _ = load_dataset_config(dataset_config_path)
@@ -116,10 +117,7 @@ def load_frames_lerobot_cached(
         if not train_config_path.is_file():
             train_config_path = dataset_config_path.parent
     path = Path(train_config_path).resolve()
-    if path.is_dir():
-        train_cfg = TrainPipelineConfig.from_pretrained(path, local_files_only=True)
-    else:
-        train_cfg = TrainPipelineConfig.from_pretrained(path, local_files_only=True)
+    train_cfg = TrainPipelineConfig.from_pretrained(path, local_files_only=True)
 
     dataset_cfg = DatasetConfig(
         repo_id=repo_id,
@@ -128,7 +126,7 @@ def load_frames_lerobot_cached(
     )
     res = make_dataset(dataset_cfg, train_cfg, return_advantage_input=False)
     dataset = res[0] if isinstance(res, tuple) else res
-    camera_key = "camera0"
+    camera_key = camera_key if camera_key is not None else "camera0"
 
     # DataLoader calls __getitem__; each batch contains episode_index and timestamp.
     # With batch_size=1, each iteration visits one datapoint (one frame) exactly once.
@@ -317,6 +315,12 @@ def main() -> None:
         default=None,
         help="Episode index to load (default: first episode from dataset_config)",
     )
+    parser.add_argument(
+        "--camera-key",
+        type=str,
+        default=None,
+        help="Camera key to load (default: camera0)",
+    )
     args = parser.parse_args()
 
     dataset_config_path = args.dataset_config.resolve()
@@ -334,6 +338,7 @@ def main() -> None:
         args.train_config,
         values_path,
         episode_index,
+        args.camera_key,
     )
     run_app(df)
 
