@@ -101,7 +101,7 @@ class DatasetConfig:
         if (self.repo_id is None) == (self.vqa is None):
             raise ValueError("Exactly one of `repo_id` or `vqa` for Dataset config should be set.")
 
-        # If data_features_name_mapping have is provided, upsert it into the global DATA_FEATURES_NAME_MAPPING
+        # If data_features_name_mapping is provided, upsert it into the global DATA_FEATURES_NAME_MAPPING
         if self.data_features_name_mapping is not None:
             from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
 
