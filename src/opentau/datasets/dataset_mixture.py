@@ -60,6 +60,7 @@ Example:
         >>> dataloader = mixture.get_dataloader()
 """
 
+import functools
 import logging
 from typing import List, Optional
 
@@ -92,6 +93,18 @@ def pad_vector(vector: np.ndarray, new_dim: int) -> np.ndarray:
     new_vector = np.zeros(shape, dtype=vector.dtype)
     new_vector[..., :current_dim] = vector
     return new_vector
+
+
+def _apply_data_feature_name_mapping_overrides(
+    worker_id: int, mapping_overrides: dict[str, dict[str, str]]
+) -> None:
+    """Apply repo-specific feature mapping overrides in each worker process.
+
+    DataLoader workers run in separate processes, so they do not share module-level
+    global mutations from the parent process when using spawn.
+    """
+    del worker_id  # required by DataLoader worker_init_fn signature
+    DATA_FEATURES_NAME_MAPPING.update(mapping_overrides)
 
 
 class DatasetMixtureMetadata:
@@ -408,6 +421,14 @@ class WeightedDatasetMixture:
 
         return torch.DoubleTensor(all_sample_weights)
 
+    def _get_worker_name_mapping_overrides(self) -> dict[str, dict[str, str]]:
+        """Collect per-dataset mapping overrides from config for worker init."""
+        overrides = {}
+        for dataset_cfg in self.cfg.dataset_mixture.datasets:
+            if dataset_cfg.repo_id and dataset_cfg.data_features_name_mapping is not None:
+                overrides[dataset_cfg.repo_id] = dataset_cfg.data_features_name_mapping
+        return overrides
+
     def get_dataloader(self) -> DataLoader:
         """Create and return a PyTorch DataLoader with weighted sampling.
 
@@ -420,12 +441,23 @@ class WeightedDatasetMixture:
         Raises:
             ValueError: If no non-empty dataset has a positive sampling weight.
         """
+        worker_name_mapping_overrides = self._get_worker_name_mapping_overrides()
+        worker_init_fn = None
+        if worker_name_mapping_overrides:
+            worker_init_fn = functools.partial(
+                _apply_data_feature_name_mapping_overrides,
+                mapping_overrides=worker_name_mapping_overrides,
+            )
+
         if len(self.concatenated_dataset) == 0:
             logging.warning("Warning: Concatenated dataset is empty. DataLoader will produce no batches.")
             # Return an empty dataloader or raise error, depending on desired behavior.
             # For now, let it create an empty dataloader.
             return DataLoader(
-                self.concatenated_dataset, batch_size=self.cfg.batch_size, num_workers=self.cfg.num_workers
+                self.concatenated_dataset,
+                batch_size=self.cfg.batch_size,
+                num_workers=self.cfg.num_workers,
+                worker_init_fn=worker_init_fn,
             )
 
         # Validate there is at least one non-empty dataset with positive weight
@@ -454,6 +486,7 @@ class WeightedDatasetMixture:
             pin_memory=torch.cuda.is_available(),
             drop_last=False,
             prefetch_factor=self.cfg.prefetch_factor,
+            worker_init_fn=worker_init_fn,
         )
         logging.info("DataLoader created successfully.")
         logging.info("-" * 30)
