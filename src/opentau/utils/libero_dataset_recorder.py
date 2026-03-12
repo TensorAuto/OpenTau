@@ -317,7 +317,7 @@ def consolidate_task_result(task_result: dict, output_dir: str | Path, allow_ove
         json.dump(
             make_libero_info(
                 total_episodes=n_episodes,
-                total_frames=sum(all_lengths).item(),
+                total_frames=sum(all_lengths),
                 total_chunks=int(math.ceil(n_episodes / 1000)),
             ),
             f,
@@ -418,7 +418,7 @@ def consolidate_task_result(task_result: dict, output_dir: str | Path, allow_ove
                 {
                     "episode_index": ep_idx,
                     "tasks": [prompt],
-                    "length": ep_len.item(),
+                    "length": int(ep_len),
                     "success": success,
                 }
             )

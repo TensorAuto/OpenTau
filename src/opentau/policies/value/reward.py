@@ -45,7 +45,9 @@ def calculate_return_bins_with_equal_width(
     return_value = current_idx - episode_end_idx + 1
     # add negative reward for last step if episode is a failure, else add nothing for a successful episode
     if not success:
-        return_value += c_neg
+        return_value = (
+            return_value + c_neg
+        )  # use assignment so result is float when c_neg is float (avoids int/Long+=Float in-place error)
 
     # normalize the reward to the range of -1 to 0
     return_normalized = return_value / reward_normalizer
@@ -79,7 +81,9 @@ def calculate_n_step_return(
     return_value = max(current_idx - episode_end_idx + 1, -1 * n_steps_look_ahead)
     # add negative reward for last step if episode is a failure, else add nothing for a successful episode. also check if
     if not success and current_idx + n_steps_look_ahead >= episode_end_idx:
-        return_value += c_neg
+        return_value = (
+            return_value + c_neg
+        )  # use assignment so result is float when c_neg is float (avoids Long+=Float in-place error)
 
     # normalize the reward to the range of -1 to 0
     return_normalized = return_value / reward_normalizer
