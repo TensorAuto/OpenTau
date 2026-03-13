@@ -124,7 +124,7 @@ def load_frames_lerobot_cached(
         root=str(root),
         episodes=[episode_index],
     )
-    res = make_dataset(dataset_cfg, train_cfg, return_advantage_input=False)
+    res = make_dataset(dataset_cfg, train_cfg, return_advantage_input=True)
     dataset = res[0] if isinstance(res, tuple) else res
     camera_key = camera_key if camera_key is not None else "camera0"
 
