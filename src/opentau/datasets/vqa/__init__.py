@@ -12,42 +12,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Vision-language grounding datasets for multimodal learning.
+"""Vision-language vqa datasets for multimodal learning.
 
 This module provides datasets for training vision-language-action models on
-image-text grounding tasks without requiring robot actions. Grounding datasets
+image-text vqa tasks without requiring robot actions. VQA datasets
 are designed to help models learn visual understanding, spatial reasoning,
-and language grounding capabilities that can be transferred to robotic tasks.
+and language vqa capabilities that can be transferred to robotic tasks.
 
-Grounding datasets differ from standard robot learning datasets in that they:
+VQA datasets differ from standard robot learning datasets in that they:
     - Provide images, prompts, and responses but no robot actions or states
     - Use zero-padding for state and action features to maintain compatibility
-    - Focus on visual question answering, spatial reasoning, and object grounding
+    - Focus on visual question answering, spatial reasoning, and object vqa
     - Enable training on large-scale vision-language data without robot hardware
 
 The module uses a registration system where datasets are registered via the
-`@register_grounding_dataset` decorator, making them available through the
-`available_grounding_datasets` registry.
+`@register_vqa_dataset` decorator, making them available through the
+`available_vqa_datasets` registry.
 
 Available Datasets:
     - CLEVR: Compositional Language and Elementary Visual Reasoning dataset
         for visual question answering with synthetic scenes.
     - COCO-QA: Visual question answering dataset based on COCO images,
         filtered for spatial reasoning tasks.
-    - PIXMO: Pixel-level manipulation grounding dataset for object
+    - PIXMO: Pixel-level manipulation vqa dataset for object
         localization and manipulation tasks.
     - VSR: Visual Spatial Reasoning dataset for true/false statement
-        grounding about spatial relationships in images.
+        vqa about spatial relationships in images.
     - dummy: Synthetic test dataset with simple black, white, and gray
         images for testing infrastructure.
 
 Classes:
-    GroundingDataset: Base class for all grounding datasets, providing
+    VQADataset: Base class for all vqa datasets, providing
         common functionality for metadata creation, data format conversion,
         and zero-padding of state/action features.
 
 Modules:
-    base: Base class and common functionality for grounding datasets.
+    base: Base class and common functionality for vqa datasets.
     clevr: CLEVR dataset implementation.
     cocoqa: COCO-QA dataset implementation.
     dummy: Dummy test dataset implementation.
@@ -55,13 +55,13 @@ Modules:
     vsr: VSR dataset implementation.
 
 Example:
-    Use a grounding dataset in training configuration:
+    Use a vqa dataset in training configuration:
         >>> from opentau.configs.default import DatasetConfig
-        >>> cfg = DatasetConfig(grounding="cocoqa")
+        >>> cfg = DatasetConfig(vqa="cocoqa")
         >>> dataset = make_dataset(cfg, train_cfg)
 
-    Access available grounding datasets:
-        >>> from opentau import available_grounding_datasets
-        >>> print(list(available_grounding_datasets.keys()))
+    Access available vqa datasets:
+        >>> from opentau import available_vqa_datasets
+        >>> print(list(available_vqa_datasets.keys()))
         ['clevr', 'cocoqa', 'dummy', 'pixmo', 'vsr']
 """

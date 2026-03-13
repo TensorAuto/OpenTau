@@ -52,8 +52,8 @@ Classes:
         Metadata manager for LeRobot datasets with Hub integration, version
         checking, and statistics loading.
 
-    GroundingDatasetMetadata
-        Metadata manager for grounding datasets.
+    VQADatasetMetadata
+        Metadata manager for vqa datasets.
 
     BaseDataset
         Base PyTorch Dataset class with common functionality.
@@ -259,8 +259,8 @@ class DatasetMetadata:
         return {key: tuple(ft["shape"]) for key, ft in self.features.items()}
 
 
-class GroundingDatasetMetadata(DatasetMetadata):
-    """Metadata class for grounding datasets (vision-language datasets)."""
+class VQADatasetMetadata(DatasetMetadata):
+    """Metadata class for vqa datasets (vision-language datasets)."""
 
     pass
 
@@ -585,7 +585,7 @@ class BaseDataset(torch.utils.data.Dataset):
     """Base class for all robot learning datasets.
 
     This abstract base class provides common functionality for both LeRobotDataset
-    and GroundingDataset, including data format standardization, image processing,
+    and VQADataset, including data format standardization, image processing,
     and vector padding. It ensures all datasets conform to a standard format
     regardless of their source or structure.
 
@@ -1674,7 +1674,9 @@ class LeRobotDataset(BaseDataset):
 
         self._wait_image_writer()
         self._save_episode_table(episode_buffer, episode_index)
-        ep_stats = compute_episode_stats(episode_buffer, self.features)
+        ep_stats = compute_episode_stats(
+            episode_buffer, self.features, skip_video_stats=getattr(self, "skip_video_stats", False)
+        )
 
         if len(self.meta.video_keys) > 0:
             video_paths = self.encode_episode_videos(episode_index)
@@ -1686,19 +1688,31 @@ class LeRobotDataset(BaseDataset):
 
         ep_data_index, _ = get_episode_data_index(self.meta.episodes, [episode_index])
         ep_data_index_np = {k: t.numpy() for k, t in ep_data_index.items()}
+        timestamps = np.asarray(episode_buffer["timestamp"]).reshape(-1)
+        episode_indices = np.full(episode_length, episode_index)
         check_timestamps_sync(
-            episode_buffer["timestamp"],
-            episode_buffer["episode_index"],
+            timestamps,
+            episode_indices,
             ep_data_index_np,
             self.fps,
             self.tolerance_s,
         )
 
-        video_files = list(self.root.rglob("*.mp4"))
-        assert len(video_files) == self.num_episodes * len(self.meta.video_keys)
+        expected_episodes = self.meta.total_episodes
+        missing_videos: list[str] = []
+        for ep_idx in range(expected_episodes):
+            for vid_key in self.meta.video_keys:
+                video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
+                if not video_path.is_file():
+                    missing_videos.append(str(video_path))
+        assert not missing_videos, "Missing expected encoded videos:\n" + "\n".join(missing_videos)
 
-        parquet_files = list(self.root.rglob("*.parquet"))
-        assert len(parquet_files) == self.num_episodes
+        missing_parquet: list[str] = []
+        for ep_idx in range(expected_episodes):
+            parquet_path = self.root / self.meta.get_data_file_path(ep_idx)
+            if not parquet_path.is_file():
+                missing_parquet.append(str(parquet_path))
+        assert not missing_parquet, "Missing expected parquet episode files:\n" + "\n".join(missing_parquet)
 
         # delete images
         img_dir = self.root / "images"
@@ -1874,6 +1888,7 @@ class LeRobotDataset(BaseDataset):
         image_resample_strategy: str = "nearest",
         vector_resample_strategy: str = "nearest",
         standardize: bool = True,
+        skip_video_stats: bool = False,
     ) -> "LeRobotDataset":
         """Create a LeRobot Dataset from scratch in order to record data."""
         obj = cls.__new__(cls)
@@ -1907,5 +1922,6 @@ class LeRobotDataset(BaseDataset):
         obj.image_resample_strategy = image_resample_strategy
         obj.vector_resample_strategy = vector_resample_strategy
         obj.standardize = standardize
+        obj.skip_video_stats = skip_video_stats
         obj.episode_data_index, obj.epi2idx = get_episode_data_index(obj.meta.episodes, obj.episodes)
         return obj

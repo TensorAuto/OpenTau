@@ -83,7 +83,7 @@ def value_function_training_config(train_pipeline_config: TrainPipelineConfig) -
 
     cfg.dataset_mixture.datasets = [
         DatasetConfig(repo_id="lerobot/droid_100", episodes=[0]),
-        DatasetConfig(grounding="clevr"),
+        DatasetConfig(vqa="clevr"),
     ]
     cfg.dataset_mixture.weights = [1.0, 1.0]
     cfg.resolution = (224, 224)
@@ -131,7 +131,7 @@ def pi05_training_config(train_pipeline_config: TrainPipelineConfig) -> TrainPip
     )
     cfg.dataset_mixture.datasets = [
         DatasetConfig(repo_id="lerobot/droid_100", episodes=[0]),
-        DatasetConfig(grounding="clevr"),
+        DatasetConfig(vqa="clevr"),
     ]
     cfg.dataset_mixture.weights = [1.0, 1.0]
     cfg.resolution = (224, 224)

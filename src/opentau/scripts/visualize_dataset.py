@@ -33,6 +33,21 @@ Examples:
 local$ opentau-dataset-viz --repo-id lerobot/pusht --episode-index 0
 ```
 
+- Visualize a local dataset directory without specifying `repo_id`:
+```
+local$ opentau-dataset-viz --root data/lerobot/pusht --episode-index 0
+```
+
+- Visualize using source MP4 assets when available (smaller .rrd files):
+```
+local$ opentau-dataset-viz --repo-id lerobot/pusht --episode-index 0 --camera-log-mode asset_video
+```
+
+- Keep frame-by-frame image logging explicitly (previous default behavior):
+```
+local$ opentau-dataset-viz --repo-id lerobot/pusht --episode-index 0 --camera-log-mode frames
+```
+
 - Visualize data stored on a distant machine with a local viewer:
 ```
 distant$ opentau-dataset-viz --repo-id lerobot/pusht --episode-index 0 --save 1 --output-dir path/to/directory
@@ -69,10 +84,17 @@ from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.lerobot_dataset import LeRobotDataset
 
 PERMIT_URDF = hasattr(rr, "urdf")
+PERMIT_ASSET_VIDEO = hasattr(rr, "AssetVideo") and hasattr(rr, "VideoFrameReference")
 if not PERMIT_URDF:
     warnings.warn(
         "`rerun.urdf` module not found. Make sure you have rerun >= 0.28.2 installed. "
         " One way to ensure this is to install OpenTau with the '[urdf]' extra: `pip install opentau[urdf]`.",
+        stacklevel=2,
+    )
+if not PERMIT_ASSET_VIDEO:
+    warnings.warn(
+        "Rerun video asset APIs are unavailable (need AssetVideo + VideoFrameReference). "
+        "Falling back to per-frame image logging for camera streams.",
         stacklevel=2,
     )
 
@@ -142,8 +164,8 @@ def create_mock_train_config() -> TrainPipelineConfig:
 
 class EpisodeSampler(torch.utils.data.Sampler):
     def __init__(self, dataset: LeRobotDataset, episode_index: int):
-        from_idx = dataset.episode_data_index["from"][episode_index].item()
-        to_idx = dataset.episode_data_index["to"][episode_index].item()
+        from_idx = int(dataset.episode_data_index["from"][episode_index].item())
+        to_idx = int(dataset.episode_data_index["to"][episode_index].item())
         self.frame_ids = range(from_idx, to_idx)
 
     def __iter__(self) -> Iterator:
@@ -173,6 +195,7 @@ def visualize_dataset(
     output_dir: Path | None = None,
     urdf: Path | None = None,
     joint_names: list[str] | None = None,
+    camera_log_mode: str = "frames",
 ) -> Path | None:
     r"""
     Visualize data of a given episode of a LeRobotDataset with rerun.
@@ -188,6 +211,10 @@ def visualize_dataset(
         output_dir: Directory to save the .rrd file if `save` is True. Required if `save` is True. Defaults to None.
         urdf: Path to a URDF file to load and visualize alongside the dataset. Defaults to None.
         joint_names: List of joint names for each state dimension, in order. Used for associating state dimensions with URDF joints. If not provided, state names from dataset metadata will be used. Defaults to None.
+        camera_log_mode: Camera logging strategy.
+            - "frames": always log decoded image frames (existing behavior)
+            - "asset_video": prefer logging source mp4 videos through rerun AssetVideo
+            - "auto": same as asset_video with graceful fallback to frame logging
     """
     if save:
         assert output_dir is not None, (
@@ -196,19 +223,12 @@ def visualize_dataset(
 
     repo_id = dataset.repo_id
 
-    logging.info("Loading dataloader")
-    episode_sampler = EpisodeSampler(dataset, episode_index)
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        num_workers=num_workers,
-        batch_size=batch_size,
-        sampler=episode_sampler,
-    )
-
     logging.info("Starting Rerun")
 
     if mode not in ["local", "distant"]:
         raise ValueError(mode)
+    if camera_log_mode not in ["frames", "asset_video", "auto"]:
+        raise ValueError(camera_log_mode)
 
     spawn_local_viewer = mode == "local" and not save
     rr.init(f"{repo_id}/episode_{episode_index}", spawn=spawn_local_viewer)
@@ -239,46 +259,173 @@ def visualize_dataset(
     if mode == "distant":
         rr.serve_web_viewer(open_browser=False, web_port=web_port)
 
+    camera_features = dataset.meta.features
+    video_asset_keys: set[str] = set()
+    use_asset_video = camera_log_mode in ["asset_video", "auto"] and PERMIT_ASSET_VIDEO
+    if camera_log_mode in ["asset_video", "auto"] and not PERMIT_ASSET_VIDEO:
+        logging.warning(
+            "camera_log_mode=%s requested but rerun video asset APIs are unavailable. "
+            "Falling back to frame logging.",
+            camera_log_mode,
+        )
+
+    if use_asset_video:
+        for key in dataset.meta.camera_keys:
+            dtype = camera_features.get(key, {}).get("dtype")
+            if dtype != "video":
+                continue
+
+            video_path = dataset.root / dataset.meta.get_video_file_path(ep_index=episode_index, vid_key=key)
+            if not video_path.exists():
+                logging.warning(
+                    "Video file missing for %s: %s. Falling back to frame logging.", key, video_path
+                )
+                continue
+            if video_path.suffix.lower() != ".mp4":
+                logging.warning(
+                    "Video file for %s is not mp4 (%s). Falling back to frame logging.", key, video_path
+                )
+                continue
+
+            try:
+                rr.log(key, rr.AssetVideo(path=video_path), static=True)
+                video_asset_keys.add(key)
+            except Exception:
+                logging.exception(
+                    "Failed to log AssetVideo for %s (%s). Falling back to frame logging.", key, video_path
+                )
+
+    # Fast path: when every camera stream is logged as AssetVideo, avoid dataset.__getitem__,
+    # which would decode video frames for each sample.
+    can_skip_decode = len(dataset.meta.camera_keys) == len(video_asset_keys)
+
+    logging.info("Loading iteration source")
+    row_indices: list[int] | None = None
+    no_transform_ds = None
+    dataloader = None
+    has_action = False
+    has_observation_state = False
+    has_next_done = False
+    has_next_reward = False
+    has_next_success = False
+    if can_skip_decode:
+        logging.info("Using metadata-only iteration path (no frame decoding).")
+        epi_idx = dataset.epi2idx[episode_index]
+        from_idx = int(dataset.episode_data_index["from"][epi_idx].item())
+        to_idx = int(dataset.episode_data_index["to"][epi_idx].item())
+        row_indices = list(range(from_idx, to_idx))
+        no_transform_ds = dataset.hf_dataset.with_transform(None).with_format("numpy")
+        no_transform_columns = set(no_transform_ds.column_names)
+        has_action = "action" in no_transform_columns
+        has_observation_state = "observation.state" in no_transform_columns
+        has_next_done = "next.done" in no_transform_columns
+        has_next_reward = "next.reward" in no_transform_columns
+        has_next_success = "next.success" in no_transform_columns
+    else:
+        logging.info("Loading dataloader")
+        episode_sampler = EpisodeSampler(dataset, episode_index)
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            num_workers=num_workers,
+            batch_size=batch_size,
+            sampler=episode_sampler,
+        )
+
     logging.info("Logging to Rerun")
+    episode_start_ts: float | None = None
 
-    for batch in tqdm.tqdm(dataloader, total=len(dataloader)):
-        # iterate over the batch
-        for i in range(len(batch["index"])):
-            _rr_set_sequence("frame_index", batch["frame_index"][i].item())
-            _rr_set_seconds("timestamp", batch["timestamp"][i].item())
+    if can_skip_decode:
+        assert row_indices is not None
+        assert no_transform_ds is not None
+        total_batches = max(1, (len(row_indices) + batch_size - 1) // batch_size)
+        for start in tqdm.tqdm(range(0, len(row_indices), batch_size), total=total_batches):
+            batch_indices = row_indices[start : start + batch_size]
+            batch = no_transform_ds.select(batch_indices)
 
-            # display each camera image
-            for key in dataset.meta.camera_keys:
-                # TODO(rcadene): add `.compress()`? is it lossless?
-                rr.log(key, rr.Image(to_hwc_uint8_numpy(batch[key][i])))
+            for i in range(len(batch["index"])):
+                frame_index = int(np.asarray(batch["frame_index"][i]).item())
+                timestamp_s = float(np.asarray(batch["timestamp"][i]).item())
+                _rr_set_sequence("frame_index", frame_index)
+                _rr_set_seconds("timestamp", timestamp_s)
+                if episode_start_ts is None:
+                    episode_start_ts = timestamp_s
+                episode_video_t = max(0.0, timestamp_s - episode_start_ts)
 
-            # display each dimension of action space (e.g. actuators command)
-            if "action" in batch:
-                for dim_idx, val in enumerate(batch["action"][i]):
-                    rr.log(f"action/{dim_idx}", _rr_scalar(val.item()))
+                for key in dataset.meta.camera_keys:
+                    if key in video_asset_keys:
+                        rr.log(key, rr.VideoFrameReference(seconds=episode_video_t, video_reference=key))
 
-            # display each dimension of observed state space (e.g. agent position in joint space)
-            if "observation.state" in batch:
-                states = batch["observation.state"][i]
-                for dim_idx, val in enumerate(states):
-                    jnt_name = joint_names[dim_idx] if dim_idx < len(joint_names) else str(dim_idx)
-                    rr.log(f"state/{jnt_name}", _rr_scalar(val.item()))
-                    if jnt_name in urdf_joints:
-                        joint = urdf_joints[jnt_name]
-                        transform = joint.compute_transform(float(val))
-                        rr.log("URDF", transform)
+                if has_action:
+                    for dim_idx, val in enumerate(np.asarray(batch["action"][i]).reshape(-1)):
+                        rr.log(f"action/{dim_idx}", _rr_scalar(float(val)))
 
-            if "next.done" in batch:
-                rr.log("next.done", _rr_scalar(batch["next.done"][i].item()))
+                if has_observation_state:
+                    states = np.asarray(batch["observation.state"][i]).reshape(-1)
+                    for dim_idx, val in enumerate(states):
+                        jnt_name = joint_names[dim_idx] if dim_idx < len(joint_names) else str(dim_idx)
+                        rr.log(f"state/{jnt_name}", _rr_scalar(float(val)))
+                        if jnt_name in urdf_joints:
+                            joint = urdf_joints[jnt_name]
+                            transform = joint.compute_transform(float(val))
+                            rr.log("URDF", transform)
 
-            if "next.reward" in batch:
-                rr.log("next.reward", _rr_scalar(batch["next.reward"][i].item()))
+                if has_next_done:
+                    rr.log("next.done", _rr_scalar(float(np.asarray(batch["next.done"][i]).item())))
 
-            if "next.success" in batch:
-                rr.log("next.success", _rr_scalar(batch["next.success"][i].item()))
+                if has_next_reward:
+                    rr.log("next.reward", _rr_scalar(float(np.asarray(batch["next.reward"][i]).item())))
+
+                if has_next_success:
+                    rr.log("next.success", _rr_scalar(float(np.asarray(batch["next.success"][i]).item())))
+    else:
+        assert dataloader is not None
+        for batch in tqdm.tqdm(dataloader, total=len(dataloader)):
+            # iterate over the batch
+            for i in range(len(batch["index"])):
+                frame_index = batch["frame_index"][i].item()
+                timestamp_s = batch["timestamp"][i].item()
+                _rr_set_sequence("frame_index", frame_index)
+                _rr_set_seconds("timestamp", timestamp_s)
+                if episode_start_ts is None:
+                    episode_start_ts = timestamp_s
+                episode_video_t = max(0.0, timestamp_s - episode_start_ts)
+
+                # display each camera image
+                for key in dataset.meta.camera_keys:
+                    if key in video_asset_keys:
+                        rr.log(key, rr.VideoFrameReference(seconds=episode_video_t, video_reference=key))
+                    else:
+                        # TODO(rcadene): add `.compress()`? is it lossless?
+                        rr.log(key, rr.Image(to_hwc_uint8_numpy(batch[key][i])))
+
+                # display each dimension of action space (e.g. actuators command)
+                if "action" in batch:
+                    for dim_idx, val in enumerate(batch["action"][i]):
+                        rr.log(f"action/{dim_idx}", _rr_scalar(val.item()))
+
+                # display each dimension of observed state space (e.g. agent position in joint space)
+                if "observation.state" in batch:
+                    states = batch["observation.state"][i]
+                    for dim_idx, val in enumerate(states):
+                        jnt_name = joint_names[dim_idx] if dim_idx < len(joint_names) else str(dim_idx)
+                        rr.log(f"state/{jnt_name}", _rr_scalar(val.item()))
+                        if jnt_name in urdf_joints:
+                            joint = urdf_joints[jnt_name]
+                            transform = joint.compute_transform(float(val))
+                            rr.log("URDF", transform)
+
+                if "next.done" in batch:
+                    rr.log("next.done", _rr_scalar(batch["next.done"][i].item()))
+
+                if "next.reward" in batch:
+                    rr.log("next.reward", _rr_scalar(batch["next.reward"][i].item()))
+
+                if "next.success" in batch:
+                    rr.log("next.success", _rr_scalar(batch["next.success"][i].item()))
 
     if mode == "local" and save:
         # save .rrd locally
+        assert output_dir is not None
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         repo_id_str = repo_id.replace("/", "_")
@@ -301,8 +448,11 @@ def parse_args() -> dict:
     parser.add_argument(
         "--repo-id",
         type=str,
-        required=True,
-        help="Name of hugging face repository containing a LeRobotDataset dataset (e.g. `lerobot/pusht`).",
+        default=None,
+        help=(
+            "Name of hugging face repository containing a LeRobotDataset dataset "
+            "(e.g. `lerobot/pusht`). Optional when `--root` points to a local dataset directory."
+        ),
     )
     parser.add_argument(
         "--episode-index",
@@ -362,13 +512,27 @@ def parse_args() -> dict:
         ),
     )
     parser.add_argument(
+        "--camera-log-mode",
+        type=str,
+        default="auto",
+        choices=["frames", "asset_video", "auto"],
+        help=(
+            "Camera logging strategy. "
+            "'frames' logs decoded frames with rr.Image (larger .rrd). "
+            "'asset_video' logs source MP4 for video features via rr.AssetVideo + rr.VideoFrameReference. "
+            "'auto' behaves like 'asset_video' with graceful fallback to frames if unavailable."
+        ),
+    )
+    parser.add_argument(
         "--tolerance-s",
+        "--tolerance",
+        dest="tolerance_s",
         type=float,
         default=1e-4,
         help=(
             "Tolerance in seconds used to ensure data timestamps respect the dataset fps value"
             "This is argument passed to the constructor of LeRobotDataset and maps to its tolerance_s constructor argument"
-            "If not given, defaults to 1e-4."
+            "If not given, defaults to 1e-4. `--tolerance` is kept as an alias."
         ),
     )
     parser.add_argument(
@@ -399,6 +563,8 @@ def parse_args() -> dict:
     )
 
     args = parser.parse_args()
+    if args.repo_id is None and args.root is None:
+        parser.error("Either `--repo-id` or `--root` must be provided.")
     return vars(args)
 
 
@@ -416,14 +582,50 @@ def main():
     if not PERMIT_URDF:
         kwargs["urdf"] = None
 
+    if repo_id is None:
+        assert root is not None  # guarded in parse_args
+        # LeRobotDataset requires a repo_id; synthesize one for local-only visualization.
+        local_name = Path(root).expanduser().resolve().name or "dataset"
+        repo_id = f"local/{local_name}"
+
     logging.info("Loading dataset")
-    dataset = LeRobotDataset(
-        create_mock_train_config(),
-        repo_id,
-        root=root,
-        tolerance_s=tolerance_s,
-        standardize=False,
-    )
+    tolerance_schedule = [tolerance_s]
+    for candidate in [1e-3, 3e-3, 1e-2]:
+        if candidate > tolerance_schedule[-1]:
+            tolerance_schedule.append(candidate)
+
+    dataset = None
+    last_timestamp_error = None
+    for tol in tolerance_schedule:
+        try:
+            dataset = LeRobotDataset(
+                create_mock_train_config(),
+                repo_id,
+                root=root,
+                tolerance_s=tol,
+                standardize=False,
+            )
+            if tol != tolerance_s:
+                logging.warning(
+                    "Dataset timestamp check required relaxed tolerance. "
+                    "Requested=%s, using=%s for visualization.",
+                    tolerance_s,
+                    tol,
+                )
+            break
+        except ValueError as e:
+            # Visualization should be resilient to small timestamp quantization jitter.
+            if "timestamps unexpectedly violate the tolerance" not in str(e):
+                raise
+            last_timestamp_error = e
+            logging.warning(
+                "Timestamp sync check failed with tolerance_s=%s. Retrying with a looser tolerance.",
+                tol,
+            )
+
+    if dataset is None:
+        assert last_timestamp_error is not None
+        raise last_timestamp_error
 
     visualize_dataset(dataset, **kwargs)
 

@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dummy grounding dataset for testing and development.
+"""Dummy vqa dataset for testing and development.
 
-This module provides a simple synthetic grounding dataset for testing the
+This module provides a simple synthetic vqa dataset for testing the
 dataset infrastructure without requiring external data sources or network
 access. The dataset contains three predefined items: black, white, and gray
 images with corresponding question-answer pairs.
@@ -23,7 +23,7 @@ The dataset cycles through the predefined items, making it useful for
 testing data loading pipelines, training loops, and debugging.
 
 Classes:
-    DummyGroundingDataset: Synthetic dataset class that provides simple test
+    DummyVQADataset: Synthetic dataset class that provides simple test
         data with configurable length.
 
 Constants:
@@ -33,16 +33,16 @@ Constants:
 Example:
     Use dummy dataset for testing:
         >>> from opentau.configs.default import DatasetConfig
-        >>> cfg = DatasetConfig(grounding="dummy")
+        >>> cfg = DatasetConfig(vqa="dummy")
         >>> dataset = make_dataset(cfg, train_cfg)
         >>> len(dataset)  # Returns 1000 by default
 """
 
 import torch
 
-from opentau import register_grounding_dataset
+from opentau import register_vqa_dataset
 from opentau.configs.train import TrainPipelineConfig
-from opentau.datasets.grounding.base import GroundingDataset
+from opentau.datasets.vqa.base import VQADataset
 
 _data = [
     {
@@ -69,9 +69,9 @@ _data = [
 ]
 
 
-@register_grounding_dataset("dummy")
-class DummyGroundingDataset(GroundingDataset):
-    """Dummy grounding dataset for testing purposes.
+@register_vqa_dataset("dummy")
+class DummyVQADataset(VQADataset):
+    """Dummy vqa dataset for testing purposes.
 
     Provides simple synthetic data with black, white, and gray images
     for testing the dataset infrastructure.

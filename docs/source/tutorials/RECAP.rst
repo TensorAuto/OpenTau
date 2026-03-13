@@ -343,11 +343,11 @@ Then, run the value_visualizer_app:
 
 .. code-block:: bash
 
-    python -m opentau.scripts.value_visualizer_app --dataset_config=<path/to/dataset_mixture.json> --values=<path/to/values.json>
+    python -m opentau.scripts.value_visualizer_app --dataset-config=<path/to/dataset_mixture.json> --values=<path/to/values.json>
 
 
 The front looks like this:
 
-.. image:: ../assets/value_visualizer_app.png
+.. image:: /_static/value_visualizer_app.png
     :width: 100%
     :alt: Value Visualizer App

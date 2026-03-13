@@ -5,7 +5,7 @@
                 "repo_id": "physical-intelligence/libero"
             },
             {
-                "grounding": "clevr"
+                "vqa": "clevr"
             }
         ],
         "weights": [

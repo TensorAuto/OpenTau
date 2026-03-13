@@ -53,9 +53,9 @@ class DatasetConfig:
 
     Args:
         repo_id: HuggingFace repository ID for the dataset. Exactly one of
-            `repo_id` or `grounding` must be set.
-        grounding: Grounding dataset identifier. Exactly one of `repo_id` or
-            `grounding` must be set.
+            `repo_id` or `vqa` must be set.
+        vqa: VQA dataset identifier. Exactly one of `repo_id` or
+            `vqa` must be set.
         root: Root directory where the dataset will be stored (e.g. 'dataset/path').
             Defaults to None.
         episodes: List of episode indices to use from the dataset. If None, all
@@ -72,13 +72,13 @@ class DatasetConfig:
             standard feature names. Defaults to None.
 
     Raises:
-        ValueError: If both or neither of `repo_id` and `grounding` are set, or
+        ValueError: If both or neither of `repo_id` and `vqa` are set, or
             if `data_features_name_mapping` is provided.
             is provided.
     """
 
     repo_id: str | None = None
-    grounding: str | None = None
+    vqa: str | None = None
     # Root directory where the dataset will be stored (e.g. 'dataset/path').
     root: str | None = None
     episodes: list[int] | None = None
@@ -98,10 +98,14 @@ class DatasetConfig:
 
     def __post_init__(self):
         """Validate dataset configuration and register custom mappings if provided."""
-        if (self.repo_id is None) == (self.grounding is None):
-            raise ValueError("Exactly one of `repo_id` or `grounding` for Dataset config should be set.")
+        if (self.repo_id is None) == (self.vqa is None):
+            raise ValueError("Exactly one of `repo_id` or `vqa` for Dataset config should be set.")
 
-        # data_features_name_mapping have to be provided if it is not already in standard_data_format_mapping.py
+        # If data_features_name_mapping is provided, upsert it into the global DATA_FEATURES_NAME_MAPPING
+        if self.data_features_name_mapping is not None:
+            from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
+
+            DATA_FEATURES_NAME_MAPPING[self.repo_id] = self.data_features_name_mapping
 
 
 @dataclass
