@@ -16,6 +16,10 @@
 # limitations under the License.
 """Evaluate a policy on an environment by running rollouts and computing metrics."""
 
+import os
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import concurrent.futures as cf
 import datetime as dt
 import json
@@ -304,25 +308,42 @@ def eval_policy(
             return_observations=return_episode_data,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
         )
-        if return_episode_data:
-            if not episode_data:
-                episode_data = deepcopy(rollout_data)
-            else:
-                for key, value in rollout_data.items():
-                    if isinstance(value, torch.Tensor):
-                        episode_data[key] = torch.cat([episode_data[key], value], dim=0)
-                    elif isinstance(value, list):
-                        episode_data[key].extend(value)
-
         # Figure out where in each rollout sequence the first done condition was encountered (results after
         # this won't be included).
         n_steps = rollout_data["done"].shape[1]
         # Note: this relies on a property of argmax: that it returns the first occurrence as a tiebreaker.
-        all_done_indices = torch.argmax(rollout_data["done"].to(int), dim=1)
+        batch_done_indices = torch.argmax(rollout_data["done"].to(int), dim=1)
+        all_done_indices.extend(batch_done_indices.tolist())
+
+        if return_episode_data:
+            batch_size = rollout_data["done"].shape[0]
+            if episode_data is None:
+                episode_data = {
+                    "action": [],
+                    "reward": [],
+                    "success": [],
+                    "done": [],
+                }
+                if "observation" in rollout_data:
+                    episode_data["observation"] = {k: [] for k in rollout_data["observation"]}
+            for b in range(batch_size):
+                ep_len = batch_done_indices[b].item() + 1
+                episode_data["action"].append(rollout_data["action"][b, :ep_len].clone())
+                episode_data["reward"].append(rollout_data["reward"][b, :ep_len].clone())
+                episode_data["success"].append(rollout_data["success"][b, :ep_len].clone())
+                episode_data["done"].append(rollout_data["done"][b, :ep_len].clone())
+                if "observation" in rollout_data:
+                    for k, v in rollout_data["observation"].items():
+                        if isinstance(v, torch.Tensor):
+                            # observation has (batch, sequence+1, *); keep ep_len+1 steps for this episode
+                            episode_data["observation"][k].append(v[b, : ep_len + 1].clone())
+                        else:
+                            # list (e.g. prompt): per-step list per batch element
+                            episode_data["observation"][k].append(v[b][: ep_len + 1])
 
         # Make a mask with shape (batch, n_steps) to mask out rollout data after the first done
         # (batch-element-wise). Note the `done_indices + 1` to make sure to keep the data from the done step.
-        mask = (torch.arange(n_steps) <= einops.repeat(all_done_indices + 1, "b -> b s", s=n_steps)).int()
+        mask = (torch.arange(n_steps) <= einops.repeat(batch_done_indices + 1, "b -> b s", s=n_steps)).int()
         # Extend metrics.
         batch_sum_rewards = einops.reduce((rollout_data["reward"] * mask), "b n -> b", "sum")
         sum_rewards.extend(batch_sum_rewards.tolist())
@@ -340,7 +361,7 @@ def eval_policy(
             batch_stacked_frames = np.stack(ep_frames, axis=1)  # (b, t, *)
             for stacked_frames, done_index, success in zip(
                 batch_stacked_frames,
-                all_done_indices.flatten().tolist(),
+                batch_done_indices.flatten().tolist(),
                 batch_successes.tolist(),
                 strict=False,
             ):

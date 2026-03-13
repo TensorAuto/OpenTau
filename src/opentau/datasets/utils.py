@@ -263,9 +263,20 @@ def load_json(fpath: Path) -> Any:
 
     Returns:
         Parsed JSON data (dict, list, or primitive type).
+
+    Raises:
+        ValueError: If the file is empty or contains only whitespace.
+        json.JSONDecodeError: If the file contains invalid JSON.
     """
     with open(fpath) as f:
-        return json.load(f)
+        text = f.read()
+    if not text.strip():
+        raise ValueError(
+            f"JSON file is empty or contains only whitespace: {fpath}. "
+            "Ensure the file was written correctly. For local Libero rollout datasets, "
+            "use the rank subdirectory as dataset root (e.g. libero_rollout_0_rank0/rank0)."
+        )
+    return json.loads(text)
 
 
 def write_json(data: dict, fpath: Path) -> None:
@@ -346,8 +357,19 @@ def load_info(local_dir: Path) -> dict:
 
     Returns:
         Dataset info dictionary with feature shapes as tuples.
+
+    Raises:
+        ValueError: If meta/info.json is missing, empty, or invalid.
     """
-    info = load_json(local_dir / INFO_PATH)
+    info_path = local_dir / INFO_PATH
+    try:
+        info = load_json(info_path)
+    except (ValueError, json.JSONDecodeError) as e:
+        raise ValueError(
+            f"Failed to load dataset info from {info_path}. "
+            "Ensure the path is the dataset root (e.g. for Libero rollouts use the rank folder: "
+            "libero_rollout_0_rank0/rank0) and that meta/info.json exists and contains valid JSON."
+        ) from e
     for ft in info["features"].values():
         ft["shape"] = tuple(ft["shape"])
     return info
@@ -413,7 +435,7 @@ def load_advantages(local_dir: Path) -> dict:
     if not (local_dir / ADVANTAGES_PATH).exists():
         return None
     advantages = load_json(local_dir / ADVANTAGES_PATH)
-    return {(int(k.split(",")[0]), float(k.split(",")[1])): v for k, v in advantages.items()}
+    return {(int(k.split(",")[0]), float(k.split(",")[1])): float(v) for k, v in advantages.items()}
 
 
 def write_task(task_index: int, task: dict, local_dir: Path) -> None:

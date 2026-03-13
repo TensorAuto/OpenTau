@@ -35,7 +35,6 @@ from opentau.configs import parser
 from opentau.configs.default import DatasetMixtureConfig
 from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.factory import make_dataset
-from opentau.datasets.lerobot_dataset import LeRobotDataset
 from opentau.datasets.utils import ADVANTAGES_PATH
 from opentau.policies.factory import get_policy_class
 from opentau.policies.value.reward import calculate_n_step_return
@@ -47,10 +46,12 @@ from opentau.utils.utils import (
 
 
 def ensure_primitive(maybe_tensor):
+    """Convert single-element tensors/arrays to Python scalars so they can be used as stable dict keys."""
     if isinstance(maybe_tensor, np.ndarray):
         return ensure_primitive(torch.from_numpy(maybe_tensor))
     if isinstance(maybe_tensor, torch.Tensor):
         assert maybe_tensor.numel() == 1, f"Tensor must be a single value, got shape={maybe_tensor.numel()}"
+        return maybe_tensor.item()
     return maybe_tensor
 
 
@@ -134,10 +135,7 @@ def main(cfg: TrainPipelineConfig):
 
     for dataset_idx, dataset_cfg in enumerate(mixture_cfg.datasets):
         logging.info(f"Creating dataset {dataset_idx}")
-        dataset = make_dataset(dataset_cfg, cfg, return_advantage_input=True)
-        assert isinstance(dataset, LeRobotDataset), (
-            f"Expected instance of LeRobotDataset, got {type(dataset)}"
-        )
+        dataset, _ = make_dataset(dataset_cfg, cfg, return_advantage_input=True)
         dataloader = DataLoader(
             dataset,
             batch_size=cfg.batch_size,
@@ -172,7 +170,7 @@ def main(cfg: TrainPipelineConfig):
                         success=success,
                         n_steps_look_ahead=cfg.policy.reward_config.N_steps_look_ahead,
                         episode_end_idx=episode_end_idx,
-                        max_episode_length=cfg.policy.reward_config.reward_normalizer,
+                        reward_normalizer=cfg.policy.reward_config.reward_normalizer,
                         current_idx=current_idx,
                         c_neg=cfg.policy.reward_config.C_neg,
                     )
@@ -200,10 +198,10 @@ def main(cfg: TrainPipelineConfig):
                     ds_advantage[(episode_index, timestamp)] = advantage
 
         # Convert tuple keys to strings for JSON serialization
-        advantage_data_json = {f"{ep_idx},{ts}": val for (ep_idx, ts), val in ds_advantage.items()}
+        advantage_data_json = {f"{ep_idx},{ts}": f"{val:.6f}" for (ep_idx, ts), val in ds_advantage.items()}
 
         # TODO(shuheng) avoid overwriting existing advantage files.
-        with open(Path(dataset.root) / ADVANTAGES_PATH, "w") as f:
+        with open(Path(dataset_cfg.root) / ADVANTAGES_PATH, "w") as f:
             json.dump(advantage_data_json, f, indent=4)
 
     # Calculate percentiles of advantages: 0th, 5th, 10th, ..., 100th
