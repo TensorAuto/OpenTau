@@ -518,8 +518,12 @@ class PI0Policy(PreTrainedPolicy):
             if self.config.advantage == "on":  # always add positive advantage
                 tasks[idx] = f"{task}Advantage: positive\n"
             elif self.config.advantage == "use":  # add advantage based on threshold
-                adv = batch["advantage"][idx] >= self.config.advantage_threshold
-                adv = "positive" if adv else "negative"
+                # to handle the inference case where advantage is not present in the batch and advantage is always set to positive
+                if "advantage" not in batch:
+                    adv = "positive"
+                else:
+                    adv = batch["advantage"][idx] >= self.config.advantage_threshold
+                    adv = "positive" if adv else "negative"
                 tasks[idx] = f"{task}Advantage: {adv}\n"
 
         tokenized_prompt = self.language_tokenizer.__call__(
