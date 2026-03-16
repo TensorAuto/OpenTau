@@ -896,7 +896,7 @@ class PI05FlowMatching(nn.Module):
         load_pretrained_paligemma = (
             self.config.init_strategy == "expert_only_he_init"
         )  # only load pretrained paligemma if we are He-initializing the expert only
-        paligemma_with_export_config = PaliGemmaWithExpertConfig(
+        paligemma_with_expert_config = PaliGemmaWithExpertConfig(
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=self.config.train_expert_only,
             attention_implementation=self.config.attention_implementation,
@@ -904,7 +904,7 @@ class PI05FlowMatching(nn.Module):
             discrete_action_vocab_size=discrete_action_vocab_size,
             dropout=self.config.dropout,
         )
-        self.paligemma_with_expert = PaliGemmaWithExpertModel(paligemma_with_export_config)
+        self.paligemma_with_expert = PaliGemmaWithExpertModel(paligemma_with_expert_config)
 
         # Projections are float32
         self.action_in_proj = nn.Linear(self.config.max_action_dim, self.config.proj_width)

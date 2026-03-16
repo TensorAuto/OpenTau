@@ -39,11 +39,11 @@ from transformers import AutoProcessor, AutoTokenizer
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import NormalizationMode
 from opentau.policies.normalize import Normalize, Unnormalize
-from opentau.policies.pi05_continuous_state.configuration_pi05 import PI05ContinuousStateConfig
-from opentau.policies.pi05_continuous_state.paligemma_with_expert import (
+from opentau.policies.pi05.paligemma_with_expert import (
     PaliGemmaWithExpertConfig,
     PaliGemmaWithExpertModel,
 )
+from opentau.policies.pi05_continuous_state.configuration_pi05 import PI05ContinuousStateConfig
 from opentau.policies.pretrained import PreTrainedPolicy, T
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
@@ -352,7 +352,7 @@ class PI05ContinuousStatePolicy(PreTrainedPolicy):
         try:
             # Try to load the pytorch_model.bin or model.safetensors file
             if is_main_process:
-                print(f"Loading model from: {pretrained_name_or_path}")
+                logging.info("Loading model from: %s", pretrained_name_or_path)
             try:
                 from transformers.utils import cached_file
 
@@ -360,26 +360,26 @@ class PI05ContinuousStatePolicy(PreTrainedPolicy):
                 resolved_file = cached_file(
                     pretrained_name_or_path,
                     "model.safetensors",
-                    cache_dir=kwargs.get("cache_dir"),
-                    force_download=kwargs.get("force_download", False),
-                    resume_download=kwargs.get("resume_download"),
-                    proxies=kwargs.get("proxies"),
-                    use_auth_token=kwargs.get("use_auth_token"),
-                    revision=kwargs.get("revision"),
-                    local_files_only=kwargs.get("local_files_only", False),
+                    cache_dir=cache_dir,
+                    force_download=force_download,
+                    resume_download=resume_download,
+                    proxies=proxies,
+                    token=token,
+                    revision=revision,
+                    local_files_only=local_files_only,
                 )
                 from safetensors.torch import load_file
 
                 original_state_dict = load_file(resolved_file)
                 if is_main_process:
-                    print("✓ Loaded state dict from model.safetensors")
+                    logging.info("Loaded state dict from model.safetensors")
             except Exception as e:
                 if is_main_process:
-                    print(f"Could not load state dict from remote files: {e}")
-                    print("Returning model without loading pretrained weights")
+                    logging.warning("Could not load state dict from remote files: %s", e)
+                    logging.info("Returning model without loading pretrained weights")
                 return model
 
-            # First, fix any key differences # see openpi `model.py, _fix_pytorch_state_dict_keys`
+            # First, fix any key differences (see openpi model.py, _fix_pytorch_state_dict_keys)
             fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
 
             # Then add "model." prefix for all keys that don't already have it
@@ -391,43 +391,37 @@ class PI05ContinuousStatePolicy(PreTrainedPolicy):
                     new_key = f"model.{key}"
                     remapped_state_dict[new_key] = value
                     remap_count += 1
-                    if remap_count <= 10 and is_main_process:  # Only print first 10 to avoid spam
-                        print(f"Remapped: {key} -> {new_key}")
+                    if remap_count <= 10 and is_main_process:
+                        logging.debug("Remapped: %s -> %s", key, new_key)
                 else:
                     remapped_state_dict[key] = value
 
             if remap_count > 0 and is_main_process:
-                print(f"Remapped {remap_count} state dict keys")
+                logging.info("Remapped %d state dict keys", remap_count)
 
             # Load the remapped state dict into the model
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
 
             if missing_keys and is_main_process:
-                print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
-                if len(missing_keys) <= 20:
-                    for key in missing_keys:
-                        print(f"  - {key}")
-                else:
-                    for key in missing_keys[:20]:
-                        print(f"  - {key}")
-                    print(f"  ... and {len(missing_keys) - 20} more")
+                logging.warning("Missing keys when loading state dict: %d keys", len(missing_keys))
+                for key in missing_keys[:20]:
+                    logging.warning("  - %s", key)
+                if len(missing_keys) > 20:
+                    logging.warning("  ... and %d more", len(missing_keys) - 20)
 
             if unexpected_keys and is_main_process:
-                print(f"Unexpected keys when loading state dict: {len(unexpected_keys)} keys")
-                if len(unexpected_keys) <= 20:
-                    for key in unexpected_keys:
-                        print(f"  - {key}")
-                else:
-                    for key in unexpected_keys[:20]:
-                        print(f"  - {key}")
-                    print(f"  ... and {len(unexpected_keys) - 20} more")
+                logging.warning("Unexpected keys when loading state dict: %d keys", len(unexpected_keys))
+                for key in unexpected_keys[:20]:
+                    logging.warning("  - %s", key)
+                if len(unexpected_keys) > 20:
+                    logging.warning("  ... and %d more", len(unexpected_keys) - 20)
 
             if not missing_keys and not unexpected_keys and is_main_process:
-                print("All keys loaded successfully!")
+                logging.info("All keys loaded successfully!")
 
         except Exception as e:
             if is_main_process:
-                print(f"Warning: Could not remap state dict keys: {e}")
+                logging.warning("Could not remap state dict keys: %s", e)
 
         return model
 
@@ -676,16 +670,24 @@ class PI05ContinuousStatePolicy(PreTrainedPolicy):
         return {"MSE": mse_loss, "CE": ce_loss}
 
     def prepare_state(self, batch: dict[str, Tensor]) -> Tensor:
-        """Prepares the continuous state tensor, padding to max_state_dim.
+        """Prepares the continuous state tensor, padding or truncating to max_state_dim.
 
         Args:
             batch: Batch of data containing the "state" tensor of shape (batch_size, state_dim).
 
         Returns:
-            A tensor of shape (batch_size, max_state_dim) with zero-padding if needed.
+            A tensor of shape (batch_size, max_state_dim).
+
+        Raises:
+            ValueError: If the state dimension exceeds max_state_dim.
         """
         state = batch["state"]
         state_dim = state.shape[-1]
+        if state_dim > self.config.max_state_dim:
+            raise ValueError(
+                f"State dimension ({state_dim}) exceeds max_state_dim ({self.config.max_state_dim}). "
+                f"Increase max_state_dim in the config to accommodate the state vector."
+            )
         if state_dim < self.config.max_state_dim:
             state = F.pad(state, (0, self.config.max_state_dim - state_dim))
         return state
@@ -839,7 +841,7 @@ class PI05ContinuousStateFlowMatching(nn.Module):
         load_pretrained_paligemma = (
             self.config.init_strategy == "expert_only_he_init"
         )  # only load pretrained paligemma if we are He-initializing the expert only
-        paligemma_with_export_config = PaliGemmaWithExpertConfig(
+        paligemma_with_expert_config = PaliGemmaWithExpertConfig(
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=self.config.train_expert_only,
             attention_implementation=self.config.attention_implementation,
@@ -847,7 +849,7 @@ class PI05ContinuousStateFlowMatching(nn.Module):
             discrete_action_vocab_size=discrete_action_vocab_size,
             dropout=self.config.dropout,
         )
-        self.paligemma_with_expert = PaliGemmaWithExpertModel(paligemma_with_export_config)
+        self.paligemma_with_expert = PaliGemmaWithExpertModel(paligemma_with_expert_config)
 
         vlm_hidden_size = self.paligemma_with_expert.config.paligemma_config.text_config.hidden_size
         self.state_proj = nn.Linear(self.config.max_state_dim, vlm_hidden_size)
@@ -964,10 +966,6 @@ class PI05ContinuousStateFlowMatching(nn.Module):
             img_emb = self.paligemma_with_expert.embed_image(img)
             img_emb = img_emb.to(dtype=_preferred_dtype())
 
-            # image embeddings don't need to be unnormalized because `fix/lerobot_openpi` branch of huggingface
-            # already removed the normalization inside PaliGemma
-            pass
-
             bsize, num_img_embs = img_emb.shape[:2]
             img_mask = img_mask[:, None].expand(bsize, num_img_embs)
 
@@ -992,7 +990,7 @@ class PI05ContinuousStateFlowMatching(nn.Module):
 
         # Project continuous state into VLM embedding space as a single token
         state_emb = self.state_proj(state.to(dtype=_preferred_dtype()))
-        state_emb = state_emb.unsqueeze(1)  # (batch_size, 1, hidden_size)
+        state_emb = rearrange(state_emb, "b d -> b 1 d")  # (batch_size, 1, hidden_size)
         state_mask = torch.ones(bsize, 1, dtype=torch.bool, device=state.device)
 
         embs.append(state_emb)
@@ -1115,7 +1113,9 @@ class PI05ContinuousStateFlowMatching(nn.Module):
         vlm_2d_attention_mask = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         vlm_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
-        # avoids using discrete action for predicting continuous flow matching action
+        # During training, prefix includes discrete action tokens. Exclude them from
+        # the cross-attention KV cache so the action expert only attends to image,
+        # language, and state tokens (not discrete action tokens).
         num_cross_att_tokens = prefix_embs.shape[1] - self.config.discrete_action_max_length
 
         (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
@@ -1158,10 +1158,13 @@ class PI05ContinuousStateFlowMatching(nn.Module):
             n_cross_att_tokens=num_cross_att_tokens,
             cross_att_pad_masks=prefix_pad_masks[:, :num_cross_att_tokens],
         )
-        # We should skip the discrete action tokens when numbering the position ids for the action expert
+        # During training, prefix_pad_masks includes discrete action tokens. Slice them
+        # out so position IDs for the action expert continue from image+language+state only.
+        # (At inference time, embed_prefix is called without discrete actions, so
+        # prefix_pad_masks already excludes them — see denoise_step.)
         prefix_offsets = torch.sum(prefix_pad_masks[:, : -self.config.discrete_action_max_length], dim=-1)[
             :, None
-        ]  # action expert position ids start after prefix
+        ]
         action_expert_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
         # stop gradient to avoid backpropagating from action expert to VLM
@@ -1271,6 +1274,9 @@ class PI05ContinuousStateFlowMatching(nn.Module):
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
+        # At inference time, embed_prefix is called without discrete actions, so all
+        # prefix tokens (image + language + state) are used for cross-attention.
+        # (During training, discrete action tokens are subtracted — see forward().)
         num_cross_att_tokens = prefix_embs.shape[1]
 
         # Compute image and language key value cache
@@ -1336,9 +1342,10 @@ class PI05ContinuousStateFlowMatching(nn.Module):
             n_cross_att_tokens=num_cross_att_tokens,
             cross_att_pad_masks=prefix_pad_masks[:, :num_cross_att_tokens],
         )
-        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[
-            :, None
-        ]  # action expert position ids start after prefix
+        # At inference time, prefix_pad_masks has no discrete action tokens, so we
+        # can sum over the full mask. (During training, discrete action tokens are
+        # sliced out before summing — see forward().)
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
         action_expert_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
         outputs_embeds, _ = self.paligemma_with_expert.forward(

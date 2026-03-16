@@ -34,6 +34,7 @@ from opentau.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from opentau.datasets.utils import dataset_to_policy_features
 from opentau.policies.pi0.configuration_pi0 import PI0Config
 from opentau.policies.pi05.configuration_pi05 import PI05Config
+from opentau.policies.pi05_continuous_state.configuration_pi05 import PI05ContinuousStateConfig
 from opentau.policies.pretrained import PreTrainedPolicy
 from opentau.policies.value.configuration_value import ValueConfig
 
@@ -59,6 +60,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from opentau.policies.pi05.modeling_pi05 import PI05Policy
 
         return PI05Policy
+    elif name == "pi05_continuous_state":
+        from opentau.policies.pi05_continuous_state.modeling_pi05 import PI05ContinuousStatePolicy
+
+        return PI05ContinuousStatePolicy
     elif name == "value":
         from opentau.policies.value.modeling_value import ValueFunction
 
@@ -84,6 +89,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return PI0Config(**kwargs)
     elif policy_type == "pi05":
         return PI05Config(**kwargs)
+    elif policy_type == "pi05_continuous_state":
+        return PI05ContinuousStateConfig(**kwargs)
     elif policy_type == "value":
         return ValueConfig(**kwargs)
     else:

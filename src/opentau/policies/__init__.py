@@ -21,4 +21,5 @@ such as PI0, PI05, and Value policy.
 
 from .pi0.configuration_pi0 import PI0Config as PI0Config
 from .pi05.configuration_pi05 import PI05Config as PI05Config
+from .pi05_continuous_state.configuration_pi05 import PI05ContinuousStateConfig as PI05ContinuousStateConfig
 from .value.configuration_value import ValueConfig as ValueConfig
