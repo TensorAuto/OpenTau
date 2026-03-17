@@ -64,6 +64,7 @@ We provide fully functioning $\pi_{0.5}$ checkpoints trained with high success r
 
 | Model Checkpoint              | Description                                                                                                   | Success Rate (%)                                                   |
 |-------------------------------|---------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------|
+| [TensorAuto/moka_pot_libero_sft][6] <br> [TensorAuto/moka_pot_RECAP_R0][7] <br> [TensorAuto/moka_pot_RECAP_R1][8]   | A $\pi_{0}$ RECAP model checkpoint trained on moka pot task on libero. | 83% <br> 89% <br> 90%                                                             |
 | [TensorAuto/tPi0.5-libero][2] | A $\pi_{0.5}$ model checkpoint trained on the LIBERO dataset with discrete actions and knowledge insulation.  | 98.4% (10) <br> 97.6% (Goal) <br> 100% (Object) <br> 98% (Spatial) |
 | [TensorAuto/pi05_base][5]     | A $\pi_{0.5}$ model checkpoint converted from the official openpi checkpoint, with language embeddings added. | N/A                                                                |
 | More coming soon...           |                                                                                                               |                                                                    |
@@ -77,3 +78,6 @@ This project builds on the $\pi$ series of [papers][3] and many other open-sourc
 [3]:	https://www.pi.website/blog
 [4]:	https://huggingface.co/lerobot
 [5]:    https://huggingface.co/TensorAuto/pi05_base
+[6]: https://huggingface.co/TensorAuto/moka_pot_libero_sft
+[7]: https://huggingface.co/TensorAuto/moka_pot_RECAP_R0
+[8]: https://huggingface.co/TensorAuto/moka_pot_RECAP_R1
