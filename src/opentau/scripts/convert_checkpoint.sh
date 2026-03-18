@@ -36,6 +36,11 @@ if [ ! -d "$CHECKPOINT_DIR" ]; then
     exit 1
 fi
 
+if [ -f $CHECKPOINT_DIR/model.safetensors ]; then
+    echo "Error: model.safetensors already exists in the checkpoint directory. Please remove it before running this script."
+    exit 1
+fi
+
 echo "Converting checkpoint in directory: $CHECKPOINT_DIR"
 
 # Step 1: Convert sharded checkpoint to full state dict
