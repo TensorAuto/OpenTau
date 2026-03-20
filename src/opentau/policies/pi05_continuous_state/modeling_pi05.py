@@ -571,9 +571,6 @@ class PI05ContinuousStatePolicy(PreTrainedPolicy):
             assert delay is None or 0 <= delay.item() <= self.config.max_delay, (
                 f"Delay must be None or between 0 and {self.config.max_delay}"
             )
-            assert action_prefix is None or action_prefix.shape[1] == self.config.chunk_size, (
-                f"Action prefix must have {self.config.chunk_size} steps"
-            )
 
         batch = self.normalize_inputs(batch)
 
