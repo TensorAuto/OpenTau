@@ -30,6 +30,10 @@ You can define a dataset mixture in your configuration file using the ``dataset_
         ...
     }
 
+The ``weights`` field is optional. If you set ``"weights": null`` (or omit the field),
+OpenTau infers weights from dataset lengths at runtime (``float(len(dataset))`` for each dataset).
+Provide explicit ``weights`` only when you want custom sampling ratios.
+
 For each new dataset, you must add an entry to `src/opentau/datasets/standard_data_format_mapping.py <https://github.com/TensorAuto/OpenTau/blob/main/src/opentau/datasets/standard_data_format_mapping.py>`_ to map the dataset features to the Standard Data Format.
 Alternatively, you can provide a custom mapping in the dataset config using the ``data_features_name_mapping`` and ``loss_type_mapping`` keys.
 For example:

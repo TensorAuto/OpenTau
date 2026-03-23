@@ -54,6 +54,14 @@ def test_mismatched_datasets_and_weights_raises_error():
         DatasetMixtureConfig(datasets=[DatasetConfig("repo1")], weights=[0.5, 0.5])
 
 
+def test_none_weights_is_valid():
+    """Tests that None weights are allowed and defer to runtime inference."""
+    try:
+        DatasetMixtureConfig(datasets=[DatasetConfig("repo1"), DatasetConfig("repo2")], weights=None)
+    except ValueError:
+        pytest.fail("DatasetMixtureConfig raised ValueError unexpectedly for None weights.")
+
+
 @pytest.mark.parametrize("invalid_freq", [0, -10.5])
 def test_invalid_action_freq_raises_error(invalid_freq):
     """

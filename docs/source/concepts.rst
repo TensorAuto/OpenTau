@@ -26,7 +26,7 @@ To train policies on multiple datasets simultaneously, OpenTau uses ``opentau.da
 This class:
 
 *   Combines multiple ``LeRobotDataset`` and ``VQADataset`` instances.
-*   Different weights can be assigned to each dataset to control the sampling frequency.
+*   Different weights can be assigned to each dataset to control the sampling frequency; if weights are omitted (or set to ``null`` in JSON), weights default to dataset lengths.
 *   Aggregates statistics from all constituent datasets to ensure consistent normalization across the mixture.
 *   Resamples the action output frequency to match the action frequency specified in the configuration.
 

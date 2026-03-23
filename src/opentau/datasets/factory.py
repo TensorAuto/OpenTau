@@ -235,6 +235,8 @@ def make_dataset_mixture(
 
     Args:
         cfg (TrainPipelineConfig): The configuration containing the datasets to mix.
+            If `cfg.dataset_mixture.weights` is None, each dataset is weighted
+            by its length (cast to float).
         return_advantage_input (bool): Whether the datasets should return advantage inputs including "success",
             "episode_end_idx", "current_idx", "last_step", "episode_index", and "timestamp". Defaults to False.
 
@@ -251,14 +253,17 @@ def make_dataset_mixture(
         else:
             datasets.append(res)
 
-    train_mixture = WeightedDatasetMixture(
-        cfg, datasets, cfg.dataset_mixture.weights, cfg.dataset_mixture.action_freq
-    )
+    train_weights = cfg.dataset_mixture.weights
+    if train_weights is None:
+        train_weights = [float(len(dataset)) for dataset in datasets]
+
+    train_mixture = WeightedDatasetMixture(cfg, datasets, train_weights, cfg.dataset_mixture.action_freq)
 
     if val_datasets:
-        val_mixture = WeightedDatasetMixture(
-            cfg, val_datasets, cfg.dataset_mixture.weights, cfg.dataset_mixture.action_freq
-        )
+        val_weights = cfg.dataset_mixture.weights
+        if val_weights is None:
+            val_weights = [float(len(dataset)) for dataset in val_datasets]
+        val_mixture = WeightedDatasetMixture(cfg, val_datasets, val_weights, cfg.dataset_mixture.action_freq)
         return train_mixture, val_mixture
 
     return train_mixture
