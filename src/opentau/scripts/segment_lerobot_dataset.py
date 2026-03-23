@@ -39,6 +39,7 @@ from typing import Any, cast
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+from tqdm import tqdm
 
 from opentau.datasets.compute_stats import compute_episode_stats
 from opentau.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDatasetMetadata
@@ -331,6 +332,9 @@ def segment_dataset(
     chunks_size = int(source_meta.chunks_size)
     global_index_offset = 0
     total_frames = 0
+    total_frames_to_process = sum(
+        end - start for segments in segments_by_episode.values() for start, end in segments
+    )
     output_episodes: list[dict] = []
 
     # Write tasks as-is so existing task_index values remain valid.
@@ -346,131 +350,135 @@ def segment_dataset(
     source_tables: dict[int, pa.Table] = {}
     output_episode_index = 0
 
-    for episode_id, segments in segments_by_episode.items():
-        source_episode_stats = source_meta.episodes_stats.get(cast(Any, episode_id), {})
-        if episode_id not in source_tables:
-            source_parquet_path = input_root / source_meta.get_data_file_path(episode_id)
-            if not source_parquet_path.is_file():
-                raise ValueError(
-                    f"Missing source parquet file for episode {episode_id}: {source_parquet_path}"
-                )
-            source_table = pq.read_table(source_parquet_path)
-            source_length = int(source_meta.episodes[episode_id]["length"])
-            if source_table.num_rows != source_length:
-                raise ValueError(
-                    f"Source metadata length ({source_length}) does not match parquet row count ({source_table.num_rows})."
-                )
-            source_tables[episode_id] = source_table
-        source_table = source_tables[episode_id]
+    with tqdm(total=total_frames_to_process, desc="Segmenting frames", unit="frame") as pbar:
+        for episode_id, segments in segments_by_episode.items():
+            source_episode_stats = source_meta.episodes_stats.get(cast(Any, episode_id), {})
+            if episode_id not in source_tables:
+                source_parquet_path = input_root / source_meta.get_data_file_path(episode_id)
+                if not source_parquet_path.is_file():
+                    raise ValueError(
+                        f"Missing source parquet file for episode {episode_id}: {source_parquet_path}"
+                    )
+                source_table = pq.read_table(source_parquet_path)
+                source_length = int(source_meta.episodes[episode_id]["length"])
+                if source_table.num_rows != source_length:
+                    raise ValueError(
+                        f"Source metadata length ({source_length}) does not match parquet row count ({source_table.num_rows})."
+                    )
+                source_tables[episode_id] = source_table
+            source_table = source_tables[episode_id]
 
-        for start, end in segments:
-            seg_len = end - start
-            seg_table = source_table.slice(start, seg_len)
+            for start, end in segments:
+                seg_len = end - start
+                seg_table = source_table.slice(start, seg_len)
 
-            replacement_arrays = {
-                "episode_index": pa.array(np.full(seg_len, output_episode_index, dtype=np.int64)),
-                "frame_index": pa.array(np.arange(seg_len, dtype=np.int64)),
-                "index": pa.array(
-                    np.arange(global_index_offset, global_index_offset + seg_len, dtype=np.int64)
-                ),
-            }
-            for key, arr in replacement_arrays.items():
-                col_idx = seg_table.schema.get_field_index(key)
-                if col_idx >= 0:
-                    seg_table = seg_table.set_column(col_idx, key, arr)
-
-            # Recompute timestamps from local frame_index to avoid subtraction drift.
-            if "timestamp" in seg_table.column_names:
-                ts_idx = seg_table.schema.get_field_index("timestamp")
-                recomputed_ts = np.arange(seg_len, dtype=np.float64) / float(source_meta.fps)
-                seg_table = seg_table.set_column(
-                    ts_idx,
-                    "timestamp",
-                    pa.array(recomputed_ts, type=seg_table.schema.field("timestamp").type),
-                )
-
-            # For image-based datasets, copy only the segment frames and rewrite image references.
-            for image_key in image_keys:
-                if image_key not in seg_table.column_names:
-                    continue
-                col_idx = seg_table.schema.get_field_index(image_key)
-                image_cells = seg_table.column(image_key).to_pylist()
-                rewritten = _copy_segment_images_and_rewrite_column(
-                    image_cells=image_cells,
-                    input_root=input_root,
-                    output_root=output_root,
-                    image_key=image_key,
-                    output_episode_index=output_episode_index,
-                    source_episode_index=episode_id,
-                    source_segment_start=start,
-                )
-                seg_table = seg_table.set_column(
-                    col_idx, image_key, pa.array(rewritten, type=seg_table.schema.field(image_key).type)
-                )
-
-            episode_chunk = output_episode_index // chunks_size
-            output_parquet_path = output_root / source_meta.data_path.format(
-                episode_chunk=episode_chunk,
-                episode_index=output_episode_index,
-            )
-            output_parquet_path.parent.mkdir(parents=True, exist_ok=True)
-            pq.write_table(seg_table, output_parquet_path)
-
-            # Build tasks list for this segment from task_index values present in rows.
-            task_indices = seg_table.column("task_index").to_pylist()
-            seen_task_indices = set()
-            episode_tasks = []
-            for task_index in task_indices:
-                if task_index in seen_task_indices:
-                    continue
-                seen_task_indices.add(task_index)
-                episode_tasks.append(source_meta.tasks[int(task_index)])
-
-            output_episodes.append(
-                {
-                    "episode_index": output_episode_index,
-                    "tasks": episode_tasks,
-                    "length": seg_len,
+                replacement_arrays = {
+                    "episode_index": pa.array(np.full(seg_len, output_episode_index, dtype=np.int64)),
+                    "frame_index": pa.array(np.arange(seg_len, dtype=np.int64)),
+                    "index": pa.array(
+                        np.arange(global_index_offset, global_index_offset + seg_len, dtype=np.int64)
+                    ),
                 }
-            )
+                for key, arr in replacement_arrays.items():
+                    col_idx = seg_table.schema.get_field_index(key)
+                    if col_idx >= 0:
+                        seg_table = seg_table.set_column(col_idx, key, arr)
 
-            stats_features = {
-                key: feature
-                for key, feature in source_meta.features.items()
-                if feature["dtype"] not in ["image", "video", "string"] and key in seg_table.column_names
-            }
-            stats_data: dict[str, list[str] | np.ndarray] = {
-                key: _to_numpy_for_stats(seg_table.column(key)) for key in stats_features
-            }
-            episode_stats = compute_episode_stats(stats_data, stats_features)
+                # Recompute timestamps from local frame_index to avoid subtraction drift.
+                if "timestamp" in seg_table.column_names:
+                    ts_idx = seg_table.schema.get_field_index("timestamp")
+                    recomputed_ts = np.arange(seg_len, dtype=np.float64) / float(source_meta.fps)
+                    seg_table = seg_table.set_column(
+                        ts_idx,
+                        "timestamp",
+                        pa.array(recomputed_ts, type=seg_table.schema.field("timestamp").type),
+                    )
 
-            # Keep visual keys in stats for downstream compatibility.
-            for key in visual_keys:
-                if key in source_episode_stats:
-                    source_key_stats = cast(dict[str, np.ndarray], source_episode_stats[key])
-                    copied = {metric: np.array(val, copy=True) for metric, val in source_key_stats.items()}
-                    if "count" in copied:
-                        copied["count"] = np.array([seg_len], dtype=np.int64)
-                    episode_stats[key] = copied
+                # For image-based datasets, copy only the segment frames and rewrite image references.
+                for image_key in image_keys:
+                    if image_key not in seg_table.column_names:
+                        continue
+                    col_idx = seg_table.schema.get_field_index(image_key)
+                    image_cells = seg_table.column(image_key).to_pylist()
+                    rewritten = _copy_segment_images_and_rewrite_column(
+                        image_cells=image_cells,
+                        input_root=input_root,
+                        output_root=output_root,
+                        image_key=image_key,
+                        output_episode_index=output_episode_index,
+                        source_episode_index=episode_id,
+                        source_segment_start=start,
+                    )
+                    seg_table = seg_table.set_column(
+                        col_idx, image_key, pa.array(rewritten, type=seg_table.schema.field(image_key).type)
+                    )
 
-            write_episode_stats(output_episode_index, episode_stats, output_root)
-
-            # Copy and trim source videos for this segment, if any.
-            for video_key in source_meta.video_keys:
-                src_video_path = input_root / source_meta.get_video_file_path(episode_id, video_key)
-                if not src_video_path.is_file():
-                    raise ValueError(f"Missing source video for key '{video_key}': {src_video_path}")
-                dst_video_path = output_root / video_path_template_str.format(
+                episode_chunk = output_episode_index // chunks_size
+                output_parquet_path = output_root / source_meta.data_path.format(
                     episode_chunk=episode_chunk,
-                    video_key=video_key,
                     episode_index=output_episode_index,
                 )
-                dst_video_path.parent.mkdir(parents=True, exist_ok=True)
-                _trim_video_segment(src_video_path, dst_video_path, start, end)
+                output_parquet_path.parent.mkdir(parents=True, exist_ok=True)
+                pq.write_table(seg_table, output_parquet_path)
 
-            global_index_offset += seg_len
-            total_frames += seg_len
-            output_episode_index += 1
+                # Build tasks list for this segment from task_index values present in rows.
+                task_indices = seg_table.column("task_index").to_pylist()
+                seen_task_indices = set()
+                episode_tasks = []
+                for task_index in task_indices:
+                    if task_index in seen_task_indices:
+                        continue
+                    seen_task_indices.add(task_index)
+                    episode_tasks.append(source_meta.tasks[int(task_index)])
+
+                output_episodes.append(
+                    {
+                        "episode_index": output_episode_index,
+                        "tasks": episode_tasks,
+                        "length": seg_len,
+                    }
+                )
+
+                stats_features = {
+                    key: feature
+                    for key, feature in source_meta.features.items()
+                    if feature["dtype"] not in ["image", "video", "string"] and key in seg_table.column_names
+                }
+                stats_data: dict[str, list[str] | np.ndarray] = {
+                    key: _to_numpy_for_stats(seg_table.column(key)) for key in stats_features
+                }
+                episode_stats = compute_episode_stats(stats_data, stats_features)
+
+                # Keep visual keys in stats for downstream compatibility.
+                for key in visual_keys:
+                    if key in source_episode_stats:
+                        source_key_stats = cast(dict[str, np.ndarray], source_episode_stats[key])
+                        copied = {
+                            metric: np.array(val, copy=True) for metric, val in source_key_stats.items()
+                        }
+                        if "count" in copied:
+                            copied["count"] = np.array([seg_len], dtype=np.int64)
+                        episode_stats[key] = copied
+
+                write_episode_stats(output_episode_index, episode_stats, output_root)
+
+                # Copy and trim source videos for this segment, if any.
+                for video_key in source_meta.video_keys:
+                    src_video_path = input_root / source_meta.get_video_file_path(episode_id, video_key)
+                    if not src_video_path.is_file():
+                        raise ValueError(f"Missing source video for key '{video_key}': {src_video_path}")
+                    dst_video_path = output_root / video_path_template_str.format(
+                        episode_chunk=episode_chunk,
+                        video_key=video_key,
+                        episode_index=output_episode_index,
+                    )
+                    dst_video_path.parent.mkdir(parents=True, exist_ok=True)
+                    _trim_video_segment(src_video_path, dst_video_path, start, end)
+
+                global_index_offset += seg_len
+                total_frames += seg_len
+                output_episode_index += 1
+                pbar.update(seg_len)
 
     for episode in output_episodes:
         append_jsonlines(episode, output_root / EPISODES_PATH)
