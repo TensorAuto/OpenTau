@@ -331,7 +331,6 @@ def segment_dataset(
     output_root.mkdir(parents=True, exist_ok=False)
     chunks_size = int(source_meta.chunks_size)
     global_index_offset = 0
-    total_frames = 0
     total_frames_to_process = sum(
         end - start for segments in segments_by_episode.values() for start, end in segments
     )
@@ -476,7 +475,6 @@ def segment_dataset(
                     _trim_video_segment(src_video_path, dst_video_path, start, end)
 
                 global_index_offset += seg_len
-                total_frames += seg_len
                 output_episode_index += 1
                 pbar.update(seg_len)
 
@@ -487,7 +485,7 @@ def segment_dataset(
     info = deepcopy(source_meta.info)
     info["codebase_version"] = CODEBASE_VERSION
     info["total_episodes"] = total_episodes
-    info["total_frames"] = total_frames
+    info["total_frames"] = total_frames_to_process
     info["total_chunks"] = int(math.ceil(total_episodes / chunks_size)) if total_episodes > 0 else 0
     info["total_videos"] = total_episodes * len(source_meta.video_keys)
     info["splits"] = {"train": f"0:{total_episodes}"}
