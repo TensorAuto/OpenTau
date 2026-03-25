@@ -135,7 +135,8 @@ def main(cfg: TrainPipelineConfig):
 
     for dataset_idx, dataset_cfg in enumerate(mixture_cfg.datasets):
         logging.info(f"Creating dataset {dataset_idx}")
-        dataset, _ = make_dataset(dataset_cfg, cfg, return_advantage_input=True)
+        ds_res = make_dataset(dataset_cfg, cfg, return_advantage_input=True)
+        dataset = ds_res[0] if isinstance(ds_res, tuple) else ds_res
         dataloader = DataLoader(
             dataset,
             batch_size=cfg.batch_size,
