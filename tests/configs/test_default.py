@@ -34,16 +34,14 @@ def test_datasetconfig(repo_id, vqa, ground_truth):
 
 def test_valid_instantiation_with_data():
     """Tests a valid configuration with datasets and matching weights."""
-    try:
-        DatasetMixtureConfig(
-            datasets=[DatasetConfig("repo1"), DatasetConfig("repo2")],
-            weights=[0.5, 0.5],
-            action_freq=50.0,
-            image_resample_strategy="linear",
-            vector_resample_strategy="linear",
-        )
-    except ValueError:
-        pytest.fail("DatasetMixtureConfig raised ValueError unexpectedly for a valid configuration.")
+    cfg = DatasetMixtureConfig(
+        datasets=[DatasetConfig("repo1"), DatasetConfig("repo2")],
+        weights=[0.5, 0.5],
+        action_freq=50.0,
+        image_resample_strategy="linear",
+        vector_resample_strategy="linear",
+    )
+    assert cfg.weights == [0.5, 0.5]
 
 
 def test_mismatched_datasets_and_weights_raises_error():
@@ -56,10 +54,14 @@ def test_mismatched_datasets_and_weights_raises_error():
 
 def test_none_weights_is_valid():
     """Tests that None weights are allowed and defer to runtime inference."""
-    try:
-        DatasetMixtureConfig(datasets=[DatasetConfig("repo1"), DatasetConfig("repo2")], weights=None)
-    except ValueError:
-        pytest.fail("DatasetMixtureConfig raised ValueError unexpectedly for None weights.")
+    cfg = DatasetMixtureConfig(datasets=[DatasetConfig("repo1"), DatasetConfig("repo2")], weights=None)
+    assert cfg.weights is None
+
+
+def test_empty_weights_with_empty_datasets():
+    """Tests that an explicit empty weights list is accepted when datasets is also empty."""
+    cfg = DatasetMixtureConfig(datasets=[], weights=[])
+    assert cfg.weights == []
 
 
 @pytest.mark.parametrize("invalid_freq", [0, -10.5])

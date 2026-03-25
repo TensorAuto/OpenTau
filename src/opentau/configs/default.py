@@ -130,8 +130,9 @@ class DatasetMixtureConfig:
             Defaults to 'nearest'.
 
     Raises:
-        ValueError: If the length of `weights` doesn't match `datasets`, if
-            `action_freq` is not positive, or if resample strategies are invalid.
+        ValueError: If `weights` is provided and its length doesn't match
+            `datasets`, if `action_freq` is not positive, or if resample
+            strategies are invalid.
     """
 
     # List of dataset configs to be used in the mixture.
