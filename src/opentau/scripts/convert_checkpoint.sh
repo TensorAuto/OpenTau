@@ -36,9 +36,9 @@ if [ ! -d "$CHECKPOINT_DIR" ]; then
     exit 1
 fi
 
-if [ -f $CHECKPOINT_DIR/model.safetensors ]; then
-    echo "Error: model.safetensors already exists in the checkpoint directory. Please remove it before running this script."
-    exit 1
+if [ -f "$CHECKPOINT_DIR/model.safetensors" ]; then
+    echo "model.safetensors already exists in '$CHECKPOINT_DIR'. Skipping conversion."
+    exit 0
 fi
 
 echo "Converting checkpoint in directory: $CHECKPOINT_DIR"
@@ -50,6 +50,9 @@ python -m opentau.scripts.zero_to_fp32 "$CHECKPOINT_DIR" "$CHECKPOINT_DIR/full_s
 # Step 2: Convert pytorch_model.bin to model.safetensors
 echo "Step 2: Converting pytorch_model.bin to model.safetensors..."
 python -m opentau.scripts.bin_to_safetensors "$CHECKPOINT_DIR/full_state_dict/pytorch_model.bin" --output_file "$CHECKPOINT_DIR/model.safetensors"
+
+echo "Step 3: Cleaning up intermediate files..."
+rm -rf "$CHECKPOINT_DIR/full_state_dict"
 
 echo "Conversion completed successfully!"
 echo "Model saved as: $CHECKPOINT_DIR/model.safetensors"
