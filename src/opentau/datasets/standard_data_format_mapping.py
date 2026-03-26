@@ -132,9 +132,6 @@ DATA_FEATURES_NAME_MAPPING = {
         "camera0": "observation.images.top",
         "camera1": "observation.images.main",
         "camera2": "observation.images.cv",
-        "local_camera0": "observation.images.top",
-        "local_camera1": "observation.images.main",
-        "local_camera2": "observation.images.cv",
         "state": "observation.state",
         "actions": "action",
         "prompt": "task",
@@ -170,8 +167,6 @@ DATA_FEATURES_NAME_MAPPING = {
     "lerobot/svla_so101_pickplace": {
         "camera0": "observation.images.up",
         "camera1": "observation.images.side",
-        "local_camera0": "observation.images.up",
-        "local_camera1": "observation.images.side",
         "state": "observation.state",
         "actions": "action",
         "prompt": "task",

@@ -334,10 +334,13 @@ def check_standard_data_format(item, delta_timestamps_params, dataset, train_pip
             assert item[key].shape == shape, f"{key}"
             assert isinstance(item[key], torch.BoolTensor), f"{key}"
 
-    # test delta_timestamps
-    for timestamp_param in delta_timestamps_params:
-        assert timestamp_param["input_group"].shape == (2,)
-        assert (timestamp_param["action"].shape[0],) == (train_pipeline_config.action_chunk,)
+    # test delta_timestamps — per-feature keys
+    dt_mean = delta_timestamps_params[0]
+    for key, val in dt_mean.items():
+        if key == "action":
+            assert val.shape == (train_pipeline_config.action_chunk,)
+        else:
+            assert val.shape == (1,), f"{key} has unexpected shape {val.shape}"
 
 
 @pytest.mark.slow  # 3 sec

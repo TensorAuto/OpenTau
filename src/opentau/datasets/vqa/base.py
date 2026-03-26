@@ -141,14 +141,3 @@ class VQADataset(BaseDataset):
         item["return_continuous"] = torch.tensor(0, dtype=torch.float32)
         item["advantage"] = torch.tensor(0, dtype=torch.bfloat16)
         return item
-
-    def _separate_image_in_time(self, item: dict) -> None:
-        """Separate images in time (no-op for vqa datasets).
-
-        VQA datasets don't have temporal image sequences, so this is a no-op.
-
-        Args:
-            item: Item dictionary (unmodified).
-        """
-        # VQA datasets have nothing to separate.
-        pass

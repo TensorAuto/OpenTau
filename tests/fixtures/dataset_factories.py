@@ -377,6 +377,7 @@ def lerobot_dataset_metadata():
         1: {"episode_index": 1, "stats": mock_metadata.stats},
         2: {"episode_index": 2, "stats": mock_metadata.stats},
     }
+    mock_metadata.features = mock_metadata.info["features"]
     mock_metadata.tasks = {0: {"task_index": 0, "task": "Perform action 0."}}
     mock_metadata.episodes = {
         0: {"episode_index": 0, "tasks": ["Perform action 0."], "length": 50},
