@@ -33,7 +33,11 @@ from huggingface_hub.errors import HfHubHTTPError
 from opentau.configs import parser
 from opentau.configs.default import DatasetMixtureConfig, EvalConfig, WandBConfig
 from opentau.configs.deployment import ServerConfig
-from opentau.configs.policies import PreTrainedConfig, strip_deprecated_fields_from_json
+from opentau.configs.policies import (
+    PreTrainedConfig,
+    strip_deprecated_fields_from_json,
+    warn_deprecated_latency_fields,
+)
 from opentau.envs.configs import EnvConfig
 from opentau.optim import OptimizerConfig
 from opentau.optim.schedulers import LRSchedulerConfig
@@ -370,6 +374,9 @@ class TrainPipelineConfig(HubMixin):
                 raise FileNotFoundError(
                     f"{TRAIN_CONFIG_NAME} not found on the HuggingFace Hub in {model_id}"
                 ) from e
+
+        if config_file is not None:
+            warn_deprecated_latency_fields(config_file)
 
         cli_args = kwargs.pop("cli_args", [])
         cfg = draccus.parse(cls, config_file, args=cli_args)

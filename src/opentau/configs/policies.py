@@ -23,6 +23,7 @@ configurations from pretrained models or local paths.
 import abc
 import json
 import os
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Type, TypeVar
@@ -73,6 +74,33 @@ def strip_deprecated_fields_from_json(path: Path) -> None:
     if changed:
         with open(path, "w") as f:
             json.dump(data, f, indent=4)
+
+
+def warn_deprecated_latency_fields(config_path: str | Path) -> None:
+    """Emit a deprecation warning if a config JSON file contains latency fields.
+
+    Checks both top-level fields and fields nested under a ``"policy"`` key.
+    Should be called before loading a config so users are aware the fields
+    will be ignored.
+    """
+    with open(config_path) as f:
+        data = json.load(f)
+
+    found: list[str] = []
+    for key in _DEPRECATED_LATENCY_FIELDS:
+        if key in data:
+            found.append(key)
+        if isinstance(data.get("policy"), dict) and key in data["policy"]:
+            found.append(f"policy.{key}")
+
+    if found:
+        warnings.warn(
+            f"Config '{config_path}' contains deprecated latency fields that are no longer "
+            f"used and will be ignored: {', '.join(found)}. "
+            "Consider re-saving the config to remove them.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
 
 
 @dataclass
@@ -326,6 +354,9 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
                 raise FileNotFoundError(
                     f"{CONFIG_NAME} not found on the HuggingFace Hub in {model_id}"
                 ) from e
+
+        if config_file is not None:
+            warn_deprecated_latency_fields(config_file)
 
         # HACK: this is very ugly, ideally we'd like to be able to do that natively with draccus
         # something like --policy.path (in addition to --policy.type)
