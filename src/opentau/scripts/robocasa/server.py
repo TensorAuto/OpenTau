@@ -470,6 +470,7 @@ class OpenTauRoboCasaPolicy:
 
         self.policy.reset()
 
+        # batch for warmup inference
         dummy = build_opentau_batch(
             cfg,
             {
@@ -483,6 +484,7 @@ class OpenTauRoboCasaPolicy:
             self.dtype,
         )
         with torch.inference_mode():
+            # two warmup calls are needed right after compiling
             _ = self.policy.sample_actions(dummy)
             _ = self.policy.sample_actions(dummy)
         self.policy.reset()
@@ -737,8 +739,10 @@ def robocasa_async_main(cfg: TrainPipelineConfig) -> None:
     policy_fn: PolicyFn
     runner: Optional[OpenTauRoboCasaPolicy] = None
     if ROBOCASA_USE_STUB:
+        # policy to output random actions
         policy_fn = policy_forward
     else:
+        # initialize runner with loads model from config
         runner = OpenTauRoboCasaPolicy(
             cfg,
             compile_model=ROBOCASA_TORCH_COMPILE,
