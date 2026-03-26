@@ -63,7 +63,7 @@ Default format (``n_obs_history=None``):
 
         "img_is_pad": torch.BoolTensor,  # shape (num_cams,) with values 0 or 1, where 1 indicates that the camera image is a padded image.
         "action_is_pad": torch.BoolTensor,  # shape (action_chunk,) with values 0 or 1, where 1 indicates that the action is a padded action.
-        "obs_is_pad": torch.BoolTensor,  # shape (1,) — always False when n_obs_history is None.
+        "obs_history_is_pad": torch.BoolTensor,  # shape (1,) — always False when n_obs_history is None.
     }
 
 With observation history (``n_obs_history=T``):
@@ -81,14 +81,14 @@ With observation history (``n_obs_history=T``):
 
         "img_is_pad": torch.BoolTensor,  # shape (num_cams,) — camera slot availability.
         "action_is_pad": torch.BoolTensor,  # shape (action_chunk,)
-        "obs_is_pad": torch.BoolTensor,  # shape (T,) — True for timesteps outside the episode boundary.
+        "obs_history_is_pad": torch.BoolTensor,  # shape (T,) — True for timesteps outside the episode boundary.
     }
 
 When ``n_obs_history=T`` and ``history_interval=k``, observations are sampled at timesteps
 :math:`t - (T-1)k,\; t - (T-2)k,\; \ldots,\; t` relative to the current timestep :math:`t`, where
 the interval is measured in dataset steps (at the configured ``action_freq``). For timesteps that
 fall before the start of the current episode, the observation is clamped to the first step of the
-episode and the corresponding entry in ``obs_is_pad`` is set to ``True``.
+episode and the corresponding entry in ``obs_history_is_pad`` is set to ``True``.
 
 The config file will have to provide the following information in TrainPipelineConfig:
 

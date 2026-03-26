@@ -632,6 +632,7 @@ class BaseDataset(torch.utils.data.Dataset):
         self.max_state_dim = cfg.max_state_dim  # maximum dimension of the state vector
         self.max_action_dim = cfg.max_action_dim  # maximum dimension of the action vector
         self.action_chunk = cfg.action_chunk  # number of actions to be processed in a chunk
+        self.n_obs_history = cfg.dataset_mixture.n_obs_history if cfg.dataset_mixture else None
 
     @abstractmethod
     def _get_feature_mapping_key(self) -> str:
@@ -642,7 +643,10 @@ class BaseDataset(torch.utils.data.Dataset):
         """Standardize image features to a common format.
 
         Resizes images to the target resolution with padding, and tracks
-        which images are padded.
+        which camera slots are padded (absent cameras).
+
+        When ``self.n_obs_history`` is set, camera tensors have shape
+        ``(T, C, H, W)`` and each frame is resized individually.
 
         Args:
             item: Input item dictionary with original image keys.
@@ -650,7 +654,7 @@ class BaseDataset(torch.utils.data.Dataset):
             n_cams: Number of cameras to process.
 
         Returns:
-            List of boolean values indicating which images are padded.
+            List of boolean values indicating which camera slots are padded.
         """
         name_map = DATA_FEATURES_NAME_MAPPING[self._get_feature_mapping_key()]
         image_is_pad = []
@@ -659,8 +663,18 @@ class BaseDataset(torch.utils.data.Dataset):
             key = name_map.get(std_key)
 
             if key is None:
-                standard_item[std_key] = torch.zeros((3, *self.resolution))
+                if self.n_obs_history is not None:
+                    standard_item[std_key] = torch.zeros((self.n_obs_history, 3, *self.resolution))
+                else:
+                    standard_item[std_key] = torch.zeros((3, *self.resolution))
                 image_is_pad.append(True)
+            elif self.n_obs_history is not None:
+                frames = [
+                    self.resize_with_pad(item[key][t], self.resolution[1], self.resolution[0], pad_value=0)
+                    for t in range(item[key].shape[0])
+                ]
+                standard_item[std_key] = torch.stack(frames, dim=0)
+                image_is_pad.append(False)
             else:
                 standard_item[std_key] = self.resize_with_pad(
                     item[key],
@@ -669,16 +683,25 @@ class BaseDataset(torch.utils.data.Dataset):
                     pad_value=0,
                 )
                 image_is_pad.append(item.get(key + "_is_pad", torch.tensor(False)).item())
+
+            img = standard_item[std_key]
+            if self.n_obs_history is not None:
+                expected_ndim = 4
+                expected_c_dim = 1
+                shape_desc = "(T, 3, H, W)"
+            else:
+                expected_ndim = 3
+                expected_c_dim = 0
+                shape_desc = "(3, H, W)"
             assert (
-                len(standard_item[std_key].shape) == 3
-                and standard_item[std_key].shape[0] == 3
-                and standard_item[std_key].min() >= 0.0 - 1e-6  # bfloat16 results in precision loss
-                and standard_item[std_key].max() <= 1.0 + 1e-6  # bfloat16 results in precision loss
+                len(img.shape) == expected_ndim
+                and img.shape[expected_c_dim] == 3
+                and img.min() >= 0.0 - 1e-6
+                and img.max() <= 1.0 + 1e-6
             ), (
-                f"Expected image {std_key} to have shape (3, H, W) with values in [0, 1], "
-                f"Got shape {standard_item[std_key].shape}, "
-                f"min={standard_item[std_key].min()}, "
-                f"max={standard_item[std_key].max()}, "
+                f"Expected image {std_key} to have shape {shape_desc} with values in [0, 1], "
+                f"Got shape {img.shape}, "
+                f"min={img.min()}, max={img.max()}, "
                 f"self={self._get_feature_mapping_key()}."
             )
 
@@ -716,9 +739,9 @@ class BaseDataset(torch.utils.data.Dataset):
         state_raw_key = name_map.get("state")
         state_pad_key = f"{state_raw_key}_is_pad" if state_raw_key else None
         if state_pad_key and state_pad_key in item:
-            standard_item["obs_is_pad"] = item[state_pad_key]
+            standard_item["obs_history_is_pad"] = item[state_pad_key]
         else:
-            standard_item["obs_is_pad"] = torch.tensor([False], dtype=torch.bool)
+            standard_item["obs_history_is_pad"] = torch.tensor([False], dtype=torch.bool)
 
         # cast all tensors in standard_item to bfloat16
         for key, value in standard_item.items():

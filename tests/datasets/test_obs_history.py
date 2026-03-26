@@ -245,14 +245,14 @@ def _make_dataset_with_history(
 
 
 def test_default_no_history_shapes(lerobot_dataset_factory, info_factory, tmp_path):
-    """n_obs_history=None preserves single-frame shapes and adds obs_is_pad."""
+    """n_obs_history=None preserves single-step shapes and adds obs_history_is_pad."""
     dataset = _make_dataset_with_history(lerobot_dataset_factory, info_factory, tmp_path, n_obs_history=None)
     item = dataset[25]
     assert item["state"].shape == (dataset.cfg.max_state_dim,)
-    assert "obs_is_pad" in item
-    assert item["obs_is_pad"].shape == (1,)
-    assert item["obs_is_pad"].dtype == torch.bool
-    assert not item["obs_is_pad"].any()
+    assert "obs_history_is_pad" in item
+    assert item["obs_history_is_pad"].shape == (1,)
+    assert item["obs_history_is_pad"].dtype == torch.bool
+    assert not item["obs_history_is_pad"].any()
 
 
 def test_history_t3_state_shape(lerobot_dataset_factory, info_factory, tmp_path):
@@ -261,21 +261,21 @@ def test_history_t3_state_shape(lerobot_dataset_factory, info_factory, tmp_path)
     assert item["state"].shape == (3, dataset.cfg.max_state_dim)
 
 
-def test_history_t3_obs_is_pad_shape(lerobot_dataset_factory, info_factory, tmp_path):
+def test_history_t3_obs_history_is_pad_shape(lerobot_dataset_factory, info_factory, tmp_path):
     dataset = _make_dataset_with_history(lerobot_dataset_factory, info_factory, tmp_path, n_obs_history=3)
     item = dataset[25]
-    assert "obs_is_pad" in item
-    assert item["obs_is_pad"].shape == (3,)
-    assert item["obs_is_pad"].dtype == torch.bool
+    assert "obs_history_is_pad" in item
+    assert item["obs_history_is_pad"].shape == (3,)
+    assert item["obs_history_is_pad"].dtype == torch.bool
 
 
-def test_history_t3_obs_is_pad_mid_episode(lerobot_dataset_factory, info_factory, tmp_path):
+def test_history_t3_obs_history_is_pad_mid_episode(lerobot_dataset_factory, info_factory, tmp_path):
     """In the middle of an episode, no observation should be padded."""
     dataset = _make_dataset_with_history(lerobot_dataset_factory, info_factory, tmp_path, n_obs_history=3)
     ep_from = int(dataset.episode_data_index["from"][0].item())
     mid_idx = ep_from + 10
     item = dataset[mid_idx]
-    assert not item["obs_is_pad"].any(), "Mid-episode observations should not be padded"
+    assert not item["obs_history_is_pad"].any(), "Mid-episode observations should not be padded"
 
 
 def test_history_padding_at_episode_start(lerobot_dataset_factory, info_factory, tmp_path):
@@ -283,8 +283,8 @@ def test_history_padding_at_episode_start(lerobot_dataset_factory, info_factory,
     dataset = _make_dataset_with_history(lerobot_dataset_factory, info_factory, tmp_path, n_obs_history=5)
     ep_from = int(dataset.episode_data_index["from"][0].item())
     item = dataset[ep_from]
-    assert item["obs_is_pad"][0].item() is True, "Earliest history frame at ep start should be padded"
-    assert item["obs_is_pad"][-1].item() is False, "Current frame should never be padded"
+    assert item["obs_history_is_pad"][0].item() is True, "Earliest history frame at ep start should be padded"
+    assert item["obs_history_is_pad"][-1].item() is False, "Current frame should never be padded"
 
 
 def test_history_interval_k2_padding(lerobot_dataset_factory, info_factory, tmp_path):
@@ -294,9 +294,9 @@ def test_history_interval_k2_padding(lerobot_dataset_factory, info_factory, tmp_
     )
     ep_from = int(dataset.episode_data_index["from"][0].item())
     item = dataset[ep_from + 1]
-    assert item["obs_is_pad"][0].item() is True
-    assert item["obs_is_pad"][1].item() is True
-    assert item["obs_is_pad"][2].item() is False
+    assert item["obs_history_is_pad"][0].item() is True
+    assert item["obs_history_is_pad"][1].item() is True
+    assert item["obs_history_is_pad"][2].item() is False
 
 
 def test_history_actions_unchanged(lerobot_dataset_factory, info_factory, tmp_path):

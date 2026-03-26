@@ -318,7 +318,7 @@ def check_standard_data_format(item, delta_timestamps_params, dataset, train_pip
         ("response", None),
         ("img_is_pad", (train_pipeline_config.num_cams,)),
         ("action_is_pad", (train_pipeline_config.action_chunk,)),
-        ("obs_is_pad", obs_pad_shape),
+        ("obs_history_is_pad", obs_pad_shape),
     ]
     for i in range(train_pipeline_config.num_cams):
         keys_shape_required.append((f"camera{i}", cam_shape_fn(train_pipeline_config.resolution)))
@@ -337,7 +337,7 @@ def check_standard_data_format(item, delta_timestamps_params, dataset, train_pip
             assert item[key].shape == shape, f"{key}"
         elif key == "prompt" or key == "response":
             assert type(item[key]) is str, f"{key}"
-        elif key in ("img_is_pad", "action_is_pad", "obs_is_pad"):
+        elif key in ("img_is_pad", "action_is_pad", "obs_history_is_pad"):
             assert item[key].shape == shape, f"{key}"
             assert isinstance(item[key], torch.BoolTensor), f"{key}"
 
