@@ -130,7 +130,12 @@ def resolve_delta_timestamps(
         ):
             delta_timestamps[key] = [i / action_freq for i in cfg.policy.action_delta_indices]
         elif "camera" in standard_key or standard_key == "state":
-            delta_timestamps[key] = [0.0]
+            n_obs = cfg.dataset_mixture.n_obs_history
+            if n_obs is not None:
+                k = cfg.dataset_mixture.history_interval
+                delta_timestamps[key] = [-(n_obs - 1 - i) * k / action_freq for i in range(n_obs)]
+            else:
+                delta_timestamps[key] = [0.0]
 
     dt_mean = {k: np.array(v) for k, v in delta_timestamps.items()}
     return dt_mean, {}, {}, {}

@@ -713,6 +713,13 @@ class BaseDataset(torch.utils.data.Dataset):
         standard_item["img_is_pad"] = torch.tensor(img_is_pad, dtype=torch.bool)
         standard_item["action_is_pad"] = item[name_map["actions"] + "_is_pad"]
 
+        state_raw_key = name_map.get("state")
+        state_pad_key = f"{state_raw_key}_is_pad" if state_raw_key else None
+        if state_pad_key and state_pad_key in item:
+            standard_item["obs_is_pad"] = item[state_pad_key]
+        else:
+            standard_item["obs_is_pad"] = torch.tensor([False], dtype=torch.bool)
+
         # cast all tensors in standard_item to bfloat16
         for key, value in standard_item.items():
             if isinstance(value, torch.Tensor) and value.dtype.is_floating_point:

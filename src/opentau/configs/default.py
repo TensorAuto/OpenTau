@@ -110,7 +110,7 @@ class DatasetConfig:
 
 @dataclass
 class DatasetMixtureConfig:
-    """Configuration for a mixture of multiple datasets.
+    r"""Configuration for a mixture of multiple datasets.
 
     This configuration allows combining multiple datasets with specified weights
     for training. The datasets are sampled according to their weights during
@@ -128,6 +128,14 @@ class DatasetMixtureConfig:
         vector_resample_strategy: Resample strategy for non-image features, such
             as action or state. Must be one of 'linear' or 'nearest'.
             Defaults to 'nearest'.
+        n_obs_history: Number of historical observation steps to include. When
+            set to ``T``, each camera returns shape ``(T, C, H, W)`` and state
+            returns shape ``(T, max_state_dim)``. When ``None``, the default
+            single-step behavior is preserved. Defaults to ``None``.
+        history_interval: Step interval between historical observation steps.
+            Must be a positive integer. When ``n_obs_history=T`` and
+            ``history_interval=k``, observations are sampled at timesteps
+            :math:`t - (T-1)k,\; t - (T-2)k,\; \ldots,\; t`. Defaults to 1.
 
     Raises:
         ValueError: If `weights` is provided and its length doesn't match
@@ -151,6 +159,10 @@ class DatasetMixtureConfig:
     # This value is applied to all datasets in the mixture.
     # Defaults to 0.05.
     val_split_ratio: float = 0.05
+    # Number of historical observation steps. None preserves default single-step behavior.
+    n_obs_history: int | None = None
+    # Step interval between historical observation steps. Must be a positive integer.
+    history_interval: int = 1
 
     def __post_init__(self):
         """Validate dataset mixture configuration."""
@@ -168,6 +180,12 @@ class DatasetMixtureConfig:
             )
         if self.val_split_ratio < 0 or self.val_split_ratio > 1:
             raise ValueError(f"`val_split_ratio` must be between 0 and 1, got {self.val_split_ratio}.")
+        if self.n_obs_history is not None and (
+            not isinstance(self.n_obs_history, int) or self.n_obs_history < 1
+        ):
+            raise ValueError(f"`n_obs_history` must be None or a positive integer, got {self.n_obs_history}.")
+        if not isinstance(self.history_interval, int) or self.history_interval < 1:
+            raise ValueError(f"`history_interval` must be a positive integer, got {self.history_interval}.")
 
         # set the val_split_ratio for all datasets in the mixture
         for dataset_cfg in self.datasets:

@@ -300,17 +300,28 @@ def test_image_array_to_pil_image_wrong_range_float_0_255():
 
 
 def check_standard_data_format(item, delta_timestamps_params, dataset, train_pipeline_config):
+    n_obs = getattr(train_pipeline_config.dataset_mixture, "n_obs_history", None)
     # the keys in standard data format + tensor shape
+    if n_obs is not None:
+        state_shape = (n_obs, train_pipeline_config.max_state_dim)
+        cam_shape_fn = lambda res: (n_obs, 3, *res)  # noqa: E731
+        obs_pad_shape = (n_obs,)
+    else:
+        state_shape = (train_pipeline_config.max_state_dim,)
+        cam_shape_fn = lambda res: (3, *res)  # noqa: E731
+        obs_pad_shape = (1,)
+
     keys_shape_required = [
-        ("state", (train_pipeline_config.max_state_dim,)),
+        ("state", state_shape),
         ("actions", (train_pipeline_config.action_chunk, train_pipeline_config.max_action_dim)),
         ("prompt", None),
         ("response", None),
         ("img_is_pad", (train_pipeline_config.num_cams,)),
         ("action_is_pad", (train_pipeline_config.action_chunk,)),
+        ("obs_is_pad", obs_pad_shape),
     ]
     for i in range(train_pipeline_config.num_cams):
-        keys_shape_required.append((f"camera{i}", (3, *train_pipeline_config.resolution)))
+        keys_shape_required.append((f"camera{i}", cam_shape_fn(train_pipeline_config.resolution)))
 
     # enforce standard data format
     for key, shape in keys_shape_required:
@@ -326,17 +337,18 @@ def check_standard_data_format(item, delta_timestamps_params, dataset, train_pip
             assert item[key].shape == shape, f"{key}"
         elif key == "prompt" or key == "response":
             assert type(item[key]) is str, f"{key}"
-        elif key == "img_is_pad" or key == "action_is_pad":
+        elif key in ("img_is_pad", "action_is_pad", "obs_is_pad"):
             assert item[key].shape == shape, f"{key}"
             assert isinstance(item[key], torch.BoolTensor), f"{key}"
 
     # test delta_timestamps — per-feature keys
     dt_mean = delta_timestamps_params[0]
+    expected_obs_len = n_obs if n_obs is not None else 1
     for key, val in dt_mean.items():
         if key == "action":
             assert val.shape == (train_pipeline_config.action_chunk,)
         else:
-            assert val.shape == (1,), f"{key} has unexpected shape {val.shape}"
+            assert val.shape == (expected_obs_len,), f"{key} has unexpected shape {val.shape}"
 
 
 @pytest.mark.slow  # 3 sec
