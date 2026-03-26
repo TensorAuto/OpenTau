@@ -84,6 +84,7 @@ from opentau.datasets.lerobot_dataset import (
 )
 from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
 from opentau.datasets.transforms import ImageTransforms
+from opentau.datasets.utils import DeltaTimestampInfo
 
 IMAGENET_STATS = {
     "min": [[[0.0]], [[0.0]], [[0.0]]],  # (c,1,1)
@@ -95,7 +96,7 @@ IMAGENET_STATS = {
 
 def resolve_delta_timestamps(
     cfg: TrainPipelineConfig, dataset_cfg: DatasetConfig, ds_meta: LeRobotDatasetMetadata
-) -> tuple:
+) -> DeltaTimestampInfo:
     """Resolves per-feature delta_timestamps based on TrainPipelineConfig.
 
     Args:
@@ -113,7 +114,8 @@ def resolve_delta_timestamps(
     delta_timestamps: dict[str, list[float]] = {}
     action_freq = cfg.dataset_mixture.action_freq
 
-    assert dataset_cfg.repo_id is not None
+    if dataset_cfg.repo_id is None:
+        raise ValueError("dataset_cfg.repo_id must not be None when resolving delta timestamps.")
     name_map = DATA_FEATURES_NAME_MAPPING[dataset_cfg.repo_id]
     reverse_name_map = {v: k for k, v in name_map.items()}
     for key in ds_meta.features:
@@ -130,7 +132,8 @@ def resolve_delta_timestamps(
         elif "camera" in standard_key or standard_key == "state":
             delta_timestamps[key] = [0.0]
 
-    return delta_timestamps, {}, {}, {}
+    dt_mean = {k: np.array(v) for k, v in delta_timestamps.items()}
+    return dt_mean, {}, {}, {}
 
 
 def make_dataset(

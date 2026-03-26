@@ -1407,10 +1407,12 @@ class LeRobotDataset(BaseDataset):
         item = self.hf_dataset[idx]
         ep_idx = item["episode_index"].item()
 
-        if self.episode_data_index is not None and self.epi2idx is not None:
-            ep_end = int(self.episode_data_index["to"][self.epi2idx[ep_idx]].item())
-        else:
-            ep_end = 0
+        if self.episode_data_index is None or self.epi2idx is None:
+            raise RuntimeError(
+                "episode_data_index and epi2idx must be set before calling __getitem__. "
+                "This usually means the dataset was not properly initialized."
+            )
+        ep_end = int(self.episode_data_index["to"][self.epi2idx[ep_idx]].item())
 
         episodes_info = self.meta.episodes[ep_idx]
 

@@ -52,7 +52,7 @@ _DEPRECATED_LATENCY_FIELDS = (
 )
 
 
-def _strip_deprecated_fields_from_json(path: Path) -> None:
+def strip_deprecated_fields_from_json(path: Path) -> None:
     """Remove deprecated latency fields from a saved config JSON file in-place.
 
     Handles both top-level fields (policy configs) and fields nested under a
@@ -253,7 +253,7 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         config_path = save_directory / CONFIG_NAME
         with open(config_path, "w") as f, draccus.config_type("json"):
             draccus.dump(self, f, indent=4)
-        _strip_deprecated_fields_from_json(config_path)
+        strip_deprecated_fields_from_json(config_path)
 
     @classmethod
     def from_pretrained(

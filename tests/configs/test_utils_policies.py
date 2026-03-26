@@ -93,7 +93,7 @@ def test_save_pretrained(tmp_path, get_inherited_pretrainedconfig):
     with (
         patch("draccus.dump") as mock_dump,
         patch("builtins.open", mock_open()),
-        patch("opentau.configs.policies._strip_deprecated_fields_from_json"),
+        patch("opentau.configs.policies.strip_deprecated_fields_from_json"),
     ):
         config = get_inherited_pretrainedconfig()
 
