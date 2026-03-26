@@ -121,9 +121,7 @@ def test_add_frame_wrong_shape_python_float(tmp_path, empty_lerobot_dataset_fact
     dataset = empty_lerobot_dataset_factory(root=tmp_path / "test", features=features)
     with pytest.raises(
         ValueError,
-        match=re.escape(
-            "The feature 'state' is not a 'np.ndarray'. Expected type is 'float32', but type '<class 'float'>' provided instead.\n"
-        ),
+        match=re.escape("The feature 'state' is expected to be a numpy array, but got 'float'.\n"),
     ):
         dataset.add_frame({"state": 1.0, "task": "Dummy task"})
 
@@ -143,9 +141,7 @@ def test_add_frame_wrong_shape_numpy_ndim_0(tmp_path, empty_lerobot_dataset_fact
     dataset = empty_lerobot_dataset_factory(root=tmp_path / "test", features=features)
     with pytest.raises(
         ValueError,
-        match=re.escape(
-            "The feature 'state' is not a 'np.ndarray'. Expected type is 'float32', but type '<class 'numpy.float32'>' provided instead.\n"
-        ),
+        match=re.escape("The feature 'state' is expected to be a numpy array, but got 'float32'.\n"),
     ):
         dataset.add_frame({"state": np.float32(1.0), "task": "Dummy task"})
 
