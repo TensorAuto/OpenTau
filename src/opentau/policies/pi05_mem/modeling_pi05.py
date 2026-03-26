@@ -758,12 +758,13 @@ class PI05MemFlowMatching(nn.Module):
         embs = []
         pad_masks = []
         att_masks = []
+        bsize = lang_tokens.shape[0]
 
         for vid, vid_mask in zip(videos, vid_masks, strict=False):
             vid_emb = self.embed_video(vid)  # (B, num_video_tokens, vlm_hidden)
             vid_emb = vid_emb.to(dtype=_preferred_dtype())
 
-            bsize, num_vid_embs = vid_emb.shape[:2]
+            num_vid_embs = vid_emb.shape[1]
             vid_mask_expanded = vid_mask[:, None].expand(bsize, num_vid_embs)
 
             embs.append(vid_emb)
@@ -836,7 +837,7 @@ class PI05MemFlowMatching(nn.Module):
         action_mask = torch.ones(bsize, action_dim, dtype=torch.bool, device=device)
         pad_masks.append(action_mask)
 
-        att_masks += [1] + ([0] * (self.config.n_action_steps - 1))
+        att_masks += [1] + ([0] * (self.config.chunk_size - 1))
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)

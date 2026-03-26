@@ -149,7 +149,7 @@ class PI05MemConfig(PreTrainedConfig):
 
         if self.init_strategy == "expert_only_he_init" and self.pretrained_path == "lerobot/pi05":
             raise ValueError(
-                "You cannot load pretrained PI0 model when init_strategy is 'expert_only_he_init' due to differences in PaliGemma tokenizer vocab sizes."
+                "You cannot load pretrained PI05 model when init_strategy is 'expert_only_he_init' due to differences in PaliGemma tokenizer vocab sizes."
             )
 
         if self.pretrained_path is not None and self.pretrained_path != "lerobot/pi05":

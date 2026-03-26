@@ -18,6 +18,8 @@ Wraps a frozen V-JEPA2 ViT encoder with a learnable Perceiver cross-attention
 reducer and a linear projection to the VLM embedding dimension.
 """
 
+from contextlib import nullcontext
+
 import torch
 from torch import Tensor, nn
 from transformers import VJEPA2Config, VJEPA2Model
@@ -72,6 +74,7 @@ class VJEPA2VideoEncoder(nn.Module):
             attn_implementation="sdpa",
         )
 
+        self.freeze_encoder = freeze_encoder
         if freeze_encoder:
             self.encoder.eval()
             for p in self.encoder.parameters():
@@ -94,7 +97,8 @@ class VJEPA2VideoEncoder(nn.Module):
         Returns:
             (B, num_video_tokens, vlm_hidden_size)
         """
-        with torch.no_grad():
+        ctx = torch.no_grad() if self.freeze_encoder else nullcontext()
+        with ctx:
             encoder_out = self.encoder(video, skip_predictor=True)
         tokens = encoder_out.last_hidden_state  # (B, N_patches, vjepa2_hidden)
         tokens = self.reducer(tokens)  # (B, num_video_tokens, vjepa2_hidden)
