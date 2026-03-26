@@ -17,8 +17,8 @@ Threaded batched remote policy client for RoboCasa.
 
 Runs **n_parallel** environment threads. Each thread pulls rollouts from a shared queue
 until **num_rollouts** episodes are finished. The **main** asyncio loop receives
-observations from active workers, batches them into one WebSocket message per timestep,
-and routes returned actions back to the corresponding threads.
+observations from active workers, batches them into one WebSocket message, and routes
+returned action chunks back to the corresponding threads.
 
 Batch protocol (MessagePack over WebSocket, binary frames) matches ``client.py`` /
 ``robocasa.scripts.server``:
@@ -31,10 +31,10 @@ Batch protocol (MessagePack over WebSocket, binary frames) matches ``client.py``
         ],
     }
 
-    Server -> client: list[list[float]]  # one flat action per item, same order as ``items``
+    Server -> client: list[list[list[float]]]  # one action chunk per item, same order as ``items``
 
 The number of ``items`` (and thus the batch size) is **only** the count of workers
-still stepping this timestep. As workers finish their rollout queue and exit, batch
+that need a new chunk right now. As workers finish their rollout queue and exit, batch
 size shrinks from at most ``num_parallel`` down to 1 for the final active worker(s).
 The policy server must return exactly ``len(items)`` actions, not a fixed width of
 ``num_parallel``.
@@ -60,108 +60,22 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Union
 
-import cv2
 import imageio
 import msgpack
 import numpy as np
 import websockets
 
 import robocasa  # noqa: F401
+from robocasa.scripts.client import (
+    DEFAULT_CAMERA_HEIGHT,
+    DEFAULT_CAMERA_NAMES,
+    DEFAULT_CAMERA_WIDTH,
+    build_proprio_vector,
+    encode_all_cameras_jpeg,
+    flip_image_obs,
+    get_task_prompt,
+)
 from robocasa.utils.env_utils import convert_action_pi05, create_env
-
-# Same three cameras as ``create_env`` defaults / PandaOmron gym wrapper.
-DEFAULT_CAMERA_NAMES: tuple[str, ...] = (
-    "robot0_eye_in_hand",
-    "robot0_agentview_left",
-    "robot0_agentview_right",
-)
-# Resolution aligned with ``robocasa.wrappers.gym_wrapper.PandaOmronKeyConverter``.
-DEFAULT_CAMERA_WIDTH = 256
-DEFAULT_CAMERA_HEIGHT = 256
-
-# Flat action layout expected by env (PandaOmron); see also env_utils.convert_action.
-ACTION_ORDER = (
-    "end_effector_position",  # 3
-    "end_effector_rotation",  # 3
-    "gripper_close",  # 1
-    "base_motion",  # 4
-    "control_mode",  # 1
-)  # total 12
-
-# Proprio keys aligned with PandaOmronKeyConverter / typical RoboCasa datasets.
-DEFAULT_PROPRIO_KEYS = (
-    "robot0_base_pos",
-    "robot0_base_quat",
-    "robot0_base_to_eef_pos",
-    "robot0_base_to_eef_quat",
-    "robot0_gripper_qpos",
-)
-
-
-def get_task_prompt(env) -> str:
-    """
-    Natural-language instruction for the current episode (RoboCasa ``get_ep_meta()['lang']``).
-    """
-    meta = env.get_ep_meta()
-    if not meta:
-        return ""
-    lang = meta.get("lang", "")
-    if lang is None:
-        return ""
-    if isinstance(lang, (list, tuple)):
-        return " ".join(str(x) for x in lang)
-    return str(lang)
-
-
-def build_proprio_vector(obs: dict, keys: tuple[str, ...] = DEFAULT_PROPRIO_KEYS) -> np.ndarray:
-    """Concatenate low-dimensional robot state for policy input."""
-    parts = []
-    for k in keys:
-        if k not in obs:
-            raise KeyError(
-                f"Observation missing key {k!r}. Available keys (sample): "
-                f"{[x for x in obs if not x.endswith('_image')][:20]}..."
-            )
-        parts.append(np.asarray(obs[k], dtype=np.float64).ravel())
-    return np.concatenate(parts, axis=0)
-
-
-def flip_image_obs(obs: dict, camera_names: tuple[str, ...]) -> dict:
-    """Flip images vertically since MuJoCo renders upside down."""
-    for name in camera_names:
-        key = f"{name}_image"
-        if key in obs:
-            # Copy to ensure the array is contiguous for cv2/imageio
-            obs[key] = obs[key][::-1].copy()
-    return obs
-
-
-def encode_camera_rgb_to_jpeg(
-    obs: dict,
-    camera_name: str,
-    jpeg_quality: int = 80,
-) -> bytes:
-    """Encode one camera's RGB observation as JPEG bytes (OpenCV uses BGR)."""
-    key = f"{camera_name}_image"
-    if key not in obs:
-        raise KeyError(f"Missing {key!r}. Ensure create_env includes camera {camera_name!r}.")
-    rgb = obs[key]
-    if rgb.ndim != 3 or rgb.shape[-1] != 3:
-        raise ValueError(f"Expected HxWx3 RGB image for {key}, got shape {rgb.shape}")
-    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
-    if not ok:
-        raise RuntimeError("cv2.imencode failed")
-    return buf.tobytes()
-
-
-def encode_all_cameras_jpeg(
-    obs: dict,
-    camera_names: tuple[str, ...],
-    jpeg_quality: int = 80,
-) -> dict:
-    """JPEG-encode every listed camera; keys match ``camera_names``."""
-    return {name: encode_camera_rgb_to_jpeg(obs, name, jpeg_quality=jpeg_quality) for name in camera_names}
 
 
 @dataclass
@@ -194,30 +108,25 @@ def _normalize_batched_actions_response(
     actions_batch: Any,
     num_expected: int,
 ) -> list[Any]:
-    """Normalize the batched policy response to one action list per observation.
+    """
+    Ensure ``actions_batch`` is a list of length ``num_expected``, one action chunk per batch row.
 
-    Args:
-        actions_batch: Raw decoded batch from the server (typically a ``list``).
-        num_expected: Number of observations in this batch (length of ``items``).
+    When ``num_expected == 1``, some servers may return one chunk directly
+    (``list[list[float]]``) or one flat action (``list[float]``) instead of
+    ``[chunk]``; wrap those cases.
 
-    Returns:
-        A list of length ``num_expected``, one action (sequence of floats) per row.
-
-    Raises:
-        ValueError: If the response is not a list, length cannot be reconciled with
-            ``num_expected``, or a partial batch cannot be interpreted.
-
-    Note:
-        If ``num_expected == 1``, some servers return a single flat ``list[float]``
-        instead of ``[list[float]]``; that case is wrapped. If the server returns
-        more rows than ``num_expected``, excess rows are dropped (with a one-time
-        warning).
+    When the server returns *more* rows than ``num_expected`` (e.g. fixed max batch
+    width while the client sends a partial batch), the excess rows are dropped.
     """
     global _SERVER_TRUNCATED_ACTION_BATCH_WARNED
     if not isinstance(actions_batch, list):
         raise ValueError(f"Batched server response must be a list, got {type(actions_batch).__name__}")
     if len(actions_batch) == num_expected:
         return actions_batch
+    if num_expected == 1 and len(actions_batch) > 0:
+        first = actions_batch[0]
+        if isinstance(first, (int, float, np.floating, np.integer, list, tuple, np.ndarray)):
+            return [actions_batch]
     if len(actions_batch) > num_expected:
         if not _SERVER_TRUNCATED_ACTION_BATCH_WARNED:
             warnings.warn(
@@ -229,22 +138,27 @@ def _normalize_batched_actions_response(
             )
             _SERVER_TRUNCATED_ACTION_BATCH_WARNED = True
         return actions_batch[:num_expected]
-    # Single-env batch: server may send one flat list[float] instead of [list[float]].
-    if num_expected == 1 and len(actions_batch) > 0:
-        first = actions_batch[0]
-        if isinstance(first, (int, float, np.floating, np.integer)):
-            return [actions_batch]
     raise ValueError(
         f"Batched actions length {len(actions_batch)} != batch size {num_expected} "
         f"(partial batches must still return one action list per observation)"
     )
 
 
+def _normalize_action_chunk_for_worker(raw_action_chunk: Any) -> list[np.ndarray]:
+    """Convert one server row into a list of flat action vectors."""
+    arr = np.asarray(raw_action_chunk, dtype=np.float64)
+    if arr.ndim == 1:
+        return [arr.ravel()]
+    if arr.ndim != 2:
+        raise ValueError(f"Expected action chunk rank 1 or 2, got shape {arr.shape}")
+    return [arr[i].ravel() for i in range(arr.shape[0])]
+
+
 def _worker_loop(
     *,
     rollout_queue: queue.Queue[int | None],
     to_main: queue.Queue[WorkerToMain],
-    from_main: queue.Queue[np.ndarray],
+    from_main: queue.Queue[Any],
     env_name: str,
     split,
     start_seed: int,
@@ -255,27 +169,7 @@ def _worker_loop(
     action_dim_holder: list[int | None],
     action_dim_lock: threading.Lock,
 ) -> None:
-    """Run one worker thread: consume rollout indices and step the env until done.
-
-    Pulls rollout IDs from ``rollout_queue``, builds observations (JPEG + state +
-    prompt), sends ``ObsMsg`` to the coordinator, blocks on ``from_main`` for the
-    action, steps the environment, and sends ``DoneMsg`` when the episode ends.
-    Puts ``ExitMsg`` when the queue is empty and the thread exits.
-
-    Args:
-        rollout_queue: Queue of rollout indices; empty queue means this worker exits.
-        to_main: Queue to the asyncio coordinator (``ObsMsg``, ``DoneMsg``, ``ExitMsg``).
-        from_main: Queue from coordinator delivering one flat action vector per step.
-        env_name: Registered RoboCasa environment name.
-        split: Dataset split passed to ``create_env``.
-        start_seed: Base seed; rollout ``i`` uses ``start_seed + i``.
-        main_dir: Root directory for ``rollouts.json`` and per-rollout video folders.
-        jpeg_quality: JPEG quality for encoded camera frames (when not rendering).
-        max_episode_steps: Optional step cap per episode (in addition to success).
-        render: If True, onscreen render and no video files; else offscreen + videos.
-        action_dim_holder: Single-element list shared across workers for ``env.action_dim``.
-        action_dim_lock: Lock protecting ``action_dim_holder`` initialization.
-    """
+    """One thread: sequential rollouts from ``rollout_queue`` until empty."""
     while True:
         try:
             # get the next rollout index from the queue and its protected by a lock
@@ -321,6 +215,7 @@ def _worker_loop(
                         raise RuntimeError("env.action_dim is None after reset()")
                     action_dim_holder[0] = ad
             step_count = 0
+            pending_actions: list[np.ndarray] = []
 
             while True:
                 if render:
@@ -340,12 +235,17 @@ def _worker_loop(
                 prompt = get_task_prompt(env)
                 payload_obs = {"images": images, "state": state, "prompt": prompt}
 
-                # send the payload to the main thread
-                to_main.put(ObsMsg(payload=payload_obs))
-                # get the action from the main thread
-                action = from_main.get()
-                # convert the action to a numpy array and convert the action to the desired range
-                action = np.asarray(action, dtype=np.float64).ravel()
+                # request a new policy chunk only when local chunk is exhausted
+                if len(pending_actions) == 0:
+                    # send the payload to the main thread
+                    to_main.put(ObsMsg(payload=payload_obs))
+                    raw_action_chunk = from_main.get()
+                    pending_actions = _normalize_action_chunk_for_worker(raw_action_chunk)
+                    if len(pending_actions) == 0:
+                        raise ValueError("Server returned an empty action chunk")
+
+                # take one action from the local chunk
+                action = pending_actions.pop(0)
                 # build action vector in desired order
                 action = convert_action_pi05(action)
 
@@ -387,47 +287,23 @@ async def _run_coordinator(
     ws_uri: str,
     n_workers: int,
     to_mains: list[queue.Queue[WorkerToMain]],
-    from_mains: list[queue.Queue[np.ndarray]],
+    from_mains: list[queue.Queue[Any]],
     results_by_rollout: dict[int, tuple[int, bool]],
     results_lock: threading.Lock,
 ) -> None:
-    """Batch observations from all active workers each timestep and drive the WebSocket.
-
-    For each timestep, concurrently reads from each active worker until each has
-    produced one ``ObsMsg`` (``DoneMsg`` is consumed and recorded without blocking
-    others) or ``ExitMsg``. Builds one MessagePack batch ``{batch: true, items: ...}``,
-    sends it to the policy server, and distributes returned actions back to workers
-    via ``from_mains``. This ordering avoids deadlock when one worker is between
-    episodes while others already have the next observation.
-
-    Args:
-        ws_uri: WebSocket URI (e.g. ``ws://host:port``).
-        n_workers: Number of parallel worker threads.
-        to_mains: Per-worker queues from workers to this coordinator.
-        from_mains: Per-worker queues from coordinator to workers (actions).
-        results_by_rollout: Mutable map ``rollout_idx -> (length, success)`` for ``DoneMsg``.
-        results_lock: Lock protecting ``results_by_rollout``.
+    """
+    For each timestep, read from all active workers in parallel until each has produced
+    one ``ObsMsg`` (skipping ``DoneMsg``) or ``ExitMsg``. This avoids deadlock when one
+    worker finishes an episode and is slow to start the next rollout while others already
+    have the next observation ready.
     """
     loop = asyncio.get_event_loop()
 
     def _get(q: queue.Queue[WorkerToMain]) -> WorkerToMain:
-        """Block until ``q`` delivers the next worker-to-main message."""
-
         return q.get()
 
     async def _drain_to_obs_or_exit(wid: int) -> tuple[int, ObsMsg | None, bool]:
-        """Drain a worker queue until the next ``ObsMsg`` or thread exit.
-
-        Skips ``DoneMsg`` (records results) until an observation or ``ExitMsg``.
-
-        Args:
-            wid: Worker index (0 .. ``n_workers`` - 1).
-
-        Returns:
-            Tuple of ``(worker_id, observation_message_or_none, is_exit)``. If
-            ``is_exit`` is True, the worker has finished; ``observation_message``
-            is None. Otherwise ``observation_message`` is the ``ObsMsg`` to batch.
-        """
+        """Returns (worker_id, ObsMsg or None if exiting, is_exit)."""
         while True:
             msg = await loop.run_in_executor(None, _get, to_mains[wid])
             if isinstance(msg, ExitMsg):
@@ -479,8 +355,7 @@ async def _run_coordinator(
             actions_batch = _normalize_batched_actions_response(actions_batch, batch_size)
 
             for wid, act in zip(batch_workers, actions_batch, strict=False):
-                a = np.asarray(act, dtype=np.float64).ravel()
-                from_mains[wid].put(a)
+                from_mains[wid].put(act)
 
 
 async def run_policy_loop_threaded(
@@ -496,28 +371,6 @@ async def run_policy_loop_threaded(
     max_episode_steps: int | None,
     render: bool = False,
 ) -> None:
-    """Run threaded RoboCasa rollouts against a batched policy WebSocket server.
-
-    Spawns up to ``min(num_parallel, num_rollouts)`` worker threads, coordinates
-    batched policy calls in ``_run_coordinator``, then writes ``rollouts.json``
-    under the output directory.
-
-    Args:
-        ws_uri: WebSocket URI of the policy server.
-        env_name: RoboCasa task name for ``create_env``.
-        split: Dataset split for ``create_env``.
-        start_seed: Seed for rollout index 0; rollout ``i`` uses ``start_seed + i``.
-        num_rollouts: Total number of episodes to run.
-        num_parallel: Maximum parallel env threads (capped by ``num_rollouts``).
-        output_dir: Output root; default is ``{env_name}_async_{timestamp}``.
-        jpeg_quality: JPEG quality for camera encodes when not rendering.
-        max_episode_steps: Max steps per episode (in addition to env termination).
-        render: If True, onscreen rendering and no saved videos.
-
-    Raises:
-        ValueError: If ``num_rollouts`` or ``num_parallel`` is invalid.
-        RuntimeError: If a worker thread does not exit or a rollout result is missing.
-    """
     if num_rollouts < 1:
         raise ValueError("num_rollouts must be >= 1")
     if num_parallel < 1:
@@ -542,7 +395,7 @@ async def run_policy_loop_threaded(
 
     # queues to send messages from the coordinator to the workers and from the workers to the coordinator
     to_mains: list[queue.Queue[WorkerToMain]] = [queue.Queue() for _ in range(n_workers)]
-    from_mains: list[queue.Queue[np.ndarray]] = [queue.Queue() for _ in range(n_workers)]
+    from_mains: list[queue.Queue[Any]] = [queue.Queue() for _ in range(n_workers)]
 
     # dictionary to store the results by rollout index
     results_by_rollout: dict[int, tuple[int, bool]] = {}
@@ -630,14 +483,6 @@ async def run_policy_loop_threaded(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse command-line arguments for the threaded async RoboCasa client.
-
-    Args:
-        argv: Argument list; defaults to ``sys.argv`` when ``None``.
-
-    Returns:
-        Parsed namespace with ``env_name``, ``host``, ``port``, rollout options, etc.
-    """
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
         "env_name",
@@ -700,15 +545,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv=None) -> None:
-    """CLI entrypoint: parse args and run ``run_policy_loop_threaded``.
-
-    Args:
-        argv: Optional argument list; forwarded to ``parse_args``.
-
-    Raises:
-        SystemExit: On invalid ``--num-rollouts``, ``--num-parallel``, or placeholder
-            ``--host`` value.
-    """
     args = parse_args(argv)
     if args.num_rollouts < 1:
         raise SystemExit("error: --num-rollouts must be >= 1")

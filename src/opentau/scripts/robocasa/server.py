@@ -17,24 +17,22 @@
 Implements the same wire protocol as ``robocasa_server``, plus **batched** messages for
 ``robocasa.scripts.client_async``:
 
-    Single (``client.py``):
+    Single request:
 
         Client -> server (MessagePack): ``{ "images": {...}, "state": [...], "prompt": "..." }``
-        Server -> client: ``list[float]``
+        Server -> client: ``[[float, ...], ...]``  # shape ``(T, action_dim)``
 
     Batched (``client_async.py``):
 
         Client -> server:
             ``{ "batch": true, "items": [ { "images": {...}, "state": [...], "prompt": "..." }, ... ] }``
         Server -> client:
-            ``[ list[float], ... ]``  # one action per item, same order and length as ``items``
+            ``[ [[float, ...], ...], ... ]``  # per item: full action chunk (``T`` steps × ``action_dim``)
 
 **OpenTau mode** (default): loads the policy from ``policy.pretrained_path`` in the config.
-For single requests, each step calls ``policy.select_action`` (internal action queue).
-For **batched** requests, observations are stacked and ``select_action`` runs **once** on the
-full batch (same as vector-env rollouts).
-
-**Stub mode** (``--robocasa_use_stub=true``): small random actions.
+Each request runs ``policy.sample_actions`` (no internal queue on the server). The reply is the
+full predicted chunk per environment: shape ``(n_action_steps, action_dim)`` (trimmed/padded to
+``--robocasa_action_dim``). **Batched** requests stack observations and call ``sample_actions`` once.
 
 Run::
 
@@ -51,7 +49,7 @@ import logging
 import sys
 from dataclasses import asdict
 from pprint import pformat
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import msgpack
 import numpy as np
@@ -78,25 +76,16 @@ ROBOCASA_HOST: str = "0.0.0.0"  # nosec B104 — default listen; use ``--robocas
 ROBOCASA_PORT: int = 8765
 ROBOCASA_ACTION_DIM: int = 16
 ROBOCASA_TORCH_COMPILE: bool = True
-ROBOCASA_USE_STUB: bool = False
+
+# Fallback zero chunk length when sending an error response (client should discard).
+_ERROR_RESPONSE_CHUNK_STEPS: int = 8
 
 
 def _parse_robocasa_cli() -> None:
-    """Parse ``--robocasa_*`` flags into module globals and strip them from ``sys.argv``.
-
-    Must run before ``robocasa_async_main`` so ``argparse`` in the OpenTau config
-    parser does not see RoboCasa-specific flags.
-
-    Side effects:
-        Updates ``ROBOCASA_HOST``, ``ROBOCASA_PORT``, ``ROBOCASA_ACTION_DIM``,
-        ``ROBOCASA_TORCH_COMPILE``, ``ROBOCASA_USE_STUB``, and replaces ``sys.argv``
-        with a copy containing only non-RoboCasa arguments.
-    """
-    global ROBOCASA_HOST, ROBOCASA_PORT, ROBOCASA_ACTION_DIM, ROBOCASA_TORCH_COMPILE, ROBOCASA_USE_STUB
+    """Read ``--robocasa_*`` flags into module globals and remove them from ``sys.argv``."""
+    global ROBOCASA_HOST, ROBOCASA_PORT, ROBOCASA_ACTION_DIM, ROBOCASA_TORCH_COMPILE
 
     def _bool_arg(value: str) -> bool:
-        """Parse a string as a boolean (true/1/yes/y, case-insensitive)."""
-
         return value.lower() in ("true", "1", "yes", "y")
 
     p = argparse.ArgumentParser(add_help=False)
@@ -104,7 +93,6 @@ def _parse_robocasa_cli() -> None:
     p.add_argument("--robocasa_port", type=int, default=None)
     p.add_argument("--robocasa_action_dim", type=int, default=None)
     p.add_argument("--robocasa_torch_compile", type=str, default=None)
-    p.add_argument("--robocasa_use_stub", type=str, default=None)
     args, rest = p.parse_known_args(sys.argv[1:])
     if args.robocasa_host is not None:
         ROBOCASA_HOST = args.robocasa_host
@@ -114,8 +102,6 @@ def _parse_robocasa_cli() -> None:
         ROBOCASA_ACTION_DIM = args.robocasa_action_dim
     if args.robocasa_torch_compile is not None:
         ROBOCASA_TORCH_COMPILE = _bool_arg(args.robocasa_torch_compile)
-    if args.robocasa_use_stub is not None:
-        ROBOCASA_USE_STUB = _bool_arg(args.robocasa_use_stub)
     sys.argv = [sys.argv[0]] + rest
 
 
@@ -128,18 +114,7 @@ ROBOCASA_CAMERA_ORDER = (
 
 
 def jpeg_bytes_to_rgb(jpeg_bytes: bytes) -> np.ndarray:
-    """Decode a JPEG bytestring to an RGB image array.
-
-    Args:
-        jpeg_bytes: Raw JPEG file bytes.
-
-    Returns:
-        ``uint8`` array of shape ``(H, W, 3)`` in RGB order.
-
-    Raises:
-        RuntimeError: If OpenCV (``cv2``) is not installed.
-        ValueError: If ``cv2.imdecode`` fails (invalid JPEG).
-    """
+    """Decode JPEG bytes to HxWx3 uint8 RGB."""
     if cv2 is None:
         raise RuntimeError("opencv-python (cv2) is required to decode JPEG images on the server.")
     arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
@@ -150,18 +125,7 @@ def jpeg_bytes_to_rgb(jpeg_bytes: bytes) -> np.ndarray:
 
 
 def decode_all_images(images: Dict[str, bytes]) -> Dict[str, np.ndarray]:
-    """Decode all camera JPEG blobs for ``ROBOCASA_CAMERA_ORDER``.
-
-    Args:
-        images: Map from camera name to JPEG bytes (must include every key in
-            ``ROBOCASA_CAMERA_ORDER``).
-
-    Returns:
-        Map from camera name to ``uint8`` RGB arrays ``(H, W, 3)``.
-
-    Raises:
-        KeyError: If a required camera key is missing.
-    """
+    """Decode all camera JPEGs to RGB numpy arrays (uint8, H, W, 3)."""
     out: Dict[str, np.ndarray] = {}
     for k in ROBOCASA_CAMERA_ORDER:
         if k not in images:
@@ -171,19 +135,7 @@ def decode_all_images(images: Dict[str, bytes]) -> Dict[str, np.ndarray]:
 
 
 def unpack_payload_dict(data: dict) -> Tuple[Dict[str, bytes], np.ndarray, str]:
-    """Parse one policy request body (single message or one batch item).
-
-    Args:
-        data: Decoded MessagePack dict with ``images``, ``state``, and optional
-            ``prompt``.
-
-    Returns:
-        Tuple of ``(images_dict, state_vector, prompt_string)``. Image values are
-        normalized to ``bytes``.
-
-    Raises:
-        ValueError: If ``images`` is not a dict or ``state`` is not a list.
-    """
+    """Parse one policy request body (single message or one element of a batch)."""
     images = data.get("images")
     state = data.get("state")
     prompt = data.get("prompt", "")
@@ -197,102 +149,18 @@ def unpack_payload_dict(data: dict) -> Tuple[Dict[str, bytes], np.ndarray, str]:
     return images, state_vec, prompt_str
 
 
-def unpack_request(message: bytes) -> Tuple[Dict[str, bytes], np.ndarray, str]:
-    """Decode a single (non-batched) MessagePack WebSocket frame into observation fields.
-
-    Args:
-        message: Raw binary MessagePack payload.
-
-    Returns:
-        Same as ``unpack_payload_dict``.
-
-    Raises:
-        ValueError: If the top-level value is not a dict.
-    """
-    data = msgpack.unpackb(message, raw=False)
-    if not isinstance(data, dict):
-        raise ValueError("Expected dict payload")
-    return unpack_payload_dict(data)
-
-
-PolicyFn = Callable[
-    [Dict[str, np.ndarray], np.ndarray, str, int, np.random.Generator],
-    np.ndarray,
-]
-
-
-def default_policy(
-    images_rgb: Dict[str, np.ndarray],
-    state: np.ndarray,
-    prompt: str,
-    action_dim: int,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    """Stub policy: uniform random actions in ``[-0.05, 0.05]``.
-
-    Args:
-        images_rgb: Per-camera ``uint8`` RGB arrays (unused in stub).
-        state: Proprioceptive state vector (unused in stub).
-        prompt: Task text (unused in stub).
-        action_dim: Flat action size.
-        rng: NumPy random generator.
-
-    Returns:
-        ``float64`` array of shape ``(action_dim,)``.
-    """
-    del images_rgb, prompt  # unused in stub
-    _ = state  # available for your model
-    return rng.uniform(-0.05, 0.05, size=(action_dim,)).astype(np.float64)
-
-
-def policy_forward(
-    images_rgb: Dict[str, np.ndarray],
-    state: np.ndarray,
-    prompt: str,
-    action_dim: int,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    """Default policy entrypoint; replace implementation while keeping the signature.
-
-    Currently delegates to ``default_policy``.
-
-    Args:
-        images_rgb: Per-camera ``uint8`` RGB arrays.
-        state: Proprioceptive state vector.
-        prompt: Task text.
-        action_dim: Flat action size.
-        rng: NumPy random generator.
-
-    Returns:
-        Flat action vector of shape ``(action_dim,)``.
-    """
-    return default_policy(images_rgb, state, prompt, action_dim, rng)
-
-
-def pack_action(action: np.ndarray) -> bytes:
-    """Serialize a single flat action as MessagePack bytes for the WebSocket reply.
-
-    Args:
-        action: 1D action vector (any shape that ravel-s to the policy dimension).
-
-    Returns:
-        MessagePack-encoded bytes (list of floats).
-    """
-    a = np.asarray(action, dtype=np.float64).ravel()
+def pack_action(action_chunk: np.ndarray) -> bytes:
+    """MessagePack-encode one env's action chunk ``(T, action_dim)`` as nested lists."""
+    a = np.asarray(action_chunk, dtype=np.float64)
+    if a.ndim != 2:
+        raise ValueError(f"Expected action chunk of shape (T, action_dim), got shape {a.shape}")
     return msgpack.packb(a.tolist(), use_bin_type=True)
 
 
-def pack_actions_batch(actions: List[np.ndarray]) -> bytes:
-    """Serialize a list of flat actions for a batched WebSocket reply.
-
-    Args:
-        actions: One numpy action per batch row, same order as request ``items``.
-
-    Returns:
-        MessagePack-encoded ``list[list[float]]`` bytes.
-    """
+def pack_actions_batch(chunks: List[np.ndarray]) -> bytes:
+    """Encode one ``(T, action_dim)`` chunk per batch row (same order as request ``items``)."""
     return msgpack.packb(
-        [np.asarray(a, dtype=np.float64).ravel().tolist() for a in actions],
+        [np.asarray(c, dtype=np.float64).tolist() for c in chunks],
         use_bin_type=True,
     )
 
@@ -303,17 +171,7 @@ def _numpy_rgb_to_camera_tensor(
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Resize RGB ``uint8`` image to policy resolution and produce a CHW batch slice.
-
-    Args:
-        rgb_uint8: Image array ``(H, W, 3)`` RGB.
-        resolution: Target ``(height, width)`` as in config (H, W).
-        device: Torch device for the output tensor.
-        dtype: Floating dtype for normalized pixels.
-
-    Returns:
-        Tensor of shape ``(1, 3, H, W)`` with values in ``[0, 1]``.
-    """
+    """RGB uint8 (H,W,3) -> (1,3,H,W) float [0,1] on device."""
     pil = Image.fromarray(rgb_uint8)
     pil = pil.resize((resolution[1], resolution[0]), Image.Resampling.BILINEAR)
     arr = np.asarray(pil, dtype=np.float32) / 255.0
@@ -329,19 +187,7 @@ def build_opentau_batch(
     device: torch.device,
     dtype: torch.dtype,
 ) -> dict[str, torch.Tensor]:
-    """Build a single-row OpenTau policy batch from one RoboCasa observation.
-
-    Args:
-        cfg: Training pipeline config (camera count, resolution, state dim, etc.).
-        images_rgb: Decoded RGB arrays keyed by ``ROBOCASA_CAMERA_ORDER`` names.
-        state_vec: Proprio vector; padded or truncated to ``cfg.max_state_dim``.
-        prompt: Task string.
-        device: Torch device.
-        dtype: Floating dtype for tensors.
-
-    Returns:
-        Dict of tensors including ``camera*``, ``state``, ``prompt``, ``img_is_pad``.
-    """
+    """Map RoboCasa observation dict to OpenTau policy batch (batch size 1)."""
     num_cams = cfg.num_cams
     resolution = cfg.resolution
     batch: dict[str, torch.Tensor] = {}
@@ -374,20 +220,7 @@ def build_opentau_batch_multi(
     device: torch.device,
     dtype: torch.dtype,
 ) -> dict[str, torch.Tensor]:
-    """Stack multiple decoded observations into one OpenTau batch of batch size ``B``.
-
-    Args:
-        cfg: Training pipeline config.
-        items: List of ``(images_rgb, state_vec, prompt)`` per environment row.
-        device: Torch device.
-        dtype: Floating dtype for tensors.
-
-    Returns:
-        Batched tensor dict for ``select_action`` / ``sample_actions``.
-
-    Raises:
-        ValueError: If ``items`` is empty.
-    """
+    """Stack multiple RoboCasa observations into one OpenTau batch (batch size B)."""
     b = len(items)
     if b == 0:
         raise ValueError("empty batch")
@@ -439,18 +272,6 @@ class OpenTauRoboCasaPolicy:
         compile_model: bool = True,
         seed: int | None = None,
     ) -> None:
-        """Load the policy from ``cfg.policy.pretrained_path`` and warm up inference.
-
-        Args:
-            cfg: Full training pipeline config (policy type, resolution, state dim, etc.).
-            compile_model: If True, apply ``torch.compile`` to ``sample_actions`` when
-                supported.
-            seed: Optional RNG seed applied before construction via ``set_seed``.
-
-        Side effects:
-            Loads weights, moves the model to ``auto_torch_device()`` in bfloat16,
-            runs two dummy ``sample_actions`` calls for warmup, then ``reset()`` again.
-        """
         self.cfg = cfg
         self.device = auto_torch_device()
         self.dtype = torch.bfloat16
@@ -470,7 +291,6 @@ class OpenTauRoboCasaPolicy:
 
         self.policy.reset()
 
-        # batch for warmup inference
         dummy = build_opentau_batch(
             cfg,
             {
@@ -484,7 +304,6 @@ class OpenTauRoboCasaPolicy:
             self.dtype,
         )
         with torch.inference_mode():
-            # two warmup calls are needed right after compiling
             _ = self.policy.sample_actions(dummy)
             _ = self.policy.sample_actions(dummy)
         self.policy.reset()
@@ -497,26 +316,18 @@ class OpenTauRoboCasaPolicy:
         prompt: str,
         action_dim: int,
     ) -> np.ndarray:
-        """Run a single-environment forward pass and return a fixed-length action.
-
-        Args:
-            images_rgb: Decoded RGB images per camera.
-            state_vec: Proprio state; padded to ``cfg.max_state_dim`` in the batch.
-            prompt: Task string.
-            action_dim: Desired output length (RoboCasa / CLI); policy output is
-                truncated or zero-padded to this size.
-
-        Returns:
-            ``float64`` vector of shape ``(action_dim,)``.
-        """
+        """Return full action chunk ``(T, action_dim)`` from ``sample_actions`` (trim/pad last dim)."""
         batch = build_opentau_batch(self.cfg, images_rgb, state_vec, prompt, self.device, self.dtype)
         with torch.inference_mode():
-            act = self.policy.select_action(batch)
-        step0 = act.squeeze(0).to("cpu", torch.float32).numpy().ravel()
-        policy_adim = step0.shape[0]
-        out = np.zeros(action_dim, dtype=np.float64)
+            act = self.policy.sample_actions(batch)
+        # (1, T, policy_dim)
+        act_np = act.squeeze(0).to("cpu", torch.float32).numpy()
+        if act_np.ndim != 2:
+            raise ValueError(f"Expected policy output (T, D), got shape {act_np.shape}")
+        t_steps, policy_adim = act_np.shape
+        out = np.zeros((t_steps, action_dim), dtype=np.float64)
         n = min(action_dim, policy_adim)
-        out[:n] = step0[:n].astype(np.float64)
+        out[:, :n] = act_np[:, :n].astype(np.float64)
         return out
 
     def infer_batch(
@@ -524,65 +335,32 @@ class OpenTauRoboCasaPolicy:
         decoded_items: List[Tuple[Dict[str, np.ndarray], np.ndarray, str]],
         action_dim: int,
     ) -> List[np.ndarray]:
-        """Run one batched ``select_action`` for multiple observations.
-
-        Args:
-            decoded_items: One triple ``(images_rgb, state_vec, prompt)`` per batch row.
-            action_dim: Target flat size per row (truncate or pad each output).
-
-        Returns:
-            List of ``action_dim``-length ``float64`` arrays, same order as ``decoded_items``.
-
-        Raises:
-            ValueError: If the policy output batch size is smaller than the number of
-                input rows.
-        """
+        """One ``sample_actions`` on a stacked batch; one ``(T, action_dim)`` chunk per env."""
         batch = build_opentau_batch_multi(self.cfg, decoded_items, self.device, self.dtype)
         b = len(decoded_items)
         with torch.inference_mode():
-            act = self.policy.select_action(batch)
+            act = self.policy.sample_actions(batch)
         act_np = act.to("cpu", torch.float32).numpy()
-        if act_np.ndim == 1:
-            act_np = act_np.reshape(1, -1)
-        # Some policies pad to a fixed max batch size; only return rows for this request.
+        if act_np.ndim == 2:
+            act_np = act_np.reshape(1, *act_np.shape)
+        if act_np.ndim != 3:
+            raise ValueError(f"Expected policy output (B, T, D), got shape {act_np.shape}")
         if act_np.shape[0] > b:
             act_np = act_np[:b]
         elif act_np.shape[0] < b:
             raise ValueError(f"Policy returned batch dim {act_np.shape[0]} < input batch {b}")
+        _, t_steps, policy_adim = act_np.shape
         outs: List[np.ndarray] = []
-        for row in range(act_np.shape[0]):
-            step0 = act_np[row].ravel()
-            policy_adim = step0.shape[0]
-            out = np.zeros(action_dim, dtype=np.float64)
+        for row in range(b):
+            out = np.zeros((t_steps, action_dim), dtype=np.float64)
             n = min(action_dim, policy_adim)
-            out[:n] = step0[:n].astype(np.float64)
+            out[:, :n] = act_np[row, :, :n].astype(np.float64)
             outs.append(out)
         return outs
 
 
-def make_handler(
-    action_dim: int,
-    policy: PolicyFn,
-    rng: np.random.Generator,
-    opentau_runner: Optional[OpenTauRoboCasaPolicy] = None,
-):
-    """Build the asyncio WebSocket handler for single and batched policy requests.
-
-    Args:
-        action_dim: Expected flat action size for validation and zero-fill on errors.
-        policy: Callable used when ``opentau_runner`` is None (stub or custom).
-        rng: NumPy generator passed to ``policy`` for stochastic stubs.
-        opentau_runner: If set, batch paths use ``OpenTauRoboCasaPolicy.infer_batch``
-            for efficiency; otherwise batch is looped with ``policy``.
-
-    Returns:
-        An async function suitable for ``websockets.serve`` that reads MessagePack
-        frames and sends MessagePack-encoded actions.
-    """
-
+def make_handler(action_dim: int, runner: OpenTauRoboCasaPolicy):
     async def _handler(websocket: Any):
-        """Handle one WebSocket connection: MessagePack in, MessagePack actions out."""
-
         async for message in websocket:
             try:
                 data = msgpack.unpackb(message, raw=False)
@@ -601,25 +379,12 @@ def make_handler(
                         images_rgb = decode_all_images(images_jpeg)
                         decoded.append((images_rgb, state, prompt))
 
-                    if opentau_runner is not None:
-                        actions_out = opentau_runner.infer_batch(decoded, action_dim)
-                    else:
-                        actions_out = []
-                        for images_rgb, state, prompt in decoded:
-                            action = policy(images_rgb, state, prompt, action_dim, rng)
-                            if action.shape[0] != action_dim:
-                                raise ValueError(
-                                    f"Policy returned shape {action.shape}, expected ({action_dim},)"
-                                )
-                            actions_out.append(action)
-
+                    actions_out = runner.infer_batch(decoded, action_dim)
                     await websocket.send(pack_actions_batch(actions_out))
                 else:
                     images_jpeg, state, prompt = unpack_payload_dict(data)
                     images_rgb = decode_all_images(images_jpeg)
-                    action = policy(images_rgb, state, prompt, action_dim, rng)
-                    if action.shape[0] != action_dim:
-                        raise ValueError(f"Policy returned shape {action.shape}, expected ({action_dim},)")
+                    action = runner.infer(images_rgb, state, prompt, action_dim)
                     await websocket.send(pack_action(action))
             except Exception as e:
                 logger.exception("Policy step failed: %s", e)
@@ -630,71 +395,24 @@ def make_handler(
                 if isinstance(data, dict) and data.get("batch") is True:
                     items = data.get("items") if isinstance(data.get("items"), list) else []
                     n = len(items)
-                    zeros = [np.zeros(action_dim, dtype=np.float64).tolist() for _ in range(n)]
-                    await websocket.send(msgpack.packb(zeros, use_bin_type=True))
+                    zero_chunk = [[0.0] * action_dim for _ in range(_ERROR_RESPONSE_CHUNK_STEPS)]
+                    await websocket.send(msgpack.packb([zero_chunk for _ in range(n)], use_bin_type=True))
                 else:
-                    await websocket.send(pack_action(np.zeros(action_dim, dtype=np.float64)))
+                    await websocket.send(
+                        pack_action(np.zeros((_ERROR_RESPONSE_CHUNK_STEPS, action_dim), dtype=np.float64))
+                    )
 
     return _handler
-
-
-def make_opentau_handler(runner: OpenTauRoboCasaPolicy) -> PolicyFn:
-    """Adapt ``OpenTauRoboCasaPolicy`` to the generic ``PolicyFn`` signature.
-
-    The returned callable ignores ``rng`` (deterministic inference).
-
-    Args:
-        runner: Loaded policy wrapper.
-
-    Returns:
-        A ``PolicyFn`` that forwards to ``OpenTauRoboCasaPolicy.infer``.
-    """
-
-    def _policy(
-        images_rgb: Dict[str, np.ndarray],
-        state: np.ndarray,
-        prompt: str,
-        adim: int,
-        rng: np.random.Generator,
-    ) -> np.ndarray:
-        """Single-env policy shim; ``rng`` is unused."""
-
-        del rng
-        return runner.infer(images_rgb, state, prompt, adim)
-
-    return _policy
 
 
 async def run_server(
     host: str,
     port: int,
     action_dim: int,
-    policy: Optional[PolicyFn] = None,
-    seed: int = 0,
-    opentau_runner: Optional[OpenTauRoboCasaPolicy] = None,
+    runner: OpenTauRoboCasaPolicy,
 ) -> None:
-    """Start the WebSocket server and block until the process is interrupted.
-
-    Args:
-        host: Bind address (e.g. ``0.0.0.0``).
-        port: TCP port.
-        action_dim: Flat action dimension for validation and error fallbacks.
-        policy: Policy callable for non-OpenTau or stub mode; defaults to
-            ``policy_forward``.
-        seed: Seed for the numpy RNG used by stub / default policy.
-        opentau_runner: When non-None, batched requests use ``infer_batch`` on this
-            object; single requests still go through ``policy`` (typically from
-            ``make_opentau_handler``).
-
-    Note:
-        Uses ``ping_timeout=None`` and ``max_size=None`` for large payloads and
-        long inference times. Runs until cancelled (infinite ``asyncio.Future``).
-    """
-    rng = np.random.default_rng(seed)
-    pol: PolicyFn = policy if policy is not None else policy_forward
-
     async with websockets.serve(
-        make_handler(action_dim, pol, rng, opentau_runner=opentau_runner),
+        make_handler(action_dim, runner),
         host,
         port,
         max_size=None,
@@ -709,55 +427,32 @@ async def run_server(
 
 @parser.wrap()
 def robocasa_async_main(cfg: TrainPipelineConfig) -> None:
-    """CLI entry: parse config, optionally load OpenTau policy, and run ``run_server``.
-
-    Honors module globals set by ``_parse_robocasa_cli`` (host, port, action
-    dimension, stub vs OpenTau, torch compile). When ``ROBOCASA_USE_STUB`` is True,
-    uses ``policy_forward``; otherwise builds ``OpenTauRoboCasaPolicy`` and
-    a handler from ``make_opentau_handler``.
-
-    Args:
-        cfg: Parsed ``TrainPipelineConfig`` from OpenTau's argparse (includes
-            ``policy``, ``seed``, etc.).
-    """
+    """Start the RoboCasa WebSocket policy server (single + batched) using OpenTau config parsing."""
     logging.basicConfig(level=logging.INFO)
     logging.info(
-        "%s\nRoboCasa globals: host=%s port=%s action_dim=%s torch_compile=%s use_stub=%s",
+        "%s\nRoboCasa globals: host=%s port=%s action_dim=%s torch_compile=%s",
         pformat(asdict(cfg)),
         ROBOCASA_HOST,
         ROBOCASA_PORT,
         ROBOCASA_ACTION_DIM,
         ROBOCASA_TORCH_COMPILE,
-        ROBOCASA_USE_STUB,
     )
 
     if cfg.seed is not None:
         set_seed(cfg.seed)
 
-    seed = int(cfg.seed) if cfg.seed is not None else 0
-
-    policy_fn: PolicyFn
-    runner: Optional[OpenTauRoboCasaPolicy] = None
-    if ROBOCASA_USE_STUB:
-        # policy to output random actions
-        policy_fn = policy_forward
-    else:
-        # initialize runner with loads model from config
-        runner = OpenTauRoboCasaPolicy(
-            cfg,
-            compile_model=ROBOCASA_TORCH_COMPILE,
-            seed=cfg.seed,
-        )
-        policy_fn = make_opentau_handler(runner)
+    runner = OpenTauRoboCasaPolicy(
+        cfg,
+        compile_model=ROBOCASA_TORCH_COMPILE,
+        seed=cfg.seed,
+    )
 
     asyncio.run(
         run_server(
             host=ROBOCASA_HOST,
             port=ROBOCASA_PORT,
             action_dim=ROBOCASA_ACTION_DIM,
-            policy=policy_fn,
-            seed=seed,
-            opentau_runner=runner,
+            runner=runner,
         )
     )
 
