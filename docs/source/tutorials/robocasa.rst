@@ -1,27 +1,34 @@
 .. _robocasa:
 
+.. _robocasa_client_gist: https://gist.github.com/akshay18iitg/4d299c135c2d384ceb9a283b745baa01
+
 RoboCasa setup and rollout client
 =================================
 
-This page explains how to set up **RoboCasa** (kitchen simulation) alongside **OpenTau**, run the **policy WebSocket server** that serves an OpenTau checkpoint, and run the **batched rollout client** that steps parallel MuJoCo environments and queries the policy in batches.
+This page explains how to set up **RoboCasa** (kitchen simulation) alongside **OpenTau**, run the **policy WebSocket server** that serves an OpenTau checkpoint, and run the **rollout client** against that server.
+
+The rollout client code **is not shipped in the OpenTau repository**. Use the reference implementation in `robocasa_client_gist`_ (RoboCasa policy client: ``client`` and ``client_async``).
 
 .. note::
-   Complete the base :doc:`/installation` steps first. RoboCasa itself is installed **outside** the OpenTau package; OpenTau provides the client and server glue only.
+   Complete the base :doc:`/installation` steps first. RoboCasa itself is installed **outside** the OpenTau package. OpenTau provides the **policy server**; you run the **client** inside your RoboCasa install (files from the gist, or equivalent).
 
 Overview
 --------
 
-The workflow is split across machines or terminals:
+The workflow is usually split across machines or terminals:
 
-1. **Simulation + client** — RoboCasa environments, JPEG encoding, and episode logging run where you have the ``robocasa`` Python package and assets (often the same machine as the server for local testing).
-2. **Policy server** — Loads ``policy.pretrained_path`` from an OpenTau training config and answers WebSocket requests with MessagePack-encoded actions.
+1. **OpenTau host** — runs the WebSocket policy server, loads ``policy.pretrained_path`` from a training config, and returns **action chunks** via MessagePack.
+2. **RoboCasa host** — runs the kitchen sim, JPEG-encodes cameras, and talks to the server. Parallel rollouts use a threaded **async** client that **batches** observations for workers that need a new chunk.
 
-OpenTau ships:
+**In this repo**
 
-* ``opentau.scripts.robocasa.server`` — async WebSocket server (single-observation and **batched** requests).
-* ``opentau.scripts.robocasa.client`` — threaded client that batches observations from multiple env workers per timestep.
+* ``opentau.scripts.robocasa.server`` — WebSocket server (single-observation or batched requests; replies are **action chunks** per request row).
 
-Dependencies used by these modules (``websockets``, ``msgpack``) are declared in OpenTau’s ``pyproject.toml``. The server also needs **OpenCV** for JPEG decode on the policy side (``opencv-python`` or ``opencv-python-headless`` is already a core OpenTau dependency).
+**Outside this repo**
+
+* ``robocasa.scripts.client`` / ``robocasa.scripts.client_async`` — reference rollout scripts from `robocasa_client_gist`_ (place them under your ``robocasa`` package tree or run them as you prefer).
+
+Server dependencies (``websockets``, ``msgpack``) are in OpenTau’s ``pyproject.toml``. The server needs **OpenCV** (``cv2``) to decode JPEG camera inputs.
 
 
 Prerequisites
@@ -34,25 +41,37 @@ Prerequisites
 
 **Python**
 
-* OpenTau currently targets **Python 3.10** (see ``requires-python`` in the repo root ``pyproject.toml``). Use the same interpreter for OpenTau and for the environment where you install RoboCasa, or ensure compatibility between the two stacks.
+* OpenTau targets **Python 3.10** (see ``requires-python`` in the repo root ``pyproject.toml``). Match or reconcile Python versions with your RoboCasa environment.
 
 **RoboCasa simulation**
 
-RoboCasa is not installed by ``pip install opentau``. Install the simulator and assets from the **upstream project**:
+RoboCasa is not fully installed by ``pip install opentau``. Install the simulator and assets from upstream:
 
 * `RoboCasa installation <https://robocasa.ai/docs/introduction/installation.html>`_
 
-Typical steps include installing ``robosuite`` (often from source), then ``robocasa`` in editable mode, then running asset download scripts (kitchen assets can be large). Always refer to the official docs for the version you use.
-
 **OpenTau**
 
-Install OpenTau from source or PyPI as in :doc:`/installation`. Ensure your environment has the packages required by the scripts above (sync with ``uv sync`` or ``pip install -e .`` from the repo).
+Install OpenTau as in :doc:`/installation` (e.g. ``uv sync`` or ``pip install -e .``).
 
 
 Policy server (OpenTau)
 -----------------------
 
-The server listens on a WebSocket port and speaks MessagePack. It accepts either a **single** observation dict or a **batch** payload ``{ "batch": true, "items": [ ... ] }`` for parallel clients.
+The server listens on WebSocket and uses **MessagePack** for request and response bodies.
+
+**Inference**
+
+* Each successful call uses ``policy.sample_actions`` (not ``select_action``): the model predicts a **temporal chunk** of actions. The last dimension is trimmed or zero-padded to ``--robocasa_action_dim``.
+
+**Requests**
+
+* **Single observation:** top-level dict with ``images`` (JPEG bytes per camera name), ``state`` (list of floats), ``prompt`` (string).
+* **Batch:** ``{ "batch": true, "items": [ { ... same fields ... }, ... ] }``.
+
+**Responses**
+
+* **Single:** one chunk as nested lists: ``[[float, ...], ...]`` — shape ``(T, action_dim)`` with ``T`` equal to the policy’s predicted horizon (e.g. ``n_action_steps``).
+* **Batch:** ``[ chunk_0, chunk_1, ... ]`` — one chunk per ``items`` row, same order.
 
 **Entry point**
 
@@ -74,13 +93,11 @@ The server listens on a WebSocket port and speaks MessagePack. It accepts either
    * - ``--robocasa_port``
      - TCP port (default ``8765``).
    * - ``--robocasa_action_dim``
-     - Flat action size passed to the policy and validation (default ``16``; align with your RoboCasa / training setup).
+     - Flat action width for reply padding/trimming (default ``16``; align with RoboCasa env and training).
    * - ``--robocasa_torch_compile``
      - ``true`` / ``false`` — whether to compile ``sample_actions`` when supported (default ``true``).
-   * - ``--robocasa_use_stub``
-     - ``true`` to use a small random policy instead of loading ``policy.pretrained_path`` (useful for wiring tests without weights).
 
-**Example** with explicit host and port:
+**Example**
 
 .. code-block:: bash
 
@@ -90,88 +107,56 @@ The server listens on a WebSocket port and speaks MessagePack. It accepts either
        --robocasa_action_dim 16 \
        --config_path /path/to/train_config.json
 
-The training config must define ``policy.pretrained_path`` and compatible policy settings unless you use ``--robocasa_use_stub=true``.
+The training config must define ``policy.pretrained_path`` and settings compatible with your checkpoint.
 
 
-Rollout client (RoboCasa + OpenTau)
------------------------------------
+Rollout client (RoboCasa environment)
+-------------------------------------
 
-Copy the code from `opentau.scripts.robocasa.client` to `robocasa.scripts.client` and modify the code to fit the needs. Run the following command in robocasa environment:
+Get the client sources from `robocasa_client_gist`_.
 
-Add this function in `robocasa.utils.env_utils`:
+Typical layout after copying into a RoboCasa checkout:
 
-.. code-block:: python
+* ``robocasa/scripts/client.py`` — single-env style client (if provided in the gist).
+* ``robocasa/scripts/client_async.py`` — threaded client that **batches** observations for workers that need a **new action chunk**, sends one WebSocket message per batch, receives one chunk per batch row, then **steps the simulator for every action in each chunk** before querying the server again.
 
-    def convert_action_pi05(action):
-        """
-        Converts input action (np.array) to format expected by gym env (dict)
-        """
-        action = action.copy()
-        output_action = {
-            "action.end_effector_position": action[5:8],
-            "action.end_effector_rotation": action[8:11],
-            "action.gripper_close": action[11:12],
-            "action.base_motion": action[0:4],
-            "action.control_mode": action[4:5],
-        }
-        return np.concatenate([v for k,v in output_action.items()], axis=-1)
+If your PandaOmron-style env expects actions in a particular layout, the gist may include a ``convert_action_pi05`` helper (or equivalent); wire it to match ``create_env`` / your task.
 
-Run the client **after** the server is listening. It registers a RoboCasa task name, spawns one thread per parallel worker (up to ``--num-parallel``), batches observations for each timestep, and writes ``rollouts.json`` plus optional per-camera videos.
-
-**Entry point**
+**Example (async / batched client)**
 
 .. code-block:: bash
 
-   python -m opentau.scripts.robocasa.client ENV_NAME \
+   python -m robocasa.scripts.client_async ENV_NAME \
        --host localhost \
        --port 8765
 
-Replace ``ENV_NAME`` with a registered RoboCasa kitchen task class name (same as other RoboCasa tooling).
+Replace ``ENV_NAME`` with a registered RoboCasa kitchen task. Common options (see the gist for the exact CLI):
 
-**Useful options**
+* ``--num-rollouts`` — total episodes.
+* ``--num-parallel`` — parallel env threads (batch size is at most the count of workers requesting a chunk at once).
+* ``--seed``, ``--split``, ``--output-dir``, ``--max-episode-steps``, ``--render``, ``--jpeg-quality``.
 
-.. list-table::
-   :header-rows: 1
-   :widths: 28 72
+**Environment variables** (if supported by the gist client)
 
-   * - Option
-     - Meaning
-   * - ``--num-rollouts``
-     - Total episodes (default ``1``).
-   * - ``--num-parallel``
-     - Parallel env threads (capped by ``--num-rollouts``); batch size per step is at most this value.
-   * - ``--seed``
-     - Base seed; rollout ``i`` uses ``seed + i``.
-   * - ``--split``
-     - Dataset split for ``create_env`` (``all``, ``pretrain``, or ``target``).
-   * - ``--output-dir``
-     - Root for ``rollouts.json`` and ``rollout_*_seed_*`` video folders (default: auto-generated under cwd).
-   * - ``--max-episode-steps``
-     - Step cap per episode (default ``1500``).
-   * - ``--render``
-     - On-screen rendering; disables saved videos.
-
-**Environment variables**
-
-* ``ROBOCASA_POLICY_HOST`` — default for ``--host`` (default ``localhost``).
-* ``ROBOCASA_POLICY_PORT`` — default for ``--port`` (default ``8765``).
+* ``ROBOCASA_POLICY_HOST`` — default host.
+* ``ROBOCASA_POLICY_PORT`` — default port.
 
 
-Protocol and outputs (short)
+Protocol and outputs (summary)
 ------------------------------
 
-* **Transport:** WebSocket binary frames, MessagePack payloads.
-* **Client → server (batched):** ``{ "batch": true, "items": [ { "images": { camera_name: jpeg_bytes, ... }, "state": [...], "prompt": "..." }, ... ] }``.
-* **Server → client:** A list of flat action lists, one per item, same order as ``items``.
-* **Client output:** A directory containing ``rollouts.json`` (summary and per-rollout ``seed``, ``length``, ``success``) and, when not using ``--render``, MP4 files per camera under ``rollout_*`` subfolders.
+* **Transport:** WebSocket binary frames, MessagePack.
+* **Client → server (batch):** ``{ "batch": true, "items": [ { "images": {...}, "state": [...], "prompt": "..." }, ... ] }``.
+* **Server → client (batch):** list of action chunks; each chunk is ``(T, action_dim)`` as nested lists.
+* **Rollout output:** directory with ``rollouts.json`` and, when not rendering on screen, per-rollout MP4s per camera (behavior as implemented in the gist).
 
-For full behavioral details (variable batch size as workers finish, JPEG quality, ``ping_timeout``), see the module docstrings in ``src/opentau/scripts/robocasa/client.py`` and ``src/opentau/scripts/robocasa/server.py``.
+For server implementation details, see ``src/opentau/scripts/robocasa/server.py``. For client behavior and options, see `robocasa_client_gist`_.
 
 
 Troubleshooting
 ---------------
 
-* **Import errors for ``robocasa``** — Install and register RoboCasa per upstream docs; the client imports ``robocasa`` and ``robocasa.utils.env_utils``.
-* **Server fails on JPEG decode** — Install OpenCV for Python on the server host (``cv2``); without it, JPEG decoding raises at runtime.
-* **Port already in use** — Change ``--robocasa_port`` / ``--port`` or stop the conflicting process.
-* **Action dimension mismatches** — Align ``--robocasa_action_dim`` with the policy and environment (e.g. PandaOmron / ``convert_action_pi05`` expectations in the client).
+* **Import errors for ``robocasa``** — Install RoboCasa per upstream docs; run the client from that environment.
+* **Server JPEG decode errors** — Install OpenCV for Python on the server (``cv2``).
+* **Port in use** — Change ``--robocasa_port`` / client ``--port``.
+* **Action shape / chunk mismatch** — Align ``--robocasa_action_dim`` with training and env; ensure the client consumes **chunks** (multiple steps per server reply) if you use chunking inference.
