@@ -114,6 +114,8 @@ from opentau.datasets.utils import (
     DEFAULT_IMAGE_PATH,
     INFO_PATH,
     TASKS_PATH,
+    DeltaTimestampInfo,
+    DeltaTimestampParam,
     append_jsonlines,
     backward_compatible_episodes_stats,
     check_timestamps_sync,
@@ -216,7 +218,7 @@ class DatasetMetadata:
         repo_id: Repository ID of the dataset (set by subclasses).
     """
 
-    def __init__(self, *, info: dict = None, stats: dict = None):
+    def __init__(self, *, info: dict | None = None, stats: dict | None = None):
         self.info = info or {"features": {}}
         self.stats = stats or {}
 
@@ -226,7 +228,7 @@ class DatasetMetadata:
                     self.stats[feature_name][metric] = np.array(self.stats[feature_name][metric])
                 # TODO: check stats[feature_name][metric].shape is broadcastable with features[feature_name]["shape"]
 
-        self.repo_id = None
+        self.repo_id: str | None = None
 
     @property
     def features(self) -> dict[str, dict]:
@@ -344,12 +346,14 @@ class LeRobotDatasetMetadata(DatasetMetadata):
         Loads info, tasks, episodes, statistics, and advantages from the
         dataset root directory. Handles version compatibility checks.
         """
+        assert self.repo_id is not None
         self.info = load_info(self.root)
         check_version_compatibility(self.repo_id, self._version, CODEBASE_VERSION)
         self.tasks, self.task_to_task_index = load_tasks(self.root)
         self.episodes = load_episodes(self.root)
         if self._version < packaging.version.parse("v2.1"):
             self.stats = load_stats(self.root)
+            assert self.stats is not None
             self.episodes_stats = backward_compatible_episodes_stats(self.stats, self.episodes)
         else:
             self.episodes_stats = load_episodes_stats(self.root)
@@ -362,6 +366,7 @@ class LeRobotDatasetMetadata(DatasetMetadata):
         allow_patterns: list[str] | str | None = None,
         ignore_patterns: list[str] | str | None = None,
     ) -> None:
+        assert self.repo_id is not None
         snapshot_download(
             self.repo_id,
             repo_type="dataset",
@@ -400,6 +405,7 @@ class LeRobotDatasetMetadata(DatasetMetadata):
             Path to the video file for the episode.
         """
         ep_chunk = self.get_episode_chunk(ep_index)
+        assert self.video_path is not None
         fpath = self.video_path.format(episode_chunk=ep_chunk, video_key=vid_key, episode_index=ep_index)
         return Path(fpath)
 
@@ -1013,6 +1019,7 @@ class LeRobotDataset(BaseDataset):
         # Unused attributes
         self.image_writer = None
         self.episode_buffer = None
+        self.skip_video_stats = False
 
         self.root.mkdir(exist_ok=True, parents=True)
 
@@ -1136,7 +1143,7 @@ class LeRobotDataset(BaseDataset):
 
         self.pull_from_repo(allow_patterns=files, ignore_patterns=ignore_patterns)
 
-    def get_episodes_file_paths(self) -> list[Path]:
+    def get_episodes_file_paths(self) -> list[str]:
         """Get file paths for all selected episodes.
 
         Returns paths for both parquet data files and video files (if applicable)
@@ -1178,7 +1185,7 @@ class LeRobotDataset(BaseDataset):
         """
         features = get_hf_features_from_features(self.features)
         ft_dict = {col: [] for col in features}
-        hf_dataset = datasets.Dataset.from_dict(ft_dict, features=features, split="train")
+        hf_dataset = datasets.Dataset.from_dict(ft_dict, features=features, split=datasets.Split.TRAIN)
 
         # TODO(aliberts): hf_dataset.set_format("torch")
         hf_dataset.set_transform(hf_transform_to_torch)
@@ -1213,7 +1220,7 @@ class LeRobotDataset(BaseDataset):
 
     def _get_query_indices_soft(
         self, idx: int, ep_idx: int
-    ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    ) -> tuple[dict[str, np.ndarray], dict[str, torch.Tensor]]:
         """Get soft (float) indices for querying features with delta timestamps.
 
         Computes indices for features based on delta timestamps, accounting for
@@ -1237,7 +1244,9 @@ class LeRobotDataset(BaseDataset):
             key: np.clip(idx + delta_idx, ep_start, ep_end - 1) for key, delta_idx in delta_indices.items()
         }
         padding = {  # Pad values outside of current episode range
-            f"{key}_is_pad": torch.BoolTensor((idx + delta_idx < ep_start) | (idx + delta_idx >= ep_end))
+            f"{key}_is_pad": torch.tensor(
+                (idx + delta_idx < ep_start) | (idx + delta_idx >= ep_end), dtype=torch.bool
+            )
             for key, delta_idx in delta_indices.items()
         }
         return query_indices, padding
@@ -1399,7 +1408,9 @@ class LeRobotDataset(BaseDataset):
         ep_idx = item["episode_index"].item()
 
         if self.episode_data_index is not None and self.epi2idx is not None:
-            ep_end = self.episode_data_index["to"][self.epi2idx[ep_idx]].item()
+            ep_end = int(self.episode_data_index["to"][self.epi2idx[ep_idx]].item())
+        else:
+            ep_end = 0
 
         episodes_info = self.meta.episodes[ep_idx]
 
@@ -1581,8 +1592,9 @@ class LeRobotDataset(BaseDataset):
                 save the current episode in self.episode_buffer, which is filled with 'add_frame'. Defaults to
                 None.
         """
-        if not episode_data:
-            episode_buffer = self.episode_buffer
+        episode_buffer = self.episode_buffer if episode_data is None else episode_data
+        if episode_buffer is None:
+            raise RuntimeError("No episode data provided and no episode buffer exists. Call add_frame first.")
 
         validate_episode_buffer(episode_buffer, self.meta.total_episodes, self.features)
 
@@ -1665,7 +1677,9 @@ class LeRobotDataset(BaseDataset):
 
     def _save_episode_table(self, episode_buffer: dict, episode_index: int) -> None:
         episode_dict = {key: episode_buffer[key] for key in self.hf_features}
-        ep_dataset = datasets.Dataset.from_dict(episode_dict, features=self.hf_features, split="train")
+        ep_dataset = datasets.Dataset.from_dict(
+            episode_dict, features=self.hf_features, split=datasets.Split.TRAIN
+        )
         ep_dataset = embed_images(ep_dataset)
         self.hf_dataset = concatenate_datasets([self.hf_dataset, ep_dataset])
         self.hf_dataset.set_transform(hf_transform_to_torch)
@@ -1674,6 +1688,8 @@ class LeRobotDataset(BaseDataset):
         ep_dataset.to_parquet(ep_data_path)
 
     def clear_episode_buffer(self) -> None:
+        if self.episode_buffer is None:
+            return
         episode_index = self.episode_buffer["episode_index"]
         if self.image_writer is not None:
             for cam_key in self.meta.camera_keys:
@@ -1742,11 +1758,11 @@ class LeRobotDataset(BaseDataset):
 
     @staticmethod
     def compute_delta_params(
-        mean: dict[str, np.ndarray | list[float]],
-        std: dict[str, np.ndarray | list[float]],
-        lower: dict[str, np.ndarray | list[float]],
-        upper: dict[str, np.ndarray | list[float]],
-    ):
+        mean: dict[str, np.ndarray | list[float]] | None,
+        std: dict[str, np.ndarray | list[float]] | None,
+        lower: dict[str, np.ndarray | list[float]] | None,
+        upper: dict[str, np.ndarray | list[float]] | None,
+    ) -> DeltaTimestampInfo:
         r"""Process the parameters `mean`, `std`, `lower` and `upper` for delta timestamps.
 
         Delta timestamps are computed dynamically in ``__getitem__`` with
@@ -1765,26 +1781,32 @@ class LeRobotDataset(BaseDataset):
         std, -inf / +inf for bounds).
         """
         inf = float("inf")
-        mean = mean or {}
-        mean = {k: np.array(v) for k, v in mean.items()}
+        mean_np: DeltaTimestampParam = {k: np.array(v) for k, v in (mean or {}).items()}
 
-        std = std or {}
-        std = {k: np.array(std.get(k) or np.zeros_like(v)) for k, v in mean.items()}
+        std_raw = std or {}
+        std_np: DeltaTimestampParam = {
+            k: np.array(std_raw.get(k) or np.zeros_like(v)) for k, v in mean_np.items()
+        }
 
-        lower = lower or {}
-        lower = {k: np.array(lower.get(k) or (np.zeros_like(v) - inf)) for k, v in mean.items()}
+        lower_raw = lower or {}
+        lower_np: DeltaTimestampParam = {
+            k: np.array(lower_raw.get(k) or (np.zeros_like(v) - inf)) for k, v in mean_np.items()
+        }
 
-        upper = upper or {}
-        upper = {k: np.array(upper.get(k) or (np.zeros_like(v) + inf)) for k, v in mean.items()}
+        upper_raw = upper or {}
+        upper_np: DeltaTimestampParam = {
+            k: np.array(upper_raw.get(k) or (np.zeros_like(v) + inf)) for k, v in mean_np.items()
+        }
 
-        for k in mean:
-            if not (mean[k].shape == std[k].shape == lower[k].shape == upper[k].shape):
+        for k in mean_np:
+            if not (mean_np[k].shape == std_np[k].shape == lower_np[k].shape == upper_np[k].shape):
                 raise ValueError(
                     f"Delta timestamps parameters for {k} have inconsistent shapes: "
-                    f"mean={mean[k].shape}, std={std[k].shape}, lower={lower[k].shape}, upper={upper[k].shape}"
+                    f"mean={mean_np[k].shape}, std={std_np[k].shape}, "
+                    f"lower={lower_np[k].shape}, upper={upper_np[k].shape}"
                 )
 
-        return mean, std, lower, upper
+        return mean_np, std_np, lower_np, upper_np
 
     @classmethod
     def create(

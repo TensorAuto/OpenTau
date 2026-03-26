@@ -113,6 +113,7 @@ def resolve_delta_timestamps(
     delta_timestamps: dict[str, list[float]] = {}
     action_freq = cfg.dataset_mixture.action_freq
 
+    assert dataset_cfg.repo_id is not None
     name_map = DATA_FEATURES_NAME_MAPPING[dataset_cfg.repo_id]
     reverse_name_map = {v: k for k, v in name_map.items()}
     for key in ds_meta.features:
@@ -120,7 +121,11 @@ def resolve_delta_timestamps(
             continue  # only process camera, state, and action features
 
         standard_key = reverse_name_map[key]
-        if standard_key == "actions" and cfg.policy.action_delta_indices is not None:
+        if (
+            standard_key == "actions"
+            and cfg.policy is not None
+            and cfg.policy.action_delta_indices is not None
+        ):
             delta_timestamps[key] = [i / action_freq for i in cfg.policy.action_delta_indices]
         elif "camera" in standard_key or standard_key == "state":
             delta_timestamps[key] = [0.0]
@@ -184,9 +189,18 @@ def make_dataset(
             vector_resample_strategy=train_cfg.dataset_mixture.vector_resample_strategy,
             return_advantage_input=return_advantage_input,
         )
+    else:
+        raise ValueError("Exactly one of `cfg.vqa` and `cfg.repo_id` should be provided.")
 
     # TODO vqa datasets implement stats in original feature names, but camera_keys are standardized names
-    if not isinstance(cfg.vqa, str) and "dummy" not in cfg.repo_id and cfg.use_imagenet_stats:
+    if (
+        not isinstance(cfg.vqa, str)
+        and isinstance(cfg.repo_id, str)
+        and "dummy" not in cfg.repo_id
+        and cfg.use_imagenet_stats
+    ):
+        if dataset.meta.stats is None:
+            dataset.meta.stats = {}
         for key in dataset.meta.camera_keys:
             for stats_type, stats in IMAGENET_STATS.items():
                 if key not in dataset.meta.stats:
@@ -197,9 +211,9 @@ def make_dataset(
         val_size = int(len(dataset) * cfg.val_split_ratio)
         train_size = len(dataset) - val_size
         train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
-        train_dataset.meta = copy.deepcopy(dataset.meta)
-        val_dataset.meta = copy.deepcopy(dataset.meta)
-        return train_dataset, val_dataset
+        train_dataset.meta = copy.deepcopy(dataset.meta)  # type: ignore[assignment]
+        val_dataset.meta = copy.deepcopy(dataset.meta)  # type: ignore[assignment]
+        return train_dataset, val_dataset  # type: ignore[return-value]
 
     return dataset
 

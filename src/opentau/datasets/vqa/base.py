@@ -115,6 +115,9 @@ class VQADataset(BaseDataset):
         metadata.repo_id = self._get_feature_mapping_key()
         return metadata
 
+    def __len__(self) -> int:
+        return self.num_frames
+
     @abstractmethod
     def __getitem_helper__(self, item) -> dict:
         """Helper method to get a dataset item (to be implemented by subclasses).
