@@ -25,6 +25,7 @@ from opentau.configs.default import DatasetConfig, DatasetMixtureConfig
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.factory import resolve_delta_timestamps
+from opentau.datasets.lerobot_dataset import BaseDataset
 from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
 from opentau.datasets.transforms import ImageTransformsConfig
 from tests.fixtures.constants import DUMMY_REPO_ID
@@ -334,3 +335,72 @@ def test_obs_history_is_pad_fallback_shape(lerobot_dataset_factory, info_factory
     )
     assert item["obs_history_is_pad"].dtype == torch.bool
     assert not item["obs_history_is_pad"].any()
+
+
+# ---------------------------------------------------------------------------
+# Batched resize_with_pad tests
+# ---------------------------------------------------------------------------
+
+
+class TestResizeWithPadBatch:
+    """Verify that batched (T,C,H,W) resize_with_pad matches per-frame results."""
+
+    @staticmethod
+    def _resize(img, width, height, pad_value=0):
+        return BaseDataset.resize_with_pad(None, img, width, height, pad_value)
+
+    @pytest.mark.parametrize(
+        "src_hw, target_hw",
+        [
+            ((64, 64), (48, 48)),  # square -> square
+            ((120, 80), (48, 64)),  # portrait -> landscape
+            ((80, 120), (64, 48)),  # landscape -> portrait
+            ((100, 200), (48, 48)),  # wide -> square
+            ((200, 100), (48, 48)),  # tall -> square
+        ],
+        ids=["square", "portrait-to-landscape", "landscape-to-portrait", "wide-to-square", "tall-to-square"],
+    )
+    @pytest.mark.parametrize("T", [1, 3, 7])
+    def test_batch_matches_per_frame(self, src_hw, target_hw, T):  # noqa: N803
+        C = 3  # noqa: N806
+        h, w = src_hw
+        target_h, target_w = target_hw
+        imgs = torch.rand(T, C, h, w)
+
+        batched_result = self._resize(imgs, target_w, target_h)
+
+        per_frame = torch.stack(
+            [self._resize(imgs[t], target_w, target_h) for t in range(T)],
+            dim=0,
+        )
+
+        assert batched_result.shape == (T, C, target_h, target_w)
+        assert per_frame.shape == (T, C, target_h, target_w)
+        assert torch.allclose(batched_result, per_frame), (
+            f"Max diff: {(batched_result - per_frame).abs().max().item()}"
+        )
+
+    def test_single_frame_output_is_3d(self):
+        img = torch.rand(3, 100, 80)
+        result = self._resize(img, 48, 64)
+        assert result.shape == (3, 64, 48)
+
+    def test_batched_output_is_4d(self):
+        imgs = torch.rand(5, 3, 100, 80)
+        result = self._resize(imgs, 48, 64)
+        assert result.shape == (5, 3, 64, 48)
+
+    def test_t1_batched_stays_4d(self):
+        imgs = torch.rand(1, 3, 100, 80)
+        result = self._resize(imgs, 48, 64)
+        assert result.ndim == 4
+        assert result.shape == (1, 3, 64, 48)
+
+    def test_invalid_ndim_raises(self):
+        with pytest.raises(ValueError, match="Expected"):
+            self._resize(torch.rand(100, 80), 48, 64)
+
+    def test_pad_value_propagated(self):
+        img = torch.zeros(3, 100, 200)
+        result = self._resize(img, 48, 48, pad_value=1.0)
+        assert result.max() == 1.0, "Padding region should contain pad_value"

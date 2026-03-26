@@ -669,11 +669,13 @@ class BaseDataset(torch.utils.data.Dataset):
                     standard_item[std_key] = torch.zeros((3, *self.resolution))
                 image_is_pad.append(True)
             elif self.n_obs_history is not None:
-                frames = [
-                    self.resize_with_pad(item[key][t], self.resolution[1], self.resolution[0], pad_value=0)
-                    for t in range(item[key].shape[0])
-                ]
-                standard_item[std_key] = torch.stack(frames, dim=0)
+                standard_item[std_key] = self.resize_with_pad(
+                    item[key], self.resolution[1], self.resolution[0], pad_value=0
+                )
+                # Per-frame temporal padding info (from clamped episode boundaries) is
+                # tracked by obs_history_is_pad on the state side. Camera _is_pad only
+                # indicates whether the entire camera slot is absent, so we always mark
+                # a present camera as not padded regardless of frame-level clamping.
                 image_is_pad.append(False)
             else:
                 standard_item[std_key] = self.resize_with_pad(
@@ -759,21 +761,23 @@ class BaseDataset(torch.utils.data.Dataset):
         then pads on the left and top to reach exact target size.
 
         Args:
-            img: Input image tensor of shape (C, H, W).
+            img: Input image tensor of shape (C, H, W) or (T, C, H, W).
             width: Target width.
             height: Target height.
             pad_value: Value to use for padding. Defaults to 0.
 
         Returns:
-            Resized and padded image tensor of shape (C, height, width).
+            Resized and padded image tensor of shape (C, height, width) or
+            (T, C, height, width), matching the input rank.
 
         Raises:
-            ValueError: If input image doesn't have 4 dimensions when reshaped.
+            ValueError: If input is not 3D or 4D.
         """
-        # assume no-op when width height fits already
-        img = rearrange(img, "c h w -> 1 c h w")
+        batched = img.ndim == 4
+        if not batched:
+            img = img.unsqueeze(0)
         if img.ndim != 4:
-            raise ValueError(f"(b,c,h,w) expected, but {img.shape}")
+            raise ValueError(f"Expected (C,H,W) or (T,C,H,W), got shape {img.shape}")
 
         cur_height, cur_width = img.shape[2:]
 
@@ -787,11 +791,10 @@ class BaseDataset(torch.utils.data.Dataset):
         pad_height = max(0, int(height - resized_height))
         pad_width = max(0, int(width - resized_width))
 
-        # pad on left and top of image
         padded_img = F.pad(resized_img, (pad_width, 0, pad_height, 0), value=pad_value)
 
-        # rearrange back to (c, h, w)
-        padded_img = rearrange(padded_img, "1 c h w -> c h w")
+        if not batched:
+            padded_img = padded_img.squeeze(0)
         return padded_img
 
     @staticmethod

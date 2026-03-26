@@ -131,7 +131,11 @@ class DatasetMixtureConfig:
         n_obs_history: Number of historical observation steps to include. When
             set to ``T``, each camera returns shape ``(T, C, H, W)`` and state
             returns shape ``(T, max_state_dim)``. When ``None``, the default
-            single-step behavior is preserved. Defaults to ``None``.
+            single-step behavior is preserved with rank-3 camera tensors
+            ``(C, H, W)`` and rank-1 state tensors ``(max_state_dim,)``.
+            Note that ``n_obs_history=1`` produces rank-4/rank-2 tensors with
+            a leading singleton dimension, so downstream consumers must handle
+            both rank conventions. Defaults to ``None``.
         history_interval: Step interval between historical observation steps.
             Must be a positive integer. When ``n_obs_history=T`` and
             ``history_interval=k``, observations are sampled at timesteps

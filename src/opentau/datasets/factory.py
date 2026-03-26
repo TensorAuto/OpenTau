@@ -132,8 +132,8 @@ def resolve_delta_timestamps(
         elif "camera" in standard_key or standard_key == "state":
             n_obs = cfg.dataset_mixture.n_obs_history
             if n_obs is not None:
-                k = cfg.dataset_mixture.history_interval
-                delta_timestamps[key] = [-(n_obs - 1 - i) * k / action_freq for i in range(n_obs)]
+                interval = cfg.dataset_mixture.history_interval
+                delta_timestamps[key] = [-(n_obs - 1 - i) * interval / action_freq for i in range(n_obs)]
             else:
                 delta_timestamps[key] = [0.0]
 

@@ -304,11 +304,17 @@ def check_standard_data_format(item, delta_timestamps_params, dataset, train_pip
     # the keys in standard data format + tensor shape
     if n_obs is not None:
         state_shape = (n_obs, train_pipeline_config.max_state_dim)
-        cam_shape_fn = lambda res: (n_obs, 3, *res)  # noqa: E731
+
+        def cam_shape_fn(res):
+            return (n_obs, 3, *res)
+
         obs_pad_shape = (n_obs,)
     else:
         state_shape = (train_pipeline_config.max_state_dim,)
-        cam_shape_fn = lambda res: (3, *res)  # noqa: E731
+
+        def cam_shape_fn(res):  # type: ignore[no-redef]
+            return (3, *res)
+
         obs_pad_shape = (1,)
 
     keys_shape_required = [
