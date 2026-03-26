@@ -312,3 +312,25 @@ def test_history_img_is_pad_unchanged(lerobot_dataset_factory, info_factory, tmp
     dataset = _make_dataset_with_history(lerobot_dataset_factory, info_factory, tmp_path, n_obs_history=3)
     item = dataset[25]
     assert item["img_is_pad"].shape == (dataset.cfg.num_cams,)
+
+
+def test_obs_history_is_pad_fallback_shape(lerobot_dataset_factory, info_factory, tmp_path):
+    """When state_is_pad is absent from item, obs_history_is_pad fallback must match (T,) shape."""
+    dataset = _make_dataset_with_history(
+        lerobot_dataset_factory, info_factory, tmp_path, n_obs_history=4, suffix="_no_state"
+    )
+
+    dt_mean, dt_std, dt_lower, dt_upper = dataset.delta_timestamps_params
+    dt_mean = {k: v for k, v in dt_mean.items() if k != "state"}
+    dt_std = {k: v for k, v in dt_std.items() if k != "state"}
+    dt_lower = {k: v for k, v in dt_lower.items() if k != "state"}
+    dt_upper = {k: v for k, v in dt_upper.items() if k != "state"}
+    dataset.delta_timestamps_params = (dt_mean, dt_std, dt_lower, dt_upper)
+
+    item = dataset[25]
+    assert "obs_history_is_pad" in item
+    assert item["obs_history_is_pad"].shape == (4,), (
+        f"Expected fallback shape (4,), got {item['obs_history_is_pad'].shape}"
+    )
+    assert item["obs_history_is_pad"].dtype == torch.bool
+    assert not item["obs_history_is_pad"].any()

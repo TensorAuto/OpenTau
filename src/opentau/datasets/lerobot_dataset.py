@@ -740,6 +740,8 @@ class BaseDataset(torch.utils.data.Dataset):
         state_pad_key = f"{state_raw_key}_is_pad" if state_raw_key else None
         if state_pad_key and state_pad_key in item:
             standard_item["obs_history_is_pad"] = item[state_pad_key]
+        elif self.n_obs_history is not None:
+            standard_item["obs_history_is_pad"] = torch.zeros(self.n_obs_history, dtype=torch.bool)
         else:
             standard_item["obs_history_is_pad"] = torch.tensor([False], dtype=torch.bool)
 
