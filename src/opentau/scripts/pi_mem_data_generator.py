@@ -25,9 +25,6 @@ Examples::
     export OPENAI_API_KEY=sk-...
     python -m opentau.scripts.pi_mem_data_generator task_segments.json
 
-    # Pass the key explicitly (overrides .env / environment):
-    python -m opentau.scripts.pi_mem_data_generator task_segments.json --api-key sk-...
-
     # Verify .env is found and OPENAI_API_KEY is loaded:
     python -m opentau.scripts.pi_mem_data_generator --check-env
 """
@@ -113,16 +110,13 @@ def _mask_api_key_preview(key: str) -> str:
     return f"prefix {key[:8]}… suffix …{key[-4:]} (length {n})"
 
 
-def _run_check_env(*, api_key_override: str | None) -> int:
+def _run_check_env() -> int:
     """Print whether ``.env`` and ``OPENAI_API_KEY`` are visible after the same load as a normal run."""
     dotenv_path = _resolve_dotenv_path()
     if dotenv_path is not None:
         print(f"OK: found .env at {dotenv_path}")
     else:
         print("No .env file in any parent directory of the script (only shell env applies).")
-
-    if api_key_override:
-        os.environ["OPENAI_API_KEY"] = api_key_override.strip()
 
     key = _normalize_openai_api_key()
     if key:
@@ -167,6 +161,10 @@ mention the success. Drop the resolved failure.
 """
 
 USER_PROMPT_TEMPLATE = """\
+Previous memory: {prev_memory}
+
+Task prompt: {task_prompt}
+
 Here is the complete log of actions executed so far:
 {subtask_log}
 
@@ -219,19 +217,27 @@ def _enrich_list(
     delay_s: float,
 ) -> None:
     """For each item, build a cumulative subtask log and request a memory summary."""
+    prev_memory = "(none)"
     for i, item in enumerate(data):
         if not isinstance(item, dict):
             raise ValueError(f"Item at index {i} must be an object, got {type(item).__name__}")
         if skip_existing and output_key in item and item[output_key]:
             logger.info("Skipping index %d (existing %s)", i, output_key)
+            prev_memory = item[output_key]
             continue
 
         subtask_log = _build_subtask_log(data, up_to=i)
-        user_content = USER_PROMPT_TEMPLATE.format(subtask_log=subtask_log)
+        task_prompt = item.get("prompt", "(not provided)")
+        user_content = USER_PROMPT_TEMPLATE.format(
+            prev_memory=prev_memory,
+            task_prompt=task_prompt,
+            subtask_log=subtask_log,
+        )
         logger.info("Calling API for item %d (subtask: %s)", i, item.get("subtask"))
-        item[output_key] = _call_openai(
+        prev_memory = _call_openai(
             client, model=model, system_prompt=system_prompt, user_content=user_content
         )
+        item[output_key] = prev_memory
         if delay_s > 0:
             time.sleep(delay_s)
 
@@ -267,7 +273,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--output-key",
         type=str,
-        default="up_to_date_memory",
+        default="memory",
         help="Key for per-field replies: a dict mapping each source field name to model text.",
     )
     p.add_argument(
@@ -281,31 +287,21 @@ def main(argv: list[str] | None = None) -> int:
         default=0.0,
         help="Seconds to sleep between API calls (rate limiting).",
     )
-    p.add_argument(
-        "--api-key",
-        type=str,
-        default=None,
-        help="OpenAI API key (default: OPENAI_API_KEY from .env or environment).",
-    )
     p.add_argument("-v", "--verbose", action="store_true", help="DEBUG logging")
     args = p.parse_args(argv)
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
 
     if args.check_env:
-        return _run_check_env(api_key_override=args.api_key)
+        return _run_check_env()
 
     if args.json_path is None:
         p.error("json_path is required (unless using --check-env)")
 
-    if args.api_key:
-        os.environ["OPENAI_API_KEY"] = args.api_key.strip()
-
     api_key = _normalize_openai_api_key()
     if not api_key:
         logger.error(
-            "Missing OPENAI_API_KEY. Put it in repo .env, export it, or pass --api-key. "
-            "Run with --check-env to diagnose.",
+            "Missing OPENAI_API_KEY. Put it in repo .env or export it. Run with --check-env to diagnose.",
         )
         return 1
 
