@@ -40,38 +40,10 @@ import time
 from pathlib import Path
 from typing import Any
 
-try:
-    from dotenv import load_dotenv
-except ImportError:
-    load_dotenv = None  # type: ignore[misc, assignment]
-
+from dotenv import load_dotenv
 from openai import OpenAI
 
 logger = logging.getLogger(__name__)
-
-
-def _apply_env_file_lines(path: Path, *, override: bool) -> None:
-    """Minimal ``.env`` reader when ``python-dotenv`` is not installed."""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as e:
-        logger.warning("Could not read %s: %s", path, e)
-        return
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[7:].strip()
-        if "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if not key:
-            continue
-        if override or key not in os.environ:
-            os.environ[key] = value
 
 
 def _resolve_dotenv_path() -> Path | None:
@@ -93,8 +65,6 @@ def _load_env_file() -> Path | None:
     if path is not None:
         if load_dotenv:
             load_dotenv(path, override=True)
-        else:
-            _apply_env_file_lines(path, override=True)
         logger.debug("Loaded environment file %s", path)
         return path
     if load_dotenv:
