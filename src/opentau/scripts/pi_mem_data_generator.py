@@ -1,0 +1,353 @@
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Enrich a JSON array with OpenAI chat completions (one call per field per object).
+
+Top-level JSON must be a **list of objects**. For each object, ``subtask`` and the
+indicator are read from that object: use ``indicator`` if present, otherwise
+``success``. Those keys are prepended to every user message and are not sent as
+separate per-field API calls. Replies go under ``memory`` as
+``{ field_name: model_reply, ... }``.
+
+Examples::
+
+    export OPENAI_API_KEY=sk-...
+    python -m opentau.scripts.pi_mem_data_generator task_segments.json
+
+    # Pass the key explicitly (overrides .env / environment):
+    python -m opentau.scripts.pi_mem_data_generator task_segments.json --api-key sk-...
+
+    # Verify .env is found and OPENAI_API_KEY is loaded:
+    python -m opentau.scripts.pi_mem_data_generator --check-env
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None  # type: ignore[misc, assignment]
+
+from openai import OpenAI
+
+logger = logging.getLogger(__name__)
+
+
+def _apply_env_file_lines(path: Path, *, override: bool) -> None:
+    """Minimal ``.env`` reader when ``python-dotenv`` is not installed."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        logger.warning("Could not read %s: %s", path, e)
+        return
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if not key:
+            continue
+        if override or key not in os.environ:
+            os.environ[key] = value
+
+
+def _resolve_dotenv_path() -> Path | None:
+    """First ``.env`` file found walking up from this script (repo root typically)."""
+    script = Path(__file__).resolve()
+    for d in (script.parent, *script.parents):
+        candidate = d / ".env"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _load_env_file() -> Path | None:
+    """Load ``.env`` walking up from this script; ``override=True`` so ``.env`` beats shell.
+
+    Returns the path to the loaded ``.env`` if found in the walk, else ``None``.
+    """
+    path = _resolve_dotenv_path()
+    if path is not None:
+        if load_dotenv:
+            load_dotenv(path, override=True)
+        else:
+            _apply_env_file_lines(path, override=True)
+        logger.debug("Loaded environment file %s", path)
+        return path
+    if load_dotenv:
+        load_dotenv(override=True)
+    return None
+
+
+def _mask_api_key_preview(key: str) -> str:
+    """Safe one-line description (never print the full key)."""
+    n = len(key)
+    if n <= 12:
+        return f"length {n} (too short to show prefix/suffix safely)"
+    return f"prefix {key[:8]}… suffix …{key[-4:]} (length {n})"
+
+
+def _run_check_env(*, api_key_override: str | None) -> int:
+    """Print whether ``.env`` and ``OPENAI_API_KEY`` are visible after the same load as a normal run."""
+    dotenv_path = _resolve_dotenv_path()
+    if dotenv_path is not None:
+        print(f"OK: found .env at {dotenv_path}")
+    else:
+        print("No .env file in any parent directory of the script (only shell env applies).")
+
+    if api_key_override:
+        os.environ["OPENAI_API_KEY"] = api_key_override.strip()
+
+    key = _normalize_openai_api_key()
+    if key:
+        print(f"OK: OPENAI_API_KEY is set — {_mask_api_key_preview(key)}")
+        return 0
+
+    print(
+        "FAIL: OPENAI_API_KEY missing or empty after load. "
+        "Use one line in .env: OPENAI_API_KEY=sk-... (no spaces around =).",
+    )
+    return 1
+
+
+def _normalize_openai_api_key() -> str | None:
+    raw = os.environ.get("OPENAI_API_KEY")
+    if raw is None:
+        return None
+    key = raw.strip().strip('"').strip("'")
+    if not key:
+        return None
+    os.environ["OPENAI_API_KEY"] = key
+    return key
+
+
+SYSTEM_PROMPT = """\
+You are the memory module of a robotic manipulation system. You receive a log \
+of subtasks that have ALREADY been executed and must produce a compact \
+plain-text summary.
+
+Critical rules:
+- ONLY mention actions that appear in the log below. If an action is not in \
+the log, it has NOT happened — do NOT mention it, do NOT infer it, do NOT \
+speculate about it. You have zero knowledge beyond the log entries provided.
+- Write simple, plain sentences. No bullet points, no numbered lists, \
+no labels, no markdown, no structured formatting.
+- If the same action failed earlier but succeeded later in the log, just \
+mention the success. Drop the resolved failure.
+- If a failure is the last entry for that action in the log, mention it.
+- Merge completed actions into short phrases where possible.
+- Omit timestamps.
+- Keep it under 50 words.\
+"""
+
+USER_PROMPT_TEMPLATE = """\
+Here is the complete log of actions executed so far:
+{subtask_log}
+
+Write a plain-text summary covering ONLY the actions listed above. \
+Do not mention or infer any action that is not in this log.\
+"""
+
+
+def _call_openai(
+    client: OpenAI,
+    *,
+    model: str,
+    system_prompt: str | None,
+    user_content: str,
+) -> str:
+    messages: list[dict[str, str]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": user_content})
+    resp = client.chat.completions.create(model=model, messages=messages)
+    choice = resp.choices[0].message
+    text = choice.content
+    if not text:
+        raise RuntimeError("OpenAI returned empty message content")
+    return text.strip()
+
+
+def _build_subtask_log(data: list[dict[str, Any]], up_to: int) -> str:
+    """Format subtasks 0..up_to (inclusive) as a numbered list for the prompt."""
+    lines: list[str] = []
+    for idx in range(up_to + 1):
+        item = data[idx]
+        subtask = item.get("subtask", "unknown")
+        success = item.get("success")
+        outcome = "SUCCESS" if success else "FAILED" if success is False else "UNKNOWN"
+        t = item.get("time")
+        time_str = f" (t={t}s)" if t is not None else ""
+        lines.append(f"  {idx + 1}. [{outcome}]{time_str} {subtask}")
+    return "\n".join(lines)
+
+
+def _enrich_list(
+    data: list[Any],
+    *,
+    client: OpenAI,
+    model: str,
+    system_prompt: str,
+    output_key: str,
+    skip_existing: bool,
+    delay_s: float,
+) -> None:
+    """For each item, build a cumulative subtask log and request a memory summary."""
+    for i, item in enumerate(data):
+        if not isinstance(item, dict):
+            raise ValueError(f"Item at index {i} must be an object, got {type(item).__name__}")
+        if skip_existing and output_key in item and item[output_key]:
+            logger.info("Skipping index %d (existing %s)", i, output_key)
+            continue
+
+        subtask_log = _build_subtask_log(data, up_to=i)
+        user_content = USER_PROMPT_TEMPLATE.format(subtask_log=subtask_log)
+        logger.info("Calling API for item %d (subtask: %s)", i, item.get("subtask"))
+        item[output_key] = _call_openai(
+            client, model=model, system_prompt=system_prompt, user_content=user_content
+        )
+        if delay_s > 0:
+            time.sleep(delay_s)
+
+
+def main(argv: list[str] | None = None) -> int:
+    _load_env_file()
+
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument(
+        "--check-env",
+        action="store_true",
+        help="Load .env like a normal run, print whether OPENAI_API_KEY is set (masked), then exit.",
+    )
+    p.add_argument(
+        "json_path",
+        type=Path,
+        nargs="?",
+        default=None,
+        help="Path to JSON file to read and update in place",
+    )
+    p.add_argument(
+        "--system-prompt",
+        type=str,
+        default=None,
+        help="Optional system message for the chat completion.",
+    )
+    p.add_argument(
+        "--model",
+        type=str,
+        default=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+        help="Chat model (default: gpt-4o-mini or OPENAI_MODEL env).",
+    )
+    p.add_argument(
+        "--output-key",
+        type=str,
+        default="up_to_date_memory",
+        help="Key for per-field replies: a dict mapping each source field name to model text.",
+    )
+    p.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Do not call API if output-key already set (non-empty).",
+    )
+    p.add_argument(
+        "--delay",
+        type=float,
+        default=0.0,
+        help="Seconds to sleep between API calls (rate limiting).",
+    )
+    p.add_argument(
+        "--api-key",
+        type=str,
+        default=None,
+        help="OpenAI API key (default: OPENAI_API_KEY from .env or environment).",
+    )
+    p.add_argument("-v", "--verbose", action="store_true", help="DEBUG logging")
+    args = p.parse_args(argv)
+
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
+
+    if args.check_env:
+        return _run_check_env(api_key_override=args.api_key)
+
+    if args.json_path is None:
+        p.error("json_path is required (unless using --check-env)")
+
+    if args.api_key:
+        os.environ["OPENAI_API_KEY"] = args.api_key.strip()
+
+    api_key = _normalize_openai_api_key()
+    if not api_key:
+        logger.error(
+            "Missing OPENAI_API_KEY. Put it in repo .env, export it, or pass --api-key. "
+            "Run with --check-env to diagnose.",
+        )
+        return 1
+
+    path = args.json_path.resolve()
+    if not path.is_file():
+        logger.error("Not a file: %s", path)
+        return 1
+
+    text = path.read_text(encoding="utf-8")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        logger.error("Invalid JSON: %s", e)
+        return 1
+
+    client = OpenAI(api_key=api_key)
+    if args.verbose:
+        tail = api_key[-4:] if len(api_key) >= 4 else "****"
+        logger.debug("OpenAI client using API key ending in …%s (length %d)", tail, len(api_key))
+
+    try:
+        if not isinstance(data, list):
+            logger.error("Top-level JSON must be a list of objects")
+            return 1
+        system = args.system_prompt if args.system_prompt else SYSTEM_PROMPT
+        _enrich_list(
+            data,
+            client=client,
+            model=args.model,
+            system_prompt=system,
+            output_key=args.output_key,
+            skip_existing=args.skip_existing,
+            delay_s=args.delay,
+        )
+    except Exception as e:
+        logger.exception("OpenAI or processing failed: %s", e)
+        return 1
+
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    logger.info("Wrote %s", path)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

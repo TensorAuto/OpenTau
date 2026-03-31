@@ -1,0 +1,26 @@
+[
+  {
+    "time": 12.0,
+    "subtask": "pick up the cup and place in the tray",
+    "success": true,
+    "prompt": "Pick up a blue bottle and a cup and place it in the tray."
+  },
+  {
+    "time": 20,
+    "subtask": "pick up the bottle and place in tray",
+    "success": false,
+    "prompt": "Pick up a blue bottle and a cup and place it in the tray."
+  },
+  {
+    "time": 28,
+    "subtask": "pick up the bottle and place in tray",
+    "success": true,
+    "prompt": "Pick up a blue bottle and a cup and place it in the tray."
+  },
+  {
+    "time": 34,
+    "subtask": "reset",
+    "success": true,
+    "prompt": "Pick up a blue bottle and a cup and place it in the tray."
+  }
+]
