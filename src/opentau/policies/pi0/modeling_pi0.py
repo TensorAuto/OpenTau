@@ -460,7 +460,7 @@ class PI0Policy(PreTrainedPolicy):
             # weight loss based on exponent of advantage. Also clamp at awr_max_weight.
             losses = losses * rearrange(
                 torch.min(
-                    torch.exp(batch["advantage"]),
+                    torch.exp(batch["advantage"].to(dtype=torch.float32)),
                     torch.tensor(self.config.awr_max_weight, device=losses.device),
                 ),
                 "b -> b 1 1",
