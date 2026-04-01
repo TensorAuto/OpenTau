@@ -491,7 +491,13 @@ class PI05MemPolicy(PreTrainedPolicy):
         batch["discrete_actions"] = self.normalize_discrete_actions(dict(batch))["actions"]
         batch = self.normalize_targets(batch)
 
-        videos, vid_masks = self.prepare_videos(batch)
+        obs_history_is_pad = batch.get("obs_history_is_pad")
+        if obs_history_is_pad is None:
+            logging.warning(
+                "obs_history_is_pad is missing from the training batch. "
+                "Padded observation-history timesteps will not be masked."
+            )
+        videos, vid_masks = self.prepare_videos(batch, obs_history_is_pad=obs_history_is_pad)
         lang_tokens, lang_masks = self.prepare_language(batch)
         state = self.prepare_state(batch)
         discrete_actions, discrete_action_masks = self.prepare_discrete_actions(batch)
@@ -510,6 +516,7 @@ class PI05MemPolicy(PreTrainedPolicy):
             time,
             discrete_actions,
             discrete_action_masks,
+            obs_history_is_pad=obs_history_is_pad,
         )
 
         mse_loss = losses["MSE"]
@@ -549,7 +556,9 @@ class PI05MemPolicy(PreTrainedPolicy):
             discrete_action_masks
         ).to(device=device, dtype=torch.bool)
 
-    def prepare_videos(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
+    def prepare_videos(
+        self, batch: dict[str, Tensor], obs_history_is_pad: Tensor | None = None
+    ) -> tuple[list[Tensor], list[Tensor]]:
         """Apply preprocessing to the video inputs.
 
         Each camera key now contains a video tensor of shape (B, T, C, H, W).
@@ -558,6 +567,9 @@ class PI05MemPolicy(PreTrainedPolicy):
 
         Args:
             batch: Batch of data containing video tensors.
+            obs_history_is_pad: Optional bool tensor (B, T) indicating which
+                temporal frames are padded. Padded frames are zeroed out before
+                encoding so V-JEPA2 does not process clamped/repeated content.
 
         Returns:
             A tuple of (videos, vid_masks) lists.
@@ -576,6 +588,10 @@ class PI05MemPolicy(PreTrainedPolicy):
 
         for key in present_img_keys:
             vid = batch[key]  # (B, T, C, H, W)
+
+            if obs_history_is_pad is not None:
+                frame_mask = (~obs_history_is_pad)[:, :, None, None, None]  # (B, T, 1, 1, 1)
+                vid = vid * frame_mask
 
             if self.config.resize_imgs_with_padding is not None:
                 b, t_frames = vid.shape[:2]
@@ -739,6 +755,7 @@ class PI05MemFlowMatching(nn.Module):
         state: Tensor,
         discrete_actions: Tensor | None = None,
         discrete_action_masks: Tensor | None = None,
+        obs_history_is_pad: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Embed videos with V-JEPA2, language tokens with embedding layer, and
         temporal state via per-timestep learned projection.
@@ -751,6 +768,9 @@ class PI05MemFlowMatching(nn.Module):
             state: Temporal state tensor of shape (B, T, max_state_dim).
             discrete_actions: Optional discrete action tensor.
             discrete_action_masks: Optional discrete action mask tensor.
+            obs_history_is_pad: Optional bool tensor (B, T) from the dataloader.
+                True for padded (clamped) timesteps, False for real ones.
+                Used to mask state tokens during training; None during inference.
 
         Returns:
             (embs, pad_masks, att_masks) tuple.
@@ -786,7 +806,10 @@ class PI05MemFlowMatching(nn.Module):
         # state: (B, T, max_state_dim) -> state_emb: (B, T, vlm_hidden_size)
         state_emb = self.state_proj(state.to(dtype=_preferred_dtype()))
         num_state_tokens = state_emb.shape[1]  # T
-        state_mask = torch.ones(bsize, num_state_tokens, dtype=torch.bool, device=state.device)
+        if obs_history_is_pad is not None:
+            state_mask = ~obs_history_is_pad  # True = real, False = padded
+        else:
+            state_mask = torch.ones(bsize, num_state_tokens, dtype=torch.bool, device=state.device)
 
         embs.append(state_emb)
         pad_masks.append(state_mask)
@@ -859,6 +882,7 @@ class PI05MemFlowMatching(nn.Module):
         time: Tensor | None = None,
         discrete_actions: Tensor | None = None,
         discrete_action_masks: Tensor | None = None,
+        obs_history_is_pad: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """Do a full training forward pass and compute the loss."""
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
@@ -869,6 +893,7 @@ class PI05MemFlowMatching(nn.Module):
             state,
             discrete_actions,
             discrete_action_masks,
+            obs_history_is_pad=obs_history_is_pad,
         )
 
         vlm_2d_attention_mask = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
