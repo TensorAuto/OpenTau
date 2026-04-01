@@ -147,6 +147,10 @@ class PI0Config(PreTrainedConfig):
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
 
+    # AWR settings
+    use_awr: bool = False
+    awr_max_weight: float = 10.0
+
     # TODO: Add EMA
 
     def __post_init__(self):

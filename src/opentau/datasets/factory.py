@@ -30,8 +30,7 @@ The factory supports two types of datasets:
 
 Key Features:
     - Delta timestamp resolution: Automatically configures temporal offsets
-      for features based on policy latency settings (action decoder and
-      cloud VLM latencies).
+      for features.
     - Image transform support: Applies configurable image transformations
       during dataset creation.
     - Imagenet stats override: Optionally replaces dataset statistics with
@@ -85,6 +84,7 @@ from opentau.datasets.lerobot_dataset import (
 )
 from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
 from opentau.datasets.transforms import ImageTransforms
+from opentau.datasets.utils import DeltaTimestampInfo
 
 IMAGENET_STATS = {
     "min": [[[0.0]], [[0.0]], [[0.0]]],  # (c,1,1)
@@ -96,36 +96,26 @@ IMAGENET_STATS = {
 
 def resolve_delta_timestamps(
     cfg: TrainPipelineConfig, dataset_cfg: DatasetConfig, ds_meta: LeRobotDatasetMetadata
-) -> tuple:
-    """Resolves delta_timestamps by based on TrainPipelineConfig.
+) -> DeltaTimestampInfo:
+    """Resolves per-feature delta_timestamps based on TrainPipelineConfig.
 
     Args:
         cfg (TrainPipelineConfig): The TrainPipelineConfig to read delta_indices from.
+        dataset_cfg (DatasetConfig): The dataset configuration.
         ds_meta (LeRobotDatasetMetadata): The dataset from which features and fps are used to build
             delta_timestamps against.
 
     Returns:
-        A 2-tuple containing:
-
-            - At index 0, a 4-tuple containing delta timestamps mean, std, lower, and upper bounds for each group.
-            - At index 1, a dictionary mapping feature names to their corresponding group and index.
-
-        The delta timestamps and group mapping should follow the structure expected by LeRobotDataset.
+        A 4-tuple ``(mean, std, lower, upper)`` of dicts mapping feature names
+        to lists of delta-timestamp values.  Keys that appear only in ``mean``
+        will be filled with sensible defaults by
+        ``LeRobotDataset.compute_delta_params``.
     """
-    group = "input_group"
-    feature2group = {}
-    # Delta timestamps are in seconds, and negative because they represent past timestamps.
-    # Hence, lower and upper bounds correspond to -upper and -lower.
-    delta_timestamps = {group: [-cfg.policy.action_decoder_latency_mean, -cfg.policy.cloud_vlm_latency_mean]}
-    delta_timestamps_std = {group: [cfg.policy.action_decoder_latency_std, cfg.policy.cloud_vlm_latency_std]}
-    delta_timestamps_lower = {
-        group: [-cfg.policy.action_decoder_latency_upper, -cfg.policy.cloud_vlm_latency_upper]
-    }
-    delta_timestamps_upper = {
-        group: [-cfg.policy.action_decoder_latency_lower, -cfg.policy.cloud_vlm_latency_lower]
-    }
+    delta_timestamps: dict[str, list[float]] = {}
     action_freq = cfg.dataset_mixture.action_freq
 
+    if dataset_cfg.repo_id is None:
+        raise ValueError("dataset_cfg.repo_id must not be None when resolving delta timestamps.")
     name_map = DATA_FEATURES_NAME_MAPPING[dataset_cfg.repo_id]
     reverse_name_map = {v: k for k, v in name_map.items()}
     for key in ds_meta.features:
@@ -133,23 +123,22 @@ def resolve_delta_timestamps(
             continue  # only process camera, state, and action features
 
         standard_key = reverse_name_map[key]
-        if standard_key == "actions" and cfg.policy.action_delta_indices is not None:
+        if (
+            standard_key == "actions"
+            and cfg.policy is not None
+            and cfg.policy.action_delta_indices is not None
+        ):
             delta_timestamps[key] = [i / action_freq for i in cfg.policy.action_delta_indices]
-            feature2group[key] = (key, None)
-        if "camera" in standard_key:
-            # Index 0 corresponds to action decoder latency and index 1 to cloud VLM latency.
-            # Pick both indices. `_to_standard_data_format()` will separate the two.
-            feature2group[key] = (group, [0, 1])
-        elif standard_key == "state":
-            # Pick index 0, which corresponds to latency of action decoder, and squeeze it to a scalar.
-            feature2group[key] = (group, 0)
+        elif "camera" in standard_key or standard_key == "state":
+            n_obs = cfg.dataset_mixture.n_obs_history
+            if n_obs is not None:
+                interval = cfg.dataset_mixture.history_interval
+                delta_timestamps[key] = [-(n_obs - 1 - i) * interval / action_freq for i in range(n_obs)]
+            else:
+                delta_timestamps[key] = [0.0]
 
-    return (
-        delta_timestamps,
-        delta_timestamps_std,
-        delta_timestamps_lower,
-        delta_timestamps_upper,
-    ), feature2group
+    dt_mean = {k: np.array(v) for k, v in delta_timestamps.items()}
+    return dt_mean, {}, {}, {}
 
 
 def make_dataset(
@@ -191,7 +180,7 @@ def make_dataset(
         dataset = ds_cls(train_cfg)
     elif isinstance(cfg.repo_id, str):
         ds_meta = LeRobotDatasetMetadata(cfg.repo_id, root=cfg.root, revision=cfg.revision)
-        (dt_mean, dt_std, dt_lower, dt_upper), f2g = resolve_delta_timestamps(train_cfg, cfg, ds_meta)
+        dt_mean, dt_std, dt_lower, dt_upper = resolve_delta_timestamps(train_cfg, cfg, ds_meta)
         dataset = LeRobotDataset(
             train_cfg,
             cfg.repo_id,
@@ -201,7 +190,6 @@ def make_dataset(
             delta_timestamps_std=dt_std,
             delta_timestamps_lower=dt_lower,
             delta_timestamps_upper=dt_upper,
-            feature2group=f2g,
             image_transforms=image_transforms,
             revision=cfg.revision,
             video_backend=cfg.video_backend,
@@ -209,9 +197,18 @@ def make_dataset(
             vector_resample_strategy=train_cfg.dataset_mixture.vector_resample_strategy,
             return_advantage_input=return_advantage_input,
         )
+    else:
+        raise ValueError("Exactly one of `cfg.vqa` and `cfg.repo_id` should be provided.")
 
     # TODO vqa datasets implement stats in original feature names, but camera_keys are standardized names
-    if not isinstance(cfg.vqa, str) and "dummy" not in cfg.repo_id and cfg.use_imagenet_stats:
+    if (
+        not isinstance(cfg.vqa, str)
+        and isinstance(cfg.repo_id, str)
+        and "dummy" not in cfg.repo_id
+        and cfg.use_imagenet_stats
+    ):
+        if dataset.meta.stats is None:
+            dataset.meta.stats = {}
         for key in dataset.meta.camera_keys:
             for stats_type, stats in IMAGENET_STATS.items():
                 if key not in dataset.meta.stats:
@@ -222,9 +219,9 @@ def make_dataset(
         val_size = int(len(dataset) * cfg.val_split_ratio)
         train_size = len(dataset) - val_size
         train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
-        train_dataset.meta = copy.deepcopy(dataset.meta)
-        val_dataset.meta = copy.deepcopy(dataset.meta)
-        return train_dataset, val_dataset
+        train_dataset.meta = copy.deepcopy(dataset.meta)  # type: ignore[assignment]
+        val_dataset.meta = copy.deepcopy(dataset.meta)  # type: ignore[assignment]
+        return train_dataset, val_dataset  # type: ignore[return-value]
 
     return dataset
 

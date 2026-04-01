@@ -77,7 +77,7 @@ import contextlib
 import importlib.resources
 import json
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from itertools import accumulate
 from pathlib import Path
 from pprint import pformat
@@ -404,7 +404,7 @@ def cast_stats_to_numpy(stats) -> dict[str, dict[str, np.ndarray]]:
     return unflatten_dict(stats)
 
 
-def load_stats(local_dir: Path) -> dict[str, dict[str, np.ndarray]]:
+def load_stats(local_dir: Path) -> dict[str, dict[str, np.ndarray]] | None:
     """Load dataset statistics from the standard stats.json file.
 
     Args:
@@ -419,7 +419,7 @@ def load_stats(local_dir: Path) -> dict[str, dict[str, np.ndarray]]:
     return cast_stats_to_numpy(stats)
 
 
-def load_advantages(local_dir: Path) -> dict:
+def load_advantages(local_dir: Path) -> dict | None:
     """Load advantage values from the advantages.json file.
 
     Advantages are keyed by (episode_index, timestamp) tuples in the JSON file
@@ -480,7 +480,7 @@ def write_episode(episode: dict, local_dir: Path) -> None:
     append_jsonlines(episode, local_dir / EPISODES_PATH)
 
 
-def load_episodes(local_dir: Path) -> dict:
+def load_episodes(local_dir: Path) -> dict[int, dict]:
     """Load episodes from the episodes.jsonl file.
 
     Args:
@@ -509,7 +509,7 @@ def write_episode_stats(episode_index: int, episode_stats: dict, local_dir: Path
     append_jsonlines(episode_stats, local_dir / EPISODES_STATS_PATH)
 
 
-def load_episodes_stats(local_dir: Path) -> dict:
+def load_episodes_stats(local_dir: Path) -> dict[int, dict[str, dict[str, np.ndarray]]]:
     """Load episode statistics from the episodes_stats.jsonl file.
 
     Args:
@@ -526,8 +526,8 @@ def load_episodes_stats(local_dir: Path) -> dict:
 
 
 def backward_compatible_episodes_stats(
-    stats: dict[str, dict[str, np.ndarray]], episodes: list[int]
-) -> dict[str, dict[str, np.ndarray]]:
+    stats: dict[str, dict[str, np.ndarray]], episodes: Iterable[int]
+) -> dict[int, dict[str, dict[str, np.ndarray]]]:
     """Create episode-level statistics from global statistics for backward compatibility.
 
     In older dataset versions, statistics were stored globally rather than per-episode.
@@ -545,7 +545,7 @@ def backward_compatible_episodes_stats(
 
 
 def load_image_as_numpy(
-    fpath: str | Path, dtype: np.dtype = np.float32, channel_first: bool = True
+    fpath: str | Path, dtype: np.typing.DTypeLike = np.float32, channel_first: bool = True
 ) -> np.ndarray:
     """Load an image file as a numpy array.
 
@@ -568,7 +568,7 @@ def load_image_as_numpy(
     return img_array
 
 
-def hf_transform_to_torch(items_dict: dict[torch.Tensor | None]):
+def hf_transform_to_torch(items_dict: dict[str, list]):
     """Get a transform function that convert items from Hugging Face dataset (pyarrow)
     to torch tensors. Importantly, images are converted from PIL, which corresponds to
     a channel last representation (h w c) of uint8 type, to a torch image representation
@@ -778,7 +778,7 @@ def dataset_to_policy_features(features: dict[str, dict]) -> dict[str, PolicyFea
 def create_empty_dataset_info(
     codebase_version: str,
     fps: int,
-    robot_type: str,
+    robot_type: str | None,
     features: dict,
     use_videos: bool,
 ) -> dict:
@@ -812,7 +812,7 @@ def create_empty_dataset_info(
 
 
 def get_episode_data_index(
-    episode_dicts: dict[dict], episodes: list[int] | None = None
+    episode_dicts: dict[int, dict], episodes: list[int] | None = None
 ) -> tuple[dict[str, torch.Tensor], dict[int, int]]:
     """Compute data indices for episodes in a flattened dataset.
 
@@ -1033,7 +1033,7 @@ class IterableNamespace(SimpleNamespace):
         details: IterableNamespace(age=25)
     """
 
-    def __init__(self, dictionary: dict[str, Any] = None, **kwargs):
+    def __init__(self, dictionary: dict[str, Any] | None = None, **kwargs):
         super().__init__(**kwargs)
         if dictionary is not None:
             for key, value in dictionary.items():
@@ -1136,10 +1136,18 @@ def validate_feature_dtype_and_shape(
     expected_dtype = feature["dtype"]
     expected_shape = feature["shape"]
     if is_valid_numpy_dtype_string(expected_dtype):
+        if not isinstance(value, np.ndarray):
+            return (
+                f"The feature '{name}' is expected to be a numpy array, but got '{type(value).__name__}'.\n"
+            )
         return validate_feature_numpy_array(name, expected_dtype, expected_shape, value)
     elif expected_dtype in ["image", "video"]:
+        if not isinstance(value, (np.ndarray, PILImage.Image)):
+            return f"The feature '{name}' is expected to be an image, but got '{type(value).__name__}'.\n"
         return validate_feature_image_or_video(name, expected_shape, value)
     elif expected_dtype == "string":
+        if not isinstance(value, str):
+            return f"The feature '{name}' is expected to be a string, but got '{type(value).__name__}'.\n"
         return validate_feature_string(name, value)
     else:
         raise NotImplementedError(f"The feature dtype '{expected_dtype}' is not implemented yet.")

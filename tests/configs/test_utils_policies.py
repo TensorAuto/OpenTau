@@ -90,7 +90,11 @@ def test_save_pretrained(tmp_path, get_inherited_pretrainedconfig):
     Tests that _save_pretrained writes a file using draccus.dump.
     """
     # Setup: Mock the file system and draccus dependencies
-    with patch("draccus.dump") as mock_dump, patch("builtins.open", mock_open()):
+    with (
+        patch("draccus.dump") as mock_dump,
+        patch("builtins.open", mock_open()),
+        patch("opentau.configs.policies.strip_deprecated_fields_from_json"),
+    ):
         config = get_inherited_pretrainedconfig()
 
         # Act

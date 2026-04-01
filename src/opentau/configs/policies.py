@@ -21,7 +21,9 @@ configurations from pretrained models or local paths.
 """
 
 import abc
+import json
 import os
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Type, TypeVar
@@ -38,6 +40,67 @@ from opentau.utils.hub import HubMixin
 
 # Generic variable that is either PreTrainedConfig or a subclass thereof
 T = TypeVar("T", bound="PreTrainedConfig")
+
+_DEPRECATED_LATENCY_FIELDS = (
+    "cloud_vlm_latency_mean",
+    "cloud_vlm_latency_std",
+    "cloud_vlm_latency_lower",
+    "cloud_vlm_latency_upper",
+    "action_decoder_latency_mean",
+    "action_decoder_latency_std",
+    "action_decoder_latency_lower",
+    "action_decoder_latency_upper",
+)
+
+
+def strip_deprecated_fields_from_json(path: Path) -> None:
+    """Remove deprecated latency fields from a saved config JSON file in-place.
+
+    Handles both top-level fields (policy configs) and fields nested under a
+    ``"policy"`` key (train configs).
+    """
+    with open(path) as f:
+        data = json.load(f)
+
+    changed = False
+    for key in _DEPRECATED_LATENCY_FIELDS:
+        if key in data:
+            del data[key]
+            changed = True
+        if isinstance(data.get("policy"), dict) and key in data["policy"]:
+            del data["policy"][key]
+            changed = True
+
+    if changed:
+        with open(path, "w") as f:
+            json.dump(data, f, indent=4)
+
+
+def warn_deprecated_latency_fields(config_path: str | Path) -> None:
+    """Emit a deprecation warning if a config JSON file contains latency fields.
+
+    Checks both top-level fields and fields nested under a ``"policy"`` key.
+    Should be called before loading a config so users are aware the fields
+    will be ignored.
+    """
+    with open(config_path) as f:
+        data = json.load(f)
+
+    found: list[str] = []
+    for key in _DEPRECATED_LATENCY_FIELDS:
+        if key in data:
+            found.append(key)
+        if isinstance(data.get("policy"), dict) and key in data["policy"]:
+            found.append(f"policy.{key}")
+
+    if found:
+        warnings.warn(
+            f"Config '{config_path}' contains deprecated latency fields that are no longer "
+            f"used and will be ignored: {', '.join(found)}. "
+            "Consider re-saving the config to remove them.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
 
 
 @dataclass
@@ -68,22 +131,15 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
     use_amp: bool = False
     pretrained_path: str | None = None
 
-    # Mean latency of cloud VLM in seconds.
+    # Deprecated: latency fields are no longer used. Kept for backward-compatible
+    # loading of old JSON configs. Must remain 0.0; non-zero values will raise.
     cloud_vlm_latency_mean: float = 0.0
-    # Standard deviation of latency of cloud VLM in seconds.
     cloud_vlm_latency_std: float = 0.0
-    # Lower bound of latency of cloud VLM in seconds.
     cloud_vlm_latency_lower: float = 0.0
-    # Upper bound of latency of cloud VLM in seconds.
     cloud_vlm_latency_upper: float = 0.0
-
-    # Mean latency of action decoder in seconds.
     action_decoder_latency_mean: float = 0.0
-    # Standard deviation of latency of action decoder in seconds.
     action_decoder_latency_std: float = 0.0
-    # Lower bound of latency of action decoder in seconds.
     action_decoder_latency_lower: float = 0.0
-    # Upper bound of latency of action decoder in seconds.
     action_decoder_latency_upper: float = 0.0
 
     def __post_init__(self):
@@ -92,7 +148,13 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         This method can be overridden by subclasses to perform additional
         initialization after the dataclass is created.
         """
-        pass
+        for field_name in _DEPRECATED_LATENCY_FIELDS:
+            value = getattr(self, field_name)
+            if value != 0.0:
+                raise ValueError(
+                    f"Deprecated config field '{field_name}' must be 0.0, got {value}. "
+                    "Non-zero latency config fields are no longer supported."
+                )
 
     @property
     def type(self) -> str:
@@ -216,8 +278,10 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         Args:
             save_directory: Directory path where the configuration will be saved.
         """
-        with open(save_directory / CONFIG_NAME, "w") as f, draccus.config_type("json"):
+        config_path = save_directory / CONFIG_NAME
+        with open(config_path, "w") as f, draccus.config_type("json"):
             draccus.dump(self, f, indent=4)
+        strip_deprecated_fields_from_json(config_path)
 
     @classmethod
     def from_pretrained(
@@ -290,6 +354,9 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
                 raise FileNotFoundError(
                     f"{CONFIG_NAME} not found on the HuggingFace Hub in {model_id}"
                 ) from e
+
+        if config_file is not None:
+            warn_deprecated_latency_fields(config_file)
 
         # HACK: this is very ugly, ideally we'd like to be able to do that natively with draccus
         # something like --policy.path (in addition to --policy.type)

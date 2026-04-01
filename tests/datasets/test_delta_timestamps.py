@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from collections import defaultdict
 from itertools import accumulate
 from unittest.mock import MagicMock, patch
 
@@ -215,63 +214,47 @@ def test_resolve_delta_timestamps_basic_structure(
     """Test that resolve_delta_timestamps returns the correct basic structure."""
     result = resolve_delta_timestamps(train_pipeline_config, dataset_config, lerobot_dataset_metadata)
 
-    # Check that result is a tuple with 2 elements
     assert isinstance(result, tuple)
-    assert len(result) == 2
+    assert len(result) == 4
 
-    # First element should be a 4-tuple
-    delta_params, feature2group = result
-    assert isinstance(delta_params, tuple)
-    assert len(delta_params) == 4
-
-    # Second element should be a dict
-    assert isinstance(feature2group, dict)
+    dt_mean, dt_std, dt_lower, dt_upper = result
+    assert isinstance(dt_mean, dict)
+    assert isinstance(dt_std, dict)
+    assert isinstance(dt_lower, dict)
+    assert isinstance(dt_upper, dict)
 
 
-def test_resolve_delta_timestamps_input_group_calculation(
+def test_resolve_delta_timestamps_per_feature(
     train_pipeline_config, dataset_config, lerobot_dataset_metadata
 ):
-    """Test that input_group delta timestamps are calculated correctly."""
-    delta_params, _ = resolve_delta_timestamps(
+    """Test that per-feature delta timestamps are calculated correctly."""
+    dt_mean, dt_std, dt_lower, dt_upper = resolve_delta_timestamps(
         train_pipeline_config, dataset_config, lerobot_dataset_metadata
     )
 
-    delta_timestamps, delta_timestamps_std, delta_timestamps_lower, delta_timestamps_upper = delta_params
+    # camera0 and state should have per-feature entries with [0.0]
+    assert "camera0" in dt_mean
+    assert "state" in dt_mean
+    assert dt_mean["camera0"] == [0.0]
+    assert dt_mean["state"] == [0.0]
 
-    # Check input_group exists
-    assert "input_group" in delta_timestamps
-    assert "input_group" in delta_timestamps_std
-    assert "input_group" in delta_timestamps_lower
-    assert "input_group" in delta_timestamps_upper
-
-    # Check values are correct (negative because they represent past timestamps)
-    # Using default PI0Config values
-    expected_mean = [0.0, 0.0]  # action_decoder_latency_mean, cloud_vlm_latency_mean
-    expected_std = [0.0, 0.0]  # action_decoder_latency_std, cloud_vlm_latency_std
-    expected_lower = [0.0, 0.0]  # action_decoder_latency_upper, cloud_vlm_latency_upper (note: -upper)
-    expected_upper = [0.0, 0.0]  # action_decoder_latency_lower, cloud_vlm_latency_lower (note: -lower)
-
-    assert delta_timestamps["input_group"] == expected_mean
-    assert delta_timestamps_std["input_group"] == expected_std
-    assert delta_timestamps_lower["input_group"] == expected_lower
-    assert delta_timestamps_upper["input_group"] == expected_upper
+    # std, lower, upper default to empty dicts (filled by compute_delta_params)
+    assert dt_std == {}
+    assert dt_lower == {}
+    assert dt_upper == {}
 
 
 def test_resolve_delta_timestamps_no_reward_action_features(
     train_pipeline_config, dataset_config, lerobot_dataset_metadata
 ):
     """Test that reward and action features are not included when not present in dataset."""
-    delta_params, feature2group = resolve_delta_timestamps(
+    dt_mean, _, _, _ = resolve_delta_timestamps(
         train_pipeline_config, dataset_config, lerobot_dataset_metadata
     )
-    delta_timestamps, _, _, _ = delta_params
 
     # The lerobot_dataset_metadata fixture doesn't have "next.reward" or "action" features
-    # So they should not be in delta_timestamps or feature2group
-    assert "next.reward" not in delta_timestamps
-    assert "action" not in delta_timestamps
-    assert "next.reward" not in feature2group
-    assert "action" not in feature2group
+    assert "next.reward" not in dt_mean
+    assert "action" not in dt_mean
 
 
 def test_resolve_delta_timestamps_with_reward_action_features(
@@ -286,18 +269,15 @@ def test_resolve_delta_timestamps_with_reward_action_features(
         }
     )
 
-    delta_params, feature2group = resolve_delta_timestamps(
+    dt_mean, _, _, _ = resolve_delta_timestamps(
         train_pipeline_config, dataset_config, lerobot_dataset_metadata
     )
-    delta_timestamps, _, _, _ = delta_params
 
     # Check reward feature (PI0Config has reward_delta_indices = None by default)
-    assert "next.reward" not in delta_timestamps
-    assert "next.reward" not in feature2group
+    assert "next.reward" not in dt_mean
 
     # Check action feature (PI0Config has action_delta_indices = None by default)
-    assert "action" not in delta_timestamps
-    assert "action" not in feature2group
+    assert "action" not in dt_mean
 
 
 def test_resolve_delta_timestamps_empty_features(train_pipeline_config, dataset_config):
@@ -305,14 +285,9 @@ def test_resolve_delta_timestamps_empty_features(train_pipeline_config, dataset_
     metadata = MagicMock()
     metadata.features = {}
 
-    delta_params, feature2group = resolve_delta_timestamps(train_pipeline_config, dataset_config, metadata)
+    dt_mean, _, _, _ = resolve_delta_timestamps(train_pipeline_config, dataset_config, metadata)
 
-    # Should still have input_group in delta_timestamps
-    delta_timestamps, _, _, _ = delta_params
-    assert "input_group" in delta_timestamps
-
-    # But feature2group should be empty
-    assert len(feature2group) == 0
+    assert len(dt_mean) == 0
 
 
 def test_resolve_delta_timestamps_only_image_features(train_pipeline_config, dataset_config):
@@ -323,18 +298,11 @@ def test_resolve_delta_timestamps_only_image_features(train_pipeline_config, dat
         "camera1": {"dtype": "video", "shape": [3, 224, 224]},
     }
 
-    delta_params, feature2group = resolve_delta_timestamps(train_pipeline_config, dataset_config, metadata)
+    dt_mean, _, _, _ = resolve_delta_timestamps(train_pipeline_config, dataset_config, metadata)
 
-    # Should have input_group in delta_timestamps
-    delta_timestamps, _, _, _ = delta_params
-    assert "input_group" in delta_timestamps
-
-    # Should have image features in feature2group
-    assert len(feature2group) == 2
-    assert "camera0" in feature2group
-    assert "camera1" in feature2group
-    assert feature2group["camera0"] == ("input_group", [0, 1])
-    assert feature2group["camera1"] == ("input_group", [0, 1])
+    assert len(dt_mean) == 2
+    assert dt_mean["camera0"] == [0.0]
+    assert dt_mean["camera1"] == [0.0]
 
 
 def test_resolve_delta_timestamps_only_state_feature(train_pipeline_config, dataset_config):
@@ -344,50 +312,16 @@ def test_resolve_delta_timestamps_only_state_feature(train_pipeline_config, data
         "state": {"dtype": "float32", "shape": [7]},
     }
 
-    delta_params, feature2group = resolve_delta_timestamps(train_pipeline_config, dataset_config, metadata)
+    dt_mean, _, _, _ = resolve_delta_timestamps(train_pipeline_config, dataset_config, metadata)
 
-    # Should have input_group in delta_timestamps
-    delta_timestamps, _, _, _ = delta_params
-    assert "input_group" in delta_timestamps
-
-    # Should have state feature in feature2group
-    assert len(feature2group) == 1
-    assert "state" in feature2group
-    assert feature2group["state"] == ("input_group", 0)
-
-
-def test_resolve_delta_timestamps_zero_latency_values(
-    train_pipeline_config, dataset_config, lerobot_dataset_metadata
-):
-    """Test behavior with zero latency values."""
-    # Set all latency values to 0
-    train_pipeline_config.policy.action_decoder_latency_mean = 0.0
-    train_pipeline_config.policy.action_decoder_latency_std = 0.0
-    train_pipeline_config.policy.action_decoder_latency_lower = 0.0
-    train_pipeline_config.policy.action_decoder_latency_upper = 0.0
-    train_pipeline_config.policy.cloud_vlm_latency_mean = 0.0
-    train_pipeline_config.policy.cloud_vlm_latency_std = 0.0
-    train_pipeline_config.policy.cloud_vlm_latency_lower = 0.0
-    train_pipeline_config.policy.cloud_vlm_latency_upper = 0.0
-
-    delta_params, _ = resolve_delta_timestamps(
-        train_pipeline_config, dataset_config, lerobot_dataset_metadata
-    )
-    delta_timestamps, delta_timestamps_std, delta_timestamps_lower, delta_timestamps_upper = delta_params
-
-    # Check that all values are 0
-    expected_zero = [0.0, 0.0]
-    assert delta_timestamps["input_group"] == expected_zero
-    assert delta_timestamps_std["input_group"] == expected_zero
-    assert delta_timestamps_lower["input_group"] == expected_zero
-    assert delta_timestamps_upper["input_group"] == expected_zero
+    assert len(dt_mean) == 1
+    assert dt_mean["state"] == [0.0]
 
 
 def test_resolve_delta_timestamps_other_features_ignored(
     train_pipeline_config, dataset_config, lerobot_dataset_metadata
 ):
-    """Test that other features are not included in feature2group."""
-    # Add some other features to the metadata
+    """Test that non-camera/state/action features are not included in delta timestamps."""
     lerobot_dataset_metadata.features.update(
         {
             "timestamp": {"dtype": "float32", "shape": []},
@@ -396,64 +330,13 @@ def test_resolve_delta_timestamps_other_features_ignored(
         }
     )
 
-    _, feature2group = resolve_delta_timestamps(
+    dt_mean, _, _, _ = resolve_delta_timestamps(
         train_pipeline_config, dataset_config, lerobot_dataset_metadata
     )
 
-    # These features should not be in feature2group
-    assert "timestamp" not in feature2group
-    assert "episode_index" not in feature2group
-    assert "some_other_feature" not in feature2group
-
-
-def test_check_feature_group_mapping_valid():
-    """Test that valid feature-group mappings pass validation."""
-    # Create a minimal dataset instance with the required attributes
-    dataset = LeRobotDataset.__new__(LeRobotDataset)
-
-    # Set up valid delta_timestamps_params (4-tuple: mean, std, lower, upper)
-    dataset.delta_timestamps_params = (
-        {"input_group": [-0.1, 0.0, 0.1]},  # mean
-        {"input_group": [0.01, 0.0, 0.01]},  # std
-        {"input_group": [-0.2, -0.05, 0.05]},  # lower
-        {"input_group": [0.0, 0.05, 0.2]},  # upper
-    )
-
-    # Set up valid feature2group mapping
-    dataset.feature2group = {
-        "observation.state": ("input_group", 0),
-        "observation.images.camera0": ("input_group", [0, 1]),
-        "action": ("input_group", None),
-    }
-
-    # Should not raise any exception
-    dataset._check_feature_group_mapping()
-
-
-def test_check_feature_group_mapping_invalid_group():
-    """Test that missing group in delta_timestamps_params raises ValueError."""
-    # Create a minimal dataset instance with the required attributes
-    dataset = LeRobotDataset.__new__(LeRobotDataset)
-
-    # Set up delta_timestamps_params with only one group
-    dataset.delta_timestamps_params = (
-        {"input_group": [-0.1, 0.0, 0.1]},  # mean
-        {"input_group": [0.01, 0.0, 0.01]},  # std
-        {"input_group": [-0.2, -0.05, 0.05]},  # lower
-        {"input_group": [0.0, 0.05, 0.2]},  # upper
-    )
-
-    # Set up feature2group with a group that doesn't exist in delta_timestamps_params
-    dataset.feature2group = {
-        "observation.images.camera0": ("missing_group", [0, 1]),  # invalid
-    }
-
-    # Should raise ValueError
-    with pytest.raises(
-        ValueError,
-        match="Feature 'observation.images.camera0' is mapped to group 'missing_group', which is not present in delta_timestamps_params",
-    ):
-        dataset._check_feature_group_mapping()
+    assert "timestamp" not in dt_mean
+    assert "episode_index" not in dt_mean
+    assert "some_other_feature" not in dt_mean
 
 
 def test_compute_delta_params_basic():
@@ -666,154 +549,27 @@ def test_get_delta_indices_soft_different_fps():
 # Tests for _get_query_indices_soft method
 def test_get_query_indices_soft_basic():
     """Test basic functionality of _get_query_indices_soft."""
-    # Create a minimal dataset instance
     dataset = LeRobotDataset.__new__(LeRobotDataset)
 
-    # Set up episode_data_index
     dataset.episode_data_index = {
         "from": np.array([0, 100, 200], dtype=np.int64),
         "to": np.array([100, 200, 300], dtype=np.int64),
     }
 
-    # Set up delta_timestamps_params
     dataset.delta_timestamps_params = (
-        {"input_group": np.array([-0.1, 0.0, 0.1])},  # mean
-        {"input_group": np.array([0.01, 0.02, 0.03])},  # std
-        {"input_group": np.array([-0.2, -0.1, 0.0])},  # lower
-        {"input_group": np.array([0.0, 0.1, 0.2])},  # upper
+        {"observation.state": np.array([0.0]), "action": np.array([-0.1, 0.0, 0.1])},
+        {"observation.state": np.array([0.0]), "action": np.array([0.01, 0.02, 0.03])},
+        {"observation.state": np.array([0.0]), "action": np.array([-0.2, -0.1, 0.0])},
+        {"observation.state": np.array([0.0]), "action": np.array([0.0, 0.1, 0.2])},
     )
 
-    # Set up feature2group mapping
-    dataset.feature2group = {
-        "observation.state": ("input_group", 0),
-        "observation.images.camera0": ("input_group", [0, 1]),
-        "action": ("input_group", None),
-    }
-
-    # Mock the fps property to return 30
     type(dataset).fps = property(lambda self: 30)
 
-    # Mock get_delta_indices_soft to return predictable values
     with patch("opentau.datasets.lerobot_dataset.get_delta_indices_soft") as mock_get_delta:
         mock_get_delta.return_value = {
-            "input_group": np.array([-3.0, 0.0, 3.0])  # -0.1s, 0s, 0.1s * 30fps
+            "observation.state": np.array([0.0]),
+            "action": np.array([-3.0, 0.0, 3.0]),
         }
-
-        idx = 50  # Current index
-        ep_idx = 1  # Episode 1 (starts at 100, ends at 200)
-        dataset.epi2idx = {1: 1}
-
-        query_indices, padding = dataset._get_query_indices_soft(idx, ep_idx)
-
-        # Check query_indices
-        assert "observation.state" in query_indices
-        assert "observation.images.camera0" in query_indices
-        assert "action" in query_indices
-
-        # observation.state should use index 0 from input_group
-        expected_state_idx = np.clip(50 + (-3.0), 100, 199)  # 47 clipped to 100
-        assert query_indices["observation.state"] == expected_state_idx
-
-        # observation.images.camera0 should use indices [0, 1] from input_group
-        expected_camera_indices = np.clip(50 + np.array([-3.0, 0.0]), 100, 199)
-        assert np.allclose(query_indices["observation.images.camera0"], expected_camera_indices)
-
-        # action should use all indices from input_group
-        expected_action_indices = np.clip(50 + np.array([-3.0, 0.0, 3.0]), 100, 199)
-        assert np.allclose(query_indices["action"], expected_action_indices)
-
-        # Check padding masks
-        assert "observation.state_is_pad" in padding
-        assert "observation.images.camera0_is_pad" in padding
-        assert "action_is_pad" in padding
-
-        # observation.state should be padded (47 < 100)
-        assert padding["observation.state_is_pad"].item() is True
-
-        # observation.images.camera0 should have mixed padding
-        expected_camera_padding = torch.BoolTensor([True, True])  # 47 < 100
-        assert torch.all(padding["observation.images.camera0_is_pad"] == expected_camera_padding)
-
-        # action should have mixed padding
-        expected_action_padding = torch.BoolTensor([True, True, True])  # 47 < 100
-        assert torch.all(padding["action_is_pad"] == expected_action_padding)
-
-
-def test_get_query_indices_soft_no_padding():
-    """Test _get_query_indices_soft when no indices are outside episode bounds."""
-    # Create a minimal dataset instance
-    dataset = LeRobotDataset.__new__(LeRobotDataset)
-
-    # Set up episode_data_index
-    dataset.episode_data_index = {
-        "from": np.array([0, 100, 200], dtype=np.int64),
-        "to": np.array([100, 200, 300], dtype=np.int64),
-    }
-
-    # Set up delta_timestamps_params
-    dataset.delta_timestamps_params = (
-        {"input_group": np.array([-0.1, 0.0, 0.1])},  # mean
-        {"input_group": np.array([0.01, 0.02, 0.03])},  # std
-        {"input_group": np.array([-0.2, -0.1, 0.0])},  # lower
-        {"input_group": np.array([0.0, 0.1, 0.2])},  # upper
-    )
-
-    # Set up feature2group mapping
-    dataset.feature2group = {
-        "observation.state": ("input_group", 0),
-    }
-
-    # Mock the fps property to return 30
-    type(dataset).fps = property(lambda self: 30)
-
-    # Mock get_delta_indices_soft to return small values
-    with patch("opentau.datasets.lerobot_dataset.get_delta_indices_soft") as mock_get_delta:
-        mock_get_delta.return_value = {
-            "input_group": np.array([-1.0])  # Small offset
-        }
-
-        idx = 150  # Current index (well within episode 1 bounds)
-        ep_idx = 1  # Episode 1 (starts at 100, ends at 200)
-        dataset.epi2idx = {1: 1}
-
-        query_indices, padding = dataset._get_query_indices_soft(idx, ep_idx)
-
-        # Check query_indices
-        expected_state_idx = np.clip(150 + (-1.0), 100, 199)  # 149
-        assert query_indices["observation.state"] == expected_state_idx
-
-        # Check padding mask (should be False since 149 >= 100)
-        assert padding["observation.state_is_pad"].item() is False
-
-
-def test_get_query_indices_soft_empty_feature2group():
-    """Test _get_query_indices_soft with empty feature2group."""
-    # Create a minimal dataset instance
-    dataset = LeRobotDataset.__new__(LeRobotDataset)
-
-    # Set up episode_data_index
-    dataset.episode_data_index = {
-        "from": np.array([0, 100, 200], dtype=np.int64),
-        "to": np.array([100, 200, 300], dtype=np.int64),
-    }
-
-    # Set up delta_timestamps_params
-    dataset.delta_timestamps_params = (
-        {"input_group": np.array([-0.1, 0.0, 0.1])},  # mean
-        {"input_group": np.array([0.01, 0.02, 0.03])},  # std
-        {"input_group": np.array([-0.2, -0.1, 0.0])},  # lower
-        {"input_group": np.array([0.0, 0.1, 0.2])},  # upper
-    )
-
-    # Set up empty feature2group
-    dataset.feature2group = {}
-
-    # Mock the fps property to return 30
-    type(dataset).fps = property(lambda self: 30)
-
-    # Mock get_delta_indices_soft
-    with patch("opentau.datasets.lerobot_dataset.get_delta_indices_soft") as mock_get_delta:
-        mock_get_delta.return_value = {"input_group": np.array([-3.0, 0.0, 3.0])}
 
         idx = 50
         ep_idx = 1
@@ -821,66 +577,118 @@ def test_get_query_indices_soft_empty_feature2group():
 
         query_indices, padding = dataset._get_query_indices_soft(idx, ep_idx)
 
-        # Should return empty dictionaries
-        assert query_indices == {}
-        assert padding == {}
+        assert "observation.state" in query_indices
+        assert "action" in query_indices
+
+        expected_state_idx = np.clip(50 + 0.0, 100, 199)
+        assert query_indices["observation.state"] == expected_state_idx
+
+        expected_action_indices = np.clip(50 + np.array([-3.0, 0.0, 3.0]), 100, 199)
+        assert np.allclose(query_indices["action"], expected_action_indices)
+
+        assert padding["observation.state_is_pad"].item() is True
+        assert torch.all(padding["action_is_pad"] == torch.BoolTensor([True, True, True]))
 
 
-def test_get_query_indices_soft_edge_cases():
-    """Test _get_query_indices_soft with edge cases."""
-    # Create a minimal dataset instance
+def test_get_query_indices_soft_no_padding():
+    """Test _get_query_indices_soft when no indices are outside episode bounds."""
     dataset = LeRobotDataset.__new__(LeRobotDataset)
 
-    # Set up episode_data_index
     dataset.episode_data_index = {
         "from": np.array([0, 100, 200], dtype=np.int64),
         "to": np.array([100, 200, 300], dtype=np.int64),
     }
 
-    # Set up delta_timestamps_params
     dataset.delta_timestamps_params = (
-        {"input_group": np.array([-0.1, 0.0, 0.1])},  # mean
-        {"input_group": np.array([0.01, 0.02, 0.03])},  # std
-        {"input_group": np.array([-0.2, -0.1, 0.0])},  # lower
-        {"input_group": np.array([0.0, 0.1, 0.2])},  # upper
+        {"observation.state": np.array([0.0])},
+        {"observation.state": np.array([0.0])},
+        {"observation.state": np.array([0.0])},
+        {"observation.state": np.array([0.0])},
     )
 
-    # Set up feature2group mapping
-    dataset.feature2group = {
-        "feature1": ("input_group", 0),  # single index
-        "feature2": ("input_group", [1, 2]),  # list of indices
-        "feature3": ("input_group", None),  # all indices
-    }
-
-    # Mock the fps property to return 30
     type(dataset).fps = property(lambda self: 30)
 
-    # Mock get_delta_indices_soft
     with patch("opentau.datasets.lerobot_dataset.get_delta_indices_soft") as mock_get_delta:
-        mock_get_delta.return_value = {"input_group": np.array([-5.0, 0.0, 5.0])}
+        mock_get_delta.return_value = {
+            "observation.state": np.array([-1.0]),
+        }
 
-        # Test at episode start
-        idx = 100  # Episode 1 start
+        idx = 150
         ep_idx = 1
         dataset.epi2idx = {1: 1}
 
         query_indices, padding = dataset._get_query_indices_soft(idx, ep_idx)
 
-        # feature1 should be clipped to episode start
+        expected_state_idx = np.clip(150 + (-1.0), 100, 199)
+        assert query_indices["observation.state"] == expected_state_idx
+        assert padding["observation.state_is_pad"].item() is False
+
+
+def test_get_query_indices_soft_empty_delta_timestamps():
+    """Test _get_query_indices_soft with empty delta_timestamps."""
+    dataset = LeRobotDataset.__new__(LeRobotDataset)
+
+    dataset.episode_data_index = {
+        "from": np.array([0, 100, 200], dtype=np.int64),
+        "to": np.array([100, 200, 300], dtype=np.int64),
+    }
+
+    dataset.delta_timestamps_params = ({}, {}, {}, {})
+
+    type(dataset).fps = property(lambda self: 30)
+
+    with patch("opentau.datasets.lerobot_dataset.get_delta_indices_soft") as mock_get_delta:
+        mock_get_delta.return_value = {}
+
+        idx = 50
+        ep_idx = 1
+        dataset.epi2idx = {1: 1}
+
+        query_indices, padding = dataset._get_query_indices_soft(idx, ep_idx)
+
+        assert query_indices == {}
+        assert padding == {}
+
+
+def test_get_query_indices_soft_edge_cases():
+    """Test _get_query_indices_soft at episode boundaries."""
+    dataset = LeRobotDataset.__new__(LeRobotDataset)
+
+    dataset.episode_data_index = {
+        "from": np.array([0, 100, 200], dtype=np.int64),
+        "to": np.array([100, 200, 300], dtype=np.int64),
+    }
+
+    dataset.delta_timestamps_params = (
+        {"feature1": np.array([0.0]), "feature2": np.array([-0.1, 0.0, 0.1])},
+        {"feature1": np.array([0.0]), "feature2": np.array([0.01, 0.02, 0.03])},
+        {"feature1": np.array([0.0]), "feature2": np.array([-0.2, -0.1, 0.0])},
+        {"feature1": np.array([0.0]), "feature2": np.array([0.0, 0.1, 0.2])},
+    )
+
+    type(dataset).fps = property(lambda self: 30)
+
+    with patch("opentau.datasets.lerobot_dataset.get_delta_indices_soft") as mock_get_delta:
+        mock_get_delta.return_value = {
+            "feature1": np.array([-5.0]),
+            "feature2": np.array([-5.0, 0.0, 5.0]),
+        }
+
+        idx = 100
+        ep_idx = 1
+        dataset.epi2idx = {1: 1}
+
+        query_indices, padding = dataset._get_query_indices_soft(idx, ep_idx)
+
+        # feature1 clipped to episode start
         assert query_indices["feature1"] == 100  # 100 + (-5) clipped to 100
 
-        # feature2 should use indices [1, 2]
-        expected_feature2 = np.clip(100 + np.array([0.0, 5.0]), 100, 199)
+        # feature2 should be clipped per-element
+        expected_feature2 = np.clip(100 + np.array([-5.0, 0.0, 5.0]), 100, 199)
         assert np.allclose(query_indices["feature2"], expected_feature2)
 
-        # feature3 should use all indices
-        expected_feature3 = np.clip(100 + np.array([-5.0, 0.0, 5.0]), 100, 199)
-        assert np.allclose(query_indices["feature3"], expected_feature3)
-
-        # Check padding masks
         assert padding["feature1_is_pad"].item() is True
-        assert torch.all(padding["feature2_is_pad"] == torch.BoolTensor([False, False]))
-        assert torch.all(padding["feature3_is_pad"] == torch.BoolTensor([True, False, False]))
+        assert torch.all(padding["feature2_is_pad"] == torch.BoolTensor([True, False, False]))
 
 
 # Tests for _query_hf_dataset_soft method
@@ -1044,105 +852,3 @@ def test_query_hf_dataset_soft_invalid_strategy():
 
     with pytest.raises(ValueError, match="Unsupported vector_resample_strategy"):
         dataset._query_hf_dataset_soft(soft_indices)
-
-
-@pytest.mark.parametrize(
-    ("feature2group", "delta_indices"),
-    [
-        (
-            {
-                "observation.images.exterior_image_1_left": ("input_group", [0, 1]),
-                "observation.images.exterior_image_2_left": ("input_group", [0, 1]),
-                "observation.images.wrist_image_left": ("input_group", [0, 1]),
-                "observation.state": ("input_group", 0),
-                "action": ("action", None),
-            },
-            {
-                "input_group": np.array([-0.5902292, -3.7006334]),
-                "action": np.array([0.5 * i for i in range(50)]),
-            },
-        ),
-        (
-            {
-                "observation.images.exterior_image_1_left": ("input_group", [0, 1]),
-                "observation.images.exterior_image_2_left": ("input_group", [0, 1]),
-                "observation.images.wrist_image_left": ("input_group", [1, 1]),
-                "observation.state": ("input_group", 1),
-                "action": ("action", None),
-            },
-            {
-                "input_group": np.array([-0.5902292, -3.7006334]),
-                "action": np.array([0.5 * i for i in range(50)]),
-            },
-        ),
-        (
-            {
-                "observation.images.exterior_image_1_left": ("input_group", [1, 0]),
-                "observation.images.exterior_image_2_left": ("input_group", [1, 0]),
-                "observation.images.wrist_image_left": ("input_group", [0, 0]),
-                "observation.state": ("input_group", 0),
-                "action": ("action", None),
-            },
-            {
-                "input_group": np.array([-0.5902292, -3.7006334]),
-                "action": np.array([0.5 * i for i in range(50)]),
-            },
-        ),
-        (
-            {
-                "observation.images.exterior_image_1_left": ("input_group", [1, 0]),
-                "observation.images.exterior_image_2_left": ("input_group", [1, 0]),
-                "observation.images.wrist_image_left": ("control_group", [0, 0]),
-                "observation.state": ("input_group", 0),
-                "action": ("action", None),
-            },
-            {
-                "input_group": np.array([-0.5902292, -3.7006334]),
-                "control_group": np.array([-0.7802292, -2.7465334]),
-                "action": np.array([0.5 * i for i in range(50)]),
-            },
-        ),
-    ],
-)
-def test_feature2group(lerobot_dataset, feature2group, delta_indices):
-    """
-    Test if the function get_query_indices_soft returns same timesteps for same group features. The group inside features group are changed
-    """
-
-    # setting the feature2group attribute in lerobot dataset
-    lerobot_dataset.feature2group = feature2group
-
-    # mocking start id  and end id of episode and setting delta_indices to predefined value
-    with (
-        patch.object(
-            lerobot_dataset, "episode_data_index", new_callable=MagicMock
-        ) as mock_episode_data_index,
-        patch("opentau.datasets.lerobot_dataset.get_delta_indices_soft", return_value=delta_indices),
-    ):
-        # Configure the mocks just like before
-        mock_from_item = MagicMock()
-        mock_from_item.item.return_value = 700
-
-        mock_to_item = MagicMock()
-        mock_to_item.item.return_value = 799
-
-        mock_episode_data_index.__getitem__.side_effect = lambda key: {
-            "from": [mock_from_item],
-            "to": [mock_to_item],
-        }[key]
-
-        query_indices, _ = lerobot_dataset._get_query_indices_soft(idx=710, ep_idx=0)
-
-        # grouping all the query indices with same group into dictionary
-        dict1 = defaultdict(list)
-        for key, (group, indices) in feature2group.items():
-            if type(indices) is int:
-                dict1[(str(indices) + "_" + str(group))].append(float(query_indices[key]))
-            elif indices:
-                for i, idx in enumerate(indices):
-                    dict1[(str(idx) + "_" + str(group))].append(float(query_indices[key][i]))
-
-        # checking if all the values are same in the list of same group
-
-        for _, values in dict1.items():
-            assert len(list(set(values))) == 1

@@ -16,3 +16,4 @@ This section provides step-by-step guides for common tasks in OpenTau, including
    RL
    tutorials/human_demo
    tutorials/ros_conversion
+   tutorials/robocasa

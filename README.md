@@ -64,6 +64,10 @@ We provide fully functioning $\pi_{0.5}$ checkpoints trained with high success r
 
 | Model Checkpoint              | Description                                                                                                   | Success Rate (%)                                                   |
 |-------------------------------|---------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------|
+| [TensorAuto/Robocasa_navigatekitchen][12] | A $\pi_{0.5}$ model checkpoint trained on Navigate to Kitchen objects task on Robocasa. | 97%                                                             |
+| [TensorAuto/Robocasa_Closeupdown][11] | A $\pi_{0.5}$ model checkpoint trained on Close Oven, Close Toaster and Close Dishwasher on Robocasa. | Close Oven : 90% <br> Close Toaster : 70% <br> Close Dishwasher : 90%                                                             |
+| [TensorAuto/TensorAuto/robocasa_Closesideways][10]| A $\pi_{0.5}$ model checkpoint trained on Close Microwave, Close Cabinet and Close Fridge on Robocasa. | Close Microwave : 97% <br> Close Cabinet : 65% <br> Close Fridge : 80%                                                             |
+| [TensorAuto/pi05_libero_continuous_state][9]   | A $\pi_{0.5}$ model checkpoint trained on Libero dataset with continuous states (projecting raw proprioceptive states to models latent dimension). | 92%                                                         |
 | [TensorAuto/moka_pot_libero_sft][6] <br> [TensorAuto/moka_pot_RECAP_R0][7] <br> [TensorAuto/moka_pot_RECAP_R1][8]   | A $\pi_{0}$ RECAP model checkpoint trained on moka pot task on libero. | 83% <br> 89% <br> 90%                                                             |
 | [TensorAuto/tPi0.5-libero][2] | A $\pi_{0.5}$ model checkpoint trained on the LIBERO dataset with discrete actions and knowledge insulation.  | 98.4% (10) <br> 97.6% (Goal) <br> 100% (Object) <br> 98% (Spatial) |
 | [TensorAuto/pi05_base][5]     | A $\pi_{0.5}$ model checkpoint converted from the official openpi checkpoint, with language embeddings added. | N/A                                                                |
@@ -81,3 +85,7 @@ This project builds on the $\pi$ series of [papers][3] and many other open-sourc
 [6]: https://huggingface.co/TensorAuto/moka_pot_libero_sft
 [7]: https://huggingface.co/TensorAuto/moka_pot_RECAP_R0
 [8]: https://huggingface.co/TensorAuto/moka_pot_RECAP_R1
+[9]: https://huggingface.co/TensorAuto/pi05_libero_continuous_state
+[10]: https://huggingface.co/TensorAuto/robocasa_Closesideways
+[11]: https://huggingface.co/TensorAuto/Robocasa_Closeupdown
+[12]: https://huggingface.co/TensorAuto/Robocasa_navigatekitchen

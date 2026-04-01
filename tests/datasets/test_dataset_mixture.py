@@ -348,10 +348,8 @@ class TestWeightedDatasetMixtureIntegration:
         assert dataloader.num_workers == train_pipeline_config.num_workers
 
     @pytest.mark.slow  # ~3.5 min
-    def test_integration_basic_functionality_with_no_latency_and_same_fps_as_dataset(
-        self, train_pipeline_config
-    ):
-        """Test that the mixture with no latency and same fps as datasets actually uses the samples from the datasets."""
+    def test_integration_basic_functionality_with_same_fps_as_dataset(self, train_pipeline_config):
+        """Test that the mixture with same fps as datasets actually uses the samples from the datasets."""
         # Create dataset
         dataset_config = DatasetConfig(repo_id="lerobot/droid_100", episodes=[0, 1])
 
@@ -359,16 +357,6 @@ class TestWeightedDatasetMixtureIntegration:
         train_pipeline_config.dataset_mixture.action_freq = 15.0  # same fps as droid_100 dataset
         train_pipeline_config.dataset_mixture.image_resample_strategy = "nearest"
         train_pipeline_config.dataset_mixture.vector_resample_strategy = "nearest"
-
-        # set latency to 0
-        train_pipeline_config.policy.cloud_vlm_latency_mean = 0.0
-        train_pipeline_config.policy.cloud_vlm_latency_std = 0.0
-        train_pipeline_config.policy.cloud_vlm_latency_lower = 0.0
-        train_pipeline_config.policy.cloud_vlm_latency_upper = 0.0
-        train_pipeline_config.policy.action_decoder_latency_mean = 0.0
-        train_pipeline_config.policy.action_decoder_latency_std = 0.0
-        train_pipeline_config.policy.action_decoder_latency_lower = 0.0
-        train_pipeline_config.policy.action_decoder_latency_upper = 0.0
 
         train_pipeline_config.batch_size = 1
         train_pipeline_config.dataloader_batch_size = 1

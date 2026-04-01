@@ -114,6 +114,8 @@ from opentau.datasets.utils import (
     DEFAULT_IMAGE_PATH,
     INFO_PATH,
     TASKS_PATH,
+    DeltaTimestampInfo,
+    DeltaTimestampParam,
     append_jsonlines,
     backward_compatible_episodes_stats,
     check_timestamps_sync,
@@ -216,7 +218,7 @@ class DatasetMetadata:
         repo_id: Repository ID of the dataset (set by subclasses).
     """
 
-    def __init__(self, *, info: dict = None, stats: dict = None):
+    def __init__(self, *, info: dict | None = None, stats: dict | None = None):
         self.info = info or {"features": {}}
         self.stats = stats or {}
 
@@ -226,7 +228,7 @@ class DatasetMetadata:
                     self.stats[feature_name][metric] = np.array(self.stats[feature_name][metric])
                 # TODO: check stats[feature_name][metric].shape is broadcastable with features[feature_name]["shape"]
 
-        self.repo_id = None
+        self.repo_id: str | None = None
 
     @property
     def features(self) -> dict[str, dict]:
@@ -344,12 +346,14 @@ class LeRobotDatasetMetadata(DatasetMetadata):
         Loads info, tasks, episodes, statistics, and advantages from the
         dataset root directory. Handles version compatibility checks.
         """
+        assert self.repo_id is not None
         self.info = load_info(self.root)
         check_version_compatibility(self.repo_id, self._version, CODEBASE_VERSION)
         self.tasks, self.task_to_task_index = load_tasks(self.root)
         self.episodes = load_episodes(self.root)
         if self._version < packaging.version.parse("v2.1"):
             self.stats = load_stats(self.root)
+            assert self.stats is not None
             self.episodes_stats = backward_compatible_episodes_stats(self.stats, self.episodes)
         else:
             self.episodes_stats = load_episodes_stats(self.root)
@@ -362,6 +366,7 @@ class LeRobotDatasetMetadata(DatasetMetadata):
         allow_patterns: list[str] | str | None = None,
         ignore_patterns: list[str] | str | None = None,
     ) -> None:
+        assert self.repo_id is not None
         snapshot_download(
             self.repo_id,
             repo_type="dataset",
@@ -400,6 +405,7 @@ class LeRobotDatasetMetadata(DatasetMetadata):
             Path to the video file for the episode.
         """
         ep_chunk = self.get_episode_chunk(ep_index)
+        assert self.video_path is not None
         fpath = self.video_path.format(episode_chunk=ep_chunk, video_key=vid_key, episode_index=ep_index)
         return Path(fpath)
 
@@ -603,8 +609,6 @@ class BaseDataset(torch.utils.data.Dataset):
     Subclasses must implement:
         - `_get_feature_mapping_key()`: Returns the key used for feature name
           mapping (e.g., "lerobot/aloha_mobile_cabinet")
-        - `_separate_image_in_time()`: Separates temporal image sequences into
-          individual frames
 
     Attributes:
         resolution: Target image resolution (height, width).
@@ -618,8 +622,6 @@ class BaseDataset(torch.utils.data.Dataset):
             >>> class MyDataset(BaseDataset):
             ...     def _get_feature_mapping_key(self):
             ...         return "my-dataset"
-            ...     def _separate_image_in_time(self, item):
-            ...         pass  # No temporal separation needed
     """
 
     def __init__(self, cfg: TrainPipelineConfig):
@@ -630,40 +632,29 @@ class BaseDataset(torch.utils.data.Dataset):
         self.max_state_dim = cfg.max_state_dim  # maximum dimension of the state vector
         self.max_action_dim = cfg.max_action_dim  # maximum dimension of the action vector
         self.action_chunk = cfg.action_chunk  # number of actions to be processed in a chunk
+        self.n_obs_history = cfg.dataset_mixture.n_obs_history if cfg.dataset_mixture else None
 
     @abstractmethod
     def _get_feature_mapping_key(self) -> str:
         r"""Returns the key used for feature mapping"""
         pass
 
-    @abstractmethod
-    def _separate_image_in_time(self, item: dict):
-        r"""Some keys correspond to 2 images, where the first is image at current timestamp and the second is the image
-        from some time ago. We separate these 2 images into different keys by modifying the `item` dictionary.
-        For example, {"image_key": torch.zeros(2, 3, 224, 224), "image_key_is_pad": [False, True] } will become
-        {
-            "image_key": torch.zeros(3, 224, 224),
-            "image_key_local": torch.zeros(3, 224, 224),
-            "image_key_is_pad: False,
-            "image_key_local_is_pad": True,
-        }.
-        """
-        raise NotImplementedError
-
-    def _standardize_images(self, item, standard_item, n_cams, is_local) -> list[bool]:
+    def _standardize_images(self, item, standard_item, n_cams) -> list[bool]:
         """Standardize image features to a common format.
 
         Resizes images to the target resolution with padding, and tracks
-        which images are padded.
+        which camera slots are padded (absent cameras).
+
+        When ``self.n_obs_history`` is set, camera tensors have shape
+        ``(T, C, H, W)`` and each frame is resized individually.
 
         Args:
             item: Input item dictionary with original image keys.
             standard_item: Output dictionary to populate with standardized images.
             n_cams: Number of cameras to process.
-            is_local: Whether processing local (past) images.
 
         Returns:
-            List of boolean values indicating which images are padded.
+            List of boolean values indicating which camera slots are padded.
         """
         name_map = DATA_FEATURES_NAME_MAPPING[self._get_feature_mapping_key()]
         image_is_pad = []
@@ -672,8 +663,20 @@ class BaseDataset(torch.utils.data.Dataset):
             key = name_map.get(std_key)
 
             if key is None:
-                standard_item[std_key] = torch.zeros((3, *self.resolution))
+                if self.n_obs_history is not None:
+                    standard_item[std_key] = torch.zeros((self.n_obs_history, 3, *self.resolution))
+                else:
+                    standard_item[std_key] = torch.zeros((3, *self.resolution))
                 image_is_pad.append(True)
+            elif self.n_obs_history is not None:
+                standard_item[std_key] = self.resize_with_pad(
+                    item[key], self.resolution[1], self.resolution[0], pad_value=0
+                )
+                # Per-frame temporal padding info (from clamped episode boundaries) is
+                # tracked by obs_history_is_pad on the state side. Camera _is_pad only
+                # indicates whether the entire camera slot is absent, so we always mark
+                # a present camera as not padded regardless of frame-level clamping.
+                image_is_pad.append(False)
             else:
                 standard_item[std_key] = self.resize_with_pad(
                     item[key],
@@ -682,16 +685,25 @@ class BaseDataset(torch.utils.data.Dataset):
                     pad_value=0,
                 )
                 image_is_pad.append(item.get(key + "_is_pad", torch.tensor(False)).item())
+
+            img = standard_item[std_key]
+            if self.n_obs_history is not None:
+                expected_ndim = 4
+                expected_c_dim = 1
+                shape_desc = "(T, 3, H, W)"
+            else:
+                expected_ndim = 3
+                expected_c_dim = 0
+                shape_desc = "(3, H, W)"
             assert (
-                len(standard_item[std_key].shape) == 3
-                and standard_item[std_key].shape[0] == 3
-                and standard_item[std_key].min() >= 0.0 - 1e-6  # bfloat16 results in precision loss
-                and standard_item[std_key].max() <= 1.0 + 1e-6  # bfloat16 results in precision loss
+                len(img.shape) == expected_ndim
+                and img.shape[expected_c_dim] == 3
+                and img.min() >= 0.0 - 1e-6
+                and img.max() <= 1.0 + 1e-6
             ), (
-                f"Expected image {std_key} to have shape (3, H, W) with values in [0, 1], "
-                f"Got shape {standard_item[std_key].shape}, "
-                f"min={standard_item[std_key].min()}, "
-                f"max={standard_item[std_key].max()}, "
+                f"Expected image {std_key} to have shape {shape_desc} with values in [0, 1], "
+                f"Got shape {img.shape}, "
+                f"min={img.min()}, max={img.max()}, "
                 f"self={self._get_feature_mapping_key()}."
             )
 
@@ -710,13 +722,12 @@ class BaseDataset(torch.utils.data.Dataset):
             Dictionary with standardized feature names and formats.
         """
         name_map = DATA_FEATURES_NAME_MAPPING[self._get_feature_mapping_key()]
-        self._separate_image_in_time(item)
 
         standard_item = {}
-        img_is_pad = self._standardize_images(item, standard_item, self.num_cams, False)
+        img_is_pad = self._standardize_images(item, standard_item, self.num_cams)
 
         for new_key, key in name_map.items():
-            if new_key.startswith("camera"):
+            if "camera" in new_key:
                 continue
             standard_item[new_key] = item[key]
 
@@ -726,6 +737,15 @@ class BaseDataset(torch.utils.data.Dataset):
 
         standard_item["img_is_pad"] = torch.tensor(img_is_pad, dtype=torch.bool)
         standard_item["action_is_pad"] = item[name_map["actions"] + "_is_pad"]
+
+        state_raw_key = name_map.get("state")
+        state_pad_key = f"{state_raw_key}_is_pad" if state_raw_key else None
+        if state_pad_key and state_pad_key in item:
+            standard_item["obs_history_is_pad"] = item[state_pad_key]
+        elif self.n_obs_history is not None:
+            standard_item["obs_history_is_pad"] = torch.zeros(self.n_obs_history, dtype=torch.bool)
+        else:
+            standard_item["obs_history_is_pad"] = torch.tensor([False], dtype=torch.bool)
 
         # cast all tensors in standard_item to bfloat16
         for key, value in standard_item.items():
@@ -741,21 +761,23 @@ class BaseDataset(torch.utils.data.Dataset):
         then pads on the left and top to reach exact target size.
 
         Args:
-            img: Input image tensor of shape (C, H, W).
+            img: Input image tensor of shape (C, H, W) or (T, C, H, W).
             width: Target width.
             height: Target height.
             pad_value: Value to use for padding. Defaults to 0.
 
         Returns:
-            Resized and padded image tensor of shape (C, height, width).
+            Resized and padded image tensor of shape (C, height, width) or
+            (T, C, height, width), matching the input rank.
 
         Raises:
-            ValueError: If input image doesn't have 4 dimensions when reshaped.
+            ValueError: If input is not 3D or 4D.
         """
-        # assume no-op when width height fits already
-        img = rearrange(img, "c h w -> 1 c h w")
+        batched = img.ndim == 4
+        if not batched:
+            img = img.unsqueeze(0)
         if img.ndim != 4:
-            raise ValueError(f"(b,c,h,w) expected, but {img.shape}")
+            raise ValueError(f"Expected (C,H,W) or (T,C,H,W), got shape {img.shape}")
 
         cur_height, cur_width = img.shape[2:]
 
@@ -769,11 +791,10 @@ class BaseDataset(torch.utils.data.Dataset):
         pad_height = max(0, int(height - resized_height))
         pad_width = max(0, int(width - resized_width))
 
-        # pad on left and top of image
         padded_img = F.pad(resized_img, (pad_width, 0, pad_height, 0), value=pad_value)
 
-        # rearrange back to (c, h, w)
-        padded_img = rearrange(padded_img, "1 c h w -> c h w")
+        if not batched:
+            padded_img = padded_img.squeeze(0)
         return padded_img
 
     @staticmethod
@@ -827,7 +848,6 @@ class LeRobotDataset(BaseDataset):
         episodes: Dictionary mapping episode_index to episode info.
         image_transforms: Optional image transforms to apply.
         delta_timestamps_params: Processed delta timestamp parameters.
-        feature2group: Mapping from features to temporal groups.
         video_backend: Backend used for video decoding.
         standardize: Whether to standardize data format.
 
@@ -863,7 +883,6 @@ class LeRobotDataset(BaseDataset):
         delta_timestamps_std: dict[str, np.ndarray | list[float]] | None = None,
         delta_timestamps_lower: dict[str, np.ndarray | list[float]] | None = None,
         delta_timestamps_upper: dict[str, np.ndarray | list[float]] | None = None,
-        feature2group: dict[str, tuple[str, (list[int] | int | None)]] | None = None,
         tolerance_s: float = 1e-4,
         revision: str | None = None,
         force_cache_sync: bool = False,
@@ -963,39 +982,18 @@ class LeRobotDataset(BaseDataset):
             image_transforms (Callable | None, optional): You can pass standard v2 image transforms from
                 torchvision.transforms.v2 here which will be applied to visual modalities (whether they come
                 from videos or images). Defaults to None.
-            delta_timestamps (dict[list[float]] | None, optional): Dictionary where each key is a group name and its
-                corresponding value is a list of delta timestamps in seconds. For example, {'group1': [0, 0.1]} means
-                features of group1 will be returned as a chunk of 2, with the first element being the value at current
-                time and the second element being the value at current time + 0.1 seconds. This will also add a key
-                named '{feature}_is_pad' to the returned item, with a boolean type and a length of 2, indicating whether
-                the feature is padded or not. Padding will happen when t + 0.1 is outside the episode time range.
+            delta_timestamps (dict[list[float]] | None, optional): Dictionary mapping feature
+                names to lists of delta timestamps in seconds. For example,
+                ``{'state': [0.0], 'action': [0, 0.5, 1.0]}`` means state is sampled at the current
+                time and action is sampled at three offsets. A ``{feature}_is_pad`` boolean mask of the
+                same length is added to the returned item. Defaults to None.
+            delta_timestamps_std: (dict[list[float]] | None, optional): Per-feature standard
+                deviation for the delta timestamps. Absent keys are treated as deterministic (std=0).
                 Defaults to None.
-            delta_timestamps_std: (dict[list[float]] | None, optional): Similar to delta_timestamps, but specifies an
-                optional standard deviation for the delta timestamps. If a key is absent, the delta timestamps for that
-                key will be deterministic. If a key is present without corresponding delta_timestamps, it will be
-                ignored. E.g., delta_timestamps={'group1': [0, 0.1]} and delta_timestamps_std={'group1': [0, 0.05]} will
-                result in a chunk of 2, with the first element being the feature at current time and the second
-                element at a time following a Gaussian distribution with N(t+0.1, 0.05^2). When it takes on a value
-                outside the episode, the corresponding element in `{feature}_is_mask` will be set to True.
-                Defaults to None.
-            delta_timestamps_lower: (dict[list[float]] | None, optional): Similar to delta_timestamps_std, but specifies
-                a minimum value for the delta timestamps. When specified, the delta timestamps will be lower-clipped
-                accordingly. Defaults to None.
-            delta_timestamps_upper: (dict[list[float]] | None, optional): Similar to delta_timestamps_std, but specifies
-                a maximum value for the delta timestamps. When specified, the delta timestamps will be upper-clipped
-                accordingly. Defaults to None.
-            feature2group: (dict[str, tuple[str, (list[int] | int | None)]] | None, optional): Dictionary mapping every
-                individual feature to a tuple of (group name, indices). Group names are keys passed to delta_timestamps.
-                If `indices` is None, will use all indices in the group. If indices is a list, will use only those
-                indices in the corresponding order, including duplicates if present. If indices is an int, will return
-                that index only, resulting in a reduction in ndim by 1.
-                For example, `feature2group={'action': ('group1', None), 'observation.state': ('group2', 0),
-                'observation.images.left_hand': ('group2', [0, 1])}` means the feature `action` will use resolved
-                `delta_timestamps` from `group1` and will return every index. Also, `observation.state` will pick the
-                first element (index-0) of `group2`. `observation.images.left_hand` will pick the first and second
-                elements (indices 0 and 1) of `group2` and return them as a chunk of 2 images. The first element of
-                `observation.images.left_hand` and the state vector will always be sampled at the same timestamp despite
-                having gaussian noise applied, because they are in the same group.
+            delta_timestamps_lower: (dict[list[float]] | None, optional): Per-feature lower bound
+                for the delta timestamps. Defaults to None.
+            delta_timestamps_upper: (dict[list[float]] | None, optional): Per-feature upper bound
+                for the delta timestamps. Defaults to None.
             tolerance_s (float, optional): Tolerance in seconds used to ensure data timestamps are actually in
                 sync with the fps value. It is used at the init of the dataset to make sure that each
                 timestamps is separated to the next by 1/fps +/- tolerance_s. This also applies to frames
@@ -1023,19 +1021,12 @@ class LeRobotDataset(BaseDataset):
         self.repo_id = repo_id
         self.root = Path(root) if root else HF_OPENTAU_HOME / repo_id
         self.image_transforms = image_transforms
-        if bool(delta_timestamps) ^ bool(feature2group):
-            raise ValueError(
-                "Either both delta_timestamps and feature2group should be provided, or neither of them."
-            )
-        # delta_timestamps_params is a 4 tuple (mean, std, lower, upper)
         self.delta_timestamps_params = self.compute_delta_params(
             delta_timestamps,
             delta_timestamps_std,
             delta_timestamps_lower,
             delta_timestamps_upper,
         )
-        self.feature2group = feature2group or {}
-        self._check_feature_group_mapping()
         self.episodes = episodes
         self.tolerance_s = tolerance_s
         self.revision = revision if revision else CODEBASE_VERSION
@@ -1063,6 +1054,7 @@ class LeRobotDataset(BaseDataset):
         # Unused attributes
         self.image_writer = None
         self.episode_buffer = None
+        self.skip_video_stats = False
 
         self.root.mkdir(exist_ok=True, parents=True)
 
@@ -1186,7 +1178,7 @@ class LeRobotDataset(BaseDataset):
 
         self.pull_from_repo(allow_patterns=files, ignore_patterns=ignore_patterns)
 
-    def get_episodes_file_paths(self) -> list[Path]:
+    def get_episodes_file_paths(self) -> list[str]:
         """Get file paths for all selected episodes.
 
         Returns paths for both parquet data files and video files (if applicable)
@@ -1228,7 +1220,7 @@ class LeRobotDataset(BaseDataset):
         """
         features = get_hf_features_from_features(self.features)
         ft_dict = {col: [] for col in features}
-        hf_dataset = datasets.Dataset.from_dict(ft_dict, features=features, split="train")
+        hf_dataset = datasets.Dataset.from_dict(ft_dict, features=features, split=datasets.Split.TRAIN)
 
         # TODO(aliberts): hf_dataset.set_format("torch")
         hf_dataset.set_transform(hf_transform_to_torch)
@@ -1263,7 +1255,7 @@ class LeRobotDataset(BaseDataset):
 
     def _get_query_indices_soft(
         self, idx: int, ep_idx: int
-    ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    ) -> tuple[dict[str, np.ndarray], dict[str, torch.Tensor]]:
         """Get soft (float) indices for querying features with delta timestamps.
 
         Computes indices for features based on delta timestamps, accounting for
@@ -1283,18 +1275,13 @@ class LeRobotDataset(BaseDataset):
 
         # Get the delta_indices by group
         delta_indices = get_delta_indices_soft(self.delta_timestamps_params, self.fps)
-        # Map from group to feature
-        delta_indices = {
-            feature: delta_indices[group][
-                slice(None) if indices is None else [indices] if isinstance(indices, int) else indices
-            ]
-            for feature, (group, indices) in self.feature2group.items()
-        }
         query_indices = {
             key: np.clip(idx + delta_idx, ep_start, ep_end - 1) for key, delta_idx in delta_indices.items()
         }
         padding = {  # Pad values outside of current episode range
-            f"{key}_is_pad": torch.BoolTensor((idx + delta_idx < ep_start) | (idx + delta_idx >= ep_end))
+            f"{key}_is_pad": torch.tensor(
+                (idx + delta_idx < ep_start) | (idx + delta_idx >= ep_end), dtype=torch.bool
+            )
             for key, delta_idx in delta_indices.items()
         }
         return query_indices, padding
@@ -1455,8 +1442,12 @@ class LeRobotDataset(BaseDataset):
         item = self.hf_dataset[idx]
         ep_idx = item["episode_index"].item()
 
-        if self.episode_data_index is not None and self.epi2idx is not None:
-            ep_end = self.episode_data_index["to"][self.epi2idx[ep_idx]].item()
+        if self.episode_data_index is None or self.epi2idx is None:
+            raise RuntimeError(
+                "episode_data_index and epi2idx must be set before calling __getitem__. "
+                "This usually means the dataset was not properly initialized."
+            )
+        ep_end = int(self.episode_data_index["to"][self.epi2idx[ep_idx]].item())
 
         episodes_info = self.meta.episodes[ep_idx]
 
@@ -1485,9 +1476,9 @@ class LeRobotDataset(BaseDataset):
         task_idx = item["task_index"].item()
         item["task"] = self.meta.tasks[task_idx]
 
-        # If indices is an int, squeeze the feature
-        for feature, (_, indices) in self.feature2group.items():
-            if isinstance(indices, int):
+        # Squeeze the temporal dimension for features with a single delta timestamp
+        for feature, mean in self.delta_timestamps_params[0].items():
+            if len(mean) == 1 and feature in item:
                 item[feature] = item[feature].squeeze(0)
 
         # The conversion script of AGI BOT dataset uses a dataloader to enumerate data and compute stats.
@@ -1638,8 +1629,9 @@ class LeRobotDataset(BaseDataset):
                 save the current episode in self.episode_buffer, which is filled with 'add_frame'. Defaults to
                 None.
         """
-        if not episode_data:
-            episode_buffer = self.episode_buffer
+        episode_buffer = self.episode_buffer if episode_data is None else episode_data
+        if episode_buffer is None:
+            raise RuntimeError("No episode data provided and no episode buffer exists. Call add_frame first.")
 
         validate_episode_buffer(episode_buffer, self.meta.total_episodes, self.features)
 
@@ -1722,7 +1714,9 @@ class LeRobotDataset(BaseDataset):
 
     def _save_episode_table(self, episode_buffer: dict, episode_index: int) -> None:
         episode_dict = {key: episode_buffer[key] for key in self.hf_features}
-        ep_dataset = datasets.Dataset.from_dict(episode_dict, features=self.hf_features, split="train")
+        ep_dataset = datasets.Dataset.from_dict(
+            episode_dict, features=self.hf_features, split=datasets.Split.TRAIN
+        )
         ep_dataset = embed_images(ep_dataset)
         self.hf_dataset = concatenate_datasets([self.hf_dataset, ep_dataset])
         self.hf_dataset.set_transform(hf_transform_to_torch)
@@ -1731,6 +1725,8 @@ class LeRobotDataset(BaseDataset):
         ep_dataset.to_parquet(ep_data_path)
 
     def clear_episode_buffer(self) -> None:
+        if self.episode_buffer is None:
+            return
         episode_index = self.episode_buffer["episode_index"]
         if self.image_writer is not None:
             for cam_key in self.meta.camera_keys:
@@ -1797,76 +1793,57 @@ class LeRobotDataset(BaseDataset):
 
         return video_paths
 
-    def _separate_image_in_time(self, item: dict):
-        name_map = DATA_FEATURES_NAME_MAPPING[self._get_feature_mapping_key()]
-        cam_keys = {v for k, v in name_map.items() if k.startswith("camera")}
-        for k in cam_keys:
-            images = item.pop(k)
-            if len(images) == 2:
-                item[k + "_local"], item[k] = images
-
-            pads = item.get(k + "_is_pad")
-            if hasattr(pads, "__len__") and len(pads) == 2:
-                item[k + "_local_is_pad"], item[k + "_is_pad"] = pads
-
     @staticmethod
     def compute_delta_params(
-        mean: dict[str, np.ndarray | list[float]],
-        std: dict[str, np.ndarray | list[float]],
-        lower: dict[str, np.ndarray | list[float]],
-        upper: dict[str, np.ndarray | list[float]],
-    ):
+        mean: dict[str, np.ndarray | list[float]] | None,
+        std: dict[str, np.ndarray | list[float]] | None,
+        lower: dict[str, np.ndarray | list[float]] | None,
+        upper: dict[str, np.ndarray | list[float]] | None,
+    ) -> DeltaTimestampInfo:
         r"""Process the parameters `mean`, `std`, `lower` and `upper` for delta timestamps.
-        Delta timestamps will be computed dynamically in `__getitem__` with `clip(dT, lower, upper)` where `dT` follows
-        the gaussian distribution N(mean, std^2). Each parameter is a dictionary mapping group names to sequences of
+
+        Delta timestamps are computed dynamically in ``__getitem__`` with
+        ``clip(dT, lower, upper)`` where ``dT ~ N(mean, std^2)``.  Each
+        parameter is a dictionary mapping **feature names** to sequences of
         floats.
 
-        For example, mean = {"group1": [-0.1, 0.0, 0.1], "group2": [0.0, 0.2]}. indicates that 3 delta timestamps for
-        features in group1 will be sampled: time t-0.1, t, and t+0.1; and 2 delta timestamps for features in group2 will
-        be sampled: time t and t+0.2, where t is the timestamp of the current data point.
+        For example, ``mean = {"state": [0.0], "action": [0.0, 0.5, 1.0]}``
+        means the ``state`` feature will be sampled at ``t + 0.0`` and the
+        ``action`` feature will be sampled at three offsets ``t``, ``t+0.5``
+        and ``t+1.0``.
 
-        It is assumed that the `std`, `lower`, and `upper` have the same keys as `mean`, and matching keys have values
-        of the same length. If a key absent from `std`, `lower`, or `upper`, it will be set to a default value.
-        Namely, `std` will be set to all 0, `lower` will be set to all `-inf`, and `upper` will be set to `+inf`, with
-        lengths equal to the length of sequences in `mean` for that key.
-        If a key is absent from `mean` but present in `std`, `lower`, or `upper`, it will be ignored.
-
-        After processing, the function returns four dictionaries: `mean`, `std`, `lower`, and `upper`, where each key
-        is a feature name and each value is a numpy array of floats, satisfying the above conditions.
+        Keys present in ``std`` / ``lower`` / ``upper`` but absent from
+        ``mean`` are ignored.  Keys absent from ``std`` / ``lower`` /
+        ``upper`` but present in ``mean`` receive sensible defaults (0 for
+        std, -inf / +inf for bounds).
         """
         inf = float("inf")
-        mean = mean or {}
-        mean = {k: np.array(v) for k, v in mean.items()}
+        mean_np: DeltaTimestampParam = {k: np.array(v) for k, v in (mean or {}).items()}
 
-        std = std or {}
-        std = {k: np.array(std.get(k) or np.zeros_like(v)) for k, v in mean.items()}
+        std_raw = std or {}
+        std_np: DeltaTimestampParam = {
+            k: np.array(std_raw.get(k) or np.zeros_like(v)) for k, v in mean_np.items()
+        }
 
-        lower = lower or {}
-        lower = {k: np.array(lower.get(k) or (np.zeros_like(v) - inf)) for k, v in mean.items()}
+        lower_raw = lower or {}
+        lower_np: DeltaTimestampParam = {
+            k: np.array(lower_raw.get(k) or (np.zeros_like(v) - inf)) for k, v in mean_np.items()
+        }
 
-        upper = upper or {}
-        upper = {k: np.array(upper.get(k) or (np.zeros_like(v) + inf)) for k, v in mean.items()}
+        upper_raw = upper or {}
+        upper_np: DeltaTimestampParam = {
+            k: np.array(upper_raw.get(k) or (np.zeros_like(v) + inf)) for k, v in mean_np.items()
+        }
 
-        for k in mean:
-            if not (mean[k].shape == std[k].shape == lower[k].shape == upper[k].shape):
+        for k in mean_np:
+            if not (mean_np[k].shape == std_np[k].shape == lower_np[k].shape == upper_np[k].shape):
                 raise ValueError(
                     f"Delta timestamps parameters for {k} have inconsistent shapes: "
-                    f"mean={mean[k].shape}, std={std[k].shape}, lower={lower[k].shape}, upper={upper[k].shape}"
+                    f"mean={mean_np[k].shape}, std={std_np[k].shape}, "
+                    f"lower={lower_np[k].shape}, upper={upper_np[k].shape}"
                 )
 
-        return mean, std, lower, upper
-
-    def _check_feature_group_mapping(self):
-        for feature, (group, indices) in self.feature2group.items():
-            if group not in self.delta_timestamps_params[0]:
-                raise ValueError(
-                    f"Feature '{feature}' is mapped to group '{group}', which is not present in "
-                    "delta_timestamps_params. Please check the mapping."
-                )
-            if indices is not None and not isinstance(indices, (int, list)):
-                raise ValueError(
-                    f"Indices for feature '{feature}' in group '{group}' should be a list, an int, or None"
-                )
+        return mean_np, std_np, lower_np, upper_np
 
     @classmethod
     def create(
@@ -1912,7 +1889,6 @@ class LeRobotDataset(BaseDataset):
         obj.hf_dataset = obj.create_hf_dataset()
         obj.image_transforms = None
         obj.delta_timestamps_params = obj.compute_delta_params(None, None, None, None)
-        obj.feature2group = {}
         obj.episode_data_index = None
         obj.video_backend = video_backend if video_backend is not None else get_safe_default_codec()
         obj.image_resample_strategy = image_resample_strategy

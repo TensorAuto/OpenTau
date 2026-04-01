@@ -43,7 +43,9 @@ Metadata is stored in JSON files (``info.json``, ``stats.json``) and JSONL files
 Standard Data Format
 --------------------
 To ensure compatibility across different datasets and policies, OpenTau introduces the **Standard Data Format**.
-The Standard Data Format is the expected data format returned by ``torch.utils.data.Dataset``'s ``__getitem__`` and the expected input to ``torch.nn.Module``'s ``forward`` method. Any new datasets, VLMs, or VLAs that get added to this repository need to adhere to this format. Data being passed to the model during inference should also adhere to this format. The format is as follows:
+The Standard Data Format is the expected data format returned by ``torch.utils.data.Dataset``'s ``__getitem__`` and the expected input to ``torch.nn.Module``'s ``forward`` method. Any new datasets, VLMs, or VLAs that get added to this repository need to adhere to this format. Data being passed to the model during inference should also adhere to this format.
+
+Default format (``n_obs_history=None``):
 
 .. code-block:: python
 
@@ -53,7 +55,7 @@ The Standard Data Format is the expected data format returned by ``torch.utils.d
         # ...
         "camera{num_cams-1}": torch.Tensor,  # shape (C, H, W) with values from [0, 1] and with the H, W resized to the config's specifications.
 
-        "state": torch.Tensor,    # shape (max_state_dim)
+        "state": torch.Tensor,    # shape (max_state_dim,)
         "actions": torch.Tensor,  # shape (action_chunk, max_action_dim)
         "prompt": str,            # the task prompt, e.g. "Pick up the object and place it on the table."
         "response": str,          # the response from the VLM for vision QA tasks. For LeRobotDataset, this will be an empty string.
@@ -61,7 +63,32 @@ The Standard Data Format is the expected data format returned by ``torch.utils.d
 
         "img_is_pad": torch.BoolTensor,  # shape (num_cams,) with values 0 or 1, where 1 indicates that the camera image is a padded image.
         "action_is_pad": torch.BoolTensor,  # shape (action_chunk,) with values 0 or 1, where 1 indicates that the action is a padded action.
+        "obs_history_is_pad": torch.BoolTensor,  # shape (1,) — always False when n_obs_history is None.
     }
+
+With observation history (``n_obs_history=T``):
+
+.. code-block:: python
+
+    {
+        "camera0": torch.Tensor,  # shape (T, C, H, W) — T historical steps for camera 0.
+        # ...
+        "camera{num_cams-1}": torch.Tensor,  # shape (T, C, H, W)
+
+        "state": torch.Tensor,    # shape (T, max_state_dim)
+        "actions": torch.Tensor,  # shape (action_chunk, max_action_dim)
+        # ... (prompt, response, loss_type unchanged)
+
+        "img_is_pad": torch.BoolTensor,  # shape (num_cams,) — camera slot availability.
+        "action_is_pad": torch.BoolTensor,  # shape (action_chunk,)
+        "obs_history_is_pad": torch.BoolTensor,  # shape (T,) — True for timesteps outside the episode boundary.
+    }
+
+When ``n_obs_history=T`` and ``history_interval=k``, observations are sampled at timesteps
+:math:`t - (T-1)k,\; t - (T-2)k,\; \ldots,\; t` relative to the current timestep :math:`t`, where
+the interval is measured in dataset steps (at the configured ``action_freq``). For timesteps that
+fall before the start of the current episode, the observation is clamped to the first step of the
+episode and the corresponding entry in ``obs_history_is_pad`` is set to ``True``.
 
 The config file will have to provide the following information in TrainPipelineConfig:
 
@@ -70,6 +97,11 @@ The config file will have to provide the following information in TrainPipelineC
 *   ``max_state_dim``: The maximum dimension of the state vector.
 *   ``max_action_dim``: The maximum dimension of the action vector.
 *   ``action_chunk``: The number of actions in the action vector. This is usually 1 for single action tasks, but can be more for multi-action tasks.
+
+The following fields are set in ``DatasetMixtureConfig``:
+
+*   ``n_obs_history``: Number of historical observation steps to include. When ``None`` (default), the single-step format is used. When set to an integer ``T``, cameras and state gain a leading temporal dimension of size ``T``.
+*   ``history_interval``: Step interval between historical observation steps. Defaults to ``1``. Only relevant when ``n_obs_history`` is set.
 
 Cameras should be labeled in order of importance (e.g. camera0 is the most important camera, camera1 is the second most important camera, etc.). The model dataset will select the most important cameras to use if num_cams is less than the number of cameras in the dataset.
 
