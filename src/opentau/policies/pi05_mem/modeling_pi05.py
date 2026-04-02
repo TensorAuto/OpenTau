@@ -416,9 +416,18 @@ class PI05MemPolicy(PreTrainedPolicy):
         buffers, then assembles a batch with ``n_obs_history`` evenly-spaced
         frames (interval = ``history_interval``).  Early in an episode, missing
         history slots are zero-padded.
+
+        Expected batch keys:
+            - ``"state"``: (B, D) current proprioceptive state.
+            - image keys matching ``config.image_features``: (B, C, H, W) camera frames.
+            - ``"prompt"``: list[str] language instructions (passed through unchanged).
+            - Any other metadata keys are forwarded unchanged.
+
+        Returns a new dict with ``"state"`` expanded to (B, T, D) and image keys
+        expanded to (B, T, C, H, W), where T = ``n_obs_history``.
         """
         n_hist = self.config.n_obs_history
-        k = self.config.history_interval or 1
+        interval = self.config.history_interval or 1
         buf_maxlen = self.config.obs_buffer_size
 
         # --- initialise buffers on first call after reset() ---
@@ -436,16 +445,17 @@ class PI05MemPolicy(PreTrainedPolicy):
         for key in img_keys:
             self._obs_buffers[key].append(batch[key])  # (B, C, H, W)
 
-        # --- sample n_hist frames at interval k ---
+        # --- sample n_hist frames at the configured interval ---
         buf_len = len(self._state_buffer)
         missing = buf_maxlen - buf_len  # how many slots are still empty
 
-        temporal_batch = {k_: v for k_, v in batch.items() if k_ not in img_keys and k_ != "state"}
+        # Pass through all non-image, non-state keys (e.g. "prompt" and other metadata).
+        temporal_batch = {key: v for key, v in batch.items() if key not in img_keys and key != "state"}
 
         # Build state tensor (B, T, D)
         state_frames = []
         for i in range(n_hist):
-            idx = i * k - missing  # index into current buffer
+            idx = i * interval - missing  # index into current buffer
             if idx < 0:
                 state_frames.append(torch.zeros_like(self._state_buffer[0]))
             else:
@@ -456,7 +466,7 @@ class PI05MemPolicy(PreTrainedPolicy):
         for key in img_keys:
             cam_frames = []
             for i in range(n_hist):
-                idx = i * k - missing
+                idx = i * interval - missing
                 if idx < 0:
                     cam_frames.append(torch.zeros_like(self._obs_buffers[key][0]))
                 else:
@@ -696,13 +706,10 @@ class PI05MemPolicy(PreTrainedPolicy):
             videos.append(vid)
             vid_masks.append(mask)
 
-        for num_empty_cameras in range(len(missing_img_keys)):
-            if num_empty_cameras >= self.config.empty_cameras:
-                break
-            vid = torch.zeros_like(vid)
-            mask = torch.zeros_like(mask)
-            videos.append(vid)
-            vid_masks.append(mask)
+        n_empty = min(len(missing_img_keys), self.config.empty_cameras)
+        for _ in range(n_empty):
+            videos.append(torch.zeros_like(vid))
+            vid_masks.append(torch.zeros_like(mask))
 
         return videos, vid_masks
 
@@ -773,6 +780,7 @@ class PI05MemFlowMatching(nn.Module):
         vlm_hidden_size = self.paligemma_with_expert.config.paligemma_config.text_config.hidden_size
 
         # V-JEPA2 video encoder (replaces SigLIP)
+        encoder_dtype = getattr(torch, config.vjepa2_dtype) if config.vjepa2_dtype else None
         self.video_encoder = VJEPA2VideoEncoder(
             vjepa2_model_name=config.vjepa2_model_name,
             num_frames=config.n_obs_steps,
@@ -781,6 +789,7 @@ class PI05MemFlowMatching(nn.Module):
             vlm_hidden_size=vlm_hidden_size,
             perceiver_heads=config.vjepa2_perceiver_heads,
             freeze_encoder=config.freeze_vision_encoder,
+            encoder_dtype=encoder_dtype,
         )
 
         # Per-timestep state projection: each of the T state vectors becomes one token
@@ -791,8 +800,6 @@ class PI05MemFlowMatching(nn.Module):
 
         self.time_mlp_in = nn.Linear(self.config.proj_width, self.config.proj_width)
         self.time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
-
-        self.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
 
         self._init_model()
 

@@ -44,7 +44,11 @@ class PI05MemConfig(PreTrainedConfig):
     embedding space.
 
     Args:
-        n_obs_steps: Number of observation steps (temporal frames). Defaults to 8.
+        n_obs_steps: Number of temporal video frames passed to V-JEPA2 per forward call.
+            During training each sample has this many frames; during inference the
+            observation-history buffer (controlled by ``n_obs_history`` and
+            ``history_interval``) is stacked to produce exactly this many frames.
+            Must equal ``n_obs_history`` when the latter is set.
         chunk_size: Size of the action chunk. The upper bound for n_action_steps. Defaults to 50.
         n_action_steps: Number of action steps to predict. Defaults to 50.
         normalization_mapping: Mapping of feature names to normalization modes.
@@ -66,6 +70,8 @@ class PI05MemConfig(PreTrainedConfig):
         vjepa2_crop_size: Spatial resolution fed to V-JEPA2. Defaults to 224.
         vjepa2_num_video_tokens: Number of output tokens after reduction (must match SigLIP's 256). Defaults to 256.
         vjepa2_perceiver_heads: Number of attention heads in the Perceiver reducer. Defaults to 8.
+        vjepa2_dtype: Torch dtype string for V-JEPA2 weights (e.g. "bfloat16", "float32").
+            Defaults to None, which uses bfloat16 on CUDA and float32 on CPU.
     """
 
     # Input / output structure.
@@ -74,6 +80,12 @@ class PI05MemConfig(PreTrainedConfig):
     n_action_steps: int = 50
 
     # Observation history for inference buffering.
+    # ``n_obs_history`` controls how many evenly-spaced historical frames the
+    # inference buffer keeps.  ``history_interval`` is the stride between those
+    # frames.  Together they determine ``obs_buffer_size = (n_obs_history-1) *
+    # history_interval + 1``.  Typically ``n_obs_history`` should equal
+    # ``n_obs_steps`` so the V-JEPA2 encoder sees the same number of frames at
+    # training and inference time.
     # Populated from DatasetMixtureConfig during training if unset.
     n_obs_history: int | None = None
     history_interval: int | None = None
@@ -127,6 +139,7 @@ class PI05MemConfig(PreTrainedConfig):
     vjepa2_crop_size: int = 224
     vjepa2_num_video_tokens: int = 256
     vjepa2_perceiver_heads: int = 8
+    vjepa2_dtype: str | None = None
 
     # Training presets
     optimizer_lr: float = 2.5e-5

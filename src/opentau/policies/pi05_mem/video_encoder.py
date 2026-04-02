@@ -60,8 +60,12 @@ class VJEPA2VideoEncoder(nn.Module):
         vlm_hidden_size: int,
         perceiver_heads: int = 8,
         freeze_encoder: bool = True,
+        encoder_dtype: torch.dtype | None = None,
     ):
         super().__init__()
+
+        if encoder_dtype is None:
+            encoder_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
         vjepa2_config = VJEPA2Config.from_pretrained(vjepa2_model_name)
         vjepa2_config.crop_size = crop_size
@@ -70,7 +74,7 @@ class VJEPA2VideoEncoder(nn.Module):
         self.encoder = VJEPA2Model.from_pretrained(
             vjepa2_model_name,
             config=vjepa2_config,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=encoder_dtype,
             attn_implementation="sdpa",
         )
 
