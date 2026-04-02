@@ -202,11 +202,7 @@ def pad_discrete_tokens(tokens: list[list[int]], max_length: int) -> tuple[np.nd
     return np.array(discrete_action_tokens), np.array(discrete_action_masks)
 
 
-# ---------------------------------------------------------------------------
 # Policy wrapper
-# ---------------------------------------------------------------------------
-
-
 class PI05MemPolicy(PreTrainedPolicy):
     """Wrapper class around PI05MemFlowMatching model.
 
@@ -277,7 +273,7 @@ class PI05MemPolicy(PreTrainedPolicy):
             config = PreTrainedConfig.from_pretrained(
                 pretrained_name_or_path=pretrained_name_or_path,
                 force_download=force_download,
-                resume_download=resume_download,
+                resume_download=resume_download if resume_download is not None else False,
                 proxies=proxies,
                 token=token,
                 cache_dir=cache_dir,
@@ -294,7 +290,7 @@ class PI05MemPolicy(PreTrainedPolicy):
             if is_main_process:
                 logging.info("Loading model from: %s", pretrained_name_or_path)
             try:
-                from transformers.utils import cached_file
+                from transformers.utils.hub import cached_file
 
                 resolved_file = cached_file(
                     pretrained_name_or_path,
@@ -307,6 +303,7 @@ class PI05MemPolicy(PreTrainedPolicy):
                     revision=revision,
                     local_files_only=local_files_only,
                 )
+                assert resolved_file is not None, "cached_file returned None"
                 from safetensors.torch import load_file
 
                 original_state_dict = load_file(resolved_file)
@@ -426,11 +423,12 @@ class PI05MemPolicy(PreTrainedPolicy):
         Returns a new dict with ``"state"`` expanded to (B, T, D) and image keys
         expanded to (B, T, C, H, W), where T = ``n_obs_history``.
         """
-        n_hist = self.config.n_obs_history
+        assert self.config.n_obs_history is not None
+        n_hist: int = self.config.n_obs_history
         interval = self.config.history_interval or 1
         buf_maxlen = self.config.obs_buffer_size
 
-        # --- initialise buffers on first call after reset() ---
+        # initialise buffers on first call after reset()
         if self._state_buffer is None:
             self._state_buffer = deque(maxlen=buf_maxlen)
             self._obs_buffers = {}
@@ -440,12 +438,12 @@ class PI05MemPolicy(PreTrainedPolicy):
             if key not in self._obs_buffers:
                 self._obs_buffers[key] = deque(maxlen=buf_maxlen)
 
-        # --- append current observation ---
+        # append current observation
         self._state_buffer.append(batch["state"])  # (B, D)
         for key in img_keys:
             self._obs_buffers[key].append(batch[key])  # (B, C, H, W)
 
-        # --- sample n_hist frames at the configured interval ---
+        # sample n_hist frames at the configured interval
         buf_len = len(self._state_buffer)
         missing = buf_maxlen - buf_len  # how many slots are still empty
 
@@ -546,10 +544,10 @@ class PI05MemPolicy(PreTrainedPolicy):
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             action_prefix = torch.zeros(actions_shape, dtype=lang_tokens.dtype, device=lang_tokens.device)
         else:
-            action_prefix = self.normalize_targets({"actions": action_prefix})["actions"]
+            normalized = self.normalize_targets({"actions": action_prefix})["actions"]
             action_prefix = F.pad(
-                action_prefix,
-                (0, 0, 0, self.config.chunk_size - action_prefix.shape[1]),
+                normalized,
+                (0, 0, 0, self.config.chunk_size - normalized.shape[1]),
             )
 
         actions = self.model.sample_actions(
@@ -563,7 +561,9 @@ class PI05MemPolicy(PreTrainedPolicy):
             noise=noise,
         )
 
-        original_action_dim = self.config.action_feature.shape[0]
+        action_feature = self.config.action_feature
+        assert action_feature is not None, "action_feature must be set in output_features"
+        original_action_dim = action_feature.shape[0]
         actions = actions[:, :, :original_action_dim]
 
         actions = self.unnormalize_outputs({"actions": actions})["actions"]
@@ -668,8 +668,8 @@ class PI05MemPolicy(PreTrainedPolicy):
         Returns:
             A tuple of (videos, vid_masks) lists.
         """
-        videos = []
-        vid_masks = []
+        videos: list[Tensor] = []
+        vid_masks: list[Tensor] = []
 
         present_img_keys = [key for key in self.config.image_features if key in batch]
         missing_img_keys = [key for key in self.config.image_features if key not in batch]
@@ -679,6 +679,9 @@ class PI05MemPolicy(PreTrainedPolicy):
                 f"All image features are missing from the batch. At least one expected. "
                 f"(batch: {batch.keys()}) (image_features:{self.config.image_features})"
             )
+
+        last_vid: Tensor | None = None
+        last_mask: Tensor | None = None
 
         for key in present_img_keys:
             vid = batch[key]  # (B, T, C, H, W) or (B, C, H, W) during inference
@@ -705,11 +708,15 @@ class PI05MemPolicy(PreTrainedPolicy):
             mask = torch.ones(bsize, dtype=torch.bool, device=device)
             videos.append(vid)
             vid_masks.append(mask)
+            last_vid = vid
+            last_mask = mask
 
         n_empty = min(len(missing_img_keys), self.config.empty_cameras)
-        for _ in range(n_empty):
-            videos.append(torch.zeros_like(vid))
-            vid_masks.append(torch.zeros_like(mask))
+        if n_empty > 0:
+            assert last_vid is not None and last_mask is not None
+            for _ in range(n_empty):
+                videos.append(torch.zeros_like(last_vid))
+                vid_masks.append(torch.zeros_like(last_mask))
 
         return videos, vid_masks
 
@@ -734,11 +741,7 @@ class PI05MemPolicy(PreTrainedPolicy):
         return lang_tokens, lang_masks
 
 
-# ---------------------------------------------------------------------------
 # Flow-matching model
-# ---------------------------------------------------------------------------
-
-
 class PI05MemFlowMatching(nn.Module):
     """π05 Mem: A Vision-Language-Action Flow Model with V-JEPA2 video encoding
     and temporal state sequences.
@@ -1040,20 +1043,23 @@ class PI05MemFlowMatching(nn.Module):
         ]
         action_expert_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
-        for layer_idx in past_key_values:
-            past_key_values[layer_idx]["key_states"] = past_key_values[layer_idx]["key_states"].detach()
-            past_key_values[layer_idx]["value_states"] = past_key_values[layer_idx]["value_states"].detach()
+        assert past_key_values is not None
+        kv_cache: dict = past_key_values
+        for layer_idx in kv_cache:
+            kv_cache[layer_idx]["key_states"] = kv_cache[layer_idx]["key_states"].detach()
+            kv_cache[layer_idx]["value_states"] = kv_cache[layer_idx]["value_states"].detach()
 
         (_, suffix_out), _ = self.paligemma_with_expert.forward(
             attention_mask=action_expert_2d_attention_mask,
             position_ids=action_expert_position_ids,
-            past_key_values=past_key_values,
+            past_key_values=kv_cache,
             inputs_embeds=[None, suffix_embs],
             use_cache=True,
             fill_kv_cache=False,
             adarms_cond=[None, adarms_cond],
         )
 
+        assert suffix_out is not None
         suffix_out = suffix_out[:, -self.config.n_action_steps :]
         v_t = self.action_out_proj(suffix_out)
         v_t = v_t.to(dtype=torch.float32)
@@ -1074,6 +1080,9 @@ class PI05MemFlowMatching(nn.Module):
         postfix_mask_expanded = repeat(postfix_mask, "b c 1 -> b c d", d=mse_loss.shape[-1])
         mse_loss = mse_loss.sum() / (postfix_mask_expanded.sum() + 1e-8)
 
+        assert discrete_actions is not None
+        assert discrete_action_masks is not None
+        assert prefix_out is not None
         batch_size, seq_len = discrete_actions.shape
         discrete_token_start = -self.config.discrete_action_max_length
         discrete_action_slice_object = slice(discrete_token_start - 1, -1)
@@ -1121,7 +1130,7 @@ class PI05MemFlowMatching(nn.Module):
 
         num_cross_att_tokens = prefix_embs.shape[1]
 
-        (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
+        (prefix_out, _), past_kv = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
             position_ids=prefix_position_ids,
             past_key_values=None,
@@ -1130,6 +1139,7 @@ class PI05MemFlowMatching(nn.Module):
             use_cache=False,
             fill_kv_cache=True,
         )
+        past_key_values: list[dict[str, Tensor]] = past_kv
 
         dt = -1.0 / self.config.num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
@@ -1183,6 +1193,7 @@ class PI05MemFlowMatching(nn.Module):
             adarms_cond=[None, adarms_cond],
         )
         suffix_out = outputs_embeds[1]
+        assert suffix_out is not None
         suffix_out = suffix_out[:, -self.config.n_action_steps :]
         v_t = self.action_out_proj(suffix_out)
         v_t = v_t.to(dtype=torch.float32)
