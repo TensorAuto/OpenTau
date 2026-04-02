@@ -13,6 +13,7 @@
             1.0
         ],
         "action_freq": 10.0,
+        "n_obs_history": 8,
         "image_resample_strategy": "nearest",
         "vector_resample_strategy": "nearest"
     },
@@ -104,5 +105,26 @@
         "mode": null,
         "allow_resume": true,
         "disable_artifact": false
-    }
+    },
+    "env": {
+        "type": "libero",
+        "task": "libero_10",
+        "fps": 10,
+        "max_parallel_tasks": 1,
+        "task_ids": [0],
+        "episode_length": 100,
+        "obs_type": "pixels_agent_pos",
+        "render_mode": "rgb_array",
+        "camera_name": "agentview_image,robot0_eye_in_hand_image",
+        "init_states": true,
+        "camera_name_mapping": null
+    },
+    "eval": {
+        "n_episodes": 1,
+        "batch_size": 1,
+        "use_async_envs": true,
+        "max_episodes_rendered": 11,
+        "grid_size": null
+    },
+    "eval_freq": 10
 }

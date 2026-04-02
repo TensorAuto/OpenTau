@@ -533,7 +533,9 @@ class PI05MemPolicy(PreTrainedPolicy):
         Returns:
             A tensor of shape (B, T, max_state_dim).
         """
-        state = batch["state"]  # (B, T, D)
+        state = batch["state"]  # (B, T, D) or (B, D) during inference
+        if state.ndim == 2:
+            state = state.unsqueeze(1)  # (B, D) -> (B, 1, D)
         state_dim = state.shape[-1]
         if state_dim > self.config.max_state_dim:
             raise ValueError(
@@ -587,7 +589,9 @@ class PI05MemPolicy(PreTrainedPolicy):
             )
 
         for key in present_img_keys:
-            vid = batch[key]  # (B, T, C, H, W)
+            vid = batch[key]  # (B, T, C, H, W) or (B, C, H, W) during inference
+            if vid.ndim == 4:
+                vid = vid.unsqueeze(1)  # (B, C, H, W) -> (B, 1, C, H, W)
 
             if obs_history_is_pad is not None:
                 frame_mask = (~obs_history_is_pad)[:, :, None, None, None]  # (B, T, 1, 1, 1)
