@@ -249,6 +249,9 @@ class PI05MemPolicy(PreTrainedPolicy):
     def reset(self) -> None:
         """This should be called whenever the environment is reset."""
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
+        # Observation history buffers for inference.
+        self._obs_buffers: dict[str, deque] = {}
+        self._state_buffer: deque | None = None
 
     @classmethod
     def from_pretrained(
@@ -406,10 +409,70 @@ class PI05MemPolicy(PreTrainedPolicy):
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
         raise NotImplementedError("Currently not implemented for PI05 Mem")
 
+    def _build_history_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Buffer the current observation and construct a temporal batch.
+
+        Appends the single-frame observation from ``batch`` to internal deque
+        buffers, then assembles a batch with ``n_obs_history`` evenly-spaced
+        frames (interval = ``history_interval``).  Early in an episode, missing
+        history slots are zero-padded.
+        """
+        n_hist = self.config.n_obs_history
+        k = self.config.history_interval or 1
+        buf_maxlen = self.config.obs_buffer_size
+
+        # --- initialise buffers on first call after reset() ---
+        if self._state_buffer is None:
+            self._state_buffer = deque(maxlen=buf_maxlen)
+            self._obs_buffers = {}
+
+        img_keys = [key for key in self.config.image_features if key in batch]
+        for key in img_keys:
+            if key not in self._obs_buffers:
+                self._obs_buffers[key] = deque(maxlen=buf_maxlen)
+
+        # --- append current observation ---
+        self._state_buffer.append(batch["state"])  # (B, D)
+        for key in img_keys:
+            self._obs_buffers[key].append(batch[key])  # (B, C, H, W)
+
+        # --- sample n_hist frames at interval k ---
+        buf_len = len(self._state_buffer)
+        missing = buf_maxlen - buf_len  # how many slots are still empty
+
+        temporal_batch = {k_: v for k_, v in batch.items() if k_ not in img_keys and k_ != "state"}
+
+        # Build state tensor (B, T, D)
+        state_frames = []
+        for i in range(n_hist):
+            idx = i * k - missing  # index into current buffer
+            if idx < 0:
+                state_frames.append(torch.zeros_like(self._state_buffer[0]))
+            else:
+                state_frames.append(self._state_buffer[idx])
+        temporal_batch["state"] = torch.stack(state_frames, dim=1)  # (B, T, D)
+
+        # Build camera tensors (B, T, C, H, W)
+        for key in img_keys:
+            cam_frames = []
+            for i in range(n_hist):
+                idx = i * k - missing
+                if idx < 0:
+                    cam_frames.append(torch.zeros_like(self._obs_buffers[key][0]))
+                else:
+                    cam_frames.append(self._obs_buffers[key][idx])
+            temporal_batch[key] = torch.stack(cam_frames, dim=1)  # (B, T, C, H, W)
+
+        return temporal_batch
+
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """Select a single action given environment observations."""
         self.eval()
+
+        # Build temporal observation history if configured.
+        if self.config.n_obs_history is not None and self.config.n_obs_history > 1:
+            batch = self._build_history_batch(batch)
 
         if len(self._action_queue) == 0 or len(self._action_queue) <= self.config.max_delay:
             action_prefix = None
@@ -450,6 +513,20 @@ class PI05MemPolicy(PreTrainedPolicy):
         videos, vid_masks = self.prepare_videos(batch)
         lang_tokens, lang_masks = self.prepare_language(batch)
         state = self.prepare_state(batch)
+
+        # Shape checks: videos must be 5D (B, T, C, H, W), state must be 3D (B, T, D).
+        for vid in videos:
+            assert vid.ndim == 5, f"Expected 5D video tensor (B, T, C, H, W), got {vid.shape}"
+        assert state.ndim == 3, f"Expected 3D state tensor (B, T, D), got {state.shape}"
+
+        if self.config.n_obs_history is not None and self.config.n_obs_history > 1:
+            t_dim = state.shape[1]
+            if t_dim == 1:
+                logging.warning(
+                    "Temporal dimension T=1: no historical frames included. "
+                    "This should only happen at most %d time(s) at the start of an episode.",
+                    self.config.history_interval or 1,
+                )
 
         if delay is None:
             delay = torch.tensor(0, dtype=torch.long, device=lang_tokens.device)
@@ -535,6 +612,11 @@ class PI05MemPolicy(PreTrainedPolicy):
         """
         state = batch["state"]  # (B, T, D) or (B, D) during inference
         if state.ndim == 2:
+            if self.config.n_obs_history is not None and self.config.n_obs_history > 1:
+                raise ValueError(
+                    f"Expected 3D state tensor (B, T, D) when n_obs_history > 1, "
+                    f"got shape {state.shape}. Ensure select_action() is being used."
+                )
             state = state.unsqueeze(1)  # (B, D) -> (B, 1, D)
         state_dim = state.shape[-1]
         if state_dim > self.config.max_state_dim:
@@ -591,6 +673,11 @@ class PI05MemPolicy(PreTrainedPolicy):
         for key in present_img_keys:
             vid = batch[key]  # (B, T, C, H, W) or (B, C, H, W) during inference
             if vid.ndim == 4:
+                if self.config.n_obs_history is not None and self.config.n_obs_history > 1:
+                    raise ValueError(
+                        f"Expected 5D video tensor (B, T, C, H, W) when n_obs_history > 1, "
+                        f"got shape {vid.shape}. Ensure select_action() is being used."
+                    )
                 vid = vid.unsqueeze(1)  # (B, C, H, W) -> (B, 1, C, H, W)
 
             if obs_history_is_pad is not None:

@@ -73,6 +73,11 @@ class PI05MemConfig(PreTrainedConfig):
     chunk_size: int = 50
     n_action_steps: int = 50
 
+    # Observation history for inference buffering.
+    # Populated from DatasetMixtureConfig during training if unset.
+    n_obs_history: int | None = None
+    history_interval: int | None = None
+
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.IDENTITY,
@@ -133,9 +138,35 @@ class PI05MemConfig(PreTrainedConfig):
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
 
+    @property
+    def obs_buffer_size(self) -> int:
+        """Total raw frames the observation buffer must keep.
+
+        With ``n_obs_history=T`` and ``history_interval=k``, the buffer stores
+        the most recent ``(T-1)*k + 1`` frames so that ``T`` evenly-spaced
+        frames can be selected.
+        """
+        if self.n_obs_history is None or self.n_obs_history <= 1:
+            return 1
+        return (self.n_obs_history - 1) * (self.history_interval or 1) + 1
+
     def __post_init__(self):
         """Post-initialization validation."""
         super().__post_init__()
+
+        if self.n_obs_history is not None:
+            if not isinstance(self.n_obs_history, int) or self.n_obs_history < 1:
+                raise ValueError(
+                    f"`n_obs_history` must be None or a positive integer, got {self.n_obs_history}."
+                )
+            if self.history_interval is None:
+                self.history_interval = 1
+        if self.history_interval is not None and (
+            not isinstance(self.history_interval, int) or self.history_interval < 1
+        ):
+            raise ValueError(
+                f"`history_interval` must be None or a positive integer, got {self.history_interval}."
+            )
 
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
