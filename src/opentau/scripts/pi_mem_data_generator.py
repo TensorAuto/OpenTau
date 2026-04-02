@@ -12,21 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Enrich a JSON array with OpenAI chat completions (one call per field per object).
+"""Iterate over a JSON array of task segments and generate cumulative memory summaries.
 
-Top-level JSON must be a **list of objects**. For each object, ``subtask`` and the
-indicator are read from that object: use ``indicator`` if present, otherwise
-``success``. Those keys are prepended to every user message and are not sent as
-separate per-field API calls. Replies go under ``memory`` as
-``{ field_name: model_reply, ... }``.
+Top-level JSON must be a **list of objects**. For each object the script builds a
+cumulative subtask log (subtask names and ``success`` outcomes up to that point),
+then calls OpenAI to produce a running plain-text memory summary. The summary is
+written back to each object under the ``memory`` key (configurable via
+``--output-key``).
 
 Examples::
 
     export OPENAI_API_KEY=sk-...
     python -m opentau.scripts.pi_mem_data_generator task_segments.json
-
-    # Verify .env is found and OPENAI_API_KEY is loaded:
-    python -m opentau.scripts.pi_mem_data_generator --check-env
 """
 
 from __future__ import annotations
@@ -36,12 +33,18 @@ import json
 import logging
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
 from openai import OpenAI
+from openai.types.chat import ChatCompletionMessageParam
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +52,7 @@ logger = logging.getLogger(__name__)
 def _resolve_dotenv_path() -> Path | None:
     """First ``.env`` file found walking up from this script (repo root typically)."""
     script = Path(__file__).resolve()
-    for d in (script.parent, *script.parents):
+    for d in script.parents:
         candidate = d / ".env"
         if candidate.is_file():
             return candidate
@@ -63,41 +66,13 @@ def _load_env_file() -> Path | None:
     """
     path = _resolve_dotenv_path()
     if path is not None:
-        if load_dotenv:
+        if load_dotenv is not None:
             load_dotenv(path, override=True)
         logger.debug("Loaded environment file %s", path)
         return path
-    if load_dotenv:
+    if load_dotenv is not None:
         load_dotenv(override=True)
     return None
-
-
-def _mask_api_key_preview(key: str) -> str:
-    """Safe one-line description (never print the full key)."""
-    n = len(key)
-    if n <= 12:
-        return f"length {n} (too short to show prefix/suffix safely)"
-    return f"prefix {key[:8]}… suffix …{key[-4:]} (length {n})"
-
-
-def _run_check_env() -> int:
-    """Print whether ``.env`` and ``OPENAI_API_KEY`` are visible after the same load as a normal run."""
-    dotenv_path = _resolve_dotenv_path()
-    if dotenv_path is not None:
-        print(f"OK: found .env at {dotenv_path}")
-    else:
-        print("No .env file in any parent directory of the script (only shell env applies).")
-
-    key = _normalize_openai_api_key()
-    if key:
-        print(f"OK: OPENAI_API_KEY is set — {_mask_api_key_preview(key)}")
-        return 0
-
-    print(
-        "FAIL: OPENAI_API_KEY missing or empty after load. "
-        "Use one line in .env: OPENAI_API_KEY=sk-... (no spaces around =).",
-    )
-    return 1
 
 
 def _normalize_openai_api_key() -> str | None:
@@ -150,7 +125,7 @@ def _call_openai(
     system_prompt: str | None,
     user_content: str,
 ) -> str:
-    messages: list[dict[str, str]] = []
+    messages: list[ChatCompletionMessageParam] = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": user_content})
@@ -217,15 +192,8 @@ def main(argv: list[str] | None = None) -> int:
 
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument(
-        "--check-env",
-        action="store_true",
-        help="Load .env like a normal run, print whether OPENAI_API_KEY is set (masked), then exit.",
-    )
-    p.add_argument(
         "json_path",
         type=Path,
-        nargs="?",
-        default=None,
         help="Path to JSON file to read and update in place",
     )
     p.add_argument(
@@ -262,17 +230,9 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
 
-    if args.check_env:
-        return _run_check_env()
-
-    if args.json_path is None:
-        p.error("json_path is required (unless using --check-env)")
-
     api_key = _normalize_openai_api_key()
     if not api_key:
-        logger.error(
-            "Missing OPENAI_API_KEY. Put it in repo .env or export it. Run with --check-env to diagnose.",
-        )
+        logger.error("Missing OPENAI_API_KEY. Put it in repo .env or export it.")
         return 1
 
     path = args.json_path.resolve()
@@ -310,7 +270,15 @@ def main(argv: list[str] | None = None) -> int:
         logger.exception("OpenAI or processing failed: %s", e)
         return 1
 
-    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    # Atomic os.replace (on Unix) to avoid partial JSON updates.
+    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(data, indent=2) + "\n")
+        os.replace(tmp_path, path)
+    except BaseException:
+        os.unlink(tmp_path)
+        raise
     logger.info("Wrote %s", path)
     return 0
 
