@@ -692,6 +692,12 @@ def resample_and_trim_video(
     input_path = Path(input_path)
     output_path = Path(output_path)
 
+    if num_frames <= 0:
+        raise ValueError(f"`num_frames` must be > 0, got {num_frames}.")
+
+    if target_fps <= 0:
+        raise ValueError(f"`target_fps` must be > 0, got {target_fps}.")
+
     if not input_path.is_file():
         raise FileNotFoundError(f"Input video not found: {input_path}")
 
@@ -745,33 +751,43 @@ def resample_and_trim_video(
         )
 
     # Verify frame count
+    ffprobe_path = shutil.which("ffprobe")
+    if not ffprobe_path:
+        raise OSError(
+            "ffprobe is required to validate the output video frame count but was not found in PATH. "
+            "Install ffprobe (usually distributed with ffmpeg) and retry."
+        )
+
     info = get_video_info(str(output_path))
     actual_fps = info["video.fps"]
-    # Re-read via ffprobe to get actual frame count
-    ffprobe_path = shutil.which("ffprobe")
-    if ffprobe_path:
-        result = subprocess.run(
-            [
-                ffprobe_path,
-                "-v",
-                "error",
-                "-select_streams",
-                "v:0",
-                "-count_frames",
-                "-show_entries",
-                "stream=nb_read_frames",
-                "-of",
-                "csv=p=0",
-                str(output_path),
-            ],
-            capture_output=True,
-            text=True,
+
+    result = subprocess.run(
+        [
+            ffprobe_path,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-count_frames",
+            "-show_entries",
+            "stream=nb_read_frames",
+            "-of",
+            "csv=p=0",
+            str(output_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip().isdigit():
+        raise OSError(
+            f"Failed to validate output video frame count with ffprobe for {output_path}. "
+            f"Return code: {result.returncode}. stderr: {result.stderr.strip()}"
         )
-        if result.returncode == 0 and result.stdout.strip().isdigit():
-            actual_frames = int(result.stdout.strip())
-            if abs(actual_frames - num_frames) > 1:
-                raise ValueError(
-                    f"Resampled video has {actual_frames} frames but expected {num_frames}. "
-                    f"Source: {input_path}, target FPS: {target_fps}, duration: {duration:.4f}s. "
-                    f"Actual FPS in output: {actual_fps}"
-                )
+
+    actual_frames = int(result.stdout.strip())
+    if abs(actual_frames - num_frames) > 1:
+        raise ValueError(
+            f"Resampled video has {actual_frames} frames but expected {num_frames}. "
+            f"Source: {input_path}, target FPS: {target_fps}, duration: {duration:.4f}s. "
+            f"Actual FPS in output: {actual_fps}"
+        )

@@ -1593,7 +1593,7 @@ class LeRobotDataset(BaseDataset):
         temporary directory — nothing is written to disk. To save those frames, the 'save_episode()' method
         then needs to be called.
 
-        Video/image features listed in ``deferred_video_keys`` (set via
+        Video features listed in ``deferred_video_keys`` (set via
         :meth:`create`) may be omitted from the frame; their observations will
         be attached later via :meth:`attach_video`.
         """
@@ -1691,13 +1691,27 @@ class LeRobotDataset(BaseDataset):
         self._wait_image_writer()
         self._save_episode_table(episode_buffer, episode_index)
 
-        # When deferred video keys exist, always skip video stats since images
-        # are not available yet.
-        skip_video = getattr(self, "skip_video_stats", False) or bool(deferred)
+        # Deferred keys are excluded from effective_features below, so only
+        # honor the explicit dataset-level setting for skipping video stats.
+        skip_video = getattr(self, "skip_video_stats", False)
         # Build a features dict that excludes deferred keys so compute_episode_stats
-        # does not try to read image paths that don't exist.
+        # does not try to read image paths that don't exist, while still
+        # computing stats for non-deferred image/video features.
         effective_features = {k: v for k, v in self.features.items() if k not in deferred}
         ep_stats = compute_episode_stats(episode_buffer, effective_features, skip_video_stats=skip_video)
+
+        # Add placeholder stats for deferred video keys so downstream code
+        # (standardization, dataset mixing) never encounters missing keys.
+        for key in deferred:
+            shape = self.features[key]["shape"]
+            c = shape[0] if len(shape) >= 3 else 3
+            ep_stats[key] = {
+                "min": np.zeros((c, 1, 1), dtype=np.float64),
+                "max": np.ones((c, 1, 1), dtype=np.float64),
+                "mean": np.full((c, 1, 1), 0.5, dtype=np.float64),
+                "std": np.full((c, 1, 1), 0.5, dtype=np.float64),
+                "count": np.array([episode_length]),
+            }
 
         # Encode videos for non-deferred video keys only
         non_deferred_video_keys = [k for k in self.meta.video_keys if k not in deferred]
@@ -1807,8 +1821,9 @@ class LeRobotDataset(BaseDataset):
         Note: `encode_video_frames` is a blocking call. Making it asynchronous shouldn't speedup encoding,
         since video encoding with ffmpeg is already using multithreading.
         """
+        skip_keys = getattr(self, "deferred_video_keys", None)
         for ep_idx in range(self.meta.total_episodes):
-            self.encode_episode_videos(ep_idx)
+            self.encode_episode_videos(ep_idx, skip_keys=skip_keys)
 
     def encode_episode_videos(self, episode_index: int, skip_keys: set[str] | None = None) -> dict:
         """
