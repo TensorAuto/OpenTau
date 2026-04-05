@@ -646,3 +646,126 @@ def get_image_pixel_channels(image: Image) -> int:
         return 4  # RGBA
     else:
         raise ValueError("Unknown format")
+
+
+def resample_and_trim_video(
+    input_path: Path | str,
+    output_path: Path | str,
+    target_fps: int,
+    num_frames: int,
+    vcodec: str = "libsvtav1",
+    pix_fmt: str = "yuv420p",
+    g: int | None = 2,
+    crf: int | None = 30,
+    fast_decode: int = 0,
+    log_level: str | None = "error",
+    overwrite: bool = False,
+) -> None:
+    """Resample a video to the target FPS and trim it to exactly *num_frames* frames.
+
+    This is used to attach a pre-recorded MP4 to a :class:`LeRobotDataset`
+    episode whose non-visual observations have already been saved.  The source
+    video is re-encoded at ``target_fps`` and cropped so that the output
+    contains exactly ``num_frames`` frames (i.e. a duration of
+    ``num_frames / target_fps`` seconds, starting from the beginning of the
+    input).
+
+    Args:
+        input_path: Path to the source video file.
+        output_path: Path where the resampled/trimmed video will be written.
+        target_fps: Desired output frames per second.
+        num_frames: Exact number of frames the output video must contain.
+        vcodec: Video codec to use. Defaults to "libsvtav1".
+        pix_fmt: Pixel format. Defaults to "yuv420p".
+        g: GOP (Group of Pictures) size. Defaults to 2.
+        crf: Constant Rate Factor for quality control. Defaults to 30.
+        fast_decode: Fast decode parameter for libsvtav1. Defaults to 0.
+        log_level: FFmpeg log level. Defaults to "error".
+        overwrite: Whether to overwrite an existing output file. Defaults to False.
+
+    Raises:
+        FileNotFoundError: If ``input_path`` does not exist.
+        OSError: If ffmpeg is not found or the output file is not produced.
+        ValueError: If the resulting video does not have the expected number of
+            frames (tolerance of ±1 frame to account for codec rounding).
+    """
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+
+    if not input_path.is_file():
+        raise FileNotFoundError(f"Input video not found: {input_path}")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        raise OSError("ffmpeg not found in PATH. Install ffmpeg to process videos.")
+
+    if vcodec == "libsvtav1":
+        vcodec = get_safe_encoding_vcodec()
+
+    # Duration to keep: num_frames / target_fps
+    duration = num_frames / target_fps
+
+    ffmpeg_args = OrderedDict(
+        [
+            ("-i", str(input_path)),
+            ("-t", f"{duration:.6f}"),
+            ("-r", str(target_fps)),
+            ("-vcodec", vcodec),
+            ("-pix_fmt", pix_fmt),
+        ]
+    )
+
+    if g is not None:
+        ffmpeg_args["-g"] = str(g)
+
+    if crf is not None:
+        ffmpeg_args["-crf"] = str(crf)
+
+    if fast_decode:
+        key = "-svtav1-params" if vcodec == "libsvtav1" else "-tune"
+        value = f"fast-decode={fast_decode}" if vcodec == "libsvtav1" else "fastdecode"
+        ffmpeg_args[key] = value
+
+    if log_level is not None:
+        ffmpeg_args["-loglevel"] = str(log_level)
+
+    ffmpeg_args_list = [item for pair in ffmpeg_args.items() for item in pair]
+    if overwrite:
+        ffmpeg_args_list.append("-y")
+
+    ffmpeg_cmd = [ffmpeg_path] + ffmpeg_args_list + [str(output_path)]
+    subprocess.run(ffmpeg_cmd, check=True, stdin=subprocess.DEVNULL)
+
+    if not output_path.exists():
+        raise OSError(
+            f"Video resampling/trimming did not work. File not found: {output_path}. "
+            f"Try running the command manually to debug: `{' '.join(ffmpeg_cmd)}`"
+        )
+
+    # Verify frame count
+    info = get_video_info(str(output_path))
+    actual_fps = info["video.fps"]
+    # Re-read via ffprobe to get actual frame count
+    ffprobe_path = shutil.which("ffprobe")
+    if ffprobe_path:
+        result = subprocess.run(
+            [
+                ffprobe_path, "-v", "error",
+                "-select_streams", "v:0",
+                "-count_frames",
+                "-show_entries", "stream=nb_read_frames",
+                "-of", "csv=p=0",
+                str(output_path),
+            ],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip().isdigit():
+            actual_frames = int(result.stdout.strip())
+            if abs(actual_frames - num_frames) > 1:
+                raise ValueError(
+                    f"Resampled video has {actual_frames} frames but expected {num_frames}. "
+                    f"Source: {input_path}, target FPS: {target_fps}, duration: {duration:.4f}s. "
+                    f"Actual FPS in output: {actual_fps}"
+                )

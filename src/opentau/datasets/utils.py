@@ -1058,7 +1058,7 @@ class IterableNamespace(SimpleNamespace):
         return vars(self).keys()
 
 
-def validate_frame(frame: dict, features: dict) -> None:
+def validate_frame(frame: dict, features: dict, deferred_features: set[str] | None = None) -> None:
     """Validate that a frame dictionary matches the expected features.
 
     Checks that all required features are present, no unexpected features exist,
@@ -1067,11 +1067,17 @@ def validate_frame(frame: dict, features: dict) -> None:
     Args:
         frame: Dictionary containing frame data to validate.
         features: Dictionary of expected feature specifications.
+        deferred_features: Optional set of feature names whose data will be
+            provided later (e.g. video observations attached after episode
+            recording). These features are treated as optional during
+            validation.
 
     Raises:
         ValueError: If the frame doesn't match the feature specifications.
     """
     optional_features = {"timestamp"}
+    if deferred_features:
+        optional_features = optional_features | deferred_features
     expected_features = (set(features) - set(DEFAULT_FEATURES.keys())) | {"task"}
     actual_features = set(frame.keys())
 
@@ -1102,7 +1108,7 @@ def validate_features_presence(
         Error message string (empty if validation passes).
     """
     error_message = ""
-    missing_features = expected_features - actual_features
+    missing_features = expected_features - actual_features - optional_features
     extra_features = actual_features - (expected_features | optional_features)
 
     if missing_features or extra_features:
@@ -1232,7 +1238,12 @@ def validate_feature_string(name: str, value: str) -> str:
     return ""
 
 
-def validate_episode_buffer(episode_buffer: dict, total_episodes: int, features: dict) -> None:
+def validate_episode_buffer(
+    episode_buffer: dict,
+    total_episodes: int,
+    features: dict,
+    deferred_features: set[str] | None = None,
+) -> None:
     """Validate that an episode buffer is properly formatted.
 
     Checks that required keys exist, episode_index matches total_episodes,
@@ -1242,6 +1253,8 @@ def validate_episode_buffer(episode_buffer: dict, total_episodes: int, features:
         episode_buffer: Dictionary containing episode data to validate.
         total_episodes: Total number of episodes already in the dataset.
         features: Dictionary of expected feature specifications.
+        deferred_features: Optional set of feature names whose data will be
+            provided later and may be absent from the episode buffer.
 
     Raises:
         ValueError: If the buffer is missing required keys, is empty, or has
@@ -1265,9 +1278,10 @@ def validate_episode_buffer(episode_buffer: dict, total_episodes: int, features:
         raise ValueError("You must add one or several frames with `add_frame` before calling `add_episode`.")
 
     buffer_keys = set(episode_buffer.keys()) - {"task", "size"}
-    if not buffer_keys == set(features):
+    expected_keys = set(features) - (deferred_features or set())
+    if not buffer_keys == expected_keys:
         raise ValueError(
             f"Features from `episode_buffer` don't match the ones in `features`."
-            f"In episode_buffer not in features: {buffer_keys - set(features)}"
-            f"In features not in episode_buffer: {set(features) - buffer_keys}"
+            f"In episode_buffer not in features: {buffer_keys - expected_keys}"
+            f"In features not in episode_buffer: {expected_keys - buffer_keys}"
         )

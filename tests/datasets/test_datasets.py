@@ -457,3 +457,186 @@ def test_dataset_feature_with_forward_slash_raises_error():
 def test_vqa_dataset_imports():
     for dataset in available_vqa_datasets:
         import_module(f"opentau.datasets.vqa.{dataset}")
+
+
+def _make_dummy_mp4(path, fps=60, num_frames=100, width=128, height=96):
+    """Create a minimal MP4 test video using ffmpeg with solid-color frames."""
+    import shutil
+    import subprocess
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        pytest.skip("ffmpeg not available")
+    duration = num_frames / fps
+    subprocess.run(
+        [
+            ffmpeg,
+            "-y",
+            "-f", "lavfi",
+            "-i", f"color=c=blue:s={width}x{height}:r={fps}:d={duration:.6f}",
+            "-pix_fmt", "yuv420p",
+            "-c:v", "libx264",
+            "-g", "2",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return path
+
+
+def test_deferred_video_add_frame_and_save(tmp_path, empty_lerobot_dataset_factory):
+    """Test that frames can be added without image data for deferred video keys."""
+    features = {
+        "state": {"dtype": "float32", "shape": (2,), "names": None},
+        "observation.images.top": {
+            "dtype": "video",
+            "shape": (3, 96, 128),
+            "names": ["channels", "height", "width"],
+            "info": None,
+        },
+    }
+    dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "deferred_test",
+        features=features,
+        deferred_video_keys={"observation.images.top"},
+    )
+
+    # Add frames without video data
+    for i in range(10):
+        dataset.add_frame({
+            "state": np.array([float(i), float(i + 1)], dtype=np.float32),
+            "task": "Dummy task",
+        })
+
+    # save_episode should succeed without video data
+    dataset.save_episode()
+
+    assert dataset.meta.total_episodes == 1
+    assert dataset.meta.total_frames == 10
+
+    # The parquet file should exist
+    parquet_path = dataset.root / dataset.meta.get_data_file_path(0)
+    assert parquet_path.is_file()
+
+    # The video file should NOT exist yet
+    video_path = dataset.root / dataset.meta.get_video_file_path(0, "observation.images.top")
+    assert not video_path.is_file()
+
+
+def test_deferred_video_attach_video(tmp_path, empty_lerobot_dataset_factory):
+    """Test full workflow: add frames, save episode, attach video."""
+    features = {
+        "state": {"dtype": "float32", "shape": (2,), "names": None},
+        "observation.images.top": {
+            "dtype": "video",
+            "shape": (3, 96, 128),
+            "names": ["channels", "height", "width"],
+            "info": None,
+        },
+    }
+    target_fps = 10
+    num_frames = 5
+    dataset = LeRobotDataset.create(
+        repo_id=DUMMY_REPO_ID,
+        fps=target_fps,
+        root=tmp_path / "attach_test",
+        features=features,
+        deferred_video_keys={"observation.images.top"},
+        standardize=False,
+    )
+
+    for i in range(num_frames):
+        dataset.add_frame({
+            "state": np.array([float(i), float(i + 1)], dtype=np.float32),
+            "task": "Dummy task",
+        })
+    dataset.save_episode()
+
+    # Create a source video at a different FPS (60fps, 100 frames = 1.67s)
+    src_video = _make_dummy_mp4(tmp_path / "source.mp4", fps=60, num_frames=100, width=128, height=96)
+
+    # Attach the video - it should be resampled to 10fps and trimmed to 5 frames
+    result_path = dataset.attach_video(
+        episode_index=0,
+        video_key="observation.images.top",
+        input_video_path=src_video,
+        overwrite=True,
+    )
+
+    assert result_path.is_file()
+
+    # Verify the output video exists at the expected dataset path
+    expected_path = dataset.root / dataset.meta.get_video_file_path(0, "observation.images.top")
+    assert expected_path.is_file()
+    assert result_path == expected_path
+
+
+def test_deferred_video_invalid_key(tmp_path, empty_lerobot_dataset_factory):
+    """Creating a dataset with invalid deferred video keys should raise ValueError."""
+    features = {
+        "state": {"dtype": "float32", "shape": (2,), "names": None},
+    }
+    with pytest.raises(ValueError, match="not declared as video features"):
+        empty_lerobot_dataset_factory(
+            root=tmp_path / "invalid_deferred",
+            features=features,
+            deferred_video_keys={"nonexistent_camera"},
+        )
+
+
+def test_deferred_video_multi_episode(tmp_path, empty_lerobot_dataset_factory):
+    """Test deferred video with multiple episodes."""
+    features = {
+        "state": {"dtype": "float32", "shape": (2,), "names": None},
+        "observation.images.top": {
+            "dtype": "video",
+            "shape": (3, 96, 128),
+            "names": ["channels", "height", "width"],
+            "info": None,
+        },
+    }
+    dataset = LeRobotDataset.create(
+        repo_id=DUMMY_REPO_ID,
+        fps=10,
+        root=tmp_path / "multi_ep_test",
+        features=features,
+        deferred_video_keys={"observation.images.top"},
+        standardize=False,
+    )
+
+    # Episode 0: 5 frames
+    for i in range(5):
+        dataset.add_frame({
+            "state": np.array([float(i), 0.0], dtype=np.float32),
+            "task": "Task A",
+        })
+    dataset.save_episode()
+
+    # Episode 1: 8 frames
+    for i in range(8):
+        dataset.add_frame({
+            "state": np.array([0.0, float(i)], dtype=np.float32),
+            "task": "Task B",
+        })
+    dataset.save_episode()
+
+    assert dataset.meta.total_episodes == 2
+    assert dataset.meta.total_frames == 13
+
+    # Attach videos for both episodes
+    src_video = _make_dummy_mp4(tmp_path / "source.mp4", fps=60, num_frames=300, width=128, height=96)
+
+    for ep_idx in range(2):
+        dataset.attach_video(
+            episode_index=ep_idx,
+            video_key="observation.images.top",
+            input_video_path=src_video,
+            overwrite=True,
+        )
+
+    # Verify both videos exist
+    for ep_idx in range(2):
+        video_path = dataset.root / dataset.meta.get_video_file_path(ep_idx, "observation.images.top")
+        assert video_path.is_file()

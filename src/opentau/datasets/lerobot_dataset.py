@@ -147,6 +147,7 @@ from opentau.datasets.video_utils import (
     encode_video_frames,
     get_safe_default_codec,
     get_video_info,
+    resample_and_trim_video,
 )
 from opentau.policies.value.configuration_value import ValueConfig
 from opentau.policies.value.reward import (
@@ -525,14 +526,24 @@ class LeRobotDatasetMetadata(DatasetMetadata):
         self.stats = aggregate_stats([self.stats, episode_stats]) if self.stats else episode_stats
         write_episode_stats(episode_index, episode_stats, self.root)
 
-    def update_video_info(self) -> None:
-        """
-        Warning: this function writes info from first episode videos, implicitly assuming that all videos have
-        been encoded the same way. Also, this means it assumes the first episode exists.
+    def update_video_info(self, skip_keys: set[str] | None = None) -> None:
+        """Update video metadata from the first episode's video files.
+
+        Warning: this function writes info from first episode videos, implicitly
+        assuming that all videos have been encoded the same way. Also, this means
+        it assumes the first episode exists.
+
+        Args:
+            skip_keys: Optional set of video keys to skip (e.g. deferred video
+                keys whose files don't exist yet).
         """
         for key in self.video_keys:
+            if skip_keys and key in skip_keys:
+                continue
             if not self.features[key].get("info", None):
                 video_path = self.root / self.get_video_file_path(ep_index=0, vid_key=key)
+                if not video_path.is_file():
+                    continue
                 self.info["features"][key]["info"] = get_video_info(video_path)
 
     def __repr__(self):
@@ -1551,11 +1562,14 @@ class LeRobotDataset(BaseDataset):
 
     def create_episode_buffer(self, episode_index: int | None = None) -> dict:
         current_ep_idx = self.meta.total_episodes if episode_index is None else episode_index
+        deferred = getattr(self, "deferred_video_keys", set())
         ep_buffer = {}
         # size and task are special cases that are not in self.features
         ep_buffer["size"] = 0
         ep_buffer["task"] = []
         for key in self.features:
+            if key in deferred:
+                continue
             ep_buffer[key] = current_ep_idx if key == "episode_index" else []
         return ep_buffer
 
@@ -1578,13 +1592,18 @@ class LeRobotDataset(BaseDataset):
         This function only adds the frame to the episode_buffer. Apart from images — which are written in a
         temporary directory — nothing is written to disk. To save those frames, the 'save_episode()' method
         then needs to be called.
+
+        Video/image features listed in ``deferred_video_keys`` (set via
+        :meth:`create`) may be omitted from the frame; their observations will
+        be attached later via :meth:`attach_video`.
         """
         # Convert torch to numpy if needed
         for name in frame:
             if isinstance(frame[name], torch.Tensor):
                 frame[name] = frame[name].numpy()
 
-        validate_frame(frame, self.features)
+        deferred = getattr(self, "deferred_video_keys", set())
+        validate_frame(frame, self.features, deferred_features=deferred or None)
 
         if self.episode_buffer is None:
             self.episode_buffer = self.create_episode_buffer()
@@ -1628,12 +1647,19 @@ class LeRobotDataset(BaseDataset):
             episode_data (dict | None, optional): Dict containing the episode data to save. If None, this will
                 save the current episode in self.episode_buffer, which is filled with 'add_frame'. Defaults to
                 None.
+
+        Note:
+            When ``deferred_video_keys`` are configured, the corresponding video
+            features are excluded from validation, encoding, and existence
+            checks. Use :meth:`attach_video` after saving episodes to supply
+            the video files.
         """
         episode_buffer = self.episode_buffer if episode_data is None else episode_data
         if episode_buffer is None:
             raise RuntimeError("No episode data provided and no episode buffer exists. Call add_frame first.")
 
-        validate_episode_buffer(episode_buffer, self.meta.total_episodes, self.features)
+        deferred = getattr(self, "deferred_video_keys", set())
+        validate_episode_buffer(episode_buffer, self.meta.total_episodes, self.features, deferred or None)
 
         # size and task are special cases that won't be added to hf_dataset
         episode_length = episode_buffer.pop("size")
@@ -1658,17 +1684,26 @@ class LeRobotDataset(BaseDataset):
             # are processed separately by storing image path and frame info as meta data
             if key in ["index", "episode_index", "task_index"] or ft["dtype"] in ["image", "video"]:
                 continue
+            if key in deferred:
+                continue
             episode_buffer[key] = np.stack(episode_buffer[key])
 
         self._wait_image_writer()
         self._save_episode_table(episode_buffer, episode_index)
-        ep_stats = compute_episode_stats(
-            episode_buffer, self.features, skip_video_stats=getattr(self, "skip_video_stats", False)
-        )
 
-        if len(self.meta.video_keys) > 0:
-            video_paths = self.encode_episode_videos(episode_index)
-            for key in self.meta.video_keys:
+        # When deferred video keys exist, always skip video stats since images
+        # are not available yet.
+        skip_video = getattr(self, "skip_video_stats", False) or bool(deferred)
+        # Build a features dict that excludes deferred keys so compute_episode_stats
+        # does not try to read image paths that don't exist.
+        effective_features = {k: v for k, v in self.features.items() if k not in deferred}
+        ep_stats = compute_episode_stats(episode_buffer, effective_features, skip_video_stats=skip_video)
+
+        # Encode videos for non-deferred video keys only
+        non_deferred_video_keys = [k for k in self.meta.video_keys if k not in deferred]
+        if non_deferred_video_keys:
+            video_paths = self.encode_episode_videos(episode_index, skip_keys=deferred)
+            for key in non_deferred_video_keys:
                 episode_buffer[key] = video_paths[key]
 
         # `meta.save_episode` be executed after encoding the videos
@@ -1690,6 +1725,8 @@ class LeRobotDataset(BaseDataset):
         missing_videos: list[str] = []
         for ep_idx in range(expected_episodes):
             for vid_key in self.meta.video_keys:
+                if vid_key in deferred:
+                    continue
                 video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
                 if not video_path.is_file():
                     missing_videos.append(str(video_path))
@@ -1773,14 +1810,20 @@ class LeRobotDataset(BaseDataset):
         for ep_idx in range(self.meta.total_episodes):
             self.encode_episode_videos(ep_idx)
 
-    def encode_episode_videos(self, episode_index: int) -> dict:
+    def encode_episode_videos(self, episode_index: int, skip_keys: set[str] | None = None) -> dict:
         """
         Use ffmpeg to convert frames stored as png into mp4 videos.
         Note: `encode_video_frames` is a blocking call. Making it asynchronous shouldn't speedup encoding,
         since video encoding with ffmpeg is already using multithreading.
+
+        Args:
+            episode_index: Index of the episode to encode.
+            skip_keys: Optional set of video keys to skip (e.g. deferred video keys).
         """
         video_paths = {}
         for key in self.meta.video_keys:
+            if skip_keys and key in skip_keys:
+                continue
             video_path = self.root / self.meta.get_video_file_path(episode_index, key)
             video_paths[key] = str(video_path)
             if video_path.is_file():
@@ -1792,6 +1835,97 @@ class LeRobotDataset(BaseDataset):
             encode_video_frames(img_dir, video_path, self.fps, overwrite=True)
 
         return video_paths
+
+    def attach_video(
+        self,
+        episode_index: int,
+        video_key: str,
+        input_video_path: str | Path,
+        overwrite: bool = False,
+        vcodec: str = "libsvtav1",
+        pix_fmt: str = "yuv420p",
+        g: int | None = 2,
+        crf: int | None = 30,
+    ) -> Path:
+        """Attach a pre-recorded MP4 video to an episode with deferred video observations.
+
+        The source video is resampled to the dataset's FPS and trimmed so it
+        contains exactly as many frames as the episode.  The resulting file is
+        placed in the standard video path for the dataset.
+
+        This method is meant to be called **after** :meth:`save_episode` for
+        episodes whose video observations were deferred (see the
+        ``deferred_video_keys`` parameter of :meth:`create`).
+
+        After attaching videos for all deferred keys and episodes, you should
+        call :meth:`update_video_info` to update the dataset metadata with the
+        actual video properties (resolution, codec, etc.).
+
+        Args:
+            episode_index: Index of the episode to attach the video to.
+            video_key: The video feature key (e.g. ``"observation.images.top"``).
+            input_video_path: Path to the source MP4 file.
+            overwrite: Whether to overwrite an existing video at the target path.
+            vcodec: Video codec for re-encoding. Defaults to "libsvtav1".
+            pix_fmt: Pixel format. Defaults to "yuv420p".
+            g: GOP size. Defaults to 2.
+            crf: Constant Rate Factor. Defaults to 30.
+
+        Returns:
+            Path to the written video file inside the dataset.
+
+        Raises:
+            ValueError: If ``video_key`` is not a declared video feature, or the
+                episode index does not exist.
+            FileNotFoundError: If ``input_video_path`` does not exist.
+        """
+        if video_key not in self.meta.video_keys:
+            raise ValueError(
+                f"'{video_key}' is not a video feature. Available video keys: {self.meta.video_keys}"
+            )
+        if episode_index not in self.meta.episodes:
+            raise ValueError(
+                f"Episode {episode_index} does not exist. "
+                f"Total episodes: {self.meta.total_episodes}"
+            )
+
+        episode_length = self.meta.episodes[episode_index]["length"]
+        output_path = self.root / self.meta.get_video_file_path(episode_index, video_key)
+
+        if output_path.is_file() and not overwrite:
+            logging.info(
+                "Video already exists at %s, skipping (use overwrite=True to replace).",
+                output_path,
+            )
+            return output_path
+
+        resample_and_trim_video(
+            input_path=input_video_path,
+            output_path=output_path,
+            target_fps=self.fps,
+            num_frames=episode_length,
+            vcodec=vcodec,
+            pix_fmt=pix_fmt,
+            g=g,
+            crf=crf,
+            overwrite=overwrite,
+        )
+
+        logging.info(
+            "Attached video for episode %d, key '%s': %s -> %s (%d frames @ %d fps)",
+            episode_index, video_key, input_video_path, output_path, episode_length, self.fps,
+        )
+        return output_path
+
+    def update_video_info(self) -> None:
+        """Update video metadata from the first episode's video files.
+
+        Call this after attaching all deferred videos to populate the ``info``
+        field of each video feature with actual video properties (resolution,
+        codec, etc.) and persist the updated metadata to disk.
+        """
+        self.meta.update_video_info()
+        write_info(self.meta.info, self.meta.root)
 
     @staticmethod
     def compute_delta_params(
@@ -1862,8 +1996,20 @@ class LeRobotDataset(BaseDataset):
         vector_resample_strategy: str = "nearest",
         standardize: bool = True,
         skip_video_stats: bool = False,
+        deferred_video_keys: set[str] | None = None,
     ) -> "LeRobotDataset":
-        """Create a LeRobot Dataset from scratch in order to record data."""
+        """Create a LeRobot Dataset from scratch in order to record data.
+
+        Args:
+            deferred_video_keys: Optional set of video feature keys whose image
+                observations will be provided later via :meth:`attach_video`
+                instead of being passed to :meth:`add_frame`. When set, these
+                keys are omitted from frame validation, episode video encoding,
+                and post-save video existence checks. After all episodes are
+                recorded, call :meth:`attach_video` for each episode to supply
+                an MP4 that will be resampled to the dataset FPS and trimmed to
+                the episode length.
+        """
         obj = cls.__new__(cls)
         obj.meta = LeRobotDatasetMetadata.create(
             repo_id=repo_id,
@@ -1881,6 +2027,16 @@ class LeRobotDataset(BaseDataset):
 
         if image_writer_processes or image_writer_threads:
             obj.start_image_writer(image_writer_processes, image_writer_threads)
+
+        # Deferred video keys: video features whose observations are attached later
+        obj.deferred_video_keys = set(deferred_video_keys) if deferred_video_keys else set()
+        if obj.deferred_video_keys:
+            unknown = obj.deferred_video_keys - set(obj.meta.video_keys)
+            if unknown:
+                raise ValueError(
+                    f"deferred_video_keys {unknown} are not declared as video features. "
+                    f"Available video keys: {obj.meta.video_keys}"
+                )
 
         # TODO(aliberts, rcadene, alexander-soare): Merge this with OnlineBuffer/DataBuffer
         obj.episode_buffer = obj.create_episode_buffer()
