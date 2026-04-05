@@ -752,14 +752,20 @@ def resample_and_trim_video(
     if ffprobe_path:
         result = subprocess.run(
             [
-                ffprobe_path, "-v", "error",
-                "-select_streams", "v:0",
+                ffprobe_path,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
                 "-count_frames",
-                "-show_entries", "stream=nb_read_frames",
-                "-of", "csv=p=0",
+                "-show_entries",
+                "stream=nb_read_frames",
+                "-of",
+                "csv=p=0",
                 str(output_path),
             ],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         if result.returncode == 0 and result.stdout.strip().isdigit():
             actual_frames = int(result.stdout.strip())

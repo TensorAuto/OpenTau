@@ -473,11 +473,16 @@ def _make_dummy_mp4(path, fps=60, num_frames=100, width=128, height=96):
         [
             ffmpeg,
             "-y",
-            "-f", "lavfi",
-            "-i", f"color=c=blue:s={width}x{height}:r={fps}:d={duration:.6f}",
-            "-pix_fmt", "yuv420p",
-            "-c:v", "libx264",
-            "-g", "2",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c=blue:s={width}x{height}:r={fps}:d={duration:.6f}",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+            "-g",
+            "2",
             str(path),
         ],
         check=True,
@@ -505,10 +510,12 @@ def test_deferred_video_add_frame_and_save(tmp_path, empty_lerobot_dataset_facto
 
     # Add frames without video data
     for i in range(10):
-        dataset.add_frame({
-            "state": np.array([float(i), float(i + 1)], dtype=np.float32),
-            "task": "Dummy task",
-        })
+        dataset.add_frame(
+            {
+                "state": np.array([float(i), float(i + 1)], dtype=np.float32),
+                "task": "Dummy task",
+            }
+        )
 
     # save_episode should succeed without video data
     dataset.save_episode()
@@ -548,10 +555,12 @@ def test_deferred_video_attach_video(tmp_path, empty_lerobot_dataset_factory):
     )
 
     for i in range(num_frames):
-        dataset.add_frame({
-            "state": np.array([float(i), float(i + 1)], dtype=np.float32),
-            "task": "Dummy task",
-        })
+        dataset.add_frame(
+            {
+                "state": np.array([float(i), float(i + 1)], dtype=np.float32),
+                "task": "Dummy task",
+            }
+        )
     dataset.save_episode()
 
     # Create a source video at a different FPS (60fps, 100 frames = 1.67s)
@@ -608,18 +617,22 @@ def test_deferred_video_multi_episode(tmp_path, empty_lerobot_dataset_factory):
 
     # Episode 0: 5 frames
     for i in range(5):
-        dataset.add_frame({
-            "state": np.array([float(i), 0.0], dtype=np.float32),
-            "task": "Task A",
-        })
+        dataset.add_frame(
+            {
+                "state": np.array([float(i), 0.0], dtype=np.float32),
+                "task": "Task A",
+            }
+        )
     dataset.save_episode()
 
     # Episode 1: 8 frames
     for i in range(8):
-        dataset.add_frame({
-            "state": np.array([0.0, float(i)], dtype=np.float32),
-            "task": "Task B",
-        })
+        dataset.add_frame(
+            {
+                "state": np.array([0.0, float(i)], dtype=np.float32),
+                "task": "Task B",
+            }
+        )
     dataset.save_episode()
 
     assert dataset.meta.total_episodes == 2

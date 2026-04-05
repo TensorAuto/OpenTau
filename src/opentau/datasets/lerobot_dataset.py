@@ -1885,8 +1885,7 @@ class LeRobotDataset(BaseDataset):
             )
         if episode_index not in self.meta.episodes:
             raise ValueError(
-                f"Episode {episode_index} does not exist. "
-                f"Total episodes: {self.meta.total_episodes}"
+                f"Episode {episode_index} does not exist. Total episodes: {self.meta.total_episodes}"
             )
 
         episode_length = self.meta.episodes[episode_index]["length"]
@@ -1913,7 +1912,12 @@ class LeRobotDataset(BaseDataset):
 
         logging.info(
             "Attached video for episode %d, key '%s': %s -> %s (%d frames @ %d fps)",
-            episode_index, video_key, input_video_path, output_path, episode_length, self.fps,
+            episode_index,
+            video_key,
+            input_video_path,
+            output_path,
+            episode_length,
+            self.fps,
         )
         return output_path
 
