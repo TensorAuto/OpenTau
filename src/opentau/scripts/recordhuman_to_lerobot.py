@@ -555,9 +555,9 @@ def main():
 
     states: list[np.ndarray] = []
     head_poses: list[np.ndarray] = []
-    cap = cv2.VideoCapture(str(video_path))
 
     if overlay_writer:
+        cap = cv2.VideoCapture(str(video_path))
         next_sample = 0
         for frame_idx in range(total_video_frames):
             ret, frame = cap.read()
@@ -601,16 +601,15 @@ def main():
                 head_poses.append(np.concatenate([head_pos_tracking, head_rot]).astype(np.float32))
                 next_sample += 1
 
+        cap.release()
         overlay_writer.release()
         print(f"Overlay video written to {overlay_path}")
     else:
+        # Pose-only pass: no video decoding needed since states are derived
+        # purely from the pose JSON. The source video will be attached later
+        # via dataset.attach_video().
         for i in range(num_output_frames):
             fidx = sampled_indices[i]
-            cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
-            ret, frame = cap.read()
-            if not ret:
-                break
-
             video_time = fidx / video_fps + args.time_offset
             pidx = int(np.clip(np.searchsorted(pose_timestamps, video_time), 0, len(pose_timestamps) - 1))
             if pidx > 0 and abs(pose_timestamps[pidx - 1] - video_time) < abs(
@@ -625,8 +624,6 @@ def main():
             state, _, _ = compute_frame_state(pf, head_pos_tracking, head_rot, eye_offset)
             states.append(state)
             head_poses.append(np.concatenate([head_pos_tracking, head_rot]).astype(np.float32))
-
-    cap.release()
 
     num_frames = len(states)
     if num_frames == 0:
@@ -671,21 +668,14 @@ def main():
         robot_type="human",
         features=features,
         use_videos=True,
+        deferred_video_keys={image_key},
     )
 
-    # --- Pass 2: read sampled frames and add to dataset ---
+    # --- Pass 2: add pose-derived frames (video is attached below) ---
     print(f"Writing LeRobot dataset ({num_frames} frames, fps={fps_int}) ...")
-    cap = cv2.VideoCapture(str(video_path))
     for i in range(num_frames):
-        fidx = sampled_indices[i]
-        cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         dataset.add_frame(
             {
-                image_key: frame_rgb,
                 state_key: states[i],
                 action_key: actions[i],
                 "task": args.prompt,
@@ -693,9 +683,25 @@ def main():
         )
         if (i + 1) % 100 == 0:
             print(f"  {i + 1}/{num_frames}")
-    cap.release()
 
     dataset.save_episode()
+
+    # Attach the source MP4: resampled to target FPS and trimmed to num_frames.
+    # This replaces the old PNG round-trip: no per-frame decode or re-encode.
+    try:
+        dataset.attach_video(
+            episode_index=0,
+            video_key=image_key,
+            input_video_path=video_path,
+            overwrite=True,
+        )
+    except ValueError as err:
+        print(
+            f"Error: failed to attach source video '{video_path}' to episode 0: {err}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    dataset.update_video_info()
     print(f"LeRobot dataset written to {output_path} ({num_frames} frames, 1 episode)")
 
 
