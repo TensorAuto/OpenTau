@@ -91,19 +91,19 @@ from abc import abstractmethod
 from pathlib import Path
 from typing import Callable
 
-import datasets
 import numpy as np
 import packaging.version
 import PIL.Image
 import torch
 import torch.nn.functional as F  # noqa: N812
 import torch.utils
-from datasets import concatenate_datasets, load_dataset
 from einops import rearrange
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.constants import REPOCARD_NAME
 from huggingface_hub.errors import RevisionNotFoundError
 
+import datasets
+from datasets import concatenate_datasets, load_dataset
 from opentau.configs.train import TrainPipelineConfig
 from opentau.constants import HF_OPENTAU_HOME
 from opentau.datasets.compute_stats import aggregate_stats, compute_episode_stats
@@ -1861,6 +1861,7 @@ class LeRobotDataset(BaseDataset):
         pix_fmt: str = "yuv420p",
         g: int | None = 2,
         crf: int | None = 30,
+        start_time: float | None = None,
     ) -> Path:
         """Attach a pre-recorded MP4 video to an episode with deferred video observations.
 
@@ -1885,6 +1886,9 @@ class LeRobotDataset(BaseDataset):
             pix_fmt: Pixel format. Defaults to "yuv420p".
             g: GOP size. Defaults to 2.
             crf: Constant Rate Factor. Defaults to 30.
+            start_time: Optional start offset in seconds into the source video.
+                Useful when only a portion of the recording overlaps with the
+                episode data. Defaults to None (start from the beginning).
 
         Returns:
             Path to the written video file inside the dataset.
@@ -1923,6 +1927,7 @@ class LeRobotDataset(BaseDataset):
             g=g,
             crf=crf,
             overwrite=overwrite,
+            start_time=start_time,
         )
 
         logging.info(
