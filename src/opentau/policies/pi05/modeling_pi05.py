@@ -1078,7 +1078,7 @@ class PI05FlowMatching(nn.Module):
             # Create attention masks so that image tokens attend to each other
             att_masks += [0] * num_img_embs
 
-        # adds continuous state to the embedding if it is provided before prompt 
+        # adds continuous state to the embedding if it is provided before prompt
         if self.config.state_type == "continuous" and state is not None:
             state_emb = self.state_proj(state.to(dtype=_preferred_dtype()))
             state_emb = rearrange(state_emb, "b d -> b 1 d")

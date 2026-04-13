@@ -174,9 +174,7 @@ class PI05Config(PreTrainedConfig):
             self.init_strategy = "no_init"
 
         if self.state_type not in ("discrete", "continuous"):
-            raise ValueError(
-                f"state_type must be 'discrete' or 'continuous', got '{self.state_type}'"
-            )
+            raise ValueError(f"state_type must be 'discrete' or 'continuous', got '{self.state_type}'")
 
         if self.max_delay > self.chunk_size:
             raise ValueError(
