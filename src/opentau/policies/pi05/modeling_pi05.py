@@ -470,9 +470,8 @@ class PI05Policy(PreTrainedPolicy):
                 new_key = key.replace("action_time_mlp_in.", "time_mlp_in.")
             elif key.startswith("action_time_mlp_out."):
                 new_key = key.replace("action_time_mlp_out.", "time_mlp_out.")
-            # Also handle state_proj which shouldn't exist in pi05
-            if key.startswith("state_proj."):
-                logging.warning(f"Skipping state_proj key in pi05 mode: {key}")
+            if key.startswith("state_proj.") and model_config.state_type == "discrete":
+                logging.warning(f"Skipping state_proj key in discrete state mode: {key}")
                 continue
 
             # Handle vision tower embedding layer potential differences
@@ -596,6 +595,8 @@ class PI05Policy(PreTrainedPolicy):
                 (0, 0, 0, self.config.chunk_size - action_prefix.shape[1]),
             )
 
+        state = self.prepare_state(batch) if self.config.state_type == "continuous" else None
+
         actions = self.model.sample_actions(
             images,
             img_masks,
@@ -604,6 +605,7 @@ class PI05Policy(PreTrainedPolicy):
             action_prefix,
             delay,
             noise=noise,
+            state=state,
         )
 
         # Unpad actions
@@ -650,6 +652,7 @@ class PI05Policy(PreTrainedPolicy):
             "action_is_pad"
         )  # in actions_is_pad we have False for real actions and True for padded actions
 
+        state = self.prepare_state(batch) if self.config.state_type == "continuous" else None
         losses = self.model.forward(
             images,
             img_masks,
@@ -663,12 +666,38 @@ class PI05Policy(PreTrainedPolicy):
             time,
             discrete_actions,
             discrete_action_masks,
+            state=state,
         )
 
         mse_loss = losses["MSE"]
         ce_loss = losses["CE"]
 
         return {"MSE": mse_loss, "CE": ce_loss}
+
+    def prepare_state(self, batch: dict[str, Tensor]) -> Tensor:
+        """Prepares the continuous state tensor, padding or truncating to max_state_dim.
+
+        Only used when ``state_type == "continuous"``.
+
+        Args:
+            batch: Batch of data containing the "state" tensor of shape (batch_size, state_dim).
+
+        Returns:
+            A tensor of shape (batch_size, max_state_dim).
+
+        Raises:
+            ValueError: If the state dimension exceeds max_state_dim.
+        """
+        state = batch["state"]
+        state_dim = state.shape[-1]
+        if state_dim > self.config.max_state_dim:
+            raise ValueError(
+                f"State dimension ({state_dim}) exceeds max_state_dim ({self.config.max_state_dim}). "
+                f"Increase max_state_dim in the config to accommodate the state vector."
+            )
+        if state_dim < self.config.max_state_dim:
+            state = F.pad(state, (0, self.config.max_state_dim - state_dim))
+        return state
 
     def prepare_discrete_state(self, batch: dict[str, Tensor]) -> list[str]:
         """Discretizes the state into bins and converts it to a string representation.
@@ -781,7 +810,10 @@ class PI05Policy(PreTrainedPolicy):
     def prepare_language(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
         """Tokenize the text input.
 
-        The state is already expected to be discretized into a space-separated string.
+        When ``state_type == "discrete"``, the state is discretized into bins and
+        embedded into the prompt string.  When ``state_type == "continuous"``, the
+        state is handled separately via :meth:`prepare_state`, so the prompt only
+        contains the task description.
 
         Args:
             batch: Batch of data containing the key "prompt" and "state".
@@ -794,19 +826,23 @@ class PI05Policy(PreTrainedPolicy):
         device = batch["state"].device
         tasks = batch["prompt"]
 
-        # add state to the prompt
-        state = self.prepare_discrete_state(batch)
-        # using <eos> to separate each modality
-        if self.config.predict_response:
-            prompt = [
-                f"Task: {task}<eos>State: {state}<eos>Response:"
-                for task, state in zip(tasks, state, strict=False)
-            ]
+        if self.config.state_type == "continuous":
+            # the below prompt <eos>Actions is added assuming state will arrive before prompt in continuous mode
+            prompt = [f"Task: {task}<eos>Actions:" for task in tasks]
         else:
-            prompt = [
-                f"Task: {task}<eos>State: {state}<eos>Actions:"
-                for task, state in zip(tasks, state, strict=False)
-            ]
+            # add state to the prompt
+            state = self.prepare_discrete_state(batch)
+            # using <eos> to separate each modality
+            if self.config.predict_response:
+                prompt = [
+                    f"Task: {task}<eos>State: {state}<eos>Response:"
+                    for task, state in zip(tasks, state, strict=False)
+                ]
+            else:
+                prompt = [
+                    f"Task: {task}<eos>State: {state}<eos>Actions:"
+                    for task, state in zip(tasks, state, strict=False)
+                ]
 
         tokenized_prompt = self.language_tokenizer.__call__(
             prompt,
@@ -903,6 +939,10 @@ class PI05FlowMatching(nn.Module):
         )
         self.paligemma_with_expert = PaliGemmaWithExpertModel(paligemma_with_expert_config)
 
+        if self.config.state_type == "continuous":
+            vlm_hidden_size = self.paligemma_with_expert.config.paligemma_config.text_config.hidden_size
+            self.state_proj = nn.Linear(self.config.max_state_dim, vlm_hidden_size)
+
         # Projections are float32
         self.action_in_proj = nn.Linear(self.config.max_action_dim, self.config.proj_width)
         self.action_out_proj = nn.Linear(self.config.proj_width, self.config.max_action_dim)
@@ -985,9 +1025,15 @@ class PI05FlowMatching(nn.Module):
         response_masks: Tensor | None = None,
         discrete_actions: Tensor | None = None,
         discrete_action_masks: Tensor | None = None,
+        state: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
+
+        When ``state_type == "continuous"`` and *state* is provided, the raw state
+        vector is projected into VLM embedding space and appended as a single
+        token (with full attention to images and language).  Response tokens are
+        ignored in this mode.
 
         Args:
             images: List of image tensors.
@@ -998,6 +1044,7 @@ class PI05FlowMatching(nn.Module):
             response_masks: Optional Response language mask tensor.
             discrete_actions: Optional discrete action tensor.
             discrete_action_masks: Optional discrete action mask tensor.
+            state: Optional continuous state tensor of shape (batch_size, max_state_dim).
 
         Returns:
             A tuple containing:
@@ -1030,6 +1077,16 @@ class PI05FlowMatching(nn.Module):
 
             # Create attention masks so that image tokens attend to each other
             att_masks += [0] * num_img_embs
+
+        # adds continuous state to the embedding if it is provided before prompt 
+        if self.config.state_type == "continuous" and state is not None:
+            state_emb = self.state_proj(state.to(dtype=_preferred_dtype()))
+            state_emb = rearrange(state_emb, "b d -> b 1 d")
+            state_mask = torch.ones(bsize, 1, dtype=torch.bool, device=state.device)
+
+            embs.append(state_emb)
+            pad_masks.append(state_mask)
+            att_masks += [0]  # full attention with images and language
 
         lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
 
@@ -1142,6 +1199,7 @@ class PI05FlowMatching(nn.Module):
         time: Tensor | None = None,
         discrete_actions: Tensor | None = None,
         discrete_action_masks: Tensor | None = None,
+        state: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """Do a full training forward pass and compute the loss.
 
@@ -1158,6 +1216,7 @@ class PI05FlowMatching(nn.Module):
             time: Optional time tensor.
             discrete_actions: Optional discrete action tensor.
             discrete_action_masks: Optional discrete action mask tensor.
+            state: Optional continuous state tensor of shape (batch_size, max_state_dim).
 
         Returns:
             A dictionary containing the loss components ("MSE" and "CE").
@@ -1172,6 +1231,7 @@ class PI05FlowMatching(nn.Module):
             response_masks,
             discrete_actions,
             discrete_action_masks,
+            state=state,
         )
 
         vlm_2d_attention_mask = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
@@ -1338,6 +1398,7 @@ class PI05FlowMatching(nn.Module):
         action_prefix: Tensor,
         delay: Tensor,
         noise: Tensor | None = None,
+        state: Tensor | None = None,
     ) -> Tensor:
         """Do a full inference forward and compute the action.
 
@@ -1349,6 +1410,7 @@ class PI05FlowMatching(nn.Module):
             action_prefix: Action prefix tensor.
             delay: Number of delay actions, aka number of actions frozen from the action_prefix.
             noise: Optional noise tensor.
+            state: Optional continuous state tensor of shape (batch_size, max_state_dim).
         Returns:
             The sampled action tensor.
         """
@@ -1360,7 +1422,7 @@ class PI05FlowMatching(nn.Module):
             noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks
+            images, img_masks, lang_tokens, lang_masks, state=state
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
