@@ -688,6 +688,8 @@ class PI05Policy(PreTrainedPolicy):
         Raises:
             ValueError: If the state dimension exceeds max_state_dim.
         """
+
+        assert self.config.state_type == "continuous", "prepare_state is only used in continuous state mode"
         state = batch["state"]
         state_dim = state.shape[-1]
         if state_dim > self.config.max_state_dim:
@@ -716,6 +718,10 @@ class PI05Policy(PreTrainedPolicy):
         Raises:
             ValueError: If the state values are not normalized between -1 and 1.
         """
+
+        assert self.config.state_type == "discrete", (
+            "prepare_discrete_state is only used in discrete state mode"
+        )
         state = batch["state"]
         state_cpu = state.to(device="cpu", dtype=torch.float32)
         if torch.any(state_cpu < -1.0) or torch.any(state_cpu > 1.0):

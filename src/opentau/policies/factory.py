@@ -23,6 +23,7 @@ logic for creating fresh policies or loading pretrained ones, as well as
 parsing features from datasets or environments to properly configure the policies.
 """
 
+import warnings
 from typing import Optional
 
 import numpy as np
@@ -88,6 +89,14 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
     if policy_type == "pi0":
         return PI0Config(**kwargs)
     elif policy_type == "pi05":
+        return PI05Config(**kwargs)
+    elif policy_type == "pi05_continuous_state":
+        warnings.warn(
+            "pi05_continuous_state is deprecated. Use pi05 with state_type='continuous' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        kwargs.setdefault("state_type", "continuous")
         return PI05Config(**kwargs)
     elif policy_type == "pi05_mem":
         return PI05MemConfig(**kwargs)
