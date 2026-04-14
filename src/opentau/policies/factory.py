@@ -60,6 +60,14 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
     elif name == "pi05":
         from opentau.policies.pi05.modeling_pi05 import PI05Policy
 
+    elif name == "pi05_continuous_state":
+        warnings.warn(
+            "pi05_continuous_state is deprecated. Use pi05 with state_type='continuous' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return PI05Policy
+
         return PI05Policy
     elif name == "pi05_mem":
         from opentau.policies.pi05_mem.modeling_pi05 import PI05MemPolicy
