@@ -828,7 +828,10 @@ class PI05Policy(PreTrainedPolicy):
 
         if self.config.state_type == "continuous":
             # the below prompt <eos>Actions is added assuming state will arrive before prompt in continuous mode
-            prompt = [f"Task: {task}<eos>Actions:" for task in tasks]
+            if self.config.predict_response:
+                prompt = [f"Task: {task}<eos>Response:" for task in tasks]
+            else:
+                prompt = [f"Task: {task}<eos>Actions:" for task in tasks]
         else:
             # add state to the prompt
             state = self.prepare_discrete_state(batch)
