@@ -576,7 +576,7 @@ class PI05Policy(PreTrainedPolicy):
         batch = self.normalize_inputs(batch)
 
         images, img_masks = self.prepare_images(batch)
-        lang_tokens, lang_masks = self.prepare_language(batch)
+        lang_tokens, lang_masks, indicator_tokens, indicator_masks = self.prepare_language(batch)
 
         # if delay is not provided, set it to 0
         if delay is None:
@@ -606,6 +606,8 @@ class PI05Policy(PreTrainedPolicy):
             delay,
             noise=noise,
             state=state,
+            indicator_tokens=indicator_tokens,
+            indicator_masks=indicator_masks,
         )
 
         # Unpad actions
@@ -636,7 +638,7 @@ class PI05Policy(PreTrainedPolicy):
         images, img_masks = self.prepare_images(
             batch
         )  # in img_masks we have True for real images and False for padded images
-        lang_tokens, lang_masks = self.prepare_language(
+        lang_tokens, lang_masks, indicator_tokens, indicator_masks = self.prepare_language(
             batch
         )  # in lang_masks we have True for real tokens and False for padded tokens
         # response prediction is to predict the response . It will attend to image and language inputs.
@@ -667,6 +669,8 @@ class PI05Policy(PreTrainedPolicy):
             discrete_actions,
             discrete_action_masks,
             state=state,
+            indicator_tokens=indicator_tokens,
+            indicator_masks=indicator_masks,
         )
 
         mse_loss = losses["MSE"]
@@ -834,10 +838,7 @@ class PI05Policy(PreTrainedPolicy):
 
         if self.config.state_type == "continuous":
             # the below prompt <eos>Actions is added assuming state will arrive before prompt in continuous mode
-            if self.config.predict_response:
-                prompt = [f"Task: {task}<eos>Response:" for task in tasks]
-            else:
-                prompt = [f"Task: {task}<eos>Actions:" for task in tasks]
+            prompt = [f"Task: {task}" for task in tasks]
         else:
             # add state to the prompt
             state = self.prepare_discrete_state(batch)
@@ -864,7 +865,26 @@ class PI05Policy(PreTrainedPolicy):
         lang_tokens = tokenized_prompt["input_ids"].to(device=device)
         lang_masks = tokenized_prompt["attention_mask"].to(device=device, dtype=torch.bool)
 
-        return lang_tokens, lang_masks
+        if self.config.state_type == "continuous":
+            if self.config.predict_response:
+                indicator = ["<eos>Response:" for _ in range(len(tasks))]
+            else:
+                indicator = ["<eos>Actions:" for _ in range(len(tasks))]
+            tokenized_indicator = self.language_tokenizer.__call__(
+                indicator,
+                padding="max_length",
+                padding_side="right",
+                max_length=4,
+                return_tensors="pt",
+                truncation=True,
+            )
+            indicator_tokens = tokenized_indicator["input_ids"].to(device=device)
+            indicator_masks = tokenized_indicator["attention_mask"].to(device=device, dtype=torch.bool)
+        else:
+            indicator_tokens = None
+            indicator_masks = None
+
+        return lang_tokens, lang_masks, indicator_tokens, indicator_masks
 
     def prepare_response(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
         """Tokenize the response input.
@@ -1035,6 +1055,8 @@ class PI05FlowMatching(nn.Module):
         discrete_actions: Tensor | None = None,
         discrete_action_masks: Tensor | None = None,
         state: Tensor | None = None,
+        indicator_tokens: Tensor | None = None,
+        indicator_masks: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
@@ -1054,6 +1076,8 @@ class PI05FlowMatching(nn.Module):
             discrete_actions: Optional discrete action tensor.
             discrete_action_masks: Optional discrete action mask tensor.
             state: Optional continuous state tensor of shape (batch_size, max_state_dim).
+            indicator_tokens: Optional indicator token tensor.
+            indicator_masks: Optional indicator mask tensor.
 
         Returns:
             A tuple containing:
@@ -1087,16 +1111,6 @@ class PI05FlowMatching(nn.Module):
             # Create attention masks so that image tokens attend to each other
             att_masks += [0] * num_img_embs
 
-        # adds continuous state to the embedding if it is provided before prompt
-        if self.config.state_type == "continuous" and state is not None:
-            state_emb = self.state_proj(state.to(dtype=_preferred_dtype()))
-            state_emb = rearrange(state_emb, "b d -> b 1 d")
-            state_mask = torch.ones(bsize, 1, dtype=torch.bool, device=state.device)
-
-            embs.append(state_emb)
-            pad_masks.append(state_mask)
-            att_masks += [0]  # full attention with images and language
-
         lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
 
         # Normalize language embeddings
@@ -1109,6 +1123,22 @@ class PI05FlowMatching(nn.Module):
         # full attention between image and language inputs
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
+
+        # adds continuous state to the embedding if it is provided before prompt
+        if self.config.state_type == "continuous" and state is not None:
+            state_emb = self.state_proj(state.to(dtype=_preferred_dtype()))
+            state_emb = rearrange(state_emb, "b d -> b 1 d")
+            state_mask = torch.ones(bsize, 1, dtype=torch.bool, device=state.device)
+
+            embs.append(state_emb)
+            pad_masks.append(state_mask)
+            att_masks += [0]  # full attention with images and language
+
+        if indicator_tokens is not None:
+            indicator_emb = self.paligemma_with_expert.embed_language_tokens(indicator_tokens)
+            embs.append(indicator_emb)
+            pad_masks.append(indicator_masks)
+            att_masks += [0] * indicator_emb.shape[1]
 
         if response_tokens is not None:
             response_emb = self.paligemma_with_expert.embed_language_tokens(response_tokens)
@@ -1209,6 +1239,8 @@ class PI05FlowMatching(nn.Module):
         discrete_actions: Tensor | None = None,
         discrete_action_masks: Tensor | None = None,
         state: Tensor | None = None,
+        indicator_tokens: Tensor | None = None,
+        indicator_masks: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """Do a full training forward pass and compute the loss.
 
@@ -1226,6 +1258,8 @@ class PI05FlowMatching(nn.Module):
             discrete_actions: Optional discrete action tensor.
             discrete_action_masks: Optional discrete action mask tensor.
             state: Optional continuous state tensor of shape (batch_size, max_state_dim).
+            indicator_tokens: Optional indicator token tensor.
+            indicator_masks: Optional indicator mask tensor.
 
         Returns:
             A dictionary containing the loss components ("MSE" and "CE").
@@ -1241,6 +1275,8 @@ class PI05FlowMatching(nn.Module):
             discrete_actions,
             discrete_action_masks,
             state=state,
+            indicator_tokens=indicator_tokens,
+            indicator_masks=indicator_masks,
         )
 
         vlm_2d_attention_mask = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
@@ -1408,6 +1444,8 @@ class PI05FlowMatching(nn.Module):
         delay: Tensor,
         noise: Tensor | None = None,
         state: Tensor | None = None,
+        indicator_tokens: Tensor | None = None,
+        indicator_masks: Tensor | None = None,
     ) -> Tensor:
         """Do a full inference forward and compute the action.
 
@@ -1420,6 +1458,8 @@ class PI05FlowMatching(nn.Module):
             delay: Number of delay actions, aka number of actions frozen from the action_prefix.
             noise: Optional noise tensor.
             state: Optional continuous state tensor of shape (batch_size, max_state_dim).
+            indicator_tokens: Optional indicator token tensor.
+            indicator_masks: Optional indicator mask tensor.
         Returns:
             The sampled action tensor.
         """
@@ -1431,7 +1471,13 @@ class PI05FlowMatching(nn.Module):
             noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state=state,
+            indicator_tokens=indicator_tokens,
+            indicator_masks=indicator_masks,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
