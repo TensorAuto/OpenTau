@@ -1,0 +1,8 @@
+{
+    "datasets": [
+        {
+            "repo_id": "TensorAuto/ice-lemonade",
+            "root": "/home/ashah/Documents/IceLemonade"
+        }
+    ]
+}
