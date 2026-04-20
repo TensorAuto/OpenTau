@@ -91,19 +91,19 @@ from abc import abstractmethod
 from pathlib import Path
 from typing import Callable
 
+import datasets
 import numpy as np
 import packaging.version
 import PIL.Image
 import torch
 import torch.nn.functional as F  # noqa: N812
 import torch.utils
+from datasets import concatenate_datasets, load_dataset
 from einops import rearrange
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.constants import REPOCARD_NAME
 from huggingface_hub.errors import RevisionNotFoundError
 
-import datasets
-from datasets import concatenate_datasets, load_dataset
 from opentau.configs.train import TrainPipelineConfig
 from opentau.constants import HF_OPENTAU_HOME
 from opentau.datasets.compute_stats import aggregate_stats, compute_episode_stats
