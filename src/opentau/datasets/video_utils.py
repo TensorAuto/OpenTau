@@ -97,6 +97,7 @@ Example:
 import importlib
 import json
 import logging
+import math
 import shutil
 import subprocess
 import warnings
@@ -702,6 +703,9 @@ def resample_and_trim_video(
 
     if target_fps <= 0:
         raise ValueError(f"`target_fps` must be > 0, got {target_fps}.")
+
+    if start_time is not None and (not math.isfinite(start_time) or start_time < 0):
+        raise ValueError(f"`start_time` must be a finite non-negative number, got {start_time}.")
 
     if not input_path.is_file():
         raise FileNotFoundError(f"Input video not found: {input_path}")
