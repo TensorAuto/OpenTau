@@ -654,9 +654,7 @@ def test_deferred_video_attach_video_start_time(tmp_path):
         return dataset
 
     # Source video has time-varying content so different offsets yield different pixels.
-    src_video = _make_time_varying_mp4(
-        tmp_path / "source.mp4", fps=60, num_frames=300, width=128, height=96
-    )
+    src_video = _make_time_varying_mp4(tmp_path / "source.mp4", fps=60, num_frames=300, width=128, height=96)
 
     ds_no_offset = _build_dataset(tmp_path / "ds_no_offset")
     ds_no_offset.attach_video(
@@ -675,12 +673,8 @@ def test_deferred_video_attach_video_start_time(tmp_path):
         start_time=2.0,
     )
 
-    path_no_offset = ds_no_offset.root / ds_no_offset.meta.get_video_file_path(
-        0, "observation.images.top"
-    )
-    path_offset = ds_offset.root / ds_offset.meta.get_video_file_path(
-        0, "observation.images.top"
-    )
+    path_no_offset = ds_no_offset.root / ds_no_offset.meta.get_video_file_path(0, "observation.images.top")
+    path_offset = ds_offset.root / ds_offset.meta.get_video_file_path(0, "observation.images.top")
 
     frames_no_offset = decode_video_frames(path_no_offset, [0.0], tolerance_s=0.1)
     frames_offset = decode_video_frames(path_offset, [0.0], tolerance_s=0.1)
