@@ -30,8 +30,10 @@ An example of segments.json can be found in `configs/examples/segments.json`.
 import argparse
 import json
 import math
+import os
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, cast
@@ -187,6 +189,22 @@ def _trim_video_segment(src_video_path: Path, dst_video_path: Path, start_frame:
             f"Failed to trim video segment {start_frame}:{end_frame} from '{src_video_path}'. "
             f"ffmpeg stderr: {result.stderr.strip()}"
         )
+
+
+def _trim_video_segment_job(task: tuple[Path, Path, int, int]) -> None:
+    """Worker entry for parallel ffmpeg (ThreadPoolExecutor)."""
+    src_video_path, dst_video_path, start_frame, end_frame = task
+    _trim_video_segment(src_video_path, dst_video_path, start_frame, end_frame)
+
+
+def _ffmpeg_trim_max_workers() -> int:
+    raw = os.environ.get("TUNER_FFMPEG_MAX_WORKERS", "").strip()
+    if raw.isdigit():
+        v = int(raw)
+        if 1 <= v <= 64:
+            return v
+    cpu = os.cpu_count() or 4
+    return max(1, min(16, cpu * 2))
 
 
 def _copy_segment_images_and_rewrite_column(
@@ -348,6 +366,7 @@ def segment_dataset(
     video_path_template_str = cast(str, video_path_template) if video_path_template is not None else ""
     source_tables: dict[int, pa.Table] = {}
     output_episode_index = 0
+    ffmpeg_jobs: list[tuple[Path, Path, int, int]] = []
 
     with tqdm(total=total_frames_to_process, desc="Segmenting frames", unit="frame") as pbar:
         for episode_id, segments in segments_by_episode.items():
@@ -461,7 +480,7 @@ def segment_dataset(
 
                 write_episode_stats(output_episode_index, episode_stats, output_root)
 
-                # Copy and trim source videos for this segment, if any.
+                # Defer ffmpeg trims — run in parallel after all parquet/stats are written.
                 for video_key in source_meta.video_keys:
                     src_video_path = input_root / source_meta.get_video_file_path(episode_id, video_key)
                     if not src_video_path.is_file():
@@ -472,11 +491,23 @@ def segment_dataset(
                         episode_index=output_episode_index,
                     )
                     dst_video_path.parent.mkdir(parents=True, exist_ok=True)
-                    _trim_video_segment(src_video_path, dst_video_path, start, end)
+                    ffmpeg_jobs.append((src_video_path, dst_video_path, start, end))
 
                 global_index_offset += seg_len
                 output_episode_index += 1
                 pbar.update(seg_len)
+
+    if ffmpeg_jobs:
+        n_workers = _ffmpeg_trim_max_workers()
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = [pool.submit(_trim_video_segment_job, job) for job in ffmpeg_jobs]
+            for fut in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc=f"Trimming videos ({n_workers} workers)",
+                unit="clip",
+            ):
+                fut.result()
 
     for episode in output_episodes:
         append_jsonlines(episode, output_root / EPISODES_PATH)
