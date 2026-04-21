@@ -13,12 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Configuration module for the PI05 Mem Policy.
+"""Configuration module for the π07 Low-Level Planner.
 
-This module defines the ``PI05MemConfig`` class, which handles configuration
-parameters for the PI05 Mem variant. This variant replaces the SigLIP image
-encoder with a V-JEPA2 video encoder and processes temporal state sequences
-(one continuous token per timestep).
+This module defines the ``PI07lowlevelPlannerConfig`` class, which handles
+configuration parameters for the π07 low-level planner. This planner uses
+V-JEPA2 as a video encoder, processes temporal state sequences (one
+continuous token per timestep), and supports optional subgoal image and
+metadata conditioning.
 """
 
 import logging
@@ -37,41 +38,51 @@ from opentau.optim.schedulers import (
 @PreTrainedConfig.register_subclass("pi07_low_level_planner")
 @dataclass
 class PI07lowlevelPlannerConfig(PreTrainedConfig):
-    """Configuration class for the PI05 Mem Policy.
+    """Configuration for the π07 low-level planner.
 
-    This variant uses V-JEPA2 as a video encoder (replacing SigLIP) and projects
-    temporal state sequences into per-timestep continuous tokens in the VLM
-    embedding space.
+    The low-level planner generates continuous action chunks via flow matching
+    and discrete FAST action tokens through the VLM backbone.  It uses V-JEPA2
+    as a video encoder and projects temporal state sequences into per-timestep
+    continuous tokens.
 
     Args:
-        n_obs_steps: Number of temporal video frames passed to V-JEPA2 per forward call.
-            During training each sample has this many frames; during inference the
-            observation-history buffer (controlled by ``n_obs_history`` and
-            ``history_interval``) is stacked to produce exactly this many frames.
-            Must equal ``n_obs_history`` when the latter is set.
-        chunk_size: Size of the action chunk. The upper bound for n_action_steps. Defaults to 50.
+        n_obs_steps: Number of temporal video frames passed to V-JEPA2 per
+            forward call. Must equal ``n_obs_history`` when the latter is set.
+        chunk_size: Size of the action chunk (upper bound for
+            ``n_action_steps``). Defaults to 50.
         n_action_steps: Number of action steps to predict. Defaults to 50.
         normalization_mapping: Mapping of feature names to normalization modes.
-        max_state_dim: Maximum dimension for state vectors. Shorter vectors are padded. Defaults to 32.
-        max_action_dim: Maximum dimension for action vectors. Shorter vectors are padded. Defaults to 32.
-        resize_imgs_with_padding: Target size (height, width) for video frame resizing with padding.
-            Defaults to (224, 224).
+        max_state_dim: Maximum dimension for state vectors. Defaults to 32.
+        max_action_dim: Maximum dimension for action vectors. Defaults to 32.
+        resize_imgs_with_padding: Target ``(H, W)`` for video frame resizing
+            with padding. Defaults to ``(224, 224)``.
         empty_cameras: Number of empty camera inputs to add. Defaults to 0.
-        prompt_max_length: Maximum length for tokenizer. Defaults to 256.
-        discrete_action_max_length: Maximum length for discrete action tokens. Defaults to 32.
-        proj_width: Width of the projection layer. Defaults to 1024.
+        prompt_max_length: Maximum token length for language prompts.
+            Defaults to 256.
+        discrete_action_max_length: Maximum length for FAST action tokens.
+            Defaults to 32.
+        metadata_max_length: Maximum token length for metadata strings.
+            Defaults to 52.
+        proj_width: Width of the action projection layer. Defaults to 1024.
         dropout: Dropout rate. Defaults to 0.1.
-        num_steps: Number of flow matching steps for decoding. Defaults to 10.
-        init_strategy: Initialization strategy. Defaults to "full_he_init".
-        attention_implementation: Attention implementation ("eager" or "fa2"). Defaults to "eager".
-        freeze_vision_encoder: Whether to freeze the V-JEPA2 encoder. Defaults to True.
-        train_expert_only: Whether to train only the expert module. Defaults to False.
-        vjepa2_model_name: HuggingFace repo for V-JEPA2 weights. Defaults to "facebook/vjepa2-vitl-fpc64-256".
+        num_steps: Number of flow-matching denoising steps. Defaults to 10.
+        max_delay: Maximum number of prefix action steps for real-time
+            inference. Defaults to 0.
+        init_strategy: Weight initialization strategy. Defaults to
+            ``"full_he_init"``.
+        attention_implementation: Attention backend (``"eager"`` or
+            ``"fa2"``). Defaults to ``"eager"``.
+        freeze_vision_encoder: Whether to freeze V-JEPA2. Defaults to True.
+        train_expert_only: Whether to train only the action expert.
+            Defaults to False.
+        vjepa2_model_name: HuggingFace repo for V-JEPA2 weights.
         vjepa2_crop_size: Spatial resolution fed to V-JEPA2. Defaults to 224.
-        vjepa2_num_video_tokens: Number of output tokens after reduction (must match SigLIP's 256). Defaults to 256.
-        vjepa2_perceiver_heads: Number of attention heads in the Perceiver reducer. Defaults to 8.
-        vjepa2_dtype: Torch dtype string for V-JEPA2 weights (e.g. "bfloat16", "float32").
-            Defaults to None, which uses bfloat16 on CUDA and float32 on CPU.
+        vjepa2_num_video_tokens: Number of output tokens after Perceiver
+            reduction. Defaults to 256.
+        vjepa2_perceiver_heads: Attention heads in the Perceiver reducer.
+            Defaults to 8.
+        vjepa2_dtype: Torch dtype string for V-JEPA2 weights. Defaults to
+            None (bfloat16 on CUDA, float32 on CPU).
     """
 
     # Input / output structure.
@@ -112,6 +123,8 @@ class PI07lowlevelPlannerConfig(PreTrainedConfig):
 
     # Maximum length of the action tokens
     discrete_action_max_length: int = 32
+
+    metadata_max_length: int = 52
 
     # Projector
     proj_width: int = 1024

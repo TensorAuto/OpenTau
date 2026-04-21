@@ -268,11 +268,7 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
             Dictionary mapping feature names to PolicyFeature instances with
             type VISUAL and type SUBGOAL.
         """
-        return {
-            key: ft
-            for key, ft in self.input_features.items()
-            if ft.type is FeatureType.VISUAL and ft.type is FeatureType.SUBGOAL
-        }
+        return {key: ft for key, ft in self.input_features.items() if ft.type is FeatureType.SUBGOAL}
 
     @property
     def action_feature(self) -> PolicyFeature | None:

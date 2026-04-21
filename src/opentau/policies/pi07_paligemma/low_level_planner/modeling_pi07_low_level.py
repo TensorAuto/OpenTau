@@ -15,15 +15,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""π05 Mem: A Vision-Language-Action Flow Model with V-JEPA2 video encoding
-and temporal state sequences.
+"""π07 Low-Level Planner: a Vision-Language-Action Flow Model for continuous
+action generation.
 
-Based on π05, this variant:
-  1. Replaces the SigLIP image encoder with a frozen V-JEPA2 video encoder
-     followed by a Perceiver cross-attention reducer that compresses the video
-     into 256 tokens (matching the original SigLIP token count).
-  2. Accepts temporal state sequences (B, T, D) and projects each timestep
-     into a separate continuous token for the Gemma backbone.
+The low-level planner is one half of the π07 hierarchical architecture.
+Given video observations (encoded by V-JEPA2), a language prompt, temporal
+proprioceptive state, optional subgoal images, and optional metadata, it
+produces continuous action chunks via flow matching while simultaneously
+predicting discrete (FAST) action tokens through the VLM backbone.
+
+Key differences from the base π05 policy:
+  1. V-JEPA2 video encoder replaces SigLIP, compressing each camera's
+     temporal video into 256 tokens via a Perceiver cross-attention reducer.
+  2. Temporal state sequences (B, T, D) are projected per-timestep into
+     separate continuous tokens for the Gemma backbone.
+  3. Supports optional subgoal image conditioning and metadata tokens.
+  4. Knowledge Insulation: action-expert gradients are detached from the
+     VLM backbone to preserve language understanding capabilities.
 """
 
 import builtins
@@ -207,10 +215,11 @@ def pad_discrete_tokens(tokens: list[list[int]], max_length: int) -> tuple[np.nd
 
 # Policy wrapper
 class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
-    """Wrapper class around PI05MemFlowMatching model.
+    """Policy wrapper for the π07 low-level planner.
 
-    Uses V-JEPA2 as a video encoder and temporal state sequences projected
-    into per-timestep continuous tokens in the VLM embedding space.
+    Handles tokenization, normalization, observation-history buffering, and
+    action queue management around the inner
+    :class:`PI07LowLevelPlannerFlowMatching` model.
     """
 
     config_class = PI07lowlevelPlannerConfig
@@ -409,7 +418,7 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
-        raise NotImplementedError("Currently not implemented for PI05 Mem")
+        raise NotImplementedError("Currently not implemented for PI07 low-level planner")
 
     def _build_history_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         """Buffer the current observation and construct a temporal batch.
@@ -480,7 +489,19 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
-        """Select a single action given environment observations."""
+        """Select a single action from the queue, regenerating if needed.
+
+        Builds temporal observation history when configured, runs flow-matching
+        inference to fill the action queue, and pops the next action.
+
+        Args:
+            batch: Environment observation dict with ``"state"``, image keys,
+                ``"prompt"``, and optional ``"metadata"``.
+            noise: Optional pre-sampled noise for deterministic evaluation.
+
+        Returns:
+            A single action tensor of shape ``(B, action_dim)``.
+        """
         self.eval()
 
         # Build temporal observation history if configured.
@@ -515,7 +536,22 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         delay: Tensor | None = None,
         noise: Tensor | None = None,
     ) -> Tensor:
-        """Sample actions from the policy given environment observations."""
+        """Sample a full action chunk via flow-matching inference.
+
+        Normalizes inputs, prepares all modalities (video, language, state,
+        subgoal images, metadata), and delegates to the inner model's
+        ``sample_actions`` for iterative denoising.
+
+        Args:
+            batch: Environment observation dict.
+            action_prefix: Optional previously-committed actions for real-time
+                inference with delay.
+            delay: Number of prefix action steps already committed.
+            noise: Optional pre-sampled noise for deterministic evaluation.
+
+        Returns:
+            Action chunk tensor of shape ``(B, n_action_steps, action_dim)``.
+        """
         if not (torch.compiler.is_compiling() or torch.onnx.is_in_onnx_export()):
             assert delay is None or 0 <= delay.item() <= self.config.max_delay, (
                 f"Delay must be None or between 0 and {self.config.max_delay}"
@@ -528,6 +564,8 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         state = self.prepare_state(batch)
 
         subgoal_images, subgoal_img_masks = self.prepare_subgoal_images(batch)
+
+        metadata_tokens, metadata_masks = self.prepare_metadata(batch)
 
         # Shape checks: videos must be 5D (B, T, C, H, W), state must be 3D (B, T, D).
         for vid in videos:
@@ -568,6 +606,8 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             noise=noise,
             subgoal_images=subgoal_images,
             subgoal_img_masks=subgoal_img_masks,
+            metadata_tokens=metadata_tokens,
+            metadata_masks=metadata_masks,
         )
 
         action_feature = self.config.action_feature
@@ -582,7 +622,19 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
     def forward(
         self, batch: dict[str, Tensor], noise: Tensor | None = None, time: Tensor | None = None
     ) -> dict[str, Tensor]:
-        """Do a full training forward pass to compute the loss."""
+        """Training forward pass: normalize, prepare modalities, and compute losses.
+
+        Returns a dict with ``"MSE"`` (flow-matching velocity loss) and
+        ``"CE"`` (discrete action cross-entropy loss).
+
+        Args:
+            batch: Training batch dict with observations, actions, and prompts.
+            noise: Optional pre-sampled noise tensor.
+            time: Optional pre-sampled flow-matching timesteps.
+
+        Returns:
+            Dict with ``"MSE"`` and ``"CE"`` scalar loss tensors.
+        """
         batch = self.normalize_inputs(batch)
         batch["discrete_actions"] = self.normalize_discrete_actions(dict(batch))["actions"]
         batch = self.normalize_targets(batch)
@@ -597,6 +649,7 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         lang_tokens, lang_masks = self.prepare_language(batch)
         state = self.prepare_state(batch)
         subgoal_images, subgoal_masks = self.prepare_subgoal_images(batch)
+        metadata_tokens, metadata_masks = self.prepare_metadata(batch)
         discrete_actions, discrete_action_masks = self.prepare_discrete_actions(batch)
         actions = batch["actions"]
         actions_is_pad = batch.get("action_is_pad")
@@ -616,6 +669,8 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             obs_history_is_pad=obs_history_is_pad,
             subgoal_images=subgoal_images,
             subgoal_masks=subgoal_masks,
+            metadata_tokens=metadata_tokens,
+            metadata_masks=metadata_masks,
         )
 
         mse_loss = losses["MSE"]
@@ -651,7 +706,15 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         return state
 
     def prepare_discrete_actions(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
-        """Prepares discrete actions for the model by tokenizing and padding them."""
+        """Tokenize continuous actions into discrete FAST tokens and pad to fixed length.
+
+        Args:
+            batch: Batch dict containing ``"discrete_actions"`` (min-max normalized).
+
+        Returns:
+            A tuple ``(token_ids, token_masks)`` with shapes
+            ``(B, discrete_action_max_length)``.
+        """
         device = batch["discrete_actions"].device
         discrete_actions = batch["discrete_actions"].to(device="cpu", dtype=torch.float32)
         tokens = self.discrete_action_processor.__call__(discrete_actions)
@@ -733,11 +796,22 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         return videos, vid_masks
 
     def prepare_language(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
-        """Tokenize the text input."""
+        """Tokenize the language prompt into PaliGemma token IDs.
+
+        Wraps each prompt string as ``"Task: {task}<eos>"`` and pads/truncates
+        to ``prompt_max_length``.
+
+        Args:
+            batch: Batch dict containing ``"prompt"`` (list of strings).
+
+        Returns:
+            A tuple ``(lang_tokens, lang_masks)`` with shapes
+            ``(B, prompt_max_length)``.
+        """
         device = batch["state"].device
         tasks = batch["prompt"]
 
-        prompt = [f"Task: {task}<eos>Actions:" for task in tasks]
+        prompt = [f"Task: {task}<eos>" for task in tasks]
 
         tokenized_prompt = self.language_tokenizer.__call__(
             prompt,
@@ -752,22 +826,23 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
         return lang_tokens, lang_masks
 
-    def prepare_subgoal_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
-        """Apply preprocessing to the images.
+    def prepare_subgoal_images(
+        self, batch: dict[str, Tensor]
+    ) -> tuple[list[Tensor] | None, list[Tensor] | None]:
+        """Preprocess subgoal images for SigLIP embedding.
 
-        Resizes to 224x224 and padding to keep aspect ratio, and converts pixel range
-        from [0.0, 1.0] to [-1.0, 1.0] as requested by SigLIP.
+        Resizes each subgoal image to 224x224 with aspect-ratio padding and
+        converts the pixel range from ``[0, 1]`` to ``[-1, 1]`` as expected
+        by SigLIP. Missing cameras are filled with ``-1`` padding tensors up
+        to ``empty_cameras``.
 
         Args:
-            batch: Batch of data containing image tensors.
+            batch: Batch dict containing subgoal image tensors keyed by
+                entries in ``config.subgoal_image_features``.
 
         Returns:
-            A tuple containing:
-                - images: A list of processed image tensors.
-                - img_masks: A list of image mask tensors.
-
-        Raises:
-            ValueError: If no image features are present in the batch.
+            A tuple ``(subgoal_images, subgoal_img_masks)`` of lists, or
+            ``(None, None)`` if no subgoal features are present.
         """
         subgoal_images = []
         subgoal_img_masks = []
@@ -777,7 +852,8 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
         if len(present_subgoal_img_keys) == 0:
             warnings.warn(
-                f"All image features are missing from the batch. At least one expected. (batch: {batch.keys()}) (image_features:{self.config.image_features})",
+                f"All subgoal image features are missing from the batch. At least one expected. "
+                f"(batch: {batch.keys()}) (subgoal_image_features: {self.config.subgoal_image_features})",
                 stacklevel=2,
             )
             return None, None
@@ -810,29 +886,78 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
         return subgoal_images, subgoal_img_masks
 
+    def prepare_metadata(self, batch: dict[str, Tensor]) -> tuple[Tensor | None, Tensor | None]:
+        """Tokenize optional episode metadata into PaliGemma token IDs.
+
+        Wraps each metadata string as ``"Metadata: {meta}<eos>"`` and
+        pads/truncates to ``metadata_max_length``.
+
+        Args:
+            batch: Batch dict, optionally containing ``"metadata"``
+                (list of strings).
+
+        Returns:
+            A tuple ``(metadata_tokens, metadata_masks)`` with shapes
+            ``(B, metadata_max_length)``, or ``(None, None)`` if metadata
+            is absent.
+        """
+        if "metadata" not in batch:
+            return None, None
+
+        if batch["metadata"] is None:
+            return None, None
+
+        device = batch["state"].device
+        metadata = batch["metadata"]
+
+        metadata = [f"Metadata: {meta}<eos>" for meta in metadata]
+
+        tokenized_metadata = self.language_tokenizer.__call__(
+            metadata,
+            padding="max_length",
+            padding_side="right",
+            max_length=self.config.metadata_max_length,
+            return_tensors="pt",
+            truncation=True,
+        )
+        metadata_tokens = tokenized_metadata["input_ids"].to(device=device)
+        metadata_masks = tokenized_metadata["attention_mask"].to(device=device, dtype=torch.bool)
+
+        return metadata_tokens, metadata_masks
+
 
 # Flow-matching model
 class PI07LowLevelPlannerFlowMatching(nn.Module):
-    """π05 Mem: A Vision-Language-Action Flow Model with V-JEPA2 video encoding
-    and temporal state sequences.
+    """π07 Low-Level Planner: flow-matching action generation with Knowledge Insulation.
 
-    ┌──────────────────────────────────────────┐
-    │                   actions                │
-    │                   ▲                      │
-    │                  ┌┴─────┐                │
-    │      kv cache    │Gemma │                │
-    │      ┌──────────►│Expert│                │
-    │      │           │      │                │
-    │     ┌┴─────────┐ │x 10  │                │
-    │     │          │ └▲─────┘                │
-    │     │PaliGemma │  │                      │
-    │     │          │  noise                  │
-    │     └▲──▲──▲──▲                          │
-    │      │  │  │  └── discrete actions       │
-    │      │  │  └───── state (T tokens)       │
-    │      │  └──────── language tokens        │
-    │      └─────────── video (V-JEPA2)        │
-    └──────────────────────────────────────────┘
+    Architecture overview::
+
+        ┌──────────────────────────────────────────────┐
+        │                   actions                    │
+        │                   ▲                          │
+        │                  ┌┴─────┐                    │
+        │      kv cache    │Gemma │  (detached)        │
+        │      ┌──────────►│Expert│                    │
+        │      │           │      │                    │
+        │     ┌┴─────────┐ │x 10  │                    │
+        │     │          │ └▲─────┘                    │
+        │     │PaliGemma │  │                          │
+        │     │  (VLM)   │  noise                      │
+        │     └▲──▲──▲──▲──▲──▲──▲                     │
+        │      │  │  │  │  │  │  └── discrete actions  │
+        │      │  │  │  │  │  └───── metadata tokens   │
+        │      │  │  │  │  └──────── subgoal images    │
+        │      │  │  │  └─────────── state (T tokens)  │
+        │      │  │  └────────────── language tokens   │
+        │      │  └───────────────── video (V-JEPA2)   │
+        │      └──────────────────── video (V-JEPA2)   │
+        └──────────────────────────────────────────────┘
+
+    The VLM processes all prefix tokens (video, language, state, subgoal
+    images, metadata, discrete actions). The action expert receives the
+    prefix KV-cache (detached for Knowledge Insulation) together with
+    noisy continuous actions and flow-matching timestep embeddings to
+    predict the velocity field.
     """
 
     def __init__(self, config: PI07lowlevelPlannerConfig, discrete_action_vocab_size: int | None = None):
@@ -929,24 +1054,48 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         obs_history_is_pad: Tensor | None = None,
         subgoal_images: list[Tensor] | None = None,
         subgoal_img_masks: list[Tensor] | None = None,
+        metadata_tokens: Tensor | None = None,
+        metadata_masks: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """Embed videos with V-JEPA2, language tokens with embedding layer, and
-        temporal state via per-timestep learned projection.
+        """Embed all prefix modalities and build the 1-D attention pattern.
+
+        Concatenation order:
+        ``[video_0 | ... | video_N | language | state | subgoal_img_0 | ... |
+        metadata | discrete_actions]``
+
+        Attention pattern (via ``att_masks``):
+            - Video tokens: bidirectional (``0``).
+            - Language tokens: bidirectional (``0``).
+            - State tokens: bidirectional (``0``) with video and language.
+            - Subgoal image tokens: new bidirectional block per camera
+              (``[1, 0, …, 0]``), can see all earlier tokens.
+            - Metadata tokens: new bidirectional block (``[1, 0, …, 0]``).
+            - Discrete action tokens: causal (``1`` each).
 
         Args:
-            videos: List of video tensors, each (B, T, C, H, W).
-            vid_masks: List of video mask tensors, each (B,).
-            lang_tokens: Language token tensor.
-            lang_masks: Language mask tensor.
-            state: Temporal state tensor of shape (B, T, max_state_dim).
-            discrete_actions: Optional discrete action tensor.
-            discrete_action_masks: Optional discrete action mask tensor.
-            obs_history_is_pad: Optional bool tensor (B, T) from the dataloader.
-                True for padded (clamped) timesteps, False for real ones.
-                Used to mask state tokens during training; None during inference.
+            videos: List of video tensors, each ``(B, T, C, H, W)``.
+            vid_masks: List of boolean masks, each ``(B,)``.
+            lang_tokens: Language token IDs ``(B, prompt_max_length)``.
+            lang_masks: Boolean mask for language tokens.
+            state: Temporal state ``(B, T, max_state_dim)``.
+            discrete_actions: Optional FAST token IDs
+                ``(B, discrete_action_max_length)``. Provided during training.
+            discrete_action_masks: Boolean mask for discrete actions.
+            obs_history_is_pad: Optional ``(B, T)`` bool tensor; ``True`` for
+                padded timesteps. Used to mask state tokens during training.
+            subgoal_images: Optional list of subgoal image tensors
+                ``(B, C, H, W)``.
+            subgoal_img_masks: Optional list of boolean masks ``(B,)``.
+            metadata_tokens: Optional metadata token IDs
+                ``(B, metadata_max_length)``.
+            metadata_masks: Optional boolean mask for metadata tokens.
 
         Returns:
-            (embs, pad_masks, att_masks) tuple.
+            A tuple ``(embs, pad_masks, att_masks)`` where:
+                - embs: ``(B, total_seq_len, D)``
+                - pad_masks: ``(B, total_seq_len)``
+                - att_masks: ``(B, total_seq_len)`` for
+                  :func:`make_att_2d_masks`.
         """
         embs = []
         pad_masks = []
@@ -1007,7 +1156,15 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
                 pad_masks.append(subgoal_img_mask)
 
                 # Create attention masks so that image tokens attend to each other
-                att_masks += [0] * num_subgoal_img_embs
+                att_masks += [1] + [0] * (num_subgoal_img_embs - 1)
+
+        if metadata_tokens is not None:
+            metadata_emb = self.paligemma_with_expert.embed_language_tokens(metadata_tokens)
+            metadata_emb_dim = metadata_emb.shape[-1]
+            metadata_emb = metadata_emb * math.sqrt(metadata_emb_dim)
+            embs.append(metadata_emb)
+            pad_masks.append(metadata_masks)
+            att_masks += [1] + [0] * (metadata_emb.shape[1] - 1)
 
         if discrete_actions is not None:
             discrete_action_emb = self.paligemma_with_expert.embed_discrete_actions(discrete_actions)
@@ -1023,7 +1180,23 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         return embs, pad_masks, att_masks
 
     def embed_suffix(self, noisy_actions: Tensor, timestep: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Embed noisy_actions, timestep to prepare for Expert Gemma processing."""
+        """Embed noisy actions and flow-matching timestep for the action expert.
+
+        Projects actions through ``action_in_proj`` and computes an
+        adaRMS-style conditioning vector from sinusoidal timestep embeddings
+        via a two-layer MLP.  The suffix forms a single bidirectional block
+        (``att_masks = [1, 0, …, 0]``).
+
+        Args:
+            noisy_actions: ``(B, chunk_size, max_action_dim)`` noisy action
+                tensor at the current flow-matching timestep.
+            timestep: ``(B, chunk_size)`` per-step timestep values.
+
+        Returns:
+            A tuple ``(embs, pad_masks, att_masks, adarms_cond)`` where
+            ``adarms_cond`` is the conditioning vector for adaptive RMSNorm
+            in the Gemma expert layers.
+        """
         embs = []
         pad_masks = []
         att_masks = []
@@ -1079,8 +1252,41 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         obs_history_is_pad: Tensor | None = None,
         subgoal_images: list[Tensor] | None = None,
         subgoal_img_masks: list[Tensor] | None = None,
+        metadata_tokens: Tensor | None = None,
+        metadata_masks: Tensor | None = None,
     ) -> dict[str, Tensor]:
-        """Do a full training forward pass and compute the loss."""
+        """Training forward pass: embed all modalities and compute losses.
+
+        Runs the VLM on the prefix (video, language, state, subgoal images,
+        metadata, discrete actions), then the action expert on the noisy
+        action suffix.  Returns both the flow-matching MSE loss and the
+        discrete-action cross-entropy loss.
+
+        The VLM's KV-cache is detached before being passed to the action
+        expert (Knowledge Insulation).
+
+        Args:
+            videos: List of video tensors ``(B, T, C, H, W)``.
+            vid_masks: List of boolean masks ``(B,)``.
+            lang_tokens: Language token IDs ``(B, prompt_max_length)``.
+            lang_masks: Boolean mask for language tokens.
+            state: Temporal state ``(B, T, max_state_dim)``.
+            actions: Ground-truth continuous actions ``(B, chunk_size, max_action_dim)``.
+            actions_is_pad: Optional ``(B, chunk_size)`` bool mask for padded actions.
+            noise: Optional pre-sampled noise.
+            time: Optional pre-sampled flow-matching timesteps.
+            discrete_actions: Optional FAST token IDs.
+            discrete_action_masks: Optional mask for discrete actions.
+            obs_history_is_pad: Optional ``(B, T)`` mask for padded frames.
+            subgoal_images: Optional list of subgoal image tensors.
+            subgoal_img_masks: Optional list of masks.
+            metadata_tokens: Optional metadata token IDs.
+            metadata_masks: Optional mask for metadata tokens.
+
+        Returns:
+            Dict with ``"MSE"`` (flow-matching loss) and ``"CE"``
+            (discrete action loss) scalar tensors.
+        """
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             videos,
             vid_masks,
@@ -1092,6 +1298,8 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             obs_history_is_pad=obs_history_is_pad,
             subgoal_images=subgoal_images,
             subgoal_img_masks=subgoal_img_masks,
+            metadata_tokens=metadata_tokens,
+            metadata_masks=metadata_masks,
         )
 
         vlm_2d_attention_mask = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
@@ -1212,8 +1420,34 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         noise: Tensor | None = None,
         subgoal_images: list[Tensor] | None = None,
         subgoal_img_masks: list[Tensor] | None = None,
+        metadata_tokens: Tensor | None = None,
+        metadata_masks: Tensor | None = None,
     ) -> Tensor:
-        """Do a full inference forward and compute the action."""
+        """Inference: iteratively denoise to produce a continuous action chunk.
+
+        Embeds the prefix (without discrete actions), caches the VLM KV
+        states, then runs ``num_steps`` denoising iterations through the
+        action expert. Prefix action steps (up to ``delay``) are held fixed
+        from ``action_prefix``.
+
+        Args:
+            videos: List of video tensors ``(B, T, C, H, W)``.
+            vid_masks: List of boolean masks ``(B,)``.
+            lang_tokens: Language token IDs ``(B, prompt_max_length)``.
+            lang_masks: Boolean mask for language tokens.
+            state: Temporal state ``(B, T, max_state_dim)``.
+            action_prefix: Previously committed actions
+                ``(B, chunk_size, max_action_dim)`` (zero-padded beyond delay).
+            delay: Scalar tensor indicating how many prefix steps are fixed.
+            noise: Optional pre-sampled noise.
+            subgoal_images: Optional list of subgoal image tensors.
+            subgoal_img_masks: Optional list of masks.
+            metadata_tokens: Optional metadata token IDs.
+            metadata_masks: Optional mask for metadata tokens.
+
+        Returns:
+            Denoised action chunk ``(B, chunk_size, max_action_dim)``.
+        """
         bsize = lang_tokens.shape[0]
         device = lang_tokens.device
 
@@ -1222,7 +1456,15 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            videos, vid_masks, lang_tokens, lang_masks, state, subgoal_images, subgoal_img_masks
+            videos,
+            vid_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            subgoal_images=subgoal_images,
+            subgoal_img_masks=subgoal_img_masks,
+            metadata_tokens=metadata_tokens,
+            metadata_masks=metadata_masks,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -1269,7 +1511,22 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         x_t: Tensor,
         time: Tensor,
     ) -> Tensor:
-        """Apply one denoising step."""
+        """Run one action-expert forward pass to predict the velocity field.
+
+        Embeds the suffix (noisy actions + timestep), constructs the
+        cross-attention mask to the cached prefix, and runs the Gemma
+        expert to produce the predicted velocity ``v_t``.
+
+        Args:
+            prefix_pad_masks: ``(B, prefix_len)`` padding mask from the
+                prefix pass (used for cross-attention masking).
+            past_key_values: Cached KV states from the VLM prefix pass.
+            x_t: Current noisy actions ``(B, chunk_size, max_action_dim)``.
+            time: Per-step timestep ``(B, chunk_size)``.
+
+        Returns:
+            Predicted velocity ``(B, n_action_steps, max_action_dim)``.
+        """
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
 
         num_cross_att_tokens = prefix_pad_masks.shape[1]
