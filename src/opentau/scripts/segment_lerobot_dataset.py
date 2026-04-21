@@ -192,12 +192,42 @@ def _trim_video_segment(src_video_path: Path, dst_video_path: Path, start_frame:
 
 
 def _trim_video_segment_job(task: tuple[Path, Path, int, int]) -> None:
-    """Worker entry for parallel ffmpeg (ThreadPoolExecutor)."""
+    """Run a single ffmpeg trim as a worker callable for ``ThreadPoolExecutor``.
+
+    This is a thin adapter around :func:`_trim_video_segment` that unpacks a
+    4-tuple task, so the trim calls can be submitted to a pool without
+    capturing local variables from the main loop.
+
+    Args:
+        task: A tuple ``(src_video_path, dst_video_path, start_frame, end_frame)``
+            describing one trim job. ``start_frame`` is inclusive and
+            ``end_frame`` is exclusive, matching the source parquet indexing.
+
+    Raises:
+        RuntimeError: Propagated from :func:`_trim_video_segment` if the
+            underlying ffmpeg process returns a non-zero exit code.
+    """
     src_video_path, dst_video_path, start_frame, end_frame = task
     _trim_video_segment(src_video_path, dst_video_path, start_frame, end_frame)
 
 
 def _ffmpeg_trim_max_workers() -> int:
+    """Return the worker count for parallel ffmpeg trimming.
+
+    The value is resolved in this order:
+
+    1. If the environment variable ``TUNER_FFMPEG_MAX_WORKERS`` is set to an
+       integer in the closed range ``[1, 64]``, that value is used. Values
+       outside the range or non-integer values are silently ignored.
+    2. Otherwise, fall back to ``min(16, (os.cpu_count() or 4) * 2)``. The
+       ``* 2`` over-subscription is intentional because each worker spends
+       most of its time waiting on an external ffmpeg subprocess (I/O bound),
+       and the hard cap of 16 prevents thrashing on large machines.
+
+    Returns:
+        The number of threads to use in the ``ThreadPoolExecutor`` that
+        dispatches ffmpeg trim jobs. Guaranteed to be at least ``1``.
+    """
     raw = os.environ.get("TUNER_FFMPEG_MAX_WORKERS", "").strip()
     if raw.isdigit():
         v = int(raw)
