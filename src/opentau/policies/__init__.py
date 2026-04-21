@@ -26,4 +26,7 @@ from .pi05_mem.configuration_pi05 import PI05MemConfig as PI05MemConfig
 from .pi07_paligemma.high_level_planner.configuration_pi07_high_level import (
     PI07HighLevelPlannerConfig as PI07HighLevelPlannerConfig,
 )
+from .pi07_paligemma.low_level_planner.configuration_pi07_low_level import (
+    PI07lowlevelPlannerConfig as PI07lowlevelPlannerConfig,
+)
 from .value.configuration_value import ValueConfig as ValueConfig
