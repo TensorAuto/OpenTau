@@ -115,11 +115,12 @@ Optional Standard-Format Keys
 On top of the core fields above, ``__getitem__`` emits several *optional*
 keys when the dataset has been enriched with segment metadata (see
 :doc:`tutorials/attach_metadata`) or for the subgoal images sampled from
-future video frames. Each optional key is **always present**: when its
-underlying annotation is missing, or when training-time dropout masks
-it, the value is zero / empty and a parallel ``{key}_is_pad`` boolean
-flag is set to ``True``. This lets the default PyTorch collate handle
-the keys without special cases.
+future video frames. Each optional key is **always present**. Numeric
+and image keys pair with an ``{key}_is_pad`` boolean flag — zero-filled
++ flag True means "unavailable or masked". String keys
+(``response``, ``memory``, ``next_memory``) don't get a separate flag:
+the empty string ``""`` is itself the pad signal, which also keeps the
+default PyTorch collate happy (list of strings, same length as batch).
 
 .. code-block:: python
 
@@ -127,10 +128,11 @@ the keys without special cases.
         # ... core keys above ...
 
         "memory": str,             # Cumulative subtask summary for the current frame's segment.
-        "memory_is_pad": bool,     # True when memory_raw is absent (legacy / unannotated dataset).
-        "next_memory": str,        # Memory string for frame t+1 (same as `memory` within a segment,
-                                   # differs at segment boundaries). Clipped at episode end.
-        "next_memory_is_pad": bool,
+                                   # Empty string ("") when memory_raw is absent
+                                   # (legacy / unannotated dataset).
+        "next_memory": str,        # Memory string for frame t+1 (same as `memory` within a
+                                   # segment, differs at segment boundaries). Clipped at episode
+                                   # end. Empty string when unavailable.
 
         "speed": torch.LongTensor,     # Scalar; episode length in frames rounded to the nearest multiple of
                                        # 500 (so short <250-frame episodes bucket to 0). Populated
@@ -157,13 +159,23 @@ the keys without special cases.
                                               # all present (annotated dataset, not dropped this step) or
                                               # all padded (legacy dataset, or `subgoal_drop_prob` fired).
 
-        "response_is_pad": torch.BoolTensor,  # response may be masked to the empty string at training time.
+        # `response` (already in the core fields) may be replaced with ""
+        # when `response_drop_prob` fires — consumers read "" as masked,
+        # same convention as `memory` / `next_memory`.
     }
 
 Subgoals are always rank-3 ``(3, H, W)`` regardless of
 ``n_obs_history`` — they represent a single future target frame, not a
 temporal window. All camera slots share a single ``subgoal_is_pad``
 flag because subgoals are all-or-none.
+
+Subgoal image **paths** are read from ``meta/info.json`` under the
+``subgoals`` key. When the key is absent (the state of every LeRobot
+dataset today), ``_load_subgoal_frames`` returns ``{}`` and every
+``subgoalK`` tensor comes out zero-filled with ``subgoal_is_pad=True``.
+Datasets opt in to subgoals by adding the key; the loader then uses the
+frame-selection machinery (end-of-segment vs. uniform ``[t, t+4 s]``)
+described below.
 
 Training-time dropout
 ^^^^^^^^^^^^^^^^^^^^^

@@ -376,7 +376,11 @@ def test_attach_metadata_end_to_end_droid_100(tmp_path, dataset_config, train_pi
     ds = make_dataset(dataset_config, train_pipeline_config)
     item = ds[0]
 
-    for k in ("memory", "next_memory", "speed", "mistake", "quality"):
+    # String keys use "" as the pad signal, so they have no companion flag.
+    for k in ("memory", "next_memory"):
+        assert k in item, f"missing {k}"
+        assert f"{k}_is_pad" not in item
+    for k in ("speed", "mistake", "quality"):
         assert k in item, f"missing {k}"
         assert f"{k}_is_pad" in item
     for k in range(ds.num_cams):

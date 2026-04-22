@@ -120,10 +120,11 @@ class TestLegacyNoAnnotations:
         ds = _DummyBaseDataset()
         standard_item = _prepopulate_standard_item(ds)
         ds._emit_optional_keys({}, standard_item)
+        # String keys use "" as the pad signal — no separate flag.
         for k in ("memory", "next_memory"):
             assert k in standard_item
             assert standard_item[k] == ""
-            assert standard_item[f"{k}_is_pad"].item() is True
+            assert f"{k}_is_pad" not in standard_item
         for k in ("speed", "mistake", "quality"):
             assert k in standard_item
             assert standard_item[f"{k}_is_pad"].item() is True
@@ -144,10 +145,12 @@ class TestAllProbsZero:
         raw = _raw_item(ds)
         ds._emit_optional_keys(raw, standard_item)
 
+        # String keys: populated value means "not padded".
         assert standard_item["memory"] == "current_mem"
-        assert standard_item["memory_is_pad"].item() is False
         assert standard_item["next_memory"] == "next_mem"
-        assert standard_item["next_memory_is_pad"].item() is False
+        # No memory_is_pad / next_memory_is_pad flags — empty-string IS the pad signal.
+        assert "memory_is_pad" not in standard_item
+        assert "next_memory_is_pad" not in standard_item
 
         assert standard_item["speed"].item() == 1500
         assert standard_item["speed_is_pad"].item() is False
@@ -164,7 +167,9 @@ class TestAllProbsZero:
             assert standard_item[f"subgoal{k}"].max().item() <= 1.0 + 1e-6
         assert standard_item["subgoal_is_pad"].item() is False
 
-        assert standard_item["response_is_pad"].item() is False
+        # Response not dropped → unchanged (no separate response_is_pad flag).
+        assert standard_item["response"] == "hello"
+        assert "response_is_pad" not in standard_item
 
 
 # Force each probability to 1.0 individually.
@@ -222,15 +227,17 @@ class TestForcedDropouts:
         # Simulate the upstream subgoal drop.
         item = {k: v for k, v in _raw_item(ds).items() if not k.startswith("subgoal")}
         ds._emit_optional_keys(item, standard_item)
+        # Response left intact (still the seed string, not "").
         assert standard_item["response"] == original_response
-        assert standard_item["response_is_pad"].item() is False
+        assert "response_is_pad" not in standard_item
 
     def test_response_drop_masks_when_subgoals_present(self):
         ds = _DummyBaseDataset(subgoal_drop_prob=0.0, response_drop_prob=1.0)
         standard_item = _prepopulate_standard_item(ds)
         ds._emit_optional_keys(_raw_item(ds), standard_item)
+        # "" is the pad signal; no separate response_is_pad flag.
         assert standard_item["response"] == ""
-        assert standard_item["response_is_pad"].item() is True
+        assert "response_is_pad" not in standard_item
 
     def test_metadata_drop_all_masks_three_fields(self):
         ds = _DummyBaseDataset(metadata_drop_all_prob=1.0, metadata_drop_each_prob=0.0)
@@ -275,9 +282,9 @@ class TestDropoutDisabled:
         assert standard_item["obs_history_is_pad"].any().item() is False
         # Subgoals kept (raw tensors resize through, is_pad=False).
         assert standard_item["subgoal_is_pad"].item() is False
-        # Response kept.
+        # Response kept — still the seed string, not masked to "".
         assert standard_item["response"] == original_response
-        assert standard_item["response_is_pad"].item() is False
+        assert "response_is_pad" not in standard_item
         # Metadata kept.
         for k in ("speed", "mistake", "quality"):
             assert standard_item[f"{k}_is_pad"].item() is False
@@ -311,6 +318,7 @@ class TestDropoutDisabled:
             video_keys=["camera0"],
             episodes={0: {"segments": [0]}},
             fps=30,
+            info={"subgoals": {"subgoal0": "camera0"}},  # opt in to subgoal loading
         )
         monkeypatch.setattr(type(ds), "_get_feature_mapping_key", lambda self: mapping_key)
 
@@ -357,6 +365,7 @@ class TestDropoutDisabled:
             video_keys=["camera0"],
             episodes={0: {"segments": [0]}},
             fps=30,
+            info={"subgoals": {"subgoal0": "camera0"}},  # opt in so the drop path is exercised
         )
         monkeypatch.setattr(type(ds), "_get_feature_mapping_key", lambda self: mapping_key)
 
@@ -367,6 +376,41 @@ class TestDropoutDisabled:
 
         out = ds._load_subgoal_frames(0, 0)
         assert out == {}, "drop should return an empty dict and skip decoding"
+
+    def test_missing_subgoals_key_in_info_returns_empty(self, monkeypatch):
+        """Default state: info.json has no ``subgoals`` key, so no subgoals load."""
+        from types import SimpleNamespace
+
+        import numpy as _np
+
+        import opentau.datasets.lerobot_dataset as _ld
+
+        mapping_key = "_tests/subgoal_missing_info_key"
+        _ld.DATA_FEATURES_NAME_MAPPING[mapping_key] = {"camera0": "camera0"}
+
+        ds = _ld.LeRobotDataset.__new__(_ld.LeRobotDataset)
+        ds.enable_optional_key_dropout = False
+        ds.subgoal_end_of_segment_prob = 1.0
+        ds.subgoal_drop_prob = 0.0
+        ds.num_cams = 1
+        ds.resolution = (8, 8)
+        ds.episode_lengths = {0: 100}
+        ds.segment_starts_by_episode = {0: _np.array([0])}
+        # No "subgoals" key in info — mirrors every production LeRobot dataset today.
+        ds.meta = SimpleNamespace(
+            video_keys=["camera0"],
+            episodes={0: {"segments": [0]}},
+            fps=30,
+            info={},
+        )
+        monkeypatch.setattr(type(ds), "_get_feature_mapping_key", lambda self: mapping_key)
+
+        def _fail_query_videos(self, query_ts, ep_idx):
+            raise AssertionError("_query_videos must not be called when info has no 'subgoals'")
+
+        monkeypatch.setattr(type(ds), "_query_videos", _fail_query_videos)
+
+        assert ds._load_subgoal_frames(0, 0) == {}
 
 
 # Default collate tolerates a batch with mixed _is_pad flags.

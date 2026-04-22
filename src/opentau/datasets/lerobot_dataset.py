@@ -824,8 +824,10 @@ class BaseDataset(torch.utils.data.Dataset):
         """Emit optional memory/subgoal/metadata keys with training-time dropout.
 
         All emitted keys are always present (zero/empty-filled when absent or
-        masked) with a parallel ``{key}_is_pad`` bool, so the default PyTorch
-        collate handles them without special casing.
+        masked). Numeric / image keys come with a parallel ``{key}_is_pad``
+        bool; string keys (``response``, ``memory``, ``next_memory``) use the
+        empty string itself as the pad signal — a consumer seeing ``""`` can
+        assume the field was unavailable or was masked this step.
 
         Dropout order:
             1. ``history_state_drop_prob``: zero ``state`` and historical camera
@@ -833,7 +835,7 @@ class BaseDataset(torch.utils.data.Dataset):
             2. ``subgoal_drop_prob``: zero every ``subgoalK`` and set the
                single ``subgoal_is_pad`` flag to True (subgoals are all-or-none).
             3. ``response_drop_prob``: only when subgoals were NOT dropped, mask
-               ``response`` (empty string).
+               ``response`` to the empty string.
             4. ``metadata_drop_all_prob``: mask {speed, mistake, quality}
                together. If this didn't fire, ``metadata_drop_each_prob`` rolls
                independently for each of the three.
@@ -844,8 +846,8 @@ class BaseDataset(torch.utils.data.Dataset):
             item: Raw item dict (may include ``memory_raw``, ``next_memory_raw``,
                 ``speed_raw``, ``mistake_raw``, ``quality_raw``, and
                 ``subgoalK_raw`` tensors for K in ``[0, num_cams)``). Missing
-                entries are treated as zero-filled legacy fields and get
-                ``_is_pad=True``.
+                numeric/image entries produce zero + ``_is_pad=True``. Missing
+                string entries produce the empty string.
             standard_item: Output dict populated by :meth:`_to_standard_data_format`.
                 Mutated in place.
         """
@@ -895,22 +897,17 @@ class BaseDataset(torch.utils.data.Dataset):
         standard_item["subgoal_is_pad"] = torch.tensor(pad_subgoals)
 
         # (3) Response drop — only rolled when subgoals are actually present
-        # (dropping both would remove the primary task signal at once).
+        # (dropping both would remove the primary task signal at once). No
+        # separate ``response_is_pad`` flag: an empty string IS the pad signal.
         if not pad_subgoals and _roll(self.response_drop_prob):
             standard_item["response"] = ""
-            standard_item["response_is_pad"] = torch.tensor(True)
-        else:
-            standard_item["response_is_pad"] = torch.tensor(False)
 
-        # (4) Memory pass-through (no drop probability). Pad flag reflects
-        # whether the underlying raw field was supplied at all — legacy datasets
-        # without an annotation pass will see empty strings + is_pad=True.
+        # (4) Memory pass-through (no drop probability). No separate pad flag —
+        # consumers treat an empty string as "no memory available".
         memory_raw = item.get("memory_raw")
         standard_item["memory"] = memory_raw if isinstance(memory_raw, str) else ""
-        standard_item["memory_is_pad"] = torch.tensor(memory_raw is None)
         next_memory_raw = item.get("next_memory_raw")
         standard_item["next_memory"] = next_memory_raw if isinstance(next_memory_raw, str) else ""
-        standard_item["next_memory_is_pad"] = torch.tensor(next_memory_raw is None)
 
         # (5) Metadata drops.
         drop_meta_all = _roll(self.metadata_drop_all_prob)
@@ -1263,14 +1260,6 @@ class LeRobotDataset(BaseDataset):
         episode_indices = np.asarray(no_transform_ds["episode_index"], dtype=np.int64)
         ep_data_index_np = {k: t.numpy() for k, t in self.episode_data_index.items()}
         check_timestamps_sync(timestamps, episode_indices, ep_data_index_np, self.fps, self.tolerance_s)
-
-        # Subgoal images attached from a dedicated subfolder are a future feature;
-        # for now we refuse to silently ignore one so users can't be confused by
-        # stale subgoals that don't influence the loaded sample.
-        assert not (self.root / "subgoals").is_dir(), (
-            f"'subgoals/' subfolder found at {self.root / 'subgoals'}. Loading subgoals "
-            "from disk is not implemented yet; please remove or rename the folder."
-        )
 
         # Per-episode caches used by the optional-key emission path. Populated
         # from meta/episodes.jsonl annotations when present, else filled with
@@ -1694,25 +1683,29 @@ class LeRobotDataset(BaseDataset):
     def _load_subgoal_frames(self, ep_idx: int, frame_in_ep: int) -> dict[str, torch.Tensor]:
         """Decode subgoal frames — one per camera slot — for this sample.
 
-        The at-end-of-segment vs uniform sampling roll happens ONCE per
-        ``__getitem__`` call (shared across all camera slots); each slot decodes
-        the frame from its own video. Missing camera slots are skipped (the
-        resulting ``subgoalK`` is zero-filled and marked ``_is_pad=True`` by
-        :meth:`BaseDataset._emit_optional_keys`).
+        Subgoal image paths must be declared in ``meta/info.json`` under the
+        ``subgoals`` key. When the key is missing (the state of every
+        LeRobot dataset today), we assume no subgoal images exist and return
+        ``{}``; :meth:`BaseDataset._emit_optional_keys` then emits
+        ``subgoal_is_pad=True`` for every slot. Datasets opt in by adding
+        the key to info.json.
 
-        Drop-roll is short-circuited here (not in :meth:`_emit_optional_keys`)
-        so a dropped subgoal skips the per-camera ``_query_videos`` decode.
-        When ``self.enable_optional_key_dropout`` is False (e.g. the validation
-        subset), drop is never rolled — the frame-selection randomness stays
-        live because it's about which future frame to read, not masking.
-
-        Legacy datasets whose ``episodes.jsonl`` has no ``segments`` entry
-        (i.e. were never passed through :mod:`opentau.scripts.attach_metadata`)
-        skip sampling entirely — the emitted subgoals are zero-filled with
-        ``_is_pad=True``. This keeps legacy ``__getitem__`` deterministic and
-        avoids unnecessary video decoding.
+        When the key IS present:
+        - The at-end-of-segment vs uniform sampling roll happens ONCE per
+          ``__getitem__`` call (shared across all camera slots); each slot
+          decodes the frame from its own video.
+        - Drop-roll is short-circuited here so a dropped subgoal skips the
+          per-camera ``_query_videos`` decode. When
+          ``self.enable_optional_key_dropout`` is False (e.g. the validation
+          subset), drop is never rolled — the frame-selection randomness
+          stays live because it's about which future frame to read, not
+          masking.
+        - Episodes with no ``segments`` entry in ``episodes.jsonl`` still
+          skip sampling (no segment boundaries → nothing to clip against).
         """
         if self.num_cams <= 0 or len(self.meta.video_keys) == 0:
+            return {}
+        if "subgoals" not in self.meta.info:
             return {}
         if "segments" not in self.meta.episodes[ep_idx]:
             return {}
