@@ -144,17 +144,19 @@ the keys without special cases.
         "subgoal0": torch.Tensor,       # shape (3, H, W), values in [0,1]. A single future frame from
                                         # camera0 sampled either at end-of-segment (with probability
                                         # `subgoal_end_of_segment_prob`) or uniformly in [t, t+4 seconds].
-        "subgoal0_is_pad": torch.BoolTensor,
         # ...
         "subgoal{num_cams-1}": torch.Tensor,
-        "subgoal{num_cams-1}_is_pad": torch.BoolTensor,
+        "subgoal_is_pad": torch.BoolTensor,   # Single flag covering every `subgoalK`. Subgoals are either
+                                              # all present (annotated dataset, not dropped this step) or
+                                              # all padded (legacy dataset, or `subgoal_drop_prob` fired).
 
         "response_is_pad": torch.BoolTensor,  # response may be masked to the empty string at training time.
     }
 
 Subgoals are always rank-3 ``(3, H, W)`` regardless of
 ``n_obs_history`` — they represent a single future target frame, not a
-temporal window.
+temporal window. All camera slots share a single ``subgoal_is_pad``
+flag because subgoals are all-or-none.
 
 Training-time dropout
 ^^^^^^^^^^^^^^^^^^^^^
@@ -178,9 +180,9 @@ for reproducibility.
      - Zero-fills ``state`` and historical camera frames (when
        ``n_obs_history > 1``); sets ``obs_history_is_pad`` all True.
    * - ``subgoal_drop_prob``
-     - ``0.25``
-     - Zero-fills every ``subgoal{K}`` image and sets each
-       ``subgoal{K}_is_pad=True``.
+     - ``0.75``
+     - Zero-fills every ``subgoal{K}`` image together and sets the single
+       shared ``subgoal_is_pad`` flag to True.
    * - ``subgoal_end_of_segment_prob``
      - ``0.25``
      - Probability that a *present* subgoal is sourced from the end of

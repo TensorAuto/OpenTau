@@ -130,7 +130,7 @@ class TestLegacyNoAnnotations:
             assert f"subgoal{k}" in standard_item
             assert standard_item[f"subgoal{k}"].shape == (3, *ds.resolution)
             assert standard_item[f"subgoal{k}"].abs().max().item() == 0.0
-            assert standard_item[f"subgoal{k}_is_pad"].item() is True
+        assert standard_item["subgoal_is_pad"].item() is True
 
 
 # All-probabilities-zero path: every annotated field flows through.
@@ -156,12 +156,12 @@ class TestAllProbsZero:
         assert standard_item["quality_is_pad"].item() is False
 
         for k in range(ds.num_cams):
-            assert standard_item[f"subgoal{k}_is_pad"].item() is False
             # The raw 0.5 tensor should be resize_with_pad'd to the target
             # resolution without altering the data range.
             assert standard_item[f"subgoal{k}"].shape == (3, *ds.resolution)
             assert 0.0 <= standard_item[f"subgoal{k}"].min().item() <= 0.5
             assert standard_item[f"subgoal{k}"].max().item() <= 1.0 + 1e-6
+        assert standard_item["subgoal_is_pad"].item() is False
 
         assert standard_item["response_is_pad"].item() is False
 
@@ -204,8 +204,8 @@ class TestForcedDropouts:
         ds = _DummyBaseDataset(subgoal_drop_prob=1.0)
         standard_item = _prepopulate_standard_item(ds)
         ds._emit_optional_keys(_raw_item(ds), standard_item)
+        assert standard_item["subgoal_is_pad"].item() is True
         for k in range(ds.num_cams):
-            assert standard_item[f"subgoal{k}_is_pad"].item() is True
             assert torch.all(standard_item[f"subgoal{k}"] == 0)
 
     def test_subgoal_drop_implies_no_response_drop(self):
@@ -270,5 +270,5 @@ class TestDefaultCollate:
         assert isinstance(batch["memory"], list)
         assert len(batch["memory"]) == 2
         # is_pad flags align 1:1 with their samples.
-        assert batch["subgoal0_is_pad"].tolist() == [False, True]
+        assert batch["subgoal_is_pad"].tolist() == [False, True]
         assert batch["quality_is_pad"].tolist() == [False, True]

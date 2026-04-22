@@ -306,17 +306,20 @@ def test_attach_metadata_end_to_end_droid_100(tmp_path, dataset_config, train_pi
         setattr(mixture, field, 0.0)
 
     # --- Download the source dataset by constructing it via make_dataset. ---
-    # The default dataset_config fixture only loads episode 0, which would make
-    # attach_metadata's full-dataset iteration fail — we download everything.
-    src_root = tmp_path / "droid_100"
+    # Use the default HF cache root (same as the other droid_100 tests) rather
+    # than a fresh tmp_path — writing into a fresh location triggers a cache
+    # re-materialization that on some CI runners sees a different ``info.json``
+    # fps and fails ``check_timestamps_sync``. We only ever READ from the source
+    # root; the modified copy goes to ``tmp_path`` below.
     dataset_config.vqa = None
     dataset_config.repo_id = "lerobot/droid_100"
-    dataset_config.root = str(src_root)
+    dataset_config.root = None
     dataset_config.revision = "v2.1"
     dataset_config.episodes = None
 
     src_ds = make_dataset(dataset_config, train_pipeline_config)
     meta = src_ds.meta
+    src_root = meta.root
     del src_ds
 
     # --- Build annotations and run the script. ---
@@ -378,8 +381,8 @@ def test_attach_metadata_end_to_end_droid_100(tmp_path, dataset_config, train_pi
         assert f"{k}_is_pad" in item
     for k in range(ds.num_cams):
         assert f"subgoal{k}" in item
-        assert f"subgoal{k}_is_pad" in item
         assert item[f"subgoal{k}"].shape == (3, *ds.resolution)
+    assert "subgoal_is_pad" in item
     assert item["speed"].item() % 500 == 0
     assert 1 <= item["quality"].item() <= 5
     # The memory column in the annotated dataset follows f"memory{frame_index}";

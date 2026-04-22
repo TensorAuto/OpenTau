@@ -146,7 +146,7 @@ class DatasetMixtureConfig:
             ``obs_history_is_pad`` to all True). Must be in ``[0, 1]``. Defaults
             to 0.3.
         subgoal_drop_prob: Probability of dropping all subgoal images during a
-            single ``__getitem__`` call. Must be in ``[0, 1]``. Defaults to 0.25.
+            single ``__getitem__`` call. Must be in ``[0, 1]``. Defaults to 0.75.
         subgoal_end_of_segment_prob: Probability of sampling the subgoal frame
             at the end of the current segment (vs. uniformly in the next 4s of
             wall-clock time). Must be in ``[0, 1]``. Defaults to 0.25.
@@ -198,7 +198,7 @@ class DatasetMixtureConfig:
 
     # Training-time dropout probabilities for optional sample keys.
     history_state_drop_prob: float = 0.3
-    subgoal_drop_prob: float = 0.25
+    subgoal_drop_prob: float = 0.75
     subgoal_end_of_segment_prob: float = 0.25
     response_drop_prob: float = 0.3
     metadata_drop_all_prob: float = 0.15

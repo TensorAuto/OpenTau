@@ -808,8 +808,8 @@ class BaseDataset(torch.utils.data.Dataset):
         Dropout order:
             1. ``history_state_drop_prob``: zero ``state`` and historical camera
                frames; mark ``obs_history_is_pad`` all True.
-            2. ``subgoal_drop_prob``: zero all ``subgoalK``; mark each
-               ``subgoalK_is_pad=True``.
+            2. ``subgoal_drop_prob``: zero every ``subgoalK`` and set the
+               single ``subgoal_is_pad`` flag to True (subgoals are all-or-none).
             3. ``response_drop_prob``: only when subgoals were NOT dropped, mask
                ``response`` (empty string).
             4. ``metadata_drop_all_prob``: mask {speed, mistake, quality}
@@ -841,26 +841,30 @@ class BaseDataset(torch.utils.data.Dataset):
             else:
                 standard_item["obs_history_is_pad"] = torch.tensor([True], dtype=torch.bool)
 
-        # (2) Subgoal drop (covers every subgoalK slot uniformly).
+        # (2) Subgoal drop. A single ``subgoal_is_pad`` flag covers every slot
+        # because subgoals are either all present (annotated) or all missing
+        # (legacy / randomly dropped) — there is no partial-availability case.
         drop_subgoal = bool(torch.rand(()) < self.subgoal_drop_prob)
+        subgoals_available = all(item.get(f"subgoal{k}_raw") is not None for k in range(self.num_cams))
+        pad_subgoals = drop_subgoal or not subgoals_available
         for k in range(self.num_cams):
-            raw_key = f"subgoal{k}_raw"
             out_key = f"subgoal{k}"
-            pad_key = f"subgoal{k}_is_pad"
-            raw = item.get(raw_key)
-            if raw is None or drop_subgoal:
+            if pad_subgoals:
                 standard_item[out_key] = torch.zeros((3, *self.resolution))
-                standard_item[pad_key] = torch.tensor(True)
             else:
                 standard_item[out_key] = self.resize_with_pad(
-                    raw, self.resolution[1], self.resolution[0], pad_value=0
+                    item[f"subgoal{k}_raw"],
+                    self.resolution[1],
+                    self.resolution[0],
+                    pad_value=0,
                 )
-                standard_item[pad_key] = torch.tensor(False)
             # Subgoals are always single-frame regardless of n_obs_history.
             self._assert_image_in_unit_range(standard_item[out_key], name=out_key, expect_temporal=False)
+        standard_item["subgoal_is_pad"] = torch.tensor(pad_subgoals)
 
-        # (3) Response drop — only when subgoals are present.
-        if not drop_subgoal and torch.rand(()) < self.response_drop_prob:
+        # (3) Response drop — only rolled when subgoals are actually present
+        # (dropping both would remove the primary task signal at once).
+        if not pad_subgoals and torch.rand(()) < self.response_drop_prob:
             standard_item["response"] = ""
             standard_item["response_is_pad"] = torch.tensor(True)
         else:

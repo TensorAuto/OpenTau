@@ -554,7 +554,7 @@ class TestDatasetMixtureOptionalKeyDropProbs:
     def test_defaults(self):
         cfg = DatasetMixtureConfig()
         assert cfg.history_state_drop_prob == pytest.approx(0.3)
-        assert cfg.subgoal_drop_prob == pytest.approx(0.25)
+        assert cfg.subgoal_drop_prob == pytest.approx(0.75)
         assert cfg.subgoal_end_of_segment_prob == pytest.approx(0.25)
         assert cfg.response_drop_prob == pytest.approx(0.3)
         assert cfg.metadata_drop_all_prob == pytest.approx(0.15)
