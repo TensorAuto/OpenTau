@@ -38,6 +38,11 @@ Usage (same launch incantation as train.py):
 Defaults to 20 warmup + 200 measured steps. ``cfg.steps`` from the training
 config is intentionally ignored (production configs set it to ~1M). To run
 longer, set ``PROFILE_STEPS=500 accelerate launch ...``.
+
+Set ``PROFILE_NO_OPTIM=1`` to skip optimizer creation and
+``optimizer.step`` / ``zero_grad`` entirely. Useful for isolating raw
+forward+backward compute cost on a single GPU (no Adam state means
+you fit a large bf16 model without ZeRO partitioning).
 """
 
 import json
@@ -122,12 +127,25 @@ def profile(cfg: TrainPipelineConfig):
 
     policy = make_policy(cfg=cfg.policy, ds_meta=train_dataset.meta)
     policy.to(torch.bfloat16)
-    optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
+
+    skip_optim = os.environ.get("PROFILE_NO_OPTIM", "0") == "1"
+    if skip_optim:
+        if accelerator.is_main_process:
+            logging.info(
+                "PROFILE_NO_OPTIM=1 set — skipping optimizer creation. "
+                "Measures forward+backward compute only, no Adam state allocated."
+            )
+        optimizer, lr_scheduler = None, None
+    else:
+        optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
 
     train_dataloader = train_dataset.get_dataloader()
-    policy, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        policy, optimizer, train_dataloader, lr_scheduler
-    )
+    if skip_optim:
+        policy, train_dataloader = accelerator.prepare(policy, train_dataloader)
+    else:
+        policy, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            policy, optimizer, train_dataloader, lr_scheduler
+        )
     train_dl_iter = cycle(train_dataloader)
 
     policy.train()
@@ -155,24 +173,31 @@ def profile(cfg: TrainPipelineConfig):
 
         # Phase 3: backward + step (lines 79-92), split into fine phases so
         # we can tell compute-bound backward apart from collective/optimizer
-        # time.
+        # time. When PROFILE_NO_OPTIM=1, skip optimizer.step / clip / zero_grad
+        # so we measure compute-only and don't need Adam state memory.
         accelerator.backward(loss)
         _sync()
         t3a = time.perf_counter()
 
-        accelerator.unscale_gradients(optimizer=optimizer)
-        if accelerator.sync_gradients:
-            accelerator.clip_grad_norm_(policy.parameters(), cfg.optimizer.grad_clip_norm)
+        if not skip_optim:
+            accelerator.unscale_gradients(optimizer=optimizer)
+            if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(policy.parameters(), cfg.optimizer.grad_clip_norm)
         _sync()
         t3b = time.perf_counter()
 
-        optimizer.step()
+        if not skip_optim:
+            optimizer.step()
         _sync()
         t3c = time.perf_counter()
 
-        optimizer.zero_grad()
-        if lr_scheduler is not None:
-            lr_scheduler.step()
+        if skip_optim:
+            for p in policy.parameters():
+                p.grad = None
+        else:
+            optimizer.zero_grad()
+            if lr_scheduler is not None:
+                lr_scheduler.step()
         _sync()
         t3 = time.perf_counter()
 
