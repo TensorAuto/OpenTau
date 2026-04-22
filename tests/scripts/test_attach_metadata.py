@@ -398,13 +398,23 @@ def test_attach_metadata_end_to_end_droid_100(tmp_path, dataset_config, train_pi
         frame = _inspect.currentframe().f_back
         self_obj = frame.f_locals.get("self")
         if self_obj is not None:
-            print(f"[diagnostic] call-site self.fps = {self_obj.fps}")
-            print(f"[diagnostic] call-site type(self.meta) = {type(self_obj.meta).__name__}")
-            print(f"[diagnostic] call-site self.meta.__class__.__module__ = {type(self_obj.meta).__module__}")
-            print(f"[diagnostic] call-site self.meta.info['fps'] = {self_obj.meta.info['fps']}")
-            print(f"[diagnostic] call-site self.meta.fps = {self_obj.meta.fps}")
-            print(f"[diagnostic] call-site id(self.meta) = {id(self_obj.meta)}")
-            print(f"[diagnostic] call-site self.meta.info id = {id(self_obj.meta.info)}")
+            print(f"[diagnostic] call-site type(self_obj) = {type(self_obj).__name__}")
+            print(
+                f"[diagnostic] call-site type(self_obj).__mro__ = {[c.__name__ for c in type(self_obj).__mro__]}"
+            )
+            print(f"[diagnostic] call-site type(self_obj).__module__ = {type(self_obj).__module__}")
+            type_fps = type(self_obj).__dict__.get("fps")
+            print(f"[diagnostic] call-site type(self_obj).__dict__['fps'] = {type_fps!r}")
+            # Walk MRO and show where fps comes from
+            for cls in type(self_obj).__mro__:
+                if "fps" in cls.__dict__:
+                    print(f"[diagnostic] MRO fps found on {cls.__name__}: {cls.__dict__['fps']!r}")
+            instance_fps = self_obj.__dict__.get("fps", "<<not in __dict__>>")
+            print(f"[diagnostic] call-site self_obj.__dict__.get('fps') = {instance_fps!r}")
+            print(f"[diagnostic] call-site self_obj.fps = {self_obj.fps}")
+            print(f"[diagnostic] call-site type(self_obj.meta) = {type(self_obj.meta).__name__}")
+            print(f"[diagnostic] call-site self_obj.meta.info['fps'] = {self_obj.meta.info['fps']}")
+            print(f"[diagnostic] call-site self_obj.meta.fps = {self_obj.meta.fps}")
         print(f"[diagnostic] check_timestamps_sync called with fps={fps}, tol={tolerance_s}")
         return orig_check(timestamps, episode_indices, ep_data_index, fps, tolerance_s, *a, **kw)
 
