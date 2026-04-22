@@ -48,12 +48,15 @@ class PI05MemConfig(PreTrainedConfig):
     so the prefix matches a single-frame VLA's 256 image tokens.
 
     Args:
-        n_obs_steps: Number of temporal video frames passed to the video
-            encoder per forward call. During training each sample has this
-            many frames; during inference the observation-history buffer
-            (controlled by ``n_obs_history`` and ``history_interval``) is
-            stacked to produce exactly this many frames.
-            Must equal ``n_obs_history`` when the latter is set.
+        n_obs_steps: Number of temporal video frames the video encoder sees
+            per forward call. During training the dataloader must be
+            configured with ``dataset_mixture.n_obs_history = n_obs_steps``;
+            during inference the observation-history buffer is stacked to
+            produce exactly ``n_obs_steps`` frames (sampled at
+            ``history_interval``).
+        history_interval: Temporal stride between stacked frames, in
+            environment steps. Defaults to None (= 1). Must match
+            ``dataset_mixture.history_interval``.
         chunk_size: Size of the action chunk. The upper bound for n_action_steps. Defaults to 50.
         n_action_steps: Number of action steps to predict. Defaults to 50.
         normalization_mapping: Mapping of feature names to normalization modes.
@@ -86,15 +89,10 @@ class PI05MemConfig(PreTrainedConfig):
     chunk_size: int = 50
     n_action_steps: int = 50
 
-    # Observation history for inference buffering.
-    # ``n_obs_history`` controls how many evenly-spaced historical frames the
-    # inference buffer keeps.  ``history_interval`` is the stride between those
-    # frames.  Together they determine ``obs_buffer_size = (n_obs_history-1) *
-    # history_interval + 1``.  Typically ``n_obs_history`` should equal
-    # ``n_obs_steps`` so the video encoder sees the same number of frames at
-    # training and inference time.
+    # Inference observation-history buffer: ``history_interval`` is the
+    # temporal stride between the ``n_obs_steps`` stacked frames. Together they
+    # determine ``obs_buffer_size = (n_obs_steps - 1) * history_interval + 1``.
     # Populated from DatasetMixtureConfig during training if unset.
-    n_obs_history: int | None = None
     history_interval: int | None = None
 
     normalization_mapping: dict[str, NormalizationMode] = field(
@@ -161,25 +159,22 @@ class PI05MemConfig(PreTrainedConfig):
     def obs_buffer_size(self) -> int:
         """Total raw frames the observation buffer must keep.
 
-        With ``n_obs_history=T`` and ``history_interval=k``, the buffer stores
+        With ``n_obs_steps=T`` and ``history_interval=k``, the buffer stores
         the most recent ``(T-1)*k + 1`` frames so that ``T`` evenly-spaced
         frames can be selected.
         """
-        if self.n_obs_history is None or self.n_obs_history <= 1:
+        if self.n_obs_steps <= 1:
             return 1
-        return (self.n_obs_history - 1) * (self.history_interval or 1) + 1
+        return (self.n_obs_steps - 1) * (self.history_interval or 1) + 1
 
     def __post_init__(self):
         """Post-initialization validation."""
         super().__post_init__()
 
-        if self.n_obs_history is not None:
-            if not isinstance(self.n_obs_history, int) or self.n_obs_history < 1:
-                raise ValueError(
-                    f"`n_obs_history` must be None or a positive integer, got {self.n_obs_history}."
-                )
-            if self.history_interval is None:
-                self.history_interval = 1
+        if not isinstance(self.n_obs_steps, int) or self.n_obs_steps < 1:
+            raise ValueError(f"`n_obs_steps` must be a positive integer, got {self.n_obs_steps}.")
+        if self.n_obs_steps > 1 and self.history_interval is None:
+            self.history_interval = 1
         if self.history_interval is not None and (
             not isinstance(self.history_interval, int) or self.history_interval < 1
         ):

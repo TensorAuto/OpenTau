@@ -198,7 +198,6 @@ def test_policy_end_to_end_cuda():
     config = PI05MemConfig(
         init_strategy="no_init",
         n_obs_steps=4,
-        n_obs_history=4,
         history_interval=1,
         chunk_size=10,
         n_action_steps=10,

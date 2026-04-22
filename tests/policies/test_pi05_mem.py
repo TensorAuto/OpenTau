@@ -35,8 +35,7 @@ class TestPI05MemConfig:
         assert config.n_obs_steps == 8
         assert config.chunk_size == 50
         assert config.n_action_steps == 50
-        assert config.n_obs_history is None
-        assert config.history_interval is None
+        assert config.history_interval == 1  # auto-set when n_obs_steps > 1
         assert config.max_state_dim == 32
         assert config.max_action_dim == 32
         assert config.spacetime_layer_stride == 4
@@ -45,26 +44,26 @@ class TestPI05MemConfig:
         with pytest.raises(ValueError, match="spacetime_layer_stride"):
             PI05MemConfig(spacetime_layer_stride=0)
 
-    def test_obs_buffer_size_no_history(self):
-        config = PI05MemConfig()
+    def test_obs_buffer_size_single_frame(self):
+        config = PI05MemConfig(n_obs_steps=1)
         assert config.obs_buffer_size == 1
 
     def test_obs_buffer_size_with_history(self):
-        config = PI05MemConfig(n_obs_history=4, history_interval=2)
+        config = PI05MemConfig(n_obs_steps=4, history_interval=2)
         assert config.obs_buffer_size == (4 - 1) * 2 + 1  # 7
 
     def test_obs_buffer_size_interval_defaults_to_1(self):
-        config = PI05MemConfig(n_obs_history=8)
+        config = PI05MemConfig(n_obs_steps=8)
         assert config.history_interval == 1
         assert config.obs_buffer_size == 8
 
-    def test_invalid_n_obs_history(self):
-        with pytest.raises(ValueError, match="n_obs_history"):
-            PI05MemConfig(n_obs_history=0)
+    def test_invalid_n_obs_steps(self):
+        with pytest.raises(ValueError, match="n_obs_steps"):
+            PI05MemConfig(n_obs_steps=0)
 
     def test_invalid_history_interval(self):
         with pytest.raises(ValueError, match="history_interval"):
-            PI05MemConfig(n_obs_history=4, history_interval=-1)
+            PI05MemConfig(n_obs_steps=4, history_interval=-1)
 
     def test_n_action_steps_exceeds_chunk_size(self):
         with pytest.raises(ValueError, match="chunk size"):
@@ -157,7 +156,7 @@ class TestBuildHistoryBatch:
         from opentau.configs.types import FeatureType, PolicyFeature
 
         policy = MagicMock()
-        policy.config = PI05MemConfig(n_obs_history=4, history_interval=1)
+        policy.config = PI05MemConfig(n_obs_steps=4, history_interval=1)
         policy.config.input_features = {
             "camera0": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224)),
         }
@@ -221,7 +220,7 @@ class TestPrepareState:
         from opentau.policies.pi05_mem.modeling_pi05 import PI05MemPolicy
 
         policy = MagicMock(spec=PI05MemPolicy)
-        policy.config = PI05MemConfig(max_state_dim=8)
+        policy.config = PI05MemConfig(max_state_dim=8, n_obs_steps=1)
         policy.prepare_state = PI05MemPolicy.prepare_state.__get__(policy)
 
         batch = {"state": torch.randn(2, 6)}
@@ -254,7 +253,7 @@ class TestPrepareState:
         from opentau.policies.pi05_mem.modeling_pi05 import PI05MemPolicy
 
         policy = MagicMock(spec=PI05MemPolicy)
-        policy.config = PI05MemConfig(max_state_dim=8, n_obs_history=4)
+        policy.config = PI05MemConfig(max_state_dim=8, n_obs_steps=4)
         policy.prepare_state = PI05MemPolicy.prepare_state.__get__(policy)
 
         batch = {"state": torch.randn(2, 6)}
@@ -271,7 +270,10 @@ class TestPrepareVideos:
         from opentau.policies.pi05_mem.modeling_pi05 import PI05MemPolicy
 
         policy = MagicMock(spec=PI05MemPolicy)
+        # Default fixture uses single-frame (n_obs_steps=1); individual tests
+        # that exercise history behavior bump n_obs_steps themselves.
         policy.config = PI05MemConfig(
+            n_obs_steps=1,
             resize_imgs_with_padding=(224, 224),
             empty_cameras=0,
         )
@@ -322,7 +324,7 @@ class TestPrepareVideos:
         assert torch.all(masks[1] == 0)
 
     def test_4d_with_history_raises(self, mock_policy):
-        mock_policy.config.n_obs_history = 4
+        mock_policy.config.n_obs_steps = 4
         batch = {"camera0": torch.randn(2, 3, 224, 224)}
         with pytest.raises(ValueError, match="Expected 5D"):
             mock_policy.prepare_videos(batch)
