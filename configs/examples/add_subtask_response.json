@@ -2,7 +2,7 @@
     "datasets": [
         {
             "repo_id": "TensorAuto/ice-lemonade",
-            "root": "/home/ashah/Documents/IceLemonade"
+            "root": "/path/to/local/dataset"
         }
     ]
 }
