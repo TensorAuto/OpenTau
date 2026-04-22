@@ -1,6 +1,6 @@
 {
   "train_micro_batch_size_per_gpu": "auto",
-  "gradient_accumulation_steps": "auto",
+  "gradient_accumulation_steps": 1,
   "gradient_clipping": 10,
   "bf16": {
     "enabled": true
