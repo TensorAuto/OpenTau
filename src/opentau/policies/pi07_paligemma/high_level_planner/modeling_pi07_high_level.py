@@ -437,6 +437,19 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
         raise NotImplementedError("The high-level planner does not predict action chunks.")
 
     @torch.no_grad()
+    def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+        """Not implemented for the high-level planner.
+
+        Args:
+            batch: Batch of data containing environment observations.
+
+        Raises:
+            NotImplementedError: Always, since the high-level planner predicts
+                memory and subtask strings, not action chunks.
+        """
+        raise NotImplementedError("The high-level planner does not use select_action.")
+
+    @torch.no_grad()
     def sample_actions(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
         """Run inference to predict updated memory and subtask tokens.
 

@@ -35,7 +35,7 @@ from opentau.optim.schedulers import (
 )
 
 
-@PreTrainedConfig.register_subclass("pi07_low_level_planner")
+@PreTrainedConfig.register_subclass("pi07_paligemma_low_level_planner")
 @dataclass
 class PI07lowlevelPlannerConfig(PreTrainedConfig):
     """Configuration for the π07 low-level planner.
