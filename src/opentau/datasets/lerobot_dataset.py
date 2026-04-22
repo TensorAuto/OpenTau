@@ -1654,8 +1654,16 @@ class LeRobotDataset(BaseDataset):
         the frame from its own video. Missing camera slots are skipped (the
         resulting ``subgoalK`` is zero-filled and marked ``_is_pad=True`` by
         :meth:`BaseDataset._emit_optional_keys`).
+
+        Legacy datasets whose ``episodes.jsonl`` has no ``segments`` entry
+        (i.e. were never passed through :mod:`opentau.scripts.attach_metadata`)
+        skip sampling entirely — the emitted subgoals are zero-filled with
+        ``_is_pad=True``. This keeps legacy ``__getitem__`` deterministic and
+        avoids unnecessary video decoding.
         """
         if self.num_cams <= 0 or len(self.meta.video_keys) == 0:
+            return {}
+        if "segments" not in self.meta.episodes[ep_idx]:
             return {}
         name_map = DATA_FEATURES_NAME_MAPPING[self._get_feature_mapping_key()]
         at_end = bool(torch.rand(()) < self.subgoal_end_of_segment_prob)
