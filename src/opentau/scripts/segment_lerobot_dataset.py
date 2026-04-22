@@ -245,9 +245,7 @@ def _ffmpeg_trim_max_workers(override: int | None = None) -> int:
     """
     if override is not None:
         if not isinstance(override, int) or isinstance(override, bool) or not (1 <= override <= 64):
-            raise ValueError(
-                f"--ffmpeg-max-workers must be an integer in [1, 64], got {override!r}."
-            )
+            raise ValueError(f"--ffmpeg-max-workers must be an integer in [1, 64], got {override!r}.")
         return override
 
     raw = os.environ.get(FFMPEG_MAX_WORKERS_ENV_VAR)

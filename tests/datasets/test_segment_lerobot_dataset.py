@@ -577,9 +577,7 @@ def _inject_fake_video_feature(input_root: Path, video_key: str) -> Path:
         info["video_path"] = DEFAULT_VIDEO_PATH
     write_json(info, input_root / "meta" / "info.json")
 
-    rel_path = DEFAULT_VIDEO_PATH.format(
-        episode_chunk=0, video_key=video_key, episode_index=0
-    )
+    rel_path = DEFAULT_VIDEO_PATH.format(episode_chunk=0, video_key=video_key, episode_index=0)
     src_video = input_root / rel_path
     src_video.parent.mkdir(parents=True, exist_ok=True)
     src_video.write_bytes(b"fake-video-stub")
@@ -616,9 +614,7 @@ def test_segment_dataset_dispatches_ffmpeg_jobs_in_parallel(
     video_key = "observation.images.fake_cam"
     _inject_fake_video_feature(input_root, video_key)
 
-    with patch(
-        "opentau.scripts.segment_lerobot_dataset._trim_video_segment"
-    ) as trim_mock:
+    with patch("opentau.scripts.segment_lerobot_dataset._trim_video_segment") as trim_mock:
         segment_dataset(
             input_root=input_root,
             output_root=output_root,
@@ -627,9 +623,7 @@ def test_segment_dataset_dispatches_ffmpeg_jobs_in_parallel(
 
     # 2 segments × 1 fake video key = 2 trim calls.
     assert trim_mock.call_count == 2
-    frame_ranges = sorted(
-        (call.args[2], call.args[3]) for call in trim_mock.call_args_list
-    )
+    frame_ranges = sorted((call.args[2], call.args[3]) for call in trim_mock.call_args_list)
     assert frame_ranges == [(0, 3), (3, 8)]
     for call in trim_mock.call_args_list:
         src_path, dst_path, *_ = call.args
