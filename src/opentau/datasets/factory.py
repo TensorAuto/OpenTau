@@ -223,14 +223,14 @@ def make_dataset(
         val_dataset.meta = copy.deepcopy(dataset.meta)  # type: ignore[assignment]
 
         # Subset wraps the same underlying dataset by reference, so the
-        # training and validation halves share every instance attribute —
-        # including the optional-key dropout flag. Give the val subset its
-        # own shallow-copied dataset instance (meta/hf_dataset etc. still
-        # shared, only instance attrs diverge) so we can toggle dropout on
-        # the val side without affecting training.
-        val_underlying = copy.copy(dataset)
-        val_underlying.enable_optional_key_dropout = train_cfg.dataset_mixture.val_enable_optional_key_dropout
-        val_dataset.dataset = val_underlying  # type: ignore[attr-defined]
+        # training and validation halves would share every instance attribute
+        # — including the optional-key dropout flag. Give the val subset its
+        # own shallow copy whose only divergent attribute is the dropout
+        # toggle. See ``BaseDataset.shallow_copy_with_dropout`` for the
+        # contract on what stays shared.
+        val_dataset.dataset = dataset.shallow_copy_with_dropout(  # type: ignore[attr-defined]
+            enable_dropout=train_cfg.dataset_mixture.val_enable_optional_key_dropout,
+        )
         return train_dataset, val_dataset  # type: ignore[return-value]
 
     return dataset

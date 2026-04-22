@@ -82,6 +82,7 @@ Example:
 """
 
 import contextlib
+import copy
 import functools
 import logging
 import math
@@ -659,6 +660,22 @@ class BaseDataset(torch.utils.data.Dataset):
         # stays random either way — this flag only gates masking/zero-fill.
         self.enable_optional_key_dropout = True
 
+    def shallow_copy_with_dropout(self, *, enable_dropout: bool) -> "BaseDataset":
+        """Return a shallow copy that only diverges in ``enable_optional_key_dropout``.
+
+        Used by :func:`opentau.datasets.factory.make_dataset` to give the
+        validation subset its own dataset instance so dropout can be toggled
+        independently of the training subset. The copy shares ``meta``,
+        ``hf_dataset``, ``episode_data_index``, cached segment tables, and
+        every other instance attribute by reference — only
+        ``enable_optional_key_dropout`` diverges. If a future refactor adds an
+        instance attribute that needs to diverge between train and val, it
+        must be set here too.
+        """
+        clone = copy.copy(self)
+        clone.enable_optional_key_dropout = enable_dropout
+        return clone
+
     @abstractmethod
     def _get_feature_mapping_key(self) -> str:
         r"""Returns the key used for feature mapping"""
@@ -857,11 +874,11 @@ class BaseDataset(torch.utils.data.Dataset):
                 standard_item["obs_history_is_pad"] = torch.tensor([True], dtype=torch.bool)
 
         # (2) Subgoal drop. A single ``subgoal_is_pad`` flag covers every slot
-        # because subgoals are either all present (annotated) or all missing
-        # (legacy / randomly dropped) — there is no partial-availability case.
-        drop_subgoal = _roll(self.subgoal_drop_prob)
-        subgoals_available = all(item.get(f"subgoal{k}_raw") is not None for k in range(self.num_cams))
-        pad_subgoals = drop_subgoal or not subgoals_available
+        # because subgoals are either all present (annotated and not dropped)
+        # or all missing (legacy / `_load_subgoal_frames` decided to drop).
+        # The drop roll itself lives in ``_load_subgoal_frames`` so a dropped
+        # subgoal skips video decoding entirely — here we just detect absence.
+        pad_subgoals = not all(item.get(f"subgoal{k}_raw") is not None for k in range(self.num_cams))
         for k in range(self.num_cams):
             out_key = f"subgoal{k}"
             if pad_subgoals:
@@ -1271,17 +1288,26 @@ class LeRobotDataset(BaseDataset):
         # One memory string per segment. Read once from the parquet's "memory"
         # column at segment-start indices so __getitem__ can resolve
         # ``next_memory`` without a secondary parquet query per sample. When the
-        # dataset has no memory column (legacy), every segment gets "".
+        # dataset has no memory column (legacy), every segment gets "". Only
+        # the rows we need (segment starts across selected episodes) are
+        # materialized, which matters for multi-million-frame datasets.
         has_memory_column = "memory" in self.meta.features
         self.segment_memories_by_episode: dict[int, list[str]] = {}
         if has_memory_column:
-            # Read the raw arrow column once and index by global frame index.
-            memory_table = self.hf_dataset.with_format("arrow").select_columns(["memory"])
-            memory_column = memory_table["memory"].to_pylist()
+            indices: list[int] = []
+            offsets: list[int] = []  # cumulative offsets into `indices`, one per episode
             for ep in self.episodes:
+                offsets.append(len(indices))
                 starts = self.segment_starts_by_episode[ep]
                 ep_start = int(self.episode_data_index["from"][self.epi2idx[ep]].item())
-                self.segment_memories_by_episode[ep] = [str(memory_column[int(ep_start + s)]) for s in starts]
+                indices.extend(int(ep_start + s) for s in starts)
+            if indices:
+                memory_rows = self.hf_dataset.with_format("arrow").select(indices)["memory"].to_pylist()
+            else:
+                memory_rows = []
+            for ep, off in zip(self.episodes, offsets, strict=True):
+                n = len(self.segment_starts_by_episode[ep])
+                self.segment_memories_by_episode[ep] = [str(m) for m in memory_rows[off : off + n]]
         else:
             for ep in self.episodes:
                 starts = self.segment_starts_by_episode[ep]
@@ -1674,6 +1700,12 @@ class LeRobotDataset(BaseDataset):
         resulting ``subgoalK`` is zero-filled and marked ``_is_pad=True`` by
         :meth:`BaseDataset._emit_optional_keys`).
 
+        Drop-roll is short-circuited here (not in :meth:`_emit_optional_keys`)
+        so a dropped subgoal skips the per-camera ``_query_videos`` decode.
+        When ``self.enable_optional_key_dropout`` is False (e.g. the validation
+        subset), drop is never rolled — the frame-selection randomness stays
+        live because it's about which future frame to read, not masking.
+
         Legacy datasets whose ``episodes.jsonl`` has no ``segments`` entry
         (i.e. were never passed through :mod:`opentau.scripts.attach_metadata`)
         skip sampling entirely — the emitted subgoals are zero-filled with
@@ -1683,6 +1715,10 @@ class LeRobotDataset(BaseDataset):
         if self.num_cams <= 0 or len(self.meta.video_keys) == 0:
             return {}
         if "segments" not in self.meta.episodes[ep_idx]:
+            return {}
+        # Roll drop before any video decoding — at `subgoal_drop_prob=0.75` the
+        # old ordering threw away 75% of decodes.
+        if self.enable_optional_key_dropout and bool(torch.rand(()) < self.subgoal_drop_prob):
             return {}
         name_map = DATA_FEATURES_NAME_MAPPING[self._get_feature_mapping_key()]
         at_end = bool(torch.rand(()) < self.subgoal_end_of_segment_prob)
@@ -1785,7 +1821,6 @@ class LeRobotDataset(BaseDataset):
             item["speed_raw"] = int(round(self.episode_lengths[ep_idx] / 500) * 500)
             item.update(self._load_subgoal_frames(ep_idx, frame_in_ep))
 
-            # change data naming to standard data format
             item = self._to_standard_data_format(item)
 
             if self.meta.advantages is not None:

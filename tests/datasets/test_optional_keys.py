@@ -201,20 +201,27 @@ class TestForcedDropouts:
             assert torch.all(standard_item[f"camera{k}"][-1] == 1)
         assert standard_item["obs_history_is_pad"].all().item() is True
 
-    def test_subgoal_drop_masks_all_slots(self):
-        ds = _DummyBaseDataset(subgoal_drop_prob=1.0)
+    def test_absent_subgoal_raw_marks_all_slots_padded(self):
+        """If ``_load_subgoal_frames`` dropped (returned {}), every subgoal{k}
+        tensor is zero-filled and the shared ``subgoal_is_pad`` flag is True.
+        """
+        ds = _DummyBaseDataset()
         standard_item = _prepopulate_standard_item(ds)
-        ds._emit_optional_keys(_raw_item(ds), standard_item)
+        # Simulate the upstream drop by stripping subgoalK_raw from the item.
+        item = {k: v for k, v in _raw_item(ds).items() if not k.startswith("subgoal")}
+        ds._emit_optional_keys(item, standard_item)
         assert standard_item["subgoal_is_pad"].item() is True
         for k in range(ds.num_cams):
             assert torch.all(standard_item[f"subgoal{k}"] == 0)
 
-    def test_subgoal_drop_implies_no_response_drop(self):
-        """Per spec, response is only rolled when subgoals are not dropped."""
-        ds = _DummyBaseDataset(subgoal_drop_prob=1.0, response_drop_prob=1.0)
+    def test_absent_subgoal_raw_implies_no_response_drop(self):
+        """Per spec, response drop is only rolled when subgoals are present."""
+        ds = _DummyBaseDataset(response_drop_prob=1.0)
         standard_item = _prepopulate_standard_item(ds)
         original_response = standard_item["response"]
-        ds._emit_optional_keys(_raw_item(ds), standard_item)
+        # Simulate the upstream subgoal drop.
+        item = {k: v for k, v in _raw_item(ds).items() if not k.startswith("subgoal")}
+        ds._emit_optional_keys(item, standard_item)
         assert standard_item["response"] == original_response
         assert standard_item["response_is_pad"].item() is False
 
@@ -275,25 +282,91 @@ class TestDropoutDisabled:
         for k in ("speed", "mistake", "quality"):
             assert standard_item[f"{k}_is_pad"].item() is False
 
-    def test_subgoal_end_of_segment_roll_stays_active(self):
+    def test_subgoal_end_of_segment_roll_stays_active(self, monkeypatch):
         """Disabling dropout must NOT gate subgoal-frame randomness.
 
-        ``subgoal_end_of_segment_prob`` drives which future frame we read,
-        not whether subgoals are masked, so it stays live on the val subset.
+        Even with ``subgoal_drop_prob=1.0`` (would drop every sample in
+        training), the val path (``enable_optional_key_dropout=False``) still
+        decodes a subgoal — and ``subgoal_end_of_segment_prob=1.0`` picks the
+        last frame of the current segment.
         """
-        from opentau.datasets.lerobot_dataset import LeRobotDataset
+        from types import SimpleNamespace
 
-        ds = LeRobotDataset.__new__(LeRobotDataset)
-        ds.enable_optional_key_dropout = False
-        ds.subgoal_end_of_segment_prob = 1.0
-        ds.num_cams = 0  # short-circuits video decoding for this unit check
-        # A calm-enough check: the roll is read directly in _load_subgoal_frames.
-        # Running the method with num_cams=0 should return {} without error,
-        # proving the gate doesn't skip frame-selection logic.
+        import numpy as _np
+
         import opentau.datasets.lerobot_dataset as _ld
 
-        ds.meta = type("_M", (), {"video_keys": []})
-        assert _ld.LeRobotDataset._load_subgoal_frames(ds, 0, 0) == {}
+        mapping_key = "_tests/subgoal_end_of_segment"
+        _ld.DATA_FEATURES_NAME_MAPPING[mapping_key] = {"camera0": "camera0"}
+
+        ds = _ld.LeRobotDataset.__new__(_ld.LeRobotDataset)
+        ds.enable_optional_key_dropout = False
+        ds.subgoal_end_of_segment_prob = 1.0
+        ds.subgoal_drop_prob = 1.0  # would drop every sample in train mode
+        ds.num_cams = 1
+        ds.resolution = (8, 8)
+        ds.episode_lengths = {0: 100}
+        ds.segment_starts_by_episode = {0: _np.array([0])}
+        ds.meta = SimpleNamespace(
+            video_keys=["camera0"],
+            episodes={0: {"segments": [0]}},
+            fps=30,
+        )
+        monkeypatch.setattr(type(ds), "_get_feature_mapping_key", lambda self: mapping_key)
+
+        query_calls: list = []
+
+        def _fake_query_videos(self, query_ts, ep_idx):
+            query_calls.append((dict(query_ts), ep_idx))
+            return {"camera0": torch.zeros((3, *self.resolution))}
+
+        monkeypatch.setattr(type(ds), "_query_videos", _fake_query_videos)
+
+        out = ds._load_subgoal_frames(0, 0)
+
+        assert "subgoal0_raw" in out, "val path should still load subgoals despite subgoal_drop_prob=1.0"
+        assert len(query_calls) == 1, "subgoal decode was called exactly once"
+        ts_dict, _ep = query_calls[0]
+        # End-of-segment pick: last frame of the single segment = ep_length - 1.
+        expected_ts = (ds.episode_lengths[0] - 1) / ds.meta.fps
+        assert abs(ts_dict["camera0"][0] - expected_ts) < 1e-9
+
+    def test_subgoal_drop_skips_video_decode_in_train_mode(self, monkeypatch):
+        """In train mode with ``subgoal_drop_prob=1.0`` we must NOT call
+        ``_query_videos`` — the whole point of rolling the drop upstream is
+        to avoid wasted video decoding.
+        """
+        from types import SimpleNamespace
+
+        import numpy as _np
+
+        import opentau.datasets.lerobot_dataset as _ld
+
+        mapping_key = "_tests/subgoal_drop_skip_decode"
+        _ld.DATA_FEATURES_NAME_MAPPING[mapping_key] = {"camera0": "camera0"}
+
+        ds = _ld.LeRobotDataset.__new__(_ld.LeRobotDataset)
+        ds.enable_optional_key_dropout = True  # train mode
+        ds.subgoal_end_of_segment_prob = 0.0
+        ds.subgoal_drop_prob = 1.0  # always drop
+        ds.num_cams = 1
+        ds.resolution = (8, 8)
+        ds.episode_lengths = {0: 100}
+        ds.segment_starts_by_episode = {0: _np.array([0])}
+        ds.meta = SimpleNamespace(
+            video_keys=["camera0"],
+            episodes={0: {"segments": [0]}},
+            fps=30,
+        )
+        monkeypatch.setattr(type(ds), "_get_feature_mapping_key", lambda self: mapping_key)
+
+        def _fake_query_videos(self, query_ts, ep_idx):
+            raise AssertionError("_query_videos should not be called when dropping subgoals")
+
+        monkeypatch.setattr(type(ds), "_query_videos", _fake_query_videos)
+
+        out = ds._load_subgoal_frames(0, 0)
+        assert out == {}, "drop should return an empty dict and skip decoding"
 
 
 # Default collate tolerates a batch with mixed _is_pad flags.
@@ -307,7 +380,6 @@ class TestDefaultCollate:
         ds_keep = _DummyBaseDataset()
         ds_drop = _DummyBaseDataset(
             metadata_drop_all_prob=1.0,
-            subgoal_drop_prob=1.0,
             history_state_drop_prob=1.0,
             response_drop_prob=1.0,
         )
@@ -315,7 +387,9 @@ class TestDefaultCollate:
         keep_item = _prepopulate_standard_item(ds_keep)
         ds_keep._emit_optional_keys(_raw_item(ds_keep), keep_item)
         drop_item = _prepopulate_standard_item(ds_drop)
-        ds_drop._emit_optional_keys(_raw_item(ds_drop), drop_item)
+        # Simulate `_load_subgoal_frames` dropping by omitting subgoal_raw keys.
+        item = {k: v for k, v in _raw_item(ds_drop).items() if not k.startswith("subgoal")}
+        ds_drop._emit_optional_keys(item, drop_item)
 
         # Drop strings (default_collate handles them by stacking into a list).
         batch = default_collate([keep_item, drop_item])

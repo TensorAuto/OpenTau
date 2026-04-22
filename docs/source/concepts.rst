@@ -132,8 +132,15 @@ the keys without special cases.
                                    # differs at segment boundaries). Clipped at episode end.
         "next_memory_is_pad": bool,
 
-        "speed": torch.LongTensor,     # Scalar; episode length rounded to the nearest multiple of 500.
-        "speed_is_pad": torch.BoolTensor,
+        "speed": torch.LongTensor,     # Scalar; episode length in frames rounded to the nearest multiple of
+                                       # 500 (so short <250-frame episodes bucket to 0). Populated
+                                       # unconditionally from ``info.json`` — available on every
+                                       # LeRobotDataset regardless of whether the dataset went through
+                                       # ``attach_metadata``. Name is historical; think
+                                       # "episode-length bucket".
+        "speed_is_pad": torch.BoolTensor,  # True only when the dataset has no episode-length metadata
+                                           # (pure VQA / legacy fake datasets) or when the metadata drop
+                                           # rolls in _emit_optional_keys fire at training time.
 
         "mistake": torch.BoolTensor,   # Scalar; True iff the current segment's success flag is False.
         "mistake_is_pad": torch.BoolTensor,

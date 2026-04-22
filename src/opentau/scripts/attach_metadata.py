@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -133,8 +134,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         type=str,
-        default="gpt-4o-mini",
-        help="OpenAI chat model used when memory generation is enabled.",
+        default=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+        help="OpenAI chat model used when memory generation is enabled. "
+        "Overridable via the OPENAI_MODEL environment variable.",
     )
     parser.add_argument(
         "--delay",
