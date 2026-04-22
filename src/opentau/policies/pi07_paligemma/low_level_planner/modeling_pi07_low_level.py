@@ -19,7 +19,8 @@
 action generation.
 
 The low-level planner is one half of the π07 hierarchical architecture.
-Given video observations (encoded by V-JEPA2), a language prompt, temporal
+Given video observations (encoded by V-JEPA2), a language prompt, an
+optional subtask response from the high-level planner, temporal
 proprioceptive state, optional subgoal images, and optional metadata, it
 produces continuous action chunks via flow matching while simultaneously
 predicting discrete (FAST) action tokens through the VLM backbone.
@@ -29,7 +30,8 @@ Key differences from the base π05 policy:
      temporal video into 256 tokens via a Perceiver cross-attention reducer.
   2. Temporal state sequences (B, T, D) are projected per-timestep into
      separate continuous tokens for the Gemma backbone.
-  3. Supports optional subgoal image conditioning and metadata tokens.
+  3. Supports optional subtask response, subgoal image, and metadata
+     conditioning for hierarchical planning.
   4. Knowledge Insulation: action-expert gradients are detached from the
      VLM backbone to preserve language understanding capabilities.
 """
@@ -496,7 +498,7 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
         Args:
             batch: Environment observation dict with ``"state"``, image keys,
-                ``"prompt"``, and optional ``"metadata"``.
+                ``"prompt"``, ``"response"``, and optional ``"metadata"``.
             noise: Optional pre-sampled noise for deterministic evaluation.
 
         Returns:
@@ -538,8 +540,8 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
     ) -> Tensor:
         """Sample a full action chunk via flow-matching inference.
 
-        Normalizes inputs, prepares all modalities (video, language, state,
-        subgoal images, metadata), and delegates to the inner model's
+        Normalizes inputs, prepares all modalities (video, language, response,
+        state, subgoal images, metadata), and delegates to the inner model's
         ``sample_actions`` for iterative denoising.
 
         Args:
@@ -561,6 +563,7 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
         videos, vid_masks = self.prepare_videos(batch)
         lang_tokens, lang_masks = self.prepare_language(batch)
+        response_tokens, response_masks = self.prepare_response(batch)
         state = self.prepare_state(batch)
 
         subgoal_images, subgoal_img_masks = self.prepare_subgoal_images(batch)
@@ -608,6 +611,8 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             subgoal_img_masks=subgoal_img_masks,
             metadata_tokens=metadata_tokens,
             metadata_masks=metadata_masks,
+            response_tokens=response_tokens,
+            response_masks=response_masks,
         )
 
         action_feature = self.config.action_feature
@@ -647,6 +652,7 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             )
         videos, vid_masks = self.prepare_videos(batch, obs_history_is_pad=obs_history_is_pad)
         lang_tokens, lang_masks = self.prepare_language(batch)
+        response_tokens, response_masks = self.prepare_response(batch)
         state = self.prepare_state(batch)
         subgoal_images, subgoal_masks = self.prepare_subgoal_images(batch)
         metadata_tokens, metadata_masks = self.prepare_metadata(batch)
@@ -668,9 +674,11 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             discrete_action_masks,
             obs_history_is_pad=obs_history_is_pad,
             subgoal_images=subgoal_images,
-            subgoal_masks=subgoal_masks,
+            subgoal_img_masks=subgoal_masks,
             metadata_tokens=metadata_tokens,
             metadata_masks=metadata_masks,
+            response_tokens=response_tokens,
+            response_masks=response_masks,
         )
 
         mse_loss = losses["MSE"]
@@ -826,6 +834,33 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
         return lang_tokens, lang_masks
 
+    def prepare_response(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+        """Tokenize the high-level planner subtask response into PaliGemma token IDs.
+
+        Wraps each response string as ``"Subtask: {response}<eos>"`` and
+        pads/truncates to ``response_max_length``.
+
+        Args:
+            batch: Batch dict containing ``"response"`` (list of strings).
+
+        Returns:
+            A tuple ``(response_tokens, response_masks)`` with shapes
+            ``(B, response_max_length)``."""
+        device = batch["state"].device
+        responses = batch["response"]
+        response_prompt = [f"Subtask: {response}<eos>" for response in responses]
+        tokenized_response = self.language_tokenizer.__call__(
+            response_prompt,
+            padding="max_length",
+            padding_side="right",
+            max_length=self.config.response_max_length,
+            return_tensors="pt",
+            truncation=True,
+        )
+        response_tokens = tokenized_response["input_ids"].to(device=device)
+        response_masks = tokenized_response["attention_mask"].to(device=device, dtype=torch.bool)
+        return response_tokens, response_masks
+
     def prepare_subgoal_images(
         self, batch: dict[str, Tensor]
     ) -> tuple[list[Tensor] | None, list[Tensor] | None]:
@@ -932,30 +967,31 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
 
     Architecture overview::
 
-        ┌──────────────────────────────────────────────┐
-        │                   actions                    │
-        │                   ▲                          │
-        │                  ┌┴─────┐                    │
-        │      kv cache    │Gemma │  (detached)        │
-        │      ┌──────────►│Expert│                    │
-        │      │           │      │                    │
-        │     ┌┴─────────┐ │x 10  │                    │
-        │     │          │ └▲─────┘                    │
-        │     │PaliGemma │  │                          │
-        │     │  (VLM)   │  noise                      │
-        │     └▲──▲──▲──▲──▲──▲──▲                     │
-        │      │  │  │  │  │  │  └── discrete actions  │
-        │      │  │  │  │  │  └───── metadata tokens   │
-        │      │  │  │  │  └──────── subgoal images    │
-        │      │  │  │  └─────────── state (T tokens)  │
-        │      │  │  └────────────── language tokens   │
-        │      │  └───────────────── video (V-JEPA2)   │
-        │      └──────────────────── video (V-JEPA2)   │
-        └──────────────────────────────────────────────┘
+        ┌───────────────────────────────────────────────────┐
+        │                   actions                         │
+        │                   ▲                               │
+        │                  ┌┴─────┐                         │
+        │      kv cache    │Gemma │  (detached)             │
+        │      ┌──────────►│Expert│                         │
+        │      │           │      │                         │
+        │     ┌┴─────────┐ │x 10  │                         │
+        │     │          │ └▲─────┘                         │
+        │     │PaliGemma │  │                               │
+        │     │  (VLM)   │  noise                           │
+        │     └▲──▲──▲──▲──▲──▲──▲──▲                       │
+        │      │  │  │  │  │  │  │  └── discrete actions    │
+        │      │  │  │  │  │  │  └───── metadata tokens     │
+        │      │  │  │  │  │  └──────── subgoal images      │
+        │      │  │  │  │  └─────────── state (T tokens)    │
+        │      │  │  │  └────────────── response (subtask)  │
+        │      │  │  └───────────────── language tokens      │
+        │      │  └──────────────────── video (V-JEPA2)     │
+        │      └─────────────────────── video (V-JEPA2)     │
+        └───────────────────────────────────────────────────┘
 
-    The VLM processes all prefix tokens (video, language, state, subgoal
-    images, metadata, discrete actions). The action expert receives the
-    prefix KV-cache (detached for Knowledge Insulation) together with
+    The VLM processes all prefix tokens (video, language, response, state,
+    subgoal images, metadata, discrete actions). The action expert receives
+    the prefix KV-cache (detached for Knowledge Insulation) together with
     noisy continuous actions and flow-matching timestep embeddings to
     predict the velocity field.
     """
@@ -1056,17 +1092,20 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         subgoal_img_masks: list[Tensor] | None = None,
         metadata_tokens: Tensor | None = None,
         metadata_masks: Tensor | None = None,
+        response_tokens: Tensor | None = None,
+        response_masks: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Embed all prefix modalities and build the 1-D attention pattern.
 
         Concatenation order:
-        ``[video_0 | ... | video_N | language | state | subgoal_img_0 | ... |
-        metadata | discrete_actions]``
+        ``[video_0 | ... | video_N | language | response | state |
+        subgoal_img_0 | ... | metadata | discrete_actions]``
 
         Attention pattern (via ``att_masks``):
             - Video tokens: bidirectional (``0``).
             - Language tokens: bidirectional (``0``).
-            - State tokens: bidirectional (``0``) with video and language.
+            - Response tokens: bidirectional (``0``), same block as language.
+            - State tokens: bidirectional (``0``) with all preceding tokens.
             - Subgoal image tokens: new bidirectional block per camera
               (``[1, 0, …, 0]``), can see all earlier tokens.
             - Metadata tokens: new bidirectional block (``[1, 0, …, 0]``).
@@ -1089,6 +1128,9 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             metadata_tokens: Optional metadata token IDs
                 ``(B, metadata_max_length)``.
             metadata_masks: Optional boolean mask for metadata tokens.
+            response_tokens: Optional subtask response token IDs
+                ``(B, response_max_length)``.
+            response_masks: Optional boolean mask for response tokens.
 
         Returns:
             A tuple ``(embs, pad_masks, att_masks)`` where:
@@ -1123,6 +1165,15 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
 
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
+
+        if response_tokens is not None:
+            response_emb = self.paligemma_with_expert.embed_language_tokens(response_tokens)
+            response_emb_dim = response_emb.shape[-1]
+            response_emb = response_emb * math.sqrt(response_emb_dim)
+            embs.append(response_emb)
+            pad_masks.append(response_masks)
+            num_response_embs = response_emb.shape[1]
+            att_masks += [0] * num_response_embs
 
         # Project each timestep's state into a separate VLM token
         # state: (B, T, max_state_dim) -> state_emb: (B, T, vlm_hidden_size)
@@ -1254,12 +1305,14 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         subgoal_img_masks: list[Tensor] | None = None,
         metadata_tokens: Tensor | None = None,
         metadata_masks: Tensor | None = None,
+        response_tokens: Tensor | None = None,
+        response_masks: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """Training forward pass: embed all modalities and compute losses.
 
-        Runs the VLM on the prefix (video, language, state, subgoal images,
-        metadata, discrete actions), then the action expert on the noisy
-        action suffix.  Returns both the flow-matching MSE loss and the
+        Runs the VLM on the prefix (video, language, response, state, subgoal
+        images, metadata, discrete actions), then the action expert on the
+        noisy action suffix.  Returns both the flow-matching MSE loss and the
         discrete-action cross-entropy loss.
 
         The VLM's KV-cache is detached before being passed to the action
@@ -1282,6 +1335,8 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             subgoal_img_masks: Optional list of masks.
             metadata_tokens: Optional metadata token IDs.
             metadata_masks: Optional mask for metadata tokens.
+            response_tokens: Optional subtask response token IDs.
+            response_masks: Optional mask for response tokens.
 
         Returns:
             Dict with ``"MSE"`` (flow-matching loss) and ``"CE"``
@@ -1300,6 +1355,8 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             subgoal_img_masks=subgoal_img_masks,
             metadata_tokens=metadata_tokens,
             metadata_masks=metadata_masks,
+            response_tokens=response_tokens,
+            response_masks=response_masks,
         )
 
         vlm_2d_attention_mask = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
@@ -1422,6 +1479,8 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         subgoal_img_masks: list[Tensor] | None = None,
         metadata_tokens: Tensor | None = None,
         metadata_masks: Tensor | None = None,
+        response_tokens: Tensor | None = None,
+        response_masks: Tensor | None = None,
     ) -> Tensor:
         """Inference: iteratively denoise to produce a continuous action chunk.
 
@@ -1444,6 +1503,8 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             subgoal_img_masks: Optional list of masks.
             metadata_tokens: Optional metadata token IDs.
             metadata_masks: Optional mask for metadata tokens.
+            response_tokens: Optional subtask response token IDs.
+            response_masks: Optional mask for response tokens.
 
         Returns:
             Denoised action chunk ``(B, chunk_size, max_action_dim)``.
@@ -1465,6 +1526,8 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             subgoal_img_masks=subgoal_img_masks,
             metadata_tokens=metadata_tokens,
             metadata_masks=metadata_masks,
+            response_tokens=response_tokens,
+            response_masks=response_masks,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1

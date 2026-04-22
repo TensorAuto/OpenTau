@@ -16,8 +16,9 @@
 
 This module implements the low-level planner of the π07 hierarchical
 architecture. It uses V-JEPA2 as a video encoder, processes temporal state
-sequences (one continuous token per timestep), and supports optional subgoal
-image and metadata conditioning.  Action generation combines flow matching
-(continuous actions via an action expert) with FAST discrete token prediction
-(through the VLM backbone with Knowledge Insulation).
+sequences (one continuous token per timestep), and supports optional subtask
+response, subgoal image, and metadata conditioning.  Action generation
+combines flow matching (continuous actions via an action expert) with FAST
+discrete token prediction (through the VLM backbone with Knowledge
+Insulation).
 """

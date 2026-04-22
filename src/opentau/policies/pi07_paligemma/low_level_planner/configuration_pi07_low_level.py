@@ -18,8 +18,8 @@
 This module defines the ``PI07lowlevelPlannerConfig`` class, which handles
 configuration parameters for the π07 low-level planner. This planner uses
 V-JEPA2 as a video encoder, processes temporal state sequences (one
-continuous token per timestep), and supports optional subgoal image and
-metadata conditioning.
+continuous token per timestep), and supports optional subtask response,
+subgoal image, and metadata conditioning.
 """
 
 import logging
@@ -63,6 +63,8 @@ class PI07lowlevelPlannerConfig(PreTrainedConfig):
             Defaults to 32.
         metadata_max_length: Maximum token length for metadata strings.
             Defaults to 52.
+        response_max_length: Maximum token length for high-level planner
+            subtask responses. Defaults to 52.
         proj_width: Width of the action projection layer. Defaults to 1024.
         dropout: Dropout rate. Defaults to 0.1.
         num_steps: Number of flow-matching denoising steps. Defaults to 10.
@@ -125,6 +127,8 @@ class PI07lowlevelPlannerConfig(PreTrainedConfig):
     discrete_action_max_length: int = 32
 
     metadata_max_length: int = 52
+
+    response_max_length: int = 52
 
     # Projector
     proj_width: int = 1024
