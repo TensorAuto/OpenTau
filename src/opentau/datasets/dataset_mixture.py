@@ -373,13 +373,9 @@ class WeightedDatasetMixture:
             return [type(ds).__name__ + f"_{i}" for i, ds in enumerate(datasets)]
 
         raw_names = [
-            (dc.repo_id or dc.vqa or type(ds).__name__)
-            for dc, ds in zip(dataset_cfgs, datasets, strict=True)
+            (dc.repo_id or dc.vqa or type(ds).__name__) for dc, ds in zip(dataset_cfgs, datasets, strict=True)
         ]
-        return [
-            f"{name}#{idx}" if raw_names.count(name) > 1 else name
-            for idx, name in enumerate(raw_names)
-        ]
+        return [f"{name}#{idx}" if raw_names.count(name) > 1 else name for idx, name in enumerate(raw_names)]
 
     def _log_dataset_info(self) -> None:
         """Log information about all datasets in the mixture."""

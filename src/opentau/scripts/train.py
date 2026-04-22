@@ -327,7 +327,7 @@ def train(cfg: TrainPipelineConfig):
         if is_val_step:
             policy.eval()
 
-            def _make_val_tracker() -> MetricsTracker:
+            def _make_val_tracker(current_step: int = step) -> MetricsTracker:
                 return MetricsTracker(
                     cfg.batch_size * accelerator.num_processes,
                     {
@@ -337,7 +337,7 @@ def train(cfg: TrainPipelineConfig):
                         "l1_loss": AverageMeter("val_l1_loss", ":.3f"),
                         "accuracy": AverageMeter("val_accuracy", ":.3f"),
                     },
-                    initial_step=step,
+                    initial_step=current_step,
                 )
 
             agg_tracker = _make_val_tracker()
@@ -373,10 +373,7 @@ def train(cfg: TrainPipelineConfig):
                             .item()
                         )
                         ce_loss = (
-                            accelerator.gather_for_metrics(losses["CE"])
-                            .to(dtype=torch.float32)
-                            .mean()
-                            .item()
+                            accelerator.gather_for_metrics(losses["CE"]).to(dtype=torch.float32).mean().item()
                         )
                         l1_loss = (
                             accelerator.gather_for_metrics(losses.get("L1", zero))
