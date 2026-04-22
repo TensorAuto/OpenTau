@@ -317,7 +317,42 @@ def test_attach_metadata_end_to_end_droid_100(tmp_path, dataset_config, train_pi
     dataset_config.revision = "v2.1"
     dataset_config.episodes = None
 
+    # --- CI DIAGNOSTIC: dump what's actually on disk / in the HF cache so we
+    # can see why `self.fps` sometimes resolves to 30 on the runner even though
+    # every Hub revision has fps=15. Remove once rooted out.
+    import os
+
+    from opentau.constants import HF_OPENTAU_HOME
+
+    expected_root = HF_OPENTAU_HOME / "lerobot/droid_100"
+    info_path_on_disk = expected_root / "meta" / "info.json"
+    print("[diagnostic] HF_HOME env:", os.environ.get("HF_HOME"))
+    print("[diagnostic] HF_OPENTAU_HOME env:", os.environ.get("HF_OPENTAU_HOME"))
+    print("[diagnostic] resolved HF_OPENTAU_HOME:", HF_OPENTAU_HOME)
+    print("[diagnostic] expected src root:", expected_root, "exists:", expected_root.exists())
+    if info_path_on_disk.exists():
+        print("[diagnostic] pre-existing info.json contents (first 800 chars):")
+        print(info_path_on_disk.read_text()[:800])
+    else:
+        print("[diagnostic] no pre-existing info.json — make_dataset will download fresh")
+    # Direct-download the metadata ourselves to see what the Hub returns, bypassing
+    # the make_dataset wrapper entirely.
+    from opentau.datasets.lerobot_dataset import LeRobotDatasetMetadata
+
+    probe_meta = LeRobotDatasetMetadata("lerobot/droid_100", revision="v2.1")
+    print("[diagnostic] probe meta.info['fps']:", probe_meta.info["fps"])
+    print("[diagnostic] probe meta.info['codebase_version']:", probe_meta.info.get("codebase_version"))
+    print("[diagnostic] probe meta.root:", probe_meta.root)
+    print("[diagnostic] probe disk info.json:", (probe_meta.root / "meta/info.json").read_text()[:400])
+
     src_ds = make_dataset(dataset_config, train_pipeline_config)
+    print("[diagnostic] src_ds.meta.info['fps']:", src_ds.meta.info["fps"])
+    print("[diagnostic] src_ds.fps:", src_ds.fps)
+    print("[diagnostic] src_ds.meta.root:", src_ds.meta.root)
+    print(
+        "[diagnostic] post-make_dataset disk info.json:",
+        (src_ds.meta.root / "meta/info.json").read_text()[:400],
+    )
     meta = src_ds.meta
     src_root = meta.root
     del src_ds
