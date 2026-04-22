@@ -1704,7 +1704,20 @@ class LeRobotDataset(BaseDataset):
         # (standardization, dataset mixing) never encounters missing keys.
         for key in deferred:
             shape = self.features[key]["shape"]
-            c = shape[0] if len(shape) >= 3 else 3
+            names = self.features[key].get("names") or []
+            # Locate channel axis; LeRobot v2.1's default image convention is
+            # (H, W, C) with names ["height", "width", "channel"], but some
+            # callers declare (C, H, W). Look it up by name, falling back to
+            # the CHW convention that aggregate_stats's (3, 1, 1) assertion
+            # ultimately expects.
+            if "channel" in names:
+                c = shape[names.index("channel")]
+            elif "channels" in names:
+                c = shape[names.index("channels")]
+            elif len(shape) >= 3:
+                c = shape[0]
+            else:
+                c = 3
             ep_stats[key] = {
                 "min": np.zeros((c, 1, 1), dtype=np.float64),
                 "max": np.ones((c, 1, 1), dtype=np.float64),
