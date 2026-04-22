@@ -24,7 +24,10 @@ class TestBuildResponseArray:
         assert _build_response_array([], fps=30, episode_length=5, episode_index=0) == [""] * 5
 
     def test_zero_length_episode(self):
-        assert _build_response_array([{"time": 0.0, "subtask": "a"}], fps=30, episode_length=0, episode_index=0) == []
+        assert (
+            _build_response_array([{"time": 0.0, "subtask": "a"}], fps=30, episode_length=0, episode_index=0)
+            == []
+        )
 
     def test_single_subtask_covers_whole_episode(self):
         subtasks = [{"time": 0.0, "subtask": "pick up cup"}]
