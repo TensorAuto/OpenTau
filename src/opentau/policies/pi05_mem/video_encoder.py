@@ -119,11 +119,22 @@ class _TemporalSelfAttention(nn.Module):
     standard lower-triangular causal mask (position ``i`` attends to
     positions ``j <= i``; since ``t = T-1`` is the current frame, the current
     frame attends to all past frames).
+
+    The referenced ``SiglipAttention`` is held in a list to keep ``nn.Module``
+    from re-registering its parameters under this module's path (which would
+    duplicate them in ``state_dict`` under both
+    ``base_layer.self_attn.*`` and ``_temporal_attn.attn.*``).
     """
 
     def __init__(self, attn: SiglipAttention):
         super().__init__()
-        self.attn = attn  # reference only; parameters remain owned by attn
+        # Wrap in a list so nn.Module.__setattr__ does not treat ``attn``
+        # as a child submodule; the base layer already owns these params.
+        self._attn_ref: list[SiglipAttention] = [attn]
+
+    @property
+    def attn(self) -> SiglipAttention:
+        return self._attn_ref[0]
 
     def forward(self, hidden_states: Tensor) -> Tensor:
         """hidden_states: (B*N, T, D) -> (B*N, T, D)."""
@@ -156,10 +167,12 @@ class SpaceTimeEncoderLayerWrapper(nn.Module):
                                                            # h + spatial_attn(LN1(h))
                                                            # h + MLP(LN2(h))
 
-    The residual for the temporal sublayer adds to the pre-PE hidden state so
-    that ``T=1`` (where ``e(T-1) = 0``) produces a true no-op (temporal attn
-    output at ``T=1`` is a linear function of the value tokens, which still
-    matters; that's why we keep the residual on ``h`` rather than ``h_pe``).
+    At ``T=1`` the temporal sublayer is skipped entirely so that the wrapped
+    block degenerates to the unmodified ``SiglipEncoderLayer``, satisfying the
+    MEM paper's single-frame invariance claim. (With ``T=1`` causal attention
+    over a single timestep is not an identity — it returns ``out_proj(v_proj(
+    LN1(x)))`` — so ``e(0)=0`` alone is insufficient; the block itself must
+    also be bypassed.)
 
     Reusing ``layer_norm1`` for both the temporal and spatial sublayers keeps
     the paper's "no new learnable parameters" guarantee. It is an intentional
@@ -206,6 +219,18 @@ class SpaceTimeEncoderLayerWrapper(nn.Module):
         if n != self.num_tokens_per_frame:
             raise ValueError(
                 f"hidden_states.shape[1] ({n}) != num_tokens_per_frame ({self.num_tokens_per_frame})."
+            )
+
+        # Short-circuit at T=1: temporal self-attention over a single timestep
+        # collapses to ``out_proj(v_proj(LN1(x)))``, which is NOT an identity
+        # and would break single-frame invariance (the MEM paper's guarantee
+        # that a T=1 pass matches the unmodified SigLIP ViT). e(t=0)=0 alone
+        # is insufficient; the block must also be skipped.
+        if t == 1:
+            return self.base_layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
             )
 
         # Temporal sublayer.

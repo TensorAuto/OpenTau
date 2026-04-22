@@ -467,28 +467,23 @@ class TestSpaceTimeSiglipVideoEncoder:
         for p in encoder.multi_modal_projector.parameters():
             assert p.requires_grad
 
-    def test_single_frame_no_temporal_pe_effect(self):
-        """T=1 + e(T-1)=0 should produce an output independent of spacetime_layer_stride."""
+    def test_single_frame_invariance_structural(self):
+        """At T=1 the wrapper must short-circuit: byte-identical output to a
+        stride-999 (no-wrapping) encoder with the same underlying weights.
+
+        This is the paper's single-frame invariance claim, tested without
+        pretrained weights by sharing state dicts between the two encoders.
+        """
         from opentau.policies.pi05_mem.video_encoder import SpaceTimeSiglipVideoEncoder
 
         torch.manual_seed(0)
         enc_no_st = SpaceTimeSiglipVideoEncoder(
             num_frames=1,
-            spacetime_layer_stride=999,  # > 27 layers, so no wrapping occurs
+            spacetime_layer_stride=999,  # > 27 layers -> no wrapping
             freeze_encoder=False,
             encoder_dtype=torch.float32,
             load_pretrained=False,
         ).eval()
-
-        # Build a second encoder sharing the same underlying SigLIP weights, but
-        # with wrapping enabled. Since T=1 and e(0)=0, the temporal sublayer
-        # must be a no-op up to linear combinations of a single value token
-        # (which, for scaled-dot-product attention with seq_len=1, equals the
-        # projected value itself, followed by out_proj). Therefore the output
-        # of the two encoders should NOT be identical, but the "structure" of
-        # dimensions must still be correct -- we only check the shape here,
-        # because exact T=1 invariance requires pretrained weights (see GPU
-        # tests) to round-trip through the SigLIP MLP cleanly.
         enc_st = SpaceTimeSiglipVideoEncoder(
             num_frames=1,
             spacetime_layer_stride=4,
@@ -496,10 +491,34 @@ class TestSpaceTimeSiglipVideoEncoder:
             encoder_dtype=torch.float32,
             load_pretrained=False,
         ).eval()
+        # Copy the no-st encoder's weights into the st encoder. With wrapping,
+        # the wrapped layers expose their params under `.base_layer.` keys,
+        # but load_state_dict(..., strict=False) handles the mismatch by only
+        # loading matching keys; the unmatched `.base_layer.` keys stay at
+        # their freshly-initialized values. To avoid that, we load via the
+        # remapped keys explicitly.
+        src_sd = enc_no_st.state_dict()
+        dst_sd = enc_st.state_dict()
+        remapped = {}
+        for k, v in src_sd.items():
+            # Layer indices 3, 7, ... are wrapped in enc_st, so rename keys
+            # like "vision_tower.vision_model.encoder.layers.3.xxx" ->
+            # "vision_tower.vision_model.encoder.layers.3.base_layer.xxx".
+            new_k = k
+            for i in range(3, 27, 4):
+                prefix = f"vision_tower.vision_model.encoder.layers.{i}."
+                if k.startswith(prefix):
+                    new_k = k.replace(prefix, prefix + "base_layer.", 1)
+                    break
+            if new_k in dst_sd:
+                remapped[new_k] = v
+        missing = set(dst_sd) - set(remapped)
+        assert not missing, f"unmapped params: {sorted(missing)[:5]}..."
+        enc_st.load_state_dict(remapped, strict=True)
 
         video = torch.rand(1, 1, 3, 224, 224)
         with torch.no_grad():
             out_no_st = enc_no_st(video)
             out_st = enc_st(video)
 
-        assert out_no_st.shape == out_st.shape == (1, 256, 2048)
+        torch.testing.assert_close(out_st, out_no_st, rtol=1e-5, atol=1e-5)
