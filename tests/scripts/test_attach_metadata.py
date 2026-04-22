@@ -332,7 +332,7 @@ def test_attach_metadata_end_to_end_droid_100(tmp_path, dataset_config, train_pi
     from opentau.scripts.attach_metadata import attach_metadata
 
     attach_metadata(
-        dataset_path=src_root,
+        root=src_root,
         annotations_path=ann_path,
         copy_to=out_path,
         overwrite=False,

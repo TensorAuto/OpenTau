@@ -10,7 +10,7 @@ these up automatically and expose them as optional keys in the
 What it writes
 --------------
 
-Given a source dataset at ``--dataset`` and a JSON description of
+Given a source dataset at ``--root`` and a JSON description of
 per-episode segments at ``--annotations``, the script writes the
 modified dataset to ``--copy-to``:
 
@@ -92,7 +92,7 @@ with the placeholder ``f"memory{frame_index}"``):
 .. code-block:: bash
 
     python -m opentau.scripts.attach_metadata \
-        --dataset /path/to/source/dataset \
+        --root /path/to/source/dataset \
         --annotations /path/to/annotations.json \
         --copy-to   /path/to/output/dataset \
         --skip-memory
@@ -106,7 +106,7 @@ key in a ``.env`` at the repo root (or export ``OPENAI_API_KEY``):
     OPENAI_API_KEY=sk-...
 
     python -m opentau.scripts.attach_metadata \
-        --dataset /path/to/source/dataset \
+        --root /path/to/source/dataset \
         --annotations /path/to/annotations.json \
         --copy-to   /path/to/output/dataset \
         --model gpt-4o-mini \
@@ -125,7 +125,7 @@ CLI arguments
 
    * - Flag
      - Description
-   * - ``--dataset``
+   * - ``--root``
      - Required. Path to the source LeRobot v2.1 dataset root.
    * - ``--annotations``
      - Required. Path to the annotations JSON (schema above).

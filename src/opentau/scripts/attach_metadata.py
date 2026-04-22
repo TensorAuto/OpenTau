@@ -100,7 +100,7 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--dataset",
+        "--root",
         type=Path,
         required=True,
         help="Path to the source LeRobot v2.1 dataset root.",
@@ -454,7 +454,7 @@ def _update_episodes_jsonl(root: Path, ann_by_ep: dict[int, dict[str, Any]]) -> 
 
 
 def attach_metadata(
-    dataset_path: Path,
+    root: Path,
     annotations_path: Path,
     *,
     copy_to: Path,
@@ -468,7 +468,7 @@ def attach_metadata(
     See module docstring for the end-to-end semantics.
 
     Args:
-        dataset_path: Source LeRobot v2.1 dataset root.
+        root: Source LeRobot v2.1 dataset root.
         annotations_path: Annotations JSON path.
         copy_to: Destination dataset root (must not exist unless ``overwrite``).
         overwrite: Permit clobbering of ``copy_to``.
@@ -480,7 +480,7 @@ def attach_metadata(
         ValueError: On annotation validation failure or column mismatch.
         FileExistsError: If ``copy_to`` exists and ``overwrite`` is False.
     """
-    src = dataset_path.resolve()
+    src = root.resolve()
     if not src.is_dir():
         raise ValueError(f"Input dataset root does not exist: {src}")
     if not (src / INFO_PATH).is_file():
@@ -532,7 +532,7 @@ def main() -> None:
     """CLI entry point."""
     args = parse_args()
     attach_metadata(
-        dataset_path=args.dataset,
+        root=args.root,
         annotations_path=args.annotations,
         copy_to=args.copy_to,
         overwrite=args.overwrite,
