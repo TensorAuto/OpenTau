@@ -22,7 +22,7 @@ import numpy as np
 import pytest
 import torch
 
-from opentau.configs.default import DatasetConfig
+from opentau.configs.default import DatasetConfig, DatasetMixtureConfig
 from opentau.datasets.dataset_mixture import (
     DatasetMixtureMetadata,
     WeightedDatasetMixture,
@@ -537,3 +537,41 @@ class TestWeightedDatasetMixtureIntegration:
 
         assert "Creating DataLoader" in caplog.text
         assert "DataLoader created successfully" in caplog.text
+
+
+class TestDatasetMixtureOptionalKeyDropProbs:
+    """Tests for the optional-key dropout probability fields on DatasetMixtureConfig."""
+
+    DROP_PROB_FIELDS = (
+        "history_state_drop_prob",
+        "subgoal_drop_prob",
+        "subgoal_end_of_segment_prob",
+        "response_drop_prob",
+        "metadata_drop_all_prob",
+        "metadata_drop_each_prob",
+    )
+
+    def test_defaults(self):
+        cfg = DatasetMixtureConfig()
+        assert cfg.history_state_drop_prob == pytest.approx(0.3)
+        assert cfg.subgoal_drop_prob == pytest.approx(0.25)
+        assert cfg.subgoal_end_of_segment_prob == pytest.approx(0.25)
+        assert cfg.response_drop_prob == pytest.approx(0.3)
+        assert cfg.metadata_drop_all_prob == pytest.approx(0.15)
+        assert cfg.metadata_drop_each_prob == pytest.approx(0.05)
+
+    @pytest.mark.parametrize("field", DROP_PROB_FIELDS)
+    def test_rejects_above_one(self, field):
+        with pytest.raises(ValueError, match=f"`{field}` must be in"):
+            DatasetMixtureConfig(**{field: 1.5})
+
+    @pytest.mark.parametrize("field", DROP_PROB_FIELDS)
+    def test_rejects_negative(self, field):
+        with pytest.raises(ValueError, match=f"`{field}` must be in"):
+            DatasetMixtureConfig(**{field: -0.1})
+
+    @pytest.mark.parametrize("field", DROP_PROB_FIELDS)
+    def test_accepts_zero_and_one(self, field):
+        # Boundary values are permitted (0 disables dropout, 1 forces it).
+        DatasetMixtureConfig(**{field: 0.0})
+        DatasetMixtureConfig(**{field: 1.0})

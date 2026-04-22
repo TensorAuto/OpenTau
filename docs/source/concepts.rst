@@ -40,6 +40,8 @@ Metadata is crucial for defining the structure and statistics of a dataset. Hand
 
 Metadata is stored in JSON files (``info.json``, ``stats.json``) and JSONL files (``tasks.jsonl``) within the dataset directory.
 
+.. _standard-data-format:
+
 Standard Data Format
 --------------------
 To ensure compatibility across different datasets and policies, OpenTau introduces the **Standard Data Format**.
@@ -104,6 +106,105 @@ The following fields are set in ``DatasetMixtureConfig``:
 *   ``history_interval``: Step interval between historical observation steps. Defaults to ``1``. Only relevant when ``n_obs_history`` is set.
 
 Cameras should be labeled in order of importance (e.g. camera0 is the most important camera, camera1 is the second most important camera, etc.). The model dataset will select the most important cameras to use if num_cams is less than the number of cameras in the dataset.
+
+.. _standard-data-format-optional-keys:
+
+Optional Standard-Format Keys
+-----------------------------
+
+On top of the core fields above, ``__getitem__`` emits several *optional*
+keys when the dataset has been enriched with segment metadata (see
+:doc:`tutorials/attach_metadata`) or for the subgoal images sampled from
+future video frames. Each optional key is **always present**: when its
+underlying annotation is missing, or when training-time dropout masks
+it, the value is zero / empty and a parallel ``{key}_is_pad`` boolean
+flag is set to ``True``. This lets the default PyTorch collate handle
+the keys without special cases.
+
+.. code-block:: python
+
+    {
+        # ... core keys above ...
+
+        "memory": str,             # Cumulative subtask summary for the current frame's segment.
+        "memory_is_pad": bool,     # True when memory_raw is absent (legacy / unannotated dataset).
+        "next_memory": str,        # Memory string for frame t+1 (same as `memory` within a segment,
+                                   # differs at segment boundaries). Clipped at episode end.
+        "next_memory_is_pad": bool,
+
+        "speed": torch.LongTensor,     # Scalar; episode length rounded to the nearest multiple of 500.
+        "speed_is_pad": torch.BoolTensor,
+
+        "mistake": torch.BoolTensor,   # Scalar; True iff the current segment's success flag is False.
+        "mistake_is_pad": torch.BoolTensor,
+
+        "quality": torch.LongTensor,   # Scalar in {1,2,3,4,5}; episode-level quality score.
+        "quality_is_pad": torch.BoolTensor,
+
+        "subgoal0": torch.Tensor,       # shape (3, H, W), values in [0,1]. A single future frame from
+                                        # camera0 sampled either at end-of-segment (with probability
+                                        # `subgoal_end_of_segment_prob`) or uniformly in [t, t+4 seconds].
+        "subgoal0_is_pad": torch.BoolTensor,
+        # ...
+        "subgoal{num_cams-1}": torch.Tensor,
+        "subgoal{num_cams-1}_is_pad": torch.BoolTensor,
+
+        "response_is_pad": torch.BoolTensor,  # response may be masked to the empty string at training time.
+    }
+
+Subgoals are always rank-3 ``(3, H, W)`` regardless of
+``n_obs_history`` — they represent a single future target frame, not a
+temporal window.
+
+Training-time dropout
+^^^^^^^^^^^^^^^^^^^^^
+
+Six probability fields on ``DatasetMixtureConfig`` control how often
+each optional key is masked during a single ``__getitem__`` call. Masks
+are independent per sample (each call rolls fresh). ``DataLoader``
+workers seed their own torch RNG, so samples within a batch are
+independent across workers; seed globally via ``torch.manual_seed(...)``
+for reproducibility.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 34 14 52
+
+   * - Field
+     - Default
+     - Effect
+   * - ``history_state_drop_prob``
+     - ``0.3``
+     - Zero-fills ``state`` and historical camera frames (when
+       ``n_obs_history > 1``); sets ``obs_history_is_pad`` all True.
+   * - ``subgoal_drop_prob``
+     - ``0.25``
+     - Zero-fills every ``subgoal{K}`` image and sets each
+       ``subgoal{K}_is_pad=True``.
+   * - ``subgoal_end_of_segment_prob``
+     - ``0.25``
+     - Probability that a *present* subgoal is sourced from the end of
+       the current segment. Otherwise sampled uniformly in time from
+       the current timestamp through ``t + 4 s`` (clipped at segment
+       end, then episode end).
+   * - ``response_drop_prob``
+     - ``0.3``
+     - Replaces ``response`` with the empty string. Only rolled when
+       subgoals are NOT dropped (dropping both response and subgoals
+       would remove the primary task signal).
+   * - ``metadata_drop_all_prob``
+     - ``0.15``
+     - Masks ``speed``, ``mistake``, and ``quality`` together.
+   * - ``metadata_drop_each_prob``
+     - ``0.05``
+     - Per-field independent mask roll for each of ``speed``,
+       ``mistake``, ``quality``. Only rolled when the shared drop did
+       not fire.
+
+Legacy datasets that have not been passed through
+:mod:`opentau.scripts.attach_metadata` still load: every optional key
+appears with a zero/empty value and ``_is_pad=True``, so policies that
+consume these fields can train without gating on dataset provenance.
 
 Configs
 -------
