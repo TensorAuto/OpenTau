@@ -26,12 +26,11 @@ Usage (same launch incantation as train.py):
     accelerate launch \
         --config_file configs/libero/reproduce_pi05_libero_accelerate_config.yaml \
         src/opentau/scripts/profile_step.py \
-        --config_path=configs/libero/reproduce_pi05_libero.json \
-        --steps=250
+        --config_path=configs/libero/reproduce_pi05_libero.json
 
-The ``steps`` field in TrainPipelineConfig is reused as the measurement
-length; 20 warmup + 200 measured is a good default, so ``--steps=220`` is
-a reasonable setting. Anything larger just runs longer.
+Defaults to 20 warmup + 200 measured steps. ``cfg.steps`` from the training
+config is intentionally ignored (production configs set it to ~1M). To run
+longer, set ``PROFILE_STEPS=500 accelerate launch ...``.
 """
 
 import json
@@ -91,7 +90,9 @@ def profile(cfg: TrainPipelineConfig):
     init_logging(accelerator, level=logging.INFO)
     set_proc_accelerator(accelerator)
 
-    measure_steps = max(cfg.steps - WARMUP_STEPS, DEFAULT_MEASURE_STEPS)
+    # We intentionally ignore cfg.steps here (production configs set it to
+    # ~1M). Override with PROFILE_STEPS=<N> if you want a longer sample.
+    measure_steps = int(os.environ.get("PROFILE_STEPS", DEFAULT_MEASURE_STEPS))
     if accelerator.is_main_process:
         logging.info(
             "profile_step: warmup=%d, measured=%d, num_processes=%d, batch_size=%d, "

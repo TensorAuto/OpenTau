@@ -29,6 +29,10 @@ Run with the same launcher you use for training so you reproduce the real
 Each rank prints its own throughput; rank 0 also prints the cluster
 min/max/mean. ``H2D`` timing moves the batch to the local GPU just like
 ``accelerator.prepare(dataloader)`` would — without any collective.
+
+Defaults to 20 warmup + 300 measured batches. ``cfg.steps`` from the
+training config is intentionally ignored (production configs set it to
+~1M). To run longer, set ``PROFILE_BATCHES=500 accelerate launch ...``.
 """
 
 import logging
@@ -111,7 +115,9 @@ def profile(cfg: TrainPipelineConfig):
         else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
     )
 
-    measure_batches = max(cfg.steps - WARMUP_BATCHES, DEFAULT_MEASURE_BATCHES)
+    # We intentionally ignore cfg.steps here (production configs set it to
+    # ~1M). Override with PROFILE_BATCHES=<N> if you want a longer sample.
+    measure_batches = int(os.environ.get("PROFILE_BATCHES", DEFAULT_MEASURE_BATCHES))
     if is_main:
         logging.info(
             "profile_dataloader: warmup=%d, measured=%d, world_size=%d, batch_size=%d, "
