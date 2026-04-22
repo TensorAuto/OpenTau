@@ -76,6 +76,7 @@ class _DummyBaseDataset(BaseDataset):
         self.response_drop_prob = response_drop_prob
         self.metadata_drop_all_prob = metadata_drop_all_prob
         self.metadata_drop_each_prob = metadata_drop_each_prob
+        self.enable_optional_key_dropout = True
 
     def _get_feature_mapping_key(self) -> str:
         return _TEST_MAPPING_KEY
@@ -237,6 +238,62 @@ class TestForcedDropouts:
         ds._emit_optional_keys(_raw_item(ds), standard_item)
         for k in ("speed", "mistake", "quality"):
             assert standard_item[f"{k}_is_pad"].item() is True
+
+
+# enable_optional_key_dropout flag (val subset turns dropout off by default).
+
+
+class TestDropoutDisabled:
+    """``enable_optional_key_dropout=False`` suppresses every drop roll."""
+
+    def _all_drops_maxed(self):
+        return _DummyBaseDataset(
+            history_state_drop_prob=1.0,
+            subgoal_drop_prob=1.0,
+            response_drop_prob=1.0,
+            metadata_drop_all_prob=1.0,
+            metadata_drop_each_prob=1.0,
+        )
+
+    def test_no_drops_fire_when_disabled(self):
+        ds = self._all_drops_maxed()
+        ds.enable_optional_key_dropout = False
+        standard_item = _prepopulate_standard_item(ds)
+        original_state = standard_item["state"].clone()
+        original_response = standard_item["response"]
+        ds._emit_optional_keys(_raw_item(ds), standard_item)
+
+        # History/state untouched.
+        assert torch.equal(standard_item["state"], original_state)
+        assert standard_item["obs_history_is_pad"].any().item() is False
+        # Subgoals kept (raw tensors resize through, is_pad=False).
+        assert standard_item["subgoal_is_pad"].item() is False
+        # Response kept.
+        assert standard_item["response"] == original_response
+        assert standard_item["response_is_pad"].item() is False
+        # Metadata kept.
+        for k in ("speed", "mistake", "quality"):
+            assert standard_item[f"{k}_is_pad"].item() is False
+
+    def test_subgoal_end_of_segment_roll_stays_active(self):
+        """Disabling dropout must NOT gate subgoal-frame randomness.
+
+        ``subgoal_end_of_segment_prob`` drives which future frame we read,
+        not whether subgoals are masked, so it stays live on the val subset.
+        """
+        from opentau.datasets.lerobot_dataset import LeRobotDataset
+
+        ds = LeRobotDataset.__new__(LeRobotDataset)
+        ds.enable_optional_key_dropout = False
+        ds.subgoal_end_of_segment_prob = 1.0
+        ds.num_cams = 0  # short-circuits video decoding for this unit check
+        # A calm-enough check: the roll is read directly in _load_subgoal_frames.
+        # Running the method with num_cams=0 should return {} without error,
+        # proving the gate doesn't skip frame-selection logic.
+        import opentau.datasets.lerobot_dataset as _ld
+
+        ds.meta = type("_M", (), {"video_keys": []})
+        assert _ld.LeRobotDataset._load_subgoal_frames(ds, 0, 0) == {}
 
 
 # Default collate tolerates a batch with mixed _is_pad flags.

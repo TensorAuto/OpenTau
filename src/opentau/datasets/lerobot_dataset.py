@@ -653,6 +653,11 @@ class BaseDataset(torch.utils.data.Dataset):
         self.response_drop_prob = dm.response_drop_prob if dm else 0.0
         self.metadata_drop_all_prob = dm.metadata_drop_all_prob if dm else 0.0
         self.metadata_drop_each_prob = dm.metadata_drop_each_prob if dm else 0.0
+        # Whether the above drop rolls actually fire. `make_dataset` flips this
+        # off on the validation subset (unless `val_enable_optional_key_dropout`
+        # is set). Subgoal *frame* selection (end-of-segment vs. uniform window)
+        # stays random either way — this flag only gates masking/zero-fill.
+        self.enable_optional_key_dropout = True
 
     @abstractmethod
     def _get_feature_mapping_key(self) -> str:
@@ -827,8 +832,18 @@ class BaseDataset(torch.utils.data.Dataset):
             standard_item: Output dict populated by :meth:`_to_standard_data_format`.
                 Mutated in place.
         """
+
+        # When dropout is disabled (e.g. the validation subset), every drop
+        # roll is suppressed but subgoal *frame* selection upstream stays
+        # random. We do this by treating each drop roll as a Bernoulli that
+        # always returns False.
+        def _roll(prob: float) -> bool:
+            if not self.enable_optional_key_dropout:
+                return False
+            return bool(torch.rand(()) < prob)
+
         # (1) History + observation.state drop.
-        drop_hist = bool(torch.rand(()) < self.history_state_drop_prob)
+        drop_hist = _roll(self.history_state_drop_prob)
         if drop_hist:
             standard_item["state"] = torch.zeros_like(standard_item["state"])
             if self.n_obs_history is not None:
@@ -844,7 +859,7 @@ class BaseDataset(torch.utils.data.Dataset):
         # (2) Subgoal drop. A single ``subgoal_is_pad`` flag covers every slot
         # because subgoals are either all present (annotated) or all missing
         # (legacy / randomly dropped) — there is no partial-availability case.
-        drop_subgoal = bool(torch.rand(()) < self.subgoal_drop_prob)
+        drop_subgoal = _roll(self.subgoal_drop_prob)
         subgoals_available = all(item.get(f"subgoal{k}_raw") is not None for k in range(self.num_cams))
         pad_subgoals = drop_subgoal or not subgoals_available
         for k in range(self.num_cams):
@@ -864,7 +879,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
         # (3) Response drop — only rolled when subgoals are actually present
         # (dropping both would remove the primary task signal at once).
-        if not pad_subgoals and torch.rand(()) < self.response_drop_prob:
+        if not pad_subgoals and _roll(self.response_drop_prob):
             standard_item["response"] = ""
             standard_item["response_is_pad"] = torch.tensor(True)
         else:
@@ -881,11 +896,11 @@ class BaseDataset(torch.utils.data.Dataset):
         standard_item["next_memory_is_pad"] = torch.tensor(next_memory_raw is None)
 
         # (5) Metadata drops.
-        drop_meta_all = bool(torch.rand(()) < self.metadata_drop_all_prob)
+        drop_meta_all = _roll(self.metadata_drop_all_prob)
         for key, dtype in (("speed", torch.long), ("mistake", torch.bool), ("quality", torch.long)):
             raw_key = f"{key}_raw"
             raw = item.get(raw_key)
-            drop_this = drop_meta_all or bool(torch.rand(()) < self.metadata_drop_each_prob)
+            drop_this = drop_meta_all or _roll(self.metadata_drop_each_prob)
             if raw is None or drop_this:
                 zero = False if dtype is torch.bool else 0
                 standard_item[key] = torch.tensor(zero, dtype=dtype)

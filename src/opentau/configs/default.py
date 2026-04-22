@@ -160,6 +160,12 @@ class DatasetMixtureConfig:
             ``speed``, ``mistake``, and ``quality``. Only rolled when
             ``metadata_drop_all_prob`` did not fire. Must be in ``[0, 1]``.
             Defaults to 0.05.
+        val_enable_optional_key_dropout: Whether to apply the five
+            ``*_drop_prob`` rolls above to the validation split. Defaults to
+            ``False`` — validation evaluates on un-masked samples so metrics
+            aren't polluted by training-time augmentation. Subgoal *frame*
+            sampling (end-of-segment vs. uniform in the next 4s) stays active
+            either way; only the masking logic is gated.
 
     Note:
         Dropout rolls use the default torch RNG. PyTorch DataLoader workers
@@ -203,6 +209,10 @@ class DatasetMixtureConfig:
     response_drop_prob: float = 0.3
     metadata_drop_all_prob: float = 0.15
     metadata_drop_each_prob: float = 0.05
+    # Whether the above dropout rolls also fire on the validation split.
+    # Default keeps validation deterministic-ish (no masking); subgoal frame
+    # selection stays random either way.
+    val_enable_optional_key_dropout: bool = False
 
     def __post_init__(self):
         """Validate dataset mixture configuration."""

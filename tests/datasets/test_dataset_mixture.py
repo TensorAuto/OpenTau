@@ -559,6 +559,8 @@ class TestDatasetMixtureOptionalKeyDropProbs:
         assert cfg.response_drop_prob == pytest.approx(0.3)
         assert cfg.metadata_drop_all_prob == pytest.approx(0.15)
         assert cfg.metadata_drop_each_prob == pytest.approx(0.05)
+        # Validation dropout is OFF by default — metrics stay un-masked.
+        assert cfg.val_enable_optional_key_dropout is False
 
     @pytest.mark.parametrize("field", DROP_PROB_FIELDS)
     def test_rejects_above_one(self, field):

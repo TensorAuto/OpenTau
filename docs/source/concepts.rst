@@ -202,6 +202,19 @@ for reproducibility.
      - Per-field independent mask roll for each of ``speed``,
        ``mistake``, ``quality``. Only rolled when the shared drop did
        not fire.
+   * - ``val_enable_optional_key_dropout``
+     - ``False``
+     - Whether the five drop rolls above also fire on the **validation**
+       split. Default is ``False`` so validation metrics aren't
+       artificially noisy. Set to ``True`` if you want the validation
+       distribution to match training. Subgoal *frame* selection
+       (end-of-segment vs. uniform in the next 4 s) stays random either
+       way — only the masking logic is gated.
+
+``make_dataset`` enforces this by giving the validation subset its own
+shallow-copied dataset instance with ``enable_optional_key_dropout``
+flipped accordingly; the underlying ``meta`` / ``hf_dataset`` objects
+are still shared with the training subset, so the extra copy is cheap.
 
 Legacy datasets that have not been passed through
 :mod:`opentau.scripts.attach_metadata` still load: every optional key
