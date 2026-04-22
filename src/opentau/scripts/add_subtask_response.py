@@ -26,12 +26,12 @@ If a subtask JSON is missing for an episode a warning is emitted and the
 Example::
 
     python src/opentau/scripts/add_subtask_response.py \
-        --config_path configs/examples/pi05_subtask.json
+        --config_path configs/examples/add_subtask_response.json
 """
 
 import json
 import logging
-import warnings
+import os
 from pathlib import Path
 
 import pyarrow as pa
@@ -46,9 +46,9 @@ from opentau.datasets.utils import (
     load_info,
     write_info,
 )
+from opentau.utils.utils import init_logging
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 
 def _get_parquet_path(root: Path, data_path_template: str, ep_index: int, chunks_size: int) -> Path:
@@ -57,7 +57,7 @@ def _get_parquet_path(root: Path, data_path_template: str, ep_index: int, chunks
 
 
 def _build_response_array(
-    subtasks: list[dict],
+    subtasks: list[dict[str, float | str]],
     fps: int,
     episode_length: int,
     episode_index: int,
@@ -76,22 +76,24 @@ def _build_response_array(
     subtasks = sorted(subtasks, key=lambda s: s["time"])
 
     for i, entry in enumerate(subtasks):
-        start_frame = int(entry["time"] * fps)
+        start_frame = round(entry["time"] * fps)
         if start_frame >= episode_length:
-            warnings.warn(
-                f"Episode {episode_index}: subtask '{entry['subtask']}' starts at frame "
-                f"{start_frame} which is beyond episode length {episode_length}; skipping.",
-                stacklevel=2,
+            logger.warning(
+                "Episode %d: subtask '%s' starts at frame %d which is beyond episode length %d; skipping.",
+                episode_index,
+                entry["subtask"],
+                start_frame,
+                episode_length,
             )
             continue
 
         if i + 1 < len(subtasks):
-            end_frame = min(int(subtasks[i + 1]["time"] * fps), episode_length)
+            end_frame = min(round(subtasks[i + 1]["time"] * fps), episode_length)
         else:
             end_frame = episode_length
 
-        for f in range(start_frame, end_frame):
-            responses[f] = entry["subtask"]
+        if end_frame > start_frame:
+            responses[start_frame:end_frame] = [entry["subtask"]] * (end_frame - start_frame)
 
     return responses
 
@@ -133,31 +135,30 @@ def _process_dataset(root: Path) -> None:
         parquet_path = _get_parquet_path(root, data_path_template, ep_index, chunks_size)
 
         if not parquet_path.is_file():
-            warnings.warn(
-                f"Episode {ep_index}: parquet file not found at {parquet_path}; skipping.", stacklevel=2
-            )
+            logger.warning("Episode %d: parquet file not found at %s; skipping.", ep_index, parquet_path)
             continue
 
         subtask_file = root / subtask_path_template.format(episode_index=ep_index)
 
         if subtask_file.is_file():
             with open(subtask_file) as f:
-                subtasks: list[dict] = json.load(f)
+                subtasks: list[dict[str, float | str]] = json.load(f)
             responses = _build_response_array(subtasks, fps, ep_length, ep_index)
         else:
-            warnings.warn(
-                f"Episode {ep_index}: subtask file not found at {subtask_file}; "
-                "filling response with empty strings.",
-                stacklevel=2,
+            logger.warning(
+                "Episode %d: subtask file not found at %s; filling response with empty strings.",
+                ep_index,
+                subtask_file,
             )
             responses = [""] * ep_length
 
         table = pq.read_table(parquet_path)
         if table.num_rows != ep_length:
-            warnings.warn(
-                f"Episode {ep_index}: parquet has {table.num_rows} rows but "
-                f"episodes.jsonl reports length {ep_length}. Using parquet row count.",
-                stacklevel=2,
+            logger.warning(
+                "Episode %d: parquet has %d rows but episodes.jsonl reports length %d. Using parquet row count.",
+                ep_index,
+                table.num_rows,
+                ep_length,
             )
             if len(responses) < table.num_rows:
                 responses.extend([""] * (table.num_rows - len(responses)))
@@ -167,12 +168,22 @@ def _process_dataset(root: Path) -> None:
         response_col = pa.array(responses, type=pa.string())
 
         if "response" in table.column_names:
+            logger.warning(
+                "Episode %d: overwriting existing 'response' column in %s.", ep_index, parquet_path
+            )
             col_idx = table.schema.get_field_index("response")
             table = table.set_column(col_idx, "response", response_col)
         else:
             table = table.append_column("response", response_col)
 
-        pq.write_table(table, parquet_path)
+        tmp_path = parquet_path.with_suffix(parquet_path.suffix + ".tmp")
+        try:
+            pq.write_table(table, tmp_path)
+            os.replace(tmp_path, parquet_path)
+        except Exception:
+            if tmp_path.exists():
+                tmp_path.unlink()
+            raise
 
     if "response" not in info.get("features", {}):
         info.setdefault("features", {})["response"] = {
@@ -189,6 +200,8 @@ def _process_dataset(root: Path) -> None:
 @parser.wrap()
 def add_subtask_response(cfg: DatasetMixtureConfig) -> None:
     """Add subtask response column to all datasets in the mixture config."""
+    init_logging()
+
     if not cfg.datasets:
         raise ValueError("No datasets specified in the config.")
 
