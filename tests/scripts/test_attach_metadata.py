@@ -30,9 +30,7 @@ from opentau.scripts.attach_metadata import (
     _update_info_json_features,
 )
 
-# ---------------------------------------------------------------------------
 # Fixtures
-# ---------------------------------------------------------------------------
 
 
 def _minimal_meta(episode_lengths: dict[int, int]) -> SimpleNamespace:
@@ -71,9 +69,7 @@ def _write_json(tmp_path: Path, payload) -> Path:
     return path
 
 
-# ---------------------------------------------------------------------------
 # Validation tests
-# ---------------------------------------------------------------------------
 
 
 class TestValidation:
@@ -154,9 +150,7 @@ class TestValidation:
             _load_and_validate_annotations(_write_json(tmp_path, ann), two_episode_meta)
 
 
-# ---------------------------------------------------------------------------
 # Per-frame column builders
-# ---------------------------------------------------------------------------
 
 
 class TestPerFrameColumns:
@@ -194,9 +188,7 @@ class TestPerFrameColumns:
         assert m == ["memory0", "memory1", "memory2", "memory3"]
 
 
-# ---------------------------------------------------------------------------
 # info.json update
-# ---------------------------------------------------------------------------
 
 
 class TestInfoJsonUpdate:
@@ -225,9 +217,7 @@ class TestInfoJsonUpdate:
         assert (root / INFO_PATH).read_text() == first
 
 
-# ---------------------------------------------------------------------------
 # episodes.jsonl update
-# ---------------------------------------------------------------------------
 
 
 class TestEpisodesJsonlUpdate:
@@ -268,9 +258,7 @@ class TestEpisodesJsonlUpdate:
         assert by_ep[7]["segments"] == [0]
 
 
-# ---------------------------------------------------------------------------
 # Integration (slow, real HF download of lerobot/droid_100 @ v2.1)
-# ---------------------------------------------------------------------------
 
 
 def _synthesize_annotations(episodes: dict[int, dict]) -> list[dict]:

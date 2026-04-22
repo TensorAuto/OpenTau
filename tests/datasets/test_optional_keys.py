@@ -111,9 +111,7 @@ def _raw_item(dataset: _DummyBaseDataset) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
 # Legacy path: no _raw fields attached → all optional keys pad out.
-# ---------------------------------------------------------------------------
 
 
 class TestLegacyNoAnnotations:
@@ -135,9 +133,7 @@ class TestLegacyNoAnnotations:
             assert standard_item[f"subgoal{k}_is_pad"].item() is True
 
 
-# ---------------------------------------------------------------------------
 # All-probabilities-zero path: every annotated field flows through.
-# ---------------------------------------------------------------------------
 
 
 class TestAllProbsZero:
@@ -170,9 +166,7 @@ class TestAllProbsZero:
         assert standard_item["response_is_pad"].item() is False
 
 
-# ---------------------------------------------------------------------------
 # Force each probability to 1.0 individually.
-# ---------------------------------------------------------------------------
 
 
 class TestForcedDropouts:
@@ -245,9 +239,7 @@ class TestForcedDropouts:
             assert standard_item[f"{k}_is_pad"].item() is True
 
 
-# ---------------------------------------------------------------------------
 # Default collate tolerates a batch with mixed _is_pad flags.
-# ---------------------------------------------------------------------------
 
 
 class TestDefaultCollate:
