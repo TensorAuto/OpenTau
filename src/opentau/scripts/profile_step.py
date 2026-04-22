@@ -141,9 +141,7 @@ def profile(cfg: TrainPipelineConfig):
 
         # Phase 2: forward (mirror update_policy lines 74-77)
         losses = policy.forward(batch)
-        loss = (
-            cfg.loss_weighting["MSE"] * losses["MSE"] + cfg.loss_weighting["CE"] * losses["CE"]
-        )
+        loss = cfg.loss_weighting["MSE"] * losses["MSE"] + cfg.loss_weighting["CE"] * losses["CE"]
         _sync()
         t2 = time.perf_counter()
 
@@ -190,8 +188,9 @@ def profile(cfg: TrainPipelineConfig):
     if accelerator.is_main_process:
         print("\n=========== profile_step results (rank 0) ===========")
         print(f"warmup={WARMUP_STEPS} measured={measure_steps} ranks={accelerator.num_processes}")
-        print(f"batch_size={cfg.batch_size} num_workers={cfg.num_workers} "
-              f"prefetch_factor={cfg.prefetch_factor}")
+        print(
+            f"batch_size={cfg.batch_size} num_workers={cfg.num_workers} prefetch_factor={cfg.prefetch_factor}"
+        )
         print(f"wall-clock over full loop: {loop_wall:.2f}s")
         print()
         print(f"{'phase':<16} {'stats':<60} {'share':>8}")
@@ -205,8 +204,7 @@ def profile(cfg: TrainPipelineConfig):
         print()
         steps_per_sec = 1.0 / total_mean if total_mean > 0 else 0.0
         samples_per_sec = steps_per_sec * cfg.batch_size * accelerator.num_processes
-        print(f"throughput: {steps_per_sec:.2f} steps/s, "
-              f"{samples_per_sec:.1f} global samples/s")
+        print(f"throughput: {steps_per_sec:.2f} steps/s, {samples_per_sec:.1f} global samples/s")
         print("=====================================================\n")
 
         # Also dump raw numbers for comparison across runs

@@ -34,8 +34,9 @@ min/max/mean. ``H2D`` timing moves the batch to the local GPU just like
 import logging
 import os
 import time
+from collections.abc import Mapping, Sequence
 from statistics import mean, median
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -103,9 +104,10 @@ def profile(cfg: TrainPipelineConfig):
 
     rank = accelerator.process_index if accelerator is not None else 0
     world_size = accelerator.num_processes if accelerator is not None else 1
-    is_main = (rank == 0)
+    is_main = rank == 0
     device = (
-        accelerator.device if accelerator is not None
+        accelerator.device
+        if accelerator is not None
         else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
     )
 
@@ -172,9 +174,9 @@ def profile(cfg: TrainPipelineConfig):
             return "n/a"
         xs_sorted = sorted(xs)
         return (
-            f"mean={mean(xs)*1000:7.2f}ms "
-            f"median={median(xs)*1000:7.2f}ms "
-            f"p95={xs_sorted[int(0.95*(len(xs_sorted)-1))]*1000:7.2f}ms"
+            f"mean={mean(xs) * 1000:7.2f}ms "
+            f"median={median(xs) * 1000:7.2f}ms "
+            f"p95={xs_sorted[int(0.95 * (len(xs_sorted) - 1))] * 1000:7.2f}ms"
         )
 
     local_fetch_mean = mean(fetch_times) if fetch_times else 0.0
@@ -198,12 +200,16 @@ def profile(cfg: TrainPipelineConfig):
     if is_main:
         bps_per_rank = [1.0 / t if t > 0 else 0.0 for t in gathered]
         print("\n=========== profile_dataloader summary (rank 0) ===========")
-        print(f"world_size={world_size} batch_size={cfg.batch_size} "
-              f"num_workers={cfg.num_workers} prefetch_factor={cfg.prefetch_factor}")
+        print(
+            f"world_size={world_size} batch_size={cfg.batch_size} "
+            f"num_workers={cfg.num_workers} prefetch_factor={cfg.prefetch_factor}"
+        )
         print(f"wall-clock over full loop: {loop_wall:.2f}s")
-        print(f"per-rank batches/s (min / mean / max): "
-              f"{min(bps_per_rank):.2f} / {sum(bps_per_rank)/len(bps_per_rank):.2f} / "
-              f"{max(bps_per_rank):.2f}")
+        print(
+            f"per-rank batches/s (min / mean / max): "
+            f"{min(bps_per_rank):.2f} / {sum(bps_per_rank) / len(bps_per_rank):.2f} / "
+            f"{max(bps_per_rank):.2f}"
+        )
         total_samples_per_sec = sum(bps_per_rank) * (observed_batch_size or cfg.batch_size)
         print(f"cluster-wide samples/s (ceiling, no model): {total_samples_per_sec:.1f}")
         print("===========================================================\n")
