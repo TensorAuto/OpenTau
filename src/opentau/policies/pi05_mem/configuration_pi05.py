@@ -73,17 +73,12 @@ class PI05MemConfig(PreTrainedConfig):
             When True the ``multi_modal_projector`` remains trainable, matching
             the semantics in ``pi05_continuous_state``. Defaults to True.
         train_expert_only: Whether to train only the expert module. Defaults to False.
-        paligemma_model_name: HuggingFace repo for PaliGemma weights (used to
-            initialize the SigLIP vision tower and multi_modal_projector).
-            Defaults to ``"google/paligemma-3b-pt-224"``.
-        num_video_tokens: Number of output tokens per camera stream. Must equal
-            256 (SigLIP at patch_size=14, image_size=224). Defaults to 256.
         spacetime_layer_stride: Every ``stride``-th SigLIP encoder layer gets
             the temporal self-attention sublayer added. Defaults to 4, matching
-            the MEM paper.
-        video_encoder_dtype: Torch dtype string for SigLIP weights
-            (e.g. "bfloat16", "float32"). Defaults to None, which uses bfloat16
-            on CUDA and float32 on CPU.
+            the MEM paper. The video encoder introduces no new learnable
+            parameters and shares ``paligemma.vision_tower`` /
+            ``multi_modal_projector`` with ``paligemma_with_expert``, so any
+            pi05 checkpoint loads directly with unchanged state_dict keys.
     """
 
     # Input / output structure.
@@ -147,10 +142,10 @@ class PI05MemConfig(PreTrainedConfig):
     train_expert_only: bool = False
 
     # Space-time SigLIP video encoder settings (MEM paper low-level memory).
-    paligemma_model_name: str = "google/paligemma-3b-pt-224"
-    num_video_tokens: int = 256
+    # The encoder wraps paligemma_with_expert's own vision_tower / projector
+    # by reference and adds zero new parameters, so there is no separate
+    # model-name / dtype field here.
     spacetime_layer_stride: int = 4
-    video_encoder_dtype: str | None = None
 
     # Training presets
     optimizer_lr: float = 2.5e-5
@@ -216,11 +211,6 @@ class PI05MemConfig(PreTrainedConfig):
                 f"The max delay must be less than or equal to the chunk size. Got {self.max_delay} for `max_delay` and {self.chunk_size} for `chunk_size`."
             )
 
-        if self.num_video_tokens != 256:
-            raise ValueError(
-                f"`num_video_tokens` must be 256 (SigLIP at patch_size=14, image_size=224 "
-                f"always emits 256 patch tokens), got {self.num_video_tokens}."
-            )
         if not isinstance(self.spacetime_layer_stride, int) or self.spacetime_layer_stride < 1:
             raise ValueError(
                 f"`spacetime_layer_stride` must be a positive integer, got {self.spacetime_layer_stride}."

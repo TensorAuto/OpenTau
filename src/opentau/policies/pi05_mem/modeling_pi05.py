@@ -793,18 +793,18 @@ class PI05MemFlowMatching(nn.Module):
         vlm_hidden_size = self.paligemma_with_expert.config.paligemma_config.text_config.hidden_size
 
         # Space-time SigLIP video encoder (MEM paper low-level memory).
-        encoder_dtype = getattr(torch, config.video_encoder_dtype) if config.video_encoder_dtype else None
+        # The encoder is a thin computational wrapper: it holds
+        # ``paligemma_with_expert``'s ``vision_tower`` / ``multi_modal_projector``
+        # by reference (no parameter duplication, no separate HF download) and
+        # mutates a few encoder layers in place to add temporal self-attention.
+        # Freezing and dtype-casting of these modules are already handled by
+        # ``PaliGemmaWithExpertModel``. The encoder introduces no new learnable
+        # parameters, so a regular pi05 checkpoint's state_dict loads directly.
         self.video_encoder = SpaceTimeSiglipVideoEncoder(
-            paligemma_model_name=config.paligemma_model_name,
+            vision_tower=self.paligemma_with_expert.paligemma.vision_tower,
+            multi_modal_projector=self.paligemma_with_expert.paligemma.multi_modal_projector,
             num_frames=config.n_obs_steps,
-            num_video_tokens=config.num_video_tokens,
-            vlm_hidden_size=vlm_hidden_size,
             spacetime_layer_stride=config.spacetime_layer_stride,
-            freeze_encoder=config.freeze_vision_encoder,
-            encoder_dtype=encoder_dtype,
-            # Skip the HF download when we're about to overwrite weights from
-            # an external checkpoint anyway.
-            load_pretrained=config.init_strategy != "no_init",
         )
 
         # Per-timestep state projection: each of the T state vectors becomes one token

@@ -42,32 +42,44 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 
 # Keep these tests reasonably fast: single batch element, few frames.
 _PALIGEMMA_REPO = "google/paligemma-3b-pt-224"
-# Fallback checkpoint for debugging if the PaliGemma download path is
-# unavailable on a given machine. Exposed as a constant so reviewers can flip
-# it at runtime; default stays on the public checkpoint.
-_POLICY_CHECKPOINT_DEBUG = "TensorAuto/pi05_base"  # noqa: F841 (documented for reviewers)
 
 
-def _build_encoder(
-    *, num_frames: int, freeze_encoder: bool, load_pretrained: bool = True, dtype=torch.bfloat16
-):
+def _load_paligemma(dtype=torch.bfloat16):
+    """Load PaliGemma once and return (full_model, vision_tower, projector).
+
+    The video encoder requires vision_tower + multi_modal_projector by
+    reference — we keep ``full_model`` alive because dropping it would
+    garbage-collect the submodules."""
+    full = PaliGemmaForConditionalGeneration.from_pretrained(_PALIGEMMA_REPO, torch_dtype=dtype)
+    full = full.to("cuda").eval()
+    return full, full.vision_tower, full.multi_modal_projector
+
+
+def _build_encoder(*, num_frames: int, freeze_encoder: bool, dtype=torch.bfloat16):
+    """Build a SpaceTimeSiglipVideoEncoder wrapping a fresh PaliGemma's
+    vision_tower + projector. Returns (encoder, full_paligemma, vision_tower,
+    projector) so the caller can keep references alive and assert on params."""
     from opentau.policies.pi05_mem.video_encoder import SpaceTimeSiglipVideoEncoder
 
+    full, vision_tower, projector = _load_paligemma(dtype=dtype)
+    if freeze_encoder:
+        for p in vision_tower.parameters():
+            p.requires_grad = False
     encoder = SpaceTimeSiglipVideoEncoder(
-        paligemma_model_name=_PALIGEMMA_REPO,
+        vision_tower=vision_tower,
+        multi_modal_projector=projector,
         num_frames=num_frames,
-        freeze_encoder=freeze_encoder,
-        encoder_dtype=dtype,
-        load_pretrained=load_pretrained,
-    )
-    return encoder.to(device="cuda")
+        spacetime_layer_stride=4,
+    ).to("cuda")
+    return encoder, full, vision_tower, projector
 
 
 @pytest.mark.gpu
 @pytest.mark.slow
 def test_forward_shape_and_dtype_cuda():
     """Shape and dtype plumbing on a realistic T=8 batch."""
-    encoder = _build_encoder(num_frames=8, freeze_encoder=True).eval()
+    encoder, *_ = _build_encoder(num_frames=8, freeze_encoder=True)
+    encoder.eval()
     print("[shape] device=cuda dtype=bfloat16 num_frames=8")
 
     video = torch.rand(2, 8, 3, 224, 224, device="cuda", dtype=torch.bfloat16)
@@ -81,15 +93,14 @@ def test_forward_shape_and_dtype_cuda():
 @pytest.mark.slow
 def test_single_frame_invariance_cuda():
     """With T=1 and e(T-1)=0, the video encoder must match the patched
-    ``PaliGemmaModel.get_image_features`` for the same single frame."""
-    encoder = _build_encoder(num_frames=1, freeze_encoder=True).eval()
-    print("[invariance] device=cuda dtype=bfloat16 num_frames=1")
+    ``PaliGemmaModel.get_image_features`` for the same single frame.
 
-    pg = (
-        PaliGemmaForConditionalGeneration.from_pretrained(_PALIGEMMA_REPO, torch_dtype=torch.bfloat16)
-        .to("cuda")
-        .eval()
-    )
+    The encoder and the reference model share the same vision_tower +
+    projector instances, so any drift is purely from the encoder's forward
+    logic (expected to match at bit-level precision at T=1)."""
+    encoder, pg, _, _ = _build_encoder(num_frames=1, freeze_encoder=True)
+    encoder.eval()
+    print("[invariance] device=cuda dtype=bfloat16 num_frames=1")
 
     img = torch.rand(1, 3, 224, 224, device="cuda", dtype=torch.bfloat16)
     with torch.no_grad():
@@ -104,16 +115,17 @@ def test_single_frame_invariance_cuda():
 @pytest.mark.gpu
 @pytest.mark.slow
 def test_gradient_freeze_cuda():
-    """``freeze_encoder=True`` freezes vision_tower only; multi_modal_projector
-    remains trainable."""
-    encoder = _build_encoder(num_frames=4, freeze_encoder=True)
-    print("[freeze] device=cuda dtype=bfloat16 freeze_encoder=True")
+    """Freezing ``vision_tower`` externally (via
+    ``p.requires_grad=False``) propagates through the encoder; the shared
+    ``multi_modal_projector`` stays trainable."""
+    encoder, _, vision_tower, projector = _build_encoder(num_frames=4, freeze_encoder=True)
+    print("[freeze] device=cuda dtype=bfloat16 freeze=external")
 
     video = torch.rand(1, 4, 3, 224, 224, device="cuda", dtype=torch.bfloat16)
     encoder(video).sum().backward()
 
-    assert all(p.grad is None for p in encoder.vision_tower.parameters()), "vision_tower must be frozen"
-    assert any(p.grad is not None for p in encoder.multi_modal_projector.parameters()), (
+    assert all(p.grad is None for p in vision_tower.parameters()), "vision_tower must be frozen"
+    assert any(p.grad is not None for p in projector.parameters()), (
         "multi_modal_projector must stay trainable"
     )
 
@@ -121,15 +133,16 @@ def test_gradient_freeze_cuda():
 @pytest.mark.gpu
 @pytest.mark.slow
 def test_gradient_unfreeze_cuda():
-    """``freeze_encoder=False`` lets gradients reach SigLIP."""
-    encoder = _build_encoder(num_frames=4, freeze_encoder=False)
-    print("[unfreeze] device=cuda dtype=bfloat16 freeze_encoder=False")
+    """Without external freezing, gradients reach SigLIP params through the
+    shared vision_tower."""
+    encoder, _, vision_tower, _ = _build_encoder(num_frames=4, freeze_encoder=False)
+    print("[unfreeze] device=cuda dtype=bfloat16 freeze=none")
 
     video = torch.rand(1, 4, 3, 224, 224, device="cuda", dtype=torch.bfloat16)
     encoder(video).sum().backward()
 
-    assert any(p.grad is not None for p in encoder.vision_tower.parameters()), (
-        "vision_tower should receive gradients when freeze_encoder=False"
+    assert any(p.grad is not None for p in vision_tower.parameters()), (
+        "vision_tower should receive gradients when not externally frozen"
     )
 
 
@@ -137,9 +150,9 @@ def test_gradient_unfreeze_cuda():
 @pytest.mark.slow
 def test_causality_smoke_cuda():
     """Perturbing the current frame (last slot) must dominate over perturbing
-    the oldest frame (first slot). Exact ratio depends on pretrained weights;
-    we require current-frame dominance by at least 5x in L2 norm."""
-    encoder = _build_encoder(num_frames=4, freeze_encoder=True).eval()
+    the oldest frame (first slot). Exact ratio depends on pretrained weights."""
+    encoder, *_ = _build_encoder(num_frames=4, freeze_encoder=True)
+    encoder.eval()
     print("[causality] device=cuda dtype=bfloat16 num_frames=4")
 
     torch.manual_seed(0)

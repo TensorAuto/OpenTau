@@ -39,14 +39,7 @@ class TestPI05MemConfig:
         assert config.history_interval is None
         assert config.max_state_dim == 32
         assert config.max_action_dim == 32
-        assert config.video_encoder_dtype is None
-        assert config.paligemma_model_name == "google/paligemma-3b-pt-224"
-        assert config.num_video_tokens == 256
         assert config.spacetime_layer_stride == 4
-
-    def test_invalid_num_video_tokens(self):
-        with pytest.raises(ValueError, match="num_video_tokens"):
-            PI05MemConfig(num_video_tokens=128)
 
     def test_invalid_spacetime_layer_stride(self):
         with pytest.raises(ValueError, match="spacetime_layer_stride"):
@@ -377,19 +370,50 @@ class TestTemporalSinusoidalPE:
 class TestSpaceTimeSiglipVideoEncoder:
     """CPU-only smoke tests for SpaceTimeSiglipVideoEncoder.
 
-    Use ``load_pretrained=False`` to avoid a 3B-parameter HuggingFace download
-    in CI. The pretrained-weight path is exercised in ``test_pi05_mem_gpu.py``.
+    The encoder takes ``vision_tower`` + ``multi_modal_projector`` by
+    reference; the tests build small randomly-initialized SigLIP / projector
+    pairs directly from ``PaliGemmaConfig`` so no HF download is needed.
     """
+
+    @staticmethod
+    def _build_siglip_and_projector():
+        """Construct a fresh, randomly-initialized SigLIP + projector pair
+        with the same config PaliGemma uses."""
+        from transformers import PaliGemmaConfig, SiglipVisionConfig, SiglipVisionModel
+        from transformers.models.paligemma.modeling_paligemma import (
+            PaliGemmaMultiModalProjector,
+        )
+
+        vision_cfg_dict = {
+            "hidden_size": 1152,
+            "intermediate_size": 4304,
+            "model_type": "siglip_vision_model",
+            "num_attention_heads": 16,
+            "num_hidden_layers": 27,
+            "num_image_tokens": 256,
+            "patch_size": 14,
+            "image_size": 224,
+            "projection_dim": 2048,
+            "projector_hidden_act": "gelu_fast",
+            "vision_use_head": False,
+        }
+        vision_tower = SiglipVisionModel(SiglipVisionConfig(**vision_cfg_dict))
+        pali_cfg = PaliGemmaConfig(
+            vision_config=vision_cfg_dict,
+            text_config={"hidden_size": 2048, "model_type": "gemma", "vocab_size": 257152},
+        )
+        projector = PaliGemmaMultiModalProjector(pali_cfg)
+        return vision_tower, projector
 
     def _make_encoder(self, num_frames: int = 2, spacetime_stride: int = 4):
         from opentau.policies.pi05_mem.video_encoder import SpaceTimeSiglipVideoEncoder
 
+        vision_tower, projector = self._build_siglip_and_projector()
         return SpaceTimeSiglipVideoEncoder(
+            vision_tower=vision_tower,
+            multi_modal_projector=projector,
             num_frames=num_frames,
             spacetime_layer_stride=spacetime_stride,
-            freeze_encoder=False,
-            encoder_dtype=torch.float32,
-            load_pretrained=False,
         )
 
     def test_forward_shape(self):
@@ -402,14 +426,7 @@ class TestSpaceTimeSiglipVideoEncoder:
         assert out.dtype == torch.float32
 
     def test_wrong_num_frames_raises(self):
-        from opentau.policies.pi05_mem.video_encoder import SpaceTimeSiglipVideoEncoder
-
-        encoder = SpaceTimeSiglipVideoEncoder(
-            num_frames=4,
-            freeze_encoder=False,
-            encoder_dtype=torch.float32,
-            load_pretrained=False,
-        )
+        encoder = self._make_encoder(num_frames=4)
         encoder.eval()
         with torch.no_grad(), pytest.raises(ValueError, match="frames"):
             encoder(torch.rand(1, 2, 3, 224, 224))
@@ -420,29 +437,11 @@ class TestSpaceTimeSiglipVideoEncoder:
         with torch.no_grad(), pytest.raises(ValueError, match="5D"):
             encoder(torch.rand(2, 3, 224, 224))
 
-    def test_num_video_tokens_must_be_256(self):
-        from opentau.policies.pi05_mem.video_encoder import SpaceTimeSiglipVideoEncoder
-
-        with pytest.raises(ValueError, match="num_video_tokens"):
-            SpaceTimeSiglipVideoEncoder(
-                num_video_tokens=128,
-                load_pretrained=False,
-            )
-
     def test_wrapped_layer_count(self):
         """Verify every ``stride``-th layer (1-indexed from the Nth) is wrapped."""
-        from opentau.policies.pi05_mem.video_encoder import (
-            SpaceTimeEncoderLayerWrapper,
-            SpaceTimeSiglipVideoEncoder,
-        )
+        from opentau.policies.pi05_mem.video_encoder import SpaceTimeEncoderLayerWrapper
 
-        encoder = SpaceTimeSiglipVideoEncoder(
-            num_frames=2,
-            spacetime_layer_stride=4,
-            freeze_encoder=False,
-            encoder_dtype=torch.float32,
-            load_pretrained=False,
-        )
+        encoder = self._make_encoder(num_frames=2, spacetime_stride=4)
         layers = encoder.vision_tower.vision_model.encoder.layers
         wrapped_indices = [
             i for i, layer in enumerate(layers) if isinstance(layer, SpaceTimeEncoderLayerWrapper)
@@ -450,71 +449,62 @@ class TestSpaceTimeSiglipVideoEncoder:
         # 27 SigLIP layers; every 4th starting at index 3 -> [3, 7, 11, 15, 19, 23]
         assert wrapped_indices == [3, 7, 11, 15, 19, 23]
 
-    def test_freeze_encoder_freezes_vision_tower_only(self):
-        """``freeze_encoder=True`` freezes SigLIP but leaves multi_modal_projector trainable."""
+    def test_state_dict_keys_match_vanilla_siglip(self):
+        """The wrapped vision_tower's state_dict must have identical keys to
+        an unwrapped SigLIP. This guarantees that a pi05 checkpoint loads
+        without key remapping."""
+        from transformers import SiglipVisionModel
+
+        vision_tower, projector = self._build_siglip_and_projector()
+        reference_keys = set(SiglipVisionModel(vision_tower.config).state_dict().keys())
+
         from opentau.policies.pi05_mem.video_encoder import SpaceTimeSiglipVideoEncoder
 
-        encoder = SpaceTimeSiglipVideoEncoder(
-            num_frames=2,
-            freeze_encoder=True,
-            encoder_dtype=torch.float32,
-            load_pretrained=False,
+        SpaceTimeSiglipVideoEncoder(
+            vision_tower=vision_tower,
+            multi_modal_projector=projector,
+            num_frames=4,
+            spacetime_layer_stride=4,
         )
-        # Vision tower params must be frozen.
-        for p in encoder.vision_tower.parameters():
-            assert not p.requires_grad
-        # Multi-modal projector stays trainable.
-        for p in encoder.multi_modal_projector.parameters():
-            assert p.requires_grad
+        wrapped_keys = set(vision_tower.state_dict().keys())
+        assert wrapped_keys == reference_keys, (
+            f"state_dict keys diverged; extra in wrapped: {wrapped_keys - reference_keys}, "
+            f"missing from wrapped: {reference_keys - wrapped_keys}"
+        )
 
     def test_single_frame_invariance_structural(self):
         """At T=1 the wrapper must short-circuit: byte-identical output to a
-        stride-999 (no-wrapping) encoder with the same underlying weights.
+        stride-999 (no-wrapping) encoder sharing the exact same underlying
+        weights."""
+        import copy
 
-        This is the paper's single-frame invariance claim, tested without
-        pretrained weights by sharing state dicts between the two encoders.
-        """
         from opentau.policies.pi05_mem.video_encoder import SpaceTimeSiglipVideoEncoder
 
         torch.manual_seed(0)
+        vision_tower, projector = self._build_siglip_and_projector()
+        # Deep-copy so the two encoders have independent-but-identical weights;
+        # otherwise wrapping mutates the shared vision_tower.
+        vt_no_st = copy.deepcopy(vision_tower)
+        proj_no_st = copy.deepcopy(projector)
+        vt_st = vision_tower
+        proj_st = projector
+
         enc_no_st = SpaceTimeSiglipVideoEncoder(
+            vision_tower=vt_no_st,
+            multi_modal_projector=proj_no_st,
             num_frames=1,
-            spacetime_layer_stride=999,  # > 27 layers -> no wrapping
-            freeze_encoder=False,
-            encoder_dtype=torch.float32,
-            load_pretrained=False,
+            spacetime_layer_stride=999,  # > 27 -> no layers wrapped
         ).eval()
         enc_st = SpaceTimeSiglipVideoEncoder(
+            vision_tower=vt_st,
+            multi_modal_projector=proj_st,
             num_frames=1,
-            spacetime_layer_stride=4,
-            freeze_encoder=False,
-            encoder_dtype=torch.float32,
-            load_pretrained=False,
+            spacetime_layer_stride=4,  # 6 layers wrapped
         ).eval()
-        # Copy the no-st encoder's weights into the st encoder. With wrapping,
-        # the wrapped layers expose their params under `.base_layer.` keys,
-        # but load_state_dict(..., strict=False) handles the mismatch by only
-        # loading matching keys; the unmatched `.base_layer.` keys stay at
-        # their freshly-initialized values. To avoid that, we load via the
-        # remapped keys explicitly.
-        src_sd = enc_no_st.state_dict()
-        dst_sd = enc_st.state_dict()
-        remapped = {}
-        for k, v in src_sd.items():
-            # Layer indices 3, 7, ... are wrapped in enc_st, so rename keys
-            # like "vision_tower.vision_model.encoder.layers.3.xxx" ->
-            # "vision_tower.vision_model.encoder.layers.3.base_layer.xxx".
-            new_k = k
-            for i in range(3, 27, 4):
-                prefix = f"vision_tower.vision_model.encoder.layers.{i}."
-                if k.startswith(prefix):
-                    new_k = k.replace(prefix, prefix + "base_layer.", 1)
-                    break
-            if new_k in dst_sd:
-                remapped[new_k] = v
-        missing = set(dst_sd) - set(remapped)
-        assert not missing, f"unmapped params: {sorted(missing)[:5]}..."
-        enc_st.load_state_dict(remapped, strict=True)
+
+        # With the current design, state_dict keys are identical between the
+        # two — adopt-submodules wrapping doesn't introduce .base_layer. keys.
+        assert set(vt_no_st.state_dict().keys()) == set(vt_st.state_dict().keys())
 
         video = torch.rand(1, 1, 3, 224, 224)
         with torch.no_grad():
