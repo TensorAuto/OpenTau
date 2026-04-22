@@ -470,8 +470,8 @@ class PI05Policy(PreTrainedPolicy):
                 new_key = key.replace("action_time_mlp_in.", "time_mlp_in.")
             elif key.startswith("action_time_mlp_out."):
                 new_key = key.replace("action_time_mlp_out.", "time_mlp_out.")
-            if "state_proj." in key and model_config.state_type == "discrete":
-                logging.info(f"Skipping state_proj key in discrete state mode: {key}")
+            if key.startswith("state_proj.") and model_config.state_type == "discrete":
+                logging.warning(f"Skipping state_proj key in discrete state mode: {key}")
                 continue
 
             # Handle vision tower embedding layer potential differences
