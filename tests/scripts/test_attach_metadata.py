@@ -405,6 +405,26 @@ def test_attach_metadata_end_to_end_droid_100(tmp_path, dataset_config, train_pi
             print(f"[diagnostic] call-site type(self_obj).__module__ = {type(self_obj).__module__}")
             type_fps = type(self_obj).__dict__.get("fps")
             print(f"[diagnostic] call-site type(self_obj).__dict__['fps'] = {type_fps!r}")
+            if isinstance(type_fps, property) and type_fps.fget is not None:
+                fget = type_fps.fget
+                print(
+                    "[diagnostic]   fget:",
+                    getattr(fget, "__qualname__", fget),
+                    "from",
+                    getattr(fget, "__module__", "?"),
+                )
+                code = getattr(fget, "__code__", None)
+                if code is not None:
+                    print(f"[diagnostic]   fget code file: {code.co_filename}:{code.co_firstlineno}")
+                import inspect as _inspect2
+
+                try:
+                    src = _inspect2.getsource(fget)
+                    print("[diagnostic]   fget source:")
+                    for line in src.splitlines():
+                        print(f"[diagnostic]     {line}")
+                except OSError:
+                    print("[diagnostic]   (source unavailable)")
             # Walk MRO and show where fps comes from
             for cls in type(self_obj).__mro__:
                 if "fps" in cls.__dict__:
