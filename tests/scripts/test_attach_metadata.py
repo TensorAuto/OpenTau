@@ -391,6 +391,26 @@ def test_attach_metadata_end_to_end_droid_100(tmp_path, dataset_config, train_pi
     )
     print("[diagnostic] after resolve_delta_timestamps, ds_meta.info['fps']:", ds_meta.info["fps"])
 
+    # Instrument check so we can print self.* state right at the failure
+    def _instrumented_check(timestamps, episode_indices, ep_data_index, fps, tolerance_s, *a, **kw):
+        import inspect as _inspect
+
+        frame = _inspect.currentframe().f_back
+        self_obj = frame.f_locals.get("self")
+        if self_obj is not None:
+            print(f"[diagnostic] call-site self.fps = {self_obj.fps}")
+            print(f"[diagnostic] call-site type(self.meta) = {type(self_obj.meta).__name__}")
+            print(f"[diagnostic] call-site self.meta.__class__.__module__ = {type(self_obj.meta).__module__}")
+            print(f"[diagnostic] call-site self.meta.info['fps'] = {self_obj.meta.info['fps']}")
+            print(f"[diagnostic] call-site self.meta.fps = {self_obj.meta.fps}")
+            print(f"[diagnostic] call-site id(self.meta) = {id(self_obj.meta)}")
+            print(f"[diagnostic] call-site self.meta.info id = {id(self_obj.meta.info)}")
+        print(f"[diagnostic] check_timestamps_sync called with fps={fps}, tol={tolerance_s}")
+        return orig_check(timestamps, episode_indices, ep_data_index, fps, tolerance_s, *a, **kw)
+
+    _utils.check_timestamps_sync = _instrumented_check
+    _ld.check_timestamps_sync = _instrumented_check
+
     src_ds = LeRobotDataset(
         train_pipeline_config,
         dataset_config.repo_id,
