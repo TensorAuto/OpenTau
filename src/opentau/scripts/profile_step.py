@@ -11,12 +11,19 @@
 Phase-1 diagnostic for the "low GPU utilization" investigation. Mirrors
 ``opentau/scripts/train.py`` setup (Accelerator + DeepSpeed, same config
 parser, same dataset/policy/optimizer construction), then runs a short
-loop that splits wall-clock per step into four phases:
+loop that splits wall-clock per step into phases:
 
-  1. ``dataload_wait``  — time blocked on ``next(train_dl_iter)``
-  2. ``forward``        — ``policy.forward(batch)`` + loss combine
-  3. ``backward_step``  — ``accelerator.backward`` + grad clip + ``optimizer.step``
-  4. ``sync_gather``    — the 5 ``gather_for_metrics(...).item()`` calls
+  1. ``dataload_wait``    — time blocked on ``next(train_dl_iter)``
+  2. ``forward``          — ``policy.forward(batch)`` + loss combine
+  3. ``bwd``              — just ``accelerator.backward(loss)`` (includes
+                             DeepSpeed/DDP gradient reduce)
+  4. ``unscale_clip``     — ``unscale_gradients`` + ``clip_grad_norm_``
+  5. ``optim_step``       — ``optimizer.step()`` (includes ZeRO partition
+                             update + parameter all-gather)
+  6. ``zero_grad_sched``  — ``optimizer.zero_grad()`` + scheduler step
+  7. ``backward_step``    — sum of phases 3–6 (same label as before for
+                             backwards-compatible comparisons)
+  8. ``sync_gather``      — the 5 ``gather_for_metrics(...).item()`` calls
 
 All ranks call ``torch.cuda.synchronize()`` at phase boundaries so the
 reported times include collective + H2D sync costs. Only rank 0 prints.
@@ -146,12 +153,23 @@ def profile(cfg: TrainPipelineConfig):
         _sync()
         t2 = time.perf_counter()
 
-        # Phase 3: backward + step (lines 79-92)
+        # Phase 3: backward + step (lines 79-92), split into fine phases so
+        # we can tell compute-bound backward apart from collective/optimizer
+        # time.
         accelerator.backward(loss)
+        _sync()
+        t3a = time.perf_counter()
+
         accelerator.unscale_gradients(optimizer=optimizer)
         if accelerator.sync_gradients:
             accelerator.clip_grad_norm_(policy.parameters(), cfg.optimizer.grad_clip_norm)
+        _sync()
+        t3b = time.perf_counter()
+
         optimizer.step()
+        _sync()
+        t3c = time.perf_counter()
+
         optimizer.zero_grad()
         if lr_scheduler is not None:
             lr_scheduler.step()
@@ -172,6 +190,10 @@ def profile(cfg: TrainPipelineConfig):
         if measuring:
             phases["dataload_wait"].append(t1 - t0)
             phases["forward"].append(t2 - t1)
+            phases["bwd"].append(t3a - t2)
+            phases["unscale_clip"].append(t3b - t3a)
+            phases["optim_step"].append(t3c - t3b)
+            phases["zero_grad_sched"].append(t3 - t3c)
             phases["backward_step"].append(t3 - t2)
             phases["sync_gather"].append(t4 - t3)
             phases["total"].append(t4 - t0)
@@ -197,10 +219,26 @@ def profile(cfg: TrainPipelineConfig):
         print(f"{'phase':<16} {'stats':<60} {'share':>8}")
         print("-" * 90)
         total_mean = mean(phases["total"]) if phases["total"] else 0.0
-        for key in ["dataload_wait", "forward", "backward_step", "sync_gather", "total"]:
+        ordered_keys = [
+            "dataload_wait",
+            "forward",
+            "bwd",
+            "unscale_clip",
+            "optim_step",
+            "zero_grad_sched",
+            "backward_step",
+            "sync_gather",
+            "total",
+        ]
+        for key in ordered_keys:
             vals = phases[key]
             share = (mean(vals) / total_mean * 100.0) if vals and total_mean > 0 else 0.0
-            marker = "  <-- total" if key == "total" else f"{share:6.1f}%"
+            if key == "total":
+                marker = "  <-- total"
+            elif key == "backward_step":
+                marker = f"{share:6.1f}% (= bwd+unscale_clip+optim_step+zero_grad_sched)"
+            else:
+                marker = f"{share:6.1f}%"
             print(f"{key:<16} {_fmt_ms(vals):<60} {marker}")
         print()
         steps_per_sec = 1.0 / total_mean if total_mean > 0 else 0.0
