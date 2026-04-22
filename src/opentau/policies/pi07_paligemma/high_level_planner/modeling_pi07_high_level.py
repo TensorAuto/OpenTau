@@ -469,8 +469,11 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
 
         images, img_masks = self.prepare_images(batch)
         lang_tokens, lang_masks = self.prepare_language(batch)
+        metadata_tokens, metadata_masks = self.prepare_metadata(batch)
 
-        memory_tokens, response_tokens = self.model.sample_actions(images, img_masks, lang_tokens, lang_masks)
+        memory_tokens, response_tokens = self.model.sample_actions(
+            images, img_masks, lang_tokens, lang_masks, metadata_tokens, metadata_masks
+        )
 
         return memory_tokens, response_tokens
 
@@ -500,6 +503,10 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
             batch
         )  # in lang_masks we have True for real tokens and False for padded tokens
         # response prediction is to predict the response . It will attend to image and language inputs.
+
+        metadata_tokens, metadata_masks = self.prepare_metadata(
+            batch
+        )  # in metadata_masks we have True for real tokens and False for padded tokens
         response_tokens, response_masks = self.prepare_response(
             batch
         )  # in response_masks we have True for real tokens and False for padded tokens
@@ -517,6 +524,8 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
             response_masks,
             memory_tokens,
             memory_masks,
+            metadata_tokens,
+            metadata_masks,
         )
 
         mse_loss = losses["MSE"]
@@ -636,7 +645,7 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
         # using <eos> to separate each modality
         past_memory = batch["past_memory"]
         prompt = [
-            f"Task: {task}<eos>Past Memory: {past_mem}<eos>State: {state}<eos>Updated Memory:"
+            f"Task: {task}<eos>Past Memory: {past_mem}<eos>State: {state}<eos>"
             for task, past_mem, state in zip(tasks, past_memory, state, strict=False)
         ]
         tokenized_prompt = self.language_tokenizer.__call__(
@@ -651,6 +660,35 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
         lang_masks = tokenized_prompt["attention_mask"].to(device=device, dtype=torch.bool)
 
         return lang_tokens, lang_masks
+
+    def prepare_metadata(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+        """Tokenizes the metadata for training.
+
+        Wraps each metadata string with an ``<eos>`` suffix, then tokenizes and
+        pads to ``metadata_max_length``.
+        """
+
+        if "metadata" not in batch:
+            return None, None
+
+        if batch["metadata"] is None:
+            return None, None
+
+        device = batch["state"].device
+        metadata = batch["metadata"]
+        metadata_prompt = [f"{meta}<eos>" for meta in metadata]
+        tokenized_metadata = self.language_tokenizer.__call__(
+            metadata_prompt,
+            padding="max_length",
+            padding_side="right",
+            max_length=self.config.metadata_max_length,
+            return_tensors="pt",
+            truncation=True,
+        )
+        metadata_tokens = tokenized_metadata["input_ids"].to(device=device)
+        metadata_masks = tokenized_metadata["attention_mask"].to(device=device, dtype=torch.bool)
+
+        return metadata_tokens, metadata_masks
 
     def prepare_response(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
         """Tokenizes the target subtask response for training.
@@ -748,8 +786,9 @@ class PI07HighLevelPlannerModel(nn.Module):
         │     ┌─────────────┴──────────┐            │
         │     │       PaliGemma        │            │
         │     │  (autoregressive LM)   │            │
-        │     └▲──────▲────────▲───────┘            │
-        │      │      │        └── state (in prompt)│
+        │     └▲──────▲──────▲─────▲───┘            │
+        │      │      │      │     └── state (prompt│
+        │      │      │      └──── metadata         │
         │      │      └─────────── language tokens  │
         │      └────────────────── image(s)         │
         └───────────────────────────────────────────┘
@@ -825,16 +864,21 @@ class PI07HighLevelPlannerModel(nn.Module):
         response_masks: Tensor | None = None,
         memory_tokens: Tensor | None = None,
         memory_masks: Tensor | None = None,
+        metadata_tokens: Tensor | None = None,
+        metadata_masks: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Embeds and concatenates all prefix modalities for the transformer.
 
-        Embeds images with SigLIP and language/memory/response tokens with the
-        PaliGemma embedding layer. The concatenation order is:
-        ``[images | language | memory | response]``.
+        Embeds images with SigLIP and language/metadata/memory/response tokens
+        with the PaliGemma embedding layer. The concatenation order is:
+        ``[images | language | metadata | memory | response]``.
 
-        Image and language tokens use bidirectional (prefix) attention among
-        themselves (``att_mask=0``), while memory and response tokens use
-        causal attention (``att_mask=1``).
+        Attention pattern (via ``att_masks``):
+            - Image tokens: bidirectional (``0``).
+            - Language tokens: bidirectional (``0``), same block as images.
+            - Metadata tokens: new bidirectional block (``[1, 0, …, 0]``).
+            - Memory tokens: causal (``1`` each).
+            - Response tokens: causal (``1`` each).
 
         Args:
             images: List of image tensors, one per camera.
@@ -847,6 +891,9 @@ class PI07HighLevelPlannerModel(nn.Module):
             memory_tokens: Optional updated memory token IDs of shape
                 ``(B, memory_max_length)``. Provided during training.
             memory_masks: Optional boolean mask for memory tokens.
+            metadata_tokens: Optional metadata token IDs of shape
+                ``(B, metadata_max_length)``.
+            metadata_masks: Optional boolean mask for metadata tokens.
 
         Returns:
             A tuple ``(embs, pad_masks, att_masks)`` where:
@@ -894,6 +941,14 @@ class PI07HighLevelPlannerModel(nn.Module):
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
+        if metadata_tokens is not None:
+            metadata_emb = self.paligemma_with_expert.embed_language_tokens(metadata_tokens)
+            metadata_emb_dim = metadata_emb.shape[-1]
+            metadata_emb = metadata_emb * math.sqrt(metadata_emb_dim)
+            embs.append(metadata_emb)
+            pad_masks.append(metadata_masks)
+            att_masks += [1] + [0] * (metadata_emb.shape[1] - 1)
+
         if memory_tokens is not None:
             memory_emb = self.paligemma_with_expert.embed_language_tokens(memory_tokens)
             # Normalize memory language embeddings
@@ -938,13 +993,16 @@ class PI07HighLevelPlannerModel(nn.Module):
         response_masks: Tensor | None = None,
         memory_tokens: Tensor | None = None,
         memory_masks: Tensor | None = None,
+        metadata_tokens: Tensor | None = None,
+        metadata_masks: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """Training forward pass: embeds all modalities and computes CE losses.
 
-        The prefix sequence is ``[images | language | memory | response]``.
-        The model predicts memory tokens from the language context and response
-        tokens from the memory context, each via next-token prediction. Pad
-        tokens are masked out of both losses.
+        The prefix sequence is
+        ``[images | language | metadata | memory | response]``.
+        The model predicts memory tokens from the language/metadata context and
+        response tokens from the memory context, each via next-token
+        prediction.  Pad tokens are masked out of both losses.
 
         Args:
             images: List of image tensors, one per camera.
@@ -957,6 +1015,9 @@ class PI07HighLevelPlannerModel(nn.Module):
             memory_tokens: Updated memory token IDs
                 ``(B, memory_max_length)``.
             memory_masks: Boolean mask for memory tokens.
+            metadata_tokens: Optional metadata token IDs
+                ``(B, metadata_max_length)``.
+            metadata_masks: Optional boolean mask for metadata tokens.
 
         Returns:
             A dict with ``"MSE"`` (zero tensor, for interface compatibility)
@@ -972,6 +1033,8 @@ class PI07HighLevelPlannerModel(nn.Module):
             response_masks,
             memory_tokens,
             memory_masks,
+            metadata_tokens,
+            metadata_masks,
         )
 
         vlm_2d_attention_mask = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
@@ -1056,6 +1119,8 @@ class PI07HighLevelPlannerModel(nn.Module):
         img_masks: list[Tensor],
         lang_tokens: Tensor,
         lang_masks: Tensor,
+        metadata_tokens: Tensor | None = None,
+        metadata_masks: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Inference forward: autoregressively generates memory and subtask tokens.
 
@@ -1068,6 +1133,9 @@ class PI07HighLevelPlannerModel(nn.Module):
             img_masks: List of boolean masks for real vs. padded images.
             lang_tokens: Language token IDs ``(B, prompt_max_length)``.
             lang_masks: Boolean attention mask for language tokens.
+            metadata_tokens: Optional metadata token IDs
+                ``(B, metadata_max_length)``.
+            metadata_masks: Optional boolean mask for metadata tokens.
 
         Returns:
             A tuple ``(memory_tokens, response_tokens)`` where each is a
@@ -1079,7 +1147,12 @@ class PI07HighLevelPlannerModel(nn.Module):
         device = lang_tokens.device
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            metadata_tokens=metadata_tokens,
+            metadata_masks=metadata_masks,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1

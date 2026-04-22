@@ -27,20 +27,24 @@ from opentau.policies.pi07_paligemma.high_level_planner.modeling_pi07_high_level
 NUM_CAMERAS = 2
 SIGLIP_TOKENS_PER_CAMERA = 256
 PROMPT_MAX_LENGTH = 256
+METADATA_MAX_LENGTH = 52
 MEMORY_MAX_LENGTH = 52
 RESPONSE_MAX_LENGTH = 52
 MAX_STATE_DIM = 32
 
 # Token offsets for training prefix:
-#   images(512) | language(256) | memory(52) | response(52) = 872
+#   images(512) | language(256) | metadata(52) | memory(52) | response(52) = 924
 IMAGE_TOKENS = NUM_CAMERAS * SIGLIP_TOKENS_PER_CAMERA  # 512
 LANG_START = IMAGE_TOKENS  # 512
-MEMORY_START = LANG_START + PROMPT_MAX_LENGTH  # 768
-RESPONSE_START = MEMORY_START + MEMORY_MAX_LENGTH  # 820
-TRAIN_PREFIX_LEN = RESPONSE_START + RESPONSE_MAX_LENGTH  # 872
+METADATA_START = LANG_START + PROMPT_MAX_LENGTH  # 768
+MEMORY_START = METADATA_START + METADATA_MAX_LENGTH  # 820
+RESPONSE_START = MEMORY_START + MEMORY_MAX_LENGTH  # 872
+TRAIN_PREFIX_LEN = RESPONSE_START + RESPONSE_MAX_LENGTH  # 924
 
 # For inference: no memory or response tokens initially.
-INFER_PREFIX_LEN = IMAGE_TOKENS + PROMPT_MAX_LENGTH  # 768
+# images(512) | language(256) | metadata(52) = 820
+INFER_METADATA_START = IMAGE_TOKENS + PROMPT_MAX_LENGTH  # 768
+INFER_PREFIX_LEN = INFER_METADATA_START + METADATA_MAX_LENGTH  # 820
 
 
 class TestPI07HighLevelPlannerIntegration:
@@ -52,6 +56,7 @@ class TestPI07HighLevelPlannerIntegration:
             n_obs_steps=1,
             max_state_dim=MAX_STATE_DIM,
             prompt_max_length=PROMPT_MAX_LENGTH,
+            metadata_max_length=METADATA_MAX_LENGTH,
             memory_max_length=MEMORY_MAX_LENGTH,
             response_max_length=RESPONSE_MAX_LENGTH,
             normalization_mapping={
@@ -93,8 +98,9 @@ class TestPI07HighLevelPlannerIntegration:
         for i in range(1):
             # Image tokens should never be padded.
             assert torch.all(prefix_pad_masks[i, :IMAGE_TOKENS] == 1)
-            # Language, memory, response tokens can be padded at the end.
-            self._check_ones_before_zeros(prefix_pad_masks[i, LANG_START:MEMORY_START])
+            # Language, metadata, memory, response tokens can be padded at the end.
+            self._check_ones_before_zeros(prefix_pad_masks[i, LANG_START:METADATA_START])
+            self._check_ones_before_zeros(prefix_pad_masks[i, METADATA_START:MEMORY_START])
             self._check_ones_before_zeros(prefix_pad_masks[i, MEMORY_START:RESPONSE_START])
             self._check_ones_before_zeros(prefix_pad_masks[i, RESPONSE_START:TRAIN_PREFIX_LEN])
 
@@ -118,12 +124,11 @@ class TestPI07HighLevelPlannerIntegration:
     def _verify_vlm_attention_mask(self, vlm_attention_mask, prefix_pad_masks):
         """Verify the VLM attention mask for training.
 
-        Expected pattern:
-            - images + language (0..767): bidirectional (cumsum=0).
-            - memory (768..819): causal (cumsum=1..52).
-            - response (820..871): causal (cumsum=53..104).
-        Bidirectional tokens cannot attend to memory/response tokens.
-        Memory/response tokens can see all preceding non-padded tokens.
+        Expected pattern (cumsum progression):
+            - images + language: bidirectional (cumsum=0).
+            - metadata: bidirectional block ([1,0,...,0], cumsum=1).
+            - memory: causal ([1] each, cumsum=2..53).
+            - response: causal ([1] each, cumsum=54..105).
         """
         assert vlm_attention_mask.shape == (1, TRAIN_PREFIX_LEN, TRAIN_PREFIX_LEN)
         assert vlm_attention_mask.dtype == torch.bool
@@ -132,7 +137,8 @@ class TestPI07HighLevelPlannerIntegration:
             mask = vlm_attention_mask[i].cpu()
             pads = prefix_pad_masks[i].cpu()
 
-            n_lang = pads[LANG_START:MEMORY_START].sum().item()
+            n_lang = pads[LANG_START:METADATA_START].sum().item()
+            n_meta = pads[METADATA_START:MEMORY_START].sum().item()
             n_mem = pads[MEMORY_START:RESPONSE_START].sum().item()
             n_resp = pads[RESPONSE_START:TRAIN_PREFIX_LEN].sum().item()
 
@@ -140,8 +146,13 @@ class TestPI07HighLevelPlannerIntegration:
 
             # Zero out rows/cols for padded language tokens.
             lang_pad_start = LANG_START + n_lang
-            expected[lang_pad_start:MEMORY_START, :] = 0
-            expected[:, lang_pad_start:MEMORY_START] = 0
+            expected[lang_pad_start:METADATA_START, :] = 0
+            expected[:, lang_pad_start:METADATA_START] = 0
+
+            # Zero out rows/cols for padded metadata tokens.
+            meta_pad_start = METADATA_START + n_meta
+            expected[meta_pad_start:MEMORY_START, :] = 0
+            expected[:, meta_pad_start:MEMORY_START] = 0
 
             # Zero out rows/cols for padded memory tokens.
             mem_pad_start = MEMORY_START + n_mem
@@ -153,16 +164,20 @@ class TestPI07HighLevelPlannerIntegration:
             expected[resp_pad_start:TRAIN_PREFIX_LEN, :] = 0
             expected[:, resp_pad_start:TRAIN_PREFIX_LEN] = 0
 
-            # Bidirectional block (images + language) cannot attend to memory or response.
-            expected[:MEMORY_START, MEMORY_START:] = 0
+            # Core bidir (images + language) cannot attend to metadata, memory, or response.
+            expected[:METADATA_START, METADATA_START:] = 0
 
-            # Memory tokens: causal among themselves, can attend to images+language.
+            # Metadata: bidir among themselves, can see images+language.
+            # Cannot attend to memory or response.
+            expected[METADATA_START:MEMORY_START, MEMORY_START:] = 0
+
+            # Memory tokens: causal among themselves, can attend to images+language+metadata.
             mem_causal = torch.tril(torch.ones(n_mem, n_mem, dtype=torch.bool))
             expected[MEMORY_START : MEMORY_START + n_mem, MEMORY_START : MEMORY_START + n_mem] = mem_causal
             # Memory cannot attend to response tokens.
             expected[MEMORY_START:RESPONSE_START, RESPONSE_START:] = 0
 
-            # Response tokens: causal among themselves, can attend to images+language+memory.
+            # Response tokens: causal among themselves, can attend to everything before.
             resp_causal = torch.tril(torch.ones(n_resp, n_resp, dtype=torch.bool))
             expected[RESPONSE_START : RESPONSE_START + n_resp, RESPONSE_START : RESPONSE_START + n_resp] = (
                 resp_causal
@@ -192,6 +207,7 @@ class TestPI07HighLevelPlannerIntegration:
             "state": torch.randn(batch_size, MAX_STATE_DIM),
             "prompt": ["Pick up the red block"],
             "past_memory": ["Robot is near the table"],
+            "metadata": ["episode_id=42 robot=franka"],
             "memory": ["Robot is grasping the red block"],
             "response": ["Grasp the red block"],
         }
@@ -303,6 +319,7 @@ class TestPI07HighLevelPlannerIntegration:
             "state": batch_cuda["state"],
             "prompt": ["Pick up the red block"],
             "past_memory": ["Robot is near the table"],
+            "metadata": ["episode_id=42 robot=franka"],
         }
         memory_tokens, response_tokens = policy.sample_actions(infer_batch)
 
@@ -319,15 +336,34 @@ class TestPI07HighLevelPlannerIntegration:
         assert "last_prefix_pad_masks" in captured_infer
         assert "last_prefix_offsets" in captured_infer
 
-        # Initial VLM attention mask should be for inference prefix (images + language only).
+        # Initial VLM attention mask: images + language + metadata.
         assert captured_infer["vlm_2d_attention_mask"].shape == (1, INFER_PREFIX_LEN, INFER_PREFIX_LEN)
         assert captured_infer["vlm_2d_attention_mask"].dtype == torch.bool
 
-        # Initial prefix (images + language) should be fully bidirectional.
         init_pad = captured_infer["prefix_pad_masks"][0].cpu()
         init_mask = captured_infer["vlm_2d_attention_mask"][0].cpu()
-        expected_init = init_pad[:, None] & init_pad[None, :]
-        assert torch.all(init_mask == expected_init), "Inference prefix should be fully bidirectional"
+
+        n_meta_infer = init_pad[INFER_METADATA_START:INFER_PREFIX_LEN].sum().item()
+
+        expected_init = torch.ones(INFER_PREFIX_LEN, INFER_PREFIX_LEN, dtype=torch.bool)
+        # Zero out padded language columns/rows.
+        n_lang_infer = init_pad[LANG_START:INFER_METADATA_START].sum().item()
+        lang_pad_infer = LANG_START + n_lang_infer
+        expected_init[lang_pad_infer:INFER_METADATA_START, :] = 0
+        expected_init[:, lang_pad_infer:INFER_METADATA_START] = 0
+
+        # Zero out padded metadata columns/rows.
+        meta_pad_infer = INFER_METADATA_START + n_meta_infer
+        expected_init[meta_pad_infer:INFER_PREFIX_LEN, :] = 0
+        expected_init[:, meta_pad_infer:INFER_PREFIX_LEN] = 0
+
+        # Core bidir block (images + language) cannot attend to metadata.
+        expected_init[:INFER_METADATA_START, INFER_METADATA_START:] = 0
+
+        assert torch.all(init_mask == expected_init), (
+            f"Inference prefix attention mismatch.\n"
+            f"Diff indices: {(init_mask != expected_init).nonzero(as_tuple=False)[:20]}"
+        )
 
         # After autoregressive generation, prefix should have grown by memory + response tokens.
         final_prefix_len = INFER_PREFIX_LEN + MEMORY_MAX_LENGTH + RESPONSE_MAX_LENGTH

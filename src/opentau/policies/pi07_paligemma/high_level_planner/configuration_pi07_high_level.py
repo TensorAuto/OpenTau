@@ -62,6 +62,8 @@ class PI07HighLevelPlannerConfig(PreTrainedConfig):
             sequence. Defaults to 52.
         response_max_length: Maximum token length for the subtask response
             sequence. Defaults to 52.
+        metadata_max_length: Maximum token length for episode metadata
+            strings. Defaults to 52.
         dropout: Dropout rate applied in the transformer expert.
             Defaults to 0.1.
         init_strategy: Weight initialization strategy. One of ``"no_init"``,
@@ -109,6 +111,9 @@ class PI07HighLevelPlannerConfig(PreTrainedConfig):
 
     # Response Tokenizer
     response_max_length: int = 52
+
+    # Metadata Tokenizer
+    metadata_max_length: int = 52
 
     # Dropout
     dropout: float = 0.1
