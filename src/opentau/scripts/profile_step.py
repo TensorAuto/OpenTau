@@ -91,10 +91,14 @@ def _fmt_ms(seconds_list):
 def profile(cfg: TrainPipelineConfig):
     cfg.validate()
 
+    # Match train.py's default of find_unused_parameters=True, but allow opting
+    # out via env var. The kwarg is silently ignored under DeepSpeed, but under
+    # bare DDP it is active and adds its own per-step graph-walk cost.
+    find_unused = os.environ.get("FIND_UNUSED_PARAMS", "true").lower() == "true"
     accelerator_kwargs: dict[str, Any] = {
         "step_scheduler_with_optimizer": False,
         "split_batches": False,
-        "kwargs_handlers": [DistributedDataParallelKwargs(find_unused_parameters=True)],
+        "kwargs_handlers": [DistributedDataParallelKwargs(find_unused_parameters=find_unused)],
     }
     if cfg.gradient_accumulation_steps > 1:
         accelerator_kwargs["gradient_accumulation_steps"] = cfg.gradient_accumulation_steps
