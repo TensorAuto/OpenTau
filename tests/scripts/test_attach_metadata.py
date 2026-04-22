@@ -345,7 +345,55 @@ def test_attach_metadata_end_to_end_droid_100(tmp_path, dataset_config, train_pi
     print("[diagnostic] probe meta.root:", probe_meta.root)
     print("[diagnostic] probe disk info.json:", (probe_meta.root / "meta/info.json").read_text()[:400])
 
-    src_ds = make_dataset(dataset_config, train_pipeline_config)
+    # Monkey-patch check_timestamps_sync so we can inspect meta state right
+    # before it would raise. We also bypass make_dataset and construct
+    # LeRobotDataset manually to see each step.
+    import opentau.datasets.utils as _utils
+    from opentau.datasets.lerobot_dataset import LeRobotDataset
+
+    orig_check = _utils.check_timestamps_sync
+
+    def _instrumented_check(timestamps, episode_indices, ep_data_index, fps, tolerance_s, *a, **kw):
+        print(f"[diagnostic] check_timestamps_sync called with fps={fps}, tol={tolerance_s}")
+        return orig_check(timestamps, episode_indices, ep_data_index, fps, tolerance_s, *a, **kw)
+
+    _utils.check_timestamps_sync = _instrumented_check
+    # The module where it's used imports by name, so patch there too:
+    import opentau.datasets.lerobot_dataset as _ld
+
+    _ld.check_timestamps_sync = _instrumented_check
+
+    # Manual LeRobotDataset construction mirroring make_dataset.
+    ds_meta = __import__(
+        "opentau.datasets.lerobot_dataset", fromlist=["LeRobotDatasetMetadata"]
+    ).LeRobotDatasetMetadata(
+        dataset_config.repo_id, root=dataset_config.root, revision=dataset_config.revision
+    )
+    print("[diagnostic] make_dataset-style ds_meta.info['fps']:", ds_meta.info["fps"])
+    print("[diagnostic] make_dataset-style ds_meta.fps:", ds_meta.fps)
+
+    from opentau.datasets.factory import resolve_delta_timestamps
+
+    dt_mean, dt_std, dt_lower, dt_upper = resolve_delta_timestamps(
+        train_pipeline_config, dataset_config, ds_meta
+    )
+    print("[diagnostic] after resolve_delta_timestamps, ds_meta.info['fps']:", ds_meta.info["fps"])
+
+    src_ds = LeRobotDataset(
+        train_pipeline_config,
+        dataset_config.repo_id,
+        root=dataset_config.root,
+        episodes=dataset_config.episodes,
+        delta_timestamps=dt_mean,
+        delta_timestamps_std=dt_std,
+        delta_timestamps_lower=dt_lower,
+        delta_timestamps_upper=dt_upper,
+        revision=dataset_config.revision,
+        video_backend=dataset_config.video_backend,
+        image_resample_strategy=train_pipeline_config.dataset_mixture.image_resample_strategy,
+        vector_resample_strategy=train_pipeline_config.dataset_mixture.vector_resample_strategy,
+    )
+    print("[diagnostic] src_ds.meta type:", type(src_ds.meta).__name__)
     print("[diagnostic] src_ds.meta.info['fps']:", src_ds.meta.info["fps"])
     print("[diagnostic] src_ds.fps:", src_ds.fps)
     print("[diagnostic] src_ds.meta.root:", src_ds.meta.root)
