@@ -16,9 +16,11 @@
 """Configuration module for the PI05 Mem Policy.
 
 This module defines the ``PI05MemConfig`` class, which handles configuration
-parameters for the PI05 Mem variant. This variant replaces the SigLIP image
-encoder with a V-JEPA2 video encoder and processes temporal state sequences
-(one continuous token per timestep).
+parameters for the PI05 Mem variant. This variant extends the SigLIP image
+encoder from PaliGemma with space-time separable attention every
+``spacetime_layer_stride``-th layer (per the MEM paper's low-level memory
+architecture), and processes temporal state sequences (one continuous token
+per timestep).
 """
 
 import logging
@@ -39,15 +41,18 @@ from opentau.optim.schedulers import (
 class PI05MemConfig(PreTrainedConfig):
     """Configuration class for the PI05 Mem Policy.
 
-    This variant uses V-JEPA2 as a video encoder (replacing SigLIP) and projects
-    temporal state sequences into per-timestep continuous tokens in the VLM
-    embedding space.
+    This variant uses PaliGemma's SigLIP as a space-time video encoder: every
+    ``spacetime_layer_stride``-th ViT layer adds a causal temporal attention
+    over frames (reusing the layer's existing Q/K/V/O projections — no new
+    learnable parameters). Past-timestep tokens are dropped after the encoder
+    so the prefix matches a single-frame VLA's 256 image tokens.
 
     Args:
-        n_obs_steps: Number of temporal video frames passed to V-JEPA2 per forward call.
-            During training each sample has this many frames; during inference the
-            observation-history buffer (controlled by ``n_obs_history`` and
-            ``history_interval``) is stacked to produce exactly this many frames.
+        n_obs_steps: Number of temporal video frames passed to the video
+            encoder per forward call. During training each sample has this
+            many frames; during inference the observation-history buffer
+            (controlled by ``n_obs_history`` and ``history_interval``) is
+            stacked to produce exactly this many frames.
             Must equal ``n_obs_history`` when the latter is set.
         chunk_size: Size of the action chunk. The upper bound for n_action_steps. Defaults to 50.
         n_action_steps: Number of action steps to predict. Defaults to 50.
@@ -64,14 +69,21 @@ class PI05MemConfig(PreTrainedConfig):
         num_steps: Number of flow matching steps for decoding. Defaults to 10.
         init_strategy: Initialization strategy. Defaults to "full_he_init".
         attention_implementation: Attention implementation ("eager" or "fa2"). Defaults to "eager".
-        freeze_vision_encoder: Whether to freeze the V-JEPA2 encoder. Defaults to True.
+        freeze_vision_encoder: Whether to freeze the SigLIP vision tower.
+            When True the ``multi_modal_projector`` remains trainable, matching
+            the semantics in ``pi05_continuous_state``. Defaults to True.
         train_expert_only: Whether to train only the expert module. Defaults to False.
-        vjepa2_model_name: HuggingFace repo for V-JEPA2 weights. Defaults to "facebook/vjepa2-vitl-fpc64-256".
-        vjepa2_crop_size: Spatial resolution fed to V-JEPA2. Defaults to 224.
-        vjepa2_num_video_tokens: Number of output tokens after reduction (must match SigLIP's 256). Defaults to 256.
-        vjepa2_perceiver_heads: Number of attention heads in the Perceiver reducer. Defaults to 8.
-        vjepa2_dtype: Torch dtype string for V-JEPA2 weights (e.g. "bfloat16", "float32").
-            Defaults to None, which uses bfloat16 on CUDA and float32 on CPU.
+        paligemma_model_name: HuggingFace repo for PaliGemma weights (used to
+            initialize the SigLIP vision tower and multi_modal_projector).
+            Defaults to ``"google/paligemma-3b-pt-224"``.
+        num_video_tokens: Number of output tokens per camera stream. Must equal
+            256 (SigLIP at patch_size=14, image_size=224). Defaults to 256.
+        spacetime_layer_stride: Every ``stride``-th SigLIP encoder layer gets
+            the temporal self-attention sublayer added. Defaults to 4, matching
+            the MEM paper.
+        video_encoder_dtype: Torch dtype string for SigLIP weights
+            (e.g. "bfloat16", "float32"). Defaults to None, which uses bfloat16
+            on CUDA and float32 on CPU.
     """
 
     # Input / output structure.
@@ -84,7 +96,7 @@ class PI05MemConfig(PreTrainedConfig):
     # inference buffer keeps.  ``history_interval`` is the stride between those
     # frames.  Together they determine ``obs_buffer_size = (n_obs_history-1) *
     # history_interval + 1``.  Typically ``n_obs_history`` should equal
-    # ``n_obs_steps`` so the V-JEPA2 encoder sees the same number of frames at
+    # ``n_obs_steps`` so the video encoder sees the same number of frames at
     # training and inference time.
     # Populated from DatasetMixtureConfig during training if unset.
     n_obs_history: int | None = None
@@ -134,12 +146,11 @@ class PI05MemConfig(PreTrainedConfig):
     freeze_vision_encoder: bool = True
     train_expert_only: bool = False
 
-    # V-JEPA2 settings
-    vjepa2_model_name: str = "facebook/vjepa2-vitl-fpc64-256"
-    vjepa2_crop_size: int = 224
-    vjepa2_num_video_tokens: int = 256
-    vjepa2_perceiver_heads: int = 8
-    vjepa2_dtype: str | None = None
+    # Space-time SigLIP video encoder settings (MEM paper low-level memory).
+    paligemma_model_name: str = "google/paligemma-3b-pt-224"
+    num_video_tokens: int = 256
+    spacetime_layer_stride: int = 4
+    video_encoder_dtype: str | None = None
 
     # Training presets
     optimizer_lr: float = 2.5e-5
@@ -203,6 +214,16 @@ class PI05MemConfig(PreTrainedConfig):
         if self.max_delay > self.chunk_size:
             raise ValueError(
                 f"The max delay must be less than or equal to the chunk size. Got {self.max_delay} for `max_delay` and {self.chunk_size} for `chunk_size`."
+            )
+
+        if self.num_video_tokens != 256:
+            raise ValueError(
+                f"`num_video_tokens` must be 256 (SigLIP at patch_size=14, image_size=224 "
+                f"always emits 256 patch tokens), got {self.num_video_tokens}."
+            )
+        if not isinstance(self.spacetime_layer_stride, int) or self.spacetime_layer_stride < 1:
+            raise ValueError(
+                f"`spacetime_layer_stride` must be a positive integer, got {self.spacetime_layer_stride}."
             )
 
     def validate_features(self) -> None:

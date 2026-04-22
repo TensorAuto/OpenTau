@@ -14,7 +14,11 @@
 """
 PI05 Mem Policy Module.
 
-This module implements a variant of the π05 (Pi05) Vision-Language-Action Flow Model
-that uses V-JEPA2 as a video encoder (replacing SigLIP) and processes temporal state
-sequences, passing one continuous state token per timestep to the Gemma backbone.
+This module implements a variant of the π05 (Pi05) Vision-Language-Action Flow
+Model with the low-level memory architecture from Torne, Pertsch, Walke et al.
+"MEM: Multi-Scale Embodied Memory for Vision Language Action Models". The
+SigLIP image encoder is extended with space-time separable attention every
+N-th layer so past frames can inform the current-frame tokens without
+introducing new learnable parameters, and temporal state sequences are
+projected into one continuous token per timestep for the Gemma backbone.
 """
