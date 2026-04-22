@@ -211,7 +211,17 @@ class SpaceTimeEncoderLayerWrapper(nn.Module):
         # params don't show up twice in state_dict.
         self._temporal_attn = _TemporalSelfAttention(self.self_attn)
 
-        pe = _build_temporal_sinusoidal_pe(num_frames, self.embed_dim)
+        # Build the PE on the base layer's current device / dtype. The parent
+        # vision_tower is often moved to GPU BEFORE this wrapper is inserted
+        # (the normal load flow for pi05_mem does
+        # ``paligemma = ...from_pretrained(...).to('cuda')`` and then wraps);
+        # with no parent ``.to(device)`` happening after wrapping, a PE built
+        # on CPU would stay on CPU and trigger a cross-device RuntimeError at
+        # forward time. Pinning to the base layer's device sidesteps that.
+        ref_param = base_layer.self_attn.q_proj.weight
+        pe = _build_temporal_sinusoidal_pe(
+            num_frames, self.embed_dim, dtype=ref_param.dtype, device=ref_param.device
+        )
         # Non-persistent: not saved in state_dict but moves with .to(device).
         self.register_buffer("_temporal_pe", pe, persistent=False)
 
@@ -281,8 +291,12 @@ class SpaceTimeEncoderLayerWrapper(nn.Module):
 
         # Temporal sublayer.
         x = rearrange(hidden_states, "(b t) n d -> b t n d", b=b, t=t)
-        # Cast PE to match tensor dtype each call (supports mixed-precision).
-        pe = self._temporal_pe.to(dtype=x.dtype).view(1, t, 1, d)
+        # Cast PE to match tensor device/dtype each call. Both are no-ops if
+        # already aligned (the common case — the buffer is constructed on
+        # the base layer's device). The cast only allocates when something
+        # external has moved the inputs onto a different device without
+        # propagating ``.to()`` through to this wrapper.
+        pe = self._temporal_pe.to(device=x.device, dtype=x.dtype).view(1, t, 1, d)
         x_pe = x + pe
 
         t_in = rearrange(x_pe, "b t n d -> (b n) t d")

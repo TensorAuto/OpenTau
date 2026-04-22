@@ -451,6 +451,66 @@ class TestSpaceTimeSiglipVideoEncoder:
         # 27 SigLIP layers; every 4th starting at index 3 -> [3, 7, 11, 15, 19, 23]
         assert wrapped_indices == [3, 7, 11, 15, 19, 23]
 
+    def test_temporal_pe_on_base_layer_device(self):
+        """The temporal PE buffer must be constructed on the base layer's
+        device/dtype, not default CPU.
+
+        Regression test for a bug where PaliGemma was moved to a non-default
+        device BEFORE the encoder wrapped its layers, leaving the wrapper's
+        PE on CPU. Uses a bfloat16 cast as a proxy for "parent was moved
+        before wrapping" (dtype and device are moved by the same .to()
+        mechanism, so fixing one catches the other)."""
+        import copy
+
+        from opentau.policies.pi05_mem.video_encoder import (
+            SpaceTimeEncoderLayerWrapper,
+            SpaceTimeSiglipVideoEncoder,
+        )
+
+        vision_tower, projector = self._build_siglip_and_projector()
+        vision_tower = vision_tower.to(dtype=torch.bfloat16)
+        projector = copy.deepcopy(projector).to(dtype=torch.bfloat16)
+
+        SpaceTimeSiglipVideoEncoder(
+            vision_tower=vision_tower,
+            multi_modal_projector=projector,
+            num_frames=4,
+            spacetime_layer_stride=4,
+        )
+
+        ref_param = next(vision_tower.parameters())
+        for layer in vision_tower.vision_model.encoder.layers:
+            if isinstance(layer, SpaceTimeEncoderLayerWrapper):
+                assert layer._temporal_pe.device == ref_param.device, (
+                    f"PE device {layer._temporal_pe.device} != vision_tower {ref_param.device}"
+                )
+                assert layer._temporal_pe.dtype == ref_param.dtype, (
+                    f"PE dtype {layer._temporal_pe.dtype} != vision_tower {ref_param.dtype}"
+                )
+
+    def test_forward_after_external_dtype_cast(self):
+        """End-to-end forward must succeed when vision_tower was moved to a
+        different dtype BEFORE wrapping (mirrors the GPU load flow of
+        ``paligemma.to(cuda/bf16)`` then construct encoder)."""
+        import copy
+
+        from opentau.policies.pi05_mem.video_encoder import SpaceTimeSiglipVideoEncoder
+
+        vision_tower, projector = self._build_siglip_and_projector()
+        vision_tower = vision_tower.to(dtype=torch.bfloat16)
+        projector = copy.deepcopy(projector).to(dtype=torch.bfloat16)
+
+        encoder = SpaceTimeSiglipVideoEncoder(
+            vision_tower=vision_tower,
+            multi_modal_projector=projector,
+            num_frames=4,
+            spacetime_layer_stride=4,
+        ).eval()
+        with torch.no_grad():
+            out = encoder(torch.rand(1, 4, 3, 224, 224, dtype=torch.bfloat16))
+        assert out.shape == (1, 256, 2048)
+        assert out.dtype == torch.bfloat16
+
     def test_state_dict_keys_match_vanilla_siglip(self):
         """The wrapped vision_tower's state_dict must have identical keys to
         an unwrapped SigLIP. This guarantees that a pi05 checkpoint loads
