@@ -345,23 +345,35 @@ def test_attach_metadata_end_to_end_droid_100(tmp_path, dataset_config, train_pi
     print("[diagnostic] probe meta.root:", probe_meta.root)
     print("[diagnostic] probe disk info.json:", (probe_meta.root / "meta/info.json").read_text()[:400])
 
-    # Monkey-patch check_timestamps_sync so we can inspect meta state right
-    # before it would raise. We also bypass make_dataset and construct
-    # LeRobotDataset manually to see each step.
+    # Monkey-patch check_timestamps_sync AND load_info so we can inspect what
+    # exactly LeRobotDataset pulls off disk and ties to check_timestamps_sync.
+    import traceback as _tb
+
     import opentau.datasets.utils as _utils
     from opentau.datasets.lerobot_dataset import LeRobotDataset
 
     orig_check = _utils.check_timestamps_sync
+    orig_load_info = _utils.load_info
+
+    def _instrumented_load_info(local_dir):
+        info = orig_load_info(local_dir)
+        print(f"[diagnostic] load_info({local_dir}) -> fps={info['fps']}")
+        print("[diagnostic]   called from:")
+        for line in _tb.format_stack()[-6:-1]:
+            print("[diagnostic]   ", line.strip().splitlines()[0])
+        return info
 
     def _instrumented_check(timestamps, episode_indices, ep_data_index, fps, tolerance_s, *a, **kw):
         print(f"[diagnostic] check_timestamps_sync called with fps={fps}, tol={tolerance_s}")
         return orig_check(timestamps, episode_indices, ep_data_index, fps, tolerance_s, *a, **kw)
 
     _utils.check_timestamps_sync = _instrumented_check
-    # The module where it's used imports by name, so patch there too:
+    _utils.load_info = _instrumented_load_info
     import opentau.datasets.lerobot_dataset as _ld
 
     _ld.check_timestamps_sync = _instrumented_check
+    # lerobot_dataset.py imports load_info at top; patch that reference too:
+    _ld.load_info = _instrumented_load_info
 
     # Manual LeRobotDataset construction mirroring make_dataset.
     ds_meta = __import__(
