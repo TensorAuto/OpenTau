@@ -547,7 +547,7 @@ def test_get_delta_indices_soft_different_fps():
 
 
 # Tests for _get_query_indices_soft method
-def test_get_query_indices_soft_basic():
+def test_get_query_indices_soft_basic(monkeypatch):
     """Test basic functionality of _get_query_indices_soft."""
     dataset = LeRobotDataset.__new__(LeRobotDataset)
 
@@ -563,7 +563,7 @@ def test_get_query_indices_soft_basic():
         {"observation.state": np.array([0.0]), "action": np.array([0.0, 0.1, 0.2])},
     )
 
-    type(dataset).fps = property(lambda self: 30)
+    monkeypatch.setattr(LeRobotDataset, "fps", property(lambda self: 30))
 
     with patch("opentau.datasets.lerobot_dataset.get_delta_indices_soft") as mock_get_delta:
         mock_get_delta.return_value = {
@@ -590,7 +590,7 @@ def test_get_query_indices_soft_basic():
         assert torch.all(padding["action_is_pad"] == torch.BoolTensor([True, True, True]))
 
 
-def test_get_query_indices_soft_no_padding():
+def test_get_query_indices_soft_no_padding(monkeypatch):
     """Test _get_query_indices_soft when no indices are outside episode bounds."""
     dataset = LeRobotDataset.__new__(LeRobotDataset)
 
@@ -606,7 +606,7 @@ def test_get_query_indices_soft_no_padding():
         {"observation.state": np.array([0.0])},
     )
 
-    type(dataset).fps = property(lambda self: 30)
+    monkeypatch.setattr(LeRobotDataset, "fps", property(lambda self: 30))
 
     with patch("opentau.datasets.lerobot_dataset.get_delta_indices_soft") as mock_get_delta:
         mock_get_delta.return_value = {
@@ -624,7 +624,7 @@ def test_get_query_indices_soft_no_padding():
         assert padding["observation.state_is_pad"].item() is False
 
 
-def test_get_query_indices_soft_empty_delta_timestamps():
+def test_get_query_indices_soft_empty_delta_timestamps(monkeypatch):
     """Test _get_query_indices_soft with empty delta_timestamps."""
     dataset = LeRobotDataset.__new__(LeRobotDataset)
 
@@ -635,7 +635,7 @@ def test_get_query_indices_soft_empty_delta_timestamps():
 
     dataset.delta_timestamps_params = ({}, {}, {}, {})
 
-    type(dataset).fps = property(lambda self: 30)
+    monkeypatch.setattr(LeRobotDataset, "fps", property(lambda self: 30))
 
     with patch("opentau.datasets.lerobot_dataset.get_delta_indices_soft") as mock_get_delta:
         mock_get_delta.return_value = {}
