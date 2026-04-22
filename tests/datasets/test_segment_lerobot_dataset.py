@@ -719,7 +719,7 @@ def test_segment_dataset_accepts_ffmpeg_max_workers_override(
     class _SpyPool(_RealPool):
         def __init__(self, max_workers: int | None = None, *args: Any, **kwargs: Any) -> None:
             observed_max_workers.append(int(max_workers) if max_workers is not None else -1)
-            super().__init__(max_workers=max_workers, *args, **kwargs)
+            super().__init__(max_workers, *args, **kwargs)
 
     with (
         patch("opentau.scripts.segment_lerobot_dataset.ThreadPoolExecutor", _SpyPool),
