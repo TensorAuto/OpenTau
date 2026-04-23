@@ -833,7 +833,6 @@ class PI05Policy(PreTrainedPolicy):
         tasks = batch["prompt"]
 
         if self.config.state_type == "continuous":
-            # the below prompt <eos>Actions is added assuming state will arrive before prompt in continuous mode
             prompt = [f"Task: {task}" for task in tasks]
         else:
             # add state to the prompt
@@ -1090,7 +1089,6 @@ class PI05FlowMatching(nn.Module):
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
-        # adds continuous state to the embedding if it is provided before prompt
         if self.config.state_type == "continuous" and state is not None:
             state_emb = self.state_proj(state.to(dtype=_preferred_dtype()))
             state_emb = rearrange(state_emb, "b d -> b 1 d")

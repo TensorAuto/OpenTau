@@ -21,6 +21,7 @@ optimization, scheduling, and data processing.
 """
 
 import logging
+import warnings
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -252,3 +253,19 @@ class PI05Config(PreTrainedConfig):
             None: As reward deltas are not used.
         """
         return None
+
+
+@PreTrainedConfig.register_subclass("pi05_continuous_state")
+@dataclass
+class PI05ContinuousStateConfig(PI05Config):
+    """Deprecated: use ``PI05Config(state_type="continuous")`` instead."""
+
+    state_type: Literal["discrete", "continuous"] = "continuous"
+
+    def __post_init__(self):
+        warnings.warn(
+            "PI05ContinuousStateConfig is deprecated. Use PI05Config with state_type='continuous' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        super().__post_init__()
