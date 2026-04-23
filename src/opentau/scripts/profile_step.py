@@ -155,8 +155,16 @@ def profile(cfg: TrainPipelineConfig):
             old_pg = optimizer.param_groups
             # Rebuild one group at a time so per-group hyperparameters
             # (e.g. different lr for vision vs. expert) are preserved.
+            # IMPORTANT: drop any existing ``fused``/``foreach`` entries from the
+            # copied dicts. torch.optim.Optimizer.add_param_group uses
+            # ``param_group.setdefault(name, default)``, so a leftover
+            # ``fused: None`` in the dict would silently override our top-level
+            # ``fused=True`` kwarg (which only becomes the default). Stripping
+            # the keys lets the default win.
+            _DROP = {"params", "fused", "foreach"}
             param_groups = [
-                {k: v for k, v in pg.items() if k != "params"} | {"params": pg["params"]} for pg in old_pg
+                {k: v for k, v in pg.items() if k not in _DROP} | {"params": pg["params"]}
+                for pg in old_pg
             ]
             # Pull defaults from the first group; AdamWConfig uses uniform
             # values in the current code, but future-proof it.
