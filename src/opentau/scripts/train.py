@@ -122,10 +122,18 @@ def update_policy(
 def train(cfg: TrainPipelineConfig):
     cfg.validate()
 
+    # Under DDP this kwarg controls whether DDP walks the autograd graph after
+    # each backward to discover parameters that didn't receive a gradient.
+    # It is silently ignored under DeepSpeed. Default True for safety (policies
+    # with config-gated heads can produce unused params); set
+    # FIND_UNUSED_PARAMS=false once a run has been audited (see
+    # scripts/find_unused_params.py) to reclaim the per-step graph-walk cost
+    # (~10-15% of step time on pi05).
+    find_unused = os.environ.get("FIND_UNUSED_PARAMS", "true").lower() == "true"
     accelerator_kwargs = {
         "step_scheduler_with_optimizer": False,
         "split_batches": False,  # split_batches == True is not working anyways
-        "kwargs_handlers": [DistributedDataParallelKwargs(find_unused_parameters=True)],
+        "kwargs_handlers": [DistributedDataParallelKwargs(find_unused_parameters=find_unused)],
     }
     if cfg.wandb.enable:
         accelerator_kwargs["log_with"] = "wandb"

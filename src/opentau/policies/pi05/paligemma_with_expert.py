@@ -232,6 +232,14 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         self.gemma_expert = GemmaForCausalLM(config=config.gemma_expert_config)
         # Remove unused embed_tokens
         self.gemma_expert.model.embed_tokens = None
+        # Remove unused lm_head. The action expert is used as an encoder: its
+        # output is routed through action_out_proj for continuous flow-matching
+        # actions and through da_head for discrete-action CE. It never flows
+        # through a token-vocabulary head. Leaving lm_head in place registers a
+        # ~263M-param weight that receives no gradient and forces
+        # DistributedDataParallelKwargs(find_unused_parameters=True), which costs
+        # a per-step DDP graph walk (~10-15% of step time).
+        self.gemma_expert.lm_head = None
 
         # Learned embedding layer for discrete actions
         # Embedding dimension matches expert model hidden size
