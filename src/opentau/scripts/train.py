@@ -145,6 +145,44 @@ def train(cfg: TrainPipelineConfig):
     # Register accelerator globally for use in other modules, (e.g., detect current rank, etc.)
     set_proc_accelerator(accelerator)
 
+    # Strict guard for gradient_checkpointing: the pi05 custom forward loop
+    # wraps layer bodies in torch.utils.checkpoint.checkpoint, which is only
+    # semantically safe under distributed backends that do NOT re-shard
+    # parameters during forward. DDP (MULTI_GPU), single-process (NO), and
+    # DeepSpeed ZeRO-1/2 all replicate full params on every rank during
+    # forward — safe. ZeRO-3 and FSDP re-shard and rely on forward-time
+    # all-gather hooks that plain torch.utils.checkpoint does not trigger
+    # during backward recompute, which can silently produce wrong gradients
+    # or hang. Fail loudly at startup instead of corrupting training.
+    if getattr(cfg.policy, "gradient_checkpointing", False):
+        grad_ckpt_allowed = {
+            accelerate.DistributedType.MULTI_GPU,
+            accelerate.DistributedType.NO,
+            accelerate.DistributedType.DEEPSPEED,
+        }
+        if accelerator.distributed_type not in grad_ckpt_allowed:
+            raise ValueError(
+                f"gradient_checkpointing=True is not supported under "
+                f"distributed_type={accelerator.distributed_type}. Supported: "
+                "MULTI_GPU (DDP), NO (single process), DEEPSPEED (ZeRO-1/2 only). "
+                "ZeRO-3 and FSDP need backend-specific activation-checkpointing "
+                "hooks which pi05's custom per-layer forward does not wire up. "
+                "Either set gradient_checkpointing=False or switch to a "
+                "supported backend."
+            )
+        if accelerator.distributed_type == accelerate.DistributedType.DEEPSPEED:
+            zero_stage = accelerator.deepspeed_plugin.hf_ds_config.config.get("zero_optimization", {}).get(
+                "stage", 0
+            )
+            if zero_stage >= 3:
+                raise ValueError(
+                    f"gradient_checkpointing=True is not supported under "
+                    f"DeepSpeed ZeRO stage {zero_stage}. ZeRO-3 re-shards parameters "
+                    "during forward and needs deepspeed.checkpointing.checkpoint "
+                    "rather than torch.utils.checkpoint. Either set "
+                    "gradient_checkpointing=False or use zero_stage: 1 or 2."
+                )
+
     logging.info(pformat(cfg.to_dict()))
 
     if accelerator.is_main_process:
