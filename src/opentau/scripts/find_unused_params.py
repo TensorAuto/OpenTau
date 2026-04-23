@@ -25,14 +25,6 @@ Usage (no accelerate launch needed — single process is enough):
     python src/opentau/scripts/find_unused_params.py \
         --config_path=configs/libero/reproduce_pi05_libero.json
 
-If you want to use accelerate's launcher for consistency with the other
-profile scripts, the single-GPU accelerate config also works:
-
-    accelerate launch \
-        --config_file configs/libero/reproduce_pi05_libero_accelerate_config_single.yaml \
-        src/opentau/scripts/find_unused_params.py \
-        --config_path=configs/libero/reproduce_pi05_libero.json
-
 Output sections:
 
   - "UNUSED" — params with requires_grad=True and grad is None after backward.

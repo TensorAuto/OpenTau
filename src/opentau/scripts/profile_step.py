@@ -8,10 +8,11 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """Per-step timing breakdown for the training loop.
 
-Phase-1 diagnostic for the "low GPU utilization" investigation. Mirrors
-``opentau/scripts/train.py`` setup (Accelerator + DeepSpeed, same config
-parser, same dataset/policy/optimizer construction), then runs a short
-loop that splits wall-clock per step into phases:
+Diagnostic for the "low GPU utilization" investigation. Mirrors
+``opentau/scripts/train.py`` setup (Accelerator under DDP or DeepSpeed
+depending on the supplied accelerate config; same config parser, same
+dataset/policy/optimizer construction), then runs a short loop that
+splits wall-clock per step into phases:
 
   1. ``dataload_wait``    — time blocked on ``next(train_dl_iter)``
   2. ``forward``          — ``policy.forward(batch)`` + loss combine
