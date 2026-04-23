@@ -36,6 +36,7 @@ from opentau.policies.pi0.configuration_pi0 import PI0Config
 from opentau.policies.pi05.configuration_pi05 import PI05Config
 from opentau.policies.pi05_continuous_state.configuration_pi05 import PI05ContinuousStateConfig
 from opentau.policies.pi05_mem.configuration_pi05 import PI05MemConfig
+from opentau.policies.pi06.configuration_pi06 import PI06Config
 from opentau.policies.pretrained import PreTrainedPolicy
 from opentau.policies.value.configuration_value import ValueConfig
 
@@ -69,6 +70,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from opentau.policies.pi05_mem.modeling_pi05 import PI05MemPolicy
 
         return PI05MemPolicy
+    elif name == "pi06":
+        from opentau.policies.pi06.modeling_pi06 import PI06Policy
+
+        return PI06Policy
     elif name == "value":
         from opentau.policies.value.modeling_value import ValueFunction
 
@@ -98,6 +103,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return PI05ContinuousStateConfig(**kwargs)
     elif policy_type == "pi05_mem":
         return PI05MemConfig(**kwargs)
+    elif policy_type == "pi06":
+        return PI06Config(**kwargs)
     elif policy_type == "value":
         return ValueConfig(**kwargs)
     else:
