@@ -129,6 +129,20 @@ def profile(cfg: TrainPipelineConfig):
     else:
         train_dataset = make_dataset_mixture(cfg)
 
+    # Optional: override the policy's attention_implementation before the
+    # policy is constructed. Lets us A/B eager vs sdpa without touching the
+    # training config JSON. Recognised values match the pi05 validator:
+    # "eager", "sdpa", "fa2" (the last falls back to eager with a warning).
+    attn_impl_env = os.environ.get("ATTENTION_IMPL")
+    if attn_impl_env is not None and hasattr(cfg.policy, "attention_implementation"):
+        if accelerator.is_main_process:
+            logging.info(
+                "ATTENTION_IMPL=%s: overriding cfg.policy.attention_implementation (was %r)",
+                attn_impl_env,
+                cfg.policy.attention_implementation,
+            )
+        cfg.policy.attention_implementation = attn_impl_env
+
     policy = make_policy(cfg=cfg.policy, ds_meta=train_dataset.meta)
     policy.to(torch.bfloat16)
 
