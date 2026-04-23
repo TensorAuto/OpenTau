@@ -52,11 +52,9 @@ from opentau.policies.pretrained import PreTrainedPolicy, T
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
 
-# ---------------------------------------------------------------------------
 # Utility helpers — straight copies of the pi05 versions, documented here for
 # locality. If the pi05 file ever evolves, we consciously choose to keep the
 # pi06 version frozen at the shape the π0.6 paper assumes.
-# ---------------------------------------------------------------------------
 
 
 def _preferred_dtype():
@@ -210,9 +208,7 @@ def pad_discrete_tokens(tokens: list[list[int]], max_length: int) -> tuple[np.nd
     return np.array(discrete_action_tokens), np.array(discrete_action_masks)
 
 
-# ---------------------------------------------------------------------------
 # PI06Policy — the public `PreTrainedPolicy` that OpenTau instantiates.
-# ---------------------------------------------------------------------------
 
 
 class PI06Policy(PreTrainedPolicy):
@@ -558,9 +554,7 @@ class PI06Policy(PreTrainedPolicy):
         ce_loss = losses["CE"]
         return {"MSE": mse_loss, "CE": ce_loss}
 
-    # ------------------------------------------------------------------
     # Preprocessing helpers (state discretization, image resize, etc.)
-    # ------------------------------------------------------------------
 
     def prepare_discrete_state(self, batch: dict[str, Tensor]) -> list[str]:
         """Discretize each state dim into 256 bins and format as a space-joined
@@ -689,10 +683,8 @@ class PI06Policy(PreTrainedPolicy):
         return response_tokens, response_masks
 
 
-# ---------------------------------------------------------------------------
 # PI06FlowMatching — the core nn.Module doing flow-matching decoding with
 # a shared per-layer KV between the Gemma 3 backbone and the Gemma-v1 expert.
-# ---------------------------------------------------------------------------
 
 
 class PI06FlowMatching(nn.Module):
@@ -784,12 +776,10 @@ class PI06FlowMatching(nn.Module):
         time_beta = beta_dist.sample((bsize,)).to(device=device, dtype=torch.float32)
         return time_beta * 0.999 + 0.001
 
-    # ------------------------------------------------------------------
     # Embedding builders — shape matches π0.5 exactly; the block pattern
     # (image + language bidirectional, response/discrete-action causal, action
     # suffix bidirectional cross-attending to prefix) is the same as the
     # π0.6 model card specifies.
-    # ------------------------------------------------------------------
 
     def embed_prefix(
         self,
@@ -901,9 +891,7 @@ class PI06FlowMatching(nn.Module):
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
         return embs, pad_masks, att_masks, adarms_cond
 
-    # ------------------------------------------------------------------
     # Training forward — flow matching + discrete-action CE + optional response CE.
-    # ------------------------------------------------------------------
 
     def forward(
         self,
@@ -1060,9 +1048,7 @@ class PI06FlowMatching(nn.Module):
             return gemma3.lm_head
         return gemma3.model.lm_head
 
-    # ------------------------------------------------------------------
     # Inference — flow-matching denoising, optional response autoregression.
-    # ------------------------------------------------------------------
 
     def sample_actions(
         self,

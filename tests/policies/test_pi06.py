@@ -39,9 +39,7 @@ from opentau.policies.pi06.modeling_pi06 import (
     resize_with_pad,
 )
 
-# ---------------------------------------------------------------------------
 # Block-causal attention mask (pi05 / π0.6 prefix-LM pattern)
-# ---------------------------------------------------------------------------
 
 
 class TestMakeAtt2dMasks:
@@ -107,9 +105,7 @@ class TestMakeAtt2dMasks:
         assert not torch.any(mask[0, :, 2])
 
 
-# ---------------------------------------------------------------------------
 # Sliding-window mask (Gemma 3 local attention)
-# ---------------------------------------------------------------------------
 
 
 class TestSlidingWindowMask:
@@ -131,9 +127,7 @@ class TestSlidingWindowMask:
         assert torch.all(mask == torch.eye(4, dtype=torch.bool))
 
 
-# ---------------------------------------------------------------------------
 # RoPE shape preservation + different theta values
-# ---------------------------------------------------------------------------
 
 
 class TestApplyRope:
@@ -161,9 +155,7 @@ class TestApplyRope:
         assert torch.allclose(out, x, atol=1e-6)
 
 
-# ---------------------------------------------------------------------------
 # PI06Config defaults + validators
-# ---------------------------------------------------------------------------
 
 
 class TestPI06Config:
@@ -191,9 +183,7 @@ class TestPI06Config:
             PI06Config(chunk_size=4, n_action_steps=4, max_delay=8)
 
 
-# ---------------------------------------------------------------------------
 # Gemma3WithExpertConfig defaults — locks in π0.6 topology
-# ---------------------------------------------------------------------------
 
 
 class TestGemma3WithExpertConfig:
@@ -242,9 +232,7 @@ class TestGemma3WithExpertConfig:
             Gemma3WithExpertConfig(discrete_action_vocab_size=2048, attention_implementation="sdpa")
 
 
-# ---------------------------------------------------------------------------
 # Image preprocessing (448×448 default, padding correctness)
-# ---------------------------------------------------------------------------
 
 
 class TestResizeWithPad:
@@ -270,9 +258,7 @@ class TestResizeWithPad:
             resize_with_pad(img, 32, 32)
 
 
-# ---------------------------------------------------------------------------
 # FAST discrete-action padding
-# ---------------------------------------------------------------------------
 
 
 class TestPadDiscreteTokens:
@@ -295,9 +281,7 @@ class TestPadDiscreteTokens:
         assert masks[0].tolist() == [True, True, True, True]
 
 
-# ---------------------------------------------------------------------------
 # End-to-end integration — guarded because Gemma 3 4B is huge.
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.gpu

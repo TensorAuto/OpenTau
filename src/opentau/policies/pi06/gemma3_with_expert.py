@@ -138,7 +138,7 @@ class Gemma3WithExpertConfig(PretrainedConfig):
         self.discrete_action_vocab_size = discrete_action_vocab_size
         self.dropout = dropout
 
-        # --- Gemma 3 backbone defaults (match google/gemma-3-4b-pt) ----------
+        # Gemma 3 backbone defaults (match google/gemma-3-4b-pt).
         if gemma3_config is None:
             self.gemma3_config = CONFIG_MAPPING["gemma3"](
                 text_config={
@@ -189,7 +189,7 @@ class Gemma3WithExpertConfig(PretrainedConfig):
         else:
             self.gemma3_config = gemma3_config
 
-        # --- Gemma-v1 action-expert defaults (~860M params) -----------------
+        # Gemma-v1 action-expert defaults (~860M params).
         if gemma_expert_config is None:
             self.gemma_expert_config = CONFIG_MAPPING["gemma"](
                 attention_bias=False,
@@ -286,9 +286,7 @@ class Gemma3WithExpertModel(PreTrainedModel):
         self._expert_rope = float(self._expert_config.rope_theta)
         self._query_pre_attn_scaling = float(self._text_config.query_pre_attn_scalar) ** -0.5
 
-    # ------------------------------------------------------------------
     # Trainable / dtype plumbing
-    # ------------------------------------------------------------------
 
     def set_requires_grad(self) -> None:
         if self.config.freeze_vision_encoder:
@@ -329,9 +327,7 @@ class Gemma3WithExpertModel(PreTrainedModel):
             if any(selector in name for selector in params_to_change_dtype):
                 param.data = param.data.to(dtype=torch.bfloat16)
 
-    # ------------------------------------------------------------------
     # Embedding helpers
-    # ------------------------------------------------------------------
 
     def _vision_tower(self):
         # Gemma 3's vision tower lives at `gemma3.model.vision_tower` depending on
@@ -367,9 +363,7 @@ class Gemma3WithExpertModel(PreTrainedModel):
             actions = actions.long()
         return self.discrete_action_embedding(actions)
 
-    # ------------------------------------------------------------------
     # Attention core
-    # ------------------------------------------------------------------
 
     def get_attention_interface(self):
         if self.config.attention_implementation == "fa2":
@@ -431,9 +425,7 @@ class Gemma3WithExpertModel(PreTrainedModel):
         att_output = att_output.reshape(batch_size, -1, num_key_value_heads * num_key_value_groups * head_dim)
         return att_output
 
-    # ------------------------------------------------------------------
     # Per-layer interleaved forward
-    # ------------------------------------------------------------------
 
     def forward(
         self,
@@ -516,12 +508,12 @@ class Gemma3WithExpertModel(PreTrainedModel):
                 layer = layers_this_step[stream_idx]
 
                 if stream_idx == 0:
-                    # --- Gemma 3 backbone ------------------------------------
+                    # Gemma 3 backbone.
                     backbone_preattn_residual = hidden_states
                     h = layer.input_layernorm(hidden_states)
                     gate = None
                 else:
-                    # --- Gemma-v1 expert (patched to return (tensor, gate)) --
+                    # Gemma-v1 expert (patched to return (tensor, gate)).
                     h, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[stream_idx])
 
                 gates.append(gate)
@@ -650,9 +642,7 @@ class Gemma3WithExpertModel(PreTrainedModel):
 
         return final_outputs, past_key_values
 
-    # ------------------------------------------------------------------
     # Gemma 3 structural accessors
-    # ------------------------------------------------------------------
 
     def _backbone_text_model(self):
         # Different transformers versions expose Gemma 3 under slightly different
