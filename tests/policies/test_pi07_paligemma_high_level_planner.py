@@ -207,7 +207,12 @@ class TestPI07HighLevelPlannerIntegration:
             "state": torch.randn(batch_size, MAX_STATE_DIM),
             "prompt": ["Pick up the red block"],
             "past_memory": ["Robot is near the table"],
-            "metadata": ["episode_id=42 robot=franka"],
+            "speed": torch.tensor([500]),
+            "quality": torch.tensor([3]),
+            "mistake": torch.tensor([0]),
+            "speed_is_pad": torch.tensor([False]),
+            "quality_is_pad": torch.tensor([False]),
+            "mistake_is_pad": torch.tensor([False]),
             "memory": ["Robot is grasping the red block"],
             "response": ["Grasp the red block"],
         }
@@ -319,7 +324,12 @@ class TestPI07HighLevelPlannerIntegration:
             "state": batch_cuda["state"],
             "prompt": ["Pick up the red block"],
             "past_memory": ["Robot is near the table"],
-            "metadata": ["episode_id=42 robot=franka"],
+            "speed": torch.tensor([500], device="cuda"),
+            "quality": torch.tensor([3], device="cuda"),
+            "mistake": torch.tensor([0], device="cuda"),
+            "speed_is_pad": torch.tensor([False], device="cuda"),
+            "quality_is_pad": torch.tensor([False], device="cuda"),
+            "mistake_is_pad": torch.tensor([False], device="cuda"),
         }
         memory_tokens, response_tokens = policy.sample_actions(infer_batch)
 

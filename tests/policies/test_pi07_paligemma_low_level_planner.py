@@ -86,7 +86,6 @@ class TestPI07LowLevelPlannerIntegration:
         config.input_features = {
             "camera0": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224)),
             "camera1": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224)),
-            "subgoal_camera0": PolicyFeature(type=FeatureType.SUBGOAL, shape=(3, 224, 224)),
             "state": PolicyFeature(type=FeatureType.STATE, shape=(MAX_STATE_DIM,)),
         }
         config.output_features = {
@@ -336,12 +335,18 @@ class TestPI07LowLevelPlannerIntegration:
         batch = {
             "camera0": torch.randn(batch_size, N_OBS_STEPS, 3, 224, 224),
             "camera1": torch.randn(batch_size, N_OBS_STEPS, 3, 224, 224),
-            "subgoal_camera0": torch.randn(batch_size, 3, 224, 224),
+            "subgoal0": torch.randn(batch_size, 3, 224, 224),
             "state": torch.randn(batch_size, N_OBS_STEPS, MAX_STATE_DIM),
             "actions": torch.randn(batch_size, CHUNK_SIZE, MAX_ACTION_DIM),
             "prompt": ["Pick up the red block"],
             "response": ["Grasp the red block"],
-            "metadata": ["episode_id=42 robot=franka"],
+            "speed": torch.tensor([500]),
+            "quality": torch.tensor([3]),
+            "mistake": torch.tensor([0]),
+            "speed_is_pad": torch.tensor([False]),
+            "quality_is_pad": torch.tensor([False]),
+            "mistake_is_pad": torch.tensor([False]),
+            "subgoal_is_pad": torch.tensor([False]),
             "action_is_pad": torch.cat(
                 [
                     torch.zeros(batch_size, CHUNK_SIZE // 2, dtype=torch.bool),
@@ -490,11 +495,17 @@ class TestPI07LowLevelPlannerIntegration:
         infer_batch = {
             "camera0": batch_cuda["camera0"][:, 0],  # (B, C, H, W)
             "camera1": batch_cuda["camera1"][:, 0],
-            "subgoal_camera0": batch_cuda["subgoal_camera0"],  # already (B, C, H, W)
+            "subgoal0": batch_cuda["subgoal0"],  # already (B, C, H, W)
             "state": batch_cuda["state"][:, 0],  # (B, D)
             "prompt": ["Pick up the red block"],
             "response": ["Grasp the red block"],
-            "metadata": ["episode_id=42 robot=franka"],
+            "speed": torch.tensor([500], device="cuda"),
+            "quality": torch.tensor([3], device="cuda"),
+            "mistake": torch.tensor([0], device="cuda"),
+            "speed_is_pad": torch.tensor([False], device="cuda"),
+            "quality_is_pad": torch.tensor([False], device="cuda"),
+            "mistake_is_pad": torch.tensor([False], device="cuda"),
+            "subgoal_is_pad": torch.tensor([False], device="cuda"),
         }
         action = policy.select_action(infer_batch)
 

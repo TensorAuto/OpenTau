@@ -33,8 +33,6 @@ class FeatureType(str, Enum):
     """Robot state features."""
     VISUAL = "VISUAL"
     """Visual/image features."""
-    SUBGOAL = "SUBGOAL"
-    """Subgoal visual/image features."""
     ENV = "ENV"
     """Environment state features."""
     ACTION = "ACTION"

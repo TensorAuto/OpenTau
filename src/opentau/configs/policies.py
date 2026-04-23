@@ -261,16 +261,6 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         return {key: ft for key, ft in self.input_features.items() if ft.type is FeatureType.VISUAL}
 
     @property
-    def subgoal_image_features(self) -> dict[str, PolicyFeature]:
-        """Get all subgoal visual/image features from input features.
-
-        Returns:
-            Dictionary mapping feature names to PolicyFeature instances with
-            type VISUAL and type SUBGOAL.
-        """
-        return {key: ft for key, ft in self.input_features.items() if ft.type is FeatureType.SUBGOAL}
-
-    @property
     def action_feature(self) -> PolicyFeature | None:
         """Get the action feature from output features.
 

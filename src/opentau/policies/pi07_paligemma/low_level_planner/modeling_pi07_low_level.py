@@ -860,44 +860,47 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         response_masks = tokenized_response["attention_mask"].to(device=device, dtype=torch.bool)
         return response_tokens, response_masks
 
-    def prepare_subgoal_images(
-        self, batch: dict[str, Tensor]
-    ) -> tuple[list[Tensor] | None, list[Tensor] | None]:
+    def prepare_subgoal_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
         """Preprocess subgoal images for SigLIP embedding.
 
-        Resizes each subgoal image to 224x224 with aspect-ratio padding and
+        Derives subgoal keys from ``config.image_features``: for each
+        ``camera{k}`` the corresponding batch key is ``subgoal{k}`` (the
+        naming convention used by ``LeRobotDataset._emit_optional_keys``).
+
+        Resizes each subgoal image to 224×224 with aspect-ratio padding and
         converts the pixel range from ``[0, 1]`` to ``[-1, 1]`` as expected
-        by SigLIP. Missing cameras are filled with ``-1`` padding tensors up
-        to ``empty_cameras``.
+        by SigLIP.  Missing cameras are filled with ``-1`` padding tensors
+        up to ``empty_cameras``.
 
         When ``batch["subgoal_is_pad"]`` is ``True`` for a sample, all
         subgoal slots for that sample are zeroed out and their masks set to
         ``False`` so that downstream attention ignores them.
 
         Args:
-            batch: Batch dict containing subgoal image tensors keyed by
-                entries in ``config.subgoal_image_features``.
+            batch: Batch dict containing subgoal image tensors keyed as
+                ``subgoal{k}`` for each ``camera{k}`` in
+                ``config.image_features``.
 
         Returns:
-            A tuple ``(subgoal_images, subgoal_img_masks)`` of lists, or
-            ``(None, None)`` if no subgoal features are present.
+            A tuple ``(subgoal_images, subgoal_img_masks)`` of lists.
         """
         subgoal_images = []
         subgoal_img_masks = []
 
-        present_subgoal_img_keys = [key for key in self.config.subgoal_image_features if key in batch]
-        missing_subgoal_img_keys = [key for key in self.config.subgoal_image_features if key not in batch]
+        # Derive subgoal keys from image_features: camera{k} -> subgoal{k}
+        subgoal_keys = [key.replace("camera", "subgoal") for key in self.config.image_features]
+        present_subgoal_img_keys = [key for key in subgoal_keys if key in batch]
+        missing_subgoal_img_keys = [key for key in subgoal_keys if key not in batch]
 
         if len(present_subgoal_img_keys) == 0:
             raise ValueError(
                 f"All subgoal image features are missing from the batch. At least one expected. "
-                f"(batch: {batch.keys()}) (subgoal_image_features: {self.config.subgoal_image_features})"
+                f"(batch: {batch.keys()}) (expected subgoal keys: {subgoal_keys})"
             )
 
         # Per-sample flag: True means the subgoal was dropped or absent.
         subgoal_is_pad = batch.get("subgoal_is_pad")  # (B,) bool or None
 
-        # Preprocess image features present in the batch
         for key in present_subgoal_img_keys:
             subgoal_img = batch[key]
 
