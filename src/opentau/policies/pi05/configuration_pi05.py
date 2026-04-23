@@ -105,6 +105,10 @@ class PI05Config(PreTrainedConfig):
     # Language Tokenizer
     prompt_max_length: int = 256
 
+    # Maximum length of the indicator tokens
+    response_indicator_max_length: int = 3
+    discrete_action_indicator_max_length: int = 3
+
     # Response Tokenizer
     response_max_length: int = 52
 
