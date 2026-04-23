@@ -936,17 +936,30 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             ``(B, metadata_max_length)``, or ``(None, None)`` if metadata
             is absent.
         """
-        if "metadata" not in batch:
-            return None, None
 
-        if batch["metadata"] is None:
-            return None, None
+        metadata = []
+        for speed, quality, mistake, speed_is_pad, quality_is_pad, mistake_is_pad in zip(
+            batch["speed"],
+            batch["quality"],
+            batch["mistake"],
+            batch["speed_is_pad"],
+            batch["quality_is_pad"],
+            batch["mistake_is_pad"],
+            strict=False,
+        ):
+            meta = ""
+            if not speed_is_pad:
+                meta += f"Speed: {str(speed)} "
+
+            if not quality_is_pad:
+                meta += f"Quality: {str(quality)} "
+
+            if not mistake_is_pad:
+                meta += f"Mistake: {str(mistake)}"
+
+            metadata.append(f"Metadata: {meta}<eos>")
 
         device = batch["state"].device
-        metadata = batch["metadata"]
-
-        metadata = [f"Metadata: {meta}<eos>" for meta in metadata]
-
         tokenized_metadata = self.language_tokenizer.__call__(
             metadata,
             padding="max_length",
