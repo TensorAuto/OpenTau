@@ -143,6 +143,40 @@ def profile(cfg: TrainPipelineConfig):
     else:
         optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
 
+        # Optional: replace the AdamW optimizer returned by the factory with a
+        # fused-kernel variant, for A/B benchmarking. Zero change to production
+        # code; scoped to this script via env var. When FUSED_ADAMW=true we
+        # rebuild with the same hyperparameters but ``fused=True``. If
+        # FUSED_ADAMW=false we explicitly pass ``fused=False`` so the A/B is
+        # symmetric. Unset = leave PyTorch defaults untouched.
+        fused_env = os.environ.get("FUSED_ADAMW")
+        if fused_env is not None and isinstance(optimizer, torch.optim.AdamW):
+            want_fused = fused_env.lower() == "true"
+            old_pg = optimizer.param_groups
+            # Rebuild one group at a time so per-group hyperparameters
+            # (e.g. different lr for vision vs. expert) are preserved.
+            param_groups = [
+                {k: v for k, v in pg.items() if k != "params"} | {"params": pg["params"]} for pg in old_pg
+            ]
+            # Pull defaults from the first group; AdamWConfig uses uniform
+            # values in the current code, but future-proof it.
+            defaults = old_pg[0]
+            optimizer = torch.optim.AdamW(
+                param_groups,
+                lr=defaults["lr"],
+                betas=defaults.get("betas", (0.9, 0.999)),
+                eps=defaults.get("eps", 1e-8),
+                weight_decay=defaults.get("weight_decay", 0.0),
+                fused=want_fused,
+            )
+            if accelerator.is_main_process:
+                # Confirm the implementation actually in effect.
+                logging.info(
+                    "FUSED_ADAMW=%s: rebuilt AdamW with fused=%s",
+                    fused_env,
+                    want_fused,
+                )
+
     train_dataloader = train_dataset.get_dataloader()
     if skip_optim:
         policy, train_dataloader = accelerator.prepare(policy, train_dataloader)
