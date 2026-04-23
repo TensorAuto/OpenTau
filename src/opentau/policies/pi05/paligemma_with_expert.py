@@ -22,8 +22,6 @@ Vision-Language Model (VLM) with a Gemma-based expert model to handle
 action generation and conditioning.
 """
 
-import logging
-
 import torch
 from torch import nn
 from transformers import (
@@ -207,18 +205,9 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
                 "You set `freeze_vision_encoder=False` and `train_expert_only=True` which are not compatible."
             )
 
-        if self.attention_implementation not in ["eager", "sdpa", "fa2"]:
+        if self.attention_implementation not in ["eager", "fa2"]:
             raise ValueError(
-                f"Wrong value provided for `attention_implementation` ({self.attention_implementation}). "
-                "Expected 'eager', 'sdpa', or 'fa2'."
-            )
-        if self.attention_implementation == "fa2":
-            # "fa2" has been accepted by the validator historically but never
-            # implemented in PaliGemmaWithExpertModel. Fall back to eager so
-            # existing configs keep running.
-            logging.warning(
-                "attention_implementation='fa2' is not implemented; falling back to 'eager'. "
-                "Consider switching to 'sdpa' for ~10-15%% better throughput."
+                f"Wrong value provided for `attention_implementation` ({self.attention_implementation}). Expected 'eager' or 'fa2'."
             )
 
 
@@ -516,24 +505,9 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
     def get_attention_interface(self):
         """Returns the attention implementation function based on config.
 
-        Dispatches on ``self.config.attention_implementation``:
-          - ``"eager"``: naive matmul-softmax-matmul in fp32 (historical
-            default; see ``eager_attention_forward``).
-          - ``"sdpa"``: ``torch.nn.functional.scaled_dot_product_attention``
-            which on A100 dispatches to FlashAttention-2 or the
-            memory-efficient backend — 2-3x faster than eager at pi05's
-            sequence length.
-          - ``"fa2"``: accepted for backward compatibility; falls back to
-            eager with a warning emitted at config validation time.
-
         Returns:
             callable: The attention function to use.
         """
-        impl = self.config.attention_implementation
-        if impl == "sdpa":
-            return self.sdpa_attention_forward
-        # "eager" and legacy "fa2" both land here; "fa2" already warned
-        # during __post_init__.
         return self.eager_attention_forward
 
     def eager_attention_forward(
@@ -605,89 +579,6 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
 
         att_output = att_output.permute(0, 2, 1, 3)
         # we use -1 because sequence length can change
-        att_output = att_output.reshape(batch_size, -1, num_key_value_heads * num_key_value_groups * head_dim)
-
-        return att_output
-
-    def sdpa_attention_forward(
-        self,
-        attention_mask: torch.Tensor,
-        batch_size: int,
-        head_dim: int,
-        query_states: torch.Tensor,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-    ) -> torch.Tensor:
-        """SDPA attention forward pass using ``F.scaled_dot_product_attention``.
-
-        Produces the same output shape and semantic as ``eager_attention_forward``
-        but delegates the scores-softmax-matmul chain to PyTorch's fused SDPA
-        kernel. On A100 + bf16 PyTorch typically dispatches to FlashAttention-2,
-        which keeps the S×S attention matrix in on-chip SRAM and runs the
-        matmul in bf16 with fp32 accumulation in the softmax. There is a
-        deliberate numerical difference vs. the eager kernel: we do **not**
-        upcast Q/K to float32 before the matmul, because modern attention
-        kernels do fp32 accumulation internally — cleaner and faster. Training
-        dynamics are equivalent within bf16 reassociation noise.
-
-        Args:
-            attention_mask: Boolean mask of shape (B, S, S); ``True`` = attend.
-            batch_size: Batch size.
-            head_dim: Per-head dimension.
-            query_states: Query states of shape (B, S, num_attention_heads, head_dim).
-            key_states: Key states of shape (B, S, num_key_value_heads, head_dim).
-            value_states: Value states of shape (B, S, num_key_value_heads, head_dim).
-
-        Returns:
-            torch.Tensor: Attention output of shape
-            (B, S, num_attention_heads * head_dim).
-        """
-        num_att_heads = self.config.paligemma_config.text_config.num_attention_heads
-        num_key_value_heads = self.config.paligemma_config.text_config.num_key_value_heads
-        num_key_value_groups = num_att_heads // num_key_value_heads
-        sequence_length = key_states.shape[1]
-
-        # GQA expansion mirroring eager_attention_forward. Always-correct
-        # across PyTorch versions; for PyTorch 2.5+ we could alternatively
-        # pass the un-expanded K/V with enable_gqa=True to SDPA, but the
-        # explicit expand+reshape is a memory-view and adds no real cost.
-        key_states = key_states[:, :, :, None, :].expand(
-            batch_size, sequence_length, num_key_value_heads, num_key_value_groups, head_dim
-        )
-        key_states = key_states.reshape(
-            batch_size, sequence_length, num_key_value_heads * num_key_value_groups, head_dim
-        )
-        value_states = value_states[:, :, :, None, :].expand(
-            batch_size, sequence_length, num_key_value_heads, num_key_value_groups, head_dim
-        )
-        value_states = value_states.reshape(
-            batch_size, sequence_length, num_key_value_heads * num_key_value_groups, head_dim
-        )
-
-        # SDPA expects (B, H, S, D_h) for Q, K, V.
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
-
-        # PyTorch's SDPA accepts a bool ``attn_mask`` where True = attend,
-        # which matches our convention from make_att_2d_masks. Broadcast a
-        # single-head dim so the same mask applies to every attention head.
-        attn_mask = attention_mask[:, None, :, :]
-
-        # is_causal must be False: our mask already encodes both the intra-
-        # prefix bidirectional pattern and any causal tail. SDPA's
-        # ``is_causal=True`` shortcut would double-apply and be wrong.
-        att_output = nn.functional.scaled_dot_product_attention(
-            query_states,
-            key_states,
-            value_states,
-            attn_mask=attn_mask,
-            is_causal=False,
-            dropout_p=0.0,
-        )
-
-        # att_output: (B, H, S, D_h) → (B, S, H * D_h) to match eager output.
-        att_output = att_output.permute(0, 2, 1, 3)
         att_output = att_output.reshape(batch_size, -1, num_key_value_heads * num_key_value_groups * head_dim)
 
         return att_output
