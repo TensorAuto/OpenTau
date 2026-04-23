@@ -88,12 +88,30 @@ def apply_rope(x: torch.Tensor, positions: torch.Tensor, max_wavelength: float =
     return res.to(dtype)
 
 
-def _build_sliding_window_mask(seq_len: int, window: int, device: torch.device) -> torch.Tensor:
-    """Returns a `(seq_len, seq_len)` bool mask that is `True` iff
-    `|i - j| < window`. Combined with the base attention mask, this enforces
-    the Gemma-3 local sliding-window pattern."""
-    idx = torch.arange(seq_len, device=device)
-    diff = (idx[:, None] - idx[None, :]).abs()
+def _build_sliding_window_mask(
+    query_positions: torch.Tensor,
+    key_positions: torch.Tensor,
+    window: int,
+) -> torch.Tensor:
+    """Returns a `(B, Q, K)` bool mask that is `True` iff
+    `|pos_q - pos_k| < window`.
+
+    Using absolute positions (not dense indices) is critical when the mask
+    covers cross-attention into a cached prefix: the expert's Q tokens live
+    at positions `prefix_offsets + chunk_idx`, not at `0, 1, ...`, so a
+    mask built from dense indices would wrongly exclude every prefix token
+    beyond `window`.
+
+    Args:
+        query_positions: `(B, Q)` absolute positions of the query tokens.
+        key_positions: `(B, K)` absolute positions of the key tokens.
+        window: Sliding-window half-width (exclusive upper bound on
+            `|pos_q - pos_k|`).
+
+    Returns:
+        Boolean `(B, Q, K)` tensor, `True` where the pair is inside the window.
+    """
+    diff = (query_positions[:, :, None] - key_positions[:, None, :]).abs()
     return diff < window
 
 
@@ -169,11 +187,17 @@ class Gemma3WithExpertConfig(PretrainedConfig):
                     "num_attention_heads": 16,
                     "num_hidden_layers": 27,
                     "patch_size": 14,
-                    "image_size": 896,
+                    # π0.6 feeds 448×448 images. `Gemma3MultiModalProjector`
+                    # hardcodes `patches_per_image = image_size // patch_size`,
+                    # so this MUST match the actual input resolution or the
+                    # projector's reshape crashes (see test_pi06.py::
+                    # TestGemma3WithExpertConfig::test_vision_image_size_matches_input).
+                    "image_size": 448,
                     "projection_dim": 2560,
                     "projector_hidden_act": "gelu_fast",
                     "vision_use_head": False,
                     "torch_dtype": "float32",
+                    "layer_norm_eps": 1e-6,
                 },
                 image_token_index=262144,
                 mm_tokens_per_image=256,
@@ -283,7 +307,9 @@ class Gemma3WithExpertModel(PreTrainedModel):
         self._rope_local = float(getattr(self._text_config, "rope_local_base_freq", 10_000.0))
         self._sliding_window = int(self._text_config.sliding_window)
         self._layer_types: list[str] = list(self._text_config.layer_types)
-        self._expert_rope = float(self._expert_config.rope_theta)
+        # Note: the expert's own `rope_theta` is deliberately ignored at
+        # runtime — the shared attention requires the backbone's per-layer θ
+        # for both streams. See `forward()`.
         self._query_pre_attn_scaling = float(self._text_config.query_pre_attn_scalar) ** -0.5
 
     # Trainable / dtype plumbing
@@ -483,10 +509,16 @@ class Gemma3WithExpertModel(PreTrainedModel):
         for layer_idx in range(self._num_layers):
             layer_type = self._layer_types[layer_idx]
             is_sliding = layer_type == "sliding_attention"
-            backbone_rope_theta = self._rope_local if is_sliding else self._rope_global
+            layer_rope_theta = self._rope_local if is_sliding else self._rope_global
 
             layers_this_step = [backbone_layers[layer_idx], expert_layers[layer_idx]]
-            rope_thetas = [backbone_rope_theta, self._expert_rope]
+            # Both streams MUST use the same RoPE base at this layer. Shared
+            # attention concatenates Q/K along the sequence axis; the dot-product
+            # invariant `R(q,p)·R(k,q) = q·R(q-p)k` only holds when the same θ
+            # produced both rotations. For global Gemma-3 layers (θ=1M) this
+            # means the expert also rotates at 1M even though the config carries
+            # a single fallback `rope_theta=10k`.
+            rope_thetas = [layer_rope_theta, layer_rope_theta]
 
             query_states = []
             key_states = []
@@ -549,9 +581,14 @@ class Gemma3WithExpertModel(PreTrainedModel):
             k_concat = torch.cat(k_list, dim=1)
             v_concat = torch.cat(v_list, dim=1)
 
+            # Positions corresponding to K: cached prefix positions (if any)
+            # followed by this call's query positions (which double as key
+            # positions for the current step).
+            cached_key_positions = None
             if use_cache and past_key_values is not None and layer_idx in past_key_values:
                 k_concat = torch.cat([past_key_values[layer_idx]["key_states"], k_concat], dim=1)
                 v_concat = torch.cat([past_key_values[layer_idx]["value_states"], v_concat], dim=1)
+                cached_key_positions = past_key_values[layer_idx]["key_positions"]
 
             if fill_kv_cache:
                 if past_key_values is None:
@@ -561,15 +598,21 @@ class Gemma3WithExpertModel(PreTrainedModel):
                 past_key_values[layer_idx] = {
                     "key_states": k_concat[:, :n_cross_att_tokens, :, :],
                     "value_states": v_concat[:, :n_cross_att_tokens, :, :],
+                    "key_positions": position_ids[:, :n_cross_att_tokens],
                 }
 
-            # For sliding-window layers, restrict the base mask to the window.
+            # For sliding-window layers, restrict the base mask to the window
+            # using ABSOLUTE positions. During cross-attention the Q tokens
+            # sit at `prefix_offsets + chunk_idx`, not at dense indices, so a
+            # mask built from `torch.arange` would wrongly drop every prefix
+            # key beyond `window`.
             if is_sliding and attention_mask is not None:
-                sw_mask = _build_sliding_window_mask(
-                    attention_mask.shape[-1], self._sliding_window, attention_mask.device
-                )
-                # Broadcast over query axis -> (1, Q_or_1, K)
-                layer_attention_mask = attention_mask & sw_mask[None, : attention_mask.shape[1], :]
+                if cached_key_positions is not None:
+                    key_positions = torch.cat([cached_key_positions, position_ids], dim=1)
+                else:
+                    key_positions = position_ids
+                sw_mask = _build_sliding_window_mask(position_ids, key_positions, self._sliding_window)
+                layer_attention_mask = attention_mask & sw_mask
             else:
                 layer_attention_mask = attention_mask
 

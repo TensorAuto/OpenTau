@@ -27,9 +27,11 @@ from __future__ import annotations
 import pytest
 import torch
 
+from opentau.policies.pi06 import gemma3_with_expert as g3we
 from opentau.policies.pi06.configuration_pi06 import PI06Config
 from opentau.policies.pi06.gemma3_with_expert import (
     Gemma3WithExpertConfig,
+    Gemma3WithExpertModel,
     _build_sliding_window_mask,
     apply_rope,
 )
@@ -109,22 +111,44 @@ class TestMakeAtt2dMasks:
 
 
 class TestSlidingWindowMask:
-    def test_window_smaller_than_sequence(self):
-        # With a sliding window of 3, only positions within |i-j|<3 should be True.
-        mask = _build_sliding_window_mask(seq_len=6, window=3, device=torch.device("cpu"))
-        assert mask.shape == (6, 6)
+    def test_self_attention_window_smaller_than_sequence(self):
+        # Self-attention: positions 0..5 on both sides, window 3.
+        pos = torch.arange(6)[None, :]
+        mask = _build_sliding_window_mask(pos, pos, window=3)
+        assert mask.shape == (1, 6, 6)
         for i in range(6):
             for j in range(6):
-                expected = abs(i - j) < 3
-                assert mask[i, j].item() == expected, f"mismatch at ({i}, {j})"
+                assert mask[0, i, j].item() == (abs(i - j) < 3), f"mismatch at ({i},{j})"
 
     def test_window_covers_full_sequence(self):
-        mask = _build_sliding_window_mask(seq_len=4, window=100, device=torch.device("cpu"))
+        pos = torch.arange(4)[None, :]
+        mask = _build_sliding_window_mask(pos, pos, window=100)
         assert torch.all(mask)
 
     def test_window_of_one_is_identity(self):
-        mask = _build_sliding_window_mask(seq_len=4, window=1, device=torch.device("cpu"))
-        assert torch.all(mask == torch.eye(4, dtype=torch.bool))
+        pos = torch.arange(4)[None, :]
+        mask = _build_sliding_window_mask(pos, pos, window=1)
+        assert torch.all(mask[0] == torch.eye(4, dtype=torch.bool))
+
+    def test_cross_attention_uses_absolute_positions(self):
+        # Regression for a correctness bug: before this fix, the mask indexed
+        # the first T_suffix rows of a dense `arange(T_prefix+T_suffix)` mask,
+        # which made suffix tokens unable to attend to any prefix key farther
+        # than `window` from the suffix's dense row index. The real suffix
+        # positions sit after the whole prefix — so the mask must be built
+        # from absolute position ids, not dense indices.
+        prefix_len, window = 5, 2
+        prefix_positions = torch.arange(prefix_len)[None, :]  # [0, 1, 2, 3, 4]
+        suffix_positions = torch.tensor([[prefix_len, prefix_len + 1]])  # [5, 6]
+        key_positions = torch.cat([prefix_positions, suffix_positions], dim=1)
+
+        mask = _build_sliding_window_mask(suffix_positions, key_positions, window=window)
+        # Suffix row 0 (abs pos 5) must see keys at positions {4, 5, 6} — which
+        # crucially includes prefix index 4, not just the dense-index neighbours.
+        assert mask[0, 0].tolist() == [False, False, False, False, True, True, True]
+        # Suffix row 1 (abs pos 6) sees keys at positions {5, 6, 7}; 7 doesn't
+        # exist in the sequence so it's naturally omitted.
+        assert mask[0, 1].tolist() == [False, False, False, False, False, True, True]
 
 
 # RoPE shape preservation + different theta values
@@ -231,6 +255,33 @@ class TestGemma3WithExpertConfig:
         with pytest.raises(ValueError, match="attention_implementation"):
             Gemma3WithExpertConfig(discrete_action_vocab_size=2048, attention_implementation="sdpa")
 
+    def test_vision_image_size_matches_input_resolution(self):
+        # Regression: Gemma 3's `Gemma3MultiModalProjector` hardcodes
+        # `patches_per_image = image_size // patch_size`, so the config's
+        # `vision_config.image_size` MUST match what we actually feed through
+        # the vision tower. π0.6 uses 448×448, so the default config has to
+        # carry image_size=448 — otherwise the projector's reshape crashes
+        # on the first forward pass.
+        cfg = Gemma3WithExpertConfig(discrete_action_vocab_size=2048)
+        vc = cfg.gemma3_config.vision_config
+        assert vc.image_size == 448
+        assert vc.patch_size == 14
+        # 448/14 = 32 patches/side → 1024 vision tokens → avg-pool to 256 mm tokens.
+        assert (vc.image_size // vc.patch_size) ** 2 == 1024
+
+    def test_projector_accepts_448_inputs(self):
+        # The above is a correctness check; this is the end-to-end runtime
+        # smoke test that the projector actually runs at 448 without crashing.
+        from transformers.models.gemma3.modeling_gemma3 import Gemma3MultiModalProjector
+
+        cfg = Gemma3WithExpertConfig(discrete_action_vocab_size=2048)
+        proj = Gemma3MultiModalProjector(cfg.gemma3_config)
+        vision_hidden = cfg.gemma3_config.vision_config.hidden_size
+        # SigLIP at 448 produces 32×32 = 1024 patch tokens per image.
+        vision_out = torch.randn(1, 1024, vision_hidden)
+        out = proj(vision_out)
+        assert out.shape == (1, 256, cfg.gemma3_config.text_config.hidden_size)
+
 
 # Image preprocessing (448×448 default, padding correctness)
 
@@ -279,6 +330,132 @@ class TestPadDiscreteTokens:
         assert padded.shape == (1, 4)
         assert padded[0].tolist() == [0, 1, 2, 3]
         assert masks[0].tolist() == [True, True, True, True]
+
+
+# Per-layer RoPE θ selection inside `Gemma3WithExpertModel.forward` — regression
+# for the bug where the expert used its own `rope_theta=10_000` even on global
+# Gemma-3 layers whose backbone Q/K are rotated at θ=1_000_000.
+
+
+def _make_tiny_g3we_model():
+    """Construct a minimally-sized `Gemma3WithExpertModel` for fast tests."""
+    cfg = Gemma3WithExpertConfig(
+        gemma3_config={
+            "text_config": {
+                "model_type": "gemma3_text",
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 16,
+                "sliding_window": 2,
+                "rope_theta": 1_000_000.0,
+                "rope_local_base_freq": 10_000.0,
+                "query_pre_attn_scalar": 16,
+                "rms_norm_eps": 1e-6,
+                "vocab_size": 128,
+                "max_position_embeddings": 512,
+                "attention_bias": False,
+                "attention_dropout": 0.0,
+                "hidden_activation": "gelu_pytorch_tanh",
+                "sliding_window_pattern": 2,
+                "torch_dtype": "float32",
+                # Force one local + one global layer for the RoPE θ test.
+                "layer_types": ["sliding_attention", "full_attention"],
+            },
+            "vision_config": {
+                "model_type": "siglip_vision_model",
+                "hidden_size": 16,
+                "intermediate_size": 32,
+                "num_attention_heads": 2,
+                "num_hidden_layers": 2,
+                "patch_size": 14,
+                "image_size": 448,
+                "projection_dim": 32,
+                "projector_hidden_act": "gelu_fast",
+                "vision_use_head": False,
+                "torch_dtype": "float32",
+                "layer_norm_eps": 1e-6,
+            },
+            "image_token_index": 127,
+            "mm_tokens_per_image": 4,
+            "boi_token_index": 125,
+            "eoi_token_index": 126,
+        },
+        gemma_expert_config={
+            "attention_bias": False,
+            "attention_dropout": 0.0,
+            "head_dim": 16,
+            "hidden_activation": "gelu_pytorch_tanh",
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "max_position_embeddings": 512,
+            "num_attention_heads": 2,
+            "num_hidden_layers": 2,
+            "num_key_value_heads": 1,
+            "rms_norm_eps": 1e-6,
+            # Intentionally different from the backbone's θs — we want to
+            # confirm this value is IGNORED during shared attention.
+            "rope_theta": 10_000.0,
+            "use_adarms": True,
+            "adarms_cond_dim": 16,
+            "vocab_size": 128,
+        },
+        discrete_action_vocab_size=32,
+        freeze_vision_encoder=False,
+        train_expert_only=False,
+    )
+    # bfloat16 cast interacts badly with tiny Linear layers; skip it for tests.
+    import torch as _torch
+
+    return Gemma3WithExpertModel.__new__(Gemma3WithExpertModel), cfg, _torch
+
+
+class TestRopeThetaSymmetryDuringForward:
+    def test_expert_uses_backbone_per_layer_theta(self, monkeypatch):
+        """Both streams' Q/K must rotate with the backbone's per-layer θ so
+        the shared-attention dot product stays in a consistent RoPE basis."""
+        captured: list[float] = []
+
+        real_apply_rope = g3we.apply_rope
+
+        def spy_apply_rope(x, positions, max_wavelength=10_000.0):
+            captured.append(float(max_wavelength))
+            return real_apply_rope(x, positions, max_wavelength=max_wavelength)
+
+        monkeypatch.setattr(g3we, "apply_rope", spy_apply_rope)
+        # `Gemma3WithExpertModel` unconditionally casts its layers to bfloat16
+        # in __init__; override for the test so a plain float32 forward pass
+        # doesn't complain about mixed dtypes through the tiny expert linear.
+        monkeypatch.setattr(g3we, "_preferred_dtype", lambda: torch.float32)
+
+        _, cfg, _ = _make_tiny_g3we_model()
+        model = Gemma3WithExpertModel(cfg)
+        model = model.to(dtype=torch.float32)
+
+        batch, seq_len = 1, 3
+        hidden_backbone = torch.randn(batch, seq_len, cfg.gemma3_config.text_config.hidden_size)
+        position_ids = torch.arange(seq_len)[None, :]
+        attention_mask = torch.ones(batch, seq_len, seq_len, dtype=torch.bool)
+
+        model(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=[hidden_backbone, None],
+            n_cross_att_tokens=seq_len,
+            use_cache=False,
+            fill_kv_cache=True,
+        )
+
+        # Per layer we compute RoPE on two tensors (Q and K). 2 layers × 2
+        # tensors = 4 calls; we only have the backbone stream here so the
+        # expert's θ isn't exercised, but the backbone's per-layer θ must be
+        # present (10_000 for the sliding layer, 1_000_000 for the global).
+        assert 10_000.0 in captured
+        assert 1_000_000.0 in captured
+        assert captured.count(10_000.0) == 2, captured
+        assert captured.count(1_000_000.0) == 2, captured
 
 
 # End-to-end integration — guarded because Gemma 3 4B is huge.
