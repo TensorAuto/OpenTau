@@ -91,6 +91,7 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
         load_pretrained_paligemma: bool = False,
         discrete_action_vocab_size: int | None = None,
         dropout: float = 0.1,
+        gradient_checkpointing: bool = False,
         **kwargs,
     ):
         """Initializes the configuration.
@@ -100,10 +101,18 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
             gemma_expert_config: Configuration dictionary for the Gemma expert model.
             freeze_vision_encoder: Whether to freeze the vision encoder. Defaults to True.
             train_expert_only: Whether to train only the expert model. Defaults to True.
-            attention_implementation: Attention implementation to use ("eager" or "fa2"). Defaults to "eager".
+            attention_implementation: Attention implementation to use ("eager", "sdpa",
+                or "fa2"). Defaults to "eager".
             load_pretrained_paligemma: Whether to load a pretrained PaliGemma model. Defaults to False.
             discrete_action_vocab_size: Vocabulary size for discrete actions.
             dropout: Dropout probability. Defaults to 0.1.
+            gradient_checkpointing: Wrap each decoder-layer body in
+                ``torch.utils.checkpoint.checkpoint`` during training. Trades
+                roughly one extra forward pass per step (~25-33% compute)
+                for ~30-40 GB of activation memory per rank, which enables
+                larger per-rank batch sizes and amortizes per-step fixed cost.
+                Only safe under plain DDP (MULTI_GPU), single-process (NO),
+                or DeepSpeed ZeRO-1/2 — see the train.py guard. Defaults to False.
             **kwargs: Additional keyword arguments passed to PretrainedConfig.
         """
         self.freeze_vision_encoder = freeze_vision_encoder
@@ -112,6 +121,7 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
         self.load_pretrained_paligemma = load_pretrained_paligemma
         self.discrete_action_vocab_size = discrete_action_vocab_size
         self.dropout = dropout
+        self.gradient_checkpointing = gradient_checkpointing
 
         if paligemma_config is None:
             # Default config from Pi0
@@ -408,99 +418,53 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         # RMSNorm
         num_layers = self.paligemma.config.text_config.num_hidden_layers
         head_dim = self.paligemma.config.text_config.head_dim
+
+        # If gradient checkpointing will be writing to past_key_values, make
+        # sure the dict exists before we enter the loop. The original code
+        # lazily created it on the first layer via
+        # ``if past_key_values is None: past_key_values = {}``; doing it here
+        # hoists that out so ``_run_layer`` always receives a non-None dict
+        # when fill_kv_cache=True, which is important for checkpoint recompute
+        # to be idempotent.
+        if fill_kv_cache and past_key_values is None:
+            past_key_values = {}
+
+        use_ckpt = self.config.gradient_checkpointing and self.training
         for layer_idx in range(num_layers):
-            query_states = []
-            key_states = []
-            value_states = []
-            gates = []
-            for i, hidden_states in enumerate(inputs_embeds):
-                if hidden_states is None:
-                    gates.append(None)
-                    continue
-                layer = models[i].layers[layer_idx]
-                # normalizer = torch.tensor(models[i].config.hidden_size**0.5, dtype=hidden_states.dtype)
-                # hidden_states = hidden_states * normalizer
-                hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])
-                gates.append(gate)
-                input_shape = hidden_states.shape[:-1]
-                hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
-
-                hidden_states = hidden_states.to(dtype=_preferred_dtype())
-                query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape)
-                key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape)
-                value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape)
-
-                query_states.append(query_state)
-                key_states.append(key_state)
-                value_states.append(value_state)
-
-            # B,L,H,D with L sequence length, H number of heads, D head dim
-            # concatenate on the number of embeddings/tokens
-            query_states = torch.cat(query_states, dim=1)
-            key_states = torch.cat(key_states, dim=1)
-            value_states = torch.cat(value_states, dim=1)
-
-            query_states = apply_rope(query_states, position_ids)
-            key_states = apply_rope(key_states, position_ids)
-
-            if use_cache:
-                # TODO here, some optimization can be done - similar to a `StaticCache` we can declare the `max_len` before.
-                # so we create an empty cache, with just one cuda malloc, and if (in autoregressive case) we reach
-                # the max len, then we (for instance) double the cache size. This implementation already exists
-                # in `transformers`. (molbap)
-                key_states = torch.cat([past_key_values[layer_idx]["key_states"], key_states], dim=1)
-                value_states = torch.cat([past_key_values[layer_idx]["value_states"], value_states], dim=1)
-            if fill_kv_cache:
-                if past_key_values is None:
-                    past_key_values = {}
-                if n_cross_att_tokens is None:
-                    raise ValueError("n_cross_att_tokens must be provided when fill_kv_cache is True")
-                past_key_values[layer_idx] = {
-                    # save the first n_cross_att_tokens for action expert cross attention
-                    "key_states": key_states[:, :n_cross_att_tokens, :, :],
-                    "value_states": value_states[:, :n_cross_att_tokens, :, :],
-                }
-
-            attention_interface = self.get_attention_interface()
-            att_output = attention_interface(
-                attention_mask, batch_size, head_dim, query_states, key_states, value_states
-            )
-            att_output = att_output.to(dtype=_preferred_dtype())
-
-            # first part of att_output is prefix (up to sequence length, [:, 0:prefix_seq_len])
-            outputs_embeds = []
-            start = 0
-            for i, hidden_states in enumerate(inputs_embeds):
-                layer = models[i].layers[layer_idx]
-
-                if hidden_states is not None:
-                    end = start + hidden_states.shape[1]
-
-                    if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
-                        att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
-                    out_emb = layer.self_attn.o_proj(att_output[:, start:end])
-
-                    out_emb = self.dropout(out_emb)
-
-                    # first residual
-                    out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
-                    after_first_residual = out_emb.clone()
-
-                    out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
-                    out_emb = layer.mlp(out_emb)
-
-                    out_emb = self.dropout(out_emb)
-
-                    # second residual
-                    out_emb = modeling_gemma._gated_residual(after_first_residual, out_emb, gate)  # noqa: SLF001
-
-                    outputs_embeds.append(out_emb)
-
-                    start = end
-                else:
-                    outputs_embeds.append(None)
-
-            inputs_embeds = outputs_embeds
+            if use_ckpt:
+                # use_reentrant=False is the modern, DDP-safe path; it
+                # preserves RNG state across recompute so dropout is
+                # deterministic, and participates cleanly in autograd's
+                # saved_tensors_hooks.
+                inputs_embeds = torch.utils.checkpoint.checkpoint(
+                    self._run_layer,
+                    layer_idx,
+                    inputs_embeds,
+                    attention_mask,
+                    position_ids,
+                    past_key_values,
+                    n_cross_att_tokens,
+                    use_cache,
+                    fill_kv_cache,
+                    adarms_cond,
+                    batch_size,
+                    head_dim,
+                    use_reentrant=False,
+                )
+            else:
+                inputs_embeds = self._run_layer(
+                    layer_idx,
+                    inputs_embeds,
+                    attention_mask,
+                    position_ids,
+                    past_key_values,
+                    n_cross_att_tokens,
+                    use_cache,
+                    fill_kv_cache,
+                    adarms_cond,
+                    batch_size,
+                    head_dim,
+                )
 
         # final norm
         outputs_embeds = []
@@ -512,6 +476,141 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
                 outputs_embeds.append(None)
 
         return outputs_embeds, past_key_values
+
+    def _run_layer(
+        self,
+        layer_idx: int,
+        inputs_embeds: list[torch.FloatTensor | None],
+        attention_mask: torch.Tensor | None,
+        position_ids: torch.LongTensor | None,
+        past_key_values: dict | None,
+        n_cross_att_tokens: int | None,
+        use_cache: bool | None,
+        fill_kv_cache: bool | None,
+        adarms_cond: list[torch.Tensor | None],
+        batch_size: int,
+        head_dim: int,
+    ) -> list[torch.FloatTensor | None]:
+        """Run a single layer of the dual-tower decoder loop.
+
+        Extracted from ``forward()`` as a standalone method so it can be the
+        unit of ``torch.utils.checkpoint.checkpoint`` wrapping when
+        ``config.gradient_checkpointing`` is enabled. Behavior is bit-identical
+        to the original inlined loop body; side effects on ``past_key_values``
+        are preserved (mutation is idempotent across checkpoint recompute
+        because each layer writes its own unique key).
+
+        Args:
+            layer_idx: Index of the current decoder layer.
+            inputs_embeds: Per-tower input embeddings. Entries may be None if
+                that tower is not participating in this forward (e.g. expert
+                tower during prefix-only pass).
+            attention_mask: Bool attention mask, True = attend, shape (B, S, S).
+            position_ids: Position IDs tensor passed through RoPE.
+            past_key_values: KV cache dict, populated if fill_kv_cache, read
+                if use_cache.
+            n_cross_att_tokens: Number of prefix tokens to cache for cross-
+                attention (required when fill_kv_cache).
+            use_cache: If True, prepend cached KV for this layer.
+            fill_kv_cache: If True, write this layer's K/V into the cache.
+            adarms_cond: Per-tower AdaRMSNorm conditioning tensors (or None).
+            batch_size: Cached batch size from the outer forward.
+            head_dim: Per-head dimension.
+
+        Returns:
+            list[torch.FloatTensor | None]: Per-tower output embeddings for
+                this layer.
+        """
+        models = [self.paligemma.language_model, self.gemma_expert.model]
+
+        query_states = []
+        key_states = []
+        value_states = []
+        gates = []
+        for i, hidden_states in enumerate(inputs_embeds):
+            if hidden_states is None:
+                gates.append(None)
+                continue
+            layer = models[i].layers[layer_idx]
+            hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])
+            gates.append(gate)
+            input_shape = hidden_states.shape[:-1]
+            hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
+
+            hidden_states = hidden_states.to(dtype=_preferred_dtype())
+            query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape)
+            key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape)
+            value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape)
+
+            query_states.append(query_state)
+            key_states.append(key_state)
+            value_states.append(value_state)
+
+        # B,L,H,D with L sequence length, H number of heads, D head dim
+        # concatenate on the number of embeddings/tokens
+        query_states = torch.cat(query_states, dim=1)
+        key_states = torch.cat(key_states, dim=1)
+        value_states = torch.cat(value_states, dim=1)
+
+        query_states = apply_rope(query_states, position_ids)
+        key_states = apply_rope(key_states, position_ids)
+
+        if use_cache:
+            # TODO here, some optimization can be done - similar to a `StaticCache` we can declare the `max_len` before.
+            # so we create an empty cache, with just one cuda malloc, and if (in autoregressive case) we reach
+            # the max len, then we (for instance) double the cache size. This implementation already exists
+            # in `transformers`. (molbap)
+            key_states = torch.cat([past_key_values[layer_idx]["key_states"], key_states], dim=1)
+            value_states = torch.cat([past_key_values[layer_idx]["value_states"], value_states], dim=1)
+        if fill_kv_cache:
+            if n_cross_att_tokens is None:
+                raise ValueError("n_cross_att_tokens must be provided when fill_kv_cache is True")
+            past_key_values[layer_idx] = {
+                # save the first n_cross_att_tokens for action expert cross attention
+                "key_states": key_states[:, :n_cross_att_tokens, :, :],
+                "value_states": value_states[:, :n_cross_att_tokens, :, :],
+            }
+
+        attention_interface = self.get_attention_interface()
+        att_output = attention_interface(
+            attention_mask, batch_size, head_dim, query_states, key_states, value_states
+        )
+        att_output = att_output.to(dtype=_preferred_dtype())
+
+        # first part of att_output is prefix (up to sequence length, [:, 0:prefix_seq_len])
+        outputs_embeds: list[torch.FloatTensor | None] = []
+        start = 0
+        for i, hidden_states in enumerate(inputs_embeds):
+            layer = models[i].layers[layer_idx]
+
+            if hidden_states is not None:
+                end = start + hidden_states.shape[1]
+
+                if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
+                    att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
+                out_emb = layer.self_attn.o_proj(att_output[:, start:end])
+
+                out_emb = self.dropout(out_emb)
+
+                # first residual
+                out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
+                after_first_residual = out_emb.clone()
+
+                out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
+                out_emb = layer.mlp(out_emb)
+
+                out_emb = self.dropout(out_emb)
+
+                # second residual
+                out_emb = modeling_gemma._gated_residual(after_first_residual, out_emb, gate)  # noqa: SLF001
+
+                outputs_embeds.append(out_emb)
+
+                start = end
+            else:
+                outputs_embeds.append(None)
+
+        return outputs_embeds
 
     def get_attention_interface(self):
         """Returns the attention implementation function based on config.
