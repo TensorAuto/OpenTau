@@ -153,6 +153,25 @@ def profile(cfg: TrainPipelineConfig):
             )
         cfg.policy.attention_implementation = attn_impl_env
 
+    # Optional: toggle gradient checkpointing per run. Production default is
+    # False; setting GRAD_CHECKPOINT=true lets us A/B the throughput/memory
+    # tradeoff without touching the training config JSON. The strict
+    # distributed-backend guard in train.py is *not* duplicated here because
+    # profile_step already runs under accelerator and pi05's custom forward
+    # only supports the same set of backends for ckpt; if users try it
+    # under an unsupported backend they'll hit the same autograd issues at
+    # first backward.
+    grad_ckpt_env = os.environ.get("GRAD_CHECKPOINT")
+    if grad_ckpt_env is not None and hasattr(cfg.policy, "gradient_checkpointing"):
+        want_ckpt = grad_ckpt_env.lower() == "true"
+        if accelerator.is_main_process:
+            logging.info(
+                "GRAD_CHECKPOINT=%s: overriding cfg.policy.gradient_checkpointing (was %r)",
+                grad_ckpt_env,
+                cfg.policy.gradient_checkpointing,
+            )
+        cfg.policy.gradient_checkpointing = want_ckpt
+
     policy = make_policy(cfg=cfg.policy, ds_meta=train_dataset.meta)
     policy.to(torch.bfloat16)
 
