@@ -193,11 +193,29 @@ def profile(cfg: TrainPipelineConfig):
                     optimizer._step_count = 0
                     optimizer.step = _with_counter(optimizer.step, optimizer)
             if accelerator.is_main_process:
-                # Confirm the implementation actually in effect.
+                # Confirm the implementation actually in effect. Read back from
+                # the optimizer itself so we catch cases where PyTorch silently
+                # falls back (e.g. unsupported dtype, capturable conflicts,
+                # missing CUDA). PyTorch stores fused/foreach on each param
+                # group after __init__.
+                actual_flags = {k: optimizer.param_groups[0].get(k, "<unset>") for k in ("fused", "foreach")}
+                total_params = sum(
+                    p.numel() for g in optimizer.param_groups for p in g["params"] if p.requires_grad
+                )
+                dtype_counts: dict[str, int] = defaultdict(int)
+                for g in optimizer.param_groups:
+                    for p in g["params"]:
+                        if p.requires_grad:
+                            dtype_counts[str(p.dtype)] += 1
                 logging.info(
-                    "FUSED_ADAMW=%s: rebuilt AdamW with fused=%s",
+                    "FUSED_ADAMW=%s: rebuilt AdamW with fused=%s | "
+                    "optimizer.param_groups[0] reports %s | "
+                    "trainable tensors by dtype: %s | total trainable params: %s",
                     fused_env,
                     want_fused,
+                    actual_flags,
+                    dict(dtype_counts),
+                    f"{total_params:,}",
                 )
 
     train_dataloader = train_dataset.get_dataloader()
