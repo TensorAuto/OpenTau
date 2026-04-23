@@ -97,6 +97,7 @@ Example:
 import importlib
 import json
 import logging
+import math
 import shutil
 import subprocess
 import warnings
@@ -660,6 +661,7 @@ def resample_and_trim_video(
     fast_decode: int = 0,
     log_level: str | None = "error",
     overwrite: bool = False,
+    start_time: float | None = None,
 ) -> None:
     """Resample a video to the target FPS and trim it to exactly *num_frames* frames.
 
@@ -667,8 +669,8 @@ def resample_and_trim_video(
     episode whose non-visual observations have already been saved.  The source
     video is re-encoded at ``target_fps`` and cropped so that the output
     contains exactly ``num_frames`` frames (i.e. a duration of
-    ``num_frames / target_fps`` seconds, starting from the beginning of the
-    input).
+    ``num_frames / target_fps`` seconds, starting from ``start_time`` seconds
+    into the input, or from the beginning if ``start_time`` is ``None``).
 
     Args:
         input_path: Path to the source video file.
@@ -682,6 +684,9 @@ def resample_and_trim_video(
         fast_decode: Fast decode parameter for libsvtav1. Defaults to 0.
         log_level: FFmpeg log level. Defaults to "error".
         overwrite: Whether to overwrite an existing output file. Defaults to False.
+        start_time: Optional start offset in seconds into the source video.
+            When provided, ``-ss`` is placed before ``-i`` for fast input
+            seeking. Defaults to None (start from the beginning).
 
     Raises:
         FileNotFoundError: If ``input_path`` does not exist.
@@ -698,6 +703,9 @@ def resample_and_trim_video(
     if target_fps <= 0:
         raise ValueError(f"`target_fps` must be > 0, got {target_fps}.")
 
+    if start_time is not None and (not math.isfinite(start_time) or start_time < 0):
+        raise ValueError(f"`start_time` must be a finite non-negative number, got {start_time}.")
+
     if not input_path.is_file():
         raise FileNotFoundError(f"Input video not found: {input_path}")
 
@@ -713,9 +721,14 @@ def resample_and_trim_video(
     # Duration to keep: num_frames / target_fps
     duration = num_frames / target_fps
 
+    input_args: list[tuple[str, str]] = []
+    if start_time is not None:
+        input_args.append(("-ss", f"{start_time:.9f}"))
+    input_args.append(("-i", str(input_path)))
+
     ffmpeg_args = OrderedDict(
-        [
-            ("-i", str(input_path)),
+        input_args
+        + [
             ("-t", f"{duration:.6f}"),
             ("-r", str(target_fps)),
             ("-vcodec", vcodec),

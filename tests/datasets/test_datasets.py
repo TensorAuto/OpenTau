@@ -491,6 +491,42 @@ def _make_dummy_mp4(path, fps=60, num_frames=100, width=128, height=96):
     return path
 
 
+def _make_time_varying_mp4(path, fps=60, num_frames=300, width=128, height=96):
+    """Create an MP4 whose content changes over time.
+
+    Uses ffmpeg's ``testsrc2`` filter, which renders a test card with a
+    changing timer — every frame is visibly different from the last.
+    """
+    import shutil
+    import subprocess
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        pytest.skip("ffmpeg not available")
+    duration = num_frames / fps
+    subprocess.run(
+        [
+            ffmpeg,
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"testsrc2=size={width}x{height}:rate={fps}:duration={duration:.6f}",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+            "-g",
+            "2",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return path
+
+
 def test_deferred_video_add_frame_and_save(tmp_path, empty_lerobot_dataset_factory):
     """Test that frames can be added without image data for deferred video keys."""
     features = {
@@ -580,6 +616,134 @@ def test_deferred_video_attach_video(tmp_path, empty_lerobot_dataset_factory):
     expected_path = dataset.root / dataset.meta.get_video_file_path(0, "observation.images.top")
     assert expected_path.is_file()
     assert result_path == expected_path
+
+
+def test_deferred_video_attach_video_start_time(tmp_path):
+    """A non-zero ``start_time`` must shift the extracted segment."""
+    from opentau.datasets.video_utils import decode_video_frames
+
+    features = {
+        "state": {"dtype": "float32", "shape": (2,), "names": None},
+        "observation.images.top": {
+            "dtype": "video",
+            "shape": (3, 96, 128),
+            "names": ["channels", "height", "width"],
+            "info": None,
+        },
+    }
+    target_fps = 10
+    num_frames = 5
+
+    def _build_dataset(root):
+        dataset = LeRobotDataset.create(
+            repo_id=DUMMY_REPO_ID,
+            fps=target_fps,
+            root=root,
+            features=features,
+            deferred_video_keys={"observation.images.top"},
+            standardize=False,
+        )
+        for i in range(num_frames):
+            dataset.add_frame(
+                {
+                    "state": np.array([float(i), float(i + 1)], dtype=np.float32),
+                    "task": "Dummy task",
+                }
+            )
+        dataset.save_episode()
+        return dataset
+
+    # Source video has time-varying content so different offsets yield different pixels.
+    src_video = _make_time_varying_mp4(tmp_path / "source.mp4", fps=60, num_frames=300, width=128, height=96)
+
+    ds_no_offset = _build_dataset(tmp_path / "ds_no_offset")
+    ds_no_offset.attach_video(
+        episode_index=0,
+        video_key="observation.images.top",
+        input_video_path=src_video,
+        overwrite=True,
+    )
+
+    ds_offset = _build_dataset(tmp_path / "ds_offset")
+    ds_offset.attach_video(
+        episode_index=0,
+        video_key="observation.images.top",
+        input_video_path=src_video,
+        overwrite=True,
+        start_time=2.0,
+    )
+
+    path_no_offset = ds_no_offset.root / ds_no_offset.meta.get_video_file_path(0, "observation.images.top")
+    path_offset = ds_offset.root / ds_offset.meta.get_video_file_path(0, "observation.images.top")
+
+    frames_no_offset = decode_video_frames(path_no_offset, [0.0], tolerance_s=0.1)
+    frames_offset = decode_video_frames(path_offset, [0.0], tolerance_s=0.1)
+
+    assert frames_no_offset.shape == frames_offset.shape
+    # The two first frames should be clearly distinct (testsrc2 is different every frame).
+    assert not torch.allclose(frames_no_offset, frames_offset, atol=1e-2)
+
+
+def test_resample_and_trim_video_invalid_start_time(tmp_path):
+    """``start_time`` must be finite and non-negative."""
+    from opentau.datasets.video_utils import resample_and_trim_video
+
+    src = _make_dummy_mp4(tmp_path / "src.mp4", fps=30, num_frames=30)
+    out = tmp_path / "out.mp4"
+
+    for bad in (-1.0, float("inf"), float("-inf"), float("nan")):
+        with pytest.raises(ValueError, match="start_time"):
+            resample_and_trim_video(
+                input_path=src,
+                output_path=out,
+                target_fps=10,
+                num_frames=5,
+                start_time=bad,
+            )
+
+
+def test_deferred_video_multi_episode_hwc_convention(tmp_path, empty_lerobot_dataset_factory):
+    """Saving two episodes in sequence with deferred video keys declared in
+    LeRobot v2.1's (H, W, C) convention must not crash.
+
+    Regression test for a bug in the placeholder-stats fallback: it assumed
+    shape[0] was the channel axis, which is true for (C, H, W) but produces
+    shape (H, 1, 1) for (H, W, C) — aggregate_stats then rejected it on the
+    second save_episode because its shape-check requires (3, 1, 1) for
+    features with 'image' in the key.
+    """
+    features = {
+        "state": {"dtype": "float32", "shape": (2,), "names": None},
+        "observation.images.top": {
+            "dtype": "video",
+            "shape": (96, 128, 3),
+            "names": ["height", "width", "channel"],
+            "info": None,
+        },
+    }
+    dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "hwc_test",
+        features=features,
+        deferred_video_keys={"observation.images.top"},
+    )
+    for ep in range(2):
+        for i in range(3):
+            dataset.add_frame(
+                {
+                    "state": np.array([float(i), float(i + ep)], dtype=np.float32),
+                    "task": "Dummy task",
+                }
+            )
+        dataset.save_episode()
+
+    assert dataset.meta.total_episodes == 2
+    # Placeholder stats for the deferred key must use the channel axis (3),
+    # not the height axis (96).
+    stats = dataset.meta.stats["observation.images.top"]
+    assert stats["min"].shape == (3, 1, 1)
+    assert stats["max"].shape == (3, 1, 1)
+    assert stats["mean"].shape == (3, 1, 1)
+    assert stats["std"].shape == (3, 1, 1)
 
 
 def test_deferred_video_invalid_key(tmp_path, empty_lerobot_dataset_factory):

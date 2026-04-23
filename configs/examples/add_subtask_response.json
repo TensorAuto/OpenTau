@@ -1,0 +1,8 @@
+{
+    "datasets": [
+        {
+            "repo_id": "TensorAuto/ice-lemonade",
+            "root": "/path/to/local/dataset"
+        }
+    ]
+}

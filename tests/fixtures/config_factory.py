@@ -48,13 +48,25 @@ def dataset_config(transforms_config):
 
 @pytest.fixture
 def dataset_mixture_config(dataset_config):
-    """Return a mock DatasetMixtureConfig object with minimal required attributes."""
+    """Return a mock DatasetMixtureConfig object with minimal required attributes.
+
+    Optional-key dropout probabilities are pinned to 0 so tests are deterministic
+    by default. Tests that specifically exercise dropout should override the
+    relevant fields on the returned config (see
+    ``tests/datasets/test_optional_keys.py`` for focused coverage).
+    """
     return DatasetMixtureConfig(
         datasets=[dataset_config],
         weights=[1.0],
         action_freq=30.0,
         image_resample_strategy="nearest",
         vector_resample_strategy="nearest",
+        history_state_drop_prob=0.0,
+        subgoal_drop_prob=0.0,
+        subgoal_end_of_segment_prob=0.0,
+        response_drop_prob=0.0,
+        metadata_drop_all_prob=0.0,
+        metadata_drop_each_prob=0.0,
     )
 
 

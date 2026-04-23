@@ -77,3 +77,76 @@ Each training config should contain a dataset mixture definition. To evaluate th
         --num_workers=10
 
 This will output a token count for each language key in the dataset mixture, and save it to ``outputs/stats/token_count.json``.
+
+Adding subtask responses to a dataset
+--------------------------------------
+
+Some policies (e.g. π0.5) can be trained with per-frame subtask annotations that tell the model *what* sub-goal is active at each timestep.
+The ``add_subtask_response`` script reads per-episode subtask JSON files, converts the time-based subtask boundaries to frame indices using the dataset FPS, and writes the active subtask string into a ``response`` column in each episode parquet file.
+
+Prerequisites:
+
+- Each dataset must have a ``subtask_path`` field in its ``meta/info.json`` that points to per-episode subtask JSON files
+  (e.g. ``"subtask_path": "subtask/episode_{episode_index:06d}.json"``).
+- Each subtask JSON is a list of objects with ``"time"`` (in seconds) and ``"subtask"`` (a string) keys:
+
+  .. code-block:: javascript
+
+      [
+          {"time": 0.0, "subtask": "pick up the cup"},
+          {"time": 2.5, "subtask": "pour water into the cup"},
+          {"time": 5.1, "subtask": "place the cup on the table"}
+      ]
+
+Create a config file that lists the datasets you want to process, each with a local ``root`` path:
+
+.. code-block:: javascript
+
+    {
+        "datasets": [
+            {
+                "repo_id": "TensorAuto/ice-lemonade",
+                "root": "/path/to/local/dataset"
+            }
+        ]
+    }
+
+Then run the script:
+
+.. code-block:: bash
+
+    python src/opentau/scripts/add_subtask_response.py \
+        --config_path=configs/examples/add_subtask_response.json
+
+The script will:
+
+1. Read ``meta/info.json`` for each dataset to determine the FPS and subtask file path template.
+2. For each episode, load the subtask JSON, map time-based boundaries to frame indices, and
+   assign the active subtask string to every frame in that range.
+3. Write (or overwrite) the ``response`` column in the episode parquet file.
+4. Add a ``response`` feature entry to ``meta/info.json`` if it doesn't already exist.
+
+If a subtask JSON is missing for an episode, the ``response`` column is filled with empty strings and a warning is emitted.
+
+To use the subtask responses during training, map the ``response`` key in your dataset config:
+
+.. code-block:: javascript
+
+    {
+        "dataset_mixture": {
+            "datasets": [
+                {
+                    "repo_id": "TensorAuto/IceLemonade_100",
+                    "data_features_name_mapping": {
+                        "camera0": "observation.images.rgb",
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "task",
+                        "response": "response"
+                    }
+                }
+            ],
+            ...
+        },
+        ...
+    }

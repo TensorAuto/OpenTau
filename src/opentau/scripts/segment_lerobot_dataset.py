@@ -29,9 +29,12 @@ An example of segments.json can be found in `configs/examples/segments.json`.
 
 import argparse
 import json
+import logging
 import math
+import os
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, cast
@@ -52,6 +55,10 @@ from opentau.datasets.utils import (
     write_json,
 )
 
+logger = logging.getLogger(__name__)
+
+FFMPEG_MAX_WORKERS_ENV_VAR = "OPENTAU_FFMPEG_MAX_WORKERS"
+
 
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for dataset segmentation.
@@ -67,6 +74,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("input_root", type=Path, help="Path to source LeRobot dataset root.")
     parser.add_argument("output_root", type=Path, help="Path to output dataset root (must not exist).")
     parser.add_argument("segments_json", type=Path, help="Path to JSON segmentation plan.")
+    parser.add_argument(
+        "--ffmpeg-max-workers",
+        type=int,
+        default=None,
+        help=(
+            "Override the worker count used to dispatch parallel ffmpeg trim jobs. "
+            "Must be an integer in [1, 64]. When unset, falls back to the "
+            f"{FFMPEG_MAX_WORKERS_ENV_VAR} environment variable, then to "
+            "min(16, (os.cpu_count() or 4) * 2)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -189,6 +207,70 @@ def _trim_video_segment(src_video_path: Path, dst_video_path: Path, start_frame:
         )
 
 
+def _ffmpeg_trim_max_workers(override: int | None = None) -> int:
+    """Return the worker count for parallel ffmpeg trimming.
+
+    Resolution order:
+
+    1. If ``override`` is not ``None``, it is treated as the authoritative
+       value (typically sourced from the ``--ffmpeg-max-workers`` CLI flag).
+       It must be an integer in the closed range ``[1, 64]``; otherwise
+       :class:`ValueError` is raised — explicit user overrides never fall
+       back silently.
+    2. Otherwise, if the environment variable ``OPENTAU_FFMPEG_MAX_WORKERS``
+       is set, it must parse as an integer in ``[1, 64]``. Invalid or
+       out-of-range values are rejected with a logged warning and the
+       default is used instead (never silently fall through).
+    3. Otherwise, fall back to ``min(16, (os.cpu_count() or 4) * 2)``.
+
+    The default is a pragmatic cap for dispatching external ffmpeg
+    processes. ``ThreadPoolExecutor`` is appropriate here because the
+    Python threads only launch subprocesses and wait for them to finish;
+    the actual work happens in ffmpeg itself, so the GIL is not a concern.
+    For CPU-heavy codecs (e.g. AV1 software decode), shared decoder CPU can
+    become the bottleneck before the worker count is saturated — in that
+    case tune via ``--ffmpeg-max-workers`` or the environment variable.
+
+    Args:
+        override: Explicit worker count from a CLI flag. ``None`` means no
+            override was provided; otherwise it must be in ``[1, 64]``.
+
+    Returns:
+        The number of threads to use in the ``ThreadPoolExecutor`` that
+        dispatches ffmpeg trim jobs. Guaranteed to be at least ``1``.
+
+    Raises:
+        ValueError: If ``override`` is provided but not an integer in
+            ``[1, 64]``.
+    """
+    if override is not None:
+        if not isinstance(override, int) or isinstance(override, bool) or not (1 <= override <= 64):
+            raise ValueError(f"--ffmpeg-max-workers must be an integer in [1, 64], got {override!r}.")
+        return override
+
+    raw = os.environ.get(FFMPEG_MAX_WORKERS_ENV_VAR)
+    if raw is not None and raw.strip() != "":
+        stripped = raw.strip()
+        try:
+            v = int(stripped)
+        except ValueError:
+            logger.warning(
+                "Ignoring %s=%r: not an integer. Falling back to the default worker count.",
+                FFMPEG_MAX_WORKERS_ENV_VAR,
+                raw,
+            )
+        else:
+            if 1 <= v <= 64:
+                return v
+            logger.warning(
+                "Ignoring %s=%d: outside the allowed range [1, 64]. Falling back to the default worker count.",
+                FFMPEG_MAX_WORKERS_ENV_VAR,
+                v,
+            )
+    cpu = os.cpu_count() or 4
+    return max(1, min(16, cpu * 2))
+
+
 def _copy_segment_images_and_rewrite_column(
     image_cells: list[Any],
     input_root: Path,
@@ -279,6 +361,7 @@ def segment_dataset(
     input_root: Path,
     output_root: Path,
     segments_by_episode: dict[int, list[tuple[int, int]]],
+    ffmpeg_max_workers: int | None = None,
 ) -> None:
     """Create a new segmented dataset from one or more source episodes.
 
@@ -287,6 +370,10 @@ def segment_dataset(
         output_root: Destination directory for the new dataset. Must not exist.
         segments_by_episode: Mapping from source episode id to list of
             ``(start, end)`` frame ranges in ``[start, end)`` form.
+        ffmpeg_max_workers: Explicit worker count for the parallel ffmpeg
+            trim pool. ``None`` lets :func:`_ffmpeg_trim_max_workers` decide
+            based on the ``OPENTAU_FFMPEG_MAX_WORKERS`` env var or the
+            CPU-based default.
 
     Notes:
         For visual features (``dtype`` in ``{"image", "video"}``), per-episode
@@ -348,6 +435,7 @@ def segment_dataset(
     video_path_template_str = cast(str, video_path_template) if video_path_template is not None else ""
     source_tables: dict[int, pa.Table] = {}
     output_episode_index = 0
+    ffmpeg_jobs: list[tuple[Path, Path, int, int]] = []
 
     with tqdm(total=total_frames_to_process, desc="Segmenting frames", unit="frame") as pbar:
         for episode_id, segments in segments_by_episode.items():
@@ -461,7 +549,7 @@ def segment_dataset(
 
                 write_episode_stats(output_episode_index, episode_stats, output_root)
 
-                # Copy and trim source videos for this segment, if any.
+                # Defer ffmpeg trims — run in parallel after all parquet/stats are written.
                 for video_key in source_meta.video_keys:
                     src_video_path = input_root / source_meta.get_video_file_path(episode_id, video_key)
                     if not src_video_path.is_file():
@@ -472,11 +560,27 @@ def segment_dataset(
                         episode_index=output_episode_index,
                     )
                     dst_video_path.parent.mkdir(parents=True, exist_ok=True)
-                    _trim_video_segment(src_video_path, dst_video_path, start, end)
+                    ffmpeg_jobs.append((src_video_path, dst_video_path, start, end))
 
                 global_index_offset += seg_len
                 output_episode_index += 1
                 pbar.update(seg_len)
+
+    if ffmpeg_jobs:
+        n_workers = _ffmpeg_trim_max_workers(ffmpeg_max_workers)
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = [pool.submit(_trim_video_segment, *job) for job in ffmpeg_jobs]
+            try:
+                for fut in tqdm(
+                    as_completed(futures),
+                    total=len(futures),
+                    desc=f"Trimming videos ({n_workers} workers)",
+                    unit="clip",
+                ):
+                    fut.result()
+            except BaseException:
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
 
     for episode in output_episodes:
         append_jsonlines(episode, output_root / EPISODES_PATH)
@@ -500,6 +604,7 @@ def main() -> None:
         input_root=args.input_root,
         output_root=args.output_root,
         segments_by_episode=segments_by_episode,
+        ffmpeg_max_workers=args.ffmpeg_max_workers,
     )
 
 

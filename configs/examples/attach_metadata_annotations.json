@@ -1,0 +1,50 @@
+[
+  {
+    "episode_id": 0,
+    "quality": 3,
+    "segments": [
+      {
+        "start": 0,
+        "subtask": "approach the blue cup",
+        "success": false
+      },
+      {
+        "start": 50,
+        "subtask": "pick up the blue cup",
+        "success": true
+      },
+      {
+        "start": 120,
+        "subtask": "place the cup in the tray",
+        "success": true
+      }
+    ]
+  },
+  {
+    "episode_id": 1,
+    "quality": 5,
+    "segments": [
+      {
+        "start": 0,
+        "subtask": "pick up the bottle",
+        "success": true
+      },
+      {
+        "start": 80,
+        "subtask": "place the bottle in the tray",
+        "success": true
+      }
+    ]
+  },
+  {
+    "episode_id": 7,
+    "quality": 4,
+    "segments": [
+      {
+        "start": 0,
+        "subtask": "reset the workspace",
+        "success": true
+      }
+    ]
+  }
+]
