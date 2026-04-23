@@ -15,9 +15,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import abc
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable
 
 import draccus
 import torch
@@ -60,9 +60,11 @@ class AdamConfig(OptimizerConfig):
     weight_decay: float = 0.0
     grad_clip_norm: float = 10.0
     # Use the fused Adam CUDA kernel when running on GPU. Falls back to the
-    # default foreach path on CPU-only hosts (see build()). For large models
-    # (~3B+ trainable params) this cuts optimizer.step() wall time by ~60%
-    # on A100. No math change; same state_dict layout.
+    # default foreach path on CPU-only hosts (see build()). Typically faster
+    # than foreach once models get large enough that launch overhead matters;
+    # exact speedup is workload-dependent (e.g. ~60% on pi05's ~3.4B params
+    # on A100, smaller for smaller models). No math change; same state_dict
+    # layout.
     fused: bool = True
 
     def build(self, params: Iterable[Parameter]) -> torch.optim.Optimizer:

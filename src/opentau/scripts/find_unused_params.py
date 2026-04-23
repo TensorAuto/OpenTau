@@ -42,6 +42,7 @@ Output sections:
 """
 
 import logging
+import math
 import os
 from collections import defaultdict
 from typing import Any
@@ -135,7 +136,9 @@ def find(cfg: TrainPipelineConfig):
 
     def _summarize(label: str, items: list[tuple[str, tuple[int, ...]]]) -> None:
         n = len(items)
-        n_params = sum(int(torch.tensor(s).prod()) for _, s in items) if items else 0
+        # math.prod avoids allocating a CPU tensor per shape, which matters
+        # when `items` is long (hundreds of tensors per audit is normal).
+        n_params = sum(math.prod(s) for _, s in items) if items else 0
         print(f"\n========== {label} ({n} tensors, {n_params:,} params) ==========")
         if not items:
             return
@@ -145,13 +148,16 @@ def find(cfg: TrainPipelineConfig):
             by_root[_module_root(name, depth=3)].append((name, shape))
         for root in sorted(by_root.keys()):
             group = by_root[root]
-            group_n = sum(int(torch.tensor(s).prod()) for _, s in group)
+            group_n = sum(math.prod(s) for _, s in group)
             print(f"  [{root}]  ({len(group)} tensors, {group_n:,} params)")
             for name, shape in group:
                 print(f"    - {name}  shape={shape}")
 
+    # Use the policy type from the config so the header is accurate when this
+    # script is run against pi0, value, etc. rather than being hard-coded to pi05.
+    policy_name = getattr(cfg.policy, "type", "policy")
     print("\n#" + "=" * 78)
-    print("# pi05 parameter audit — single forward + backward, single GPU")
+    print(f"# {policy_name} parameter audit — single forward + backward, single GPU")
     print(f"# include_zero_grad={include_zero_grad}")
     print("#" + "=" * 78)
 
