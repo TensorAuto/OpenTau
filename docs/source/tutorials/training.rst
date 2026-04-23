@@ -4,6 +4,11 @@ Training and Checkpointing
 .. note::
    Make sure you have followed the :doc:`/installation` guide before proceeding.
 
+.. tip::
+   If you're investigating slow training or low GPU utilization, see the
+   :doc:`benchmarking` guide for diagnostic scripts that break a step down
+   into forward / backward / optimizer / sync phases.
+
 Distributed Training Configuration
 ----------------------------------
 

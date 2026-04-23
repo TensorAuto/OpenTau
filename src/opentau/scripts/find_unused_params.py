@@ -6,33 +6,39 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""List pi05 parameters that DDP would flag as unused.
+"""Audit policy parameters that DDP would flag as unused.
 
-After Phase 2 we are running on bare DDP, but ``train.py`` still sets
-``DistributedDataParallelKwargs(find_unused_parameters=True)`` because
-flipping it to False makes DDP error out — there's at least one
-parameter in pi05 whose backward graph is never reached. The True
-setting costs a per-step graph walk (~10–15% of step time) so we want
-to fix the underlying issue and flip it off.
+Builds the policy from a training config, runs one forward + backward
+on a real batch (single GPU, no DDP or DeepSpeed wrapping), and lists
+every parameter where ``param.requires_grad and param.grad is None``.
+Those are exactly the parameters DDP would refuse to sync with
+``find_unused_parameters=False``.
 
-This script does one forward + backward on a real batch on a single
-GPU (no DDP, no DeepSpeed) and prints every parameter where
-``param.requires_grad and param.grad is None``. Those are exactly the
-parameters DDP would refuse to sync with ``find_unused_parameters=False``.
-
-Usage (no accelerate launch needed — single process is enough):
+Usage — single Python invocation is enough (this script never needs
+``accelerate launch``):
 
     python src/opentau/scripts/find_unused_params.py \
         --config_path=configs/libero/reproduce_pi05_libero.json
 
+If the ``UNUSED`` section is empty you can safely set
+``FIND_UNUSED_PARAMS=false`` when running training, reclaiming the
+per-step graph-walk cost DDP otherwise pays. If not, each reported
+tensor is either an orphan in the model (fix or freeze it) or a
+conditionally-touched parameter (add an unconditional graph edge).
+
+Environment variables:
+
+  - ``INCLUDE_ZERO_GRAD=true``  —  also list parameters whose grad
+    tensor exists but is all zero. Often indicates a code path that
+    touches the parameter but produces no learning signal. Usually
+    safe to ignore.
+
 Output sections:
 
-  - "UNUSED" — params with requires_grad=True and grad is None after backward.
-    These are the ones we need to fix or freeze.
-  - "ZERO-GRAD" (optional, set ``--include_zero_grad``) — params whose grad
-    tensor exists but is all zero. Often indicates a code path that touches
-    the param but produces no learning signal; usually safe to ignore.
-  - "FROZEN" — params with requires_grad=False, listed for context.
+  - ``UNUSED`` — params with ``requires_grad=True`` and ``grad is None``
+    after backward. These are the ones we need to fix or freeze.
+  - ``ZERO-GRAD`` (only when ``INCLUDE_ZERO_GRAD=true``) — see above.
+  - ``FROZEN`` — ``requires_grad=False`` params, listed for context.
 """
 
 import logging

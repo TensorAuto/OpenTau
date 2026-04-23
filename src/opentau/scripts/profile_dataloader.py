@@ -6,20 +6,21 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Dataloader-only throughput for the training pipeline.
+"""Dataloader-only throughput ceiling for the training pipeline.
 
-Phase-1 diagnostic companion to ``profile_step.py``. Builds the exact same
+Companion to ``profile_step.py`` that answers "is the dataloader keeping
+up with the GPUs?" Builds the exact same
 ``WeightedDatasetMixture.get_dataloader()`` the training loop uses (same
 ``num_workers``, ``prefetch_factor``, ``pin_memory``, ``HierarchicalSampler``)
-and then iterates batches in a tight loop with **no model, no optimizer, no
+and iterates batches in a tight loop with **no model, no optimizer, no
 collective**. Any slowdown observed here is pure input-pipeline cost.
 
 Compare the ``batches/s`` reported here against the ``steps/s`` from
-``profile_step.py``. If dataloader throughput is at or below training step
-rate, the input pipeline is the bottleneck.
+``profile_step.py``. If dataloader throughput is at or below training
+step rate, the input pipeline is the bottleneck.
 
-Run with the same launcher you use for training so you reproduce the real
-8-rank × N-worker pressure:
+Run with the same launcher you use for training so you reproduce the
+real multi-rank × N-worker pressure on the host CPU:
 
     accelerate launch \
         --config_file configs/libero/reproduce_pi05_libero_accelerate_config.yaml \
@@ -27,12 +28,14 @@ Run with the same launcher you use for training so you reproduce the real
         --config_path=configs/libero/reproduce_pi05_libero.json
 
 Each rank prints its own throughput; rank 0 also prints the cluster
-min/max/mean. ``H2D`` timing moves the batch to the local GPU just like
+min/mean/max. ``H2D`` timing moves the batch to the local GPU just like
 ``accelerator.prepare(dataloader)`` would — without any collective.
 
-Defaults to 20 warmup + 300 measured batches. ``cfg.steps`` from the
-training config is intentionally ignored (production configs set it to
-~1M). To run longer, set ``PROFILE_BATCHES=500 accelerate launch ...``.
+Environment variables (all optional):
+
+  - ``PROFILE_BATCHES=N``  (default 300)  number of measured batches.
+    ``cfg.steps`` is intentionally ignored (production configs set it
+    to ~1M).
 """
 
 import logging

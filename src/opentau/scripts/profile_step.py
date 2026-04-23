@@ -8,11 +8,10 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """Per-step timing breakdown for the training loop.
 
-Diagnostic for the "low GPU utilization" investigation. Mirrors
-``opentau/scripts/train.py`` setup (Accelerator under DDP or DeepSpeed
-depending on the supplied accelerate config; same config parser, same
-dataset/policy/optimizer construction), then runs a short loop that
-splits wall-clock per step into phases:
+Mirrors ``opentau/scripts/train.py`` setup (Accelerator under DDP or
+DeepSpeed depending on the supplied accelerate config; same config
+parser, same dataset/policy/optimizer construction), then runs a short
+loop that splits wall-clock per step into phases:
 
   1. ``dataload_wait``    — time blocked on ``next(train_dl_iter)``
   2. ``forward``          — ``policy.forward(batch)`` + loss combine
@@ -22,8 +21,9 @@ splits wall-clock per step into phases:
   5. ``optim_step``       — ``optimizer.step()`` (includes ZeRO partition
                              update + parameter all-gather)
   6. ``zero_grad_sched``  — ``optimizer.zero_grad()`` + scheduler step
-  7. ``backward_step``    — sum of phases 3–6 (same label as before for
-                             backwards-compatible comparisons)
+  7. ``backward_step``    — sum of phases 3–6 (kept as an aggregate row
+                             for easy comparison with earlier runs that
+                             only reported the combined number)
   8. ``sync_gather``      — the 5 ``gather_for_metrics(...).item()`` calls
 
 All ranks call ``torch.cuda.synchronize()`` at phase boundaries so the
@@ -36,14 +36,23 @@ Usage (same launch incantation as train.py):
         src/opentau/scripts/profile_step.py \
         --config_path=configs/libero/reproduce_pi05_libero.json
 
-Defaults to 20 warmup + 200 measured steps. ``cfg.steps`` from the training
-config is intentionally ignored (production configs set it to ~1M). To run
-longer, set ``PROFILE_STEPS=500 accelerate launch ...``.
+Environment variables (all optional):
 
-Set ``PROFILE_NO_OPTIM=1`` to skip optimizer creation and
-``optimizer.step`` / ``zero_grad`` entirely. Useful for isolating raw
-forward+backward compute cost on a single GPU (no Adam state means
-you fit a large bf16 model without ZeRO partitioning).
+  - ``PROFILE_STEPS=N``       (default 200)  number of measured steps.
+    ``cfg.steps`` from the training config is intentionally ignored
+    (production configs set it to ~1M).
+  - ``PROFILE_NO_OPTIM=1``    (default 0)    skip optimizer creation and
+    ``optimizer.step`` / ``zero_grad`` entirely. Useful for isolating
+    raw forward+backward compute on a single GPU (no Adam state
+    allocated, so a large bf16 model fits without ZeRO partitioning).
+  - ``FIND_UNUSED_PARAMS``    (default true) toggles DDP's
+    ``find_unused_parameters`` kwarg. Ignored under DeepSpeed. Set to
+    ``false`` after auditing with ``find_unused_params.py``.
+  - ``FUSED_ADAMW``           (unset = use factory default) force-toggle
+    ``torch.optim.AdamW(fused=True|false)`` for an A/B without touching
+    the optimizer config JSON.
+  - ``PROFILE_STEP_JSON=PATH``  (optional)  dump a JSON summary of
+    phase means/medians to ``PATH`` on rank 0 for easy scripting.
 """
 
 import json
