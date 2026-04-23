@@ -39,7 +39,6 @@ Key differences from the base π05 policy:
 import builtins
 import logging
 import math
-import warnings
 from collections import deque
 from pathlib import Path
 
@@ -871,6 +870,10 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         by SigLIP. Missing cameras are filled with ``-1`` padding tensors up
         to ``empty_cameras``.
 
+        When ``batch["subgoal_is_pad"]`` is ``True`` for a sample, all
+        subgoal slots for that sample are zeroed out and their masks set to
+        ``False`` so that downstream attention ignores them.
+
         Args:
             batch: Batch dict containing subgoal image tensors keyed by
                 entries in ``config.subgoal_image_features``.
@@ -886,12 +889,13 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         missing_subgoal_img_keys = [key for key in self.config.subgoal_image_features if key not in batch]
 
         if len(present_subgoal_img_keys) == 0:
-            warnings.warn(
+            raise ValueError(
                 f"All subgoal image features are missing from the batch. At least one expected. "
-                f"(batch: {batch.keys()}) (subgoal_image_features: {self.config.subgoal_image_features})",
-                stacklevel=2,
+                f"(batch: {batch.keys()}) (subgoal_image_features: {self.config.subgoal_image_features})"
             )
-            return None, None
+
+        # Per-sample flag: True means the subgoal was dropped or absent.
+        subgoal_is_pad = batch.get("subgoal_is_pad")  # (B,) bool or None
 
         # Preprocess image features present in the batch
         for key in present_subgoal_img_keys:
@@ -906,6 +910,12 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             bsize = subgoal_img.shape[0]
             device = subgoal_img.device
             mask = torch.ones(bsize, dtype=torch.bool, device=device)
+
+            if subgoal_is_pad is not None:
+                is_pad = subgoal_is_pad.to(device=device, dtype=torch.bool)
+                mask = mask & ~is_pad
+                subgoal_img = subgoal_img * (~is_pad)[:, None, None, None]
+
             subgoal_images.append(subgoal_img)
             subgoal_img_masks.append(mask)
 
@@ -949,13 +959,13 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         ):
             meta = ""
             if not speed_is_pad:
-                meta += f"Speed: {str(speed)} "
+                meta += f"Speed: {str(speed.item())} "
 
             if not quality_is_pad:
-                meta += f"Quality: {str(quality)} "
+                meta += f"Quality: {str(quality.item())} "
 
             if not mistake_is_pad:
-                meta += f"Mistake: {str(mistake)}"
+                meta += f"Mistake: {str(mistake.item())}"
 
             metadata.append(f"Metadata: {meta}<eos>")
 
@@ -1179,14 +1189,13 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
-        if response_tokens is not None:
-            response_emb = self.paligemma_with_expert.embed_language_tokens(response_tokens)
-            response_emb_dim = response_emb.shape[-1]
-            response_emb = response_emb * math.sqrt(response_emb_dim)
-            embs.append(response_emb)
-            pad_masks.append(response_masks)
-            num_response_embs = response_emb.shape[1]
-            att_masks += [0] * num_response_embs
+        response_emb = self.paligemma_with_expert.embed_language_tokens(response_tokens)
+        response_emb_dim = response_emb.shape[-1]
+        response_emb = response_emb * math.sqrt(response_emb_dim)
+        embs.append(response_emb)
+        pad_masks.append(response_masks)
+        num_response_embs = response_emb.shape[1]
+        att_masks += [0] * num_response_embs
 
         # Project each timestep's state into a separate VLM token
         # state: (B, T, max_state_dim) -> state_emb: (B, T, vlm_hidden_size)
@@ -1201,34 +1210,32 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         pad_masks.append(state_mask)
         att_masks += [0] * num_state_tokens  # full attention with video and language
 
-        if subgoal_images is not None:
-            for (
-                subgoal_img,
-                subgoal_img_mask,
-            ) in zip(subgoal_images, subgoal_img_masks, strict=False):
-                subgoal_img_emb = self.paligemma_with_expert.embed_image(subgoal_img)
-                subgoal_img_emb = subgoal_img_emb.to(dtype=_preferred_dtype())
+        for (
+            subgoal_img,
+            subgoal_img_mask,
+        ) in zip(subgoal_images, subgoal_img_masks, strict=False):
+            subgoal_img_emb = self.paligemma_with_expert.embed_image(subgoal_img)
+            subgoal_img_emb = subgoal_img_emb.to(dtype=_preferred_dtype())
 
-                # image embeddings don't need to be unnormalized because `fix/lerobot_openpi` branch of huggingface
-                # already removed the normalization inside PaliGemma
-                pass
+            # image embeddings don't need to be unnormalized because `fix/lerobot_openpi` branch of huggingface
+            # already removed the normalization inside PaliGemma
+            pass
 
-                bsize, num_subgoal_img_embs = subgoal_img_emb.shape[:2]
-                subgoal_img_mask = subgoal_img_mask[:, None].expand(bsize, num_subgoal_img_embs)
+            bsize, num_subgoal_img_embs = subgoal_img_emb.shape[:2]
+            subgoal_img_mask = subgoal_img_mask[:, None].expand(bsize, num_subgoal_img_embs)
 
-                embs.append(subgoal_img_emb)
-                pad_masks.append(subgoal_img_mask)
+            embs.append(subgoal_img_emb)
+            pad_masks.append(subgoal_img_mask)
 
-                # Create attention masks so that image tokens attend to each other
-                att_masks += [1] + [0] * (num_subgoal_img_embs - 1)
+            # Create attention masks so that image tokens attend to each other
+            att_masks += [1] + [0] * (num_subgoal_img_embs - 1)
 
-        if metadata_tokens is not None:
-            metadata_emb = self.paligemma_with_expert.embed_language_tokens(metadata_tokens)
-            metadata_emb_dim = metadata_emb.shape[-1]
-            metadata_emb = metadata_emb * math.sqrt(metadata_emb_dim)
-            embs.append(metadata_emb)
-            pad_masks.append(metadata_masks)
-            att_masks += [1] + [0] * (metadata_emb.shape[1] - 1)
+        metadata_emb = self.paligemma_with_expert.embed_language_tokens(metadata_tokens)
+        metadata_emb_dim = metadata_emb.shape[-1]
+        metadata_emb = metadata_emb * math.sqrt(metadata_emb_dim)
+        embs.append(metadata_emb)
+        pad_masks.append(metadata_masks)
+        att_masks += [1] + [0] * (metadata_emb.shape[1] - 1)
 
         if discrete_actions is not None:
             discrete_action_emb = self.paligemma_with_expert.embed_discrete_actions(discrete_actions)

@@ -680,13 +680,13 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
         ):
             meta = ""
             if not speed_is_pad:
-                meta += f"Speed: {str(speed)} "
+                meta += f"Speed: {str(speed.item())} "
 
             if not quality_is_pad:
-                meta += f"Quality: {str(quality)} "
+                meta += f"Quality: {str(quality.item())} "
 
             if not mistake_is_pad:
-                meta += f"Mistake: {str(mistake)}"
+                meta += f"Mistake: {str(mistake.item())}"
 
             metadata.append(f"Metadata: {meta}<eos>")
 
