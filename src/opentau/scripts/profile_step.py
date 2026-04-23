@@ -169,6 +169,29 @@ def profile(cfg: TrainPipelineConfig):
                 weight_decay=defaults.get("weight_decay", 0.0),
                 fused=want_fused,
             )
+            # Rewire the LR scheduler so its internal optimizer-step counter
+            # (set up by _LRScheduler.__init__ on the OLD optimizer) tracks
+            # the new optimizer. Without this, every scheduler.step() warns
+            # "Detected call of lr_scheduler.step() before optimizer.step()"
+            # because the old .step wrapper is no longer called. Cosmetic
+            # warning in the benchmark (throughput numbers are unaffected),
+            # but noisy. In production this code path never runs: the real
+            # wire-up builds the fused optimizer first, then the scheduler
+            # patches it naturally.
+            if lr_scheduler is not None:
+                lr_scheduler.optimizer = optimizer
+                if not hasattr(optimizer.step, "_with_counter"):
+
+                    def _with_counter(step_fn, opt):
+                        def wrapped(*args, **kwargs):
+                            opt._step_count += 1
+                            return step_fn(*args, **kwargs)
+
+                        wrapped._with_counter = True
+                        return wrapped
+
+                    optimizer._step_count = 0
+                    optimizer.step = _with_counter(optimizer.step, optimizer)
             if accelerator.is_main_process:
                 # Confirm the implementation actually in effect.
                 logging.info(
