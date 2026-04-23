@@ -161,9 +161,9 @@ def profile(cfg: TrainPipelineConfig):
             # ``fused: None`` in the dict would silently override our top-level
             # ``fused=True`` kwarg (which only becomes the default). Stripping
             # the keys lets the default win.
-            _DROP = {"params", "fused", "foreach"}
+            drop_keys = {"params", "fused", "foreach"}
             param_groups = [
-                {k: v for k, v in pg.items() if k not in _DROP} | {"params": pg["params"]}
+                {k: v for k, v in pg.items() if k not in drop_keys} | {"params": pg["params"]}
                 for pg in old_pg
             ]
             # Pull defaults from the first group; AdamWConfig uses uniform
