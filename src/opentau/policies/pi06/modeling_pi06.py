@@ -821,9 +821,12 @@ class PI06FlowMatching(nn.Module):
             # Image tokens share a bidirectional block with the language tokens.
             att_masks += [0] * num_img_embs
 
+        # Gemma 3's `embed_tokens` is a `Gemma3TextScaledWordEmbedding` that
+        # already multiplies by sqrt(hidden_size) internally — do NOT scale
+        # again here (unlike pi05, whose PaliGemma Gemma-v1 embedding is a
+        # plain nn.Embedding with the normalizer applied later in the stock
+        # forward that we bypass).
         lang_emb = self.gemma3_with_expert.embed_language_tokens(lang_tokens)
-        lang_emb_dim = lang_emb.shape[-1]
-        lang_emb = lang_emb * math.sqrt(lang_emb_dim)
 
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
@@ -833,8 +836,6 @@ class PI06FlowMatching(nn.Module):
 
         if response_tokens is not None:
             response_emb = self.gemma3_with_expert.embed_language_tokens(response_tokens)
-            response_emb_dim = response_emb.shape[-1]
-            response_emb = response_emb * math.sqrt(response_emb_dim)
 
             embs.append(response_emb)
             pad_masks.append(response_masks)
@@ -1214,9 +1215,9 @@ class PI06FlowMatching(nn.Module):
 
         response_tokens = torch.cat([response_tokens, response_token], dim=1)
 
+        # Gemma 3's `embed_tokens` already scales by sqrt(hidden_size); see
+        # the note in `embed_prefix`.
         response_emb = self.gemma3_with_expert.embed_language_tokens(response_token)
-        response_emb_dim = response_emb.shape[-1]
-        response_emb = response_emb * math.sqrt(response_emb_dim)
 
         response_att_masks = torch.ones((bsize, 1), device=device, dtype=response_emb.dtype)
 
