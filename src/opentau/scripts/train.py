@@ -38,6 +38,7 @@ from opentau.datasets.utils import cycle
 from opentau.envs.factory import make_envs
 from opentau.envs.utils import close_envs
 from opentau.optim.factory import make_optimizer_and_scheduler
+from opentau.optim.master_weights import MasterWeightOptimizer
 from opentau.policies.factory import make_policy
 from opentau.policies.pretrained import PreTrainedPolicy
 from opentau.scripts.eval import consolidate_eval_info, eval_policy_all
@@ -80,7 +81,19 @@ def update_policy(
     accelerator.unscale_gradients(optimizer=optimizer)
 
     if accelerator.sync_gradients:
-        grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+        # When the optimizer is wrapped in ``MasterWeightOptimizer`` (the
+        # DDP / single / FSDP path; see issue #181), gradients live in bf16
+        # on the live params and have not yet been upcast to the fp32 masters.
+        # Calling ``MasterWeightOptimizer.clip_grad_norm_`` performs the
+        # bf16 -> fp32 upcast and clips on the fp32 master grads, so the
+        # subsequent ``optimizer.step`` reads from the clipped fp32 grads.
+        # Under DeepSpeed the inner BF16_Optimizer clips internally, so we
+        # use ``accelerator.clip_grad_norm_`` there.
+        inner_opt = getattr(optimizer, "optimizer", optimizer)
+        if isinstance(inner_opt, MasterWeightOptimizer):
+            grad_norm = inner_opt.clip_grad_norm_(grad_clip_norm)
+        else:
+            grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
         if accelerator.is_main_process:
             train_metrics.grad_norm = grad_norm
 
@@ -214,13 +227,18 @@ def train(cfg: TrainPipelineConfig):
 
     logging.info("Creating policy")
     policy = make_policy(cfg=cfg.policy, ds_meta=train_dataset.meta)
-    # Issue #181: only cast to bf16 under DeepSpeed, whose ZeRO optimizer
-    # allocates fp32 master weights regardless. For DDP/FSDP/single-process we
-    # keep fp32 master params so accelerate's bf16 autocast yields fp32 Adam state.
-    if accelerator.distributed_type == accelerate.DistributedType.DEEPSPEED:
-        policy.to(torch.bfloat16)
+    # Keep the policy in bf16 for forward/backward (activation memory + bf16
+    # compute). The optimizer state is kept in fp32 separately: DeepSpeed
+    # ZeRO does this through ``BF16_Optimizer``; under DDP/FSDP/single we
+    # mirror that with ``MasterWeightOptimizer`` (see issue #181).
+    policy.to(torch.bfloat16)
     logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
+    # Outside DeepSpeed, wrap the optimizer so it carries fp32 master weights
+    # and fp32 Adam state. DeepSpeed already provides this via BF16_Optimizer
+    # (see ``ds_config['bf16']['enabled']``), so we don't double-wrap there.
+    if accelerator.distributed_type != accelerate.DistributedType.DEEPSPEED:
+        optimizer = MasterWeightOptimizer.from_existing(optimizer)
 
     step = 0  # number of policy updates (forward + backward + optim)
 
@@ -261,6 +279,16 @@ def train(cfg: TrainPipelineConfig):
         # load accelerator state
         # This will load the model, optimizer, and lr_scheduler state
         accelerator.load_state(cfg.checkpoint_path)
+
+        # When the master-weights wrapper is in use, the live bf16 weights
+        # have just been overwritten by ``accelerator.load_state``. Rebuild
+        # the fp32 masters from those weights so the inner optimizer's
+        # subsequent steps operate on consistent fp32 master copies.
+        # (Under DeepSpeed this is unnecessary; ZeRO restores its own fp32
+        # masters from its checkpoint.)
+        inner_opt_for_resume = getattr(optimizer, "optimizer", optimizer)
+        if isinstance(inner_opt_for_resume, MasterWeightOptimizer):
+            inner_opt_for_resume.rebuild_masters_from_live(policy.parameters())
 
         # all processes should load the step & rng states
         step = load_training_state(cfg.checkpoint_path)
