@@ -50,6 +50,7 @@ from opentau.utils.train_utils import (
     load_training_state,
     load_training_step,
     prune_old_checkpoints,
+    reseed_new_ranks_on_resume,
     save_checkpoint,
 )
 from opentau.utils.utils import (
@@ -248,6 +249,11 @@ def train(cfg: TrainPipelineConfig):
         # load accelerator state
         # This will load the model, optimizer, and lr_scheduler state
         accelerator.load_state(cfg.checkpoint_path)
+
+        # Per-rank random_states_<rank>.pkl is loaded by accelerator.load_state above,
+        # but missing files (when resuming on more GPUs than were saved) are silently
+        # skipped. Re-seed those new ranks deterministically.
+        reseed_new_ranks_on_resume(cfg.checkpoint_path, accelerator, cfg.seed)
 
         # all processes should load the step & rng states
         step = load_training_state(cfg.checkpoint_path)

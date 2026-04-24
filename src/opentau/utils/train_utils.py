@@ -126,6 +126,62 @@ def save_checkpoint(
     save_rng_state(checkpoint_dir)
 
 
+def reseed_new_ranks_on_resume(
+    checkpoint_dir: Path,
+    accelerator: "accelerate.Accelerator",
+    seed: int | None,
+) -> None:
+    """Re-seed ranks that have no per-rank RNG file in the checkpoint.
+
+    Accelerate's ``load_state`` reads ``random_states_<process_index>.pkl`` per
+    rank and silently logs ``"Could not load random states"`` at INFO level when
+    the file is missing. When resuming on more GPUs than the checkpoint was
+    saved with, the new ranks are left with whatever default RNG state the
+    process happened to start with -- correlated across ranks and
+    irreproducible. This helper detects that case and assigns each new rank a
+    deterministic, decorrelated seed via ``set_seed``.
+
+    Surviving ranks (whose files loaded successfully) are not touched.
+
+    Args:
+        checkpoint_dir: Directory holding the saved ``random_states_*.pkl`` files.
+        accelerator: The current Accelerator (provides ``num_processes`` and
+            ``process_index``).
+        seed: Base training seed (``cfg.seed``). If ``None``, no re-seeding is
+            performed and a warning is emitted instead.
+    """
+    from opentau.utils.random_utils import set_seed
+
+    saved = len(list(checkpoint_dir.glob("random_states_*.pkl")))
+    current = accelerator.num_processes
+    if saved == current:
+        return
+    if saved < current:
+        logging.warning(
+            "Resuming on more processes (%d) than the checkpoint was saved with (%d). "
+            "Ranks %d..%d had no per-rank RNG file; re-seeding them deterministically "
+            "from cfg.seed. Note: global batch size has changed by a factor of %.3fx; "
+            "consider scaling cfg.gradient_accumulation_steps to compensate.",
+            current, saved, saved, current - 1, current / saved,
+        )
+        if accelerator.process_index >= saved:
+            if seed is None:
+                logging.warning(
+                    "cfg.seed is None; rank %d will retain its default startup RNG "
+                    "(not reproducible).", accelerator.process_index,
+                )
+            else:
+                set_seed(seed, accelerator=accelerator)
+    else:
+        logging.info(
+            "Resuming on fewer processes (%d) than the checkpoint was saved with (%d). "
+            "Per-rank RNG files for ranks %d..%d are ignored. Note: global batch size "
+            "has changed by a factor of %.3fx; consider scaling "
+            "cfg.gradient_accumulation_steps to compensate.",
+            current, saved, current, saved - 1, current / saved,
+        )
+
+
 def load_training_state(checkpoint_dir: Path) -> tuple[int, Optimizer, LRScheduler | None]:
     """Load training state including step, optimizer, scheduler, and RNG state.
 
