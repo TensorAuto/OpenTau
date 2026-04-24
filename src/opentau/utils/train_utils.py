@@ -23,6 +23,7 @@ managing checkpoint directories, and pruning old checkpoints.
 import logging
 import shutil
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from termcolor import colored
 from torch.optim import Optimizer
@@ -36,6 +37,9 @@ from opentau.constants import (
 )
 from opentau.datasets.utils import load_json, write_json
 from opentau.utils.random_utils import load_rng_state, save_rng_state
+
+if TYPE_CHECKING:
+    import accelerate
 
 
 def log_output_dir(out_dir):
@@ -162,13 +166,17 @@ def reseed_new_ranks_on_resume(
             "Ranks %d..%d had no per-rank RNG file; re-seeding them deterministically "
             "from cfg.seed. Note: global batch size has changed by a factor of %.3fx; "
             "consider scaling cfg.gradient_accumulation_steps to compensate.",
-            current, saved, saved, current - 1, current / saved,
+            current,
+            saved,
+            saved,
+            current - 1,
+            current / saved,
         )
         if accelerator.process_index >= saved:
             if seed is None:
                 logging.warning(
-                    "cfg.seed is None; rank %d will retain its default startup RNG "
-                    "(not reproducible).", accelerator.process_index,
+                    "cfg.seed is None; rank %d will retain its default startup RNG (not reproducible).",
+                    accelerator.process_index,
                 )
             else:
                 set_seed(seed, accelerator=accelerator)
@@ -178,7 +186,11 @@ def reseed_new_ranks_on_resume(
             "Per-rank RNG files for ranks %d..%d are ignored. Note: global batch size "
             "has changed by a factor of %.3fx; consider scaling "
             "cfg.gradient_accumulation_steps to compensate.",
-            current, saved, current, saved - 1, current / saved,
+            current,
+            saved,
+            current,
+            saved - 1,
+            current / saved,
         )
 
 
