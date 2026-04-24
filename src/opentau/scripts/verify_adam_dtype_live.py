@@ -43,7 +43,6 @@ import logging
 
 import accelerate
 import torch
-from accelerate.optimizer import AcceleratedOptimizer
 from torch import nn
 
 
@@ -98,52 +97,103 @@ def apply_deepspeed_dataloaderless_workaround(accelerator: accelerate.Accelerato
     plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = 1
 
 
-def step_once(model: nn.Module, optimizer: torch.optim.Optimizer, device: torch.device) -> None:
+def step_once(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    accelerator: accelerate.Accelerator,
+) -> None:
     """Run a single backward + optimizer step with a dummy loss.
 
-    Input dtype is matched to the live model's parameter dtype so the
-    forward works identically whether the model was cast to bf16 or left
-    in fp32 by the surrounding accelerate runtime.
+    Uses ``accelerator.backward(loss)`` rather than raw ``loss.backward()``
+    because under DeepSpeed the prepared optimizer's ``step()`` is a no-op
+    (see ``accelerate/utils/deepspeed.py``: ``DeepSpeedOptimizerWrapper.step``);
+    DS performs the real optimiser step inside ``accelerator.backward`` via
+    ``DeepSpeedEngineWrapper.backward`` → ``engine.step()``. Calling raw
+    ``loss.backward()`` + ``optimizer.step()`` would leave ``optimizer.state``
+    empty under DS while still working under DDP.
 
     Args:
         model: The prepared model (possibly an accelerate wrapper).
-        optimizer: The prepared optimizer (an ``AcceleratedOptimizer``).
-        device: Device used to allocate the synthetic input batch.
+        optimizer: The prepared optimizer (an ``AcceleratedOptimizer`` or
+            ``DeepSpeedOptimizerWrapper``).
+        accelerator: The live accelerator; routed through here so the
+            DS path triggers its internal step.
     """
     underlying = model.module if hasattr(model, "module") else model
     param_dtype = next(underlying.parameters()).dtype
-    x = torch.randn(4, 1024, device=device, dtype=param_dtype)
+    x = torch.randn(4, 1024, device=accelerator.device, dtype=param_dtype)
     y = model(x)
     loss = y.pow(2).mean()
-    loss.backward()
+    accelerator.backward(loss)
     optimizer.step()
     optimizer.zero_grad()
+
+
+def _walk_to_populated_state(opt: object) -> object:
+    """Walk a chain of ``.optimizer`` attributes until ``.state`` is non-empty.
+
+    Under DDP the prepared optimiser is an ``AcceleratedOptimizer`` whose
+    ``state`` property already delegates to the inner torch optimiser, so
+    the first level usually has populated state. Under DeepSpeed the
+    chain is two layers deep (wrapper → DSZero → inner torch AdamW over
+    fp32 flat masters) but each layer's ``state`` proxies via property,
+    so the top-level ``.state`` is also populated *after* the DS step ran.
+    The walk is a defence-in-depth: if any intermediate level returned an
+    empty dict for some accelerate version, we keep descending.
+
+    Args:
+        opt: The prepared optimiser (any accelerate / DS wrapper).
+
+    Returns:
+        The deepest object in the ``.optimizer`` chain whose ``.state``
+        is a non-empty mapping. Falls back to ``opt`` if no level has
+        populated state.
+    """
+    seen: set[int] = set()
+    cur = opt
+    while id(cur) not in seen:
+        seen.add(id(cur))
+        state = getattr(cur, "state", None)
+        if isinstance(state, dict) and len(state) > 0:
+            return cur
+        nxt = getattr(cur, "optimizer", None)
+        if nxt is None or id(nxt) in seen:
+            break
+        cur = nxt
+    return opt
 
 
 def print_state_dtypes(model: nn.Module, optimizer: torch.optim.Optimizer) -> None:
     """Walk ``optimizer.state`` and print dtype info for every parameter.
 
+    The keys in the populated state are the parameters the *inner* torch
+    optimiser actually steps. Under DDP these match ``model.named_parameters()``
+    one-to-one; under DeepSpeed they are fp32 flat-master partition tensors
+    that don't appear in the model's named-parameter list, so the lookup
+    falls back to ``<flat-master-N>``.
+
     Args:
-        model: The prepared model; used to recover per-parameter names.
-        optimizer: The prepared optimizer. If it is an
-            ``AcceleratedOptimizer`` it is unwrapped to reach the real
-            torch optimizer whose ``state`` carries ``exp_avg`` and
-            ``exp_avg_sq``.
+        model: The prepared model; used to recover per-parameter names
+            for the DDP path.
+        optimizer: The prepared optimizer (any accelerate / DS wrapper).
     """
-    inner = optimizer.optimizer if isinstance(optimizer, AcceleratedOptimizer) else optimizer
-    # Build a reverse lookup: id(param) -> name. Works for both the DDP
-    # wrapper and the raw module.
+    inner = _walk_to_populated_state(optimizer)
     underlying = model.module if hasattr(model, "module") else model
     id_to_name = {id(p): n for n, p in underlying.named_parameters()}
 
-    print(f"{'name':<30} {'param':<12} {'exp_avg':<12} {'exp_avg_sq':<12}")
-    for param, state in inner.state.items():
-        name = id_to_name.get(id(param), "<unknown>")
-        exp_avg = state.get("exp_avg")
-        exp_avg_sq = state.get("exp_avg_sq")
+    print(f"  (state dump from {type(inner).__name__})")
+    print(f"{'name':<30} {'param':<14} {'exp_avg':<14} {'exp_avg_sq':<14}")
+    state = getattr(inner, "state", {})
+    if not state:
+        print("  (empty optimizer state — accelerator.backward(loss) probably did not run)")
+        return
+    for i, (param, param_state) in enumerate(state.items()):
+        name = id_to_name.get(id(param), f"<flat-master-{i}>")
+        exp_avg = param_state.get("exp_avg")
+        exp_avg_sq = param_state.get("exp_avg_sq")
         exp_avg_dtype = exp_avg.dtype if exp_avg is not None else None
         exp_avg_sq_dtype = exp_avg_sq.dtype if exp_avg_sq is not None else None
-        print(f"{name:<30} {str(param.dtype):<12} {str(exp_avg_dtype):<12} {str(exp_avg_sq_dtype):<12}")
+        print(f"{name:<30} {str(param.dtype):<14} {str(exp_avg_dtype):<14} {str(exp_avg_sq_dtype):<14}")
 
 
 def main() -> None:
@@ -160,7 +210,7 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
     model, optimizer = accelerator.prepare(model, optimizer)
-    step_once(model, optimizer, accelerator.device)
+    step_once(model, optimizer, accelerator)
     print_state_dtypes(model, optimizer)
 
 
