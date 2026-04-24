@@ -81,7 +81,10 @@ def apply_deepspeed_dataloaderless_workaround(accelerator: accelerate.Accelerato
     accelerate's DeepSpeed path normally infers the per-rank batch size from
     a dataloader passed to ``prepare()``. This script doesn't use one (a
     single synthetic step is enough), so we set the required field directly
-    on the DeepSpeed plugin config. No-op for non-DeepSpeed backends.
+    on the DeepSpeed plugin config. The default value is the string ``"auto"``
+    (see ``accelerate/utils/dataclasses.py``); we must overwrite it
+    unconditionally — ``setdefault`` is a no-op since the key already exists.
+    No-op for non-DeepSpeed backends.
 
     Args:
         accelerator: The already-constructed accelerator. Must be inspected
@@ -92,7 +95,7 @@ def apply_deepspeed_dataloaderless_workaround(accelerator: accelerate.Accelerato
     plugin = accelerator.state.deepspeed_plugin
     if plugin is None:
         return
-    plugin.deepspeed_config.setdefault("train_micro_batch_size_per_gpu", 1)
+    plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = 1
 
 
 def step_once(model: nn.Module, optimizer: torch.optim.Optimizer, device: torch.device) -> None:
