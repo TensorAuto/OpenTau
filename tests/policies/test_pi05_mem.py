@@ -511,10 +511,12 @@ class TestSpaceTimeSiglipVideoEncoder:
         assert out.shape == (1, 256, 2048)
         assert out.dtype == torch.bfloat16
 
-    def test_state_dict_keys_match_vanilla_siglip(self):
-        """The wrapped vision_tower's state_dict must have identical keys to
-        an unwrapped SigLIP. This guarantees that a pi05 checkpoint loads
-        without key remapping."""
+    def test_state_dict_keys_are_vanilla_siglip_plus_alpha(self):
+        """The wrapped vision_tower's state_dict must contain every vanilla
+        SigLIP key (so a pi05 checkpoint loads into the SigLIP submodules
+        without key remapping), plus exactly one ``temporal_gate`` scalar per
+        wrapped layer. No other extra keys are allowed — that would mean the
+        wrapper is accidentally shadowing or duplicating a SigLIP parameter."""
         from transformers import SiglipVisionModel
 
         vision_tower, projector = self._build_siglip_and_projector()
@@ -529,9 +531,19 @@ class TestSpaceTimeSiglipVideoEncoder:
             spacetime_layer_stride=4,
         )
         wrapped_keys = set(vision_tower.state_dict().keys())
-        assert wrapped_keys == reference_keys, (
-            f"state_dict keys diverged; extra in wrapped: {wrapped_keys - reference_keys}, "
-            f"missing from wrapped: {reference_keys - wrapped_keys}"
+
+        # All vanilla SigLIP keys must be present (load without remapping).
+        assert reference_keys <= wrapped_keys, (
+            f"missing SigLIP keys in wrapped: {reference_keys - wrapped_keys}"
+        )
+        # The only extras are the per-wrapped-layer α gates.
+        extras = wrapped_keys - reference_keys
+        expected_alpha_keys = {
+            f"vision_model.encoder.layers.{i}.temporal_gate" for i in (3, 7, 11, 15, 19, 23)
+        }
+        assert extras == expected_alpha_keys, (
+            f"unexpected extras beyond temporal_gate: {extras - expected_alpha_keys}; "
+            f"missing expected gates: {expected_alpha_keys - extras}"
         )
 
     def test_single_frame_invariance_structural(self):
@@ -564,9 +576,14 @@ class TestSpaceTimeSiglipVideoEncoder:
             spacetime_layer_stride=4,  # 6 layers wrapped
         ).eval()
 
-        # With the current design, state_dict keys are identical between the
-        # two — adopt-submodules wrapping doesn't introduce .base_layer. keys.
-        assert set(vt_no_st.state_dict().keys()) == set(vt_st.state_dict().keys())
+        # With the current design, adopt-submodules wrapping doesn't introduce
+        # .base_layer. keys. The only wrapped-vs-unwrapped difference in
+        # state_dict is the per-wrapped-layer ``temporal_gate`` scalar.
+        no_st_keys = set(vt_no_st.state_dict().keys())
+        st_keys = set(vt_st.state_dict().keys())
+        assert no_st_keys <= st_keys
+        extras = st_keys - no_st_keys
+        assert all(k.endswith(".temporal_gate") for k in extras), f"unexpected extras: {extras}"
 
         video = torch.rand(1, 1, 3, 224, 224)
         with torch.no_grad():
@@ -574,3 +591,128 @@ class TestSpaceTimeSiglipVideoEncoder:
             out_st = enc_st(video)
 
         torch.testing.assert_close(out_st, out_no_st, rtol=1e-5, atol=1e-5)
+
+    def test_alpha_zero_is_vanilla_siglip_at_t8(self):
+        """At α=0 (zero-init default), the T=8 encoder output is byte-exact to
+        a vanilla SigLIP pass on the current frame. This is the guarantee that
+        lets any pi05 checkpoint's vision features flow through unchanged at
+        training start, independent of T."""
+        import copy
+
+        from opentau.policies.pi05_mem.video_encoder import SpaceTimeSiglipVideoEncoder
+
+        torch.manual_seed(0)
+        vision_tower, projector = self._build_siglip_and_projector()
+        vt_no_st = copy.deepcopy(vision_tower)
+        proj_no_st = copy.deepcopy(projector)
+
+        # Unwrapped reference: stride > 27 -> no wrapping, num_frames=1.
+        enc_no_st = SpaceTimeSiglipVideoEncoder(
+            vision_tower=vt_no_st,
+            multi_modal_projector=proj_no_st,
+            num_frames=1,
+            spacetime_layer_stride=999,
+        ).eval()
+        # Wrapped, T=8. α=0 by default; should produce identical current-frame
+        # output to the unwrapped single-frame encoder on the same frame.
+        enc_st = SpaceTimeSiglipVideoEncoder(
+            vision_tower=vision_tower,
+            multi_modal_projector=projector,
+            num_frames=8,
+            spacetime_layer_stride=4,
+        ).eval()
+
+        current = torch.rand(1, 1, 3, 224, 224)
+        # Replicate the current frame 8× to build the T=8 input. Actual past
+        # frames don't matter because α=0 nullifies the temporal residual.
+        video_t8 = current.expand(1, 8, 3, 224, 224).contiguous()
+        with torch.no_grad():
+            out_ref = enc_no_st(current)
+            out_t8 = enc_st(video_t8)
+
+        torch.testing.assert_close(out_t8, out_ref, rtol=1e-5, atol=1e-5)
+
+    def test_alpha_gradient_flows(self):
+        """``temporal_gate`` must receive a non-zero gradient from a loss on
+        the encoder output when T>1. Without gradient flow, α can never rise
+        off its zero init."""
+        from opentau.policies.pi05_mem.video_encoder import (
+            SpaceTimeEncoderLayerWrapper,
+            SpaceTimeSiglipVideoEncoder,
+        )
+
+        torch.manual_seed(0)
+        vision_tower, projector = self._build_siglip_and_projector()
+        encoder = SpaceTimeSiglipVideoEncoder(
+            vision_tower=vision_tower,
+            multi_modal_projector=projector,
+            num_frames=4,
+            spacetime_layer_stride=4,
+        )
+        # Use T=4 with distinct per-frame content so the temporal attention
+        # produces a non-zero t_out (identical frames would make the gate's
+        # gradient degenerate).
+        video = torch.rand(1, 4, 3, 224, 224)
+        out = encoder(video)
+        out.sum().backward()
+
+        wrapped = [
+            layer
+            for layer in encoder.vision_tower.vision_model.encoder.layers
+            if isinstance(layer, SpaceTimeEncoderLayerWrapper)
+        ]
+        assert len(wrapped) > 0
+        for layer in wrapped:
+            assert layer.temporal_gate.grad is not None, "temporal_gate has no .grad"
+            assert layer.temporal_gate.grad.abs().item() > 0, (
+                f"temporal_gate.grad is exactly 0 at α=0; gate will never learn. layer={layer}"
+            )
+
+    def test_state_dict_loads_without_alpha(self):
+        """Loading a state_dict that lacks the new ``temporal_gate`` keys
+        (i.e., any pre-α-gate pi05 checkpoint) must succeed with
+        ``strict=False`` and leave α at its zero init."""
+        import copy
+
+        from opentau.policies.pi05_mem.video_encoder import (
+            SpaceTimeEncoderLayerWrapper,
+            SpaceTimeSiglipVideoEncoder,
+        )
+
+        torch.manual_seed(0)
+        vision_tower, projector = self._build_siglip_and_projector()
+        # Reference vanilla SigLIP state_dict (no temporal_gate anywhere).
+        reference_sd = copy.deepcopy(vision_tower.state_dict())
+
+        # Construct only for the side effect of wrapping vision_tower's layers.
+        SpaceTimeSiglipVideoEncoder(
+            vision_tower=vision_tower,
+            multi_modal_projector=projector,
+            num_frames=4,
+            spacetime_layer_stride=4,
+        )
+        # Perturb α non-trivially so we can detect that loading resets /
+        # fails to reset it.
+        wrapped = [
+            layer
+            for layer in vision_tower.vision_model.encoder.layers
+            if isinstance(layer, SpaceTimeEncoderLayerWrapper)
+        ]
+        for layer in wrapped:
+            with torch.no_grad():
+                layer.temporal_gate.fill_(0.5)
+
+        missing, unexpected = vision_tower.load_state_dict(reference_sd, strict=False)
+
+        # temporal_gate keys are expected to be "missing" from the checkpoint;
+        # strict=False must accept that.
+        gate_missing = [k for k in missing if k.endswith("temporal_gate")]
+        assert len(gate_missing) == len(wrapped), (
+            f"expected {len(wrapped)} temporal_gate missing keys, got {len(gate_missing)}: {gate_missing}"
+        )
+        assert len(unexpected) == 0, f"unexpected keys: {unexpected}"
+        # Our manually set 0.5 should persist: strict=False doesn't touch missing keys.
+        for layer in wrapped:
+            assert layer.temporal_gate.item() == pytest.approx(0.5), (
+                "strict=False load reset temporal_gate unexpectedly"
+            )
