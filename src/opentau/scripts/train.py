@@ -214,7 +214,11 @@ def train(cfg: TrainPipelineConfig):
 
     logging.info("Creating policy")
     policy = make_policy(cfg=cfg.policy, ds_meta=train_dataset.meta)
-    policy.to(torch.bfloat16)
+    # Issue #181: only cast to bf16 under DeepSpeed, whose ZeRO optimizer
+    # allocates fp32 master weights regardless. For DDP/FSDP/single-process we
+    # keep fp32 master params so accelerate's bf16 autocast yields fp32 Adam state.
+    if accelerator.distributed_type == accelerate.DistributedType.DEEPSPEED:
+        policy.to(torch.bfloat16)
     logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
 
