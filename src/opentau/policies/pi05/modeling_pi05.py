@@ -833,7 +833,7 @@ class PI05Policy(PreTrainedPolicy):
         tasks = batch["prompt"]
 
         if self.config.state_type == "continuous":
-            prompt = [f"Task: {task}" for task in tasks]
+            prompt = [f"Task: {task}, " for task in tasks]
         else:
             # add state to the prompt
             state = self.prepare_discrete_state(batch)
@@ -1090,6 +1090,17 @@ class PI05FlowMatching(nn.Module):
         att_masks += [0] * num_lang_embs
 
         if self.config.state_type == "continuous" and state is not None:
+            state_indicator_ids = self.language_tokenizer.encode("State: ", add_special_tokens=False)
+            state_indicator_tokens = torch.tensor([state_indicator_ids] * bsize, device=lang_tokens.device)
+            state_indicator_emb = self.paligemma_with_expert.embed_language_tokens(state_indicator_tokens)
+            state_indicator_emb = state_indicator_emb * math.sqrt(state_indicator_emb.shape[-1])
+            state_indicator_mask = torch.ones(
+                bsize, state_indicator_emb.shape[1], dtype=torch.bool, device=lang_tokens.device
+            )
+            embs.append(state_indicator_emb)
+            pad_masks.append(state_indicator_mask)
+            att_masks += [0] * state_indicator_emb.shape[1]
+
             state_emb = self.state_proj(state.to(dtype=_preferred_dtype()))
             state_emb = rearrange(state_emb, "b d -> b 1 d")
             state_mask = torch.ones(bsize, 1, dtype=torch.bool, device=state.device)
@@ -1097,6 +1108,21 @@ class PI05FlowMatching(nn.Module):
             embs.append(state_emb)
             pad_masks.append(state_mask)
             att_masks += [0]  # full attention with images and language
+
+            state_end_indicator_ids = self.language_tokenizer.encode(":\n", add_special_tokens=False)
+            state_end_indicator_tokens = torch.tensor(
+                [state_end_indicator_ids] * bsize, device=lang_tokens.device
+            )
+            state_end_indicator_emb = self.paligemma_with_expert.embed_language_tokens(
+                state_end_indicator_tokens
+            )
+            state_end_indicator_emb = state_end_indicator_emb * math.sqrt(state_end_indicator_emb.shape[-1])
+            state_end_indicator_mask = torch.ones(
+                bsize, state_end_indicator_emb.shape[1], dtype=torch.bool, device=lang_tokens.device
+            )
+            embs.append(state_end_indicator_emb)
+            pad_masks.append(state_end_indicator_mask)
+            att_masks += [0] * state_end_indicator_emb.shape[1]
 
         if self.config.predict_response:
             response_indicator_ids = self.language_tokenizer.encode("Response: ", add_special_tokens=False)
