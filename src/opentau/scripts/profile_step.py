@@ -294,6 +294,15 @@ def profile(cfg: TrainPipelineConfig):
         policy, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             policy, optimizer, train_dataloader, lr_scheduler
         )
+        # accelerator.prepare may have migrated the policy's bf16 params from
+        # CPU to GPU. The MasterWeightOptimizer's fp32 masters were cloned
+        # at wrap-time (still on CPU) and would otherwise stay there, making
+        # this benchmark report misleadingly low GPU memory. Re-build masters
+        # from the now-migrated live params so they live on the same device.
+        # No-op when masters are already on the right device.
+        inner_opt_for_migrate = getattr(optimizer, "optimizer", optimizer)
+        if isinstance(inner_opt_for_migrate, MasterWeightOptimizer):
+            inner_opt_for_migrate.rebuild_masters_from_live(policy.parameters())
     train_dl_iter = cycle(train_dataloader)
 
     policy.train()

@@ -308,6 +308,17 @@ def train(cfg: TrainPipelineConfig):
         policy, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             policy, optimizer, train_dataloader, lr_scheduler
         )
+    # ``accelerator.prepare`` may have moved the policy from CPU to GPU.
+    # When ``MasterWeightOptimizer`` is in use, the fp32 masters were cloned
+    # from the bf16 live params at wrap-time (still on CPU) and would
+    # otherwise stay there — Adam would then run on CPU master tensors,
+    # paying a CPU<->GPU copy on every grad upcast and param downcast and
+    # never letting the masters appear in nvidia-smi accounting. Rebuild
+    # masters from the now-migrated live params so they live on the same
+    # device as the model. No-op when devices already agree.
+    inner_opt_for_migrate = getattr(optimizer, "optimizer", optimizer)
+    if isinstance(inner_opt_for_migrate, MasterWeightOptimizer):
+        inner_opt_for_migrate.rebuild_masters_from_live(policy.parameters())
     train_dl_iter = cycle(train_dataloader)
 
     # Register the LR scheduler for checkpointing

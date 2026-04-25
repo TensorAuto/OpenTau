@@ -351,7 +351,23 @@ class MasterWeightOptimizer:
             self._live_params = list(live_iter)
 
         for live, master in zip(self._live_params, self._fp32_params, strict=True):
-            master.data.copy_(live.data.to(torch.float32))
+            new_data = live.data.detach().to(torch.float32).clone()
+            target_device = new_data.device
+            # If Adam state was already populated and lives on a different
+            # device than the live param now uses (e.g. masters constructed
+            # at wrap-time when live was on CPU; live since moved to GPU by
+            # ``accelerator.prepare``), migrate the state tensors to the new
+            # device before re-pointing master.data. Without this the next
+            # ``step()`` would crash on a device-mismatch addmul.
+            if master in self.inner.state:
+                for k, v in self.inner.state[master].items():
+                    if isinstance(v, torch.Tensor) and v.device != target_device:
+                        self.inner.state[master][k] = v.to(target_device)
+            # ``master.data = ...`` re-points the Parameter at a fresh
+            # storage tensor (potentially on a different device). The
+            # Parameter object identity is preserved, so the inner
+            # optimizer's ``param_groups`` references remain valid.
+            master.data = new_data
             if master.grad is not None:
                 master.grad = None
         self._upcast_done_this_step = False
