@@ -369,6 +369,7 @@ class SpaceTimeSiglipVideoEncoder(nn.Module):
         multi_modal_projector: PaliGemmaMultiModalProjector,
         num_frames: int,
         spacetime_layer_stride: int = 4,
+        gradient_checkpointing: bool = False,
     ):
         super().__init__()
         if num_frames < 1:
@@ -378,6 +379,14 @@ class SpaceTimeSiglipVideoEncoder(nn.Module):
 
         self.num_frames = num_frames
         self.spacetime_layer_stride = spacetime_layer_stride
+        # Wrap each SigLIP encoder layer (vanilla or space-time) in
+        # torch.utils.checkpoint.checkpoint during training. Mirrors the
+        # explicit per-layer pattern used by pi05's PaliGemmaWithExpertModel
+        # so we do not depend on transformers' SiglipEncoder internal
+        # gradient-checkpointing plumbing. The strict distributed-backend
+        # guard in src/opentau/scripts/train.py applies (DDP, single, or
+        # DeepSpeed ZeRO-1/2 only).
+        self.gradient_checkpointing = gradient_checkpointing
 
         # Hold references in lists so nn.Module.__setattr__ does not
         # re-register these modules under this encoder's path. They are owned
@@ -448,8 +457,19 @@ class SpaceTimeSiglipVideoEncoder(nn.Module):
 
         # Encoder stack: standard spatial layers + wrapped every-Nth layer
         # with temporal attention. SpaceTimeEncoderLayerWrapper matches the
-        # SiglipEncoderLayer signature, so SiglipEncoder.forward is unchanged.
-        hidden = self.vision_tower.vision_model.encoder(inputs_embeds=hidden).last_hidden_state
+        # SiglipEncoderLayer signature, so we drive the loop manually here
+        # (instead of calling SiglipEncoder.forward) so we can wrap each
+        # layer in torch.utils.checkpoint.checkpoint when the flag is set —
+        # the same explicit pattern PaliGemmaWithExpertModel uses.
+        use_ckpt = self.gradient_checkpointing and self.training
+        for layer in self.vision_tower.vision_model.encoder.layers:
+            if use_ckpt:
+                layer_outputs = torch.utils.checkpoint.checkpoint(
+                    layer, hidden, None, False, use_reentrant=False
+                )
+            else:
+                layer_outputs = layer(hidden, None, False)
+            hidden = layer_outputs[0]
 
         hidden = self.vision_tower.vision_model.post_layernorm(hidden)
 

@@ -221,6 +221,16 @@ def make_dataset(
         train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
         train_dataset.meta = copy.deepcopy(dataset.meta)  # type: ignore[assignment]
         val_dataset.meta = copy.deepcopy(dataset.meta)  # type: ignore[assignment]
+
+        # Subset wraps the same underlying dataset by reference, so the
+        # training and validation halves would share every instance attribute
+        # — including the optional-key dropout flag. Give the val subset its
+        # own shallow copy whose only divergent attribute is the dropout
+        # toggle. See ``BaseDataset.shallow_copy_with_dropout`` for the
+        # contract on what stays shared.
+        val_dataset.dataset = dataset.shallow_copy_with_dropout(  # type: ignore[attr-defined]
+            enable_dropout=train_cfg.dataset_mixture.val_enable_optional_key_dropout,
+        )
         return train_dataset, val_dataset  # type: ignore[return-value]
 
     return dataset

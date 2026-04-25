@@ -543,9 +543,21 @@ def lerobot_dataset_factory(
                 def validate_features(self):
                     pass
 
-            # Minimal DatasetConfig for the mixture
+            # Minimal DatasetConfig for the mixture. Training-time dropout
+            # probabilities are pinned to 0 so tests exercise deterministic
+            # behavior; tests that specifically want dropout should override the
+            # instance attributes after construction.
             dataset_cfg = DatasetConfig(repo_id=repo_id, root=str(root), episodes=kwargs.get("episodes"))
-            mixture_cfg = DatasetMixtureConfig(datasets=[dataset_cfg], weights=[1.0])
+            mixture_cfg = DatasetMixtureConfig(
+                datasets=[dataset_cfg],
+                weights=[1.0],
+                history_state_drop_prob=0.0,
+                subgoal_drop_prob=0.0,
+                subgoal_end_of_segment_prob=0.0,
+                response_drop_prob=0.0,
+                metadata_drop_all_prob=0.0,
+                metadata_drop_each_prob=0.0,
+            )
             policy_cfg = DummyPolicyConfig()
             cfg = TrainPipelineConfig(dataset_mixture=mixture_cfg, policy=policy_cfg, batch_size=8)
 

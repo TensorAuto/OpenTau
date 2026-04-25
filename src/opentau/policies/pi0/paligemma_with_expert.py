@@ -220,6 +220,11 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         self.gemma_expert = GemmaForCausalLM(config=config.gemma_expert_config)
         # Remove unused embed_tokens
         self.gemma_expert.model.embed_tokens = None
+        # Remove unused lm_head. Same reasoning as pi05: the action expert is
+        # used as an encoder — its output never flows through a token head. An
+        # unused lm_head registers ~263M orphan params that force DDP's
+        # find_unused_parameters=True path (~10-15% per-step cost).
+        self.gemma_expert.lm_head = None
 
         self.dropout = nn.Dropout(config.dropout)
 

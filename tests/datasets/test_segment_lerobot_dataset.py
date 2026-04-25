@@ -23,8 +23,20 @@ import pyarrow.parquet as pq
 import pytest
 
 from opentau.datasets.lerobot_dataset import LeRobotDatasetMetadata
-from opentau.datasets.utils import load_episodes, load_episodes_stats, load_info, write_json, write_stats
-from opentau.scripts.segment_lerobot_dataset import _load_segments_by_episode, segment_dataset
+from opentau.datasets.utils import (
+    DEFAULT_VIDEO_PATH,
+    load_episodes,
+    load_episodes_stats,
+    load_info,
+    write_json,
+    write_stats,
+)
+from opentau.scripts.segment_lerobot_dataset import (
+    FFMPEG_MAX_WORKERS_ENV_VAR,
+    _ffmpeg_trim_max_workers,
+    _load_segments_by_episode,
+    segment_dataset,
+)
 
 
 def _extract_image_path(cell: Any) -> str | None:
@@ -431,3 +443,287 @@ def test_trim_video_segment_uses_frame_range_filter(tmp_path: Path) -> None:
     assert "-vf" in cmd
     vf_expr = cmd[cmd.index("-vf") + 1]
     assert "trim=start_frame=5:end_frame=15" in vf_expr
+
+
+@pytest.mark.parametrize("valid", ["1", "8", "64", " 16 ", "+4"])
+def test_ffmpeg_trim_max_workers_env_var_valid(monkeypatch: pytest.MonkeyPatch, valid: str) -> None:
+    """Valid integer env values in [1, 64] are used verbatim.
+
+    Leading ``+`` signs are accepted (regression guard for the pre-review
+    ``isdigit()`` check, which rejected them silently).
+
+    Args:
+        monkeypatch: pytest fixture for environment manipulation.
+        valid: A string representation of a valid worker count.
+    """
+    monkeypatch.setenv(FFMPEG_MAX_WORKERS_ENV_VAR, valid)
+    assert _ffmpeg_trim_max_workers() == int(valid.strip())
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "65", "100", "abc", "", "  ", "3.14"])
+def test_ffmpeg_trim_max_workers_env_var_invalid_falls_back(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, bad: str
+) -> None:
+    """Invalid env values are rejected with a warning and ignored.
+
+    Args:
+        monkeypatch: pytest fixture for environment manipulation.
+        caplog: pytest fixture capturing emitted log records.
+        bad: A string representation of a rejected value.
+    """
+    monkeypatch.setenv(FFMPEG_MAX_WORKERS_ENV_VAR, bad)
+    monkeypatch.setattr("opentau.scripts.segment_lerobot_dataset.os.cpu_count", lambda: 4)
+    with caplog.at_level("WARNING", logger="opentau.scripts.segment_lerobot_dataset"):
+        result = _ffmpeg_trim_max_workers()
+    # CPU-based default: min(16, (4)*2) == 8
+    assert result == 8
+    # Empty / whitespace values are indistinguishable from unset and should
+    # not emit a warning. Every other rejected value must log one.
+    if bad.strip() != "":
+        assert any(FFMPEG_MAX_WORKERS_ENV_VAR in rec.message for rec in caplog.records)
+
+
+def test_ffmpeg_trim_max_workers_env_var_unset_uses_cpu_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the env var is unset, the CPU-based default is returned.
+
+    Args:
+        monkeypatch: pytest fixture for environment manipulation.
+    """
+    monkeypatch.delenv(FFMPEG_MAX_WORKERS_ENV_VAR, raising=False)
+    monkeypatch.setattr("opentau.scripts.segment_lerobot_dataset.os.cpu_count", lambda: 6)
+    # min(16, 6*2) == 12
+    assert _ffmpeg_trim_max_workers() == 12
+
+
+def test_ffmpeg_trim_max_workers_env_var_caps_at_16(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The CPU-based default is capped at 16 even on large machines.
+
+    Args:
+        monkeypatch: pytest fixture for environment manipulation.
+    """
+    monkeypatch.delenv(FFMPEG_MAX_WORKERS_ENV_VAR, raising=False)
+    monkeypatch.setattr("opentau.scripts.segment_lerobot_dataset.os.cpu_count", lambda: 128)
+    assert _ffmpeg_trim_max_workers() == 16
+
+
+def test_ffmpeg_trim_max_workers_handles_none_cpu_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``os.cpu_count()`` returning ``None`` must not crash the helper.
+
+    Args:
+        monkeypatch: pytest fixture for environment manipulation.
+    """
+    monkeypatch.delenv(FFMPEG_MAX_WORKERS_ENV_VAR, raising=False)
+    monkeypatch.setattr("opentau.scripts.segment_lerobot_dataset.os.cpu_count", lambda: None)
+    # Fallback cpu=4 -> min(16, 8) == 8
+    assert _ffmpeg_trim_max_workers() == 8
+
+
+@pytest.mark.parametrize("override", [1, 8, 64])
+def test_ffmpeg_trim_max_workers_override_takes_precedence(
+    monkeypatch: pytest.MonkeyPatch, override: int
+) -> None:
+    """An explicit override wins over the env var and the CPU default.
+
+    Args:
+        monkeypatch: pytest fixture for environment manipulation.
+        override: The integer override under test.
+    """
+    monkeypatch.setenv(FFMPEG_MAX_WORKERS_ENV_VAR, "32")
+    assert _ffmpeg_trim_max_workers(override) == override
+
+
+@pytest.mark.parametrize("bad", [0, -1, 65, 100, True, 3.14, "4"])
+def test_ffmpeg_trim_max_workers_rejects_invalid_override(bad: Any) -> None:
+    """Invalid overrides must raise ValueError, not silently fall back.
+
+    Args:
+        bad: A value that must be rejected by the override path.
+    """
+    with pytest.raises(ValueError, match=r"--ffmpeg-max-workers"):
+        _ffmpeg_trim_max_workers(bad)
+
+
+def _inject_fake_video_feature(input_root: Path, video_key: str) -> Path:
+    """Declare a fake video feature on an image dataset and materialize the file.
+
+    Registers a ``dtype=video`` entry under ``meta/info.json`` and creates a
+    zero-byte stub file at the canonical video path so
+    :func:`segment_dataset` will enqueue an ffmpeg job for it (we mock
+    ``_trim_video_segment`` in tests, so the stub never has to be playable).
+
+    Args:
+        input_root: Root of the source dataset to mutate in place.
+        video_key: Feature key for the fake video stream.
+
+    Returns:
+        Absolute path to the created stub video file.
+    """
+    info = load_info(input_root)
+    info["features"][video_key] = {
+        "dtype": "video",
+        "shape": [3, 8, 8],
+        "names": ["channel", "height", "width"],
+        "info": {
+            "video.fps": info.get("fps", 30),
+            "video.codec": "mp4v",
+            "video.pix_fmt": "yuv420p",
+            "video.is_depth_map": False,
+            "has_audio": False,
+        },
+    }
+    if info.get("video_path") is None:
+        info["video_path"] = DEFAULT_VIDEO_PATH
+    write_json(info, input_root / "meta" / "info.json")
+
+    rel_path = DEFAULT_VIDEO_PATH.format(episode_chunk=0, video_key=video_key, episode_index=0)
+    src_video = input_root / rel_path
+    src_video.parent.mkdir(parents=True, exist_ok=True)
+    src_video.write_bytes(b"fake-video-stub")
+    return src_video
+
+
+def test_segment_dataset_dispatches_ffmpeg_jobs_in_parallel(
+    tmp_path: Path, empty_lerobot_dataset_factory: Any
+) -> None:
+    """Assert segment_dataset submits one trim per (segment, video_key) and
+    propagates worker results via fut.result().
+
+    Args:
+        tmp_path: Temporary directory fixture provided by pytest.
+        empty_lerobot_dataset_factory: Fixture that creates a writable dataset.
+    """
+    input_root = tmp_path / "src_with_fake_video"
+    output_root = tmp_path / "dst_with_fake_video"
+    features = {
+        "state": {"dtype": "float32", "shape": (1,), "names": None},
+        "actions": {"dtype": "float32", "shape": (1,), "names": None},
+    }
+    dataset = empty_lerobot_dataset_factory(root=input_root, features=features, use_videos=False)
+    for i in range(8):
+        dataset.add_frame(
+            {
+                "state": np.array([float(i)], dtype=np.float32),
+                "actions": np.array([float(i)], dtype=np.float32),
+                "task": "parallel-dispatch",
+            }
+        )
+    dataset.save_episode()
+
+    video_key = "observation.images.fake_cam"
+    _inject_fake_video_feature(input_root, video_key)
+
+    with patch("opentau.scripts.segment_lerobot_dataset._trim_video_segment") as trim_mock:
+        segment_dataset(
+            input_root=input_root,
+            output_root=output_root,
+            segments_by_episode={0: [(0, 3), (3, 8)]},
+        )
+
+    # 2 segments × 1 fake video key = 2 trim calls.
+    assert trim_mock.call_count == 2
+    frame_ranges = sorted((call.args[2], call.args[3]) for call in trim_mock.call_args_list)
+    assert frame_ranges == [(0, 3), (3, 8)]
+    for call in trim_mock.call_args_list:
+        src_path, dst_path, *_ = call.args
+        assert Path(src_path).is_file()
+        # Parent directory for the destination must be pre-created by the main
+        # loop so workers never race on mkdir.
+        assert Path(dst_path).parent.is_dir()
+
+
+def test_segment_dataset_propagates_worker_exceptions(
+    tmp_path: Path, empty_lerobot_dataset_factory: Any
+) -> None:
+    """Exceptions raised inside ffmpeg workers must surface via fut.result().
+
+    Regression guard for accidentally dropping ``fut.result()`` in the
+    parallel-dispatch loop.
+
+    Args:
+        tmp_path: Temporary directory fixture provided by pytest.
+        empty_lerobot_dataset_factory: Fixture that creates a writable dataset.
+    """
+    input_root = tmp_path / "src_worker_error"
+    output_root = tmp_path / "dst_worker_error"
+    features = {
+        "state": {"dtype": "float32", "shape": (1,), "names": None},
+        "actions": {"dtype": "float32", "shape": (1,), "names": None},
+    }
+    dataset = empty_lerobot_dataset_factory(root=input_root, features=features, use_videos=False)
+    for i in range(6):
+        dataset.add_frame(
+            {
+                "state": np.array([float(i)], dtype=np.float32),
+                "actions": np.array([float(i)], dtype=np.float32),
+                "task": "worker-error",
+            }
+        )
+    dataset.save_episode()
+
+    _inject_fake_video_feature(input_root, "observation.images.fake_cam")
+
+    def _boom(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("synthetic ffmpeg failure")
+
+    with (
+        patch("opentau.scripts.segment_lerobot_dataset._trim_video_segment", side_effect=_boom),
+        pytest.raises(RuntimeError, match="synthetic ffmpeg failure"),
+    ):
+        segment_dataset(
+            input_root=input_root,
+            output_root=output_root,
+            segments_by_episode={0: [(0, 2), (2, 6)]},
+        )
+
+
+def test_segment_dataset_accepts_ffmpeg_max_workers_override(
+    tmp_path: Path, empty_lerobot_dataset_factory: Any
+) -> None:
+    """The ``ffmpeg_max_workers`` kwarg must reach ``ThreadPoolExecutor``.
+
+    Args:
+        tmp_path: Temporary directory fixture provided by pytest.
+        empty_lerobot_dataset_factory: Fixture that creates a writable dataset.
+    """
+    input_root = tmp_path / "src_pool_size"
+    output_root = tmp_path / "dst_pool_size"
+    features = {
+        "state": {"dtype": "float32", "shape": (1,), "names": None},
+        "actions": {"dtype": "float32", "shape": (1,), "names": None},
+    }
+    dataset = empty_lerobot_dataset_factory(root=input_root, features=features, use_videos=False)
+    for i in range(4):
+        dataset.add_frame(
+            {
+                "state": np.array([float(i)], dtype=np.float32),
+                "actions": np.array([float(i)], dtype=np.float32),
+                "task": "pool-size",
+            }
+        )
+    dataset.save_episode()
+
+    _inject_fake_video_feature(input_root, "observation.images.fake_cam")
+
+    from concurrent.futures import ThreadPoolExecutor as _RealPool
+
+    observed_max_workers: list[int] = []
+
+    class _SpyPool(_RealPool):
+        def __init__(self, max_workers: int | None = None, *args: Any, **kwargs: Any) -> None:
+            observed_max_workers.append(int(max_workers) if max_workers is not None else -1)
+            super().__init__(max_workers, *args, **kwargs)
+
+    with (
+        patch("opentau.scripts.segment_lerobot_dataset.ThreadPoolExecutor", _SpyPool),
+        patch("opentau.scripts.segment_lerobot_dataset._trim_video_segment"),
+    ):
+        segment_dataset(
+            input_root=input_root,
+            output_root=output_root,
+            segments_by_episode={0: [(0, 2), (2, 4)]},
+            ffmpeg_max_workers=3,
+        )
+
+    assert observed_max_workers == [3]

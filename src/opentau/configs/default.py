@@ -140,11 +140,45 @@ class DatasetMixtureConfig:
             Must be a positive integer. When ``n_obs_history=T`` and
             ``history_interval=k``, observations are sampled at timesteps
             :math:`t - (T-1)k,\; t - (T-2)k,\; \ldots,\; t`. Defaults to 1.
+        history_state_drop_prob: Probability of dropping historical frames and
+            ``observation.state`` together during a single ``__getitem__`` call
+            (zeros out ``state`` and historical camera frames; sets
+            ``obs_history_is_pad`` to all True). Must be in ``[0, 1]``. Defaults
+            to 0.3.
+        subgoal_drop_prob: Probability of dropping all subgoal images during a
+            single ``__getitem__`` call. Must be in ``[0, 1]``. Defaults to 0.75.
+        subgoal_end_of_segment_prob: Probability of sampling the subgoal frame
+            at the end of the current segment (vs. uniformly in the next 4s of
+            wall-clock time). Must be in ``[0, 1]``. Defaults to 0.25.
+        response_drop_prob: Probability of dropping the ``response`` (subtask
+            text) during a single ``__getitem__`` call. Only rolled when
+            subgoals are not dropped. Must be in ``[0, 1]``. Defaults to 0.3.
+        metadata_drop_all_prob: Probability of dropping ``speed``, ``mistake``,
+            and ``quality`` together during a single ``__getitem__`` call.
+            Must be in ``[0, 1]``. Defaults to 0.15.
+        metadata_drop_each_prob: Per-field independent drop probability for
+            ``speed``, ``mistake``, and ``quality``. Only rolled when
+            ``metadata_drop_all_prob`` did not fire. Must be in ``[0, 1]``.
+            Defaults to 0.05.
+        val_enable_optional_key_dropout: Whether to apply the five
+            ``*_drop_prob`` rolls above to the validation split. Defaults to
+            ``False`` — validation evaluates on un-masked samples so metrics
+            aren't polluted by training-time augmentation. Subgoal *frame*
+            sampling (end-of-segment vs. uniform in the next 4s) stays active
+            either way; only the masking logic is gated.
+
+    Note:
+        Dropout rolls use the default torch RNG. PyTorch DataLoader workers
+        auto-seed each process's torch RNG from the base seed + worker id, so
+        workers sample independently. For reproducibility the caller should
+        seed via ``torch.manual_seed(...)`` in the main process before
+        constructing the DataLoader.
 
     Raises:
         ValueError: If `weights` is provided and its length doesn't match
-            `datasets`, if `action_freq` is not positive, or if resample
-            strategies are invalid.
+            `datasets`, if `action_freq` is not positive, if resample
+            strategies are invalid, or if any drop probability is outside
+            ``[0, 1]``.
     """
 
     # List of dataset configs to be used in the mixture.
@@ -168,6 +202,18 @@ class DatasetMixtureConfig:
     # Step interval between historical observation steps. Must be a positive integer.
     history_interval: int = 1
 
+    # Training-time dropout probabilities for optional sample keys.
+    history_state_drop_prob: float = 0.3
+    subgoal_drop_prob: float = 0.75
+    subgoal_end_of_segment_prob: float = 0.25
+    response_drop_prob: float = 0.3
+    metadata_drop_all_prob: float = 0.15
+    metadata_drop_each_prob: float = 0.05
+    # Whether the above dropout rolls also fire on the validation split.
+    # Default keeps validation deterministic-ish (no masking); subgoal frame
+    # selection stays random either way.
+    val_enable_optional_key_dropout: bool = False
+
     def __post_init__(self):
         """Validate dataset mixture configuration."""
         if self.weights is not None and len(self.datasets) != len(self.weights):
@@ -190,6 +236,17 @@ class DatasetMixtureConfig:
             raise ValueError(f"`n_obs_history` must be None or a positive integer, got {self.n_obs_history}.")
         if not isinstance(self.history_interval, int) or self.history_interval < 1:
             raise ValueError(f"`history_interval` must be a positive integer, got {self.history_interval}.")
+        for name in (
+            "history_state_drop_prob",
+            "subgoal_drop_prob",
+            "subgoal_end_of_segment_prob",
+            "response_drop_prob",
+            "metadata_drop_all_prob",
+            "metadata_drop_each_prob",
+        ):
+            value = getattr(self, name)
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"`{name}` must be in [0, 1], got {value}.")
 
         # set the val_split_ratio for all datasets in the mixture
         for dataset_cfg in self.datasets:

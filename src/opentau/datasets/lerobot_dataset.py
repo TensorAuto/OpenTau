@@ -82,6 +82,7 @@ Example:
 """
 
 import contextlib
+import copy
 import functools
 import logging
 import math
@@ -643,12 +644,81 @@ class BaseDataset(torch.utils.data.Dataset):
         self.max_state_dim = cfg.max_state_dim  # maximum dimension of the state vector
         self.max_action_dim = cfg.max_action_dim  # maximum dimension of the action vector
         self.action_chunk = cfg.action_chunk  # number of actions to be processed in a chunk
-        self.n_obs_history = cfg.dataset_mixture.n_obs_history if cfg.dataset_mixture else None
+        dm = cfg.dataset_mixture
+        self.n_obs_history = dm.n_obs_history if dm else None
+        # Optional-key dropout probabilities (all default to 0 when no mixture config is
+        # provided, preserving legacy/VQA paths that don't use these keys).
+        self.history_state_drop_prob = dm.history_state_drop_prob if dm else 0.0
+        self.subgoal_drop_prob = dm.subgoal_drop_prob if dm else 0.0
+        self.subgoal_end_of_segment_prob = dm.subgoal_end_of_segment_prob if dm else 0.0
+        self.response_drop_prob = dm.response_drop_prob if dm else 0.0
+        self.metadata_drop_all_prob = dm.metadata_drop_all_prob if dm else 0.0
+        self.metadata_drop_each_prob = dm.metadata_drop_each_prob if dm else 0.0
+        # Whether the above drop rolls actually fire. `make_dataset` flips this
+        # off on the validation subset (unless `val_enable_optional_key_dropout`
+        # is set). Subgoal *frame* selection (end-of-segment vs. uniform window)
+        # stays random either way — this flag only gates masking/zero-fill.
+        self.enable_optional_key_dropout = True
+
+    def shallow_copy_with_dropout(self, *, enable_dropout: bool) -> "BaseDataset":
+        """Return a shallow copy that only diverges in ``enable_optional_key_dropout``.
+
+        Used by :func:`opentau.datasets.factory.make_dataset` to give the
+        validation subset its own dataset instance so dropout can be toggled
+        independently of the training subset. The copy shares ``meta``,
+        ``hf_dataset``, ``episode_data_index``, cached segment tables, and
+        every other instance attribute by reference — only
+        ``enable_optional_key_dropout`` diverges. If a future refactor adds an
+        instance attribute that needs to diverge between train and val, it
+        must be set here too.
+        """
+        clone = copy.copy(self)
+        clone.enable_optional_key_dropout = enable_dropout
+        return clone
 
     @abstractmethod
     def _get_feature_mapping_key(self) -> str:
         r"""Returns the key used for feature mapping"""
         pass
+
+    def _assert_image_in_unit_range(
+        self, img: torch.Tensor, *, name: str, expect_temporal: bool | None = None
+    ) -> None:
+        """Assert an image tensor has the expected rank, 3-channel, and [0, 1] range.
+
+        By default, the expected shape follows ``self.n_obs_history``: rank-3
+        ``(3, H, W)`` when None, rank-4 ``(T, 3, H, W)`` otherwise. Pass
+        ``expect_temporal`` explicitly to override — e.g. subgoals are always
+        single-frame targets regardless of observation history.
+
+        Args:
+            img: Image tensor to validate.
+            name: Human-readable key name for the error message.
+            expect_temporal: If ``None``, defers to ``self.n_obs_history``. If
+                ``True`` force-expects ``(T, 3, H, W)``. If ``False`` force-expects
+                ``(3, H, W)``.
+        """
+        if expect_temporal is None:
+            expect_temporal = self.n_obs_history is not None
+        if expect_temporal:
+            expected_ndim = 4
+            expected_c_dim = 1
+            shape_desc = "(T, 3, H, W)"
+        else:
+            expected_ndim = 3
+            expected_c_dim = 0
+            shape_desc = "(3, H, W)"
+        assert (
+            len(img.shape) == expected_ndim
+            and img.shape[expected_c_dim] == 3
+            and img.min() >= 0.0 - 1e-6
+            and img.max() <= 1.0 + 1e-6
+        ), (
+            f"Expected image {name} to have shape {shape_desc} with values in [0, 1], "
+            f"Got shape {img.shape}, "
+            f"min={img.min()}, max={img.max()}, "
+            f"self={self._get_feature_mapping_key()}."
+        )
 
     def _standardize_images(self, item, standard_item, n_cams) -> list[bool]:
         """Standardize image features to a common format.
@@ -697,26 +767,7 @@ class BaseDataset(torch.utils.data.Dataset):
                 )
                 image_is_pad.append(item.get(key + "_is_pad", torch.tensor(False)).item())
 
-            img = standard_item[std_key]
-            if self.n_obs_history is not None:
-                expected_ndim = 4
-                expected_c_dim = 1
-                shape_desc = "(T, 3, H, W)"
-            else:
-                expected_ndim = 3
-                expected_c_dim = 0
-                shape_desc = "(3, H, W)"
-            assert (
-                len(img.shape) == expected_ndim
-                and img.shape[expected_c_dim] == 3
-                and img.min() >= 0.0 - 1e-6
-                and img.max() <= 1.0 + 1e-6
-            ), (
-                f"Expected image {std_key} to have shape {shape_desc} with values in [0, 1], "
-                f"Got shape {img.shape}, "
-                f"min={img.min()}, max={img.max()}, "
-                f"self={self._get_feature_mapping_key()}."
-            )
+            self._assert_image_in_unit_range(standard_item[std_key], name=std_key)
 
         return image_is_pad
 
@@ -758,12 +809,120 @@ class BaseDataset(torch.utils.data.Dataset):
         else:
             standard_item["obs_history_is_pad"] = torch.tensor([False], dtype=torch.bool)
 
+        # Emit optional keys (memory, next_memory, speed, mistake, quality, subgoalK)
+        # with their _is_pad siblings, applying training-time dropout rolls.
+        self._emit_optional_keys(item, standard_item)
+
         # cast all tensors in standard_item to bfloat16
         for key, value in standard_item.items():
             if isinstance(value, torch.Tensor) and value.dtype.is_floating_point:
                 standard_item[key] = value.to(dtype=torch.bfloat16)
 
         return standard_item
+
+    def _emit_optional_keys(self, item: dict, standard_item: dict) -> None:
+        """Emit optional memory/subgoal/metadata keys with training-time dropout.
+
+        All emitted keys are always present (zero/empty-filled when absent or
+        masked). Numeric / image keys come with a parallel ``{key}_is_pad``
+        bool; string keys (``response``, ``memory``, ``next_memory``) use the
+        empty string itself as the pad signal — a consumer seeing ``""`` can
+        assume the field was unavailable or was masked this step.
+
+        Dropout order:
+            1. ``history_state_drop_prob``: zero ``state`` and historical camera
+               frames; mark ``obs_history_is_pad`` all True.
+            2. ``subgoal_drop_prob``: zero every ``subgoalK`` and set the
+               single ``subgoal_is_pad`` flag to True (subgoals are all-or-none).
+            3. ``response_drop_prob``: only when subgoals were NOT dropped, mask
+               ``response`` to the empty string.
+            4. ``metadata_drop_all_prob``: mask {speed, mistake, quality}
+               together. If this didn't fire, ``metadata_drop_each_prob`` rolls
+               independently for each of the three.
+
+        Dropout rolls use the default torch RNG (auto-seeded per worker).
+
+        Args:
+            item: Raw item dict (may include ``memory_raw``, ``next_memory_raw``,
+                ``speed_raw``, ``mistake_raw``, ``quality_raw``, and
+                ``subgoalK_raw`` tensors for K in ``[0, num_cams)``). Missing
+                numeric/image entries produce zero + ``_is_pad=True``. Missing
+                string entries produce the empty string.
+            standard_item: Output dict populated by :meth:`_to_standard_data_format`.
+                Mutated in place.
+        """
+
+        # When dropout is disabled (e.g. the validation subset), every drop
+        # roll is suppressed but subgoal *frame* selection upstream stays
+        # random. We do this by treating each drop roll as a Bernoulli that
+        # always returns False.
+        def _roll(prob: float) -> bool:
+            if not self.enable_optional_key_dropout:
+                return False
+            return bool(torch.rand(()) < prob)
+
+        # (1) History + observation.state drop.
+        drop_hist = _roll(self.history_state_drop_prob)
+        if drop_hist:
+            standard_item["state"] = torch.zeros_like(standard_item["state"])
+            if self.n_obs_history is not None:
+                standard_item["obs_history_is_pad"] = torch.ones(self.n_obs_history, dtype=torch.bool)
+                if self.n_obs_history > 1:
+                    for k in range(self.num_cams):
+                        cam_key = f"camera{k}"
+                        if cam_key in standard_item:
+                            standard_item[cam_key][:-1] = 0
+            else:
+                standard_item["obs_history_is_pad"] = torch.tensor([True], dtype=torch.bool)
+
+        # (2) Subgoal drop. A single ``subgoal_is_pad`` flag covers every slot
+        # because subgoals are either all present (annotated and not dropped)
+        # or all missing (legacy / `_load_subgoal_frames` decided to drop).
+        # The drop roll itself lives in ``_load_subgoal_frames`` so a dropped
+        # subgoal skips video decoding entirely — here we just detect absence.
+        pad_subgoals = not all(item.get(f"subgoal{k}_raw") is not None for k in range(self.num_cams))
+        for k in range(self.num_cams):
+            out_key = f"subgoal{k}"
+            if pad_subgoals:
+                standard_item[out_key] = torch.zeros((3, *self.resolution))
+            else:
+                standard_item[out_key] = self.resize_with_pad(
+                    item[f"subgoal{k}_raw"],
+                    self.resolution[1],
+                    self.resolution[0],
+                    pad_value=0,
+                )
+            # Subgoals are always single-frame regardless of n_obs_history.
+            self._assert_image_in_unit_range(standard_item[out_key], name=out_key, expect_temporal=False)
+        standard_item["subgoal_is_pad"] = torch.tensor(pad_subgoals)
+
+        # (3) Response drop — only rolled when subgoals are actually present
+        # (dropping both would remove the primary task signal at once). No
+        # separate ``response_is_pad`` flag: an empty string IS the pad signal.
+        if not pad_subgoals and _roll(self.response_drop_prob):
+            standard_item["response"] = ""
+
+        # (4) Memory pass-through (no drop probability). No separate pad flag —
+        # consumers treat an empty string as "no memory available".
+        memory_raw = item.get("memory_raw")
+        standard_item["memory"] = memory_raw if isinstance(memory_raw, str) else ""
+        next_memory_raw = item.get("next_memory_raw")
+        standard_item["next_memory"] = next_memory_raw if isinstance(next_memory_raw, str) else ""
+
+        # (5) Metadata drops.
+        drop_meta_all = _roll(self.metadata_drop_all_prob)
+        for key, dtype in (("speed", torch.long), ("mistake", torch.bool), ("quality", torch.long)):
+            raw_key = f"{key}_raw"
+            raw = item.get(raw_key)
+            drop_this = drop_meta_all or _roll(self.metadata_drop_each_prob)
+            if raw is None or drop_this:
+                zero = False if dtype is torch.bool else 0
+                standard_item[key] = torch.tensor(zero, dtype=dtype)
+                standard_item[f"{key}_is_pad"] = torch.tensor(True)
+            else:
+                value = bool(raw) if dtype is torch.bool else int(raw)
+                standard_item[key] = torch.tensor(value, dtype=dtype)
+                standard_item[f"{key}_is_pad"] = torch.tensor(False)
 
     def resize_with_pad(self, img, width, height, pad_value=0) -> torch.Tensor:
         """Resize an image to target dimensions with padding.
@@ -1102,6 +1261,47 @@ class LeRobotDataset(BaseDataset):
         ep_data_index_np = {k: t.numpy() for k, t in self.episode_data_index.items()}
         check_timestamps_sync(timestamps, episode_indices, ep_data_index_np, self.fps, self.tolerance_s)
 
+        # Per-episode caches used by the optional-key emission path. Populated
+        # from meta/episodes.jsonl annotations when present, else filled with
+        # safe defaults that cause every annotated key to emit as _is_pad=True.
+        self.episode_lengths: dict[int, int] = {
+            ep: int(info["length"]) for ep, info in self.meta.episodes.items()
+        }
+        self.segment_starts_by_episode: dict[int, np.ndarray] = {}
+        for ep, info in self.meta.episodes.items():
+            starts = info.get("segments")
+            if starts is None or len(starts) == 0:
+                starts = [0]
+            self.segment_starts_by_episode[ep] = np.asarray(starts, dtype=np.int64)
+
+        # One memory string per segment. Read once from the parquet's "memory"
+        # column at segment-start indices so __getitem__ can resolve
+        # ``next_memory`` without a secondary parquet query per sample. When the
+        # dataset has no memory column (legacy), every segment gets "". Only
+        # the rows we need (segment starts across selected episodes) are
+        # materialized, which matters for multi-million-frame datasets.
+        has_memory_column = "memory" in self.meta.features
+        self.segment_memories_by_episode: dict[int, list[str]] = {}
+        if has_memory_column:
+            indices: list[int] = []
+            offsets: list[int] = []  # cumulative offsets into `indices`, one per episode
+            for ep in self.episodes:
+                offsets.append(len(indices))
+                starts = self.segment_starts_by_episode[ep]
+                ep_start = int(self.episode_data_index["from"][self.epi2idx[ep]].item())
+                indices.extend(int(ep_start + s) for s in starts)
+            if indices:
+                memory_rows = self.hf_dataset.with_format("arrow").select(indices)["memory"].to_pylist()
+            else:
+                memory_rows = []
+            for ep, off in zip(self.episodes, offsets, strict=True):
+                n = len(self.segment_starts_by_episode[ep])
+                self.segment_memories_by_episode[ep] = [str(m) for m in memory_rows[off : off + n]]
+        else:
+            for ep in self.episodes:
+                starts = self.segment_starts_by_episode[ep]
+                self.segment_memories_by_episode[ep] = [""] * len(starts)
+
     @on_accelerate_main_proc(local=True, _sync=True)
     def push_to_hub(
         self,
@@ -1431,6 +1631,101 @@ class LeRobotDataset(BaseDataset):
 
         return item
 
+    def _lookup_segment_index(self, ep_idx: int, frame_in_ep: int) -> int:
+        """Return the zero-based segment index containing ``frame_in_ep``.
+
+        Uses the cached ``segment_starts_by_episode`` table. Legacy datasets
+        with a single placeholder segment always return 0.
+        """
+        starts = self.segment_starts_by_episode[ep_idx]
+        idx = int(np.searchsorted(starts, frame_in_ep, side="right")) - 1
+        return max(idx, 0)
+
+    def _segment_end_in_ep(self, ep_idx: int, seg_idx: int) -> int:
+        """Exclusive end-frame index of segment ``seg_idx`` within its episode."""
+        starts = self.segment_starts_by_episode[ep_idx]
+        if seg_idx + 1 < len(starts):
+            return int(starts[seg_idx + 1])
+        return self.episode_lengths[ep_idx]
+
+    def _lookup_next_memory(self, ep_idx: int, frame_in_ep: int) -> str:
+        """Return the memory string for frame ``frame_in_ep + 1``, clipped at episode end."""
+        ep_length = self.episode_lengths[ep_idx]
+        next_frame = min(frame_in_ep + 1, ep_length - 1)
+        seg = self._lookup_segment_index(ep_idx, next_frame)
+        memories = self.segment_memories_by_episode.get(ep_idx, [""])
+        if not memories:
+            return ""
+        return memories[min(seg, len(memories) - 1)]
+
+    def _sample_subgoal_frame(self, ep_idx: int, frame_in_ep: int, *, at_end_of_segment: bool) -> int:
+        """Pick a future frame index (within-episode) to serve as the subgoal source.
+
+        When ``at_end_of_segment`` is True, returns the last frame of the
+        current segment (clipped to the episode's last frame). Otherwise samples
+        a timestamp uniformly in ``[t, t + 4s]`` (wall-clock) and converts it to
+        a frame index, clipping to the current segment end and the episode end.
+        """
+        ep_length = self.episode_lengths[ep_idx]
+        seg_idx = self._lookup_segment_index(ep_idx, frame_in_ep)
+        seg_end_excl = self._segment_end_in_ep(ep_idx, seg_idx)
+        upper = min(seg_end_excl, ep_length) - 1  # inclusive upper bound.
+        upper = max(upper, frame_in_ep)
+        if at_end_of_segment:
+            return upper
+        window_frames = int(round(4.0 * self.fps))
+        top = min(frame_in_ep + window_frames, upper)
+        if top <= frame_in_ep:
+            return frame_in_ep
+        offset = int(torch.randint(low=0, high=top - frame_in_ep + 1, size=()).item())
+        return frame_in_ep + offset
+
+    def _load_subgoal_frames(self, ep_idx: int, frame_in_ep: int) -> dict[str, torch.Tensor]:
+        """Decode subgoal frames — one per camera slot — for this sample.
+
+        Subgoal image paths must be declared in ``meta/info.json`` under the
+        ``subgoals`` key. When the key is missing (the state of every
+        LeRobot dataset today), we assume no subgoal images exist and return
+        ``{}``; :meth:`BaseDataset._emit_optional_keys` then emits
+        ``subgoal_is_pad=True`` for every slot. Datasets opt in by adding
+        the key to info.json.
+
+        When the key IS present:
+        - The at-end-of-segment vs uniform sampling roll happens ONCE per
+          ``__getitem__`` call (shared across all camera slots); each slot
+          decodes the frame from its own video.
+        - Drop-roll is short-circuited here so a dropped subgoal skips the
+          per-camera ``_query_videos`` decode. When
+          ``self.enable_optional_key_dropout`` is False (e.g. the validation
+          subset), drop is never rolled — the frame-selection randomness
+          stays live because it's about which future frame to read, not
+          masking.
+        - Episodes with no ``segments`` entry in ``episodes.jsonl`` still
+          skip sampling (no segment boundaries → nothing to clip against).
+        """
+        if self.num_cams <= 0 or len(self.meta.video_keys) == 0:
+            return {}
+        if "subgoals" not in self.meta.info:
+            return {}
+        if "segments" not in self.meta.episodes[ep_idx]:
+            return {}
+        # Roll drop before any video decoding — at `subgoal_drop_prob=0.75` the
+        # old ordering threw away 75% of decodes.
+        if self.enable_optional_key_dropout and bool(torch.rand(()) < self.subgoal_drop_prob):
+            return {}
+        name_map = DATA_FEATURES_NAME_MAPPING[self._get_feature_mapping_key()]
+        at_end = bool(torch.rand(()) < self.subgoal_end_of_segment_prob)
+        subgoal_frame = self._sample_subgoal_frame(ep_idx, frame_in_ep, at_end_of_segment=at_end)
+        ts = subgoal_frame / self.fps
+        out: dict[str, torch.Tensor] = {}
+        for k in range(self.num_cams):
+            vid_key = name_map.get(f"camera{k}")
+            if vid_key is None or vid_key not in self.meta.video_keys:
+                continue
+            frames = self._query_videos({vid_key: np.array([ts])}, ep_idx)
+            out[f"subgoal{k}_raw"] = frames[vid_key]
+        return out
+
     def _add_padding_keys(self, item: dict, padding: dict[str, list[bool]]) -> dict:
         """Add padding mask keys to the item dictionary.
 
@@ -1504,7 +1799,21 @@ class LeRobotDataset(BaseDataset):
             # don't convert to timestamp to `float`, because torch.float64 is not supported on MPS
             timestamp = item["timestamp"]
 
-            # change data naming to standard data format
+            # Attach raw optional fields (stripped to _raw suffix) so
+            # BaseDataset._emit_optional_keys can apply dropout uniformly.
+            ep_start = int(self.episode_data_index["from"][self.epi2idx[ep_idx]].item())
+            frame_in_ep = idx - ep_start
+            if "memory" in item:
+                item["memory_raw"] = str(item["memory"])
+            if "mistake" in item:
+                item["mistake_raw"] = int(item["mistake"])
+            item["next_memory_raw"] = self._lookup_next_memory(ep_idx, frame_in_ep)
+            quality = self.meta.episodes[ep_idx].get("quality")
+            if quality is not None:
+                item["quality_raw"] = int(quality)
+            item["speed_raw"] = int(round(self.episode_lengths[ep_idx] / 500) * 500)
+            item.update(self._load_subgoal_frames(ep_idx, frame_in_ep))
+
             item = self._to_standard_data_format(item)
 
             if self.meta.advantages is not None:

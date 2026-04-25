@@ -335,7 +335,7 @@ class WeightedDatasetMixture:
         self.datasets = datasets
         self.dataset_weights = dataset_weights
         self.action_freq = action_freq  # Frequency used for resampling action output
-        self.dataset_names = [type(ds).__name__ + f"_{i}" for i, ds in enumerate(datasets)]  # For logging
+        self.dataset_names = self._make_dataset_names(cfg, datasets)  # For logging
 
         logging.info("Initializing WeightedDatasetMixture...")
         self._log_dataset_info()
@@ -357,6 +357,25 @@ class WeightedDatasetMixture:
         if not all(hasattr(ds, "meta") and ds.meta is not None for ds in datasets):
             raise ValueError("All datasets must have a 'meta' attribute with valid metadata.")
         self.meta = DatasetMixtureMetadata(cfg, [ds.meta for ds in datasets], dataset_weights)
+
+    @staticmethod
+    def _make_dataset_names(cfg: TrainPipelineConfig, datasets: List[BaseDataset]) -> List[str]:
+        """Derive human-readable names for each dataset in the mixture.
+
+        Uses each ``DatasetConfig``'s ``repo_id`` or ``vqa`` identifier when
+        available (ordered to match ``cfg.dataset_mixture.datasets``). Duplicate
+        identifiers are disambiguated with a ``#<idx>`` suffix. Falls back to the
+        dataset class name plus index when the config list cannot be lined up
+        with ``datasets`` (e.g. in tests that construct a mixture directly).
+        """
+        dataset_cfgs = getattr(getattr(cfg, "dataset_mixture", None), "datasets", None)
+        if dataset_cfgs is None or len(dataset_cfgs) != len(datasets):
+            return [type(ds).__name__ + f"_{i}" for i, ds in enumerate(datasets)]
+
+        raw_names = [
+            (dc.repo_id or dc.vqa or type(ds).__name__) for dc, ds in zip(dataset_cfgs, datasets, strict=True)
+        ]
+        return [f"{name}#{idx}" if raw_names.count(name) > 1 else name for idx, name in enumerate(raw_names)]
 
     def _log_dataset_info(self) -> None:
         """Log information about all datasets in the mixture."""
@@ -491,3 +510,38 @@ class WeightedDatasetMixture:
         logging.info("DataLoader created successfully.")
         logging.info("-" * 30)
         return dataloader
+
+    def get_per_dataset_dataloaders(self) -> dict[str, DataLoader]:
+        """Create one sequential DataLoader per underlying dataset.
+
+        Intended for per-dataset evaluation (e.g. per-dataset validation loss),
+        where each dataset should be iterated exactly once rather than mixed
+        via weighted hierarchical sampling. Empty datasets are skipped.
+
+        Returns:
+            Mapping from ``dataset_name`` to its DataLoader.
+        """
+        worker_name_mapping_overrides = self._get_worker_name_mapping_overrides()
+        worker_init_fn = None
+        if worker_name_mapping_overrides:
+            worker_init_fn = functools.partial(
+                _apply_data_feature_name_mapping_overrides,
+                mapping_overrides=worker_name_mapping_overrides,
+            )
+
+        loaders: dict[str, DataLoader] = {}
+        for name, ds in zip(self.dataset_names, self.datasets, strict=True):
+            if len(ds) == 0:
+                logging.info(f"Skipping per-dataset DataLoader for empty dataset '{name}'.")
+                continue
+            loaders[name] = DataLoader(
+                ds,
+                batch_size=self.cfg.dataloader_batch_size,
+                shuffle=False,
+                num_workers=self.cfg.num_workers,
+                pin_memory=torch.cuda.is_available(),
+                drop_last=False,
+                prefetch_factor=self.cfg.prefetch_factor,
+                worker_init_fn=worker_init_fn,
+            )
+        return loaders
