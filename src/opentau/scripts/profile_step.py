@@ -120,6 +120,12 @@ def profile(cfg: TrainPipelineConfig):
     # We intentionally ignore cfg.steps here (production configs set it to
     # ~1M). Override with PROFILE_STEPS=<N> if you want a longer sample.
     measure_steps = int(os.environ.get("PROFILE_STEPS", DEFAULT_MEASURE_STEPS))
+    # Optional per-step loss capture for A/B equivalence tests (e.g. eager vs
+    # sdpa attention). The same seed + same data ordering + same model init
+    # should produce nearly-identical loss trajectories under both backends;
+    # any divergence beyond bf16 reassociation noise is a signal.
+    loss_log_path: str | None = os.environ.get("PROFILE_LOSS_LOG")
+    loss_log: list[dict[str, Any]] = []
     if accelerator.is_main_process:
         logging.info(
             "profile_step: warmup=%d, measured=%d, num_processes=%d, batch_size=%d, "
@@ -325,6 +331,21 @@ def profile(cfg: TrainPipelineConfig):
         # Phase 2: forward (mirror update_policy lines 74-77)
         losses = policy.forward(batch)
         loss = cfg.loss_weighting["MSE"] * losses["MSE"] + cfg.loss_weighting["CE"] * losses["CE"]
+        # When PROFILE_LOSS_LOG is set, record per-step (rank-local) losses
+        # for an A/B equivalence test (e.g. eager vs sdpa attention). The
+        # ``.item()`` call syncs CPU<->GPU; cheap relative to forward+backward
+        # and is the same on both A and B sides so timing comparisons remain
+        # apples-to-apples.
+        if loss_log_path is not None and accelerator.is_main_process:
+            loss_log.append(
+                {
+                    "step": step,
+                    "warmup": step < WARMUP_STEPS,
+                    "loss": loss.detach().to(torch.float32).item(),
+                    "mse": losses["MSE"].detach().to(torch.float32).item(),
+                    "ce": losses["CE"].detach().to(torch.float32).item(),
+                }
+            )
         _sync()
         t2 = time.perf_counter()
 
@@ -455,6 +476,24 @@ def profile(cfg: TrainPipelineConfig):
                     indent=2,
                 )
             print(f"wrote {out_path}")
+
+        if loss_log_path is not None and loss_log:
+            with open(loss_log_path, "w") as f:
+                json.dump(
+                    {
+                        "warmup": WARMUP_STEPS,
+                        "measured": measure_steps,
+                        "num_processes": accelerator.num_processes,
+                        "batch_size": cfg.batch_size,
+                        "attention_implementation": cfg.policy.attention_implementation,
+                        "gradient_checkpointing": getattr(cfg.policy, "gradient_checkpointing", False),
+                        "seed": cfg.seed,
+                        "per_step": loss_log,
+                    },
+                    f,
+                    indent=2,
+                )
+            print(f"wrote loss log {loss_log_path}")
 
 
 if __name__ == "__main__":
