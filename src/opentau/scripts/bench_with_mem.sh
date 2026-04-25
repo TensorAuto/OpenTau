@@ -128,9 +128,9 @@ END {
                g, peak[g], cap[g], peak[g]/1024.0, cap[g]-peak[g]
         first = 0
     }
-    # max_peak_mib is the max-across-GPUs of each GPU's peak-over-time:
+    # max_peak_mib is the max-across-GPUs of each per-GPU peak-over-time:
     # the worst single-GPU footprint observed at any point during the run.
-    # That's the value that determines whether the run OOMs, since CUDA
+    # This is the value that determines whether the run OOMs, since CUDA
     # OOM is per-device, not aggregated.
     max = 0; max_idx = -1
     for (g in peak) if (peak[g] > max) { max = peak[g]; max_idx = g + 0 }
