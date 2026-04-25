@@ -26,9 +26,17 @@
 # Usage:
 #   predict_max_bs.sh <bs1> <gpu-mem-tag1.json> <bs2> <gpu-mem-tag2.json> [target_gib]
 #
-# ``target_gib`` defaults to 78, which leaves ~2 GiB of headroom on an
-# 80 GiB A100 for the driver, NCCL buffers, and intra-step transient
-# spikes that the 500 ms poller may miss.
+# ``target_gib`` defaults to 79.5 GiB (= 81,408 MiB), empirically
+# verified safe on an 80 GiB A100 for this workload. The remaining
+# ~0.5 GiB absorbs NCCL transient buffers and intra-step memory spikes
+# that the 500 ms poller may miss. Pass a smaller target if you want
+# more conservative headroom.
+#
+# The ``max_peak_mib`` value read from each JSON is the max across
+# *every* visible GPU of that GPU's peak-over-time — produced by
+# ``bench_with_mem.sh``'s awk reducer. So a single-GPU spike anywhere
+# in the rank set will dominate the prediction, which is the right
+# OOM-safety semantics.
 #
 # Example:
 #   bench_with_mem.sh probe-bs4 ... --batch_size=4
@@ -46,7 +54,7 @@ BS1="$1"
 JSON1="$2"
 BS2="$3"
 JSON2="$4"
-TARGET_GIB="${5:-78}"
+TARGET_GIB="${5:-79.5}"
 
 if [ ! -s "$JSON1" ] || [ ! -s "$JSON2" ]; then
     echo "Error: one of $JSON1 / $JSON2 is missing or empty." >&2
@@ -84,9 +92,9 @@ BEGIN {
         exit 3
     }
     bs_max_real = (target_mib - intercept) / slope
-    # Floor to int. ``target_gib`` already builds in ~2 GiB of headroom
-    # against the 80 GiB cards; flooring on top of that gives one more
-    # sample of safety margin.
+    # Floor to int. ``target_gib`` (default 79.5 = 81,408 MiB) already
+    # builds in the empirically-verified safe headroom; flooring on top
+    # gives one more sample of safety margin.
     bs_max = int(bs_max_real)
     if (bs_max < 1) bs_max = 1
     pred_peak_mib = slope * bs_max + intercept
