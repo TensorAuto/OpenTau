@@ -22,6 +22,7 @@ bf16 + CPU; total wall-time is well under five seconds.
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from opentau.optim.master_weights import MasterWeightOptimizer
@@ -331,3 +332,177 @@ def test_rebuild_masters_from_live_resyncs_after_external_load():
     # Masters now match the live params (in fp32).
     for live, master in zip(layer.parameters(), opt._fp32_params, strict=True):
         torch.testing.assert_close(master.data, live.data.to(torch.float32))
+
+
+def test_wrapper_is_torch_optimizer_subclass():
+    """The wrapper must satisfy ``isinstance(_, torch.optim.Optimizer)``.
+
+    Without this, accelerate's ``_prepare_one`` (``accelerator.py:1403``)
+    skips the wrapper entirely — no ``AcceleratedOptimizer`` wrapping,
+    no gradient-accumulation gating on ``step()`` / ``zero_grad()``, no
+    inclusion in ``Accelerator._optimizers`` (so the LR scheduler can't
+    find it via ``prepare_scheduler``'s identity match either).
+    """
+    layer = _make_bf16_linear()
+    inner = torch.optim.AdamW(list(layer.parameters()))
+    wrapped = MasterWeightOptimizer.from_existing(inner)
+
+    assert isinstance(wrapped, torch.optim.Optimizer)
+
+
+def test_lr_scheduler_reaches_inner_after_from_existing_with_rebind():
+    """Mimics ``train.py``'s prefix and pins the scheduler-rebind contract.
+
+    ``make_optimizer_and_scheduler`` builds the scheduler bound to the
+    original ``torch.optim.AdamW``. ``MasterWeightOptimizer.from_existing``
+    discards that AdamW and creates a fresh inner with new ``param_groups``
+    dicts. Without rebinding ``scheduler.optimizer = wrapped``,
+    ``scheduler.step()`` mutates the orphaned optimizer's groups and the
+    inner AdamW's lr never moves — schedule silently applied to nothing.
+    """
+    layer = _make_bf16_linear(in_features=4, out_features=1)
+    inner_opt = torch.optim.AdamW(list(layer.parameters()), lr=1.0, weight_decay=0.0)
+    scheduler = torch.optim.lr_scheduler.LinearLR(inner_opt, start_factor=1.0, end_factor=0.5, total_iters=4)
+    initial_lr = scheduler.optimizer.param_groups[0]["lr"]
+    assert initial_lr == 1.0
+
+    wrapped = MasterWeightOptimizer.from_existing(inner_opt)
+    # The rebind that train.py performs immediately after from_existing.
+    scheduler.optimizer = wrapped
+
+    x = torch.randn(8, 4, dtype=torch.bfloat16)
+    target = torch.randn(8, 1, dtype=torch.bfloat16)
+    for _ in range(2):
+        ((layer(x) - target) ** 2).float().mean().backward()
+        wrapped.step()
+        wrapped.zero_grad()
+        scheduler.step()
+
+    # The inner AdamW's lr must reflect the LinearLR decay.
+    inner_lr = wrapped.inner.param_groups[0]["lr"]
+    assert inner_lr < initial_lr, (
+        f"LR decay did not reach the inner optimizer: still {inner_lr} after 2 scheduler steps"
+    )
+    # And the wrapper's exposed lr must equal the inner's (single source of truth).
+    assert wrapped.param_groups[0]["lr"] == inner_lr
+
+
+def test_lr_scheduler_does_not_reach_inner_without_rebind():
+    """Negative control for the rebind contract above.
+
+    Documents the failure mode if a future change drops the
+    ``scheduler.optimizer = wrapped`` line in ``train.py``: the inner
+    AdamW's lr stays frozen at the construction value while the
+    scheduler happily mutates an orphaned optimizer.
+    """
+    layer = _make_bf16_linear(in_features=4, out_features=1)
+    inner_opt = torch.optim.AdamW(list(layer.parameters()), lr=1.0, weight_decay=0.0)
+    scheduler = torch.optim.lr_scheduler.LinearLR(inner_opt, start_factor=1.0, end_factor=0.5, total_iters=4)
+
+    wrapped = MasterWeightOptimizer.from_existing(inner_opt)
+    # Deliberately do NOT rebind: scheduler.optimizer is still the original AdamW.
+
+    x = torch.randn(8, 4, dtype=torch.bfloat16)
+    target = torch.randn(8, 1, dtype=torch.bfloat16)
+    for _ in range(2):
+        ((layer(x) - target) ** 2).float().mean().backward()
+        wrapped.step()
+        wrapped.zero_grad()
+        scheduler.step()
+
+    # The orphaned optimizer's lr decayed (proves the scheduler IS stepping).
+    assert inner_opt.param_groups[0]["lr"] < 1.0
+    # But the wrapper's inner is stuck — the bug we're guarding against.
+    assert wrapped.inner.param_groups[0]["lr"] == 1.0
+
+
+@pytest.mark.gpu
+def test_rebuild_masters_migrates_to_live_device_on_fresh_run():
+    """Fresh-run regression for the dd1154e migration bug.
+
+    The wrapper is constructed before ``accelerator.prepare`` runs, so the
+    fp32 masters are cloned while the live policy is still on CPU.
+    ``accelerator.prepare`` later migrates the live params to GPU; the next
+    call to ``rebuild_masters_from_live`` must follow the live device, not
+    silently leave masters on CPU. (Pre-fix, ``master.data.copy_(...)``
+    preserved master's old device — Adam ran on CPU and every step paid a
+    GPU<->CPU memcpy.)
+    """
+    layer = _make_bf16_linear()
+    opt = MasterWeightOptimizer(_adamw_factory(), list(layer.parameters()))
+    for master in opt._fp32_params:
+        assert master.device.type == "cpu"
+
+    layer.cuda()
+    opt.rebuild_masters_from_live(layer.parameters())
+
+    for master in opt._fp32_params:
+        assert master.device.type == "cuda"
+        assert master.dtype == torch.float32
+    for live, master in zip(layer.parameters(), opt._fp32_params, strict=True):
+        torch.testing.assert_close(master.data, live.data.to(torch.float32))
+
+
+@pytest.mark.gpu
+def test_rebuild_masters_migrates_populated_state_and_step_succeeds():
+    """Resume-path regression: populated Adam state must follow the new device.
+
+    On resume, ``accelerator.load_state`` restores Adam state on whatever
+    device it was checkpointed from; ``accelerator.prepare`` may have
+    independently migrated the live policy. ``rebuild_masters_from_live``
+    must move ``exp_avg`` / ``exp_avg_sq`` to the live device before
+    re-pointing ``master.data``, otherwise the next ``step()`` crashes on a
+    device-mismatch ``addmul_``.
+    """
+    layer = _make_bf16_linear()
+    opt = MasterWeightOptimizer(_adamw_factory(), list(layer.parameters()))
+
+    # Populate Adam state on CPU.
+    x = torch.randn(8, 8, dtype=torch.bfloat16)
+    target = torch.randn(8, 4, dtype=torch.bfloat16)
+    ((layer(x) - target) ** 2).float().mean().backward()
+    opt.step()
+    for master in opt._fp32_params:
+        for value in opt.inner.state[master].values():
+            if isinstance(value, torch.Tensor):
+                assert value.device.type == "cpu"
+
+    layer.cuda()
+    opt.rebuild_masters_from_live(layer.parameters())
+
+    for master in opt._fp32_params:
+        assert master.device.type == "cuda"
+        for value in opt.inner.state[master].values():
+            if isinstance(value, torch.Tensor):
+                assert value.device.type == "cuda"
+
+    # Next step on GPU must succeed (no device-mismatch addmul_).
+    x_gpu = torch.randn(8, 8, dtype=torch.bfloat16, device="cuda")
+    target_gpu = torch.randn(8, 4, dtype=torch.bfloat16, device="cuda")
+    ((layer(x_gpu) - target_gpu) ** 2).float().mean().backward()
+    opt.step()
+
+
+@pytest.mark.gpu
+def test_rebuild_masters_preserves_parameter_identity_across_migration():
+    """``master.data = ...`` must keep the ``Parameter`` object identical.
+
+    The inner ``torch.optim.AdamW`` holds references to the master
+    ``nn.Parameter`` objects in its ``param_groups``. If
+    ``rebuild_masters_from_live`` swapped in fresh ``Parameter`` objects
+    (rather than re-assigning ``.data`` on the existing ones), the inner
+    optimizer would step the stale tensors and the wrapper would silently
+    diverge from the inner state.
+    """
+    layer = _make_bf16_linear()
+    opt = MasterWeightOptimizer(_adamw_factory(), list(layer.parameters()))
+    masters_before = list(opt._fp32_params)
+    inner_param_ids_before = {id(p) for group in opt.inner.param_groups for p in group["params"]}
+
+    layer.cuda()
+    opt.rebuild_masters_from_live(layer.parameters())
+
+    for before, after in zip(masters_before, opt._fp32_params, strict=True):
+        assert before is after
+    inner_param_ids_after = {id(p) for group in opt.inner.param_groups for p in group["params"]}
+    assert inner_param_ids_before == inner_param_ids_after
