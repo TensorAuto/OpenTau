@@ -15,13 +15,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""π05 Mem: A Vision-Language-Action Flow Model with V-JEPA2 video encoding
-and temporal state sequences.
+"""π05 Mem: A Vision-Language-Action Flow Model with space-time SigLIP video
+encoding and temporal state sequences.
 
-Based on π05, this variant:
-  1. Replaces the SigLIP image encoder with a frozen V-JEPA2 video encoder
-     followed by a Perceiver cross-attention reducer that compresses the video
-     into 256 tokens (matching the original SigLIP token count).
+Based on π05, this variant implements the low-level memory architecture from
+Torne, Pertsch, Walke et al. "MEM: Multi-Scale Embodied Memory for Vision
+Language Action Models" (Section III-C + Appendix C):
+
+  1. Extends the PaliGemma SigLIP image encoder with space-time separable
+     attention every ``spacetime_layer_stride``-th ViT layer. The temporal
+     sublayer re-uses each layer's existing Q/K/V/O projections — no new
+     learnable parameters are introduced. Past-timestep tokens are dropped
+     after the encoder so the prefix matches a single-frame VLA's 256 image
+     tokens exactly.
   2. Accepts temporal state sequences (B, T, D) and projects each timestep
      into a separate continuous token for the Gemma backbone.
 """
@@ -47,7 +53,7 @@ from opentau.policies.pi05.paligemma_with_expert import (
     PaliGemmaWithExpertModel,
 )
 from opentau.policies.pi05_mem.configuration_pi05 import PI05MemConfig
-from opentau.policies.pi05_mem.video_encoder import VJEPA2VideoEncoder
+from opentau.policies.pi05_mem.video_encoder import SpaceTimeSiglipVideoEncoder
 from opentau.policies.pretrained import PreTrainedPolicy, T
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
@@ -206,8 +212,9 @@ def pad_discrete_tokens(tokens: list[list[int]], max_length: int) -> tuple[np.nd
 class PI05MemPolicy(PreTrainedPolicy):
     """Wrapper class around PI05MemFlowMatching model.
 
-    Uses V-JEPA2 as a video encoder and temporal state sequences projected
-    into per-timestep continuous tokens in the VLM embedding space.
+    Uses a space-time SigLIP video encoder (MEM paper low-level memory) and
+    temporal state sequences projected into per-timestep continuous tokens in
+    the VLM embedding space.
     """
 
     config_class = PI05MemConfig
@@ -410,7 +417,7 @@ class PI05MemPolicy(PreTrainedPolicy):
         """Buffer the current observation and construct a temporal batch.
 
         Appends the single-frame observation from ``batch`` to internal deque
-        buffers, then assembles a batch with ``n_obs_history`` evenly-spaced
+        buffers, then assembles a batch with ``n_obs_steps`` evenly-spaced
         frames (interval = ``history_interval``).  Early in an episode, missing
         history slots are zero-padded.
 
@@ -421,10 +428,9 @@ class PI05MemPolicy(PreTrainedPolicy):
             - Any other metadata keys are forwarded unchanged.
 
         Returns a new dict with ``"state"`` expanded to (B, T, D) and image keys
-        expanded to (B, T, C, H, W), where T = ``n_obs_history``.
+        expanded to (B, T, C, H, W), where T = ``n_obs_steps``.
         """
-        assert self.config.n_obs_history is not None
-        n_hist: int = self.config.n_obs_history
+        n_hist: int = self.config.n_obs_steps
         interval = self.config.history_interval or 1
         buf_maxlen = self.config.obs_buffer_size
 
@@ -479,7 +485,7 @@ class PI05MemPolicy(PreTrainedPolicy):
         self.eval()
 
         # Build temporal observation history if configured.
-        if self.config.n_obs_history is not None and self.config.n_obs_history > 1:
+        if self.config.n_obs_steps > 1:
             batch = self._build_history_batch(batch)
 
         if len(self._action_queue) == 0 or len(self._action_queue) <= self.config.max_delay:
@@ -527,7 +533,7 @@ class PI05MemPolicy(PreTrainedPolicy):
             assert vid.ndim == 5, f"Expected 5D video tensor (B, T, C, H, W), got {vid.shape}"
         assert state.ndim == 3, f"Expected 3D state tensor (B, T, D), got {state.shape}"
 
-        if self.config.n_obs_history is not None and self.config.n_obs_history > 1:
+        if self.config.n_obs_steps > 1:
             t_dim = state.shape[1]
             if t_dim == 1:
                 logging.warning(
@@ -622,9 +628,9 @@ class PI05MemPolicy(PreTrainedPolicy):
         """
         state = batch["state"]  # (B, T, D) or (B, D) during inference
         if state.ndim == 2:
-            if self.config.n_obs_history is not None and self.config.n_obs_history > 1:
+            if self.config.n_obs_steps > 1:
                 raise ValueError(
-                    f"Expected 3D state tensor (B, T, D) when n_obs_history > 1, "
+                    f"Expected 3D state tensor (B, T, D) when n_obs_steps > 1, "
                     f"got shape {state.shape}. Ensure select_action() is being used."
                 )
             state = state.unsqueeze(1)  # (B, D) -> (B, 1, D)
@@ -656,14 +662,17 @@ class PI05MemPolicy(PreTrainedPolicy):
         """Apply preprocessing to the video inputs.
 
         Each camera key now contains a video tensor of shape (B, T, C, H, W).
-        Frames are resized to 224x224 with padding. ImageNet normalization is
-        assumed to be already applied by the dataset loader.
+        Frames are resized to 224x224 with padding. Pixel values remain in the
+        ``[0, 1]`` range as produced by the dataset loader; the video encoder
+        rescales to ``[-1, 1]`` (SigLIP's expected range) inside its own
+        forward pass.
 
         Args:
             batch: Batch of data containing video tensors.
             obs_history_is_pad: Optional bool tensor (B, T) indicating which
                 temporal frames are padded. Padded frames are zeroed out before
-                encoding so V-JEPA2 does not process clamped/repeated content.
+                encoding so the video encoder does not see clamped/repeated
+                content.
 
         Returns:
             A tuple of (videos, vid_masks) lists.
@@ -686,9 +695,9 @@ class PI05MemPolicy(PreTrainedPolicy):
         for key in present_img_keys:
             vid = batch[key]  # (B, T, C, H, W) or (B, C, H, W) during inference
             if vid.ndim == 4:
-                if self.config.n_obs_history is not None and self.config.n_obs_history > 1:
+                if self.config.n_obs_steps > 1:
                     raise ValueError(
-                        f"Expected 5D video tensor (B, T, C, H, W) when n_obs_history > 1, "
+                        f"Expected 5D video tensor (B, T, C, H, W) when n_obs_steps > 1, "
                         f"got shape {vid.shape}. Ensure select_action() is being used."
                     )
                 vid = vid.unsqueeze(1)  # (B, C, H, W) -> (B, 1, C, H, W)
@@ -743,8 +752,8 @@ class PI05MemPolicy(PreTrainedPolicy):
 
 # Flow-matching model
 class PI05MemFlowMatching(nn.Module):
-    """π05 Mem: A Vision-Language-Action Flow Model with V-JEPA2 video encoding
-    and temporal state sequences.
+    """π05 Mem: A Vision-Language-Action Flow Model with space-time SigLIP
+    video encoding and temporal state sequences.
 
     ┌──────────────────────────────────────────┐
     │                   actions                │
@@ -761,7 +770,7 @@ class PI05MemFlowMatching(nn.Module):
     │      │  │  │  └── discrete actions       │
     │      │  │  └───── state (T tokens)       │
     │      │  └──────── language tokens        │
-    │      └─────────── video (V-JEPA2)        │
+    │      └─────────── video (SigLIP+ST)      │
     └──────────────────────────────────────────┘
     """
 
@@ -782,17 +791,19 @@ class PI05MemFlowMatching(nn.Module):
 
         vlm_hidden_size = self.paligemma_with_expert.config.paligemma_config.text_config.hidden_size
 
-        # V-JEPA2 video encoder (replaces SigLIP)
-        encoder_dtype = getattr(torch, config.vjepa2_dtype) if config.vjepa2_dtype else None
-        self.video_encoder = VJEPA2VideoEncoder(
-            vjepa2_model_name=config.vjepa2_model_name,
+        # Space-time SigLIP video encoder (MEM paper low-level memory).
+        # The encoder is a thin computational wrapper: it holds
+        # ``paligemma_with_expert``'s ``vision_tower`` / ``multi_modal_projector``
+        # by reference (no parameter duplication, no separate HF download) and
+        # mutates a few encoder layers in place to add temporal self-attention.
+        # Freezing and dtype-casting of these modules are already handled by
+        # ``PaliGemmaWithExpertModel``. The encoder introduces no new learnable
+        # parameters, so a regular pi05 checkpoint's state_dict loads directly.
+        self.video_encoder = SpaceTimeSiglipVideoEncoder(
+            vision_tower=self.paligemma_with_expert.paligemma.vision_tower,
+            multi_modal_projector=self.paligemma_with_expert.paligemma.multi_modal_projector,
             num_frames=config.n_obs_steps,
-            crop_size=config.vjepa2_crop_size,
-            num_video_tokens=config.vjepa2_num_video_tokens,
-            vlm_hidden_size=vlm_hidden_size,
-            perceiver_heads=config.vjepa2_perceiver_heads,
-            freeze_encoder=config.freeze_vision_encoder,
-            encoder_dtype=encoder_dtype,
+            spacetime_layer_stride=config.spacetime_layer_stride,
         )
 
         # Per-timestep state projection: each of the T state vectors becomes one token
@@ -837,13 +848,18 @@ class PI05MemFlowMatching(nn.Module):
         return time
 
     def embed_video(self, video: Tensor) -> Tensor:
-        """Encode a video through V-JEPA2 + Perceiver reducer + projection.
+        """Encode a video through the space-time SigLIP video encoder.
+
+        The encoder applies standard SigLIP spatial attention on every layer
+        plus a causal temporal attention sublayer every
+        ``spacetime_layer_stride``-th layer. Past-timestep tokens are dropped;
+        only the current frame's 256 tokens are returned.
 
         Args:
-            video: (B, T, C, H, W)
+            video: (B, T, C, H, W) pixel values in [0, 1].
 
         Returns:
-            (B, num_video_tokens, vlm_hidden_size)
+            (B, num_video_tokens, vlm_hidden_size) current-frame tokens.
         """
         return self.video_encoder(video)
 
@@ -858,8 +874,9 @@ class PI05MemFlowMatching(nn.Module):
         discrete_action_masks: Tensor | None = None,
         obs_history_is_pad: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """Embed videos with V-JEPA2, language tokens with embedding layer, and
-        temporal state via per-timestep learned projection.
+        """Embed videos with the space-time SigLIP video encoder, language
+        tokens with the embedding layer, and temporal state via per-timestep
+        learned projection.
 
         Args:
             videos: List of video tensors, each (B, T, C, H, W).

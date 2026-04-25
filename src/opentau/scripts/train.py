@@ -149,6 +149,35 @@ def _find_unused_params_from_env() -> bool:
     return os.environ.get("FIND_UNUSED_PARAMS", "true").lower() == "true"
 
 
+def _sync_deepspeed_gradient_accumulation_steps(
+    accelerator: accelerate.Accelerator, cfg: TrainPipelineConfig
+) -> None:
+    """Make TrainPipelineConfig the single source of truth for gradient_accumulation_steps.
+
+    When DeepSpeed is the distributed backend, the value declared in the Accelerate YAML's
+    `deepspeed_config.gradient_accumulation_steps` is forcibly overridden to match
+    `cfg.gradient_accumulation_steps`. Must be called on all ranks and before
+    `accelerator.prepare(...)`, because `_prepare_deepspeed` reads this value from
+    `hf_ds_config.config` on every rank at prepare time.
+    """
+    if accelerator.distributed_type != accelerate.DistributedType.DEEPSPEED:
+        return
+
+    ds_config = accelerator.deepspeed_plugin.hf_ds_config.config
+    current = ds_config.get("gradient_accumulation_steps", 1)
+    target = cfg.gradient_accumulation_steps
+    if current != target and accelerator.is_main_process:
+        logging.warning(
+            "Overriding DeepSpeed `gradient_accumulation_steps` (%s) with the value from "
+            "TrainPipelineConfig (%s). TrainPipelineConfig is the single source of truth; "
+            "the value in the Accelerate YAML is ignored.",
+            current,
+            target,
+        )
+    ds_config["gradient_accumulation_steps"] = target
+    accelerator.deepspeed_plugin.gradient_accumulation_steps = target
+
+
 @parser.wrap()
 def train(cfg: TrainPipelineConfig):
     cfg.validate()
@@ -158,16 +187,20 @@ def train(cfg: TrainPipelineConfig):
         "step_scheduler_with_optimizer": False,
         "split_batches": False,  # split_batches == True is not working anyways
         "kwargs_handlers": [DistributedDataParallelKwargs(find_unused_parameters=find_unused)],
+        "gradient_accumulation_steps": cfg.gradient_accumulation_steps,
     }
     if cfg.wandb.enable:
         accelerator_kwargs["log_with"] = "wandb"
-    if cfg.gradient_accumulation_steps > 1:
-        accelerator_kwargs["gradient_accumulation_steps"] = cfg.gradient_accumulation_steps
 
     accelerator = accelerate.Accelerator(**accelerator_kwargs)
     init_logging(accelerator, level=logging.DEBUG if cfg.debug else logging.INFO)
     # Register accelerator globally for use in other modules, (e.g., detect current rank, etc.)
     set_proc_accelerator(accelerator)
+
+    # Must run before `encode_accelerator_state_dict` + `init_trackers` below so the
+    # wandb-logged accelerator config and the value DeepSpeed consumes at prepare()
+    # time both reflect TrainPipelineConfig.
+    _sync_deepspeed_gradient_accumulation_steps(accelerator, cfg)
 
     # Strict guard for gradient_checkpointing: the pi05 custom forward loop
     # wraps layer bodies in torch.utils.checkpoint.checkpoint, which is only
@@ -212,18 +245,6 @@ def train(cfg: TrainPipelineConfig):
     if accelerator.is_main_process:
         accelerator_config = encode_accelerator_state_dict(accelerator.state.__dict__)
         logging.info(pformat(accelerator_config))
-
-        # Ensure `gradient_accumulation_steps` is consistent between TrainPipelineConfig and DeepSpeedConfig
-        if accelerator.distributed_type == accelerate.DistributedType.DEEPSPEED:
-            deepspeed_config, deepspeed_key = accelerator.deepspeed_plugin.hf_ds_config.find_config_node(
-                "gradient_accumulation_steps"
-            )
-            ds_grad_acc_steps = deepspeed_config.get(deepspeed_key, 1)
-            if ds_grad_acc_steps != cfg.gradient_accumulation_steps:
-                raise ValueError(
-                    "The `gradient_accumulation_steps` in TrainPipelineConfig does not match the value "
-                    f"specified in DeepSpeedConfig {cfg.gradient_accumulation_steps} != {ds_grad_acc_steps}. "  # nosec B608
-                )
 
         if cfg.wandb.enable:
             step = load_training_step(cfg.checkpoint_path) if cfg.resume else None
