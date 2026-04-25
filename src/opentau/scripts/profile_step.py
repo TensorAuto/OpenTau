@@ -74,6 +74,7 @@ from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.factory import make_dataset_mixture
 from opentau.datasets.utils import cycle
 from opentau.optim.factory import make_optimizer_and_scheduler
+from opentau.optim.master_weights import MasterWeightOptimizer
 from opentau.policies.factory import make_policy
 from opentau.utils.accelerate_utils import set_proc_accelerator
 from opentau.utils.random_utils import set_seed
@@ -269,6 +270,23 @@ def profile(cfg: TrainPipelineConfig):
                     f"{total_params:,}",
                 )
 
+        # Mirror train.py's master-weights wrapping. Without this, profile_step
+        # silently allocates Adam state (exp_avg, exp_avg_sq) in bf16 since the
+        # optimizer is built over the bf16-cast policy parameters; the resulting
+        # memory footprint is ~half of what production training pays under the
+        # PR #182 fix, so the benchmark would systematically under-report
+        # memory and over-report the largest batch that fits. See issue #181.
+        # DeepSpeed ZeRO already provides equivalent fp32-master semantics via
+        # BF16_Optimizer, so we skip the wrap on that backend.
+        if accelerator.distributed_type != accelerate.DistributedType.DEEPSPEED:
+            optimizer = MasterWeightOptimizer.from_existing(optimizer)
+            if accelerator.is_main_process:
+                logging.info(
+                    "Wrapped optimizer with MasterWeightOptimizer (fp32 master "
+                    "weights + fp32 Adam state). Backend: %s.",
+                    accelerator.distributed_type,
+                )
+
     train_dataloader = train_dataset.get_dataloader()
     if skip_optim:
         policy, train_dataloader = accelerator.prepare(policy, train_dataloader)
@@ -312,7 +330,15 @@ def profile(cfg: TrainPipelineConfig):
         if not skip_optim:
             accelerator.unscale_gradients(optimizer=optimizer)
             if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(policy.parameters(), cfg.optimizer.grad_clip_norm)
+                # Mirror train.py's dispatch: when MasterWeightOptimizer is in
+                # use, route the clip through it so the bf16->fp32 grad upcast
+                # is amortized into the clip phase (and the subsequent step
+                # skips the upcast). Otherwise use accelerator's clip path.
+                inner_opt = getattr(optimizer, "optimizer", optimizer)
+                if isinstance(inner_opt, MasterWeightOptimizer):
+                    inner_opt.clip_grad_norm_(cfg.optimizer.grad_clip_norm)
+                else:
+                    accelerator.clip_grad_norm_(policy.parameters(), cfg.optimizer.grad_clip_norm)
         _sync()
         t3b = time.perf_counter()
 
