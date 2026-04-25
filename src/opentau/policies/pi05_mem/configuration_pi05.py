@@ -71,7 +71,8 @@ class PI05MemConfig(PreTrainedConfig):
         dropout: Dropout rate. Defaults to 0.1.
         num_steps: Number of flow matching steps for decoding. Defaults to 10.
         init_strategy: Initialization strategy. Defaults to "full_he_init".
-        attention_implementation: Attention implementation ("eager" or "fa2"). Defaults to "eager".
+        attention_implementation: Attention implementation ("eager", "sdpa", or "fa2"; "fa2"
+            falls back to "eager" with a warning). Defaults to "eager".
         freeze_vision_encoder: Whether to freeze the SigLIP vision tower.
             When True the ``multi_modal_projector`` remains trainable, matching
             the semantics in ``pi05_continuous_state``. Defaults to True.
@@ -138,6 +139,17 @@ class PI05MemConfig(PreTrainedConfig):
     # Finetuning settings
     freeze_vision_encoder: bool = True
     train_expert_only: bool = False
+
+    # Wrap each transformer-layer forward in torch.utils.checkpoint to trade
+    # ~25-33% same-batch compute for ~30-40 GB of activation memory per rank,
+    # typically netting +10-25% throughput once the freed memory is spent on
+    # a larger per-rank batch. Only supported with distributed_type=MULTI_GPU
+    # (DDP), NO (single process), or DeepSpeed ZeRO-1/2 — src/opentau/scripts/
+    # train.py raises if the accelerator's distributed_type is anything else
+    # (ZeRO-3, FSDP) because the custom per-layer forward does not wire up
+    # the backend-specific activation-checkpointing hooks those strategies
+    # require. Defaults to False (no ckpt, lowest risk).
+    gradient_checkpointing: bool = False
 
     # Space-time SigLIP video encoder settings (MEM paper low-level memory).
     # The encoder wraps paligemma_with_expert's own vision_tower / projector
