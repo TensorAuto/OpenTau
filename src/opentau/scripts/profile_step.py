@@ -286,6 +286,14 @@ def profile(cfg: TrainPipelineConfig):
         # BF16_Optimizer, so we skip the wrap on that backend.
         if accelerator.distributed_type != accelerate.DistributedType.DEEPSPEED:
             optimizer = MasterWeightOptimizer.from_existing(optimizer)
+            # Same rebind train.py performs immediately after from_existing:
+            # ``make_optimizer_and_scheduler`` left ``lr_scheduler.optimizer``
+            # pointing at the original (now-orphaned) AdamW. Without this,
+            # ``lr_scheduler.step()`` would mutate the orphan's
+            # ``param_groups[i]['lr']`` and the wrapper's inner AdamW would
+            # never see the schedule. See PR #182 and 8be2cd1.
+            if lr_scheduler is not None:
+                lr_scheduler.optimizer = optimizer
             if accelerator.is_main_process:
                 logging.info(
                     "Wrapped optimizer with MasterWeightOptimizer (fp32 master "
