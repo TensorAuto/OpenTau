@@ -334,6 +334,88 @@ def test_rebuild_masters_from_live_resyncs_after_external_load():
         torch.testing.assert_close(master.data, live.data.to(torch.float32))
 
 
+def test_wrapper_is_torch_optimizer_subclass():
+    """The wrapper must satisfy ``isinstance(_, torch.optim.Optimizer)``.
+
+    Without this, accelerate's ``_prepare_one`` (``accelerator.py:1403``)
+    skips the wrapper entirely — no ``AcceleratedOptimizer`` wrapping,
+    no gradient-accumulation gating on ``step()`` / ``zero_grad()``, no
+    inclusion in ``Accelerator._optimizers`` (so the LR scheduler can't
+    find it via ``prepare_scheduler``'s identity match either).
+    """
+    layer = _make_bf16_linear()
+    inner = torch.optim.AdamW(list(layer.parameters()))
+    wrapped = MasterWeightOptimizer.from_existing(inner)
+
+    assert isinstance(wrapped, torch.optim.Optimizer)
+
+
+def test_lr_scheduler_reaches_inner_after_from_existing_with_rebind():
+    """Mimics ``train.py``'s prefix and pins the scheduler-rebind contract.
+
+    ``make_optimizer_and_scheduler`` builds the scheduler bound to the
+    original ``torch.optim.AdamW``. ``MasterWeightOptimizer.from_existing``
+    discards that AdamW and creates a fresh inner with new ``param_groups``
+    dicts. Without rebinding ``scheduler.optimizer = wrapped``,
+    ``scheduler.step()`` mutates the orphaned optimizer's groups and the
+    inner AdamW's lr never moves — schedule silently applied to nothing.
+    """
+    layer = _make_bf16_linear(in_features=4, out_features=1)
+    inner_opt = torch.optim.AdamW(list(layer.parameters()), lr=1.0, weight_decay=0.0)
+    scheduler = torch.optim.lr_scheduler.LinearLR(inner_opt, start_factor=1.0, end_factor=0.5, total_iters=4)
+    initial_lr = scheduler.optimizer.param_groups[0]["lr"]
+    assert initial_lr == 1.0
+
+    wrapped = MasterWeightOptimizer.from_existing(inner_opt)
+    # The rebind that train.py performs immediately after from_existing.
+    scheduler.optimizer = wrapped
+
+    x = torch.randn(8, 4, dtype=torch.bfloat16)
+    target = torch.randn(8, 1, dtype=torch.bfloat16)
+    for _ in range(2):
+        ((layer(x) - target) ** 2).float().mean().backward()
+        wrapped.step()
+        wrapped.zero_grad()
+        scheduler.step()
+
+    # The inner AdamW's lr must reflect the LinearLR decay.
+    inner_lr = wrapped.inner.param_groups[0]["lr"]
+    assert inner_lr < initial_lr, (
+        f"LR decay did not reach the inner optimizer: still {inner_lr} after 2 scheduler steps"
+    )
+    # And the wrapper's exposed lr must equal the inner's (single source of truth).
+    assert wrapped.param_groups[0]["lr"] == inner_lr
+
+
+def test_lr_scheduler_does_not_reach_inner_without_rebind():
+    """Negative control for the rebind contract above.
+
+    Documents the failure mode if a future change drops the
+    ``scheduler.optimizer = wrapped`` line in ``train.py``: the inner
+    AdamW's lr stays frozen at the construction value while the
+    scheduler happily mutates an orphaned optimizer.
+    """
+    layer = _make_bf16_linear(in_features=4, out_features=1)
+    inner_opt = torch.optim.AdamW(list(layer.parameters()), lr=1.0, weight_decay=0.0)
+    scheduler = torch.optim.lr_scheduler.LinearLR(inner_opt, start_factor=1.0, end_factor=0.5, total_iters=4)
+
+    wrapped = MasterWeightOptimizer.from_existing(inner_opt)
+    # Deliberately do NOT rebind: scheduler.optimizer is still the original AdamW.
+
+    x = torch.randn(8, 4, dtype=torch.bfloat16)
+    target = torch.randn(8, 1, dtype=torch.bfloat16)
+    for _ in range(2):
+        ((layer(x) - target) ** 2).float().mean().backward()
+        wrapped.step()
+        wrapped.zero_grad()
+        scheduler.step()
+
+    # The orphaned optimizer's lr decayed (proves the scheduler IS stepping).
+    assert inner_opt.param_groups[0]["lr"] < 1.0
+    # But the wrapper's inner is stuck — the bug we're guarding against.
+    assert wrapped.inner.param_groups[0]["lr"] == 1.0
+
+
 @pytest.mark.gpu
 def test_rebuild_masters_migrates_to_live_device_on_fresh_run():
     """Fresh-run regression for the dd1154e migration bug.

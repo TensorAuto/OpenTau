@@ -239,6 +239,14 @@ def train(cfg: TrainPipelineConfig):
     # (see ``ds_config['bf16']['enabled']``), so we don't double-wrap there.
     if accelerator.distributed_type != accelerate.DistributedType.DEEPSPEED:
         optimizer = MasterWeightOptimizer.from_existing(optimizer)
+        # ``make_optimizer_and_scheduler`` bound the LR scheduler to the
+        # ORIGINAL ``torch.optim.AdamW`` (now discarded in favour of the
+        # wrapper's new inner). Without this rebind, ``lr_scheduler.step()``
+        # would mutate the orphaned optimizer's ``param_groups[i]['lr']``
+        # and the inner AdamW's lr would silently stay at the initial
+        # value forever — schedule applied to nothing.
+        if lr_scheduler is not None:
+            lr_scheduler.optimizer = optimizer
 
     step = 0  # number of policy updates (forward + backward + optim)
 

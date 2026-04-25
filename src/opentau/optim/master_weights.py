@@ -35,7 +35,7 @@ import torch
 from torch.nn import Parameter
 
 
-class MasterWeightOptimizer:
+class MasterWeightOptimizer(torch.optim.Optimizer):
     """Duck-typed optimizer that keeps fp32 master copies of bf16 params.
 
     The wrapper holds a parallel list of fp32 master tensors built from
@@ -58,11 +58,16 @@ class MasterWeightOptimizer:
     :meth:`clip_grad_norm_`) yields identical per-rank fp32 norms with
     no extra cross-rank reduction.
 
-    The class is *not* a subclass of ``torch.optim.Optimizer``. It is
-    designed to be wrapped by :class:`accelerate.optimizer.AcceleratedOptimizer`,
-    which only touches ``state`` / ``param_groups`` / ``defaults`` /
-    ``state_dict`` / ``load_state_dict`` / ``add_param_group`` / ``step``
-    / ``zero_grad``. Each of those is provided here.
+    The class subclasses :class:`torch.optim.Optimizer` so that
+    accelerate's ``isinstance`` checks recognise it and wrap it in
+    :class:`accelerate.optimizer.AcceleratedOptimizer` during
+    ``Accelerator.prepare``. We deliberately do *not* call
+    ``super().__init__()`` — the base class would try to populate
+    ``param_groups`` / ``state`` / ``defaults`` from our master list,
+    but those attributes are exposed here as ``@property`` proxies onto
+    the inner optimizer (so any mutation lands in one place). The
+    upstream :class:`AcceleratedOptimizer` itself uses this same
+    skip-super pattern.
 
     Attributes:
         inner: The underlying ``torch.optim.Optimizer`` operating on
@@ -75,6 +80,11 @@ class MasterWeightOptimizer:
         bf16_params: list[Parameter],
     ) -> None:
         """Build fp32 masters and instantiate the inner optimizer.
+
+        Note:
+            This intentionally does **not** call ``super().__init__()``;
+            see the class docstring. ``param_groups`` / ``state`` /
+            ``defaults`` are proxied to ``self.inner`` instead.
 
         Args:
             inner_factory: A callable that takes the list of fp32 master
