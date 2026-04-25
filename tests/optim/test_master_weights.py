@@ -22,6 +22,7 @@ bf16 + CPU; total wall-time is well under five seconds.
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from opentau.optim.master_weights import MasterWeightOptimizer
@@ -331,3 +332,95 @@ def test_rebuild_masters_from_live_resyncs_after_external_load():
     # Masters now match the live params (in fp32).
     for live, master in zip(layer.parameters(), opt._fp32_params, strict=True):
         torch.testing.assert_close(master.data, live.data.to(torch.float32))
+
+
+@pytest.mark.gpu
+def test_rebuild_masters_migrates_to_live_device_on_fresh_run():
+    """Fresh-run regression for the dd1154e migration bug.
+
+    The wrapper is constructed before ``accelerator.prepare`` runs, so the
+    fp32 masters are cloned while the live policy is still on CPU.
+    ``accelerator.prepare`` later migrates the live params to GPU; the next
+    call to ``rebuild_masters_from_live`` must follow the live device, not
+    silently leave masters on CPU. (Pre-fix, ``master.data.copy_(...)``
+    preserved master's old device — Adam ran on CPU and every step paid a
+    GPU<->CPU memcpy.)
+    """
+    layer = _make_bf16_linear()
+    opt = MasterWeightOptimizer(_adamw_factory(), list(layer.parameters()))
+    for master in opt._fp32_params:
+        assert master.device.type == "cpu"
+
+    layer.cuda()
+    opt.rebuild_masters_from_live(layer.parameters())
+
+    for master in opt._fp32_params:
+        assert master.device.type == "cuda"
+        assert master.dtype == torch.float32
+    for live, master in zip(layer.parameters(), opt._fp32_params, strict=True):
+        torch.testing.assert_close(master.data, live.data.to(torch.float32))
+
+
+@pytest.mark.gpu
+def test_rebuild_masters_migrates_populated_state_and_step_succeeds():
+    """Resume-path regression: populated Adam state must follow the new device.
+
+    On resume, ``accelerator.load_state`` restores Adam state on whatever
+    device it was checkpointed from; ``accelerator.prepare`` may have
+    independently migrated the live policy. ``rebuild_masters_from_live``
+    must move ``exp_avg`` / ``exp_avg_sq`` to the live device before
+    re-pointing ``master.data``, otherwise the next ``step()`` crashes on a
+    device-mismatch ``addmul_``.
+    """
+    layer = _make_bf16_linear()
+    opt = MasterWeightOptimizer(_adamw_factory(), list(layer.parameters()))
+
+    # Populate Adam state on CPU.
+    x = torch.randn(8, 8, dtype=torch.bfloat16)
+    target = torch.randn(8, 4, dtype=torch.bfloat16)
+    ((layer(x) - target) ** 2).float().mean().backward()
+    opt.step()
+    for master in opt._fp32_params:
+        for value in opt.inner.state[master].values():
+            if isinstance(value, torch.Tensor):
+                assert value.device.type == "cpu"
+
+    layer.cuda()
+    opt.rebuild_masters_from_live(layer.parameters())
+
+    for master in opt._fp32_params:
+        assert master.device.type == "cuda"
+        for value in opt.inner.state[master].values():
+            if isinstance(value, torch.Tensor):
+                assert value.device.type == "cuda"
+
+    # Next step on GPU must succeed (no device-mismatch addmul_).
+    x_gpu = torch.randn(8, 8, dtype=torch.bfloat16, device="cuda")
+    target_gpu = torch.randn(8, 4, dtype=torch.bfloat16, device="cuda")
+    ((layer(x_gpu) - target_gpu) ** 2).float().mean().backward()
+    opt.step()
+
+
+@pytest.mark.gpu
+def test_rebuild_masters_preserves_parameter_identity_across_migration():
+    """``master.data = ...`` must keep the ``Parameter`` object identical.
+
+    The inner ``torch.optim.AdamW`` holds references to the master
+    ``nn.Parameter`` objects in its ``param_groups``. If
+    ``rebuild_masters_from_live`` swapped in fresh ``Parameter`` objects
+    (rather than re-assigning ``.data`` on the existing ones), the inner
+    optimizer would step the stale tensors and the wrapper would silently
+    diverge from the inner state.
+    """
+    layer = _make_bf16_linear()
+    opt = MasterWeightOptimizer(_adamw_factory(), list(layer.parameters()))
+    masters_before = list(opt._fp32_params)
+    inner_param_ids_before = {id(p) for group in opt.inner.param_groups for p in group["params"]}
+
+    layer.cuda()
+    opt.rebuild_masters_from_live(layer.parameters())
+
+    for before, after in zip(masters_before, opt._fp32_params, strict=True):
+        assert before is after
+    inner_param_ids_after = {id(p) for group in opt.inner.param_groups for p in group["params"]}
+    assert inner_param_ids_before == inner_param_ids_after
