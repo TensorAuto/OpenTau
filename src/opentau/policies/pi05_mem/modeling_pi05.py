@@ -805,6 +805,7 @@ class PI05MemFlowMatching(nn.Module):
             multi_modal_projector=self.paligemma_with_expert.paligemma.multi_modal_projector,
             num_frames=config.n_obs_steps,
             spacetime_layer_stride=config.spacetime_layer_stride,
+            gradient_checkpointing=config.gradient_checkpointing,
         )
 
         # Per-timestep state projection: each of the T state vectors becomes one token
