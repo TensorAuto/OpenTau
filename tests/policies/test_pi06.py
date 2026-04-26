@@ -32,7 +32,6 @@ from opentau.policies.pi06.configuration_pi06 import PI06Config
 from opentau.policies.pi06.gemma3_with_expert import (
     Gemma3WithExpertConfig,
     Gemma3WithExpertModel,
-    _build_sliding_window_mask,
     apply_rope,
 )
 from opentau.policies.pi06.modeling_pi06 import (
@@ -105,50 +104,6 @@ class TestMakeAtt2dMasks:
         assert torch.all(mask[0, :, :2])
         # Padded cross key should be masked out.
         assert not torch.any(mask[0, :, 2])
-
-
-# Sliding-window mask (Gemma 3 local attention)
-
-
-class TestSlidingWindowMask:
-    def test_self_attention_window_smaller_than_sequence(self):
-        # Self-attention: positions 0..5 on both sides, window 3.
-        pos = torch.arange(6)[None, :]
-        mask = _build_sliding_window_mask(pos, pos, window=3)
-        assert mask.shape == (1, 6, 6)
-        for i in range(6):
-            for j in range(6):
-                assert mask[0, i, j].item() == (abs(i - j) < 3), f"mismatch at ({i},{j})"
-
-    def test_window_covers_full_sequence(self):
-        pos = torch.arange(4)[None, :]
-        mask = _build_sliding_window_mask(pos, pos, window=100)
-        assert torch.all(mask)
-
-    def test_window_of_one_is_identity(self):
-        pos = torch.arange(4)[None, :]
-        mask = _build_sliding_window_mask(pos, pos, window=1)
-        assert torch.all(mask[0] == torch.eye(4, dtype=torch.bool))
-
-    def test_cross_attention_uses_absolute_positions(self):
-        # Regression for a correctness bug: before this fix, the mask indexed
-        # the first T_suffix rows of a dense `arange(T_prefix+T_suffix)` mask,
-        # which made suffix tokens unable to attend to any prefix key farther
-        # than `window` from the suffix's dense row index. The real suffix
-        # positions sit after the whole prefix — so the mask must be built
-        # from absolute position ids, not dense indices.
-        prefix_len, window = 5, 2
-        prefix_positions = torch.arange(prefix_len)[None, :]  # [0, 1, 2, 3, 4]
-        suffix_positions = torch.tensor([[prefix_len, prefix_len + 1]])  # [5, 6]
-        key_positions = torch.cat([prefix_positions, suffix_positions], dim=1)
-
-        mask = _build_sliding_window_mask(suffix_positions, key_positions, window=window)
-        # Suffix row 0 (abs pos 5) must see keys at positions {4, 5, 6} — which
-        # crucially includes prefix index 4, not just the dense-index neighbours.
-        assert mask[0, 0].tolist() == [False, False, False, False, True, True, True]
-        # Suffix row 1 (abs pos 6) sees keys at positions {5, 6, 7}; 7 doesn't
-        # exist in the sequence so it's naturally omitted.
-        assert mask[0, 1].tolist() == [False, False, False, False, False, True, True]
 
 
 # RoPE shape preservation + different theta values
@@ -456,6 +411,71 @@ class TestRopeThetaSymmetryDuringForward:
         assert 1_000_000.0 in captured
         assert captured.count(10_000.0) == 2, captured
         assert captured.count(1_000_000.0) == 2, captured
+
+
+# Sliding-window mask is INTENTIONALLY not enforced — confirm the per-layer
+# attention mask reaching `eager_attention_forward` is the unmodified input
+# mask regardless of whether the layer is local or global.
+
+
+class TestNoSlidingWindowEnforcement:
+    def test_per_layer_mask_equals_input_mask_on_both_layer_types(self, monkeypatch):
+        """π0.6 keeps the prefix block-causal mask global at every layer.
+
+        If sliding-window enforcement crept back in, the captured mask on
+        the local (sliding) layer would differ from the captured mask on
+        the global (full_attention) layer; this test guards against that.
+        """
+        monkeypatch.setattr(g3we, "_preferred_dtype", lambda: torch.float32)
+
+        _, cfg, _ = _make_tiny_g3we_model()
+        # The tiny config above already orders layers as
+        # ["sliding_attention", "full_attention"] — exercise both.
+        assert cfg.gemma3_config.text_config.layer_types == [
+            "sliding_attention",
+            "full_attention",
+        ]
+
+        model = Gemma3WithExpertModel(cfg)
+        model = model.to(dtype=torch.float32)
+
+        captured_masks: list[torch.Tensor] = []
+        real_eager = model.eager_attention_forward
+
+        def spy_eager(attention_mask, *args, **kwargs):
+            captured_masks.append(attention_mask.clone())
+            return real_eager(attention_mask, *args, **kwargs)
+
+        monkeypatch.setattr(model, "eager_attention_forward", spy_eager)
+
+        batch, seq_len = 1, 8
+        hidden_backbone = torch.randn(batch, seq_len, cfg.gemma3_config.text_config.hidden_size)
+        position_ids = torch.arange(seq_len)[None, :]
+        # A non-trivial input mask so we can verify it survives unchanged
+        # through every layer (no AND-ing with a sliding window).
+        attention_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool))[None]
+
+        model(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=[hidden_backbone, None],
+            n_cross_att_tokens=seq_len,
+            use_cache=False,
+            fill_kv_cache=True,
+        )
+
+        assert len(captured_masks) == 2, "expected one capture per layer"
+        # Sliding-window cap (= 2) WOULD have zeroed everything more than 2
+        # positions away on the sliding layer; the global layer would have
+        # been left alone. Confirm both layers received the identical input
+        # mask.
+        assert torch.equal(captured_masks[0], attention_mask), (
+            "sliding (local) layer mask differs from input — sliding window "
+            "enforcement appears to have been re-enabled"
+        )
+        assert torch.equal(captured_masks[1], attention_mask), (
+            "global layer mask differs from input — something is mutating it"
+        )
 
 
 # End-to-end integration — guarded because Gemma 3 4B is huge.

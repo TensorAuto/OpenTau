@@ -88,31 +88,13 @@ def apply_rope(x: torch.Tensor, positions: torch.Tensor, max_wavelength: float =
     return res.to(dtype)
 
 
-def _build_sliding_window_mask(
-    query_positions: torch.Tensor,
-    key_positions: torch.Tensor,
-    window: int,
-) -> torch.Tensor:
-    """Returns a `(B, Q, K)` bool mask that is `True` iff
-    `|pos_q - pos_k| < window`.
-
-    Using absolute positions (not dense indices) is critical when the mask
-    covers cross-attention into a cached prefix: the expert's Q tokens live
-    at positions `prefix_offsets + chunk_idx`, not at `0, 1, ...`, so a
-    mask built from dense indices would wrongly exclude every prefix token
-    beyond `window`.
-
-    Args:
-        query_positions: `(B, Q)` absolute positions of the query tokens.
-        key_positions: `(B, K)` absolute positions of the key tokens.
-        window: Sliding-window half-width (exclusive upper bound on
-            `|pos_q - pos_k|`).
-
-    Returns:
-        Boolean `(B, Q, K)` tensor, `True` where the pair is inside the window.
-    """
-    diff = (query_positions[:, :, None] - key_positions[:, None, :]).abs()
-    return diff < window
+# NOTE: π0.6 deliberately does NOT enforce Gemma 3's sliding-window mask.
+# The model card describes "bidirectional attention among ALL of the image
+# tokens" and "block-wise causal" prefix attention — wording that's
+# incompatible with a 1024-token window once you have 4 cameras × 256 image
+# tokens = 1024 image tokens. The local layers' pretrained weights still
+# rotate at θ=10_000 (we honour that), but the per-layer attention pattern
+# is the global block-causal mask everywhere.
 
 
 class Gemma3WithExpertConfig(PretrainedConfig):
@@ -305,11 +287,13 @@ class Gemma3WithExpertModel(PreTrainedModel):
         self._head_dim = self._text_config.head_dim
         self._rope_global = float(self._text_config.rope_theta)
         self._rope_local = float(getattr(self._text_config, "rope_local_base_freq", 10_000.0))
-        self._sliding_window = int(self._text_config.sliding_window)
         self._layer_types: list[str] = list(self._text_config.layer_types)
-        # Note: the expert's own `rope_theta` is deliberately ignored at
-        # runtime — the shared attention requires the backbone's per-layer θ
-        # for both streams. See `forward()`.
+        # Notes:
+        #   * the expert's own `rope_theta` is deliberately ignored at runtime
+        #     — the shared attention requires the backbone's per-layer θ for
+        #     both streams (see `forward()`).
+        #   * `text_config.sliding_window` is also deliberately unused — see
+        #     the comment near `apply_rope` for why π0.6 doesn't enforce it.
         self._query_pre_attn_scaling = float(self._text_config.query_pre_attn_scalar) ** -0.5
 
     # Trainable / dtype plumbing
@@ -581,14 +565,9 @@ class Gemma3WithExpertModel(PreTrainedModel):
             k_concat = torch.cat(k_list, dim=1)
             v_concat = torch.cat(v_list, dim=1)
 
-            # Positions corresponding to K: cached prefix positions (if any)
-            # followed by this call's query positions (which double as key
-            # positions for the current step).
-            cached_key_positions = None
             if use_cache and past_key_values is not None and layer_idx in past_key_values:
                 k_concat = torch.cat([past_key_values[layer_idx]["key_states"], k_concat], dim=1)
                 v_concat = torch.cat([past_key_values[layer_idx]["value_states"], v_concat], dim=1)
-                cached_key_positions = past_key_values[layer_idx]["key_positions"]
 
             if fill_kv_cache:
                 if past_key_values is None:
@@ -598,23 +577,12 @@ class Gemma3WithExpertModel(PreTrainedModel):
                 past_key_values[layer_idx] = {
                     "key_states": k_concat[:, :n_cross_att_tokens, :, :],
                     "value_states": v_concat[:, :n_cross_att_tokens, :, :],
-                    "key_positions": position_ids[:, :n_cross_att_tokens],
                 }
 
-            # For sliding-window layers, restrict the base mask to the window
-            # using ABSOLUTE positions. During cross-attention the Q tokens
-            # sit at `prefix_offsets + chunk_idx`, not at dense indices, so a
-            # mask built from `torch.arange` would wrongly drop every prefix
-            # key beyond `window`.
-            if is_sliding and attention_mask is not None:
-                if cached_key_positions is not None:
-                    key_positions = torch.cat([cached_key_positions, position_ids], dim=1)
-                else:
-                    key_positions = position_ids
-                sw_mask = _build_sliding_window_mask(position_ids, key_positions, self._sliding_window)
-                layer_attention_mask = attention_mask & sw_mask
-            else:
-                layer_attention_mask = attention_mask
+            # π0.6 keeps the prefix block-causal mask at every layer — the
+            # Gemma 3 sliding-window pattern is deliberately not applied
+            # (see the note next to `apply_rope`).
+            layer_attention_mask = attention_mask
 
             attention_interface = self.get_attention_interface()
             att_output = attention_interface(
