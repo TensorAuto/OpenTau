@@ -52,11 +52,12 @@ _DEPRECATED_LATENCY_FIELDS = (
     "action_decoder_latency_upper",
 )
 
-# Construction-time-only fields that have no meaning in a saved config because
-# the model's weights are already baked in. Stripped on save and on wandb upload.
-_TRANSIENT_POLICY_FIELDS = ("init_strategy",)
+# Fields that have been removed from the policy config dataclass. Stripped from
+# both incoming JSON (so old saved configs load without erroring on unknown
+# fields) and outgoing JSON (defensive).
+_REMOVED_POLICY_FIELDS = ("init_strategy",)
 
-_STRIPPED_FIELDS = _DEPRECATED_LATENCY_FIELDS + _TRANSIENT_POLICY_FIELDS
+_STRIPPED_FIELDS = _DEPRECATED_LATENCY_FIELDS + _REMOVED_POLICY_FIELDS
 
 
 def _strip_keys(data: dict, keys: tuple[str, ...]) -> bool:
@@ -76,10 +77,12 @@ def _strip_keys(data: dict, keys: tuple[str, ...]) -> bool:
 
 
 def strip_deprecated_fields_from_json(path: Path) -> None:
-    """Remove deprecated and transient fields from a saved config JSON in-place.
+    """Remove deprecated and removed fields from a config JSON file in-place.
 
-    Strips deprecated latency fields and transient construction-only fields
-    (e.g. ``init_strategy``) at the top level and under a ``"policy"`` sub-dict.
+    Strips deprecated latency fields and removed fields (e.g. ``init_strategy``)
+    at the top level and under a ``"policy"`` sub-dict. Use both before parsing
+    incoming configs that may have been saved by older versions and after
+    writing to keep our own outputs clean.
     """
     with open(path) as f:
         data = json.load(f)
@@ -87,17 +90,6 @@ def strip_deprecated_fields_from_json(path: Path) -> None:
     if _strip_keys(data, _STRIPPED_FIELDS):
         with open(path, "w") as f:
             json.dump(data, f, indent=4)
-
-
-def strip_transient_fields_in_place(data: dict) -> dict:
-    """Drop transient policy fields from ``data`` in place and return it.
-
-    Intended for fresh dicts about to be logged or uploaded (e.g. wandb), where
-    the construction-time-only ``init_strategy`` is not meaningful in a saved
-    or logged record.
-    """
-    _strip_keys(data, _TRANSIENT_POLICY_FIELDS)
-    return data
 
 
 def warn_deprecated_latency_fields(config_path: str | Path) -> None:
@@ -381,6 +373,7 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
 
         if config_file is not None:
             warn_deprecated_latency_fields(config_file)
+            strip_deprecated_fields_from_json(Path(config_file))
 
         # HACK: this is very ugly, ideally we'd like to be able to do that natively with draccus
         # something like --policy.path (in addition to --policy.type)

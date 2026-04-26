@@ -21,7 +21,6 @@ for the PI0 Vision-Language-Action Flow Model. It includes settings for the mode
 optimization, scheduling, and data processing.
 """
 
-import logging
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -63,9 +62,6 @@ class PI0Config(PreTrainedConfig):
         advantage: Advantage conditioning mode. One of "ignore", "on", "use".
             "use" uses values from dataset, "ignore" disables conditioning,
             "on" sets advantage to True (for expert demos). Defaults to "use".
-        init_strategy: Initialization strategy. One of "no_init", "full_he_init".
-            Defaults to None, which auto-selects "no_init" when ``pretrained_path`` is
-            set and "full_he_init" otherwise. Ignored when ``pretrained_path`` is set.
         use_cache: Whether to use KV cache during inference. Defaults to True.
         attention_implementation: Attention implementation to use ("eager" or "fa2"). Defaults to "eager".
         freeze_vision_encoder: Whether to freeze the vision encoder during fine-tuning. Defaults to True.
@@ -126,10 +122,6 @@ class PI0Config(PreTrainedConfig):
     # This should only be "on" when training on expert demonstrations or interventions.
     advantage: Literal["ignore", "on", "use"] = "use"
 
-    # Initialization strategy. None auto-resolves in __post_init__ to "no_init" if
-    # pretrained_path is set, else "full_he_init". Ignored once pretrained_path is set.
-    init_strategy: Literal["no_init", "full_he_init"] | None = None
-
     # Attention utils
     use_cache: bool = True
     attention_implementation: str = "eager"  # or fa2
@@ -170,22 +162,6 @@ class PI0Config(PreTrainedConfig):
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
-
-        if self.init_strategy is not None and self.init_strategy not in ("no_init", "full_he_init"):
-            raise ValueError(
-                f"Invalid init_strategy={self.init_strategy!r}; must be one of "
-                "'no_init', 'full_he_init', or None."
-            )
-
-        if self.pretrained_path is not None:
-            if self.init_strategy is not None and self.init_strategy != "no_init":
-                logging.warning(
-                    f"init_strategy={self.init_strategy!r} is ignored because pretrained_path is set; "
-                    "the policy's weights are loaded from the checkpoint."
-                )
-            self.init_strategy = "no_init"
-        elif self.init_strategy is None:
-            self.init_strategy = "full_he_init"
 
     def validate_features(self) -> None:
         """Validates the features and adds empty cameras if configured.

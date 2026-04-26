@@ -36,7 +36,6 @@ from opentau.configs.deployment import ServerConfig
 from opentau.configs.policies import (
     PreTrainedConfig,
     strip_deprecated_fields_from_json,
-    strip_transient_fields_in_place,
     warn_deprecated_latency_fields,
 )
 from opentau.envs.configs import EnvConfig
@@ -305,14 +304,10 @@ class TrainPipelineConfig(HubMixin):
     def to_dict(self) -> dict:
         """Convert the configuration to a dictionary.
 
-        Construction-time-only policy fields (e.g. ``init_strategy``) are
-        stripped so the result is suitable for logging and wandb upload
-        without carrying values that have no meaning once weights are loaded.
-
         Returns:
             Dictionary representation of the configuration.
         """
-        return strip_transient_fields_in_place(draccus.encode(self))
+        return draccus.encode(self)
 
     def _save_pretrained(self, save_directory: Path) -> None:
         """Save the configuration to a directory.
@@ -401,6 +396,7 @@ class TrainPipelineConfig(HubMixin):
 
         if config_file is not None:
             warn_deprecated_latency_fields(config_file)
+            strip_deprecated_fields_from_json(Path(config_file))
 
         cli_args = kwargs.pop("cli_args", [])
         cfg = draccus.parse(cls, config_file, args=cli_args)

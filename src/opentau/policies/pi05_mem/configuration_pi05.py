@@ -21,9 +21,7 @@ encoder with a V-JEPA2 video encoder and processes temporal state sequences
 (one continuous token per timestep).
 """
 
-import logging
 from dataclasses import dataclass, field
-from typing import Literal
 
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
@@ -62,9 +60,6 @@ class PI05MemConfig(PreTrainedConfig):
         proj_width: Width of the projection layer. Defaults to 1024.
         dropout: Dropout rate. Defaults to 0.1.
         num_steps: Number of flow matching steps for decoding. Defaults to 10.
-        init_strategy: Initialization strategy. One of "no_init", "full_he_init".
-            Defaults to None, which auto-selects "no_init" when ``pretrained_path`` is
-            set and "full_he_init" otherwise. Ignored when ``pretrained_path`` is set.
         attention_implementation: Attention implementation ("eager" or "fa2"). Defaults to "eager".
         freeze_vision_encoder: Whether to freeze the V-JEPA2 encoder. Defaults to True.
         train_expert_only: Whether to train only the expert module. Defaults to False.
@@ -126,10 +121,6 @@ class PI05MemConfig(PreTrainedConfig):
     # Real Time Inference
     max_delay: int = 0
 
-    # Initialization strategy. None auto-resolves in __post_init__ to "no_init" if
-    # pretrained_path is set, else "full_he_init". Ignored once pretrained_path is set.
-    init_strategy: Literal["no_init", "full_he_init"] | None = None
-
     # Attention utils
     attention_implementation: str = "eager"
 
@@ -189,22 +180,6 @@ class PI05MemConfig(PreTrainedConfig):
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
                 f"{self.n_action_steps} for `n_action_steps` and {self.chunk_size} for `chunk_size`."
             )
-
-        if self.init_strategy is not None and self.init_strategy not in ("no_init", "full_he_init"):
-            raise ValueError(
-                f"Invalid init_strategy={self.init_strategy!r}; must be one of "
-                "'no_init', 'full_he_init', or None."
-            )
-
-        if self.pretrained_path is not None:
-            if self.init_strategy is not None and self.init_strategy != "no_init":
-                logging.warning(
-                    f"init_strategy={self.init_strategy!r} is ignored because pretrained_path is set; "
-                    "the policy's weights are loaded from the checkpoint."
-                )
-            self.init_strategy = "no_init"
-        elif self.init_strategy is None:
-            self.init_strategy = "full_he_init"
 
         if self.max_delay > self.chunk_size:
             raise ValueError(
