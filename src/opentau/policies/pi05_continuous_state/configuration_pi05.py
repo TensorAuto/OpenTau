@@ -58,8 +58,9 @@ class PI05ContinuousStateConfig(PreTrainedConfig):
         proj_width: Width of the projection layer. Defaults to 1024.
         dropout: Dropout rate. Defaults to 0.1.
         num_steps: Number of flow matching steps for decoding. Defaults to 10.
-        init_strategy: Initialization strategy. One of "no_init", "full_he_init", "expert_only_he_init".
-            Defaults to "full_he_init".
+        init_strategy: Initialization strategy. One of "no_init", "full_he_init".
+            Defaults to None, which auto-selects "no_init" when ``pretrained_path`` is
+            set and "full_he_init" otherwise. Ignored when ``pretrained_path`` is set.
         attention_implementation: Attention implementation to use ("eager" or "fa2"). Defaults to "eager".
         freeze_vision_encoder: Whether to freeze the vision encoder during fine-tuning. Defaults to True.
         train_expert_only: Whether to train only the expert module. Defaults to False.
@@ -115,8 +116,9 @@ class PI05ContinuousStateConfig(PreTrainedConfig):
     # maximum number of frozen actions
     max_delay: int = 0
 
-    # Initialization strategy
-    init_strategy: Literal["no_init", "full_he_init", "expert_only_he_init"] = "full_he_init"
+    # Initialization strategy. None auto-resolves in __post_init__ to "no_init" if
+    # pretrained_path is set, else "full_he_init". Ignored once pretrained_path is set.
+    init_strategy: Literal["no_init", "full_he_init"] | None = None
 
     # Attention utils
     attention_implementation: str = "eager"
@@ -151,18 +153,21 @@ class PI05ContinuousStateConfig(PreTrainedConfig):
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
 
-        assert self.init_strategy in ["no_init", "full_he_init", "expert_only_he_init"], (
-            f"Invalid init strategy: {self.init_strategy} must be one of ['no_init', 'full_he_init', 'expert_only_he_init']"
-        )
-
-        if self.init_strategy == "expert_only_he_init" and self.pretrained_path == "lerobot/pi05":
+        if self.init_strategy is not None and self.init_strategy not in ("no_init", "full_he_init"):
             raise ValueError(
-                "You cannot load pretrained PI0 model when init_strategy is 'expert_only_he_init' due to differences in PaliGemma tokenizer vocab sizes."
+                f"Invalid init_strategy={self.init_strategy!r}; must be one of "
+                "'no_init', 'full_he_init', or None."
             )
 
-        if self.pretrained_path is not None and self.pretrained_path != "lerobot/pi05":
-            logging.info("Setting init_strategy to 'no_init' because we are resuming from a checkpoint.")
+        if self.pretrained_path is not None:
+            if self.init_strategy is not None and self.init_strategy != "no_init":
+                logging.warning(
+                    f"init_strategy={self.init_strategy!r} is ignored because pretrained_path is set; "
+                    "the policy's weights are loaded from the checkpoint."
+                )
             self.init_strategy = "no_init"
+        elif self.init_strategy is None:
+            self.init_strategy = "full_he_init"
 
         if self.max_delay > self.chunk_size:
             raise ValueError(

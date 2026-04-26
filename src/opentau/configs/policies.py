@@ -52,28 +52,52 @@ _DEPRECATED_LATENCY_FIELDS = (
     "action_decoder_latency_upper",
 )
 
+# Construction-time-only fields that have no meaning in a saved config because
+# the model's weights are already baked in. Stripped on save and on wandb upload.
+_TRANSIENT_POLICY_FIELDS = ("init_strategy",)
 
-def strip_deprecated_fields_from_json(path: Path) -> None:
-    """Remove deprecated latency fields from a saved config JSON file in-place.
+_STRIPPED_FIELDS = _DEPRECATED_LATENCY_FIELDS + _TRANSIENT_POLICY_FIELDS
 
-    Handles both top-level fields (policy configs) and fields nested under a
-    ``"policy"`` key (train configs).
+
+def _strip_keys(data: dict, keys: tuple[str, ...]) -> bool:
+    """Drop ``keys`` from ``data`` (top-level and under a ``"policy"`` sub-dict).
+
+    Returns True if anything changed.
     """
-    with open(path) as f:
-        data = json.load(f)
-
     changed = False
-    for key in _DEPRECATED_LATENCY_FIELDS:
+    for key in keys:
         if key in data:
             del data[key]
             changed = True
         if isinstance(data.get("policy"), dict) and key in data["policy"]:
             del data["policy"][key]
             changed = True
+    return changed
 
-    if changed:
+
+def strip_deprecated_fields_from_json(path: Path) -> None:
+    """Remove deprecated and transient fields from a saved config JSON in-place.
+
+    Strips deprecated latency fields and transient construction-only fields
+    (e.g. ``init_strategy``) at the top level and under a ``"policy"`` sub-dict.
+    """
+    with open(path) as f:
+        data = json.load(f)
+
+    if _strip_keys(data, _STRIPPED_FIELDS):
         with open(path, "w") as f:
             json.dump(data, f, indent=4)
+
+
+def strip_transient_fields_in_place(data: dict) -> dict:
+    """Drop transient policy fields from ``data`` in place and return it.
+
+    Intended for fresh dicts about to be logged or uploaded (e.g. wandb), where
+    the construction-time-only ``init_strategy`` is not meaningful in a saved
+    or logged record.
+    """
+    _strip_keys(data, _TRANSIENT_POLICY_FIELDS)
+    return data
 
 
 def warn_deprecated_latency_fields(config_path: str | Path) -> None:

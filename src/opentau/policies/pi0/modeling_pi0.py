@@ -582,14 +582,10 @@ class PI0FlowMatching(nn.Module):
         super().__init__()
         self.config = config
 
-        load_pretrained_paligemma = (
-            self.config.init_strategy == "expert_only_he_init"
-        )  # only load pretrained paligemma if we are He-initializing the expert only
         paligemma_with_export_config = PaliGemmaWithExpertConfig(
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=self.config.train_expert_only,
             attention_implementation=self.config.attention_implementation,
-            load_pretrained_paligemma=load_pretrained_paligemma,
             dropout=self.config.dropout,
         )
         self.paligemma_with_expert = PaliGemmaWithExpertModel(paligemma_with_export_config)
@@ -631,9 +627,6 @@ class PI0FlowMatching(nn.Module):
             return
         elif self.config.init_strategy == "full_he_init":
             for m in self.modules():
-                self._init_weights(m)
-        elif self.config.init_strategy == "expert_only_he_init":
-            for m in self.paligemma_with_expert.gemma_expert.modules():
                 self._init_weights(m)
         else:
             raise ValueError(f"Invalid init strategy: {self.config.init_strategy}")

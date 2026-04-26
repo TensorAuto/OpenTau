@@ -63,8 +63,9 @@ class PI0Config(PreTrainedConfig):
         advantage: Advantage conditioning mode. One of "ignore", "on", "use".
             "use" uses values from dataset, "ignore" disables conditioning,
             "on" sets advantage to True (for expert demos). Defaults to "use".
-        init_strategy: Initialization strategy. One of "no_init", "full_he_init", "expert_only_he_init".
-            Defaults to "full_he_init".
+        init_strategy: Initialization strategy. One of "no_init", "full_he_init".
+            Defaults to None, which auto-selects "no_init" when ``pretrained_path`` is
+            set and "full_he_init" otherwise. Ignored when ``pretrained_path`` is set.
         use_cache: Whether to use KV cache during inference. Defaults to True.
         attention_implementation: Attention implementation to use ("eager" or "fa2"). Defaults to "eager".
         freeze_vision_encoder: Whether to freeze the vision encoder during fine-tuning. Defaults to True.
@@ -125,8 +126,9 @@ class PI0Config(PreTrainedConfig):
     # This should only be "on" when training on expert demonstrations or interventions.
     advantage: Literal["ignore", "on", "use"] = "use"
 
-    # Initialization strategy
-    init_strategy: Literal["no_init", "full_he_init", "expert_only_he_init"] = "full_he_init"
+    # Initialization strategy. None auto-resolves in __post_init__ to "no_init" if
+    # pretrained_path is set, else "full_he_init". Ignored once pretrained_path is set.
+    init_strategy: Literal["no_init", "full_he_init"] | None = None
 
     # Attention utils
     use_cache: bool = True
@@ -169,18 +171,21 @@ class PI0Config(PreTrainedConfig):
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
 
-        assert self.init_strategy in ["no_init", "full_he_init", "expert_only_he_init"], (
-            f"Invalid init strategy: {self.init_strategy} must be one of ['no_init', 'full_he_init', 'expert_only_he_init']"
-        )
-
-        if self.init_strategy == "expert_only_he_init" and self.pretrained_path == "lerobot/pi0":
+        if self.init_strategy is not None and self.init_strategy not in ("no_init", "full_he_init"):
             raise ValueError(
-                "You cannot load pretrained PI0 model when init_strategy is 'expert_only_he_init' due to differences in PaliGemma tokenizer vocab sizes."
+                f"Invalid init_strategy={self.init_strategy!r}; must be one of "
+                "'no_init', 'full_he_init', or None."
             )
 
-        if self.pretrained_path is not None and self.pretrained_path != "lerobot/pi0":
-            logging.info("Setting init_strategy to 'no_init' because we are resuming from a checkpoint.")
+        if self.pretrained_path is not None:
+            if self.init_strategy is not None and self.init_strategy != "no_init":
+                logging.warning(
+                    f"init_strategy={self.init_strategy!r} is ignored because pretrained_path is set; "
+                    "the policy's weights are loaded from the checkpoint."
+                )
             self.init_strategy = "no_init"
+        elif self.init_strategy is None:
+            self.init_strategy = "full_he_init"
 
     def validate_features(self) -> None:
         """Validates the features and adds empty cameras if configured.

@@ -32,7 +32,6 @@
         "max_action_dim": 32,
         "proj_width": 1024,
         "num_steps": 10,
-        "init_strategy": "expert_only_he_init",
         "attention_implementation": "eager",
         "freeze_vision_encoder": true,
         "train_expert_only": true,
