@@ -16,6 +16,7 @@
 # limitations under the License.
 
 import logging
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -537,6 +538,78 @@ class TestWeightedDatasetMixtureIntegration:
 
         assert "Creating DataLoader" in caplog.text
         assert "DataLoader created successfully" in caplog.text
+
+
+class TestMakeDatasetNames:
+    """Tests for ``WeightedDatasetMixture._make_dataset_names``.
+
+    The static method does not need a real ``TrainPipelineConfig`` /
+    ``DatasetConfig`` -- it only reads ``cfg.dataset_mixture.datasets`` and the
+    ``repo_id`` / ``vqa`` attributes -- so we use ``SimpleNamespace`` stubs to
+    keep these tests focused on the naming logic.
+    """
+
+    @staticmethod
+    def _cfg(*ds_cfgs: SimpleNamespace) -> SimpleNamespace:
+        return SimpleNamespace(dataset_mixture=SimpleNamespace(datasets=list(ds_cfgs)))
+
+    @staticmethod
+    def _ds_cfg(repo_id: str | None = None, vqa: str | None = None) -> SimpleNamespace:
+        return SimpleNamespace(repo_id=repo_id, vqa=vqa)
+
+    class _Stub:
+        """Minimal stand-in for ``BaseDataset`` -- we only read ``type(ds).__name__``."""
+
+    def test_all_unique_repo_ids(self):
+        cfg = self._cfg(self._ds_cfg("lerobot/a"), self._ds_cfg("lerobot/b"))
+        datasets = [self._Stub(), self._Stub()]
+        assert WeightedDatasetMixture._make_dataset_names(cfg, datasets) == ["lerobot/a", "lerobot/b"]
+
+    def test_repeated_repo_id_uses_per_name_sequential_suffix(self):
+        # The previous implementation used the GLOBAL index (yielding
+        # ['A#0', 'B', 'A#2']); this test pins the per-name sequential behaviour.
+        cfg = self._cfg(
+            self._ds_cfg("lerobot/a"),
+            self._ds_cfg("lerobot/b"),
+            self._ds_cfg("lerobot/a"),
+        )
+        datasets = [self._Stub(), self._Stub(), self._Stub()]
+        names = WeightedDatasetMixture._make_dataset_names(cfg, datasets)
+        assert names == ["lerobot/a#0", "lerobot/b", "lerobot/a#1"]
+
+    def test_all_identical(self):
+        cfg = self._cfg(self._ds_cfg("x"), self._ds_cfg("x"), self._ds_cfg("x"))
+        datasets = [self._Stub(), self._Stub(), self._Stub()]
+        assert WeightedDatasetMixture._make_dataset_names(cfg, datasets) == ["x#0", "x#1", "x#2"]
+
+    def test_vqa_and_repo_id_mix(self):
+        cfg = self._cfg(
+            self._ds_cfg(repo_id="lerobot/a"),
+            self._ds_cfg(vqa="vqa-set-1"),
+            self._ds_cfg(vqa="vqa-set-1"),
+        )
+        datasets = [self._Stub(), self._Stub(), self._Stub()]
+        names = WeightedDatasetMixture._make_dataset_names(cfg, datasets)
+        assert names == ["lerobot/a", "vqa-set-1#0", "vqa-set-1#1"]
+
+    def test_neither_repo_id_nor_vqa_falls_back_to_classname(self):
+        cfg = self._cfg(self._ds_cfg(), self._ds_cfg())
+        datasets = [self._Stub(), self._Stub()]
+        names = WeightedDatasetMixture._make_dataset_names(cfg, datasets)
+        # Both share the class name, so they collide and get suffixed.
+        assert names == ["_Stub#0", "_Stub#1"]
+
+    def test_mismatched_cfg_length_falls_back_to_classname_index(self):
+        cfg = self._cfg(self._ds_cfg("lerobot/a"))
+        datasets = [self._Stub(), self._Stub()]
+        names = WeightedDatasetMixture._make_dataset_names(cfg, datasets)
+        assert names == ["_Stub_0", "_Stub_1"]
+
+    def test_no_dataset_mixture_attribute_falls_back_to_classname_index(self):
+        cfg = SimpleNamespace()  # no .dataset_mixture
+        datasets = [self._Stub(), self._Stub()]
+        names = WeightedDatasetMixture._make_dataset_names(cfg, datasets)
+        assert names == ["_Stub_0", "_Stub_1"]
 
 
 class TestDatasetMixtureOptionalKeyDropProbs:
