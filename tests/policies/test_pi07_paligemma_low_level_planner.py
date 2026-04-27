@@ -381,20 +381,25 @@ class TestPI07LowLevelPlannerIntegration:
             return original_paligemma_forward(*args, **kwargs)
 
         def capture_embed_prefix(*args, **kwargs):
-            args_list = list(args)
             # Truncate discrete actions to inject padding (same workaround as PI05 test).
             half = DISCRETE_ACTION_MAX_LENGTH // 2
-            args_list[-2] = torch.cat(
-                (args_list[-2][:, :half], torch.zeros((1, half), device=args_list[-2].device)), dim=-1
-            )
-            args_list[-1] = torch.cat(
+            discrete_actions = kwargs["discrete_actions"]
+            discrete_action_masks = kwargs["discrete_action_masks"]
+            kwargs["discrete_actions"] = torch.cat(
                 (
-                    args_list[-1][:, :half],
-                    torch.zeros((1, half), dtype=torch.bool, device=args_list[-1].device),
+                    discrete_actions[:, :half],
+                    torch.zeros((1, half), dtype=discrete_actions.dtype, device=discrete_actions.device),
                 ),
                 dim=-1,
             )
-            result = original_embed_prefix(*tuple(args_list), **kwargs)
+            kwargs["discrete_action_masks"] = torch.cat(
+                (
+                    discrete_action_masks[:, :half],
+                    torch.zeros((1, half), dtype=torch.bool, device=discrete_action_masks.device),
+                ),
+                dim=-1,
+            )
+            result = original_embed_prefix(*args, **kwargs)
             captured["prefix_pad_masks"] = result[1].clone()
             return result
 
