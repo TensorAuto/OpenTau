@@ -213,7 +213,7 @@ class TestPI07HighLevelPlannerIntegration:
             "speed_is_pad": torch.tensor([False]),
             "quality_is_pad": torch.tensor([False]),
             "mistake_is_pad": torch.tensor([False]),
-            "memory": ["Robot is grasping the red block"],
+            "next_memory": ["Robot is grasping the red block"],
             "response": ["Grasp the red block"],
         }
 
