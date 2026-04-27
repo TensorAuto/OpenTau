@@ -62,6 +62,13 @@ class PI07HighLevelPlannerConfig(PreTrainedConfig):
             sequence. Defaults to 52.
         metadata_max_length: Maximum token length for episode metadata
             strings. Defaults to 52.
+        subtask_indicator_max_length: Number of tokenizer pieces for the fixed
+            ``"Subtask: "`` span (``encode(..., add_special_tokens=False)``). Used to
+            align CE slices with the prefix layout; for
+            ``google/paligemma-3b-pt-224`` this is 4. Defaults to 4.
+        memory_indicator_max_length: Number of tokenizer pieces for the fixed
+            ``"Updated Memory: "`` span. Used for documentation and layout checks;
+            for ``google/paligemma-3b-pt-224`` this is 4. Defaults to 4.
         dropout: Dropout rate applied in the transformer expert.
             Defaults to 0.1.
         attention_implementation: Attention backend — ``"eager"`` or
@@ -109,6 +116,10 @@ class PI07HighLevelPlannerConfig(PreTrainedConfig):
 
     # Metadata Tokenizer
     metadata_max_length: int = 52
+
+    subtask_indicator_max_length: int = 4
+
+    memory_indicator_max_length: int = 4
 
     # Dropout
     dropout: float = 0.1

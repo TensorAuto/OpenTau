@@ -21,6 +21,7 @@ from opentau.policies.pi07_paligemma.high_level_planner.configuration_pi07_high_
 )
 from opentau.policies.pi07_paligemma.high_level_planner.modeling_pi07_high_level import (
     PI07HighLevelPlannerPolicy,
+    make_att_2d_masks,
 )
 
 # Config defaults used across the test.
@@ -32,19 +33,11 @@ MEMORY_MAX_LENGTH = 52
 RESPONSE_MAX_LENGTH = 52
 MAX_STATE_DIM = 32
 
-# Token offsets for training prefix:
-#   images(512) | language(256) | metadata(52) | memory(52) | response(52) = 924
+# Token offsets (fixed by config and image tokenization).
 IMAGE_TOKENS = NUM_CAMERAS * SIGLIP_TOKENS_PER_CAMERA  # 512
 LANG_START = IMAGE_TOKENS  # 512
 METADATA_START = LANG_START + PROMPT_MAX_LENGTH  # 768
-MEMORY_START = METADATA_START + METADATA_MAX_LENGTH  # 820
-RESPONSE_START = MEMORY_START + MEMORY_MAX_LENGTH  # 872
-TRAIN_PREFIX_LEN = RESPONSE_START + RESPONSE_MAX_LENGTH  # 924
-
-# For inference: no memory or response tokens initially.
-# images(512) | language(256) | metadata(52) = 820
-INFER_METADATA_START = IMAGE_TOKENS + PROMPT_MAX_LENGTH  # 768
-INFER_PREFIX_LEN = INFER_METADATA_START + METADATA_MAX_LENGTH  # 820
+METADATA_END = METADATA_START + METADATA_MAX_LENGTH  # 820
 
 
 class TestPI07HighLevelPlannerIntegration:
@@ -73,6 +66,26 @@ class TestPI07HighLevelPlannerIntegration:
         return config
 
     @staticmethod
+    def _indicator_lens(tokenizer):
+        """Lengths of fixed text spans inserted by ``embed_prefix`` / inference."""
+        return {
+            "prefix_end": len(tokenizer.encode(";\n ", add_special_tokens=False)),
+            "memory_lead": len(tokenizer.encode("Updated Memory: ", add_special_tokens=False)),
+            "subtask_lead": len(tokenizer.encode("Subtask: ", add_special_tokens=False)),
+        }
+
+    @classmethod
+    def _train_prefix_total(cls, tokenizer) -> int:
+        meta = cls._indicator_lens(tokenizer)
+        mem_tokens_start = METADATA_END + meta["prefix_end"] + meta["memory_lead"]
+        return mem_tokens_start + MEMORY_MAX_LENGTH + meta["subtask_lead"] + RESPONSE_MAX_LENGTH
+
+    @classmethod
+    def _infer_embed_prefix_total(cls, tokenizer) -> int:
+        meta = cls._indicator_lens(tokenizer)
+        return METADATA_END + meta["prefix_end"] + meta["memory_lead"]
+
+    @staticmethod
     def _check_ones_before_zeros(mask_slice):
         """Check that in a 1-D boolean mask all Trues precede all Falses."""
         mask = mask_slice.cpu().numpy()
@@ -91,102 +104,36 @@ class TestPI07HighLevelPlannerIntegration:
     # Verification helpers
     # ------------------------------------------------------------------
 
-    def _verify_pad_masks(self, prefix_pad_masks):
-        assert prefix_pad_masks.shape == (1, TRAIN_PREFIX_LEN)
+    def _verify_pad_masks(self, prefix_pad_masks, tokenizer):
+        meta = self._indicator_lens(tokenizer)
+        total = self._train_prefix_total(tokenizer)
+        assert prefix_pad_masks.shape == (1, total)
         assert prefix_pad_masks.dtype == torch.bool
 
+        mem_tokens_start = METADATA_END + meta["prefix_end"] + meta["memory_lead"]
+        resp_tokens_start = mem_tokens_start + MEMORY_MAX_LENGTH + meta["subtask_lead"]
+
         for i in range(1):
-            # Image tokens should never be padded.
             assert torch.all(prefix_pad_masks[i, :IMAGE_TOKENS] == 1)
-            # Language, metadata, memory, response tokens can be padded at the end.
             self._check_ones_before_zeros(prefix_pad_masks[i, LANG_START:METADATA_START])
-            self._check_ones_before_zeros(prefix_pad_masks[i, METADATA_START:MEMORY_START])
-            self._check_ones_before_zeros(prefix_pad_masks[i, MEMORY_START:RESPONSE_START])
-            self._check_ones_before_zeros(prefix_pad_masks[i, RESPONSE_START:TRAIN_PREFIX_LEN])
+            self._check_ones_before_zeros(prefix_pad_masks[i, METADATA_START:METADATA_END])
+            self._check_ones_before_zeros(
+                prefix_pad_masks[i, mem_tokens_start : mem_tokens_start + MEMORY_MAX_LENGTH]
+            )
+            self._check_ones_before_zeros(
+                prefix_pad_masks[i, resp_tokens_start : resp_tokens_start + RESPONSE_MAX_LENGTH]
+            )
 
     def _verify_position_ids(self, prefix_position_ids, prefix_pad_masks):
-        assert prefix_position_ids.shape == (1, TRAIN_PREFIX_LEN)
-        assert prefix_position_ids.dtype == torch.long
+        expected = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        assert torch.equal(prefix_position_ids, expected)
 
-        for i in range(1):
-            pids = prefix_position_ids[i]
-            pads = prefix_pad_masks[i]
-            for j in range(1, len(pids)):
-                if pads[j] == 1:
-                    assert pids[j] == pids[j - 1] + 1, (
-                        f"Position ID should increment at {j}: {pids[j - 1]} -> {pids[j]}"
-                    )
-                else:
-                    assert pids[j] == pids[j - 1], (
-                        f"Position ID should stay same at padded {j}: {pids[j - 1]} -> {pids[j]}"
-                    )
-
-    def _verify_vlm_attention_mask(self, vlm_attention_mask, prefix_pad_masks):
-        """Verify the VLM attention mask for training.
-
-        Expected pattern (cumsum progression):
-            - images + language: bidirectional (cumsum=0).
-            - metadata: bidirectional block ([1,0,...,0], cumsum=1).
-            - memory: causal ([1] each, cumsum=2..53).
-            - response: causal ([1] each, cumsum=54..105).
-        """
-        assert vlm_attention_mask.shape == (1, TRAIN_PREFIX_LEN, TRAIN_PREFIX_LEN)
-        assert vlm_attention_mask.dtype == torch.bool
-
-        for i in range(1):
-            mask = vlm_attention_mask[i].cpu()
-            pads = prefix_pad_masks[i].cpu()
-
-            n_lang = pads[LANG_START:METADATA_START].sum().item()
-            n_meta = pads[METADATA_START:MEMORY_START].sum().item()
-            n_mem = pads[MEMORY_START:RESPONSE_START].sum().item()
-            n_resp = pads[RESPONSE_START:TRAIN_PREFIX_LEN].sum().item()
-
-            expected = torch.ones(TRAIN_PREFIX_LEN, TRAIN_PREFIX_LEN, dtype=torch.bool)
-
-            # Zero out rows/cols for padded language tokens.
-            lang_pad_start = LANG_START + n_lang
-            expected[lang_pad_start:METADATA_START, :] = 0
-            expected[:, lang_pad_start:METADATA_START] = 0
-
-            # Zero out rows/cols for padded metadata tokens.
-            meta_pad_start = METADATA_START + n_meta
-            expected[meta_pad_start:MEMORY_START, :] = 0
-            expected[:, meta_pad_start:MEMORY_START] = 0
-
-            # Zero out rows/cols for padded memory tokens.
-            mem_pad_start = MEMORY_START + n_mem
-            expected[mem_pad_start:RESPONSE_START, :] = 0
-            expected[:, mem_pad_start:RESPONSE_START] = 0
-
-            # Zero out rows/cols for padded response tokens.
-            resp_pad_start = RESPONSE_START + n_resp
-            expected[resp_pad_start:TRAIN_PREFIX_LEN, :] = 0
-            expected[:, resp_pad_start:TRAIN_PREFIX_LEN] = 0
-
-            # Core bidir (images + language) cannot attend to metadata, memory, or response.
-            expected[:METADATA_START, METADATA_START:] = 0
-
-            # Metadata: bidir among themselves, can see images+language.
-            # Cannot attend to memory or response.
-            expected[METADATA_START:MEMORY_START, MEMORY_START:] = 0
-
-            # Memory tokens: causal among themselves, can attend to images+language+metadata.
-            mem_causal = torch.tril(torch.ones(n_mem, n_mem, dtype=torch.bool))
-            expected[MEMORY_START : MEMORY_START + n_mem, MEMORY_START : MEMORY_START + n_mem] = mem_causal
-            # Memory cannot attend to response tokens.
-            expected[MEMORY_START:RESPONSE_START, RESPONSE_START:] = 0
-
-            # Response tokens: causal among themselves, can attend to everything before.
-            resp_causal = torch.tril(torch.ones(n_resp, n_resp, dtype=torch.bool))
-            expected[RESPONSE_START : RESPONSE_START + n_resp, RESPONSE_START : RESPONSE_START + n_resp] = (
-                resp_causal
-            )
-
-            assert torch.all(mask == expected), (
-                f"VLM attention mask mismatch.\n"
-                f"Diff indices: {(mask != expected).nonzero(as_tuple=False)[:20]}"
-            )
+    def _verify_vlm_attention_mask(self, vlm_attention_mask, prefix_pad_masks, prefix_att_masks):
+        expected = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        assert torch.equal(vlm_attention_mask, expected), (
+            f"VLM attention mask mismatch vs make_att_2d_masks.\n"
+            f"Diff indices: {(vlm_attention_mask != expected).nonzero(as_tuple=False)[:20]}"
+        )
 
     # ------------------------------------------------------------------
     # Main integration test
@@ -199,6 +146,7 @@ class TestPI07HighLevelPlannerIntegration:
 
         config = self._make_config()
         policy = PI07HighLevelPlannerPolicy(config, dataset_stats=lerobot_dataset_metadata.stats)
+        tokenizer = policy.model.language_tokenizer
 
         batch_size = 1
         batch = {
@@ -239,6 +187,7 @@ class TestPI07HighLevelPlannerIntegration:
         def capture_embed_prefix(*args, **kwargs):
             result = original_embed_prefix(*args, **kwargs)
             captured["prefix_pad_masks"] = result[1].clone()
+            captured["prefix_att_masks"] = result[2].clone()
             return result
 
         policy.model.paligemma_with_expert.forward = capture_forward
@@ -252,15 +201,19 @@ class TestPI07HighLevelPlannerIntegration:
         policy.model.embed_prefix = original_embed_prefix
 
         # Verify captures.
-        for var in ["prefix_pad_masks", "vlm_2d_attention_mask", "vlm_position_ids"]:
+        for var in ["prefix_pad_masks", "prefix_att_masks", "vlm_2d_attention_mask", "vlm_position_ids"]:
             assert var in captured, f"{var} was not captured"
 
         assert captured["vlm_2d_attention_mask"].dtype == torch.bool
         assert captured["prefix_pad_masks"].dtype == torch.bool
 
-        self._verify_pad_masks(captured["prefix_pad_masks"])
+        self._verify_pad_masks(captured["prefix_pad_masks"], tokenizer)
         self._verify_position_ids(captured["vlm_position_ids"], captured["prefix_pad_masks"])
-        self._verify_vlm_attention_mask(captured["vlm_2d_attention_mask"], captured["prefix_pad_masks"])
+        self._verify_vlm_attention_mask(
+            captured["vlm_2d_attention_mask"],
+            captured["prefix_pad_masks"],
+            captured["prefix_att_masks"],
+        )
 
         assert isinstance(loss, dict)
         assert "MSE" in loss
@@ -295,7 +248,6 @@ class TestPI07HighLevelPlannerIntegration:
             )
             assert prefix_embs.shape[1] == prefix_pad_masks.shape[1]
 
-            # Each new autoregressive token gets att_mask=1 (causal).
             assert prefix_att_masks.shape[1] == prefix_pad_masks.shape[1]
 
             captured_infer["last_prefix_pad_masks"] = prefix_pad_masks.clone()
@@ -312,6 +264,7 @@ class TestPI07HighLevelPlannerIntegration:
         def capture_embed_prefix_infer(*args, **kwargs):
             result = original_embed_prefix(*args, **kwargs)
             captured_infer["prefix_pad_masks"] = result[1].clone()
+            captured_infer["prefix_att_masks"] = result[2].clone()
             return result
 
         policy.model.paligemma_with_expert.forward = capture_forward_infer
@@ -338,45 +291,31 @@ class TestPI07HighLevelPlannerIntegration:
         policy.model.embed_prefix = original_embed_prefix
         policy.model.infer_autoregressive = original_infer_autoregressive
 
-        # Verify total number of autoregressive steps.
+        # Verify total number of autoregressive steps (memory + response only).
         assert step_counter[0] == MEMORY_MAX_LENGTH + RESPONSE_MAX_LENGTH
 
         # Verify inference captures.
         assert "vlm_2d_attention_mask" in captured_infer
+        assert "prefix_pad_masks" in captured_infer
+        assert "prefix_att_masks" in captured_infer
         assert "last_prefix_pad_masks" in captured_infer
         assert "last_prefix_offsets" in captured_infer
 
-        # Initial VLM attention mask: images + language + metadata.
-        assert captured_infer["vlm_2d_attention_mask"].shape == (1, INFER_PREFIX_LEN, INFER_PREFIX_LEN)
+        infer_base = self._infer_embed_prefix_total(tokenizer)
+        assert captured_infer["vlm_2d_attention_mask"].shape == (1, infer_base, infer_base)
         assert captured_infer["vlm_2d_attention_mask"].dtype == torch.bool
 
-        init_pad = captured_infer["prefix_pad_masks"][0].cpu()
-        init_mask = captured_infer["vlm_2d_attention_mask"][0].cpu()
-
-        n_meta_infer = init_pad[INFER_METADATA_START:INFER_PREFIX_LEN].sum().item()
-
-        expected_init = torch.ones(INFER_PREFIX_LEN, INFER_PREFIX_LEN, dtype=torch.bool)
-        # Zero out padded language columns/rows.
-        n_lang_infer = init_pad[LANG_START:INFER_METADATA_START].sum().item()
-        lang_pad_infer = LANG_START + n_lang_infer
-        expected_init[lang_pad_infer:INFER_METADATA_START, :] = 0
-        expected_init[:, lang_pad_infer:INFER_METADATA_START] = 0
-
-        # Zero out padded metadata columns/rows.
-        meta_pad_infer = INFER_METADATA_START + n_meta_infer
-        expected_init[meta_pad_infer:INFER_PREFIX_LEN, :] = 0
-        expected_init[:, meta_pad_infer:INFER_PREFIX_LEN] = 0
-
-        # Core bidir block (images + language) cannot attend to metadata.
-        expected_init[:INFER_METADATA_START, INFER_METADATA_START:] = 0
-
-        assert torch.all(init_mask == expected_init), (
-            f"Inference prefix attention mismatch.\n"
-            f"Diff indices: {(init_mask != expected_init).nonzero(as_tuple=False)[:20]}"
+        init_expected = make_att_2d_masks(
+            captured_infer["prefix_pad_masks"],
+            captured_infer["prefix_att_masks"],
+        )
+        assert torch.equal(captured_infer["vlm_2d_attention_mask"], init_expected), (
+            f"Inference VLM 2D mask vs make_att_2d_masks.\n"
+            f"Diff: {(captured_infer['vlm_2d_attention_mask'] != init_expected).nonzero(as_tuple=False)[:20]}"
         )
 
-        # After autoregressive generation, prefix should have grown by memory + response tokens.
-        final_prefix_len = INFER_PREFIX_LEN + MEMORY_MAX_LENGTH + RESPONSE_MAX_LENGTH
+        subtask_lead = self._indicator_lens(tokenizer)["subtask_lead"]
+        final_prefix_len = infer_base + MEMORY_MAX_LENGTH + subtask_lead + RESPONSE_MAX_LENGTH
         assert captured_infer["last_prefix_pad_masks"].shape == (1, final_prefix_len)
 
         # Output shapes.

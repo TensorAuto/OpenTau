@@ -818,7 +818,7 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         device = batch["state"].device
         tasks = batch["prompt"]
 
-        prompt = [f"Task: {task}<eos>" for task in tasks]
+        prompt = [f"Task: {task}, " for task in tasks]
 
         tokenized_prompt = self.language_tokenizer.__call__(
             prompt,
@@ -847,7 +847,7 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             ``(B, response_max_length)``."""
         device = batch["state"].device
         responses = batch["response"]
-        response_prompt = [f"Subtask: {response}<eos>" for response in responses]
+        response_prompt = [f"Subtask: {response}, " for response in responses]
         tokenized_response = self.language_tokenizer.__call__(
             response_prompt,
             padding="max_length",
@@ -963,15 +963,15 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         ):
             segments = []
             if not speed_is_pad:
-                segments.append(f"Speed: {str(speed.item())}")
+                segments.append(f"Speed: {str(speed.item())}, ")
 
             if not quality_is_pad:
-                segments.append(f"Quality: {str(quality.item())}")
+                segments.append(f"Quality: {str(quality.item())}, ")
 
             if not mistake_is_pad:
-                segments.append(f"Mistake: {str(mistake.item())}")
+                segments.append(f"Mistake: {str(mistake.item())}, ")
 
-            metadata.append(f"Metadata: {' '.join(segments)}<eos>")
+            metadata.append(f"Metadata: {' '.join(segments)}")
 
         device = batch["state"].device
         tokenized_metadata = self.language_tokenizer.__call__(
@@ -1006,18 +1006,17 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         │     │PaliGemma │  │                               │
         │     │  (VLM)   │  noise                           │
         │     └▲──▲──▲──▲──▲──▲──▲──▲                       │
-        │      │  │  │  │  │  │  │  └── discrete actions    │
-        │      │  │  │  │  │  │  └───── metadata tokens     │
-        │      │  │  │  │  │  └──────── subgoal images      │
-        │      │  │  │  │  └─────────── state (T tokens)    │
-        │      │  │  │  └────────────── response (subtask)  │
-        │      │  │  └───────────────── language tokens      │
-        │      │  └──────────────────── video (V-JEPA2)     │
-        │      └─────────────────────── video (V-JEPA2)     │
+        │      │  │  │  │  │  └── ``Action:`` + discrete (training) │
+        │      │  │  │  │  └───── ``";\n "`` + metadata        │
+        │      │  │  │  └──────── subgoal images, ``Subgoal:`` │
+        │      │  │  └────────── response, commas, state, ``State:`` │
+        │      │  └──────────── language                        │
+        │      └────────────── video (V-JEPA2)                 │
         └───────────────────────────────────────────────────┘
 
-    The VLM processes all prefix tokens (video, language, response, state,
-    subgoal images, metadata, discrete actions). The action expert receives
+    The VLM processes the same prefix layout as :meth:`embed_prefix` (videos, language,
+    ``State:``, state, commas, response, ``Subgoal:``, subgoal images, ``";\n "``,
+    optional ``Action:``/discrete, metadata). The action expert receives
     the prefix KV-cache (detached for Knowledge Insulation) together with
     noisy continuous actions and flow-matching timestep embeddings to
     predict the velocity field.
@@ -1061,6 +1060,8 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         self.time_mlp_in = nn.Linear(self.config.proj_width, self.config.proj_width)
         self.time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
 
+        self.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
+
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
         return torch.normal(mean=0.0, std=1.0, size=shape, dtype=torch.float32, device=device)
 
@@ -1101,18 +1102,19 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         """Embed all prefix modalities and build the 1-D attention pattern.
 
         Concatenation order:
-        ``[video_0 | ... | video_N | language | response | state |
-        subgoal_img_0 | ... | metadata | discrete_actions]``
 
-        Attention pattern (via ``att_masks``):
-            - Video tokens: bidirectional (``0``).
-            - Language tokens: bidirectional (``0``).
-            - Response tokens: bidirectional (``0``), same block as language.
-            - State tokens: bidirectional (``0``) with all preceding tokens.
-            - Subgoal image tokens: new bidirectional block per camera
-              (``[1, 0, …, 0]``), can see all earlier tokens.
-            - Metadata tokens: new bidirectional block (``[1, 0, …, 0]``).
-            - Discrete action tokens: causal (``1`` each).
+        ``[videos | language | State: | state(T) | ", " | response |
+        Subgoal: | subgoal_images… | ", " | metadata | ";\\n " |
+        ("Action:" + discrete_actions only when training)]``
+
+        Attention pattern (via ``att_masks`` cumsums):
+            - Video + language: bidirectional (``0``).
+            - ``State:``, projected state timestep tokens, comma after state: bidirectional (``0``).
+            - Response spans: prefix-LM style block opening (``[1, 0, …]`` inside the segment).
+            - ``Subgoal:``: new bidirectional block (``[1, 0, …]``).
+            - Subgoal image patches per camera: bidirectional blocks (``[1, 0, …]``).
+            - Commas/metadata / ``";\\n "``: mostly continued prefix blocks (see code).
+            - Discrete actions (training): causal ``1`` per timestep after ``Action:``.
 
         Args:
             videos: List of video tensors, each ``(B, T, C, H, W)``.
@@ -1167,13 +1169,24 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
-        response_emb = self.paligemma_with_expert.embed_language_tokens(response_tokens)
-        response_emb_dim = response_emb.shape[-1]
-        response_emb = response_emb * math.sqrt(response_emb_dim)
-        embs.append(response_emb)
-        pad_masks.append(response_masks)
-        num_response_embs = response_emb.shape[1]
-        att_masks += [0] * num_response_embs
+        state_start_indicator_ids = self.language_tokenizer.encode("State: ", add_special_tokens=False)
+        state_start_tokens = torch.tensor(
+            [state_start_indicator_ids] * bsize,
+            device=lang_tokens.device,
+            dtype=torch.long,
+        )
+        state_start_emb = self.paligemma_with_expert.embed_language_tokens(state_start_tokens)
+        state_start_dim = state_start_emb.shape[-1]
+        state_start_emb = state_start_emb * math.sqrt(state_start_dim)
+
+        num_state_start_embs = state_start_emb.shape[1]
+        state_start_mask = torch.ones(
+            bsize, num_state_start_embs, dtype=torch.bool, device=lang_tokens.device
+        )
+
+        embs.append(state_start_emb)
+        pad_masks.append(state_start_mask)
+        att_masks += [0] * num_state_start_embs
 
         # Project each timestep's state into a separate VLM token
         # state: (B, T, max_state_dim) -> state_emb: (B, T, vlm_hidden_size)
@@ -1187,6 +1200,52 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         embs.append(state_emb)
         pad_masks.append(state_mask)
         att_masks += [0] * num_state_tokens  # full attention with video and language
+
+        state_end_indicator_ids = self.language_tokenizer.encode(", ", add_special_tokens=False)
+        state_end_tokens = torch.tensor(
+            [state_end_indicator_ids] * bsize,
+            device=lang_tokens.device,
+            dtype=torch.long,
+        )
+        state_end_emb = self.paligemma_with_expert.embed_language_tokens(state_end_tokens)
+        state_end_dim = state_end_emb.shape[-1]
+        state_end_emb = state_end_emb * math.sqrt(state_end_dim)
+
+        num_state_end_embs = state_end_emb.shape[1]
+        state_end_mask = torch.ones(bsize, num_state_end_embs, dtype=torch.bool, device=lang_tokens.device)
+
+        embs.append(state_end_emb)
+        pad_masks.append(state_end_mask)
+        att_masks += [0] * num_state_end_embs
+
+        response_emb = self.paligemma_with_expert.embed_language_tokens(response_tokens)
+        response_emb_dim = response_emb.shape[-1]
+        response_emb = response_emb * math.sqrt(response_emb_dim)
+        embs.append(response_emb)
+        pad_masks.append(response_masks)
+        num_response_embs = response_emb.shape[1]
+        att_masks += [1] + [0] * (num_response_embs - 1)
+
+        subgoal_img_start_indicator_ids = self.language_tokenizer.encode(
+            "Subgoal: ", add_special_tokens=False
+        )
+        subgoal_img_start_tokens = torch.tensor(
+            [subgoal_img_start_indicator_ids] * bsize,
+            device=lang_tokens.device,
+            dtype=torch.long,
+        )
+        subgoal_img_start_emb = self.paligemma_with_expert.embed_language_tokens(subgoal_img_start_tokens)
+        subgoal_img_start_dim = subgoal_img_start_emb.shape[-1]
+        subgoal_img_start_emb = subgoal_img_start_emb * math.sqrt(subgoal_img_start_dim)
+
+        num_subgoal_img_start_embs = subgoal_img_start_emb.shape[1]
+        subgoal_img_start_mask = torch.ones(
+            bsize, num_subgoal_img_start_embs, dtype=torch.bool, device=lang_tokens.device
+        )
+
+        embs.append(subgoal_img_start_emb)
+        pad_masks.append(subgoal_img_start_mask)
+        att_masks += [1] + [0] * (num_subgoal_img_start_embs - 1)
 
         for (
             subgoal_img,
@@ -1207,6 +1266,25 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             # Create attention masks so that image tokens attend to each other
             att_masks += [1] + [0] * (num_subgoal_img_embs - 1)
 
+        subgoal_img_end_indicator_ids = self.language_tokenizer.encode(", ", add_special_tokens=False)
+        subgoal_img_end_tokens = torch.tensor(
+            [subgoal_img_end_indicator_ids] * bsize,
+            device=lang_tokens.device,
+            dtype=torch.long,
+        )
+        subgoal_img_end_emb = self.paligemma_with_expert.embed_language_tokens(subgoal_img_end_tokens)
+        subgoal_img_end_dim = subgoal_img_end_emb.shape[-1]
+        subgoal_img_end_emb = subgoal_img_end_emb * math.sqrt(subgoal_img_end_dim)
+
+        num_subgoal_img_end_embs = subgoal_img_end_emb.shape[1]
+        subgoal_img_end_mask = torch.ones(
+            bsize, num_subgoal_img_end_embs, dtype=torch.bool, device=lang_tokens.device
+        )
+
+        embs.append(subgoal_img_end_emb)
+        pad_masks.append(subgoal_img_end_mask)
+        att_masks += [0] * num_subgoal_img_end_embs
+
         metadata_emb = self.paligemma_with_expert.embed_language_tokens(metadata_tokens)
         metadata_emb_dim = metadata_emb.shape[-1]
         metadata_emb = metadata_emb * math.sqrt(metadata_emb_dim)
@@ -1214,7 +1292,47 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         pad_masks.append(metadata_masks)
         att_masks += [1] + [0] * (metadata_emb.shape[1] - 1)
 
+        prefix_end_indicator_ids = self.language_tokenizer.encode(";\n ", add_special_tokens=False)
+        prefix_end_tokens = torch.tensor(
+            [prefix_end_indicator_ids] * bsize,
+            device=lang_tokens.device,
+            dtype=torch.long,
+        )
+        prefix_end_emb = self.paligemma_with_expert.embed_language_tokens(prefix_end_tokens)
+        prefix_end_dim = prefix_end_emb.shape[-1]
+        prefix_end_emb = prefix_end_emb * math.sqrt(prefix_end_dim)
+
+        num_prefix_end_embs = prefix_end_emb.shape[1]
+        prefix_end_mask = torch.ones(bsize, num_prefix_end_embs, dtype=torch.bool, device=lang_tokens.device)
+
+        embs.append(prefix_end_emb)
+        pad_masks.append(prefix_end_mask)
+        att_masks += [0] * num_prefix_end_embs
+
         if discrete_actions is not None:
+            discrete_action_start_indicator_ids = self.language_tokenizer.encode(
+                "Action: ", add_special_tokens=False
+            )
+            discrete_action_start_tokens = torch.tensor(
+                [discrete_action_start_indicator_ids] * bsize,
+                device=lang_tokens.device,
+                dtype=torch.long,
+            )
+            discrete_action_start_emb = self.paligemma_with_expert.embed_language_tokens(
+                discrete_action_start_tokens
+            )
+            discrete_action_start_dim = discrete_action_start_emb.shape[-1]
+            discrete_action_start_emb = discrete_action_start_emb * math.sqrt(discrete_action_start_dim)
+
+            num_discrete_action_start_embs = discrete_action_start_emb.shape[1]
+            discrete_action_start_mask = torch.ones(
+                bsize, num_discrete_action_start_embs, dtype=torch.bool, device=lang_tokens.device
+            )
+
+            embs.append(discrete_action_start_emb)
+            pad_masks.append(discrete_action_start_mask)
+            att_masks += [1] + [0] * (num_discrete_action_start_embs - 1)
+
             discrete_action_emb = self.paligemma_with_expert.embed_discrete_actions(discrete_actions)
             embs.append(discrete_action_emb.to(dtype=_preferred_dtype()))
             pad_masks.append(discrete_action_masks)

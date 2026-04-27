@@ -645,7 +645,7 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
         # using <eos> to separate each modality
         past_memory = batch["past_memory"]
         prompt = [
-            f"Task: {task}<eos>Past Memory: {past_mem}<eos>State: {state}<eos>"
+            f"Task: {task}, Past Memory: {past_mem}, State: {state}, "
             for task, past_mem, state in zip(tasks, past_memory, state, strict=False)
         ]
         tokenized_prompt = self.language_tokenizer.__call__(
@@ -680,15 +680,15 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
         ):
             segments = []
             if not speed_is_pad:
-                segments.append(f"Speed: {str(speed.item())}")
+                segments.append(f"Speed: {str(speed.item())}, ")
 
             if not quality_is_pad:
-                segments.append(f"Quality: {str(quality.item())}")
+                segments.append(f"Quality: {str(quality.item())}, ")
 
             if not mistake_is_pad:
-                segments.append(f"Mistake: {str(mistake.item())}")
+                segments.append(f"Mistake: {str(mistake.item())}, ")
 
-            metadata.append(f"Metadata: {' '.join(segments)}<eos>")
+            metadata.append(f"Metadata: {' '.join(segments)}")
 
         device = batch["state"].device
         tokenized_metadata = self.language_tokenizer.__call__(
@@ -783,28 +783,29 @@ class PI07HighLevelPlannerModel(nn.Module):
     """π07 High-Level Planner inner model.
 
     Uses a PaliGemma VLM backbone to encode images and a composite language
-    prompt (task + past memory + discretized state), then autoregressively
-    generates two token sequences:
+    prompt (task + past context) and optional episode metadata, with fixed tokenizer
+    spans ``";\\n "``, ``"Updated Memory: "``, and (in full training runs) ``"Subtask: "``
+    before the predicted text, then autoregressively
+    predicts updated memory and subtask text:
 
-    1. **Updated memory** — a summary of relevant context for downstream use.
-    2. **Subtask (response)** — the next subtask instruction for the low-level
-       policy.
+    1. **Updated memory** — next-token CE over ``memory_max_length`` slots after the
+       ``"Updated Memory: "`` span.
+    2. **Subtask (response)** — next-token CE over ``response_max_length`` slots after
+       the ``"Subtask: "`` span (training).
 
-    Architecture::
+    Inference mirrors training by inserting the live ``"Subtask: "`` token IDs into the
+    KV cache after memory decoding and before response decoding.
+
+    Architecture (rough dataflow)::
 
         ┌───────────────────────────────────────────┐
-        │          subtask (response) tokens        │
+        │     response content (subtask text)       │
         │                   ▲                       │
-        │          updated memory tokens            │
-        │                   ▲                       │
-        │     ┌─────────────┴──────────┐            │
+        │  memory, ``Subtask: ``, lang, ``";\\n "``, images, … │
+        │     ┌───────────────────────┐             │
         │     │       PaliGemma        │            │
         │     │  (autoregressive LM)   │            │
-        │     └▲──────▲──────▲─────▲───┘            │
-        │      │      │      │     └── state (prompt│
-        │      │      │      └──── metadata         │
-        │      │      └─────────── language tokens  │
-        │      └────────────────── image(s)         │
+        │     └────────────────────────┘            │
         └───────────────────────────────────────────┘
 
     Args:
@@ -851,16 +852,25 @@ class PI07HighLevelPlannerModel(nn.Module):
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Embeds and concatenates all prefix modalities for the transformer.
 
-        Embeds images with SigLIP and language/metadata/memory/response tokens
-        with the PaliGemma embedding layer. The concatenation order is:
-        ``[images | language | metadata | memory | response]``.
+        Embeds images with SigLIP and language/metadata/memory/response spans with the
+        PaliGemma embedding layer. **Concatenation order** (training when memory and response
+        are provided):
 
-        Attention pattern (via ``att_masks``):
-            - Image tokens: bidirectional (``0``).
-            - Language tokens: bidirectional (``0``), same block as images.
-            - Metadata tokens: new bidirectional block (``[1, 0, …, 0]``).
-            - Memory tokens: causal (``1`` each).
-            - Response tokens: causal (``1`` each).
+        ``[images | language | metadata | ";\\n " | "Updated Memory: " | memory_tokens |
+        "Subtask: " | response_tokens]``
+
+        When ``memory_tokens`` / ``response_tokens`` are omitted (inference), only the
+        fixed spans before those segments are present; memory and subtask text are filled in
+        via KV-cache decoding plus an explicit ``"Subtask: "`` injection before response AR.
+
+        Attention pattern (via ``att_masks`` cumsums):
+            - Image + language tokens: bidirectional (``0``).
+            - Metadata (if present): new bidirectional block (``[1, 0, …, 0]``).
+            - ``";\\n "`` (same string as ``encode(";\n ", add_special_tokens=False)``): continues previous block (``0``).
+            - ``"Updated Memory: "``: new bidirectional block (``[1, 0, …, 0]``).
+            - Memory token slots: causal segment (``1`` per slot).
+            - ``"Subtask: "`` (training): new block then causal continuation within span.
+            - Response token slots: causal (``1`` per slot).
 
         Args:
             images: List of image tensors, one per camera.
@@ -931,6 +941,44 @@ class PI07HighLevelPlannerModel(nn.Module):
             pad_masks.append(metadata_masks)
             att_masks += [1] + [0] * (metadata_emb.shape[1] - 1)
 
+        prefix_end_indicator_ids = self.language_tokenizer.encode(";\n ", add_special_tokens=False)
+        prefix_end_tokens = torch.tensor(
+            [prefix_end_indicator_ids] * bsize,
+            device=lang_tokens.device,
+            dtype=torch.long,
+        )
+        prefix_end_emb = self.paligemma_with_expert.embed_language_tokens(prefix_end_tokens)
+        prefix_end_dim = prefix_end_emb.shape[-1]
+        prefix_end_emb = prefix_end_emb * math.sqrt(prefix_end_dim)
+
+        num_prefix_end_embs = prefix_end_emb.shape[1]
+        prefix_end_mask = torch.ones(bsize, num_prefix_end_embs, dtype=torch.bool, device=lang_tokens.device)
+
+        embs.append(prefix_end_emb)
+        pad_masks.append(prefix_end_mask)
+        att_masks += [0] * num_prefix_end_embs
+
+        memory_start_indicator_ids = self.language_tokenizer.encode(
+            "Updated Memory: ", add_special_tokens=False
+        )
+        memory_start_tokens = torch.tensor(
+            [memory_start_indicator_ids] * bsize,
+            device=lang_tokens.device,
+            dtype=torch.long,
+        )
+        memory_start_emb = self.paligemma_with_expert.embed_language_tokens(memory_start_tokens)
+        memory_start_dim = memory_start_emb.shape[-1]
+        memory_start_emb = memory_start_emb * math.sqrt(memory_start_dim)
+
+        num_memory_start_embs = memory_start_emb.shape[1]
+        memory_start_mask = torch.ones(
+            bsize, num_memory_start_embs, dtype=torch.bool, device=lang_tokens.device
+        )
+
+        embs.append(memory_start_emb)
+        pad_masks.append(memory_start_mask)
+        att_masks += [1] + [0] * (num_memory_start_embs - 1)
+
         if memory_tokens is not None:
             memory_emb = self.paligemma_with_expert.embed_language_tokens(memory_tokens)
             # Normalize memory language embeddings
@@ -945,6 +993,27 @@ class PI07HighLevelPlannerModel(nn.Module):
             att_masks += [1] * num_memory_embs
 
         if response_tokens is not None:
+            response_start_indicator_ids = self.language_tokenizer.encode(
+                "Subtask: ", add_special_tokens=False
+            )
+            response_start_tokens = torch.tensor(
+                [response_start_indicator_ids] * bsize,
+                device=lang_tokens.device,
+                dtype=torch.long,
+            )
+            response_start_emb = self.paligemma_with_expert.embed_language_tokens(response_start_tokens)
+            response_start_dim = response_start_emb.shape[-1]
+            response_start_emb = response_start_emb * math.sqrt(response_start_dim)
+
+            num_response_start_embs = response_start_emb.shape[1]
+            response_start_mask = torch.ones(
+                bsize, num_response_start_embs, dtype=torch.bool, device=lang_tokens.device
+            )
+
+            embs.append(response_start_emb)
+            pad_masks.append(response_start_mask)
+            att_masks += [1] + [0] * (num_response_start_embs - 1)
+
             response_emb = self.paligemma_with_expert.embed_language_tokens(response_tokens)
 
             # Normalize response language embeddings
@@ -980,11 +1049,12 @@ class PI07HighLevelPlannerModel(nn.Module):
     ) -> dict[str, Tensor]:
         """Training forward pass: embeds all modalities and computes CE losses.
 
-        The prefix sequence is
-        ``[images | language | metadata | memory | response]``.
-        The model predicts memory tokens from the language/metadata context and
-        response tokens from the memory context, each via next-token
-        prediction.  Pad tokens are masked out of both losses.
+        The prefix matches :meth:`embed_prefix` when memory and response tensors are set:
+        fixed separators ``";\\n "``, ``"Updated Memory: "``, and ``"Subtask: "`` appear
+        in addition to ``metadata``, ``memory_tokens``, and ``response_tokens``. CE slices use
+        negative offsets from the **sequence tail**, relying on
+        ``config.subtask_indicator_max_length`` so memory logits align with memory contents
+        even though ``"Subtask: "`` sits between memory and response text.
 
         Args:
             images: List of image tensors, one per camera.
@@ -1037,8 +1107,7 @@ class PI07HighLevelPlannerModel(nn.Module):
 
         batch_size, seq_len = response_tokens.shape
         response_token_start = -self.config.response_max_length
-        # The last token of language will predict <BOS> token of response, so no need to include for loss calculation. Hence slice starts from -self.config.memory_max_length - self.config.response_max_length.
-        # The last token of response predicts first token  of memory, so no need to include for loss calculation. Hence slice ends at -self.config.memory_max_length - 1.
+        # Slice covers only response **content** slots at the tail (after ``Subtask: ``).
         response_token_end = -1
         response_slice_object = slice(response_token_start, response_token_end)
         response_out = prefix_out[
@@ -1064,10 +1133,13 @@ class PI07HighLevelPlannerModel(nn.Module):
         response_ce_loss = response_ce_loss.mean()
 
         batch_size, seq_len = memory_tokens.shape
-        memory_token_start = -self.config.memory_max_length - self.config.response_max_length
-        # The last token of language will predict <BOS> token of response, so no need to include for loss calculation. Hence slice starts from -self.config.memory_max_length - self.config.response_max_length.
-        # The last token of response predicts first token  of memory, so no need to include for loss calculation. Hence slice ends at -1.
-        memory_token_end = -self.config.response_max_length - 1
+        memory_token_start = (
+            -self.config.memory_max_length
+            - self.config.response_max_length
+            - self.config.subtask_indicator_max_length
+        )
+        # Memory **content** span: immediately after ``Subtask: `` and response (from the end).
+        memory_token_end = -self.config.response_max_length - self.config.subtask_indicator_max_length - 1
         memory_slice_object = slice(memory_token_start, memory_token_end)
         memory_out = prefix_out[
             :,
@@ -1106,9 +1178,10 @@ class PI07HighLevelPlannerModel(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         """Inference forward: autoregressively generates memory and subtask tokens.
 
-        First generates ``memory_max_length`` memory tokens, then generates
-        ``response_max_length`` subtask (response) tokens, each conditioned on
-        all previously generated tokens via KV-cache.
+        Runs ``memory_max_length`` ``infer_autoregressive`` steps, then feeds the same
+        ``"Subtask: "`` token IDs used in training (tokenizer-dependent length
+        ``subtask_indicator_max_length``) through the cache, then runs ``response_max_length``
+        response steps. Each step conditions on prior KV-cache entries.
 
         Args:
             images: List of image tensors, one per camera.
@@ -1177,6 +1250,44 @@ class PI07HighLevelPlannerModel(nn.Module):
                 auto_step=auto_step,
                 bsize=bsize,
                 device=device,
+            )
+
+        # Match training `embed_prefix`: "Subtask: " must be in the KV cache before subtask
+        # autoregression (inference does not call `embed_prefix` with `response_tokens`).
+        response_start_indicator_ids = self.language_tokenizer.encode("Subtask: ", add_special_tokens=False)
+        for i, tid in enumerate(response_start_indicator_ids):
+            token = torch.full((bsize, 1), int(tid), device=device, dtype=torch.long)
+            emb = self.paligemma_with_expert.embed_language_tokens(token)
+            emb = emb * math.sqrt(emb.shape[-1])
+            pad_row = torch.ones((bsize, 1), device=device, dtype=prefix_pad_masks.dtype)
+            if prefix_att_masks.dtype == torch.bool:
+                new_att = torch.full((bsize, 1), i == 0, device=device, dtype=torch.bool)
+            else:
+                new_att = torch.full(
+                    (bsize, 1),
+                    1.0 if i == 0 else 0.0,
+                    device=device,
+                    dtype=prefix_att_masks.dtype,
+                )
+            prefix_embs = torch.cat([prefix_embs, emb], dim=1)
+            prefix_pad_masks = torch.cat([prefix_pad_masks, pad_row], dim=1)
+            prefix_att_masks = torch.cat([prefix_att_masks, new_att], dim=1)
+            num_cross = prefix_pad_masks.shape[1]
+            att_2d_masks = make_att_2d_masks(
+                pad_row,
+                new_att,
+                n_cross_att_tokens=num_cross - 1,
+                cross_att_pad_masks=prefix_pad_masks[:, : num_cross - 1],
+            )
+            prefix_offsets = prefix_offsets + pad_row.long()
+            (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
+                attention_mask=att_2d_masks,
+                position_ids=prefix_offsets,
+                past_key_values=past_key_values,
+                inputs_embeds=[emb, None],
+                n_cross_att_tokens=num_cross,
+                use_cache=True,
+                fill_kv_cache=True,
             )
 
         # initialize response tokens to empty tensor for storing response tokens during inference

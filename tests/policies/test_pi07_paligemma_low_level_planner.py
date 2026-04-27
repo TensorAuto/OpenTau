@@ -21,6 +21,7 @@ from opentau.policies.pi07_paligemma.low_level_planner.configuration_pi07_low_le
 )
 from opentau.policies.pi07_paligemma.low_level_planner.modeling_pi07_low_level import (
     PI07LowLevelPlannerPolicy,
+    make_att_2d_masks,
 )
 
 # Config defaults used across the test.
@@ -39,27 +40,12 @@ MAX_ACTION_DIM = 32
 # For training the state is provided as (B, n_obs_steps, D) so T = n_obs_steps.
 N_OBS_STEPS = 8
 
-# Token offsets for training prefix:
-#   video(512) | lang(256) | response(52) | state(8) | subgoal(256) | metadata(52) | discrete_actions(32)
 VIDEO_TOKENS = NUM_CAMERAS * VJEPA2_TOKENS_PER_CAMERA  # 512
 LANG_START = VIDEO_TOKENS  # 512
-RESPONSE_START = LANG_START + PROMPT_MAX_LENGTH  # 768
-STATE_START = RESPONSE_START + RESPONSE_MAX_LENGTH  # 820
-SUBGOAL_START = STATE_START + N_OBS_STEPS  # 828
 SUBGOAL_TOKENS = NUM_SUBGOAL_CAMERAS * SIGLIP_TOKENS_PER_SUBGOAL  # 256
-METADATA_START = SUBGOAL_START + SUBGOAL_TOKENS  # 1084
-DISCRETE_ACTION_START = METADATA_START + METADATA_MAX_LENGTH  # 1136
-TRAIN_PREFIX_LEN = DISCRETE_ACTION_START + DISCRETE_ACTION_MAX_LENGTH  # 1168
 
-# For inference: no discrete actions, state is 1 token (2D -> unsqueezed).
+# For inference: no discrete actions; state is 1 timestep for embed_prefix.
 INFER_STATE_TOKENS = 1
-INFER_SUBGOAL_START = VIDEO_TOKENS + PROMPT_MAX_LENGTH + RESPONSE_MAX_LENGTH + INFER_STATE_TOKENS  # 821
-INFER_METADATA_START = INFER_SUBGOAL_START + SUBGOAL_TOKENS  # 1077
-INFER_PREFIX_LEN = INFER_METADATA_START + METADATA_MAX_LENGTH  # 1129
-
-# Cross-attention tokens = prefix minus discrete actions.
-CROSS_ATT_TOKENS_TRAIN = TRAIN_PREFIX_LEN - DISCRETE_ACTION_MAX_LENGTH  # 1136
-CROSS_ATT_TOKENS_INFER = INFER_PREFIX_LEN  # 1129
 
 
 class TestPI07LowLevelPlannerIntegration:
@@ -94,6 +80,44 @@ class TestPI07LowLevelPlannerIntegration:
         return config
 
     @staticmethod
+    def _indicator_lens(tokenizer):
+        """Fixed strings inserted by ``embed_prefix`` (matches modeling layout)."""
+        return {
+            "state_lead": len(tokenizer.encode("State: ", add_special_tokens=False)),
+            "comma": len(tokenizer.encode(", ", add_special_tokens=False)),
+            "subgoal_lead": len(tokenizer.encode("Subgoal: ", add_special_tokens=False)),
+            "prefix_end": len(tokenizer.encode(";\n ", add_special_tokens=False)),
+            "action_lead": len(tokenizer.encode("Action: ", add_special_tokens=False)),
+        }
+
+    @classmethod
+    def _train_prefix_total(cls, tokenizer) -> int:
+        m = cls._indicator_lens(tokenizer)
+        p = 0
+        p += VIDEO_TOKENS
+        p += PROMPT_MAX_LENGTH
+        p += m["state_lead"] + N_OBS_STEPS + m["comma"]
+        p += RESPONSE_MAX_LENGTH
+        p += m["subgoal_lead"] + SUBGOAL_TOKENS + m["comma"]
+        p += METADATA_MAX_LENGTH
+        p += m["prefix_end"]
+        p += m["action_lead"] + DISCRETE_ACTION_MAX_LENGTH
+        return p
+
+    @classmethod
+    def _infer_prefix_total(cls, tokenizer) -> int:
+        m = cls._indicator_lens(tokenizer)
+        p = 0
+        p += VIDEO_TOKENS
+        p += PROMPT_MAX_LENGTH
+        p += m["state_lead"] + INFER_STATE_TOKENS + m["comma"]
+        p += RESPONSE_MAX_LENGTH
+        p += m["subgoal_lead"] + SUBGOAL_TOKENS + m["comma"]
+        p += METADATA_MAX_LENGTH
+        p += m["prefix_end"]
+        return p
+
+    @staticmethod
     def _check_ones_before_zeros(mask_slice):
         """Check that in a 1-D boolean mask all Trues precede all Falses."""
         mask = mask_slice.cpu().numpy()
@@ -112,38 +136,40 @@ class TestPI07LowLevelPlannerIntegration:
     # Verification helpers
     # ------------------------------------------------------------------
 
-    def _verify_pad_masks(self, prefix_pad_masks, suffix_pad_masks, inference_mode=False):
+    def _verify_pad_masks(self, prefix_pad_masks, suffix_pad_masks, tokenizer, inference_mode=False):
         assert prefix_pad_masks.shape[0] == 1
-        expected_prefix_len = INFER_PREFIX_LEN if inference_mode else TRAIN_PREFIX_LEN
-        assert prefix_pad_masks.shape[1] == expected_prefix_len
+        total = self._infer_prefix_total(tokenizer) if inference_mode else self._train_prefix_total(tokenizer)
+        assert prefix_pad_masks.shape[1] == total
         assert prefix_pad_masks.dtype == torch.bool
         assert suffix_pad_masks.shape == (1, CHUNK_SIZE)
         assert suffix_pad_masks.dtype == torch.bool
 
+        m = self._indicator_lens(tokenizer)
+
+        lang_slice = slice(LANG_START, LANG_START + PROMPT_MAX_LENGTH)
+        state_t = INFER_STATE_TOKENS if inference_mode else N_OBS_STEPS
+
+        resp_lo = LANG_START + PROMPT_MAX_LENGTH + m["state_lead"] + state_t + m["comma"]
+        resp_slice = slice(resp_lo, resp_lo + RESPONSE_MAX_LENGTH)
+
+        sg_lo = resp_lo + RESPONSE_MAX_LENGTH + m["subgoal_lead"]
+        sg_slice = slice(sg_lo, sg_lo + SUBGOAL_TOKENS)
+
+        meta_lo = sg_lo + SUBGOAL_TOKENS + m["comma"]
+        meta_slice = slice(meta_lo, meta_lo + METADATA_MAX_LENGTH)
+
         for i in range(prefix_pad_masks.shape[0]):
-            # Video tokens should never be padded.
             assert torch.all(prefix_pad_masks[i, :VIDEO_TOKENS] == 1)
-            # Language tokens can be padded at the end.
-            self._check_ones_before_zeros(prefix_pad_masks[i, LANG_START:RESPONSE_START])
-            # Response tokens can be padded at the end.
-            self._check_ones_before_zeros(
-                prefix_pad_masks[i, RESPONSE_START : RESPONSE_START + RESPONSE_MAX_LENGTH]
-            )
+            self._check_ones_before_zeros(prefix_pad_masks[i, lang_slice])
+            self._check_ones_before_zeros(prefix_pad_masks[i, resp_slice])
+            assert torch.all(prefix_pad_masks[i, sg_slice] == 1)
+            self._check_ones_before_zeros(prefix_pad_masks[i, meta_slice])
+
             if not inference_mode:
-                # Subgoal image tokens should never be padded.
-                assert torch.all(prefix_pad_masks[i, SUBGOAL_START : SUBGOAL_START + SUBGOAL_TOKENS] == 1)
-                # Metadata tokens can be padded at the end.
-                self._check_ones_before_zeros(prefix_pad_masks[i, METADATA_START:DISCRETE_ACTION_START])
-                # Discrete action tokens can be padded at the end.
-                self._check_ones_before_zeros(prefix_pad_masks[i, DISCRETE_ACTION_START:TRAIN_PREFIX_LEN])
-            else:
-                # Subgoal image tokens should never be padded (inference).
-                assert torch.all(
-                    prefix_pad_masks[i, INFER_SUBGOAL_START : INFER_SUBGOAL_START + SUBGOAL_TOKENS] == 1
-                )
-                # Metadata tokens can be padded at the end (inference).
-                self._check_ones_before_zeros(prefix_pad_masks[i, INFER_METADATA_START:INFER_PREFIX_LEN])
-            # Suffix (action chunk) can be padded.
+                da_lo = meta_lo + METADATA_MAX_LENGTH + m["prefix_end"] + m["action_lead"]
+                da_slice = slice(da_lo, da_lo + DISCRETE_ACTION_MAX_LENGTH)
+                self._check_ones_before_zeros(prefix_pad_masks[i, da_slice])
+
             self._check_ones_before_zeros(suffix_pad_masks[i])
 
     def _verify_position_ids(
@@ -152,172 +178,53 @@ class TestPI07LowLevelPlannerIntegration:
         suffix_position_ids,
         prefix_pad_masks,
         suffix_pad_masks,
+        tokenizer,
         inference_mode=False,
     ):
-        expected_prefix_len = INFER_PREFIX_LEN if inference_mode else TRAIN_PREFIX_LEN
-        assert prefix_position_ids.shape == (1, expected_prefix_len)
-        assert prefix_position_ids.dtype == torch.long
-        assert suffix_position_ids.shape == (1, CHUNK_SIZE)
-        assert suffix_position_ids.dtype == torch.long
+        expected_prefix = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        assert torch.equal(prefix_position_ids, expected_prefix)
 
-        def _check_ids(position_ids, pad_masks):
-            for j in range(1, len(position_ids)):
-                if pad_masks[j] == 1:
-                    assert position_ids[j] == position_ids[j - 1] + 1, (
-                        f"Position ID should increment at {j}: {position_ids[j - 1]} -> {position_ids[j]}"
-                    )
-                else:
-                    assert position_ids[j] == position_ids[j - 1], (
-                        f"Position ID should stay same at padded {j}: {position_ids[j - 1]} -> {position_ids[j]}"
-                    )
+        if inference_mode:
+            prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        else:
+            prefix_offsets = torch.sum(prefix_pad_masks[:, :-DISCRETE_ACTION_MAX_LENGTH], dim=-1)[:, None]
 
-        for i in range(1):
-            _check_ids(prefix_position_ids[i], prefix_pad_masks[i])
-            _check_ids(suffix_position_ids[i], suffix_pad_masks[i])
+        expected_suffix = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        assert torch.equal(suffix_position_ids, expected_suffix)
 
-            if not inference_mode:
-                # Suffix starts after the cross-attention portion of the prefix.
-                cross_att_end = DISCRETE_ACTION_START  # = prefix minus discrete actions
-                assert suffix_position_ids[i, 0] == prefix_position_ids[i, cross_att_end]
-
-    def _verify_vlm_attention_mask(self, vlm_attention_mask, prefix_pad_masks, inference_mode=False):
-        expected_len = INFER_PREFIX_LEN if inference_mode else TRAIN_PREFIX_LEN
-        assert vlm_attention_mask.shape == (1, expected_len, expected_len)
-        assert vlm_attention_mask.dtype == torch.bool
-
-        for i in range(1):
-            mask = vlm_attention_mask[i].cpu()
-            pads = prefix_pad_masks[i].cpu()
-
-            if not inference_mode:
-                # Build the expected mask.
-                # Blocks (cumsum progression):
-                #   video + lang + response + state (bidir, cumsum=0)
-                #   | subgoal images (bidir block, [1,0,...,0], cumsum=1)
-                #   | metadata (bidir block, [1,0,...,0], cumsum=2)
-                #   | discrete_actions (causal, [1] each, cumsum=3,4,...)
-                expected = torch.ones(expected_len, expected_len, dtype=torch.bool)
-
-                # Determine non-padded counts in each paddable section.
-                n_lang = pads[LANG_START:RESPONSE_START].sum().item()
-                n_resp = pads[RESPONSE_START:STATE_START].sum().item()
-                n_meta = pads[METADATA_START:DISCRETE_ACTION_START].sum().item()
-                n_disc = pads[DISCRETE_ACTION_START:TRAIN_PREFIX_LEN].sum().item()
-
-                # Zero out rows/cols for padded language tokens.
-                lang_pad_start = LANG_START + n_lang
-                expected[lang_pad_start:RESPONSE_START, :] = 0
-                expected[:, lang_pad_start:RESPONSE_START] = 0
-
-                # Zero out rows/cols for padded response tokens.
-                resp_pad_start = RESPONSE_START + n_resp
-                expected[resp_pad_start:STATE_START, :] = 0
-                expected[:, resp_pad_start:STATE_START] = 0
-
-                # Zero out rows/cols for padded metadata tokens.
-                meta_pad_start = METADATA_START + n_meta
-                expected[meta_pad_start:DISCRETE_ACTION_START, :] = 0
-                expected[:, meta_pad_start:DISCRETE_ACTION_START] = 0
-
-                # Zero out rows/cols for padded discrete action tokens.
-                disc_pad_start = DISCRETE_ACTION_START + n_disc
-                expected[disc_pad_start:TRAIN_PREFIX_LEN, :] = 0
-                expected[:, disc_pad_start:TRAIN_PREFIX_LEN] = 0
-
-                # Core bidir (video+lang+resp+state) cannot attend to subgoal, metadata, or discrete.
-                expected[:SUBGOAL_START, SUBGOAL_START:] = 0
-
-                # Subgoal tokens: bidir among themselves, can see core bidir.
-                # Cannot attend to metadata or discrete actions.
-                expected[SUBGOAL_START:METADATA_START, METADATA_START:] = 0
-
-                # Metadata tokens: bidir among themselves, can see core bidir + subgoal.
-                # Cannot attend to discrete action tokens.
-                expected[METADATA_START:DISCRETE_ACTION_START, DISCRETE_ACTION_START:] = 0
-
-                # Discrete action tokens: causal among themselves, can attend to
-                # everything before (core bidir + subgoal + metadata).
-                da_start = DISCRETE_ACTION_START
-                causal = torch.tril(torch.ones(n_disc, n_disc, dtype=torch.bool))
-                expected[da_start : da_start + n_disc, da_start : da_start + n_disc] = causal
-
-                assert torch.all(mask == expected), (
-                    f"VLM attention mask mismatch at batch {i}.\n"
-                    f"Diff indices: {(mask != expected).nonzero(as_tuple=False)[:20]}"
-                )
-            else:
-                # In inference, no discrete actions.
-                # Blocks (cumsum progression):
-                #   video + lang + response + state (bidir, cumsum=0)
-                #   | subgoal images (bidir block, cumsum=1)
-                #   | metadata (bidir block, cumsum=2)
-                n_lang = pads[LANG_START : LANG_START + PROMPT_MAX_LENGTH].sum().item()
-                n_resp = (
-                    pads[
-                        LANG_START + PROMPT_MAX_LENGTH : LANG_START + PROMPT_MAX_LENGTH + RESPONSE_MAX_LENGTH
-                    ]
-                    .sum()
-                    .item()
-                )
-                n_meta = pads[INFER_METADATA_START:INFER_PREFIX_LEN].sum().item()
-
-                expected = torch.ones(expected_len, expected_len, dtype=torch.bool)
-                lang_pad_start = LANG_START + n_lang
-                resp_start_infer = LANG_START + PROMPT_MAX_LENGTH
-                expected[lang_pad_start:resp_start_infer, :] = 0
-                expected[:, lang_pad_start:resp_start_infer] = 0
-
-                resp_pad_start = resp_start_infer + n_resp
-                state_start_infer = resp_start_infer + RESPONSE_MAX_LENGTH
-                expected[resp_pad_start:state_start_infer, :] = 0
-                expected[:, resp_pad_start:state_start_infer] = 0
-
-                # Zero out rows/cols for padded metadata tokens.
-                meta_pad_start_infer = INFER_METADATA_START + n_meta
-                expected[meta_pad_start_infer:INFER_PREFIX_LEN, :] = 0
-                expected[:, meta_pad_start_infer:INFER_PREFIX_LEN] = 0
-
-                # Core bidir cannot attend to subgoal or metadata.
-                expected[:INFER_SUBGOAL_START, INFER_SUBGOAL_START:] = 0
-
-                # Subgoal tokens: bidir among themselves, can see core bidir.
-                # Cannot attend to metadata.
-                expected[INFER_SUBGOAL_START:INFER_METADATA_START, INFER_METADATA_START:] = 0
-
-                assert torch.all(mask == expected), (
-                    f"VLM attention mask mismatch (inference) at batch {i}.\n"
-                    f"Diff indices: {(mask != expected).nonzero(as_tuple=False)[:20]}"
-                )
+    def _verify_vlm_attention_mask(
+        self, vlm_attention_mask, prefix_pad_masks, prefix_att_masks, inference_mode=False
+    ):
+        del inference_mode  # same rule as training
+        expected = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        assert torch.equal(vlm_attention_mask, expected), (
+            f"VLM attention mask mismatch vs make_att_2d_masks.\n"
+            f"Diff indices: {(vlm_attention_mask != expected).nonzero(as_tuple=False)[:20]}"
+        )
 
     def _verify_action_expert_attention_mask(
-        self, action_expert_attention_mask, prefix_pad_masks, suffix_pad_masks, inference_mode=False
+        self,
+        action_expert_attention_mask,
+        prefix_pad_masks,
+        suffix_pad_masks,
+        suffix_att_masks,
+        inference_mode=False,
     ):
-        cross_att = CROSS_ATT_TOKENS_INFER if inference_mode else CROSS_ATT_TOKENS_TRAIN
-        total_cols = cross_att + CHUNK_SIZE
-        assert action_expert_attention_mask.shape == (1, CHUNK_SIZE, total_cols)
-        assert action_expert_attention_mask.dtype == torch.bool
+        if inference_mode:
+            num_cross = prefix_pad_masks.shape[1]
+        else:
+            num_cross = prefix_pad_masks.shape[1] - DISCRETE_ACTION_MAX_LENGTH
 
-        for i in range(1):
-            mask = action_expert_attention_mask[i].cpu()
-            n_action = suffix_pad_masks[i].sum().item()
-
-            expected = torch.ones(CHUNK_SIZE, total_cols, dtype=torch.bool)
-
-            prefix_pads = prefix_pad_masks[i, :cross_att].cpu()
-            # Zero out columns where prefix tokens are padded.
-            for col in range(cross_att):
-                if not prefix_pads[col]:
-                    expected[:, col] = 0
-
-            # Zero out rows for padded action tokens.
-            expected[n_action:, :] = 0
-            # Zero out columns for padded action tokens in the suffix portion.
-            expected[:, cross_att + n_action :] = 0
-
-            assert torch.all(mask == expected), (
-                f"Action expert attention mask mismatch at batch {i}.\n"
-                f"Diff indices: {(mask != expected).nonzero(as_tuple=False)[:20]}"
-            )
+        expected = make_att_2d_masks(
+            suffix_pad_masks,
+            suffix_att_masks,
+            n_cross_att_tokens=num_cross,
+            cross_att_pad_masks=prefix_pad_masks[:, :num_cross],
+        )
+        assert torch.equal(action_expert_attention_mask, expected), (
+            f"Action expert attention mask mismatch vs make_att_2d_masks.\n"
+            f"Diff indices: {(action_expert_attention_mask != expected).nonzero(as_tuple=False)[:20]}"
+        )
 
     # ------------------------------------------------------------------
     # Main integration test
@@ -330,6 +237,7 @@ class TestPI07LowLevelPlannerIntegration:
 
         config = self._make_config()
         policy = PI07LowLevelPlannerPolicy(config, dataset_stats=lerobot_dataset_metadata.stats)
+        tokenizer = policy.model.language_tokenizer
 
         batch_size = 1
         batch = {
@@ -401,11 +309,13 @@ class TestPI07LowLevelPlannerIntegration:
             )
             result = original_embed_prefix(*args, **kwargs)
             captured["prefix_pad_masks"] = result[1].clone()
+            captured["prefix_att_masks"] = result[2].clone()
             return result
 
         def capture_embed_suffix(*args, **kwargs):
             result = original_embed_suffix(*args, **kwargs)
             captured["suffix_pad_masks"] = result[1].clone()
+            captured["suffix_att_masks"] = result[2].clone()
             return result
 
         policy.model.paligemma_with_expert.forward = capture_forward
@@ -431,7 +341,9 @@ class TestPI07LowLevelPlannerIntegration:
         # Verify all expected captures are present.
         for var in [
             "prefix_pad_masks",
+            "prefix_att_masks",
             "suffix_pad_masks",
+            "suffix_att_masks",
             "vlm_2d_attention_mask",
             "vlm_position_ids",
             "action_expert_2d_attention_mask",
@@ -444,18 +356,24 @@ class TestPI07LowLevelPlannerIntegration:
         assert captured["prefix_pad_masks"].dtype == torch.bool
         assert captured["suffix_pad_masks"].dtype == torch.bool
 
-        self._verify_pad_masks(captured["prefix_pad_masks"], captured["suffix_pad_masks"])
+        self._verify_pad_masks(captured["prefix_pad_masks"], captured["suffix_pad_masks"], tokenizer)
         self._verify_position_ids(
             captured["vlm_position_ids"],
             captured["action_expert_position_ids"],
             captured["prefix_pad_masks"],
             captured["suffix_pad_masks"],
+            tokenizer,
         )
-        self._verify_vlm_attention_mask(captured["vlm_2d_attention_mask"], captured["prefix_pad_masks"])
+        self._verify_vlm_attention_mask(
+            captured["vlm_2d_attention_mask"],
+            captured["prefix_pad_masks"],
+            captured["prefix_att_masks"],
+        )
         self._verify_action_expert_attention_mask(
             captured["action_expert_2d_attention_mask"],
             captured["prefix_pad_masks"],
             captured["suffix_pad_masks"],
+            captured["suffix_att_masks"],
         )
 
         assert isinstance(loss, dict)
@@ -485,11 +403,13 @@ class TestPI07LowLevelPlannerIntegration:
         def capture_embed_prefix_infer(*args, **kwargs):
             result = original_embed_prefix(*args, **kwargs)
             captured_infer["prefix_pad_masks"] = result[1].clone()
+            captured_infer["prefix_att_masks"] = result[2].clone()
             return result
 
         def capture_embed_suffix_infer(*args, **kwargs):
             result = original_embed_suffix(*args, **kwargs)
             captured_infer["suffix_pad_masks"] = result[1].clone()
+            captured_infer["suffix_att_masks"] = result[2].clone()
             return result
 
         policy.model.paligemma_with_expert.forward = capture_forward_infer
@@ -521,7 +441,9 @@ class TestPI07LowLevelPlannerIntegration:
 
         for var in [
             "prefix_pad_masks",
+            "prefix_att_masks",
             "suffix_pad_masks",
+            "suffix_att_masks",
             "vlm_2d_attention_mask",
             "vlm_position_ids",
             "action_expert_2d_attention_mask",
@@ -535,24 +457,30 @@ class TestPI07LowLevelPlannerIntegration:
         assert captured_infer["suffix_pad_masks"].dtype == torch.bool
 
         self._verify_pad_masks(
-            captured_infer["prefix_pad_masks"], captured_infer["suffix_pad_masks"], inference_mode=True
+            captured_infer["prefix_pad_masks"],
+            captured_infer["suffix_pad_masks"],
+            tokenizer,
+            inference_mode=True,
         )
         self._verify_position_ids(
             captured_infer["vlm_position_ids"],
             captured_infer["action_expert_position_ids"],
             captured_infer["prefix_pad_masks"],
             captured_infer["suffix_pad_masks"],
+            tokenizer,
             inference_mode=True,
         )
         self._verify_vlm_attention_mask(
             captured_infer["vlm_2d_attention_mask"],
             captured_infer["prefix_pad_masks"],
+            captured_infer["prefix_att_masks"],
             inference_mode=True,
         )
         self._verify_action_expert_attention_mask(
             captured_infer["action_expert_2d_attention_mask"],
             captured_infer["prefix_pad_masks"],
             captured_infer["suffix_pad_masks"],
+            captured_infer["suffix_att_masks"],
             inference_mode=True,
         )
 
