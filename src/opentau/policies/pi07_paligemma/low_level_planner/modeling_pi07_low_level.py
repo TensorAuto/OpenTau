@@ -836,8 +836,10 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
     def prepare_response(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
         """Tokenize the high-level planner subtask response into PaliGemma token IDs.
 
-        Wraps each response string as ``"Subtask: {response}<eos>"`` and
-        pads/truncates to ``response_max_length``.
+        Wraps each response string as ``"Subtask: {response}, "`` and
+        pads/truncates to ``response_max_length``. Uses ``add_special_tokens=False`` so
+        no BOS (or other special tokens) are inserted; the prefix already encodes a
+        ``"Subtask: "`` span in :meth:`PI07LowLevelPlannerFlowMatching.embed_prefix`.
 
         Args:
             batch: Batch dict containing ``"response"`` (list of strings).
@@ -846,8 +848,8 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             A tuple ``(response_tokens, response_masks)`` with shapes
             ``(B, response_max_length)``."""
         device = batch["state"].device
-        responses = batch["response"]
-        response_prompt = [f"Subtask: {response}, " for response in responses]
+        responses = batch["response"] if "response" in batch else [""] * batch["state"].shape[0]
+        response_prompt = [f"Subtask: {response}, " if response != "" else "" for response in responses]
         tokenized_response = self.language_tokenizer.__call__(
             response_prompt,
             padding="max_length",
@@ -855,6 +857,7 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             max_length=self.config.response_max_length,
             return_tensors="pt",
             truncation=True,
+            add_special_tokens=False,
         )
         response_tokens = tokenized_response["input_ids"].to(device=device)
         response_masks = tokenized_response["attention_mask"].to(device=device, dtype=torch.bool)
@@ -866,8 +869,9 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         Derives subgoal keys from ``config.image_features``: for each
         ``camera{k}`` the corresponding batch key is ``subgoal{k}`` (the
         naming convention used by ``LeRobotDataset._emit_optional_keys``).
-        At least one ``subgoal{k}`` key is required in ``batch``; absence
-        raises ``ValueError``.
+        If no ``subgoal{k}`` keys are present, a warning is logged and
+        zero-filled images with masks all ``False`` are returned (no subgoal
+        signal), matching a fully padded subgoal batch.
 
         Resizes each subgoal image to 224×224 with aspect-ratio padding and
         converts the pixel range from ``[0, 1]`` to ``[-1, 1]`` as expected
@@ -881,7 +885,8 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         Args:
             batch: Batch dict containing subgoal image tensors keyed as
                 ``subgoal{k}`` for each ``camera{k}`` in
-                ``config.image_features``. Required.
+                ``config.image_features``. If all are absent, see warning +
+                fallback above.
 
         Returns:
             A tuple ``(subgoal_images, subgoal_img_masks)`` of lists.
@@ -895,13 +900,16 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         missing_subgoal_img_keys = [key for key in subgoal_keys if key not in batch]
 
         if len(present_subgoal_img_keys) == 0:
-            raise ValueError(
-                f"All subgoal image features are missing from the batch. At least one expected. "
-                f"(batch: {batch.keys()}) (expected subgoal keys: {subgoal_keys})"
+            logging.getLogger(__name__).warning(
+                "All subgoal image features are missing from the batch; using zero tensors with "
+                "cleared masks (no subgoal conditioning). "
+                f"(batch keys: {list(batch.keys())}) (expected: {subgoal_keys})"
             )
 
         # Per-sample flag: True means the subgoal was dropped or absent.
-        subgoal_is_pad = batch.get("subgoal_is_pad")  # (B,) bool or None
+        subgoal_is_pad = batch.get(
+            "subgoal_is_pad", torch.zeros(batch["state"].shape[0], dtype=torch.bool)
+        )  # (B,) bool or None
 
         for key in present_subgoal_img_keys:
             subgoal_img = batch[key]
@@ -952,13 +960,14 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         """
 
         metadata = []
+        # safety conditioning if metadata are not passed by sample actions
         for speed, quality, mistake, speed_is_pad, quality_is_pad, mistake_is_pad in zip(
-            batch["speed"],
-            batch["quality"],
-            batch["mistake"],
-            batch["speed_is_pad"],
-            batch["quality_is_pad"],
-            batch["mistake_is_pad"],
+            batch.get("speed", torch.zeros(batch["state"].shape[0], dtype=torch.float32)),
+            batch.get("quality", torch.zeros(batch["state"].shape[0], dtype=torch.float32)),
+            batch.get("mistake", torch.zeros(batch["state"].shape[0], dtype=torch.float32)),
+            batch.get("speed_is_pad", torch.zeros(batch["state"].shape[0], dtype=torch.bool)),
+            batch.get("quality_is_pad", torch.zeros(batch["state"].shape[0], dtype=torch.bool)),
+            batch.get("mistake_is_pad", torch.zeros(batch["state"].shape[0], dtype=torch.bool)),
             strict=True,
         ):
             segments = []
@@ -971,7 +980,7 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             if not mistake_is_pad:
                 segments.append(f"Mistake: {str(mistake.item())}, ")
 
-            metadata.append(f"Metadata: {' '.join(segments)}")
+            metadata.append(f"Metadata: {' '.join(segments)}" if segments else "")
 
         device = batch["state"].device
         tokenized_metadata = self.language_tokenizer.__call__(
@@ -981,6 +990,7 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             max_length=self.config.metadata_max_length,
             return_tensors="pt",
             truncation=True,
+            add_special_tokens=False,
         )
         metadata_tokens = tokenized_metadata["input_ids"].to(device=device)
         metadata_masks = tokenized_metadata["attention_mask"].to(device=device, dtype=torch.bool)
