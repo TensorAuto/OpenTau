@@ -23,18 +23,13 @@ zero. Past-timestep tokens are dropped after the encoder so the output shape
 matches a single-image VLA.
 
 Key properties:
-  - Temporal attention re-uses each layer's own Q/K/V/O projections; the only
-    added learnable parameters are one zero-initialized scalar gate per
-    wrapped layer (``temporal_gate``), six in total at the default stride.
+  - Introduces no new learnable parameters on top of the pretrained SigLIP
+    weights (temporal attention re-uses each layer's own Q/K/V/O projections).
     Any pi05/pi05_continuous_state checkpoint can be loaded directly — the
-    space-time layers just wrap the existing SiglipEncoderLayer weights, and
-    the α-gate keys are simply missing (handled by ``strict=False`` loading,
-    leaving α at its zero init).
-  - All-T invariance at init: because α=0 initially, the encoder is byte-exact
-    to vanilla single-frame SigLIP on the current frame at every T (not just
-    T=1). Training drives α upward as the downstream expert learns to use
-    temporal signal. The explicit T=1 short-circuit is kept as belt-and-suspenders
-    and is still verified by the single-frame invariance tests.
+    space-time layers just wrap the existing SiglipEncoderLayer weights.
+  - Single-frame invariance: with ``T=1`` the output is byte-identical to
+    ``PaliGemmaModel.get_image_features`` (see the single-frame invariance
+    tests).
   - Convention: the current frame lives at the **last** time index
     (``t = T-1``). This matches
     ``src/opentau/datasets/factory.py:136`` (delta_timestamps) and
@@ -160,18 +155,17 @@ class SpaceTimeEncoderLayerWrapper(nn.Module):
 
     The wrapper **adopts** the original layer's submodules by reference —
     ``self_attn``, ``layer_norm1``, ``layer_norm2``, ``mlp`` — so its
-    ``state_dict`` keys for the adopted SigLIP submodules are **identical** to
-    a vanilla ``SiglipEncoderLayer``. The only new *learnable* state is a
-    single zero-initialized scalar ``temporal_gate`` (see below); the only
-    other new state is a non-persistent ``_temporal_pe`` buffer (excluded from
-    state_dict) and an internal ``_temporal_attn`` wrapper that holds a
-    by-reference pointer to ``self_attn`` (also excluded because it's kept in
-    a list).
+    ``state_dict`` keys are **identical** to a vanilla ``SiglipEncoderLayer``.
+    That means any pi05 / pi05_continuous_state checkpoint can load directly
+    into the wrapped layer without any key remapping. The only new state is
+    a non-persistent ``_temporal_pe`` buffer (excluded from state_dict) and
+    an internal ``_temporal_attn`` wrapper that holds a by-reference pointer
+    to ``self_attn`` (also excluded because it's kept in a list).
 
     The forward computes:
 
         h_pe  = h + e(t)                                   # broadcast over (B, N)
-        h     = h + α · temporal_attn( LN1(h_pe) )         # α = temporal_gate (scalar, zero-init)
+        h     = h + temporal_attn( LN1(h_pe) )             # new; causal over T
         # then the standard SigLIP block:
         h     = h + spatial_attn( LN1(h) )
         h     = h + MLP( LN2(h) )
@@ -184,20 +178,9 @@ class SpaceTimeEncoderLayerWrapper(nn.Module):
     also be bypassed.)
 
     Reusing ``layer_norm1`` for both the temporal and spatial sublayers keeps
-    the paper's "near-zero new learnable parameters" guarantee — only a single
-    scalar gate is added per wrapper. It is an intentional design choice: the
-    two attentions operate on different axes and the LayerNorm is applied to
-    different input tensors each time.
-
-    Why the scalar gate ``α``: the temporal sublayer reuses the SigLIP spatial
-    Q/K/V/O projections over the T axis, producing a non-trivial residual at
-    every wrapped layer even though no new *trained* parameters are introduced.
-    Applied to a fresh vanilla pi05 checkpoint, the cumulative drift through 6
-    wrapped layers shifts the current-frame features out of distribution for
-    the downstream action expert. Initializing ``α = 0`` makes the wrapper
-    byte-exact to a vanilla ``SiglipEncoderLayer`` at every T (not just T=1),
-    so any pi05 checkpoint's features flow unchanged into the expert; training
-    then drives ``α`` upward as the expert learns to use temporal signal.
+    the paper's "no new learnable parameters" guarantee. It is an intentional
+    design choice: the two attentions operate on different axes and the
+    LayerNorm is applied to different input tensors each time.
     """
 
     # Match the SiglipEncoderLayer class attribute so transformers'
@@ -227,14 +210,6 @@ class SpaceTimeEncoderLayerWrapper(nn.Module):
         # holds its reference in a list (see _TemporalSelfAttention) so the
         # params don't show up twice in state_dict.
         self._temporal_attn = _TemporalSelfAttention(self.self_attn)
-
-        # Zero-initialized scalar gate on the temporal residual. At α=0 this
-        # wrapper is byte-exact to a vanilla SiglipEncoderLayer at every T
-        # (not just T=1 via the short-circuit), so any pi05 checkpoint's
-        # features flow through unchanged at init. Training drives α > 0 as
-        # the action expert learns to use temporal signal. Kept in fp32 for
-        # stable scalar updates; cast to input dtype at use-site.
-        self.temporal_gate = nn.Parameter(torch.zeros(()))
 
         # Build the PE on the base layer's current device / dtype. The parent
         # vision_tower is often moved to GPU BEFORE this wrapper is inserted
@@ -329,9 +304,7 @@ class SpaceTimeEncoderLayerWrapper(nn.Module):
         t_out = self._temporal_attn(t_norm)
         # Residual on the pre-PE hidden (not on x_pe): PE is a transient
         # positional signal, not a feature perturbation to carry forward.
-        # ``temporal_gate`` (α) starts at 0, making this wrapper byte-exact to
-        # a vanilla SiglipEncoderLayer at init regardless of T.
-        t_res = rearrange(x, "b t n d -> (b n) t d") + self.temporal_gate.to(t_out.dtype) * t_out
+        t_res = rearrange(x, "b t n d -> (b n) t d") + t_out
         h_after_t = rearrange(t_res, "(b n) t d -> (b t) n d", n=n)
 
         # Spatial + MLP sublayers.
