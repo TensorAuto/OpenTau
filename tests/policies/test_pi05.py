@@ -67,12 +67,17 @@ class TestPI05Integration:
         prefix_pad_masks: tensor with shape (batch_size, seq_len)
         suffix_pad_masks: tensor with shape (batch_size, seq_len)
         inference_mode: boolean indicating if the pad masks were created using the forward method (training) or select_action method (inference)
+
+        Token layout (training, 858 total):
+            Images(512) | Prompt(256) | ResponseInd(3) | Response(52) | ActionInd(3) | DiscreteAction(32)
+        Token layout (inference, 771 total):
+            Images(512) | Prompt(256) | ResponseInd(3)
         """
-        assert prefix_pad_masks.shape[0] == 1
-        assert prefix_pad_masks.shape[1] == 852 if not inference_mode else 768
+        total_train, total_infer = 858, 771
+        expected_len = total_infer if inference_mode else total_train
+        assert prefix_pad_masks.shape == (1, expected_len)
         assert prefix_pad_masks.dtype == torch.bool
-        assert suffix_pad_masks.shape[0] == 1
-        assert suffix_pad_masks.shape[1] == 50
+        assert suffix_pad_masks.shape == (1, 50)
         assert suffix_pad_masks.dtype == torch.bool
 
         def _check_ones_before_zeros(mask_slice):
@@ -84,21 +89,20 @@ class TestPI05Integration:
                     first_zero_idx = idx
                     break
             if first_zero_idx is not None:
-                # All elements after first_zero_idx must be zero
                 assert all(v == 0 for v in mask[first_zero_idx:]), f"Zeros not contiguous at end: {mask}"
-                # All elements before first_zero_idx must be one
                 assert all(v == 1 for v in mask[:first_zero_idx]), f"Ones not contiguous at start: {mask}"
             else:
-                # All ones
                 assert all(v == 1 for v in mask), f"Expected all ones in {mask}"
 
         batch_size = prefix_pad_masks.shape[0]
         for i in range(batch_size):
             assert torch.all(prefix_pad_masks[i, :512] == 1)  # image tokens should not be padded
             _check_ones_before_zeros(prefix_pad_masks[i, 512:768])  # prompt tokens
+            assert torch.all(prefix_pad_masks[i, 768:771] == 1)  # response indicator (always present)
             if not inference_mode:
-                _check_ones_before_zeros(prefix_pad_masks[i, 820:852])  # discrete action tokens
-                _check_ones_before_zeros(prefix_pad_masks[i, 768:820])  # response tokens
+                _check_ones_before_zeros(prefix_pad_masks[i, 771:823])  # response tokens
+                assert torch.all(prefix_pad_masks[i, 823:826] == 1)  # action indicator (always present)
+                _check_ones_before_zeros(prefix_pad_masks[i, 826:858])  # discrete action tokens
 
             _check_ones_before_zeros(suffix_pad_masks[i, 0:50])  # action chunks
 
@@ -119,172 +123,136 @@ class TestPI05Integration:
         suffix_pad_masks: tensor with shape (batch_size, seq_len)
         inference_mode: boolean indicating if the position ids were created using the forward method (training) or select_action method (inference)
         """
-        assert prefix_position_ids.shape[0] == 1
-        assert prefix_position_ids.shape[1] == 852 if not inference_mode else 768
+        total_train, total_infer = 858, 771
+        expected_len = total_infer if inference_mode else total_train
+        assert prefix_position_ids.shape == (1, expected_len)
         assert prefix_position_ids.dtype == torch.long
-        assert suffix_position_ids.shape[0] == 1
-        assert suffix_position_ids.shape[1] == 50
+        assert suffix_position_ids.shape == (1, 50)
         assert suffix_position_ids.dtype == torch.long
 
         def _check_position_ids_with_padding(position_ids, pad_masks):
             """Check that position IDs increment correctly for non-padded tokens and stay the same for padded tokens."""
-            # Check that position IDs follow the rule: increment for non-padded tokens, stay same for padded tokens
             for i in range(1, len(position_ids)):
                 if pad_masks[i] == 1:  # non-padded token
-                    # Should increment from previous position
                     assert position_ids[i] == position_ids[i - 1] + 1, (
                         f"Position ID should increment at index {i}: {position_ids[i - 1]} -> {position_ids[i]}"
                     )
                 else:  # padded token
-                    # Should stay the same as previous position
                     assert position_ids[i] == position_ids[i - 1], (
                         f"Position ID should stay same at padded index {i}: {position_ids[i - 1]} -> {position_ids[i]}"
                     )
 
         batch_size = prefix_position_ids.shape[0]
         for i in range(batch_size):
-            # Check entire prefix position IDs array
             _check_position_ids_with_padding(prefix_position_ids[i], prefix_pad_masks[i])
-
-            # Check entire suffix position IDs array
             _check_position_ids_with_padding(suffix_position_ids[i], suffix_pad_masks[i])
 
-            # check that the prefix offset is correct
-            # the suffix position ids should start after the prefix position ids (minus the response tokens)
             if not inference_mode:
-                assert suffix_position_ids[i, 0] == prefix_position_ids[i, 820]
+                # Action expert positions start after cross-att tokens (excluding action indicator + discrete actions)
+                assert suffix_position_ids[i, 0] == prefix_position_ids[i, 823]
             else:
                 assert suffix_position_ids[i, 0] == last_prefix_offsets.item() + 1
 
     def _verify_vlm_attention_mask(self, vlm_attention_mask, prefix_pad_masks, inference_mode=False):
-        """Verify the VLM attention mask is correct.
+        """Verify the VLM attention mask follows a prefix-LM pattern.
 
-        vlm_attention_mask: tensor with shape (batch_size, seq_len, seq_len)
-        prefix_pad_masks: tensor with shape (batch_size, seq_len)
-        inference_mode: boolean indicating if the attention mask were created using the forward method (training) or select_action method (inference)
+        Token layout (training, 858):
+            [Images(512)][Prompt(256)] bidirectional | [RespInd(3)][Response(52)][ActInd(3)][Discrete(32)] causal
+        Token layout (inference, 771):
+            [Images(512)][Prompt(256)] bidirectional | [RespInd(3)] causal
+
+        Bidirectional tokens have full mutual attention. Causal tokens attend to
+        all bidirectional tokens plus causal tokens up to and including themselves.
+        Padded tokens neither attend nor are attended to.
         """
-        assert vlm_attention_mask.shape[0] == 1
-        assert vlm_attention_mask.shape[1] == 852 if not inference_mode else 768
-        assert vlm_attention_mask.shape[2] == 852 if not inference_mode else 768
+        total_train, total_infer = 858, 771
+        prompt_start = 512
+        causal_start = 768
+        response_start = 771
+        action_ind_start = 823
+        discrete_action_start = 826
+
+        total = total_infer if inference_mode else total_train
+        assert vlm_attention_mask.shape == (1, total, total)
         assert vlm_attention_mask.dtype == torch.bool
 
-        batch_size = vlm_attention_mask.shape[0]
-        for i in range(batch_size):
-            # construct correct attention mask
-            # see diagram here: https://drive.google.com/file/d/1x3pM8SoIf9rqAG4-rZxmVvrqkorqhU-s/view?usp=sharing
-            correct_vlm_attention_mask = torch.ones(852, 852, dtype=torch.bool)
+        for i in range(vlm_attention_mask.shape[0]):
+            correct = torch.zeros(total, total, dtype=torch.bool)
 
-            # pad tokens should not be attended to or attend to any other tokens
-            num_non_padded_prompt_tokens = prefix_pad_masks[i, 512:768].sum()
-            num_non_padded_response_tokens = prefix_pad_masks[i, 768:820].sum()
-            num_non_padded_discrete_action_tokens = prefix_pad_masks[i, 820:852].sum()
-            prompt_start_idx, response_start_idx, discrete_action_start_idx = 512, 768, 820
+            # Bidirectional block: full mutual attention (images + prompt)
+            correct[:causal_start, :causal_start] = 1
 
-            # set the masks for pad tokens in prompt to 0
-            correct_vlm_attention_mask[
-                prompt_start_idx + num_non_padded_prompt_tokens : response_start_idx, :
-            ] = 0
-            correct_vlm_attention_mask[
-                response_start_idx + num_non_padded_response_tokens : discrete_action_start_idx, :
-            ] = 0
-            correct_vlm_attention_mask[
-                discrete_action_start_idx + num_non_padded_discrete_action_tokens : 852, :
-            ] = 0
+            # Causal tokens attend to all bidirectional tokens
+            correct[causal_start:, :causal_start] = 1
 
-            correct_vlm_attention_mask[
-                :, prompt_start_idx + num_non_padded_prompt_tokens : response_start_idx
-            ] = 0
-            correct_vlm_attention_mask[
-                :, response_start_idx + num_non_padded_response_tokens : discrete_action_start_idx
-            ] = 0
-            correct_vlm_attention_mask[
-                :, discrete_action_start_idx + num_non_padded_discrete_action_tokens : 852
-            ] = 0
-
-            # nothing should attend to discrete action tokens (other than discrete action tokens)
-            correct_vlm_attention_mask[
-                :,
-                response_start_idx:,
-            ] = 0
-
-            correct_vlm_attention_mask[
-                discrete_action_start_idx : discrete_action_start_idx + num_non_padded_discrete_action_tokens,
-                response_start_idx : response_start_idx + num_non_padded_response_tokens,
-            ] = 1
-
-            # discrete action tokens should have a causal attention mask when attending to other discrete action tokens
-            # Create causal mask: each token can attend to itself and all previous tokens
-            discrete_action_causal_mask = torch.tril(
-                torch.ones(
-                    num_non_padded_discrete_action_tokens,
-                    num_non_padded_discrete_action_tokens,
-                    dtype=torch.bool,
-                )
+            # Causal self-attention (lower triangular)
+            causal_len = total - causal_start
+            correct[causal_start:, causal_start:] = torch.tril(
+                torch.ones(causal_len, causal_len, dtype=torch.bool)
             )
-            correct_vlm_attention_mask[
-                discrete_action_start_idx : discrete_action_start_idx + num_non_padded_discrete_action_tokens,
-                discrete_action_start_idx : discrete_action_start_idx + num_non_padded_discrete_action_tokens,
-            ] = discrete_action_causal_mask
 
-            response_causal_mask = torch.tril(
-                torch.ones(
-                    num_non_padded_response_tokens,
-                    num_non_padded_response_tokens,
-                    dtype=torch.bool,
-                )
-            )
-            correct_vlm_attention_mask[
-                response_start_idx : response_start_idx + num_non_padded_response_tokens,
-                response_start_idx : response_start_idx + num_non_padded_response_tokens,
-            ] = response_causal_mask
+            # Zero out padding: prompt section
+            num_np_prompt = prefix_pad_masks[i, prompt_start:causal_start].sum().item()
+            prompt_pad_start = prompt_start + num_np_prompt
+            correct[prompt_pad_start:causal_start, :] = 0
+            correct[:, prompt_pad_start:causal_start] = 0
 
-            # discrete action tokens are not used in inference
-            if inference_mode:
-                correct_vlm_attention_mask = correct_vlm_attention_mask[:768, :768]
+            if not inference_mode:
+                # Response indicator (768-770): never padded — no masking needed
+                # Response section padding
+                num_np_resp = prefix_pad_masks[i, response_start:action_ind_start].sum().item()
+                resp_pad_start = response_start + num_np_resp
+                correct[resp_pad_start:action_ind_start, :] = 0
+                correct[:, resp_pad_start:action_ind_start] = 0
 
-            assert torch.all(vlm_attention_mask[i].cpu() == correct_vlm_attention_mask.cpu())
+                # Action indicator (823-825): never padded — no masking needed
+                # Discrete action section padding
+                num_np_da = prefix_pad_masks[i, discrete_action_start:total_train].sum().item()
+                da_pad_start = discrete_action_start + num_np_da
+                correct[da_pad_start:total_train, :] = 0
+                correct[:, da_pad_start:total_train] = 0
+
+            assert torch.all(vlm_attention_mask[i].cpu() == correct.cpu())
 
     def _verify_action_expert_attention_mask(
         self, action_expert_attention_mask, prefix_pad_masks, suffix_pad_masks
     ):
         """Verify the action expert attention mask is correct.
 
-        action_expert_attention_mask: tensor with shape (batch_size, seq_len, seq_len)
-        prefix_pad_masks: tensor with shape (batch_size, seq_len)
-        suffix_pad_masks: tensor with shape (batch_size, seq_len)
+        The action expert cross-attends to 823 prefix tokens (everything except action
+        indicator + discrete actions) and has 50 action tokens, giving shape (50, 873).
+
+        Cross-att layout (823 tokens):
+            Images(512) | Prompt(256) | ResponseInd(3) | Response(52)
         """
-        assert action_expert_attention_mask.shape[0] == 1
-        assert action_expert_attention_mask.shape[1] == 50
-        assert action_expert_attention_mask.shape[2] == 870
+        n_cross = 823
+        n_suffix = 50
+        total_attn = n_cross + n_suffix  # 873
+        prompt_start = 512
+        causal_start = 768
+        response_start = 771
+
+        assert action_expert_attention_mask.shape == (1, n_suffix, total_attn)
         assert action_expert_attention_mask.dtype == torch.bool
 
-        batch_size = action_expert_attention_mask.shape[0]
-        for i in range(batch_size):
-            # construct correct attention mask
-            # see diagram here: https://drive.google.com/file/d/19oKbjVdPBQzXF_Wt6PhfIRY3RaAxUGnd/view?usp=sharing
-            correct_action_expert_attention_mask = torch.ones(50, 870, dtype=torch.bool)
+        for i in range(action_expert_attention_mask.shape[0]):
+            correct = torch.ones(n_suffix, total_attn, dtype=torch.bool)
 
-            # pad tokens should not be attended to or attend to any other tokens
-            num_non_padded_action_tokens = suffix_pad_masks[i, 0:50].sum()
-            num_non_padded_prompt_tokens = prefix_pad_masks[i, 512:768].sum()
-            num_non_padded_response_tokens = prefix_pad_masks[i, 768:820].sum()
-            action_start_idx, prompt_start_idx, response_start_idx = 820, 512, 768
-            # set attention mask for prompt pad tokens to 0
-            correct_action_expert_attention_mask[
-                :, prompt_start_idx + num_non_padded_prompt_tokens : response_start_idx
-            ] = 0
+            num_np_action = suffix_pad_masks[i, :n_suffix].sum().item()
+            num_np_prompt = prefix_pad_masks[i, prompt_start:causal_start].sum().item()
+            num_np_resp = prefix_pad_masks[i, response_start:n_cross].sum().item()
 
-            correct_action_expert_attention_mask[
-                :, response_start_idx + num_non_padded_response_tokens : action_start_idx
-            ] = 0
+            # Zero out padded prompt columns (response indicator 768-770 is never padded)
+            correct[:, prompt_start + num_np_prompt : causal_start] = 0
 
-            # set attention mask for action pad tokens to 0
-            correct_action_expert_attention_mask[num_non_padded_action_tokens:, :] = 0
-            correct_action_expert_attention_mask[:, action_start_idx + num_non_padded_action_tokens :] = 0
+            # Zero out padded response columns
+            correct[:, response_start + num_np_resp : n_cross] = 0
 
-            assert torch.all(
-                action_expert_attention_mask[i].cpu() == correct_action_expert_attention_mask.cpu()
-            )
+            # Zero out padded action rows and columns
+            correct[num_np_action:, :] = 0
+            correct[:, n_cross + num_np_action :] = 0
+
+            assert torch.all(action_expert_attention_mask[i].cpu() == correct.cpu())
 
     @pytest.mark.gpu
     @pytest.mark.slow  # ~1 mins
