@@ -381,20 +381,25 @@ class TestPI07LowLevelPlannerIntegration:
             return original_paligemma_forward(*args, **kwargs)
 
         def capture_embed_prefix(*args, **kwargs):
-            args_list = list(args)
             # Truncate discrete actions to inject padding (same workaround as PI05 test).
             half = DISCRETE_ACTION_MAX_LENGTH // 2
-            args_list[-2] = torch.cat(
-                (args_list[-2][:, :half], torch.zeros((1, half), device=args_list[-2].device)), dim=-1
-            )
-            args_list[-1] = torch.cat(
+            discrete_actions = kwargs["discrete_actions"]
+            discrete_action_masks = kwargs["discrete_action_masks"]
+            kwargs["discrete_actions"] = torch.cat(
                 (
-                    args_list[-1][:, :half],
-                    torch.zeros((1, half), dtype=torch.bool, device=args_list[-1].device),
+                    discrete_actions[:, :half],
+                    torch.zeros((1, half), dtype=discrete_actions.dtype, device=discrete_actions.device),
                 ),
                 dim=-1,
             )
-            result = original_embed_prefix(*tuple(args_list), **kwargs)
+            kwargs["discrete_action_masks"] = torch.cat(
+                (
+                    discrete_action_masks[:, :half],
+                    torch.zeros((1, half), dtype=torch.bool, device=discrete_action_masks.device),
+                ),
+                dim=-1,
+            )
+            result = original_embed_prefix(*args, **kwargs)
             captured["prefix_pad_masks"] = result[1].clone()
             return result
 
@@ -552,3 +557,88 @@ class TestPI07LowLevelPlannerIntegration:
         )
 
         assert action.shape == (1, MAX_ACTION_DIM)
+
+
+class TestPI07LowLevelPlannerRegression:
+    """GPU regression tests pinning the low-level planner signature/dtype fixes.
+
+    Covers the changes made to ``embed_prefix``, ``embed_suffix``,
+    ``prepare_metadata``, and the metadata-zip ``strict=True`` switch.
+    """
+
+    @staticmethod
+    def _make_policy(lerobot_dataset_metadata) -> PI07LowLevelPlannerPolicy:
+        config = TestPI07LowLevelPlannerIntegration._make_config()
+        policy = PI07LowLevelPlannerPolicy(config, dataset_stats=lerobot_dataset_metadata.stats)
+        policy.to(dtype=torch.bfloat16, device="cuda")
+        return policy
+
+    @staticmethod
+    def _make_metadata_batch(batch_size: int) -> dict[str, torch.Tensor]:
+        return {
+            "state": torch.randn(batch_size, N_OBS_STEPS, MAX_STATE_DIM, device="cuda", dtype=torch.bfloat16),
+            "speed": torch.tensor([500] * batch_size, device="cuda"),
+            "quality": torch.tensor([3] * batch_size, device="cuda"),
+            "mistake": torch.tensor([0] * batch_size, device="cuda"),
+            "speed_is_pad": torch.tensor([False] * batch_size, device="cuda"),
+            "quality_is_pad": torch.tensor([False] * batch_size, device="cuda"),
+            "mistake_is_pad": torch.tensor([False] * batch_size, device="cuda"),
+        }
+
+    @pytest.mark.gpu
+    @pytest.mark.slow
+    def test_prepare_metadata_always_returns_tensors(self, lerobot_dataset_metadata):
+        """prepare_metadata returns (Tensor, Tensor) — never (None, None) — with the documented shapes."""
+        policy = self._make_policy(lerobot_dataset_metadata)
+        batch = self._make_metadata_batch(batch_size=2)
+
+        tokens, masks = policy.prepare_metadata(batch)
+
+        assert isinstance(tokens, torch.Tensor)
+        assert isinstance(masks, torch.Tensor)
+        assert tokens.shape == (2, METADATA_MAX_LENGTH)
+        assert masks.shape == (2, METADATA_MAX_LENGTH)
+        assert masks.dtype == torch.bool
+
+    @pytest.mark.gpu
+    @pytest.mark.slow
+    def test_prepare_metadata_zip_strict_catches_mismatch(self, lerobot_dataset_metadata):
+        """The ``strict=True`` zip in prepare_metadata raises on length mismatch."""
+        policy = self._make_policy(lerobot_dataset_metadata)
+        batch = self._make_metadata_batch(batch_size=2)
+        # Truncate quality to length 1 to break the zip.
+        batch["quality"] = batch["quality"][:1]
+        batch["quality_is_pad"] = batch["quality_is_pad"][:1]
+
+        with pytest.raises(ValueError):
+            policy.prepare_metadata(batch)
+
+    @pytest.mark.gpu
+    @pytest.mark.slow
+    def test_embed_suffix_returns_bool_att_masks(self, lerobot_dataset_metadata):
+        """The suffix att_masks must be bool, not embs.dtype (was a copy-paste bug)."""
+        policy = self._make_policy(lerobot_dataset_metadata)
+
+        bsize = 1
+        noisy_actions = torch.randn(bsize, CHUNK_SIZE, MAX_ACTION_DIM, device="cuda", dtype=torch.bfloat16)
+        timestep = torch.zeros(bsize, CHUNK_SIZE, device="cuda", dtype=torch.bfloat16)
+
+        _, _, att_masks, _ = policy.model.embed_suffix(noisy_actions, timestep)
+
+        assert att_masks.dtype == torch.bool, f"Expected torch.bool, got {att_masks.dtype}"
+
+    @pytest.mark.gpu
+    @pytest.mark.slow
+    def test_embed_prefix_metadata_response_are_required(self):
+        """response_tokens / response_masks / metadata_tokens / metadata_masks are positional, no defaults."""
+        import inspect
+
+        from opentau.policies.pi07_paligemma.low_level_planner.modeling_pi07_low_level import (
+            PI07LowLevelPlannerFlowMatching,
+        )
+
+        params = inspect.signature(PI07LowLevelPlannerFlowMatching.embed_prefix).parameters
+        for name in ("response_tokens", "response_masks", "metadata_tokens", "metadata_masks"):
+            assert params[name].default is inspect.Parameter.empty, (
+                f"{name} should be a required parameter (no default), got default={params[name].default}"
+            )

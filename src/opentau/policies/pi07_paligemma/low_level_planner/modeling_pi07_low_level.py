@@ -866,6 +866,8 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         Derives subgoal keys from ``config.image_features``: for each
         ``camera{k}`` the corresponding batch key is ``subgoal{k}`` (the
         naming convention used by ``LeRobotDataset._emit_optional_keys``).
+        At least one ``subgoal{k}`` key is required in ``batch``; absence
+        raises ``ValueError``.
 
         Resizes each subgoal image to 224×224 with aspect-ratio padding and
         converts the pixel range from ``[0, 1]`` to ``[-1, 1]`` as expected
@@ -879,7 +881,7 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         Args:
             batch: Batch dict containing subgoal image tensors keyed as
                 ``subgoal{k}`` for each ``camera{k}`` in
-                ``config.image_features``.
+                ``config.image_features``. Required.
 
         Returns:
             A tuple ``(subgoal_images, subgoal_img_masks)`` of lists.
@@ -934,20 +936,19 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
         return subgoal_images, subgoal_img_masks
 
-    def prepare_metadata(self, batch: dict[str, Tensor]) -> tuple[Tensor | None, Tensor | None]:
-        """Tokenize optional episode metadata into PaliGemma token IDs.
+    def prepare_metadata(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+        """Tokenize episode metadata into PaliGemma token IDs.
 
         Wraps each metadata string as ``"Metadata: {meta}<eos>"`` and
         pads/truncates to ``metadata_max_length``.
 
         Args:
-            batch: Batch dict, optionally containing ``"metadata"``
-                (list of strings).
+            batch: Batch dict containing ``"speed"``, ``"quality"``,
+                ``"mistake"`` and their corresponding ``_is_pad`` flags.
 
         Returns:
             A tuple ``(metadata_tokens, metadata_masks)`` with shapes
-            ``(B, metadata_max_length)``, or ``(None, None)`` if metadata
-            is absent.
+            ``(B, metadata_max_length)``.
         """
 
         metadata = []
@@ -958,19 +959,19 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             batch["speed_is_pad"],
             batch["quality_is_pad"],
             batch["mistake_is_pad"],
-            strict=False,
+            strict=True,
         ):
-            meta = ""
+            segments = []
             if not speed_is_pad:
-                meta += f"Speed: {str(speed.item())} "
+                segments.append(f"Speed: {str(speed.item())}")
 
             if not quality_is_pad:
-                meta += f"Quality: {str(quality.item())} "
+                segments.append(f"Quality: {str(quality.item())}")
 
             if not mistake_is_pad:
-                meta += f"Mistake: {str(mistake.item())}"
+                segments.append(f"Mistake: {str(mistake.item())}")
 
-            metadata.append(f"Metadata: {meta}<eos>")
+            metadata.append(f"Metadata: {' '.join(segments)}<eos>")
 
         device = batch["state"].device
         tokenized_metadata = self.language_tokenizer.__call__(
@@ -1026,12 +1027,11 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         super().__init__()
         self.config = config
 
-        load_pretrained_paligemma = self.config.init_strategy == "expert_only_he_init"
         paligemma_with_expert_config = PaliGemmaWithExpertConfig(
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=self.config.train_expert_only,
             attention_implementation=self.config.attention_implementation,
-            load_pretrained_paligemma=load_pretrained_paligemma,
+            load_pretrained_paligemma=False,
             discrete_action_vocab_size=discrete_action_vocab_size,
             dropout=self.config.dropout,
         )
@@ -1061,29 +1061,6 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         self.time_mlp_in = nn.Linear(self.config.proj_width, self.config.proj_width)
         self.time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
 
-        self._init_model()
-
-    def _init_weights(self, module: nn.Module) -> None:
-        if isinstance(module, nn.Linear):
-            nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.LayerNorm):
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
-
-    def _init_model(self) -> None:
-        if self.config.init_strategy == "no_init":
-            return
-        elif self.config.init_strategy == "full_he_init":
-            for m in self.modules():
-                self._init_weights(m)
-        elif self.config.init_strategy == "expert_only_he_init":
-            for m in self.paligemma_with_expert.gemma_expert.modules():
-                self._init_weights(m)
-        else:
-            raise ValueError(f"Invalid init strategy: {self.config.init_strategy}")
-
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
         return torch.normal(mean=0.0, std=1.0, size=shape, dtype=torch.float32, device=device)
 
@@ -1111,15 +1088,15 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         lang_tokens: Tensor,
         lang_masks: Tensor,
         state: Tensor,
+        response_tokens: Tensor,
+        response_masks: Tensor,
+        metadata_tokens: Tensor,
+        metadata_masks: Tensor,
         discrete_actions: Tensor | None = None,
         discrete_action_masks: Tensor | None = None,
         obs_history_is_pad: Tensor | None = None,
         subgoal_images: list[Tensor] | None = None,
         subgoal_img_masks: list[Tensor] | None = None,
-        metadata_tokens: Tensor | None = None,
-        metadata_masks: Tensor | None = None,
-        response_tokens: Tensor | None = None,
-        response_masks: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Embed all prefix modalities and build the 1-D attention pattern.
 
@@ -1143,20 +1120,18 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             lang_tokens: Language token IDs ``(B, prompt_max_length)``.
             lang_masks: Boolean mask for language tokens.
             state: Temporal state ``(B, T, max_state_dim)``.
+            response_tokens: Subtask response token IDs
+                ``(B, response_max_length)``.
+            response_masks: Boolean mask for response tokens.
+            metadata_tokens: Metadata token IDs ``(B, metadata_max_length)``.
+            metadata_masks: Boolean mask for metadata tokens.
             discrete_actions: Optional FAST token IDs
                 ``(B, discrete_action_max_length)``. Provided during training.
             discrete_action_masks: Boolean mask for discrete actions.
             obs_history_is_pad: Optional ``(B, T)`` bool tensor; ``True`` for
                 padded timesteps. Used to mask state tokens during training.
-            subgoal_images: Optional list of subgoal image tensors
-                ``(B, C, H, W)``.
-            subgoal_img_masks: Optional list of boolean masks ``(B,)``.
-            metadata_tokens: Optional metadata token IDs
-                ``(B, metadata_max_length)``.
-            metadata_masks: Optional boolean mask for metadata tokens.
-            response_tokens: Optional subtask response token IDs
-                ``(B, response_max_length)``.
-            response_masks: Optional boolean mask for response tokens.
+            subgoal_images: List of subgoal image tensors ``(B, C, H, W)``.
+            subgoal_img_masks: List of boolean masks ``(B,)``.
 
         Returns:
             A tuple ``(embs, pad_masks, att_masks)`` where:
@@ -1170,7 +1145,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         att_masks = []
         bsize = lang_tokens.shape[0]
 
-        for vid, vid_mask in zip(videos, vid_masks, strict=False):
+        for vid, vid_mask in zip(videos, vid_masks, strict=True):
             vid_emb = self.embed_video(vid)  # (B, num_video_tokens, vlm_hidden)
             vid_emb = vid_emb.to(dtype=_preferred_dtype())
 
@@ -1216,13 +1191,12 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         for (
             subgoal_img,
             subgoal_img_mask,
-        ) in zip(subgoal_images, subgoal_img_masks, strict=False):
+        ) in zip(subgoal_images, subgoal_img_masks, strict=True):
             subgoal_img_emb = self.paligemma_with_expert.embed_image(subgoal_img)
             subgoal_img_emb = subgoal_img_emb.to(dtype=_preferred_dtype())
 
             # image embeddings don't need to be unnormalized because `fix/lerobot_openpi` branch of huggingface
             # already removed the normalization inside PaliGemma
-            pass
 
             bsize, num_subgoal_img_embs = subgoal_img_emb.shape[:2]
             subgoal_img_mask = subgoal_img_mask[:, None].expand(bsize, num_subgoal_img_embs)
@@ -1305,7 +1279,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
+        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=embs.device)
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
         return embs, pad_masks, att_masks, adarms_cond
@@ -1371,15 +1345,15 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             lang_tokens,
             lang_masks,
             state,
-            discrete_actions,
-            discrete_action_masks,
+            response_tokens,
+            response_masks,
+            metadata_tokens,
+            metadata_masks,
+            discrete_actions=discrete_actions,
+            discrete_action_masks=discrete_action_masks,
             obs_history_is_pad=obs_history_is_pad,
             subgoal_images=subgoal_images,
             subgoal_img_masks=subgoal_img_masks,
-            metadata_tokens=metadata_tokens,
-            metadata_masks=metadata_masks,
-            response_tokens=response_tokens,
-            response_masks=response_masks,
         )
 
         vlm_2d_attention_mask = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
@@ -1545,12 +1519,12 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             lang_tokens,
             lang_masks,
             state,
+            response_tokens,
+            response_masks,
+            metadata_tokens,
+            metadata_masks,
             subgoal_images=subgoal_images,
             subgoal_img_masks=subgoal_img_masks,
-            metadata_tokens=metadata_tokens,
-            metadata_masks=metadata_masks,
-            response_tokens=response_tokens,
-            response_masks=response_masks,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1

@@ -20,9 +20,7 @@ for the PI07 high level planner. It includes settings for the model architecture
 optimization, scheduling, and data processing.
 """
 
-import logging
 from dataclasses import dataclass, field
-from typing import Literal
 
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
@@ -66,9 +64,6 @@ class PI07HighLevelPlannerConfig(PreTrainedConfig):
             strings. Defaults to 52.
         dropout: Dropout rate applied in the transformer expert.
             Defaults to 0.1.
-        init_strategy: Weight initialization strategy. One of ``"no_init"``,
-            ``"full_he_init"``, ``"expert_only_he_init"``. Defaults to
-            ``"full_he_init"``.
         attention_implementation: Attention backend — ``"eager"`` or
             ``"fa2"`` (Flash Attention 2). Defaults to ``"eager"``.
         freeze_vision_encoder: Whether to freeze the SigLIP vision encoder
@@ -118,9 +113,6 @@ class PI07HighLevelPlannerConfig(PreTrainedConfig):
     # Dropout
     dropout: float = 0.1
 
-    # Initialization strategy
-    init_strategy: Literal["no_init", "full_he_init", "expert_only_he_init"] = "full_he_init"
-
     # Attention utils
     attention_implementation: str = "eager"
 
@@ -142,8 +134,6 @@ class PI07HighLevelPlannerConfig(PreTrainedConfig):
 
         Raises:
             ValueError: If ``n_obs_steps`` is not 1.
-            AssertionError: If ``init_strategy`` is not one of the allowed
-                values.
         """
         super().__post_init__()
 
@@ -151,19 +141,6 @@ class PI07HighLevelPlannerConfig(PreTrainedConfig):
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
-
-        assert self.init_strategy in ["no_init", "full_he_init", "expert_only_he_init"], (
-            f"Invalid init strategy: {self.init_strategy} must be one of ['no_init', 'full_he_init', 'expert_only_he_init']"
-        )
-
-        if self.init_strategy == "expert_only_he_init" and self.pretrained_path == "lerobot/pi05":
-            raise ValueError(
-                "You cannot load pretrained PI0 model when init_strategy is 'expert_only_he_init' due to differences in PaliGemma tokenizer vocab sizes."
-            )
-
-        if self.pretrained_path is not None and self.pretrained_path != "lerobot/pi05":
-            logging.info("Setting init_strategy to 'no_init' because we are resuming from a checkpoint.")
-            self.init_strategy = "no_init"
 
     def validate_features(self) -> None:
         """Adds placeholder camera features for empty camera slots.

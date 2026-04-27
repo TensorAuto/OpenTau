@@ -22,9 +22,7 @@ continuous token per timestep), and supports optional subtask response,
 subgoal image, and metadata conditioning.
 """
 
-import logging
 from dataclasses import dataclass, field
-from typing import Literal
 
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
@@ -70,8 +68,6 @@ class PI07lowlevelPlannerConfig(PreTrainedConfig):
         num_steps: Number of flow-matching denoising steps. Defaults to 10.
         max_delay: Maximum number of prefix action steps for real-time
             inference. Defaults to 0.
-        init_strategy: Weight initialization strategy. Defaults to
-            ``"full_he_init"``.
         attention_implementation: Attention backend (``"eager"`` or
             ``"fa2"``). Defaults to ``"eager"``.
         freeze_vision_encoder: Whether to freeze V-JEPA2. Defaults to True.
@@ -142,9 +138,6 @@ class PI07lowlevelPlannerConfig(PreTrainedConfig):
     # Real Time Inference
     max_delay: int = 0
 
-    # Initialization strategy
-    init_strategy: Literal["no_init", "full_he_init", "expert_only_he_init"] = "full_he_init"
-
     # Attention utils
     attention_implementation: str = "eager"
 
@@ -204,19 +197,6 @@ class PI07lowlevelPlannerConfig(PreTrainedConfig):
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
                 f"{self.n_action_steps} for `n_action_steps` and {self.chunk_size} for `chunk_size`."
             )
-
-        assert self.init_strategy in ["no_init", "full_he_init", "expert_only_he_init"], (
-            f"Invalid init strategy: {self.init_strategy} must be one of ['no_init', 'full_he_init', 'expert_only_he_init']"
-        )
-
-        if self.init_strategy == "expert_only_he_init" and self.pretrained_path == "lerobot/pi05":
-            raise ValueError(
-                "You cannot load pretrained PI05 model when init_strategy is 'expert_only_he_init' due to differences in PaliGemma tokenizer vocab sizes."
-            )
-
-        if self.pretrained_path is not None and self.pretrained_path != "lerobot/pi05":
-            logging.info("Setting init_strategy to 'no_init' because we are resuming from a checkpoint.")
-            self.init_strategy = "no_init"
 
         if self.max_delay > self.chunk_size:
             raise ValueError(

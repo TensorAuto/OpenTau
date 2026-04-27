@@ -487,7 +487,7 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
         Args:
             batch: Batch of training data. Expected keys include images,
                 ``"prompt"``, ``"state"``, ``"past_memory"``, ``"response"``,
-                and ``"memory"``.
+                and ``"next_memory"``.
 
         Returns:
             A dict with ``"MSE"`` (always zero, kept for interface
@@ -512,7 +512,7 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
         )  # in response_masks we have True for real tokens and False for padded tokens
 
         # memory prediction is to predict the memory . It will attend to image and language inputs.
-        memory_tokens, memory_masks = self.prepare_memory(
+        memory_tokens, memory_masks = self.prepare_next_memory(
             batch
         )  # in memory_masks we have True for real tokens and False for padded tokens
         losses = self.model.forward(
@@ -676,19 +676,19 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
             batch["speed_is_pad"],
             batch["quality_is_pad"],
             batch["mistake_is_pad"],
-            strict=False,
+            strict=True,
         ):
-            meta = ""
+            segments = []
             if not speed_is_pad:
-                meta += f"Speed: {str(speed.item())} "
+                segments.append(f"Speed: {str(speed.item())}")
 
             if not quality_is_pad:
-                meta += f"Quality: {str(quality.item())} "
+                segments.append(f"Quality: {str(quality.item())}")
 
             if not mistake_is_pad:
-                meta += f"Mistake: {str(mistake.item())}"
+                segments.append(f"Mistake: {str(mistake.item())}")
 
-            metadata.append(f"Metadata: {meta}<eos>")
+            metadata.append(f"Metadata: {' '.join(segments)}<eos>")
 
         device = batch["state"].device
         tokenized_metadata = self.language_tokenizer.__call__(
@@ -741,15 +741,15 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
 
         return response_tokens, response_masks
 
-    def prepare_memory(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+    def prepare_next_memory(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
         """Tokenizes the target updated memory for training.
 
         Wraps each memory string with an ``<eos>`` suffix, then tokenizes and
         pads to ``memory_max_length``.
 
         Args:
-            batch: Batch containing ``"memory"`` (list of memory strings) and
-                ``"state"`` (used only to determine the device).
+            batch: Batch containing ``"next_memory"`` (list of target memory
+                strings) and ``"state"`` (used only to determine the device).
 
         Returns:
             A tuple ``(memory_tokens, memory_masks)`` where:
@@ -760,10 +760,10 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
         """
 
         device = batch["state"].device
-        memory = batch["memory"]
+        next_memory = batch["next_memory"]
 
-        # if '' is found in response then response is not for loss calculation (used for robotic dataset with no subtask), so add pad token to the response.
-        memory_prompt = [f"{mem}<eos>" for mem in memory]
+        # if '' is found in next_memory then it is not for loss calculation (used for robotic dataset with no subtask), so add pad token.
+        memory_prompt = [f"{mem}<eos>" for mem in next_memory]
 
         tokenized_memory = self.language_tokenizer.__call__(
             memory_prompt,
@@ -824,49 +824,17 @@ class PI07HighLevelPlannerModel(nn.Module):
         super().__init__()
         self.config = config
 
-        load_pretrained_paligemma = (
-            self.config.init_strategy == "expert_only_he_init"
-        )  # only load pretrained paligemma if we are He-initializing the expert only
         paligemma_with_expert_config = PaliGemmaWithExpertConfig(
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=False,
             attention_implementation=self.config.attention_implementation,
-            load_pretrained_paligemma=load_pretrained_paligemma,
+            load_pretrained_paligemma=False,
             discrete_action_vocab_size=discrete_action_vocab_size,
             dropout=self.config.dropout,
         )
         self.paligemma_with_expert = PaliGemmaWithExpertModel(paligemma_with_expert_config)
 
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
-
-        self._init_model()
-
-    def _init_weights(self, module: nn.Module) -> None:
-        """Initialize weights using He (Kaiming) initialization.
-
-        Args:
-            module: The module to initialize.
-        """
-        if isinstance(module, nn.Linear):
-            nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.LayerNorm):
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
-
-    def _init_model(self) -> None:
-        """Initialize the model weights based on the configuration."""
-        if self.config.init_strategy == "no_init":
-            return
-        elif self.config.init_strategy == "full_he_init":
-            for m in self.modules():
-                self._init_weights(m)
-        elif self.config.init_strategy == "expert_only_he_init":
-            for m in self.paligemma_with_expert.gemma_expert.modules():
-                self._init_weights(m)
-        else:
-            raise ValueError(f"Invalid init strategy: {self.config.init_strategy}")
 
     def embed_prefix(
         self,
