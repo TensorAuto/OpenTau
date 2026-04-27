@@ -23,6 +23,7 @@ logic for creating fresh policies or loading pretrained ones, as well as
 parsing features from datasets or environments to properly configure the policies.
 """
 
+import warnings
 from typing import Optional
 
 import numpy as np
@@ -34,7 +35,6 @@ from opentau.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from opentau.datasets.utils import dataset_to_policy_features
 from opentau.policies.pi0.configuration_pi0 import PI0Config
 from opentau.policies.pi05.configuration_pi05 import PI05Config
-from opentau.policies.pi05_continuous_state.configuration_pi05 import PI05ContinuousStateConfig
 from opentau.policies.pi05_mem.configuration_pi05 import PI05MemConfig
 from opentau.policies.pretrained import PreTrainedPolicy
 from opentau.policies.value.configuration_value import ValueConfig
@@ -62,9 +62,14 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
 
         return PI05Policy
     elif name == "pi05_continuous_state":
-        from opentau.policies.pi05_continuous_state.modeling_pi05 import PI05ContinuousStatePolicy
+        warnings.warn(
+            "pi05_continuous_state is deprecated. Use pi05 with state_type='continuous' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        from opentau.policies.pi05.modeling_pi05 import PI05Policy
 
-        return PI05ContinuousStatePolicy
+        return PI05Policy
     elif name == "pi05_mem":
         from opentau.policies.pi05_mem.modeling_pi05 import PI05MemPolicy
 
@@ -95,7 +100,13 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
     elif policy_type == "pi05":
         return PI05Config(**kwargs)
     elif policy_type == "pi05_continuous_state":
-        return PI05ContinuousStateConfig(**kwargs)
+        warnings.warn(
+            "pi05_continuous_state is deprecated. Use pi05 with state_type='continuous' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        kwargs.setdefault("state_type", "continuous")
+        return PI05Config(**kwargs)
     elif policy_type == "pi05_mem":
         return PI05MemConfig(**kwargs)
     elif policy_type == "value":

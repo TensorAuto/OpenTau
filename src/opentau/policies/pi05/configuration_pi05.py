@@ -20,7 +20,9 @@ for the PI05 Vision-Language-Action Flow Model. It includes settings for the mod
 optimization, scheduling, and data processing.
 """
 
+import warnings
 from dataclasses import dataclass, field
+from typing import Literal
 
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
@@ -87,6 +89,10 @@ class PI05Config(PreTrainedConfig):
     max_action_dim: int = 32
     predict_response: bool = False
 
+    # "discrete" encodes state as binned text tokens in the language prompt;
+    # "continuous" projects the raw state vector into VLM embedding space.
+    state_type: Literal["discrete", "continuous"] = "discrete"
+
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (224, 224)
 
@@ -96,6 +102,10 @@ class PI05Config(PreTrainedConfig):
 
     # Language Tokenizer
     prompt_max_length: int = 256
+
+    # Maximum length of the indicator tokens
+    response_indicator_max_length: int = 3
+    discrete_action_indicator_max_length: int = 3
 
     # Response Tokenizer
     response_max_length: int = 52
@@ -148,6 +158,9 @@ class PI05Config(PreTrainedConfig):
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
+
+        if self.state_type not in ("discrete", "continuous"):
+            raise ValueError(f"state_type must be 'discrete' or 'continuous', got '{self.state_type}'")
 
         if self.max_delay > self.chunk_size:
             raise ValueError(
@@ -221,3 +234,19 @@ class PI05Config(PreTrainedConfig):
             None: As reward deltas are not used.
         """
         return None
+
+
+@PreTrainedConfig.register_subclass("pi05_continuous_state")
+@dataclass
+class PI05ContinuousStateConfig(PI05Config):
+    """Deprecated: use ``PI05Config(state_type="continuous")`` instead."""
+
+    state_type: Literal["discrete", "continuous"] = "continuous"
+
+    def __post_init__(self):
+        warnings.warn(
+            "PI05ContinuousStateConfig is deprecated. Use PI05Config with state_type='continuous' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        super().__post_init__()
