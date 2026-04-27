@@ -62,6 +62,7 @@ Example:
 
 import functools
 import logging
+from collections import Counter
 from typing import List, Optional
 
 import numpy as np
@@ -363,10 +364,11 @@ class WeightedDatasetMixture:
         """Derive human-readable names for each dataset in the mixture.
 
         Uses each ``DatasetConfig``'s ``repo_id`` or ``vqa`` identifier when
-        available (ordered to match ``cfg.dataset_mixture.datasets``). Duplicate
-        identifiers are disambiguated with a ``#<idx>`` suffix. Falls back to the
-        dataset class name plus index when the config list cannot be lined up
-        with ``datasets`` (e.g. in tests that construct a mixture directly).
+        available (ordered to match ``cfg.dataset_mixture.datasets``). Duplicates
+        get a per-name sequential ``#<i>`` suffix (so ``['A','B','A']`` becomes
+        ``['A#0','B','A#1']``). Falls back to the dataset class name plus index
+        when the config list cannot be lined up with ``datasets`` (e.g. in tests
+        that construct a mixture directly).
         """
         dataset_cfgs = getattr(getattr(cfg, "dataset_mixture", None), "datasets", None)
         if dataset_cfgs is None or len(dataset_cfgs) != len(datasets):
@@ -375,7 +377,17 @@ class WeightedDatasetMixture:
         raw_names = [
             (dc.repo_id or dc.vqa or type(ds).__name__) for dc, ds in zip(dataset_cfgs, datasets, strict=True)
         ]
-        return [f"{name}#{idx}" if raw_names.count(name) > 1 else name for idx, name in enumerate(raw_names)]
+        counts = Counter(raw_names)
+        seen: dict[str, int] = {}
+        out: list[str] = []
+        for name in raw_names:
+            if counts[name] > 1:
+                i = seen.get(name, 0)
+                out.append(f"{name}#{i}")
+                seen[name] = i + 1
+            else:
+                out.append(name)
+        return out
 
     def _log_dataset_info(self) -> None:
         """Log information about all datasets in the mixture."""
