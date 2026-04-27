@@ -958,19 +958,19 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             batch["speed_is_pad"],
             batch["quality_is_pad"],
             batch["mistake_is_pad"],
-            strict=False,
+            strict=True,
         ):
-            meta = ""
+            segments = []
             if not speed_is_pad:
-                meta += f"Speed: {str(speed.item())} "
+                segments.append(f"Speed: {str(speed.item())}")
 
             if not quality_is_pad:
-                meta += f"Quality: {str(quality.item())} "
+                segments.append(f"Quality: {str(quality.item())}")
 
             if not mistake_is_pad:
-                meta += f"Mistake: {str(mistake.item())}"
+                segments.append(f"Mistake: {str(mistake.item())}")
 
-            metadata.append(f"Metadata: {meta}<eos>")
+            metadata.append(f"Metadata: {' '.join(segments)}<eos>")
 
         device = batch["state"].device
         tokenized_metadata = self.language_tokenizer.__call__(
