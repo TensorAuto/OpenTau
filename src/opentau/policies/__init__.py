@@ -21,6 +21,12 @@ such as PI0, PI05, and Value policy.
 
 from .pi0.configuration_pi0 import PI0Config as PI0Config
 from .pi05.configuration_pi05 import PI05Config as PI05Config
-from .pi05_continuous_state.configuration_pi05 import PI05ContinuousStateConfig as PI05ContinuousStateConfig
+from .pi05.configuration_pi05 import PI05ContinuousStateConfig as PI05ContinuousStateConfig
 from .pi05_mem.configuration_pi05 import PI05MemConfig as PI05MemConfig
+from .pi07_paligemma.high_level_planner.configuration_pi07_high_level import (
+    PI07HighLevelPlannerConfig as PI07HighLevelPlannerConfig,
+)
+from .pi07_paligemma.low_level_planner.configuration_pi07_low_level import (
+    PI07lowlevelPlannerConfig as PI07lowlevelPlannerConfig,
+)
 from .value.configuration_value import ValueConfig as ValueConfig

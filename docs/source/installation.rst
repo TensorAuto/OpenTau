@@ -126,4 +126,6 @@ Configure accelerate for your distributed training setup:
 
     accelerate config
 
-This will create an accelerate config file at `~/.cache/huggingface/accelerate/default_config.yaml`. We are currently using DeepSpeed ZeRO2 for model parallelism distributed training. For an accelerate config example, see `this config file <https://github.com/TensorAuto/OpenTau/blob/main/configs/examples/accelerate_deepspeed_config.yaml>`_ used for our CI pipelines.
+This will create an accelerate config file at `~/.cache/huggingface/accelerate/default_config.yaml`. The recommended setup for models that fit in GPU memory (including the pi05 reference policy) is plain DDP with bf16 mixed precision. For an example, see `configs/examples/accelerate_ddp_config.yaml <https://github.com/TensorAuto/OpenTau/blob/main/configs/examples/accelerate_ddp_config.yaml>`_.
+
+A DeepSpeed ZeRO-2 config is also available at `configs/examples/accelerate_deepspeed_config.yaml <https://github.com/TensorAuto/OpenTau/blob/main/configs/examples/accelerate_deepspeed_config.yaml>`_ for memory-constrained scenarios (very large models, long sequences), but note that it can be significantly slower than DDP on mid-sized policies with many small parameter tensors due to per-parameter gradient-reduce hooks. See issue #177 for benchmarks.

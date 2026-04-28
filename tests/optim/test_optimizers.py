@@ -55,3 +55,27 @@ def test_save_and_load_optimizer_state(model_params, optimizer, tmp_path):
     loaded_optimizer = load_optimizer_state(loaded_optimizer, tmp_path)
 
     torch.testing.assert_close(optimizer.state_dict(), loaded_optimizer.state_dict())
+
+
+@pytest.mark.parametrize("config_cls", [AdamConfig, AdamWConfig])
+def test_fused_falls_back_to_foreach_on_cpu_only_host(config_cls, model_params, monkeypatch):
+    """``fused=True`` must fall back to ``foreach`` when CUDA is unavailable.
+
+    PyTorch raises at AdamW construction time if ``fused=True`` is
+    requested without a CUDA (or MPS) device. The fallback in ``build()``
+    is the only thing that keeps CPU-only tests (including this one) and
+    single-process debug runs from breaking when the default flips to
+    True.
+    """
+    # Force the CPU-only branch regardless of what this host actually has,
+    # so the test passes identically on CI runners with or without GPUs.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    config = config_cls(fused=True)
+    optimizer = config.build(model_params)
+
+    # After the fallback, fused must be False (or absent / None) in the
+    # optimizer's defaults — otherwise the first .step() would raise.
+    assert optimizer.defaults.get("fused") in (False, None), (
+        f"fused should have been forced to False on CPU-only host, got {optimizer.defaults.get('fused')!r}"
+    )

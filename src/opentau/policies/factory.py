@@ -23,6 +23,7 @@ logic for creating fresh policies or loading pretrained ones, as well as
 parsing features from datasets or environments to properly configure the policies.
 """
 
+import warnings
 from typing import Optional
 
 import numpy as np
@@ -34,9 +35,14 @@ from opentau.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from opentau.datasets.utils import dataset_to_policy_features
 from opentau.policies.pi0.configuration_pi0 import PI0Config
 from opentau.policies.pi05.configuration_pi05 import PI05Config
-from opentau.policies.pi05_continuous_state.configuration_pi05 import PI05ContinuousStateConfig
 from opentau.policies.pi05_mem.configuration_pi05 import PI05MemConfig
 from opentau.policies.pi06.configuration_pi06 import PI06Config
+from opentau.policies.pi07_paligemma.high_level_planner.configuration_pi07_high_level import (
+    PI07HighLevelPlannerConfig,
+)
+from opentau.policies.pi07_paligemma.low_level_planner.configuration_pi07_low_level import (
+    PI07lowlevelPlannerConfig,
+)
 from opentau.policies.pretrained import PreTrainedPolicy
 from opentau.policies.value.configuration_value import ValueConfig
 
@@ -63,9 +69,14 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
 
         return PI05Policy
     elif name == "pi05_continuous_state":
-        from opentau.policies.pi05_continuous_state.modeling_pi05 import PI05ContinuousStatePolicy
+        warnings.warn(
+            "pi05_continuous_state is deprecated. Use pi05 with state_type='continuous' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        from opentau.policies.pi05.modeling_pi05 import PI05Policy
 
-        return PI05ContinuousStatePolicy
+        return PI05Policy
     elif name == "pi05_mem":
         from opentau.policies.pi05_mem.modeling_pi05 import PI05MemPolicy
 
@@ -74,6 +85,18 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from opentau.policies.pi06.modeling_pi06 import PI06Policy
 
         return PI06Policy
+    elif name == "pi07_paligemma_high_level_planner":
+        from opentau.policies.pi07_paligemma.high_level_planner.modeling_pi07_high_level import (
+            PI07HighLevelPlannerPolicy,
+        )
+
+        return PI07HighLevelPlannerPolicy
+    elif name == "pi07_paligemma_low_level_planner":
+        from opentau.policies.pi07_paligemma.low_level_planner.modeling_pi07_low_level import (
+            PI07LowLevelPlannerPolicy,
+        )
+
+        return PI07LowLevelPlannerPolicy
     elif name == "value":
         from opentau.policies.value.modeling_value import ValueFunction
 
@@ -100,11 +123,21 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
     elif policy_type == "pi05":
         return PI05Config(**kwargs)
     elif policy_type == "pi05_continuous_state":
-        return PI05ContinuousStateConfig(**kwargs)
+        warnings.warn(
+            "pi05_continuous_state is deprecated. Use pi05 with state_type='continuous' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        kwargs.setdefault("state_type", "continuous")
+        return PI05Config(**kwargs)
     elif policy_type == "pi05_mem":
         return PI05MemConfig(**kwargs)
     elif policy_type == "pi06":
         return PI06Config(**kwargs)
+    elif policy_type == "pi07_paligemma_high_level_planner":
+        return PI07HighLevelPlannerConfig(**kwargs)
+    elif policy_type == "pi07_paligemma_low_level_planner":
+        return PI07lowlevelPlannerConfig(**kwargs)
     elif policy_type == "value":
         return ValueConfig(**kwargs)
     else:

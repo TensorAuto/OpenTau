@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-PI05 Continuous State Policy Module.
+PI07 high level planner Policy Module.
 
-This module implements a variant of the π05 (Pi05) Vision-Language-Action Flow Model
-that uses continuous state embeddings projected directly into the VLM embedding space,
-rather than discretizing the state into text tokens. Response prediction has been removed.
+This module implements the High level planner for π07 which is basically π05 (Pi05) Vision-Language-model with memory and response prediction,
+designed for high level planning, memory and subtask generation. It includes the policy definition,
+configuration, and model architecture.
 """

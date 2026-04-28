@@ -15,9 +15,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import logging
 import re
 from copy import deepcopy
 from importlib import import_module
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -817,3 +819,86 @@ def test_deferred_video_multi_episode(tmp_path, empty_lerobot_dataset_factory):
     for ep_idx in range(2):
         video_path = dataset.root / dataset.meta.get_video_file_path(ep_idx, "observation.images.top")
         assert video_path.is_file()
+
+
+def test_overlay_resolves_video_to_source_repo(tmp_path, monkeypatch, lerobot_dataset_factory, info_factory):
+    """Overlay datasets resolve videos against the source repo, lazily caching
+    them under HF_OPENTAU_HOME/<source_repo> and reusing the file on repeat
+    calls. The path is formatted with `original_episode_index` from
+    episodes.jsonl, not the dense partition-local `episode_index`."""
+    src_repo = "src-org/source-dataset"
+    monkeypatch.setattr("opentau.datasets.lerobot_dataset.HF_OPENTAU_HOME", tmp_path / "cache")
+    src_root = tmp_path / "cache" / src_repo
+
+    # Pre-populate the source info.json so __init__ skips the network fetch.
+    src_info_path = src_root / "meta" / "info.json"
+    src_info_path.parent.mkdir(parents=True, exist_ok=True)
+    src_info_path.write_text(
+        json.dumps(
+            {
+                "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+                "chunks_size": 1000,
+            }
+        )
+    )
+
+    info = info_factory(total_episodes=3, total_frames=150, total_tasks=1)
+    info["videos"] = {"source_repo": src_repo, "source_revision": "abc123"}
+
+    task = "Perform action 0."
+    eps = {
+        0: {"episode_index": 0, "tasks": [task], "length": 50, "original_episode_index": 17},
+        1: {"episode_index": 1, "tasks": [task], "length": 50, "original_episode_index": 42},
+        2: {"episode_index": 2, "tasks": [task], "length": 50, "original_episode_index": 99},
+    }
+
+    with patch("opentau.datasets.lerobot_dataset.hf_hub_download") as mock_dl:
+        ds = lerobot_dataset_factory(root=tmp_path / "ds", info=info, episode_dicts=eps)
+        # Pre-populated info.json must short-circuit the source-info download.
+        mock_dl.assert_not_called()
+
+    vid_key = ds.meta.video_keys[0]
+    expected = src_root / f"videos/chunk-000/{vid_key}/episode_000017.mp4"
+
+    with patch("opentau.datasets.lerobot_dataset.hf_hub_download") as mock_dl:
+        # Local file missing → download is triggered with source-repo args.
+        result = ds._resolve_video_path(0, vid_key)
+        assert result == expected
+        mock_dl.assert_called_once_with(
+            repo_id=src_repo,
+            filename=f"videos/chunk-000/{vid_key}/episode_000017.mp4",
+            repo_type="dataset",
+            revision="abc123",
+            local_dir=src_root,
+        )
+
+        # Place the file at the expected location → second call skips re-download
+        # (this is what lets a future vanilla load of the source repo reuse it).
+        expected.parent.mkdir(parents=True, exist_ok=True)
+        expected.touch()
+        mock_dl.reset_mock()
+        assert ds._resolve_video_path(0, vid_key) == expected
+        mock_dl.assert_not_called()
+
+    # Overlay datasets must not list video files for snapshot_download / local existence checks.
+    assert all(not p.startswith("videos/") for p in ds.get_episodes_file_paths())
+
+
+def test_control_mode_warning_emitted_once_per_repo(tmp_path, lerobot_dataset_factory, info_factory, caplog):
+    """When info.json lacks `control_mode`, the loader warns exactly once per
+    repo_id within a process even across multiple LeRobotDataset instances."""
+    from opentau.datasets import lerobot_dataset as ld_mod
+
+    test_repo = "warn-once/test-repo"
+    ld_mod._CONTROL_MODE_WARNED.discard(test_repo)
+
+    info = info_factory(total_episodes=3, total_frames=150, total_tasks=1)  # no `control_mode` key
+
+    with caplog.at_level(logging.WARNING):
+        ds_a = lerobot_dataset_factory(root=tmp_path / "a", repo_id=test_repo, info=info)
+        ds_b = lerobot_dataset_factory(root=tmp_path / "b", repo_id=test_repo, info=info)
+
+    assert ds_a.control_mode == "unknown"
+    assert ds_b.control_mode == "unknown"
+    matching = [r for r in caplog.records if "control_mode" in r.getMessage() and r.args == (test_repo,)]
+    assert len(matching) == 1

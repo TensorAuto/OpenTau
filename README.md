@@ -46,6 +46,7 @@ OpenTau ($\tau$) is a tool developed by *[Tensor][1]* to bridge this gap, and we
 |                       Visualize dataset with URDF models |            ❌            |                ❌                 |      ✅      |
 |            Simulation Environments for Evaluating Models |            ❌            |                ✅                 |      ✅      |
 |                 Create Validation Splits During Training |            ❌            |                ❌                 |      ✅      |
+|    Drop-in Training Profiler & Unused-Param Auditor      |            ❌            |                ❌                 |      ✅      |
 |    $\pi^{*}_{0.6}$ style Reinforcement Learning Pipeline |            ❌            |                ❌                 |      ✅      |
 |                               Post-training on Human Data|            ❌            |                ❌                 |      ✅      |
 |            Authentic $\pi_{0.6}$ Policy (Gemma 3 4B backbone, 448×448 vision) |       ❌            |                ❌                 |      ✅      |
@@ -62,6 +63,27 @@ For using local notebooks to train and evaluate models, find the notebooks at [n
 For using the Google Colab notebooks to train and evaluate models, find the colab notebooks here: [pi05_training](https://colab.research.google.com/drive/1DeU0lNnEzs1KHo0Nkgh4YKBr-xu9moBM?usp=sharing) and [pi05_evaluation_only](https://colab.research.google.com/drive/1U_AyuH9WYMT4anEWvsOtIT7g01jA0WGm?usp=sharing) respectively.
 
 To spin up a $\pi_{0.6}$ training run, start from [configs/examples/pi06_training_config.json](https://github.com/TensorAuto/OpenTau/blob/main/configs/examples/pi06_training_config.json). The policy is selected by setting `"type": "pi06"` and differs from $\pi_{0.5}$ in its Gemma 3 4B backbone, 448×448 image resolution, ~860M-parameter action expert, and 5-step flow-matching default.
+
+## Training Diagnostics
+
+OpenTau ships three drop-in scripts under `src/opentau/scripts/` to help you figure out where a training run is spending its time. Each reads the same `TrainPipelineConfig` as `opentau-train`, so they reproduce your exact model / dataset / batch size — no reconfiguration needed.
+
+| Script | What it answers |
+|---|---|
+| [`profile_step.py`](https://github.com/TensorAuto/OpenTau/blob/main/src/opentau/scripts/profile_step.py) | Where does each training step's wall-clock go? (forward / backward / optimizer / sync phases, with mean / median / p95) |
+| [`profile_dataloader.py`](https://github.com/TensorAuto/OpenTau/blob/main/src/opentau/scripts/profile_dataloader.py) | Is the dataloader keeping up with the GPUs? (pure input-pipeline ceiling, no model, no collective) |
+| [`find_unused_params.py`](https://github.com/TensorAuto/OpenTau/blob/main/src/opentau/scripts/find_unused_params.py) | Are any parameters dead? (lists params DDP would refuse to sync with `find_unused_parameters=False`) |
+
+A one-command example — see where your training time is going:
+
+```bash
+accelerate launch \
+    --config_file configs/examples/accelerate_ddp_config.yaml \
+    src/opentau/scripts/profile_step.py \
+    --config_path=<your_training_config.json>
+```
+
+Full tutorial with annotated example output and env-var knobs: [docs/tutorials/benchmarking](https://opentau.readthedocs.io/en/latest/tutorials/benchmarking.html). A worked example investigation that used these tools to find and fix a 2.9× throughput regression is tracked in [issue #177](https://github.com/TensorAuto/OpenTau/issues/177).
 
 ## Checkpoints
 We provide fully functioning $\pi_{0.5}$ checkpoints trained with high success rates. We plan to release more models in the near future.
