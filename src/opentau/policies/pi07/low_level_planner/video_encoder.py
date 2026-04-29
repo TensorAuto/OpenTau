@@ -44,7 +44,8 @@ The encoder does NOT own its own copy of the SigLIP weights. The caller
 """
 
 import math
-from typing import Optional
+from contextlib import contextmanager
+from typing import Iterator, Optional
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -208,6 +209,16 @@ class SpaceTimeEncoderLayerWrapper(nn.Module):
         # params don't show up twice in state_dict.
         self._temporal_attn = _TemporalSelfAttention(self.self_attn)
 
+        # Caller-driven flag: when False, ``forward`` short-circuits to the
+        # vanilla spatial-only block (`_spatial_block_forward`) regardless of
+        # the input shape. This is used by ``Gemma3WithExpertModel.embed_image``
+        # via the ``suppress_spacetime_temporal`` context manager so the same
+        # wrapped vision_tower can be reused for non-video inputs (e.g. single
+        # subgoal images) without firing temporal attention over data that has
+        # no time axis.  Flag lives on the wrapper rather than on a kwarg
+        # because ``SiglipEncoder.forward`` does not accept extra kwargs.
+        self._temporal_active: bool = True
+
         # Build the PE on the base layer's current device / dtype. The parent
         # vision_tower is often moved to GPU BEFORE this wrapper is inserted
         # (the normal load flow for pi05_mem does
@@ -272,20 +283,28 @@ class SpaceTimeEncoderLayerWrapper(nn.Module):
                 f"hidden_states.shape[1] ({n}) != num_tokens_per_frame ({self.num_tokens_per_frame})."
             )
 
+        # Short-circuit when the caller has suppressed temporal attention.
+        # ``Gemma3WithExpertModel.embed_image`` shares the same wrapped vision
+        # tower for non-video inputs (e.g. subgoal frames) and toggles this
+        # flag via the ``suppress_spacetime_temporal`` context manager — those
+        # calls are spatial-only; there is no time axis to attend over.
+        if not self._temporal_active:
+            return self._spatial_block_forward(hidden_states, attention_mask, output_attentions)
+
         # Short-circuit at T=1: temporal self-attention over a single timestep
         # collapses to ``out_proj(v_proj(LN1(x)))``, which is NOT an identity
         # and would break single-frame invariance (the MEM paper's guarantee
         # that a T=1 pass matches the unmodified SigLIP ViT). e(t=0)=0 alone
         # is insufficient; the block must also be skipped.
-        #
-        # Also short-circuit when ``bt`` is not a multiple of ``t``: the same
-        # wrapped tower is shared with ``Gemma3WithExpertModel.embed_image``,
-        # which passes single images as ``(B, N, D)`` with ``B < t`` (e.g.
-        # subgoal frames in ``embed_prefix``).  Those calls are spatial-only;
-        # there is no valid ``(b, t, ...)`` grouping for temporal attention.
-        if t == 1 or bt % t != 0:
+        if t == 1:
             return self._spatial_block_forward(hidden_states, attention_mask, output_attentions)
 
+        if bt % t != 0:
+            raise ValueError(
+                f"hidden_states.shape[0] ({bt}) must be divisible by num_frames ({t}); "
+                "video encoder expects inputs flattened as (B*T, N, D). "
+                "Use `suppress_spacetime_temporal(...)` for non-video forwards."
+            )
         b = bt // t
 
         # Temporal sublayer.
@@ -308,6 +327,31 @@ class SpaceTimeEncoderLayerWrapper(nn.Module):
 
         # Spatial + MLP sublayers.
         return self._spatial_block_forward(h_after_t, attention_mask, output_attentions)
+
+
+@contextmanager
+def suppress_spacetime_temporal(module: nn.Module) -> Iterator[None]:
+    """Context manager that flips ``_temporal_active=False`` on every
+    :class:`SpaceTimeEncoderLayerWrapper` in ``module``'s subtree, and
+    restores the previous value on exit.
+
+    Used by ``Gemma3WithExpertModel.embed_image`` so that single-image
+    forwards through a vision_tower that has been wrapped with space-time
+    attention skip the temporal sublayer (which has no time axis to attend
+    over for non-video inputs).  When ``module`` contains no wrappers (e.g.
+    no video encoder has been constructed yet), this is a no-op.
+    """
+    wrappers: list[SpaceTimeEncoderLayerWrapper] = [
+        m for m in module.modules() if isinstance(m, SpaceTimeEncoderLayerWrapper)
+    ]
+    previous = [w._temporal_active for w in wrappers]
+    for w in wrappers:
+        w._temporal_active = False
+    try:
+        yield
+    finally:
+        for w, prev in zip(wrappers, previous, strict=True):
+            w._temporal_active = prev
 
 
 class SpaceTimeSiglipVideoEncoder(nn.Module):
