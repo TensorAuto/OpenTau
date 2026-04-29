@@ -455,9 +455,9 @@ class TestDefaultCollate:
         assert batch["quality_is_pad"].tolist() == [False, True]
 
 
-# Dataset-level identifiers (robot_type, control_mode) emitted by
-# _to_standard_data_format read directly from self.meta.info and are not
-# subject to any training-time dropout.
+# Dataset-level identifiers (robot_type, control_mode) are emitted inside
+# _emit_optional_keys and participate in the metadata_drop_all_prob /
+# metadata_drop_each_prob dropout rolls, same as speed / mistake / quality.
 
 
 def _full_raw_item(dataset: _DummyBaseDataset) -> dict:
@@ -498,9 +498,9 @@ class TestRobotTypeControlMode:
         out = ds._to_standard_data_format(_full_raw_item(ds))
         assert out["robot_type"] == ""
 
-    def test_pass_through_under_all_dropouts(self):
-        # Lock in the contract: even with every drop probability cranked to 1.0
-        # and dropout enabled, robot_type / control_mode are unchanged.
+    def test_dropped_when_metadata_drop_all_prob_is_one(self):
+        # When metadata_drop_all_prob=1.0, robot_type / control_mode collapse to
+        # "" — they participate in the same metadata drop group as speed/mistake.
         ds = _DummyBaseDataset(
             num_cams=1,
             meta_info={"robot_type": "panda", "control_mode": "ee"},
@@ -509,6 +509,20 @@ class TestRobotTypeControlMode:
             response_drop_prob=1.0,
             metadata_drop_all_prob=1.0,
             metadata_drop_each_prob=1.0,
+        )
+        assert ds.enable_optional_key_dropout is True
+        out = ds._to_standard_data_format(_full_raw_item(ds))
+        assert out["robot_type"] == ""
+        assert out["control_mode"] == ""
+
+    def test_pass_through_when_drop_probs_zero(self):
+        # With all drop probabilities at zero, robot_type / control_mode pass
+        # through unchanged even when dropout is enabled.
+        ds = _DummyBaseDataset(
+            num_cams=1,
+            meta_info={"robot_type": "panda", "control_mode": "ee"},
+            metadata_drop_all_prob=0.0,
+            metadata_drop_each_prob=0.0,
         )
         assert ds.enable_optional_key_dropout is True
         out = ds._to_standard_data_format(_full_raw_item(ds))

@@ -126,9 +126,9 @@ happy (list of strings, same length as batch).
 ``robot_type`` and ``control_mode`` are **dataset-level identifiers**
 (constant for every sample within a given dataset, distinct across
 datasets in a mixture batch) sourced directly from ``meta/info.json``.
-Unlike the segment-metadata keys below, they are **not** subject to
-training-time dropout — see :ref:`Training-time dropout
-<standard-data-format-optional-keys-dropout>`.
+Like ``speed``, ``mistake``, and ``quality``, they participate in the
+``metadata_drop_all_prob`` / ``metadata_drop_each_prob`` dropout rolls —
+see :ref:`Training-time dropout <standard-data-format-optional-keys-dropout>`.
 
 .. code-block:: python
 
@@ -200,8 +200,7 @@ Training-time dropout
 
 Six probability fields on ``DatasetMixtureConfig`` control how often
 each optional key is masked during a single ``__getitem__`` call.
-``robot_type`` and ``control_mode`` are exempt — they are passed through
-unchanged regardless of any drop roll. Masks
+Masks
 are independent per sample (each call rolls fresh). ``DataLoader``
 workers seed their own torch RNG, so samples within a batch are
 independent across workers; seed globally via ``torch.manual_seed(...)``
@@ -235,12 +234,13 @@ for reproducibility.
        would remove the primary task signal).
    * - ``metadata_drop_all_prob``
      - ``0.15``
-     - Masks ``speed``, ``mistake``, and ``quality`` together.
+     - Masks ``speed``, ``mistake``, ``quality``, ``robot_type``, and
+       ``control_mode`` together.
    * - ``metadata_drop_each_prob``
      - ``0.05``
      - Per-field independent mask roll for each of ``speed``,
-       ``mistake``, ``quality``. Only rolled when the shared drop did
-       not fire.
+       ``mistake``, ``quality``, ``robot_type``, ``control_mode``.
+       Only rolled when the shared drop did not fire.
    * - ``val_enable_optional_key_dropout``
      - ``False``
      - Whether the five drop rolls above also fire on the **validation**

@@ -820,15 +820,10 @@ class BaseDataset(torch.utils.data.Dataset):
         else:
             standard_item["obs_history_is_pad"] = torch.tensor([False], dtype=torch.bool)
 
-        # Emit optional keys (memory, next_memory, speed, mistake, quality, subgoalK)
-        # with their _is_pad siblings, applying training-time dropout rolls.
+        # Emit optional keys (memory, next_memory, speed, mistake, quality,
+        # robot_type, control_mode, subgoalK) with their _is_pad siblings,
+        # applying training-time dropout rolls.
         self._emit_optional_keys(item, standard_item)
-
-        # Dataset-level identifiers, surfaced per-sample so policies/collators
-        # can read them uniformly. "" signals "field absent in meta/info.json"
-        # (same convention as response / memory / next_memory).
-        standard_item["robot_type"] = self.meta.info.get("robot_type") or ""
-        standard_item["control_mode"] = self.meta.info.get("control_mode") or ""
 
         # cast all tensors in standard_item to bfloat16
         for key, value in standard_item.items():
@@ -842,9 +837,10 @@ class BaseDataset(torch.utils.data.Dataset):
 
         All emitted keys are always present (zero/empty-filled when absent or
         masked). Numeric / image keys come with a parallel ``{key}_is_pad``
-        bool; string keys (``response``, ``memory``, ``next_memory``) use the
-        empty string itself as the pad signal — a consumer seeing ``""`` can
-        assume the field was unavailable or was masked this step.
+        bool; string keys (``response``, ``memory``, ``next_memory``,
+        ``robot_type``, ``control_mode``) use the empty string itself as the
+        pad signal — a consumer seeing ``""`` can assume the field was
+        unavailable or was masked this step.
 
         Dropout order:
             1. ``history_state_drop_prob``: zero ``state`` and historical camera
@@ -853,9 +849,9 @@ class BaseDataset(torch.utils.data.Dataset):
                single ``subgoal_is_pad`` flag to True (subgoals are all-or-none).
             3. ``response_drop_prob``: only when subgoals were NOT dropped, mask
                ``response`` to the empty string.
-            4. ``metadata_drop_all_prob``: mask {speed, mistake, quality}
-               together. If this didn't fire, ``metadata_drop_each_prob`` rolls
-               independently for each of the three.
+            4. ``metadata_drop_all_prob``: mask {speed, mistake, quality,
+               robot_type, control_mode} together. If this didn't fire,
+               ``metadata_drop_each_prob`` rolls independently for each field.
 
         Dropout rolls use the default torch RNG (auto-seeded per worker).
 
@@ -926,7 +922,8 @@ class BaseDataset(torch.utils.data.Dataset):
         next_memory_raw = item.get("next_memory_raw")
         standard_item["next_memory"] = next_memory_raw if isinstance(next_memory_raw, str) else ""
 
-        # (5) Metadata drops.
+        # (5) Metadata drops: numeric fields get a _is_pad flag; string
+        # identifier fields use "" as the pad signal (no separate flag).
         drop_meta_all = _roll(self.metadata_drop_all_prob)
         for key, dtype in (("speed", torch.long), ("mistake", torch.bool), ("quality", torch.long)):
             raw_key = f"{key}_raw"
@@ -940,6 +937,10 @@ class BaseDataset(torch.utils.data.Dataset):
                 value = bool(raw) if dtype is torch.bool else int(raw)
                 standard_item[key] = torch.tensor(value, dtype=dtype)
                 standard_item[f"{key}_is_pad"] = torch.tensor(False)
+        for key in ("robot_type", "control_mode"):
+            val = self.meta.info.get(key) or ""
+            drop_this = drop_meta_all or _roll(self.metadata_drop_each_prob)
+            standard_item[key] = "" if drop_this else val
 
     def resize_with_pad(self, img, width, height, pad_value=0) -> torch.Tensor:
         """Resize an image to target dimensions with padding.
