@@ -270,24 +270,30 @@ class TrainPipelineConfig(HubMixin):
             self.policy.max_action_state = self.max_action_dim
             self.policy.chunk_size = self.action_chunk
 
-            # Sync observation history settings from dataset mixture to policy.
-            if hasattr(self.policy, "n_obs_history") and self.dataset_mixture is not None:
+            # Sync observation-history settings from dataset_mixture to policy.
+            # The policy's ``n_obs_steps`` determines the T dimension its
+            # encoder expects; the dataset_mixture's ``n_obs_history`` is
+            # what the dataloader actually produces. They must agree.
+            if self.dataset_mixture is not None:
                 dm = self.dataset_mixture
-                if dm.n_obs_history is not None:
-                    if self.policy.n_obs_history is None:
-                        self.policy.n_obs_history = dm.n_obs_history
+                dm_n_obs = dm.n_obs_history if dm.n_obs_history is not None else 1
+                if self.policy.n_obs_steps != dm_n_obs:
+                    raise ValueError(
+                        f"policy.n_obs_steps ({self.policy.n_obs_steps}) != "
+                        f"dataset_mixture.n_obs_history ({dm.n_obs_history}; "
+                        "treated as 1 when unset). Set dataset_mixture.n_obs_history "
+                        "to match policy.n_obs_steps."
+                    )
+                # Only some policies (currently pi05_mem) carry a
+                # ``history_interval`` field for inference-buffer sampling.
+                if hasattr(self.policy, "history_interval"):
+                    if self.policy.history_interval is None:
                         self.policy.history_interval = dm.history_interval
-                    else:
-                        if self.policy.n_obs_history != dm.n_obs_history:
-                            raise ValueError(
-                                f"policy.n_obs_history ({self.policy.n_obs_history}) != "
-                                f"dataset_mixture.n_obs_history ({dm.n_obs_history})"
-                            )
-                        if (self.policy.history_interval or 1) != dm.history_interval:
-                            raise ValueError(
-                                f"policy.history_interval ({self.policy.history_interval}) != "
-                                f"dataset_mixture.history_interval ({dm.history_interval})"
-                            )
+                    elif (self.policy.history_interval or 1) != (dm.history_interval or 1):
+                        raise ValueError(
+                            f"policy.history_interval ({self.policy.history_interval}) != "
+                            f"dataset_mixture.history_interval ({dm.history_interval})"
+                        )
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:

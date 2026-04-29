@@ -274,3 +274,12 @@ def patched_paligemma_model_get_image_features(self, pixel_values: torch.FloatTe
 
 
 PaliGemmaModel.get_image_features = patched_paligemma_model_get_image_features
+
+
+# Re-export the PaliGemma entrypoint from this module so downstream code that
+# imports it via `from opentau.utils.transformers_patch import
+# PaliGemmaForConditionalGeneration` is guaranteed to hit the patched
+# `get_image_features` (which drops the `/ sqrt(hidden_size)` scaling) rather
+# than the stock HuggingFace behavior. Importing this name is enough to confirm
+# the patch has been applied by the time the caller uses the class.
+from transformers import PaliGemmaForConditionalGeneration  # noqa: E402, F401

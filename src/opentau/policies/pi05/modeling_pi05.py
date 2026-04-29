@@ -928,6 +928,7 @@ class PI05FlowMatching(nn.Module):
             attention_implementation=self.config.attention_implementation,
             discrete_action_vocab_size=discrete_action_vocab_size,
             dropout=self.config.dropout,
+            gradient_checkpointing=self.config.gradient_checkpointing,
         )
         self.paligemma_with_expert = PaliGemmaWithExpertModel(paligemma_with_expert_config)
 

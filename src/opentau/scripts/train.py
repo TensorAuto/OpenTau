@@ -38,6 +38,7 @@ from opentau.datasets.utils import cycle
 from opentau.envs.factory import make_envs
 from opentau.envs.utils import close_envs
 from opentau.optim.factory import make_optimizer_and_scheduler
+from opentau.optim.master_weights import MasterWeightOptimizer
 from opentau.policies.factory import make_policy
 from opentau.policies.pretrained import PreTrainedPolicy
 from opentau.scripts.eval import consolidate_eval_info, eval_policy_all
@@ -80,7 +81,19 @@ def update_policy(
     accelerator.unscale_gradients(optimizer=optimizer)
 
     if accelerator.sync_gradients:
-        grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+        # When the optimizer is wrapped in ``MasterWeightOptimizer`` (the
+        # DDP / single / FSDP path; see issue #181), gradients live in bf16
+        # on the live params and have not yet been upcast to the fp32 masters.
+        # Calling ``MasterWeightOptimizer.clip_grad_norm_`` performs the
+        # bf16 -> fp32 upcast and clips on the fp32 master grads, so the
+        # subsequent ``optimizer.step`` reads from the clipped fp32 grads.
+        # Under DeepSpeed the inner BF16_Optimizer clips internally, so we
+        # use ``accelerator.clip_grad_norm_`` there.
+        inner_opt = getattr(optimizer, "optimizer", optimizer)
+        if isinstance(inner_opt, MasterWeightOptimizer):
+            grad_norm = inner_opt.clip_grad_norm_(grad_clip_norm)
+        else:
+            grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
         if accelerator.is_main_process:
             train_metrics.grad_norm = grad_norm
 
@@ -177,6 +190,35 @@ def _find_unused_params_from_env() -> bool:
     return os.environ.get("FIND_UNUSED_PARAMS", "true").lower() == "true"
 
 
+def _sync_deepspeed_gradient_accumulation_steps(
+    accelerator: accelerate.Accelerator, cfg: TrainPipelineConfig
+) -> None:
+    """Make TrainPipelineConfig the single source of truth for gradient_accumulation_steps.
+
+    When DeepSpeed is the distributed backend, the value declared in the Accelerate YAML's
+    `deepspeed_config.gradient_accumulation_steps` is forcibly overridden to match
+    `cfg.gradient_accumulation_steps`. Must be called on all ranks and before
+    `accelerator.prepare(...)`, because `_prepare_deepspeed` reads this value from
+    `hf_ds_config.config` on every rank at prepare time.
+    """
+    if accelerator.distributed_type != accelerate.DistributedType.DEEPSPEED:
+        return
+
+    ds_config = accelerator.deepspeed_plugin.hf_ds_config.config
+    current = ds_config.get("gradient_accumulation_steps", 1)
+    target = cfg.gradient_accumulation_steps
+    if current != target and accelerator.is_main_process:
+        logging.warning(
+            "Overriding DeepSpeed `gradient_accumulation_steps` (%s) with the value from "
+            "TrainPipelineConfig (%s). TrainPipelineConfig is the single source of truth; "
+            "the value in the Accelerate YAML is ignored.",
+            current,
+            target,
+        )
+    ds_config["gradient_accumulation_steps"] = target
+    accelerator.deepspeed_plugin.gradient_accumulation_steps = target
+
+
 @parser.wrap()
 def train(cfg: TrainPipelineConfig):
     cfg.validate()
@@ -186,34 +228,64 @@ def train(cfg: TrainPipelineConfig):
         "step_scheduler_with_optimizer": False,
         "split_batches": False,  # split_batches == True is not working anyways
         "kwargs_handlers": [DistributedDataParallelKwargs(find_unused_parameters=find_unused)],
+        "gradient_accumulation_steps": cfg.gradient_accumulation_steps,
     }
     if cfg.wandb.enable:
         accelerator_kwargs["log_with"] = "wandb"
-    if cfg.gradient_accumulation_steps > 1:
-        accelerator_kwargs["gradient_accumulation_steps"] = cfg.gradient_accumulation_steps
 
     accelerator = accelerate.Accelerator(**accelerator_kwargs)
     init_logging(accelerator, level=logging.DEBUG if cfg.debug else logging.INFO)
     # Register accelerator globally for use in other modules, (e.g., detect current rank, etc.)
     set_proc_accelerator(accelerator)
 
+    # Must run before `encode_accelerator_state_dict` + `init_trackers` below so the
+    # wandb-logged accelerator config and the value DeepSpeed consumes at prepare()
+    # time both reflect TrainPipelineConfig.
+    _sync_deepspeed_gradient_accumulation_steps(accelerator, cfg)
+
+    # Strict guard for gradient_checkpointing: the pi05 custom forward loop
+    # wraps layer bodies in torch.utils.checkpoint.checkpoint, which is only
+    # semantically safe under distributed backends that do NOT re-shard
+    # parameters during forward. DDP (MULTI_GPU), single-process (NO), and
+    # DeepSpeed ZeRO-1/2 all replicate full params on every rank during
+    # forward — safe. ZeRO-3 and FSDP re-shard and rely on forward-time
+    # all-gather hooks that plain torch.utils.checkpoint does not trigger
+    # during backward recompute, which can silently produce wrong gradients
+    # or hang. Fail loudly at startup instead of corrupting training.
+    if getattr(cfg.policy, "gradient_checkpointing", False):
+        grad_ckpt_allowed = {
+            accelerate.DistributedType.MULTI_GPU,
+            accelerate.DistributedType.NO,
+            accelerate.DistributedType.DEEPSPEED,
+        }
+        if accelerator.distributed_type not in grad_ckpt_allowed:
+            raise ValueError(
+                f"gradient_checkpointing=True is not supported under "
+                f"distributed_type={accelerator.distributed_type}. Supported: "
+                "MULTI_GPU (DDP), NO (single process), DEEPSPEED (ZeRO-1/2 only). "
+                "ZeRO-3 and FSDP need backend-specific activation-checkpointing "
+                "hooks which pi05's custom per-layer forward does not wire up. "
+                "Either set gradient_checkpointing=False or switch to a "
+                "supported backend."
+            )
+        if accelerator.distributed_type == accelerate.DistributedType.DEEPSPEED:
+            zero_stage = accelerator.deepspeed_plugin.hf_ds_config.config.get("zero_optimization", {}).get(
+                "stage", 0
+            )
+            if zero_stage >= 3:
+                raise ValueError(
+                    f"gradient_checkpointing=True is not supported under "
+                    f"DeepSpeed ZeRO stage {zero_stage}. ZeRO-3 re-shards parameters "
+                    "during forward and needs deepspeed.checkpointing.checkpoint "
+                    "rather than torch.utils.checkpoint. Either set "
+                    "gradient_checkpointing=False or use zero_stage: 1 or 2."
+                )
+
     logging.info(pformat(cfg.to_dict()))
 
     if accelerator.is_main_process:
         accelerator_config = encode_accelerator_state_dict(accelerator.state.__dict__)
         logging.info(pformat(accelerator_config))
-
-        # Ensure `gradient_accumulation_steps` is consistent between TrainPipelineConfig and DeepSpeedConfig
-        if accelerator.distributed_type == accelerate.DistributedType.DEEPSPEED:
-            deepspeed_config, deepspeed_key = accelerator.deepspeed_plugin.hf_ds_config.find_config_node(
-                "gradient_accumulation_steps"
-            )
-            ds_grad_acc_steps = deepspeed_config.get(deepspeed_key, 1)
-            if ds_grad_acc_steps != cfg.gradient_accumulation_steps:
-                raise ValueError(
-                    "The `gradient_accumulation_steps` in TrainPipelineConfig does not match the value "
-                    f"specified in DeepSpeedConfig {cfg.gradient_accumulation_steps} != {ds_grad_acc_steps}. "  # nosec B608
-                )
 
         if cfg.wandb.enable:
             step = load_training_step(cfg.checkpoint_path) if cfg.resume else None
@@ -255,9 +327,26 @@ def train(cfg: TrainPipelineConfig):
 
     logging.info("Creating policy")
     policy = make_policy(cfg=cfg.policy, ds_meta=train_dataset.meta)
+    # Keep the policy in bf16 for forward/backward (activation memory + bf16
+    # compute). The optimizer state is kept in fp32 separately: DeepSpeed
+    # ZeRO does this through ``BF16_Optimizer``; under DDP/FSDP/single we
+    # mirror that with ``MasterWeightOptimizer`` (see issue #181).
     policy.to(torch.bfloat16)
     logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
+    # Outside DeepSpeed, wrap the optimizer so it carries fp32 master weights
+    # and fp32 Adam state. DeepSpeed already provides this via BF16_Optimizer
+    # (see ``ds_config['bf16']['enabled']``), so we don't double-wrap there.
+    if accelerator.distributed_type != accelerate.DistributedType.DEEPSPEED:
+        optimizer = MasterWeightOptimizer.from_existing(optimizer)
+        # ``make_optimizer_and_scheduler`` bound the LR scheduler to the
+        # ORIGINAL ``torch.optim.AdamW`` (now discarded in favour of the
+        # wrapper's new inner). Without this rebind, ``lr_scheduler.step()``
+        # would mutate the orphaned optimizer's ``param_groups[i]['lr']``
+        # and the inner AdamW's lr would silently stay at the initial
+        # value forever — schedule applied to nothing.
+        if lr_scheduler is not None:
+            lr_scheduler.optimizer = optimizer
 
     step = 0  # number of policy updates (forward + backward + optim)
 
@@ -289,6 +378,17 @@ def train(cfg: TrainPipelineConfig):
         policy, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             policy, optimizer, train_dataloader, lr_scheduler
         )
+    # ``accelerator.prepare`` may have moved the policy from CPU to GPU.
+    # When ``MasterWeightOptimizer`` is in use, the fp32 masters were cloned
+    # from the bf16 live params at wrap-time (still on CPU) and would
+    # otherwise stay there — Adam would then run on CPU master tensors,
+    # paying a CPU<->GPU copy on every grad upcast and param downcast and
+    # never letting the masters appear in nvidia-smi accounting. Rebuild
+    # masters from the now-migrated live params so they live on the same
+    # device as the model. No-op when devices already agree.
+    inner_opt_for_migrate = getattr(optimizer, "optimizer", optimizer)
+    if isinstance(inner_opt_for_migrate, MasterWeightOptimizer):
+        inner_opt_for_migrate.rebuild_masters_from_live(policy.parameters())
     train_dl_iter = cycle(train_dataloader)
 
     # Register the LR scheduler for checkpointing
@@ -298,6 +398,16 @@ def train(cfg: TrainPipelineConfig):
         # load accelerator state
         # This will load the model, optimizer, and lr_scheduler state
         accelerator.load_state(cfg.checkpoint_path)
+
+        # When the master-weights wrapper is in use, the live bf16 weights
+        # have just been overwritten by ``accelerator.load_state``. Rebuild
+        # the fp32 masters from those weights so the inner optimizer's
+        # subsequent steps operate on consistent fp32 master copies.
+        # (Under DeepSpeed this is unnecessary; ZeRO restores its own fp32
+        # masters from its checkpoint.)
+        inner_opt_for_resume = getattr(optimizer, "optimizer", optimizer)
+        if isinstance(inner_opt_for_resume, MasterWeightOptimizer):
+            inner_opt_for_resume.rebuild_masters_from_live(policy.parameters())
 
         # all processes should load the step & rng states
         step = load_training_state(cfg.checkpoint_path)

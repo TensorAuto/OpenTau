@@ -13,32 +13,32 @@
             1.0
         ],
         "action_freq": 10.0,
-        "n_obs_history": 8,
         "image_resample_strategy": "nearest",
         "vector_resample_strategy": "nearest"
     },
     "policy": {
-        "type": "pi05_mem",
+        "type": "pi06",
         "pretrained_path": null,
-        "n_obs_steps": 8,
+        "n_obs_steps": 1,
         "normalization_mapping": {
             "VISUAL": "IDENTITY",
-            "STATE": "MEAN_STD",
+            "STATE": "MIN_MAX",
             "ACTION": "MEAN_STD"
         },
         "chunk_size": 10,
+        "predict_response": true,
         "n_action_steps": 10,
         "max_state_dim": 32,
         "max_action_dim": 32,
-        "proj_width": 1024,
-        "dropout": 0.1,
-        "num_steps": 10,
+        "proj_width": 1280,
+        "num_steps": 5,
+        "resize_imgs_with_padding": [448, 448],
+        "init_strategy": "expert_only_he_init",
         "attention_implementation": "eager",
         "freeze_vision_encoder": true,
-        "train_expert_only": false,
-        "prompt_max_length": 50,
+        "train_expert_only": true,
+        "prompt_max_length": 256,
         "discrete_action_max_length": 100,
-        "spacetime_layer_stride": 4,
         "optimizer_lr": 2.5e-05,
         "optimizer_betas": [
             0.9,
@@ -52,7 +52,7 @@
     },
     "resume": false,
     "seed": 1000,
-    "resolution": [224, 224],
+    "resolution": [448, 448],
     "num_cams": 2,
     "max_state_dim": 32,
     "max_action_dim": 32,
@@ -91,36 +91,15 @@
     "wandb": {
         "enable": true,
         "entity": "wyautox-autox",
-        "project": "pi05_mem",
+        "project": "pi06",
         "run_id": null,
         "name": null,
-        "notes": "PI05 Mem training run with space-time SigLIP video encoder",
+        "notes": "PI06 training run",
         "tags": [],
         "group": null,
         "job_type": null,
         "mode": null,
         "allow_resume": true,
         "disable_artifact": false
-    },
-    "env": {
-        "type": "libero",
-        "task": "libero_10",
-        "fps": 10,
-        "max_parallel_tasks": 1,
-        "task_ids": [0],
-        "episode_length": 100,
-        "obs_type": "pixels_agent_pos",
-        "render_mode": "rgb_array",
-        "camera_name": "agentview_image,robot0_eye_in_hand_image",
-        "init_states": true,
-        "camera_name_mapping": null
-    },
-    "eval": {
-        "n_episodes": 1,
-        "batch_size": 1,
-        "use_async_envs": true,
-        "max_episodes_rendered": 11,
-        "grid_size": null
-    },
-    "eval_freq": 10
+    }
 }

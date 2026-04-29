@@ -22,6 +22,8 @@ covered by tests/scripts/test_attach_metadata.py (slow, network-dependent).
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 
 from opentau.datasets.lerobot_dataset import BaseDataset
@@ -62,6 +64,7 @@ class _DummyBaseDataset(BaseDataset):
         response_drop_prob=0.0,
         metadata_drop_all_prob=0.0,
         metadata_drop_each_prob=0.0,
+        meta_info: dict | None = None,
     ):
         torch.utils.data.Dataset.__init__(self)
         self.resolution = resolution
@@ -77,6 +80,9 @@ class _DummyBaseDataset(BaseDataset):
         self.metadata_drop_all_prob = metadata_drop_all_prob
         self.metadata_drop_each_prob = metadata_drop_each_prob
         self.enable_optional_key_dropout = True
+        # Stub meta surface so _to_standard_data_format can read robot_type /
+        # control_mode without instantiating a real LeRobotDatasetMetadata.
+        self.meta = SimpleNamespace(info=meta_info if meta_info is not None else {})
 
     def _get_feature_mapping_key(self) -> str:
         return _TEST_MAPPING_KEY
@@ -447,3 +453,89 @@ class TestDefaultCollate:
         # is_pad flags align 1:1 with their samples.
         assert batch["subgoal_is_pad"].tolist() == [False, True]
         assert batch["quality_is_pad"].tolist() == [False, True]
+
+
+# Dataset-level identifiers (robot_type, control_mode) are emitted inside
+# _emit_optional_keys and participate in the metadata_drop_all_prob /
+# metadata_drop_each_prob dropout rolls, same as speed / mistake / quality.
+
+
+def _full_raw_item(dataset: _DummyBaseDataset) -> dict:
+    """Minimal raw item that ``_to_standard_data_format`` can consume end-to-end."""
+    h, w = dataset.resolution
+    return {
+        "camera0": torch.full((3, h, w), 0.5, dtype=torch.float32),
+        "state": torch.zeros(dataset.max_state_dim, dtype=torch.float32),
+        "actions": torch.zeros((dataset.action_chunk, dataset.max_action_dim), dtype=torch.float32),
+        "actions_is_pad": torch.zeros(dataset.action_chunk, dtype=torch.bool),
+        "prompt": "do the thing",
+        "response": "ok",
+    }
+
+
+class TestRobotTypeControlMode:
+    def test_both_present_pass_through(self):
+        ds = _DummyBaseDataset(
+            num_cams=1,
+            meta_info={"robot_type": "aloha", "control_mode": "joint"},
+        )
+        out = ds._to_standard_data_format(_full_raw_item(ds))
+        assert out["robot_type"] == "aloha"
+        assert out["control_mode"] == "joint"
+
+    def test_both_absent_emit_empty_string(self):
+        # Default _DummyBaseDataset has empty meta.info — mirrors VQA datasets and
+        # legacy LeRobot datasets that pre-date PR #183.
+        ds = _DummyBaseDataset(num_cams=1)
+        out = ds._to_standard_data_format(_full_raw_item(ds))
+        assert out["robot_type"] == ""
+        assert out["control_mode"] == ""
+
+    def test_robot_type_none_emit_empty_string(self):
+        # `info["robot_type"]` is typed `str | None`; both None and missing must
+        # collapse to the same "" sentinel so the downstream contract is uniform.
+        ds = _DummyBaseDataset(num_cams=1, meta_info={"robot_type": None})
+        out = ds._to_standard_data_format(_full_raw_item(ds))
+        assert out["robot_type"] == ""
+
+    def test_dropped_when_metadata_drop_all_prob_is_one(self):
+        # When metadata_drop_all_prob=1.0, robot_type / control_mode collapse to
+        # "" — they participate in the same metadata drop group as speed/mistake.
+        ds = _DummyBaseDataset(
+            num_cams=1,
+            meta_info={"robot_type": "panda", "control_mode": "ee"},
+            history_state_drop_prob=1.0,
+            subgoal_drop_prob=1.0,
+            response_drop_prob=1.0,
+            metadata_drop_all_prob=1.0,
+            metadata_drop_each_prob=1.0,
+        )
+        assert ds.enable_optional_key_dropout is True
+        out = ds._to_standard_data_format(_full_raw_item(ds))
+        assert out["robot_type"] == ""
+        assert out["control_mode"] == ""
+
+    def test_pass_through_when_drop_probs_zero(self):
+        # With all drop probabilities at zero, robot_type / control_mode pass
+        # through unchanged even when dropout is enabled.
+        ds = _DummyBaseDataset(
+            num_cams=1,
+            meta_info={"robot_type": "panda", "control_mode": "ee"},
+            metadata_drop_all_prob=0.0,
+            metadata_drop_each_prob=0.0,
+        )
+        assert ds.enable_optional_key_dropout is True
+        out = ds._to_standard_data_format(_full_raw_item(ds))
+        assert out["robot_type"] == "panda"
+        assert out["control_mode"] == "ee"
+
+    def test_emitted_as_python_strings_for_default_collate(self):
+        # Default PyTorch collate batches str fields into list[str]; verify the
+        # emitted values are plain strings (not bytes / np.str_ / 0-dim tensors).
+        ds = _DummyBaseDataset(
+            num_cams=1,
+            meta_info={"robot_type": "human", "control_mode": "mixed"},
+        )
+        out = ds._to_standard_data_format(_full_raw_item(ds))
+        assert type(out["robot_type"]) is str
+        assert type(out["control_mode"]) is str
