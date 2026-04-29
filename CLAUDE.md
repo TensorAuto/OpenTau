@@ -123,6 +123,7 @@ Key invariant on `TrainPipelineConfig`: `batch_size == dataloader_batch_size * g
 - Policy-related PRs require running GPU pytests + nightly regression tests; check both boxes.
 - Required tests/lint that gate merge: `cpu_test.yml` (PRs/pushes) and `pre-commit.yml`. `gpu_test.yml` and `regression_test.yml` run nightly on AWS g6 runners (cron 10:00 UTC).
 - Per-file ruff overrides in `pyproject.toml`: gRPC server (PascalCase methods, `N802`), `recordhuman_to_lerobot.py` (math-convention uppercase names, `N803`/`N806`).
+- **Claude integration:** three workflows under `.github/workflows/` add bots — `claude-pr-review.yml` does auto-review on PR open/sync (single edit-in-place summary tagged `[claude-review]`), `claude-implement-fixes.yml` handles `@claude fix` and addresses feedback in one coalesced commit (replies tagged `[claude-fix]`), and `extract-claude-lessons.yml` does post-merge lessons extraction into `chore(claude): learn from #N` PRs.
 
 ## Reference paths
 
