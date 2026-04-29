@@ -26,7 +26,6 @@ predicts updated memory and a subtask string.
 
 import builtins
 import logging
-import math
 from pathlib import Path
 
 import torch
@@ -371,6 +370,12 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
         fixed_state_dict = {}
 
         for key, value in state_dict.items():
+            # Accept legacy `paligemma_with_expert.*` prefixes from
+            # `pi07_paligemma` checkpoints as a warm-start path.  The rest of
+            # the rewrite logic applies uniformly to both prefixes.
+            if key.startswith("paligemma_with_expert."):
+                key = key.replace("paligemma_with_expert.", "gemma3_with_expert.", 1)
+
             new_key = key
 
             # Handle layer norm structure changes: .weight -> .dense.weight + .dense.bias
@@ -914,11 +919,13 @@ class PI07HighLevelPlannerModel(nn.Module):
             # Create attention masks so that image tokens attend to each other
             att_masks += [0] * num_img_embs
 
+        # Gemma 3's `embed_tokens` is a `Gemma3TextScaledWordEmbedding` that
+        # already multiplies by sqrt(hidden_size) internally — do NOT scale
+        # again here (unlike pi05's PaliGemma path, whose Gemma-v1 embedding
+        # is a plain nn.Embedding with the normalizer applied later in the
+        # stock forward that we bypass).  Applies to every
+        # `embed_language_tokens` call in this method.
         lang_emb = self.gemma3_with_expert.embed_language_tokens(lang_tokens)
-
-        # Normalize language embeddings
-        lang_emb_dim = lang_emb.shape[-1]
-        lang_emb = lang_emb * math.sqrt(lang_emb_dim)
 
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
@@ -929,8 +936,6 @@ class PI07HighLevelPlannerModel(nn.Module):
 
         if metadata_tokens is not None:
             metadata_emb = self.gemma3_with_expert.embed_language_tokens(metadata_tokens)
-            metadata_emb_dim = metadata_emb.shape[-1]
-            metadata_emb = metadata_emb * math.sqrt(metadata_emb_dim)
             embs.append(metadata_emb)
             pad_masks.append(metadata_masks)
             att_masks += [1] + [0] * (metadata_emb.shape[1] - 1)
@@ -942,8 +947,6 @@ class PI07HighLevelPlannerModel(nn.Module):
             dtype=torch.long,
         )
         prefix_end_emb = self.gemma3_with_expert.embed_language_tokens(prefix_end_tokens)
-        prefix_end_dim = prefix_end_emb.shape[-1]
-        prefix_end_emb = prefix_end_emb * math.sqrt(prefix_end_dim)
 
         num_prefix_end_embs = prefix_end_emb.shape[1]
         prefix_end_mask = torch.ones(bsize, num_prefix_end_embs, dtype=torch.bool, device=lang_tokens.device)
@@ -961,8 +964,6 @@ class PI07HighLevelPlannerModel(nn.Module):
             dtype=torch.long,
         )
         memory_start_emb = self.gemma3_with_expert.embed_language_tokens(memory_start_tokens)
-        memory_start_dim = memory_start_emb.shape[-1]
-        memory_start_emb = memory_start_emb * math.sqrt(memory_start_dim)
 
         num_memory_start_embs = memory_start_emb.shape[1]
         memory_start_mask = torch.ones(
@@ -975,9 +976,6 @@ class PI07HighLevelPlannerModel(nn.Module):
 
         if memory_tokens is not None:
             memory_emb = self.gemma3_with_expert.embed_language_tokens(memory_tokens)
-            # Normalize memory language embeddings
-            memory_emb_dim = memory_emb.shape[-1]
-            memory_emb = memory_emb * math.sqrt(memory_emb_dim)
 
             embs.append(memory_emb)
             pad_masks.append(memory_masks)
@@ -996,8 +994,6 @@ class PI07HighLevelPlannerModel(nn.Module):
                 dtype=torch.long,
             )
             response_start_emb = self.gemma3_with_expert.embed_language_tokens(response_start_tokens)
-            response_start_dim = response_start_emb.shape[-1]
-            response_start_emb = response_start_emb * math.sqrt(response_start_dim)
 
             num_response_start_embs = response_start_emb.shape[1]
             response_start_mask = torch.ones(
@@ -1009,10 +1005,6 @@ class PI07HighLevelPlannerModel(nn.Module):
             att_masks += [1] + [0] * (num_response_start_embs - 1)
 
             response_emb = self.gemma3_with_expert.embed_language_tokens(response_tokens)
-
-            # Normalize response language embeddings
-            response_emb_dim = response_emb.shape[-1]
-            response_emb = response_emb * math.sqrt(response_emb_dim)
 
             embs.append(response_emb)
             pad_masks.append(response_masks)
@@ -1251,8 +1243,9 @@ class PI07HighLevelPlannerModel(nn.Module):
         response_start_indicator_ids = self.language_tokenizer.encode("Subtask: ", add_special_tokens=False)
         for i, tid in enumerate(response_start_indicator_ids):
             token = torch.full((bsize, 1), int(tid), device=device, dtype=torch.long)
+            # Gemma 3's `embed_tokens` already scales by sqrt(hidden_size); see
+            # the note in `embed_prefix`.
             emb = self.gemma3_with_expert.embed_language_tokens(token)
-            emb = emb * math.sqrt(emb.shape[-1])
             pad_row = torch.ones((bsize, 1), device=device, dtype=prefix_pad_masks.dtype)
             if prefix_att_masks.dtype == torch.bool:
                 new_att = torch.full((bsize, 1), i == 0, device=device, dtype=torch.bool)
@@ -1387,12 +1380,9 @@ class PI07HighLevelPlannerModel(nn.Module):
         # Updating response tokens with current predicted token
         tokens = torch.cat([tokens, token], dim=1)
 
-        # Embed the current predicted token
+        # Embed the current predicted token.  Gemma 3's `embed_tokens` already
+        # scales by sqrt(hidden_size); see the note in `embed_prefix`.
         emb = self.gemma3_with_expert.embed_language_tokens(token)
-
-        # Normalize response language embeddings
-        emb_dim = emb.shape[-1]
-        emb = emb * math.sqrt(emb_dim)
 
         att_masks = torch.ones((bsize, 1), device=device, dtype=emb.dtype)
 

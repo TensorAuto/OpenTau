@@ -381,6 +381,13 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         fixed_state_dict = {}
 
         for key, value in state_dict.items():
+            # Accept legacy `paligemma_with_expert.*` prefixes from
+            # `pi07_paligemma` checkpoints as a warm-start path; the rest of
+            # the AdaRMS / time-mlp / patch_embedding handling below applies
+            # uniformly to both prefixes.
+            if key.startswith("paligemma_with_expert."):
+                key = key.replace("paligemma_with_expert.", "gemma3_with_expert.", 1)
+
             new_key = key
 
             if re.match(
@@ -1164,9 +1171,13 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
 
             att_masks += [0] * num_vid_embs
 
+        # Gemma 3's `embed_tokens` is a `Gemma3TextScaledWordEmbedding` that
+        # already multiplies by sqrt(hidden_size) internally — do NOT scale
+        # again here (unlike pi05, whose PaliGemma Gemma-v1 embedding is a
+        # plain nn.Embedding with the normalizer applied later in the stock
+        # forward that we bypass).  Applies to every `embed_language_tokens`
+        # call in this method.
         lang_emb = self.gemma3_with_expert.embed_language_tokens(lang_tokens)
-        lang_emb_dim = lang_emb.shape[-1]
-        lang_emb = lang_emb * math.sqrt(lang_emb_dim)
 
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
@@ -1181,8 +1192,6 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             dtype=torch.long,
         )
         state_start_emb = self.gemma3_with_expert.embed_language_tokens(state_start_tokens)
-        state_start_dim = state_start_emb.shape[-1]
-        state_start_emb = state_start_emb * math.sqrt(state_start_dim)
 
         num_state_start_embs = state_start_emb.shape[1]
         state_start_mask = torch.ones(
@@ -1213,8 +1222,6 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             dtype=torch.long,
         )
         state_end_emb = self.gemma3_with_expert.embed_language_tokens(state_end_tokens)
-        state_end_dim = state_end_emb.shape[-1]
-        state_end_emb = state_end_emb * math.sqrt(state_end_dim)
 
         num_state_end_embs = state_end_emb.shape[1]
         state_end_mask = torch.ones(bsize, num_state_end_embs, dtype=torch.bool, device=lang_tokens.device)
@@ -1224,8 +1231,6 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         att_masks += [0] * num_state_end_embs
 
         response_emb = self.gemma3_with_expert.embed_language_tokens(response_tokens)
-        response_emb_dim = response_emb.shape[-1]
-        response_emb = response_emb * math.sqrt(response_emb_dim)
         embs.append(response_emb)
         pad_masks.append(response_masks)
         num_response_embs = response_emb.shape[1]
@@ -1240,8 +1245,6 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             dtype=torch.long,
         )
         subgoal_img_start_emb = self.gemma3_with_expert.embed_language_tokens(subgoal_img_start_tokens)
-        subgoal_img_start_dim = subgoal_img_start_emb.shape[-1]
-        subgoal_img_start_emb = subgoal_img_start_emb * math.sqrt(subgoal_img_start_dim)
 
         num_subgoal_img_start_embs = subgoal_img_start_emb.shape[1]
         subgoal_img_start_mask = torch.ones(
@@ -1279,8 +1282,6 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             dtype=torch.long,
         )
         subgoal_img_end_emb = self.gemma3_with_expert.embed_language_tokens(subgoal_img_end_tokens)
-        subgoal_img_end_dim = subgoal_img_end_emb.shape[-1]
-        subgoal_img_end_emb = subgoal_img_end_emb * math.sqrt(subgoal_img_end_dim)
 
         num_subgoal_img_end_embs = subgoal_img_end_emb.shape[1]
         subgoal_img_end_mask = torch.ones(
@@ -1292,8 +1293,6 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         att_masks += [0] * num_subgoal_img_end_embs
 
         metadata_emb = self.gemma3_with_expert.embed_language_tokens(metadata_tokens)
-        metadata_emb_dim = metadata_emb.shape[-1]
-        metadata_emb = metadata_emb * math.sqrt(metadata_emb_dim)
         embs.append(metadata_emb)
         pad_masks.append(metadata_masks)
         att_masks += [1] + [0] * (metadata_emb.shape[1] - 1)
@@ -1305,8 +1304,6 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             dtype=torch.long,
         )
         prefix_end_emb = self.gemma3_with_expert.embed_language_tokens(prefix_end_tokens)
-        prefix_end_dim = prefix_end_emb.shape[-1]
-        prefix_end_emb = prefix_end_emb * math.sqrt(prefix_end_dim)
 
         num_prefix_end_embs = prefix_end_emb.shape[1]
         prefix_end_mask = torch.ones(bsize, num_prefix_end_embs, dtype=torch.bool, device=lang_tokens.device)
@@ -1327,8 +1324,6 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             discrete_action_start_emb = self.gemma3_with_expert.embed_language_tokens(
                 discrete_action_start_tokens
             )
-            discrete_action_start_dim = discrete_action_start_emb.shape[-1]
-            discrete_action_start_emb = discrete_action_start_emb * math.sqrt(discrete_action_start_dim)
 
             num_discrete_action_start_embs = discrete_action_start_emb.shape[1]
             discrete_action_start_mask = torch.ones(

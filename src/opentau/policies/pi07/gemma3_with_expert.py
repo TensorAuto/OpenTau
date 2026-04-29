@@ -372,19 +372,33 @@ class Gemma3WithExpertModel(PreTrainedModel):
     def embed_image(self, image: torch.Tensor) -> torch.Tensor:
         """Runs the SigLIP tower + multimodal projector to obtain image tokens.
 
-        Gemma 3's `get_image_features` returns a `BaseModelOutputWithPooling`
-        whose `pooler_output` holds the projected image tokens (shape
-        `(B, mm_tokens_per_image, text_hidden_size)`). We extract that tensor
-        so callers can treat the return as a plain `(B, N, D)` tensor — matching
-        the patched PaliGemma behavior in `transformers_patch.py`.
+        Mirrors ``Gemma3ForConditionalGeneration.get_image_features``: feed
+        ``pixel_values`` through the vision tower and run
+        ``multi_modal_projector`` on the resulting ``last_hidden_state``,
+        returning a plain ``(B, mm_tokens_per_image, text_hidden_size)``
+        tensor.
+
+        When the vision tower has been wrapped with space-time attention by
+        :class:`SpaceTimeSiglipVideoEncoder` (low-level planner), suppress the
+        temporal sublayer here — single-image inputs have no time axis to
+        attend over.  The context manager is a no-op when no wrappers are
+        present.
         """
+        # Local import keeps ``gemma3_with_expert`` importable from the
+        # high-level planner (which never constructs a video encoder) without
+        # forcing a transitive import of einops/F at module load time.
+        from opentau.policies.pi07.low_level_planner.video_encoder import (
+            suppress_spacetime_temporal,
+        )
+
         vision_tower = self._vision_tower()
         projector = self._multi_modal_projector()
         if vision_tower is None or projector is None:
             raise RuntimeError(
                 "Gemma3 vision tower / multi_modal_projector could not be located on `self.gemma3`."
             )
-        last_hidden_state = vision_tower(pixel_values=image).last_hidden_state
+        with suppress_spacetime_temporal(vision_tower):
+            last_hidden_state = vision_tower(pixel_values=image).last_hidden_state
         return projector(last_hidden_state)
 
     def _lm_head(self) -> nn.Module:
@@ -415,7 +429,7 @@ class Gemma3WithExpertModel(PreTrainedModel):
     def get_attention_interface(self):
         if self.config.attention_implementation == "fa2":
             raise NotImplementedError(
-                "fa2 attention is not supported for pi06 yet because of the interleaved "
+                "fa2 attention is not supported for pi07 yet because of the interleaved "
                 "local/global mask pattern — use 'eager' instead."
             )
         return self.eager_attention_forward
