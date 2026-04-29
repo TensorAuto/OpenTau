@@ -908,7 +908,7 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
         # Per-sample flag: True means the subgoal was dropped or absent.
         subgoal_is_pad = batch.get(
-            "subgoal_is_pad", torch.zeros(batch["state"].shape[0], dtype=torch.bool)
+            "subgoal_is_pad", torch.ones(batch["state"].shape[0], dtype=torch.bool)
         )  # (B,) bool or None
 
         last_subgoal_img: Tensor | None = None
@@ -968,9 +968,9 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             batch.get("speed", torch.zeros(batch["state"].shape[0], dtype=torch.float32)),
             batch.get("quality", torch.zeros(batch["state"].shape[0], dtype=torch.float32)),
             batch.get("mistake", torch.zeros(batch["state"].shape[0], dtype=torch.float32)),
-            batch.get("speed_is_pad", torch.zeros(batch["state"].shape[0], dtype=torch.bool)),
-            batch.get("quality_is_pad", torch.zeros(batch["state"].shape[0], dtype=torch.bool)),
-            batch.get("mistake_is_pad", torch.zeros(batch["state"].shape[0], dtype=torch.bool)),
+            batch.get("speed_is_pad", torch.ones(batch["state"].shape[0], dtype=torch.bool)),
+            batch.get("quality_is_pad", torch.ones(batch["state"].shape[0], dtype=torch.bool)),
+            batch.get("mistake_is_pad", torch.ones(batch["state"].shape[0], dtype=torch.bool)),
             strict=True,
         ):
             segments = []
