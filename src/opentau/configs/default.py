@@ -154,11 +154,12 @@ class DatasetMixtureConfig:
             text) during a single ``__getitem__`` call. Only rolled when
             subgoals are not dropped. Must be in ``[0, 1]``. Defaults to 0.3.
         metadata_drop_all_prob: Probability of dropping ``speed``, ``mistake``,
-            and ``quality`` together during a single ``__getitem__`` call.
-            Must be in ``[0, 1]``. Defaults to 0.15.
+            ``quality``, ``robot_type``, and ``control_mode`` together during a
+            single ``__getitem__`` call. Must be in ``[0, 1]``. Defaults to 0.15.
         metadata_drop_each_prob: Per-field independent drop probability for
-            ``speed``, ``mistake``, and ``quality``. Only rolled when
-            ``metadata_drop_all_prob`` did not fire. Must be in ``[0, 1]``.
+            ``speed``, ``mistake``, ``quality``, ``robot_type``, and
+            ``control_mode``. Only rolled when ``metadata_drop_all_prob`` did not
+            fire. Must be in ``[0, 1]``.
             Defaults to 0.05.
         val_enable_optional_key_dropout: Whether to apply the five
             ``*_drop_prob`` rolls above to the validation split. Defaults to

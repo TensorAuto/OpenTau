@@ -118,14 +118,30 @@ keys when the dataset has been enriched with segment metadata (see
 future video frames. Each optional key is **always present**. Numeric
 and image keys pair with an ``{key}_is_pad`` boolean flag — zero-filled
 + flag True means "unavailable or masked". String keys
-(``response``, ``memory``, ``next_memory``) don't get a separate flag:
-the empty string ``""`` is itself the pad signal, which also keeps the
-default PyTorch collate happy (list of strings, same length as batch).
+(``response``, ``memory``, ``next_memory``, ``robot_type``,
+``control_mode``) don't get a separate flag: the empty string ``""``
+is itself the pad signal, which also keeps the default PyTorch collate
+happy (list of strings, same length as batch).
+
+``robot_type`` and ``control_mode`` are **dataset-level identifiers**
+(constant for every sample within a given dataset, distinct across
+datasets in a mixture batch) sourced directly from ``meta/info.json``.
+Like ``speed``, ``mistake``, and ``quality``, they participate in the
+``metadata_drop_all_prob`` / ``metadata_drop_each_prob`` dropout rolls —
+see :ref:`Training-time dropout <standard-data-format-optional-keys-dropout>`.
 
 .. code-block:: python
 
     {
         # ... core keys above ...
+
+        "robot_type": str,         # e.g. "aloha", "panda", "human" — copied verbatim
+                                   # from `meta/info.json["robot_type"]` (a standard
+                                   # LeRobot v2 field). Empty string ("") when the key
+                                   # is absent or null (e.g. VQA datasets).
+        "control_mode": str,       # One of {"joint", "ee", "mixed"} when the dataset
+                                   # opted in (see PR #183). Empty string ("") when
+                                   # `meta/info.json["control_mode"]` is absent.
 
         "memory": str,             # Cumulative subtask summary for the current frame's segment.
                                    # Empty string ("") when memory_raw is absent
@@ -177,11 +193,14 @@ Datasets opt in to subgoals by adding the key; the loader then uses the
 frame-selection machinery (end-of-segment vs. uniform ``[t, t+4 s]``)
 described below.
 
+.. _standard-data-format-optional-keys-dropout:
+
 Training-time dropout
 ^^^^^^^^^^^^^^^^^^^^^
 
 Six probability fields on ``DatasetMixtureConfig`` control how often
-each optional key is masked during a single ``__getitem__`` call. Masks
+each optional key is masked during a single ``__getitem__`` call.
+Masks
 are independent per sample (each call rolls fresh). ``DataLoader``
 workers seed their own torch RNG, so samples within a batch are
 independent across workers; seed globally via ``torch.manual_seed(...)``
@@ -215,12 +234,13 @@ for reproducibility.
        would remove the primary task signal).
    * - ``metadata_drop_all_prob``
      - ``0.15``
-     - Masks ``speed``, ``mistake``, and ``quality`` together.
+     - Masks ``speed``, ``mistake``, ``quality``, ``robot_type``, and
+       ``control_mode`` together.
    * - ``metadata_drop_each_prob``
      - ``0.05``
      - Per-field independent mask roll for each of ``speed``,
-       ``mistake``, ``quality``. Only rolled when the shared drop did
-       not fire.
+       ``mistake``, ``quality``, ``robot_type``, ``control_mode``.
+       Only rolled when the shared drop did not fire.
    * - ``val_enable_optional_key_dropout``
      - ``False``
      - Whether the five drop rolls above also fire on the **validation**
