@@ -1,0 +1,14 @@
+{
+  "dataset_mixture": {
+    "datasets": [
+      {
+        "repo_id": "local/example",
+        "root": "example"
+      },
+      {
+        "repo_id": "lerobot/pusht",
+        "revision": "main"
+      }
+    ]
+  }
+}
