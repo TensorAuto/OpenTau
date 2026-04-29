@@ -56,7 +56,7 @@ from opentau.policies.pi05.paligemma_with_expert import (
     PaliGemmaWithExpertConfig,
     PaliGemmaWithExpertModel,
 )
-from opentau.policies.pi05_mem.video_encoder import VJEPA2VideoEncoder
+from opentau.policies.pi05_mem.video_encoder import SpaceTimeSiglipVideoEncoder
 from opentau.policies.pi07_paligemma.low_level_planner.configuration_pi07_low_level import (
     PI07lowlevelPlannerConfig,
 )
@@ -1051,17 +1051,11 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
 
         vlm_hidden_size = self.paligemma_with_expert.config.paligemma_config.text_config.hidden_size
 
-        # V-JEPA2 video encoder (replaces SigLIP)
-        encoder_dtype = getattr(torch, config.vjepa2_dtype) if config.vjepa2_dtype else None
-        self.video_encoder = VJEPA2VideoEncoder(
-            vjepa2_model_name=config.vjepa2_model_name,
+        self.video_encoder = SpaceTimeSiglipVideoEncoder(
+            vision_tower=self.paligemma_with_expert.paligemma.vision_tower,
+            multi_modal_projector=self.paligemma_with_expert.paligemma.multi_modal_projector,
             num_frames=config.n_obs_steps,
-            crop_size=config.vjepa2_crop_size,
-            num_video_tokens=config.vjepa2_num_video_tokens,
-            vlm_hidden_size=vlm_hidden_size,
-            perceiver_heads=config.vjepa2_perceiver_heads,
-            freeze_encoder=config.freeze_vision_encoder,
-            encoder_dtype=encoder_dtype,
+            spacetime_layer_stride=config.spacetime_layer_stride,
         )
 
         # Per-timestep state projection: each of the T state vectors becomes one token

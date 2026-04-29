@@ -17,7 +17,7 @@
 
 This module defines the ``PI07lowlevelPlannerConfig`` class, which handles
 configuration parameters for the π07 low-level planner. This planner uses
-V-JEPA2 as a video encoder, processes temporal state sequences (one
+SpaceTimeSiglip as a video encoder, processes temporal state sequences (one
 continuous token per timestep), and supports optional subtask response,
 subgoal image, and metadata conditioning.
 """
@@ -39,13 +39,13 @@ class PI07lowlevelPlannerConfig(PreTrainedConfig):
     """Configuration for the π07 low-level planner.
 
     The low-level planner generates continuous action chunks via flow matching
-    and discrete FAST action tokens through the VLM backbone.  It uses V-JEPA2
-    as a video encoder and projects temporal state sequences into per-timestep
-    continuous tokens.
+    and discrete FAST action tokens through the VLM backbone.  It uses
+    SpaceTimeSiglip as a video encoder and projects temporal state sequences
+    into per-timestep continuous tokens.
 
     Args:
-        n_obs_steps: Number of temporal video frames passed to V-JEPA2 per
-            forward call. Must equal ``n_obs_history`` when the latter is set.
+        n_obs_steps: Number of temporal video frames per forward call. Must
+            equal ``n_obs_history`` when the latter is set.
         chunk_size: Size of the action chunk (upper bound for
             ``n_action_steps``). Defaults to 50.
         n_action_steps: Number of action steps to predict. Defaults to 50.
@@ -70,17 +70,12 @@ class PI07lowlevelPlannerConfig(PreTrainedConfig):
             inference. Defaults to 0.
         attention_implementation: Attention backend (``"eager"`` or
             ``"fa2"``). Defaults to ``"eager"``.
-        freeze_vision_encoder: Whether to freeze V-JEPA2. Defaults to True.
+        freeze_vision_encoder: Whether to freeze the SigLIP vision encoder.
+            Defaults to True.
         train_expert_only: Whether to train only the action expert.
             Defaults to False.
-        vjepa2_model_name: HuggingFace repo for V-JEPA2 weights.
-        vjepa2_crop_size: Spatial resolution fed to V-JEPA2. Defaults to 224.
-        vjepa2_num_video_tokens: Number of output tokens after Perceiver
-            reduction. Defaults to 256.
-        vjepa2_perceiver_heads: Attention heads in the Perceiver reducer.
-            Defaults to 8.
-        vjepa2_dtype: Torch dtype string for V-JEPA2 weights. Defaults to
-            None (bfloat16 on CUDA, float32 on CPU).
+        spacetime_layer_stride: Wrap every N-th SigLIP layer with space-time
+            attention. Defaults to 4.
     """
 
     # Input / output structure.
@@ -144,12 +139,8 @@ class PI07lowlevelPlannerConfig(PreTrainedConfig):
     freeze_vision_encoder: bool = True
     train_expert_only: bool = False
 
-    # V-JEPA2 settings
-    vjepa2_model_name: str = "facebook/vjepa2-vitl-fpc64-256"
-    vjepa2_crop_size: int = 224
-    vjepa2_num_video_tokens: int = 256
-    vjepa2_perceiver_heads: int = 8
-    vjepa2_dtype: str | None = None
+    # SpaceTimeSiglip settings
+    spacetime_layer_stride: int = 4
 
     # Training presets
     optimizer_lr: float = 2.5e-5
