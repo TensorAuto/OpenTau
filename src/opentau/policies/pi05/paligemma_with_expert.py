@@ -228,7 +228,7 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
             # existing configs keep running.
             logging.warning(
                 "attention_implementation='fa2' is not implemented; falling back to 'eager'. "
-                "Consider switching to 'sdpa' for ~10-15%% better throughput."
+                "Consider switching to 'sdpa' for ~10-15% better throughput."
             )
 
 
