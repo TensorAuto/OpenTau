@@ -48,6 +48,8 @@ jobs:
       - uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: |
+            --permission-mode bypassPermissions
           prompt: |
             A reviewer asked you to address review feedback on this PR.
 

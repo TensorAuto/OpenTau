@@ -38,6 +38,8 @@ jobs:
       - uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: |
+            --permission-mode bypassPermissions
           prompt: |
             Review the comments on this merged PR. If any reviewer feedback
             reveals a missing rule in CLAUDE.md or .claude/rules/, open a

@@ -51,6 +51,7 @@ jobs:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           claude_args: |
             --model claude-opus-4-7
+            --permission-mode bypassPermissions
           prompt: |
             You are reviewing PR #${{ github.event.pull_request.number }} in
             ${{ github.repository }}.
