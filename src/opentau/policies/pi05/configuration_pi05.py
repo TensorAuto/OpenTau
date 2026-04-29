@@ -59,8 +59,6 @@ class PI05Config(PreTrainedConfig):
         proj_width: Width of the projection layer. Defaults to 1024.
         dropout: Dropout rate. Defaults to 0.1.
         num_steps: Number of flow matching steps for decoding. Defaults to 10.
-        init_strategy: Initialization strategy. One of "no_init", "full_he_init", "expert_only_he_init".
-            Defaults to "full_he_init".
         attention_implementation: Attention implementation to use ("eager", "sdpa", or "fa2").
             Defaults to "eager". "sdpa" dispatches to ``torch.nn.functional.scaled_dot_product_attention``
             (frees ~5.6 GiB on forward at the bs ceiling tested; see PR #182). "fa2" is accepted for
