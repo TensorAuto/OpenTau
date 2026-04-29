@@ -951,14 +951,21 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         return subgoal_images, subgoal_img_masks
 
     def prepare_metadata(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
-        """Tokenize episode metadata into PaliGemma token IDs.
+        """Tokenize episode metadata into Gemma 3 token IDs.
 
-        Wraps each metadata string as ``"Metadata: {meta}<eos>"`` and
-        pads/truncates to ``metadata_max_length``.
+        Wraps non-empty per-sample metadata segments into a single
+        ``"Metadata: {seg1} {seg2} ..."`` string, then pads/truncates to
+        ``metadata_max_length``. Samples with no active segments emit an
+        empty string.
 
         Args:
-            batch: Batch dict containing ``"speed"``, ``"quality"``,
-                ``"mistake"`` and their corresponding ``_is_pad`` flags.
+            batch: Batch dict that may contain any of:
+                ``"speed"``, ``"quality"``, ``"mistake"`` (float tensors with
+                a corresponding ``_is_pad`` bool tensor — entries marked as
+                pad are dropped), and ``"robot_type"``, ``"control_mode"``
+                (lists of strings — empty string is the pad signal, no
+                separate ``_is_pad`` flag). Missing keys are treated as
+                fully padded.
 
         Returns:
             A tuple ``(metadata_tokens, metadata_masks)`` with shapes
@@ -981,9 +988,9 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             batch.get("speed", torch.zeros(batch_size, dtype=torch.float32)),
             batch.get("quality", torch.zeros(batch_size, dtype=torch.float32)),
             batch.get("mistake", torch.zeros(batch_size, dtype=torch.float32)),
-            batch.get("speed_is_pad", torch.zeros(batch_size, dtype=torch.bool)),
-            batch.get("quality_is_pad", torch.zeros(batch_size, dtype=torch.bool)),
-            batch.get("mistake_is_pad", torch.zeros(batch_size, dtype=torch.bool)),
+            batch.get("speed_is_pad", torch.ones(batch_size, dtype=torch.bool)),
+            batch.get("quality_is_pad", torch.ones(batch_size, dtype=torch.bool)),
+            batch.get("mistake_is_pad", torch.ones(batch_size, dtype=torch.bool)),
             batch.get("robot_type", [""] * batch_size),
             batch.get("control_mode", [""] * batch_size),
             strict=True,

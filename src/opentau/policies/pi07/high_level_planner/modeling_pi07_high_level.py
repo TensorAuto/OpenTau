@@ -668,10 +668,25 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
         return lang_tokens, lang_masks
 
     def prepare_metadata(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
-        """Tokenizes the metadata for training.
+        """Tokenize episode metadata into Gemma 3 token IDs.
 
-        Wraps each metadata string with an ``<eos>`` suffix, then tokenizes and
-        pads to ``metadata_max_length``.
+        Wraps non-empty per-sample metadata segments into a single
+        ``"Metadata: {seg1} {seg2} ..."`` string, then pads/truncates to
+        ``metadata_max_length``. Samples with no active segments emit an
+        empty string.
+
+        Args:
+            batch: Batch dict that may contain any of:
+                ``"speed"``, ``"quality"``, ``"mistake"`` (float tensors with
+                a corresponding ``_is_pad`` bool tensor — entries marked as
+                pad are dropped), and ``"robot_type"``, ``"control_mode"``
+                (lists of strings — empty string is the pad signal, no
+                separate ``_is_pad`` flag). Missing keys are treated as
+                fully padded.
+
+        Returns:
+            A tuple ``(metadata_tokens, metadata_masks)`` with shapes
+            ``(B, metadata_max_length)``.
         """
 
         metadata = []
@@ -712,7 +727,7 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
             if control_mode:
                 segments.append(f"Control: {control_mode}, ")
 
-            metadata.append(f"Metadata: {' '.join(segments)}")
+            metadata.append(f"Metadata: {' '.join(segments)}" if segments else "")
 
         device = batch["state"].device
         tokenized_metadata = self.language_tokenizer.__call__(

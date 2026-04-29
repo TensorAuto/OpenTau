@@ -362,3 +362,181 @@ class TestNoManualSqrtScalingInPlannerSource:
             "Gemma 3's embed_tokens already scales by sqrt(hidden_size). "
             "Reintroducing the manual scaling double-scales text embeddings."
         )
+
+
+# `prepare_metadata` segment-string construction
+#
+# The two planners share an identical contract for assembling the metadata
+# prompt: each per-sample segment is appended only when the field is *not*
+# padded, and a sample with zero active segments emits an empty string (not
+# the literal "Metadata: ").  These tests pin that contract on the CPU side
+# without instantiating the full Gemma 3 backbone — we bind the unbound
+# method to a SimpleNamespace and stub the tokenizer to capture the exact
+# strings the loop produced.
+
+
+def _make_tokenizer_capture():
+    """Return a (tokenizer_stub, captured_list) pair.
+
+    Use the captured list to assert on the metadata strings the planner
+    constructed, independent of the real Gemma 3 tokenizer.
+    """
+    import types
+
+    captured: list[str] = []
+
+    def stub_call(metadata, **kwargs):
+        captured.extend(metadata)
+        batch_size = len(metadata)
+        max_length = kwargs.get("max_length", 4)
+        return {
+            "input_ids": torch.zeros((batch_size, max_length), dtype=torch.long),
+            "attention_mask": torch.zeros((batch_size, max_length), dtype=torch.long),
+        }
+
+    tokenizer = types.SimpleNamespace()
+    tokenizer.__call__ = stub_call
+    return tokenizer, captured
+
+
+def _make_fake_planner(metadata_max_length: int = 4):
+    """Construct a minimal ``self`` stand-in for the planners' ``prepare_metadata``.
+
+    The unbound method only reads ``self.language_tokenizer`` and
+    ``self.config.metadata_max_length``, so a plain SimpleNamespace is
+    sufficient — no Gemma 3 backbone, no HuggingFace download.
+    """
+    import types
+
+    tokenizer, captured = _make_tokenizer_capture()
+    fake = types.SimpleNamespace(
+        language_tokenizer=tokenizer,
+        config=types.SimpleNamespace(metadata_max_length=metadata_max_length),
+    )
+    return fake, captured
+
+
+class TestPrepareMetadataSegments:
+    """Verify the per-sample metadata string construction in both planners.
+
+    Covers:
+      * ``robot_type`` / ``control_mode`` (PR-introduced) emit ``"Robot: ..."``
+        and ``"Control: ..."`` segments only when non-empty.
+      * Missing batch keys default to "fully padded" → empty string.
+      * The high- and low-level planners agree on the all-empty case.
+    """
+
+    @staticmethod
+    def _planner_methods():
+        from opentau.policies.pi07.high_level_planner.modeling_pi07_high_level import (
+            PI07HighLevelPlannerPolicy,
+        )
+        from opentau.policies.pi07.low_level_planner.modeling_pi07_low_level import (
+            PI07LowLevelPlannerPolicy,
+        )
+
+        return {
+            "low": PI07LowLevelPlannerPolicy.prepare_metadata,
+            "high": PI07HighLevelPlannerPolicy.prepare_metadata,
+        }
+
+    @pytest.mark.parametrize("planner", ["low", "high"])
+    def test_robot_and_control_present(self, planner):
+        """Both robot_type and control_mode populated → both segments emitted."""
+        method = self._planner_methods()[planner]
+        fake, captured = _make_fake_planner()
+
+        batch_size = 2
+        batch = {
+            "state": torch.zeros(batch_size, 1),
+            "robot_type": ["franka", "ur5"],
+            "control_mode": ["joint", "ee"],
+        }
+
+        method(fake, batch)
+
+        assert len(captured) == batch_size
+        for line, robot, ctrl in zip(captured, ["franka", "ur5"], ["joint", "ee"], strict=True):
+            assert line.startswith("Metadata: ")
+            assert f"Robot: {robot}, " in line
+            assert f"Control: {ctrl}, " in line
+
+    @pytest.mark.parametrize("planner", ["low", "high"])
+    def test_robot_and_control_absent_emits_empty_string(self, planner):
+        """No metadata keys present → all samples emit ``""`` (no fabricated values)."""
+        method = self._planner_methods()[planner]
+        fake, captured = _make_fake_planner()
+
+        batch_size = 3
+        batch = {"state": torch.zeros(batch_size, 1)}
+
+        method(fake, batch)
+
+        assert captured == ["", "", ""]
+
+    @pytest.mark.parametrize("planner", ["low", "high"])
+    def test_one_present_one_empty(self, planner):
+        """Mixed: only ``robot_type`` populated → only ``Robot:`` segment emitted."""
+        method = self._planner_methods()[planner]
+        fake, captured = _make_fake_planner()
+
+        batch_size = 2
+        batch = {
+            "state": torch.zeros(batch_size, 1),
+            "robot_type": ["franka", "ur5"],
+            "control_mode": ["", ""],
+        }
+
+        method(fake, batch)
+
+        assert len(captured) == batch_size
+        for line, robot in zip(captured, ["franka", "ur5"], strict=True):
+            assert line.startswith("Metadata: ")
+            assert f"Robot: {robot}, " in line
+            assert "Control:" not in line
+
+    @pytest.mark.parametrize("planner", ["low", "high"])
+    def test_per_sample_empty_emits_empty_string(self, planner):
+        """Within a batch, samples whose every field is empty/padded emit ``""``,
+        even when sibling samples have populated fields.  Pins the
+        ``if segments else ""`` guard at both planner sites so the two
+        planners agree on the all-empty contract.
+        """
+        method = self._planner_methods()[planner]
+        fake, captured = _make_fake_planner()
+
+        batch_size = 2
+        batch = {
+            "state": torch.zeros(batch_size, 1),
+            "robot_type": ["franka", ""],
+            "control_mode": ["joint", ""],
+        }
+
+        method(fake, batch)
+
+        assert len(captured) == batch_size
+        assert captured[0].startswith("Metadata: ")
+        assert captured[1] == ""
+
+    def test_low_level_missing_speed_pad_does_not_fabricate_value(self):
+        """Regression for the zeros→ones default fix: with ``speed`` and
+        ``speed_is_pad`` both absent from the batch, the low-level planner
+        must NOT emit ``"Speed: 0.0"`` — that would surface a value the
+        caller never provided.
+        """
+        from opentau.policies.pi07.low_level_planner.modeling_pi07_low_level import (
+            PI07LowLevelPlannerPolicy,
+        )
+
+        method = PI07LowLevelPlannerPolicy.prepare_metadata
+        fake, captured = _make_fake_planner()
+
+        batch_size = 2
+        batch = {"state": torch.zeros(batch_size, 1)}
+
+        method(fake, batch)
+
+        for line in captured:
+            assert "Speed:" not in line
+            assert "Quality:" not in line
+            assert "Mistake:" not in line
