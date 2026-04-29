@@ -911,6 +911,9 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             "subgoal_is_pad", torch.zeros(batch["state"].shape[0], dtype=torch.bool)
         )  # (B,) bool or None
 
+        last_subgoal_img: Tensor | None = None
+        last_mask: Tensor | None = None
+
         for key in present_subgoal_img_keys:
             subgoal_img = batch[key]
 
@@ -931,16 +934,16 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
             subgoal_images.append(subgoal_img)
             subgoal_img_masks.append(mask)
+            last_subgoal_img = subgoal_img
+            last_mask = mask
 
-        # Create image features not present in the batch
-        # as fully 0 padded images.
-        for num_empty_cameras in range(len(missing_subgoal_img_keys)):
-            if num_empty_cameras >= self.config.empty_cameras:
-                break
-            subgoal_img = torch.ones_like(subgoal_img) * -1
-            mask = torch.zeros_like(mask)
-            subgoal_images.append(subgoal_img)
-            subgoal_img_masks.append(mask)
+        # Create image features not present in the batch as fully 0 padded images.
+        if last_subgoal_img is not None and last_mask is not None:
+            for num_empty_cameras in range(len(missing_subgoal_img_keys)):
+                if num_empty_cameras >= self.config.empty_cameras:
+                    break
+                subgoal_images.append(torch.ones_like(last_subgoal_img) * -1)
+                subgoal_img_masks.append(torch.zeros_like(last_mask))
 
         return subgoal_images, subgoal_img_masks
 
@@ -1228,79 +1231,90 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         pad_masks.append(state_end_mask)
         att_masks += [0] * num_state_end_embs
 
-        response_emb = self.paligemma_with_expert.embed_language_tokens(response_tokens)
-        response_emb_dim = response_emb.shape[-1]
-        response_emb = response_emb * math.sqrt(response_emb_dim)
-        embs.append(response_emb)
-        pad_masks.append(response_masks)
-        num_response_embs = response_emb.shape[1]
-        att_masks += [1] + [0] * (num_response_embs - 1)
+        # Only embed response when at least one sample in the batch has real response tokens.
+        # With response_drop_prob=1.0 all masks are False; skipping avoids a spurious
+        # causal-block boundary (att_masks=[1,...]) that would corrupt cumsum for every
+        # subsequent token.
+        if response_tokens is not None and response_masks is not None and response_masks.any():
+            response_emb = self.paligemma_with_expert.embed_language_tokens(response_tokens)
+            response_emb_dim = response_emb.shape[-1]
+            response_emb = response_emb * math.sqrt(response_emb_dim)
+            embs.append(response_emb)
+            pad_masks.append(response_masks)
+            num_response_embs = response_emb.shape[1]
+            att_masks += [1] + [0] * (num_response_embs - 1)
 
-        subgoal_img_start_indicator_ids = self.language_tokenizer.encode(
-            "Subgoal: ", add_special_tokens=False
-        )
-        subgoal_img_start_tokens = torch.tensor(
-            [subgoal_img_start_indicator_ids] * bsize,
-            device=lang_tokens.device,
-            dtype=torch.long,
-        )
-        subgoal_img_start_emb = self.paligemma_with_expert.embed_language_tokens(subgoal_img_start_tokens)
-        subgoal_img_start_dim = subgoal_img_start_emb.shape[-1]
-        subgoal_img_start_emb = subgoal_img_start_emb * math.sqrt(subgoal_img_start_dim)
+        # Only embed the subgoal block (header + images + footer) when subgoal images are
+        # actually present. Unconditionally adding "Subgoal: " injects real (non-padded)
+        # spurious tokens into every prefix even with subgoal_drop_prob=1.0.
+        if subgoal_images:
+            subgoal_img_start_indicator_ids = self.language_tokenizer.encode(
+                "Subgoal: ", add_special_tokens=False
+            )
+            subgoal_img_start_tokens = torch.tensor(
+                [subgoal_img_start_indicator_ids] * bsize,
+                device=lang_tokens.device,
+                dtype=torch.long,
+            )
+            subgoal_img_start_emb = self.paligemma_with_expert.embed_language_tokens(subgoal_img_start_tokens)
+            subgoal_img_start_dim = subgoal_img_start_emb.shape[-1]
+            subgoal_img_start_emb = subgoal_img_start_emb * math.sqrt(subgoal_img_start_dim)
 
-        num_subgoal_img_start_embs = subgoal_img_start_emb.shape[1]
-        subgoal_img_start_mask = torch.ones(
-            bsize, num_subgoal_img_start_embs, dtype=torch.bool, device=lang_tokens.device
-        )
+            num_subgoal_img_start_embs = subgoal_img_start_emb.shape[1]
+            subgoal_img_start_mask = torch.ones(
+                bsize, num_subgoal_img_start_embs, dtype=torch.bool, device=lang_tokens.device
+            )
 
-        embs.append(subgoal_img_start_emb)
-        pad_masks.append(subgoal_img_start_mask)
-        att_masks += [1] + [0] * (num_subgoal_img_start_embs - 1)
+            embs.append(subgoal_img_start_emb)
+            pad_masks.append(subgoal_img_start_mask)
+            att_masks += [1] + [0] * (num_subgoal_img_start_embs - 1)
 
-        for (
-            subgoal_img,
-            subgoal_img_mask,
-        ) in zip(subgoal_images, subgoal_img_masks, strict=True):
-            subgoal_img_emb = self.paligemma_with_expert.embed_image(subgoal_img)
-            subgoal_img_emb = subgoal_img_emb.to(dtype=_preferred_dtype())
+            for (
+                subgoal_img,
+                subgoal_img_mask,
+            ) in zip(subgoal_images, subgoal_img_masks, strict=True):
+                subgoal_img_emb = self.paligemma_with_expert.embed_image(subgoal_img)
+                subgoal_img_emb = subgoal_img_emb.to(dtype=_preferred_dtype())
 
-            # image embeddings don't need to be unnormalized because `fix/lerobot_openpi` branch of huggingface
-            # already removed the normalization inside PaliGemma
+                # image embeddings don't need to be unnormalized because `fix/lerobot_openpi` branch of huggingface
+                # already removed the normalization inside PaliGemma
 
-            bsize, num_subgoal_img_embs = subgoal_img_emb.shape[:2]
-            subgoal_img_mask = subgoal_img_mask[:, None].expand(bsize, num_subgoal_img_embs)
+                bsize, num_subgoal_img_embs = subgoal_img_emb.shape[:2]
+                subgoal_img_mask = subgoal_img_mask[:, None].expand(bsize, num_subgoal_img_embs)
 
-            embs.append(subgoal_img_emb)
-            pad_masks.append(subgoal_img_mask)
+                embs.append(subgoal_img_emb)
+                pad_masks.append(subgoal_img_mask)
 
-            # Create attention masks so that image tokens attend to each other
-            att_masks += [1] + [0] * (num_subgoal_img_embs - 1)
+                # Create attention masks so that image tokens attend to each other
+                att_masks += [1] + [0] * (num_subgoal_img_embs - 1)
 
-        subgoal_img_end_indicator_ids = self.language_tokenizer.encode(", ", add_special_tokens=False)
-        subgoal_img_end_tokens = torch.tensor(
-            [subgoal_img_end_indicator_ids] * bsize,
-            device=lang_tokens.device,
-            dtype=torch.long,
-        )
-        subgoal_img_end_emb = self.paligemma_with_expert.embed_language_tokens(subgoal_img_end_tokens)
-        subgoal_img_end_dim = subgoal_img_end_emb.shape[-1]
-        subgoal_img_end_emb = subgoal_img_end_emb * math.sqrt(subgoal_img_end_dim)
+            subgoal_img_end_indicator_ids = self.language_tokenizer.encode(", ", add_special_tokens=False)
+            subgoal_img_end_tokens = torch.tensor(
+                [subgoal_img_end_indicator_ids] * bsize,
+                device=lang_tokens.device,
+                dtype=torch.long,
+            )
+            subgoal_img_end_emb = self.paligemma_with_expert.embed_language_tokens(subgoal_img_end_tokens)
+            subgoal_img_end_dim = subgoal_img_end_emb.shape[-1]
+            subgoal_img_end_emb = subgoal_img_end_emb * math.sqrt(subgoal_img_end_dim)
 
-        num_subgoal_img_end_embs = subgoal_img_end_emb.shape[1]
-        subgoal_img_end_mask = torch.ones(
-            bsize, num_subgoal_img_end_embs, dtype=torch.bool, device=lang_tokens.device
-        )
+            num_subgoal_img_end_embs = subgoal_img_end_emb.shape[1]
+            subgoal_img_end_mask = torch.ones(
+                bsize, num_subgoal_img_end_embs, dtype=torch.bool, device=lang_tokens.device
+            )
 
-        embs.append(subgoal_img_end_emb)
-        pad_masks.append(subgoal_img_end_mask)
-        att_masks += [0] * num_subgoal_img_end_embs
+            embs.append(subgoal_img_end_emb)
+            pad_masks.append(subgoal_img_end_mask)
+            att_masks += [0] * num_subgoal_img_end_embs
 
-        metadata_emb = self.paligemma_with_expert.embed_language_tokens(metadata_tokens)
-        metadata_emb_dim = metadata_emb.shape[-1]
-        metadata_emb = metadata_emb * math.sqrt(metadata_emb_dim)
-        embs.append(metadata_emb)
-        pad_masks.append(metadata_masks)
-        att_masks += [1] + [0] * (metadata_emb.shape[1] - 1)
+        # Only embed metadata when at least one sample has real metadata tokens.
+        if metadata_tokens is not None and metadata_masks is not None and metadata_masks.any():
+            metadata_emb = self.paligemma_with_expert.embed_language_tokens(metadata_tokens)
+            metadata_emb_dim = metadata_emb.shape[-1]
+            metadata_emb = metadata_emb * math.sqrt(metadata_emb_dim)
+            embs.append(metadata_emb)
+            pad_masks.append(metadata_masks)
+            att_masks += [1] + [0] * (metadata_emb.shape[1] - 1)
 
         prefix_end_indicator_ids = self.language_tokenizer.encode(";\n ", add_special_tokens=False)
         prefix_end_tokens = torch.tensor(
@@ -1487,7 +1501,13 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         vlm_2d_attention_mask = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         vlm_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
-        num_cross_att_tokens = prefix_embs.shape[1] - self.config.discrete_action_max_length
+        # Exclude both the "Action: " indicator tokens and the discrete action tokens from
+        # cross-attention so the action expert sees the same prefix length at train and inference
+        # (at inference, neither is in the prefix). Matches pi05's discrete_action_indicator_max_length logic.
+        _action_indicator_len = len(self.language_tokenizer.encode("Action: ", add_special_tokens=False))
+        num_cross_att_tokens = (
+            prefix_embs.shape[1] - _action_indicator_len - self.config.discrete_action_max_length
+        )
 
         (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
             attention_mask=vlm_2d_attention_mask,
@@ -1525,9 +1545,10 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             n_cross_att_tokens=num_cross_att_tokens,
             cross_att_pad_masks=prefix_pad_masks[:, :num_cross_att_tokens],
         )
-        prefix_offsets = torch.sum(prefix_pad_masks[:, : -self.config.discrete_action_max_length], dim=-1)[
-            :, None
-        ]
+        prefix_offsets = torch.sum(
+            prefix_pad_masks[:, : -(_action_indicator_len + self.config.discrete_action_max_length)],
+            dim=-1,
+        )[:, None]
         action_expert_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
         assert past_key_values is not None
