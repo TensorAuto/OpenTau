@@ -2,7 +2,8 @@
   "dataset_mixture": {
     "datasets": [
       {
-        "repo_id": "TensorAuto/IceLemonade_100"
+        "repo_id": "lerobot/droid_100",
+        "revision": "v2.1"
       }
     ]
   }
