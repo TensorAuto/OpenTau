@@ -21,6 +21,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  id-token: write  # claude-code-action does an OIDC handshake at startup
 
 jobs:
   extract-lessons:
