@@ -74,6 +74,7 @@ from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.factory import make_dataset_mixture
 from opentau.datasets.utils import cycle
 from opentau.optim.factory import make_optimizer_and_scheduler
+from opentau.optim.master_weights import MasterWeightOptimizer
 from opentau.policies.factory import make_policy
 from opentau.utils.accelerate_utils import set_proc_accelerator
 from opentau.utils.random_utils import set_seed
@@ -138,6 +139,39 @@ def profile(cfg: TrainPipelineConfig):
         train_dataset, _ = make_dataset_mixture(cfg)
     else:
         train_dataset = make_dataset_mixture(cfg)
+
+    # Optional: override the policy's attention_implementation before the
+    # policy is constructed. Lets us A/B eager vs sdpa without touching the
+    # training config JSON. Recognised values match the pi05 validator:
+    # "eager", "sdpa", "fa2" (the last falls back to eager with a warning).
+    attn_impl_env = os.environ.get("ATTENTION_IMPL")
+    if attn_impl_env is not None and hasattr(cfg.policy, "attention_implementation"):
+        if accelerator.is_main_process:
+            logging.info(
+                "ATTENTION_IMPL=%s: overriding cfg.policy.attention_implementation (was %r)",
+                attn_impl_env,
+                cfg.policy.attention_implementation,
+            )
+        cfg.policy.attention_implementation = attn_impl_env
+
+    # Optional: toggle gradient checkpointing per run. Production default is
+    # False; setting GRAD_CHECKPOINT=true lets us A/B the throughput/memory
+    # tradeoff without touching the training config JSON. The strict
+    # distributed-backend guard in train.py is *not* duplicated here because
+    # profile_step already runs under accelerator and pi05's custom forward
+    # only supports the same set of backends for ckpt; if users try it
+    # under an unsupported backend they'll hit the same autograd issues at
+    # first backward.
+    grad_ckpt_env = os.environ.get("GRAD_CHECKPOINT")
+    if grad_ckpt_env is not None and hasattr(cfg.policy, "gradient_checkpointing"):
+        want_ckpt = grad_ckpt_env.lower() == "true"
+        if accelerator.is_main_process:
+            logging.info(
+                "GRAD_CHECKPOINT=%s: overriding cfg.policy.gradient_checkpointing (was %r)",
+                grad_ckpt_env,
+                cfg.policy.gradient_checkpointing,
+            )
+        cfg.policy.gradient_checkpointing = want_ckpt
 
     policy = make_policy(cfg=cfg.policy, ds_meta=train_dataset.meta)
     policy.to(torch.bfloat16)
@@ -236,6 +270,31 @@ def profile(cfg: TrainPipelineConfig):
                     f"{total_params:,}",
                 )
 
+        # Mirror train.py's master-weights wrapping. Without this, profile_step
+        # silently allocates Adam state (exp_avg, exp_avg_sq) in bf16 since the
+        # optimizer is built over the bf16-cast policy parameters; the resulting
+        # memory footprint is ~half of what production training pays under the
+        # PR #182 fix, so the benchmark would systematically under-report
+        # memory and over-report the largest batch that fits. See issue #181.
+        # DeepSpeed ZeRO already provides equivalent fp32-master semantics via
+        # BF16_Optimizer, so we skip the wrap on that backend.
+        if accelerator.distributed_type != accelerate.DistributedType.DEEPSPEED:
+            optimizer = MasterWeightOptimizer.from_existing(optimizer)
+            # Same rebind train.py performs immediately after from_existing:
+            # ``make_optimizer_and_scheduler`` left ``lr_scheduler.optimizer``
+            # pointing at the original (now-orphaned) AdamW. Without this,
+            # ``lr_scheduler.step()`` would mutate the orphan's
+            # ``param_groups[i]['lr']`` and the wrapper's inner AdamW would
+            # never see the schedule. See PR #182 and 8be2cd1.
+            if lr_scheduler is not None:
+                lr_scheduler.optimizer = optimizer
+            if accelerator.is_main_process:
+                logging.info(
+                    "Wrapped optimizer with MasterWeightOptimizer (fp32 master "
+                    "weights + fp32 Adam state). Backend: %s.",
+                    accelerator.distributed_type,
+                )
+
     train_dataloader = train_dataset.get_dataloader()
     if skip_optim:
         policy, train_dataloader = accelerator.prepare(policy, train_dataloader)
@@ -243,6 +302,15 @@ def profile(cfg: TrainPipelineConfig):
         policy, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             policy, optimizer, train_dataloader, lr_scheduler
         )
+        # accelerator.prepare may have migrated the policy's bf16 params from
+        # CPU to GPU. The MasterWeightOptimizer's fp32 masters were cloned
+        # at wrap-time (still on CPU) and would otherwise stay there, making
+        # this benchmark report misleadingly low GPU memory. Re-build masters
+        # from the now-migrated live params so they live on the same device.
+        # No-op when masters are already on the right device.
+        inner_opt_for_migrate = getattr(optimizer, "optimizer", optimizer)
+        if isinstance(inner_opt_for_migrate, MasterWeightOptimizer):
+            inner_opt_for_migrate.rebuild_masters_from_live(policy.parameters())
     train_dl_iter = cycle(train_dataloader)
 
     policy.train()
@@ -279,7 +347,15 @@ def profile(cfg: TrainPipelineConfig):
         if not skip_optim:
             accelerator.unscale_gradients(optimizer=optimizer)
             if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(policy.parameters(), cfg.optimizer.grad_clip_norm)
+                # Mirror train.py's dispatch: when MasterWeightOptimizer is in
+                # use, route the clip through it so the bf16->fp32 grad upcast
+                # is amortized into the clip phase (and the subsequent step
+                # skips the upcast). Otherwise use accelerator's clip path.
+                inner_opt = getattr(optimizer, "optimizer", optimizer)
+                if isinstance(inner_opt, MasterWeightOptimizer):
+                    inner_opt.clip_grad_norm_(cfg.optimizer.grad_clip_norm)
+                else:
+                    accelerator.clip_grad_norm_(policy.parameters(), cfg.optimizer.grad_clip_norm)
         _sync()
         t3b = time.perf_counter()
 

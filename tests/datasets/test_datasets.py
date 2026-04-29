@@ -902,3 +902,38 @@ def test_control_mode_warning_emitted_once_per_repo(tmp_path, lerobot_dataset_fa
     assert ds_b.control_mode == "unknown"
     matching = [r for r in caplog.records if "control_mode" in r.getMessage() and r.args == (test_repo,)]
     assert len(matching) == 1
+
+
+def test_robot_type_and_control_mode_in_meta_info(tmp_path, lerobot_dataset_factory, info_factory):
+    """robot_type and control_mode are surfaced as optional fields in the
+    standard data format. Verify the underlying meta/info.json values that
+    BaseDataset._to_standard_data_format reads via ``self.meta.info.get(...)``.
+
+    The unit tests in tests/datasets/test_optional_keys.py::TestRobotTypeControlMode
+    cover the actual emission lines; this test just guards against a regression
+    in how the factory threads info.json into ds.meta.info.
+    """
+    info_with = info_factory(
+        robot_type="aloha",
+        total_episodes=3,
+        total_frames=150,
+        total_tasks=1,
+    )
+    info_with["control_mode"] = "joint"
+    ds_with = lerobot_dataset_factory(root=tmp_path / "with-fields", info=info_with)
+    assert ds_with.meta.info["robot_type"] == "aloha"
+    assert ds_with.meta.info["control_mode"] == "joint"
+
+    info_without = info_factory(
+        robot_type=None,  # null robot_type is allowed by the type signature
+        total_episodes=3,
+        total_frames=150,
+        total_tasks=1,
+    )  # no `control_mode` key — emulates pre-PR-#183 datasets
+    ds_without = lerobot_dataset_factory(
+        root=tmp_path / "without-fields",
+        repo_id="missing-fields/test-repo",
+        info=info_without,
+    )
+    assert ds_without.meta.info["robot_type"] is None
+    assert "control_mode" not in ds_without.meta.info
