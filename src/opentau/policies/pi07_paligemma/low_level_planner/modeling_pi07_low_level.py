@@ -1241,7 +1241,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         # Only embed the subgoal block (header + images + footer) when subgoal images are
         # actually present. Unconditionally adding "Subgoal: " injects real (non-padded)
         # spurious tokens into every prefix even with subgoal_drop_prob=1.0.
-        if subgoal_images:
+        if subgoal_images and any(mask.any() for mask in subgoal_img_masks):
             subgoal_img_start_indicator_ids = self.language_tokenizer.encode(
                 "Subgoal: ", add_special_tokens=False
             )
