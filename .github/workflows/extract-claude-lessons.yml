@@ -1,0 +1,57 @@
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Extract Claude Lessons
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  extract-lessons:
+    if: >-
+      github.event.pull_request.merged == true
+      && contains(github.event.pull_request.user.login, 'claude')
+      && !startsWith(github.event.pull_request.title, 'chore(claude): learn from')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            Review the comments on this merged PR. If any reviewer feedback
+            reveals a missing rule in CLAUDE.md or .claude/rules/, open a
+            new PR titled "chore(claude): learn from #${{ github.event.pull_request.number }}"
+            with the proposed updates.
+
+            Additionally, if the PR's diff or review comments make clear that
+            something already written in CLAUDE.md or .claude/rules/ is no
+            longer factually correct or no longer relevant (e.g. a referenced
+            file/command/path no longer exists, a rule contradicts a decision
+            the team has now adopted, or guidance describes behavior that has
+            since changed), include a correction or removal in the same PR.
+            Apply this edit sparingly and only when necessary — when in doubt,
+            leave the existing text alone. Prefer minimal surgical edits over
+            rewrites, and never delete a rule purely because it wasn't
+            exercised by this PR.
+
+            If nothing rule-worthy and nothing stale, exit cleanly.
