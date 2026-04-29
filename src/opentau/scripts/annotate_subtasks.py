@@ -51,17 +51,17 @@ directory is then treated identically to a local dataset.
 Example::
 
     python src/opentau/scripts/annotate_subtasks.py \\
-        --config-path example/train_mixture_config.json
+        --config-path configs/examples/train_mixture_config.json
 
     # Low-cost dry run: 1 episode per dataset, do not update parquet
     python src/opentau/scripts/annotate_subtasks.py \\
-        --config-path example/train_mixture_config.json \\
+        --config-path configs/examples/train_mixture_config.json \\
         --max-episodes-per-dataset 1 \\
         --no-write-response-column
 
     # Override download cache location
     python src/opentau/scripts/annotate_subtasks.py \\
-        --config-path example/train_mixture_config.json \\
+        --config-path configs/examples/train_mixture_config.json \\
         --hub-cache-dir /data/hf_cache
 """
 
