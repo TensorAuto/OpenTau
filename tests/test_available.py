@@ -20,6 +20,7 @@ import opentau
 from opentau.policies.pi0.modeling_pi0 import PI0Policy
 from opentau.policies.pi05.modeling_pi05 import PI05Policy
 from opentau.policies.pi05_mem.modeling_pi05 import PI05MemPolicy
+from opentau.policies.pi06.modeling_pi06 import PI06Policy
 from opentau.policies.value.modeling_value import ValueFunction
 
 
@@ -33,6 +34,7 @@ def test_available_policies():
         ValueFunction,
         PI05Policy,
         PI05MemPolicy,
+        PI06Policy,
     ]
     policies = [pol_cls.name for pol_cls in policy_classes]
     assert set(policies) == set(opentau.available_policies), policies

@@ -62,7 +62,10 @@ class PI05Config(PreTrainedConfig):
         num_steps: Number of flow matching steps for decoding. Defaults to 10.
         init_strategy: Initialization strategy. One of "no_init", "full_he_init", "expert_only_he_init".
             Defaults to "full_he_init".
-        attention_implementation: Attention implementation to use ("eager" or "fa2"). Defaults to "eager".
+        attention_implementation: Attention implementation to use ("eager", "sdpa", or "fa2").
+            Defaults to "eager". "sdpa" dispatches to ``torch.nn.functional.scaled_dot_product_attention``
+            (frees ~5.6 GiB on forward at the bs ceiling tested; see PR #182). "fa2" is accepted for
+            backward compatibility but logs a warning and falls back to "eager".
         freeze_vision_encoder: Whether to freeze the vision encoder during fine-tuning. Defaults to True.
         train_expert_only: Whether to train only the expert module. Defaults to False.
         optimizer_lr: Learning rate for the optimizer. Defaults to 2.5e-5.
@@ -138,6 +141,16 @@ class PI05Config(PreTrainedConfig):
     # Finetuning settings
     freeze_vision_encoder: bool = True
     train_expert_only: bool = False
+    # Wrap each transformer-layer forward in torch.utils.checkpoint to trade
+    # ~25-33% same-batch compute for ~30-40 GB of activation memory per rank,
+    # typically netting +10-25% throughput once the freed memory is spent on
+    # a larger per-rank batch. Only supported with distributed_type=MULTI_GPU
+    # (DDP), NO (single process), or DeepSpeed ZeRO-1/2 — src/opentau/scripts/
+    # train.py raises if the accelerator's distributed_type is anything else
+    # (ZeRO-3, FSDP) because pi05's custom per-layer forward does not wire up
+    # the backend-specific activation-checkpointing hooks those strategies
+    # require. Defaults to False (no ckpt, lowest risk).
+    gradient_checkpointing: bool = False
 
     # Training presets
     optimizer_lr: float = 2.5e-5

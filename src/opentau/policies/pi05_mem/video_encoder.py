@@ -12,99 +12,449 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""V-JEPA2 video encoder with Perceiver token reduction.
+"""SigLIP video encoder with space-time separable attention (MEM paper).
 
-Wraps a frozen V-JEPA2 ViT encoder with a learnable Perceiver cross-attention
-reducer and a linear projection to the VLM embedding dimension.
+Implements the low-level memory video encoder from Torne, Pertsch, Walke et al.
+"MEM: Multi-Scale Embodied Memory for Vision Language Action Models"
+(Section III-C + Appendix C): a standard SigLIP ViT extended with
+space-time separable attention at every ``spacetime_layer_stride``-th layer
+and a fixed sinusoidal temporal position encoding whose current-frame row is
+zero. Past-timestep tokens are dropped after the encoder so the output shape
+matches a single-image VLA.
+
+Key properties:
+  - Introduces no new learnable parameters on top of the pretrained SigLIP
+    weights (temporal attention re-uses each layer's own Q/K/V/O projections).
+    Any pi05/pi05_continuous_state checkpoint can be loaded directly — the
+    space-time layers just wrap the existing SiglipEncoderLayer weights.
+  - Single-frame invariance: with ``T=1`` the output is byte-identical to
+    ``PaliGemmaModel.get_image_features`` (see the single-frame invariance
+    tests).
+  - Convention: the current frame lives at the **last** time index
+    (``t = T-1``). This matches
+    ``src/opentau/datasets/factory.py:136`` (delta_timestamps) and
+    ``PI05MemPolicy._build_history_batch``. ``obs_history_is_pad[:, -1]`` is
+    always ``False`` by construction.
+
+The encoder does NOT own its own copy of the SigLIP weights. The caller
+(``PI05MemFlowMatching``) constructs a ``PaliGemmaWithExpertModel`` — which
+already owns ``vision_tower`` and ``multi_modal_projector`` — and passes them
+in by reference. This avoids duplicating ~400M parameters in memory and makes
+the encoder trivially compatible with any pi05 checkpoint.
 """
 
-from contextlib import nullcontext
+import math
+from typing import Optional
 
 import torch
+import torch.nn.functional as F  # noqa: N812
+from einops import rearrange
 from torch import Tensor, nn
-from transformers import VJEPA2Config, VJEPA2Model
+from transformers.models.paligemma.modeling_paligemma import (
+    PaliGemmaMultiModalProjector,
+)
+from transformers.models.siglip.modeling_siglip import (
+    SiglipAttention,
+    SiglipEncoderLayer,
+    SiglipVisionModel,
+)
+
+# Import triggers the transformers patch (see opentau.utils.transformers_patch)
+# which rewrites PaliGemmaModel.get_image_features to drop the
+# `/ sqrt(hidden_size)` scaling that stock HuggingFace applies after the
+# multi_modal_projector. Our forward must match that patched behavior for
+# single-frame invariance to hold.
+import opentau.utils.transformers_patch  # noqa: F401
 
 
-class PerceiverReducer(nn.Module):
-    """Learned cross-attention bottleneck that compresses V-JEPA2 encoder tokens
-    into a fixed number of output tokens."""
+def _build_temporal_sinusoidal_pe(
+    num_frames: int,
+    embed_dim: int,
+    *,
+    min_period: float = 4e-3,
+    max_period: float = 4.0,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device | str = "cpu",
+) -> Tensor:
+    """Fixed sinusoidal temporal positional embedding, ``(T, embed_dim)``.
 
-    def __init__(self, hidden_size: int, num_queries: int = 256, num_heads: int = 8):
+    Row ``T-1`` (the current frame) is all zeros; earlier rows encode the
+    temporal offset into the past via sin/cos on a geometric period schedule
+    (matching ``create_sinusoidal_pos_embedding`` in ``modeling_pi05.py``).
+
+    The zero-current-row condition lets a ``T=1`` forward pass match an
+    un-modified SigLIP ViT exactly, which is required for single-frame
+    invariance against ``PaliGemmaModel.get_image_features``.
+    """
+    if embed_dim % 2 != 0:
+        raise ValueError(f"embed_dim ({embed_dim}) must be divisible by 2")
+    if num_frames < 1:
+        raise ValueError(f"num_frames ({num_frames}) must be >= 1")
+
+    # time[i] = i - (T-1) in {-(T-1), ..., -1, 0}; row T-1 has time = 0.
+    time = torch.arange(num_frames, dtype=torch.float64, device=device) - (num_frames - 1)
+    fraction = torch.linspace(0.0, 1.0, embed_dim // 2, dtype=torch.float64, device=device)
+    period = min_period * (max_period / min_period) ** fraction
+    scaling = 1.0 / period * 2 * math.pi  # (embed_dim/2,)
+    phase = time.unsqueeze(-1) * scaling.unsqueeze(0)  # (T, embed_dim/2)
+    pe = torch.cat([torch.sin(phase), torch.cos(phase)], dim=-1)  # (T, embed_dim)
+    # Shift so row T-1 is exactly zero (preserves relative sinusoidal structure,
+    # enforces boundary condition e(current) = 0 from MEM Appendix C).
+    pe = pe - pe[-1:]
+    return pe.to(dtype=dtype)
+
+
+class _TemporalSelfAttention(nn.Module):
+    """Parameter-free causal temporal self-attention.
+
+    Re-uses an existing ``SiglipAttention`` instance's
+    ``q_proj``/``k_proj``/``v_proj``/``out_proj`` linear layers, but applies
+    them over the ``T`` axis (for each fixed patch position) with a
+    standard lower-triangular causal mask (position ``i`` attends to
+    positions ``j <= i``; since ``t = T-1`` is the current frame, the current
+    frame attends to all past frames).
+
+    The referenced ``SiglipAttention`` is held in a list to keep ``nn.Module``
+    from re-registering its parameters under this module's path (which would
+    duplicate them in ``state_dict`` under both
+    ``base_layer.self_attn.*`` and ``_temporal_attn.attn.*``).
+    """
+
+    def __init__(self, attn: SiglipAttention):
         super().__init__()
-        self.queries = nn.Parameter(torch.randn(1, num_queries, hidden_size) * 0.02)
-        self.cross_attn = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
-        self.norm_q = nn.LayerNorm(hidden_size)
-        self.norm_kv = nn.LayerNorm(hidden_size)
+        # Wrap in a list so nn.Module.__setattr__ does not treat ``attn``
+        # as a child submodule; the base layer already owns these params.
+        self._attn_ref: list[SiglipAttention] = [attn]
 
-    def forward(self, tokens: Tensor) -> Tensor:
-        """tokens: (B, N, D) -> (B, num_queries, D)."""
-        b = tokens.shape[0]
-        q = self.norm_q(self.queries.expand(b, -1, -1))
-        kv = self.norm_kv(tokens)
-        out, _ = self.cross_attn(q, kv, kv)
-        return out
+    @property
+    def attn(self) -> SiglipAttention:
+        return self._attn_ref[0]
+
+    def forward(self, hidden_states: Tensor) -> Tensor:
+        """hidden_states: (B*N, T, D) -> (B*N, T, D)."""
+        attn = self.attn
+        bn, t, d = hidden_states.shape
+        num_heads = attn.num_heads
+        head_dim = attn.head_dim
+
+        q = attn.q_proj(hidden_states).view(bn, t, num_heads, head_dim).transpose(1, 2)
+        k = attn.k_proj(hidden_states).view(bn, t, num_heads, head_dim).transpose(1, 2)
+        v = attn.v_proj(hidden_states).view(bn, t, num_heads, head_dim).transpose(1, 2)
+
+        # is_causal=True -> lower-triangular mask, each position attends to
+        # itself and earlier positions (our convention: t=T-1 is current).
+        out = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=None, is_causal=True, dropout_p=0.0, scale=attn.scale
+        )
+        out = out.transpose(1, 2).reshape(bn, t, d)
+        return attn.out_proj(out)
 
 
-class VJEPA2VideoEncoder(nn.Module):
-    """Frozen V-JEPA2 encoder + learnable Perceiver reducer + projection to VLM dim.
+class SpaceTimeEncoderLayerWrapper(nn.Module):
+    """Replaces a ``SiglipEncoderLayer`` in-place; adds a temporal sublayer.
 
-    Takes video tensors (B, T, C, H, W) and produces (B, num_video_tokens, vlm_hidden_size).
+    The wrapper **adopts** the original layer's submodules by reference —
+    ``self_attn``, ``layer_norm1``, ``layer_norm2``, ``mlp`` — so its
+    ``state_dict`` keys are **identical** to a vanilla ``SiglipEncoderLayer``.
+    That means any pi05 / pi05_continuous_state checkpoint can load directly
+    into the wrapped layer without any key remapping. The only new state is
+    a non-persistent ``_temporal_pe`` buffer (excluded from state_dict) and
+    an internal ``_temporal_attn`` wrapper that holds a by-reference pointer
+    to ``self_attn`` (also excluded because it's kept in a list).
+
+    The forward computes:
+
+        h_pe  = h + e(t)                                   # broadcast over (B, N)
+        h     = h + temporal_attn( LN1(h_pe) )             # new; causal over T
+        # then the standard SigLIP block:
+        h     = h + spatial_attn( LN1(h) )
+        h     = h + MLP( LN2(h) )
+
+    At ``T=1`` the temporal sublayer is skipped entirely so that the block
+    degenerates to the unmodified SigLIP forward, satisfying the MEM paper's
+    single-frame invariance claim. (With ``T=1`` causal attention over a
+    single timestep is not an identity — it returns ``out_proj(v_proj(
+    LN1(x)))`` — so ``e(0)=0`` alone is insufficient; the block itself must
+    also be bypassed.)
+
+    Reusing ``layer_norm1`` for both the temporal and spatial sublayers keeps
+    the paper's "no new learnable parameters" guarantee. It is an intentional
+    design choice: the two attentions operate on different axes and the
+    LayerNorm is applied to different input tensors each time.
+    """
+
+    # Match the SiglipEncoderLayer class attribute so transformers'
+    # gradient-checkpointing plumbing sees a familiar interface.
+    gradient_checkpointing: bool = False
+
+    def __init__(
+        self,
+        base_layer: SiglipEncoderLayer,
+        num_frames: int,
+        num_tokens_per_frame: int,
+    ):
+        super().__init__()
+        # Adopt the base layer's submodules as our own (same attribute names).
+        # The state_dict therefore uses keys like
+        # ``encoder.layers.{i}.self_attn.q_proj.weight`` — identical to a
+        # vanilla SiglipEncoderLayer, so pi05 checkpoints load directly.
+        self.self_attn = base_layer.self_attn
+        self.layer_norm1 = base_layer.layer_norm1
+        self.layer_norm2 = base_layer.layer_norm2
+        self.mlp = base_layer.mlp
+        self.embed_dim = base_layer.embed_dim
+
+        self.num_frames = num_frames
+        self.num_tokens_per_frame = num_tokens_per_frame
+        # The temporal attention re-uses self_attn's Q/K/V/O projections; it
+        # holds its reference in a list (see _TemporalSelfAttention) so the
+        # params don't show up twice in state_dict.
+        self._temporal_attn = _TemporalSelfAttention(self.self_attn)
+
+        # Build the PE on the base layer's current device / dtype. The parent
+        # vision_tower is often moved to GPU BEFORE this wrapper is inserted
+        # (the normal load flow for pi05_mem does
+        # ``paligemma = ...from_pretrained(...).to('cuda')`` and then wraps);
+        # with no parent ``.to(device)`` happening after wrapping, a PE built
+        # on CPU would stay on CPU and trigger a cross-device RuntimeError at
+        # forward time. Pinning to the base layer's device sidesteps that.
+        ref_param = base_layer.self_attn.q_proj.weight
+        pe = _build_temporal_sinusoidal_pe(
+            num_frames, self.embed_dim, dtype=ref_param.dtype, device=ref_param.device
+        )
+        # Non-persistent: not saved in state_dict but moves with .to(device).
+        self.register_buffer("_temporal_pe", pe, persistent=False)
+
+    def _spatial_block_forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor],
+        output_attentions: bool,
+    ) -> tuple[Tensor, ...]:
+        """Inlined SiglipEncoderLayer.forward using the adopted submodules.
+
+        Mirrors
+        ``transformers.models.siglip.modeling_siglip.SiglipEncoderLayer.forward``
+        exactly — any upstream change to that forward would need to be
+        reflected here.
+        """
+        residual = hidden_states
+        hidden_states = self.layer_norm1(hidden_states)
+        hidden_states, attn_weights = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            output_attentions=output_attentions,
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.layer_norm2(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        outputs: tuple[Tensor, ...] = (hidden_states,)
+        if output_attentions:
+            outputs = outputs + (attn_weights,)
+        return outputs
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        output_attentions: bool = False,
+    ) -> tuple[Tensor, ...]:
+        """hidden_states: (B*T, N, D) -> tuple starting with (B*T, N, D).
+
+        Signature matches ``SiglipEncoderLayer.forward`` so ``SiglipEncoder``
+        can dispatch unchanged.
+        """
+        t = self.num_frames
+        bt, n, d = hidden_states.shape
+        if bt % t != 0:
+            raise ValueError(
+                f"hidden_states.shape[0] ({bt}) must be divisible by num_frames ({t}); "
+                "video encoder expects inputs flattened as (B*T, N, D)."
+            )
+        b = bt // t
+        if n != self.num_tokens_per_frame:
+            raise ValueError(
+                f"hidden_states.shape[1] ({n}) != num_tokens_per_frame ({self.num_tokens_per_frame})."
+            )
+
+        # Short-circuit at T=1: temporal self-attention over a single timestep
+        # collapses to ``out_proj(v_proj(LN1(x)))``, which is NOT an identity
+        # and would break single-frame invariance (the MEM paper's guarantee
+        # that a T=1 pass matches the unmodified SigLIP ViT). e(t=0)=0 alone
+        # is insufficient; the block must also be skipped.
+        if t == 1:
+            return self._spatial_block_forward(hidden_states, attention_mask, output_attentions)
+
+        # Temporal sublayer.
+        x = rearrange(hidden_states, "(b t) n d -> b t n d", b=b, t=t)
+        # Cast PE to match tensor device/dtype each call. Both are no-ops if
+        # already aligned (the common case — the buffer is constructed on
+        # the base layer's device). The cast only allocates when something
+        # external has moved the inputs onto a different device without
+        # propagating ``.to()`` through to this wrapper.
+        pe = self._temporal_pe.to(device=x.device, dtype=x.dtype).view(1, t, 1, d)
+        x_pe = x + pe
+
+        t_in = rearrange(x_pe, "b t n d -> (b n) t d")
+        t_norm = self.layer_norm1(t_in)
+        t_out = self._temporal_attn(t_norm)
+        # Residual on the pre-PE hidden (not on x_pe): PE is a transient
+        # positional signal, not a feature perturbation to carry forward.
+        t_res = rearrange(x, "b t n d -> (b n) t d") + t_out
+        h_after_t = rearrange(t_res, "(b n) t d -> (b t) n d", n=n)
+
+        # Spatial + MLP sublayers.
+        return self._spatial_block_forward(h_after_t, attention_mask, output_attentions)
+
+
+class SpaceTimeSiglipVideoEncoder(nn.Module):
+    """SigLIP-based video encoder with space-time separable attention.
+
+    Takes video tensors of shape ``(B, T, 3, H, W)`` in the ``[0, 1]`` range
+    and produces ``(B, num_video_tokens, vlm_hidden_size)``. Rescales pixels
+    to ``[-1, 1]`` internally (SigLIP's expected range).
+
+    Past-timestep tokens are dropped after the encoder; only the current
+    frame's ``num_video_tokens`` tokens are returned, so the output shape is
+    identical to a single-frame VLA's vision-token prefix.
+
+    The ``multi_modal_projector`` is applied to match the output space of
+    ``PaliGemmaModel.get_image_features``. We intentionally **do not** apply
+    the ``/ sqrt(text_hidden_size)`` scaling, matching
+    ``opentau.utils.transformers_patch.patched_paligemma_model_get_image_features``
+    which removes it from stock HuggingFace.
+
+    The caller owns ``vision_tower`` and ``multi_modal_projector``. This
+    module holds them by reference (via a list, so ``nn.Module`` does not
+    re-register their parameters under this module's path) and mutates the
+    vision_tower's encoder in place to wrap every ``spacetime_layer_stride``-th
+    layer. In practice the only caller is ``PI05MemFlowMatching``, which
+    passes in its ``paligemma_with_expert.paligemma``'s vision components.
     """
 
     def __init__(
         self,
-        vjepa2_model_name: str,
+        vision_tower: SiglipVisionModel,
+        multi_modal_projector: PaliGemmaMultiModalProjector,
         num_frames: int,
-        crop_size: int,
-        num_video_tokens: int,
-        vlm_hidden_size: int,
-        perceiver_heads: int = 8,
-        freeze_encoder: bool = True,
-        encoder_dtype: torch.dtype | None = None,
+        spacetime_layer_stride: int = 4,
+        gradient_checkpointing: bool = False,
     ):
         super().__init__()
+        if num_frames < 1:
+            raise ValueError(f"num_frames ({num_frames}) must be >= 1.")
+        if spacetime_layer_stride < 1:
+            raise ValueError(f"spacetime_layer_stride ({spacetime_layer_stride}) must be >= 1.")
 
-        if encoder_dtype is None:
-            encoder_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        self.num_frames = num_frames
+        self.spacetime_layer_stride = spacetime_layer_stride
+        # Wrap each SigLIP encoder layer (vanilla or space-time) in
+        # torch.utils.checkpoint.checkpoint during training. Mirrors the
+        # explicit per-layer pattern used by pi05's PaliGemmaWithExpertModel
+        # so we do not depend on transformers' SiglipEncoder internal
+        # gradient-checkpointing plumbing. The strict distributed-backend
+        # guard in src/opentau/scripts/train.py applies (DDP, single, or
+        # DeepSpeed ZeRO-1/2 only).
+        self.gradient_checkpointing = gradient_checkpointing
 
-        vjepa2_config = VJEPA2Config.from_pretrained(vjepa2_model_name)
-        vjepa2_config.crop_size = crop_size
-        vjepa2_config.frames_per_clip = num_frames
+        # Hold references in lists so nn.Module.__setattr__ does not
+        # re-register these modules under this encoder's path. They are owned
+        # by the caller (paligemma_with_expert); double registration would
+        # duplicate ~400M params in state_dict.
+        self._vision_tower_ref: list[SiglipVisionModel] = [vision_tower]
+        self._multi_modal_projector_ref: list[PaliGemmaMultiModalProjector] = [multi_modal_projector]
 
-        self.encoder = VJEPA2Model.from_pretrained(
-            vjepa2_model_name,
-            config=vjepa2_config,
-            torch_dtype=encoder_dtype,
-            attn_implementation="sdpa",
-        )
+        # The number of output tokens is fixed by the SigLIP patch grid
+        # (e.g. 224/14 = 16 -> 16*16 = 256 patches for the default config).
+        vision_cfg = vision_tower.config
+        num_patches = (vision_cfg.image_size // vision_cfg.patch_size) ** 2
+        self.num_video_tokens = num_patches
+        self.siglip_hidden_size = vision_cfg.hidden_size
 
-        self.freeze_encoder = freeze_encoder
-        if freeze_encoder:
-            self.encoder.eval()
-            for p in self.encoder.parameters():
-                p.requires_grad = False
+        # Wrap every stride-th layer with space-time attention. The wrapper
+        # holds the original SiglipEncoderLayer as ``base_layer`` so its
+        # pretrained weights flow through unchanged. State-dict keys for
+        # wrapped layers will carry a ``.base_layer.`` prefix; as long as
+        # reloads round-trip through this code, keys stay consistent.
+        layers = vision_tower.vision_model.encoder.layers
+        n_layers = len(layers)
+        for i in range(spacetime_layer_stride - 1, n_layers, spacetime_layer_stride):
+            layers[i] = SpaceTimeEncoderLayerWrapper(
+                base_layer=layers[i],
+                num_frames=num_frames,
+                num_tokens_per_frame=num_patches,
+            )
 
-        vjepa2_hidden = vjepa2_config.hidden_size  # 1024 for ViT-L
-        self.reducer = PerceiverReducer(
-            vjepa2_hidden,
-            num_queries=num_video_tokens,
-            num_heads=perceiver_heads,  # gitleaks:allow
-        )
-        self.proj = nn.Linear(vjepa2_hidden, vlm_hidden_size)
+    @property
+    def vision_tower(self) -> SiglipVisionModel:
+        return self._vision_tower_ref[0]
+
+    @property
+    def multi_modal_projector(self) -> PaliGemmaMultiModalProjector:
+        return self._multi_modal_projector_ref[0]
 
     def forward(self, video: Tensor) -> Tensor:
-        """Encode a video clip into a fixed-length token sequence.
+        """Encode a video clip and return the current-frame tokens.
 
         Args:
-            video: (B, T, C, H, W) pixel values, ImageNet-normalized.
+            video: ``(B, T, C, H, W)`` pixel values in ``[0, 1]``, with
+                ``T == num_frames``, ``C == 3``, and spatial size matching
+                the SigLIP config (224x224 by default).
 
         Returns:
-            (B, num_video_tokens, vlm_hidden_size)
+            ``(B, num_video_tokens, vlm_hidden_size)`` current-frame tokens,
+            ready to concatenate into the VLA prefix.
         """
-        ctx = torch.no_grad() if self.freeze_encoder else nullcontext()
-        with ctx:
-            encoder_out = self.encoder(video, skip_predictor=True)
-        tokens = encoder_out.last_hidden_state  # (B, N_patches, vjepa2_hidden)
-        tokens = self.reducer(tokens)  # (B, num_video_tokens, vjepa2_hidden)
-        tokens = self.proj(tokens)  # (B, num_video_tokens, vlm_hidden_size)
-        return tokens
+        if video.ndim != 5:
+            raise ValueError(f"Expected 5D input (B, T, C, H, W); got {tuple(video.shape)}.")
+        b, t, c, h, w = video.shape
+        if t != self.num_frames:
+            raise ValueError(
+                f"Expected T={self.num_frames} frames; got {t}. "
+                "Reinstantiate the encoder with a matching num_frames."
+            )
+
+        # SigLIP expects pixel values in [-1, 1]. The dataset loader yields
+        # [0, 1]; rescale here (keeps prepare_videos producer-agnostic).
+        video = video * 2.0 - 1.0
+
+        # Flatten time into batch for the SigLIP pipeline.
+        flat = rearrange(video, "b t c h w -> (b t) c h w")
+
+        # Patch embedding + learned spatial position embedding.
+        hidden = self.vision_tower.vision_model.embeddings(flat)
+
+        # Encoder stack: standard spatial layers + wrapped every-Nth layer
+        # with temporal attention. SpaceTimeEncoderLayerWrapper matches the
+        # SiglipEncoderLayer signature, so we drive the loop manually here
+        # (instead of calling SiglipEncoder.forward) so we can wrap each
+        # layer in torch.utils.checkpoint.checkpoint when the flag is set —
+        # the same explicit pattern PaliGemmaWithExpertModel uses.
+        use_ckpt = self.gradient_checkpointing and self.training
+        for layer in self.vision_tower.vision_model.encoder.layers:
+            if use_ckpt:
+                layer_outputs = torch.utils.checkpoint.checkpoint(
+                    layer, hidden, None, False, use_reentrant=False
+                )
+            else:
+                layer_outputs = layer(hidden, None, False)
+            hidden = layer_outputs[0]
+
+        hidden = self.vision_tower.vision_model.post_layernorm(hidden)
+
+        # Drop past-timestep tokens: keep only the current frame (t = T-1).
+        # This matches the MEM paper's "we only pass the representation
+        # computed for the current timestep onwards" and makes the encoder
+        # a drop-in replacement for a single-frame vision tower.
+        hidden = rearrange(hidden, "(b t) n d -> b t n d", b=b, t=t)
+        current = hidden[:, -1]
+
+        # multi_modal_projector: SigLIP hidden (1152) -> VLA hidden (2048).
+        # We deliberately omit the `/ sqrt(hidden_size)` division to match
+        # the patched ``PaliGemmaModel.get_image_features`` (see
+        # ``opentau.utils.transformers_patch``).
+        return self.multi_modal_projector(current)

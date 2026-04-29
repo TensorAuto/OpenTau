@@ -1,0 +1,110 @@
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Claude PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+# Cancel a stale review when a new commit is pushed to the same PR.
+concurrency:
+  group: claude-pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  id-token: write  # claude-code-action does an OIDC handshake at startup
+
+jobs:
+  review:
+    # Skip on `synchronize` when the pusher is a Claude bot — otherwise the
+    # implement-fixes workflow's pushes would re-trigger us in a loop and we'd
+    # end up reviewing our own fixes. Always run on `opened` (auto-reviewing a
+    # Claude-opened PR is the whole point of this workflow).
+    if: >-
+      github.event.action == 'opened'
+      || !contains(github.event.sender.login, 'claude')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: |
+            --model ${{ vars.CLAUDE_MODEL || 'claude-opus-4-7[1m]' }}
+            --permission-mode bypassPermissions
+          prompt: |
+            You are reviewing PR #${{ github.event.pull_request.number }} in
+            ${{ github.repository }}.
+
+            ## Comment hygiene — DO THIS BEFORE POSTING ANYTHING
+
+            On every run you MUST leave at most ONE summary comment on this PR
+            (edited in place across pushes), and you MUST clear stale inline
+            findings from previous runs. Concretely:
+
+            1. List existing comments with:
+                 gh pr view ${{ github.event.pull_request.number }} \
+                   --repo ${{ github.repository }} \
+                   --json comments,reviews
+               Find a prior summary comment of yours whose body starts with
+               the marker `<!-- claude-review:v1 -->`. Capture its `id`.
+            2. If a prior summary comment exists, EDIT it in place — do not
+               post a new one — via:
+                 gh api -X PATCH \
+                   /repos/${{ github.repository }}/issues/comments/<id> \
+                   -f body='<new body>'
+               If none exists, create one with `gh pr comment`.
+            3. For prior reviews of yours that have inline comments still
+               attached, dismiss them so stale line-anchored findings stop
+               showing as active:
+                 gh api -X PUT \
+                   /repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews/<review_id>/dismissals \
+                   -f message='superseded by newer review'
+
+            ## What to review
+
+            Focus on:
+            - Correctness bugs and logic errors
+            - Violations of conventions in CLAUDE.md and .claude/rules/
+            - Missing tests for new behavior
+            - PyTorch/ML-specific issues: device placement, dtype mismatches,
+              non-deterministic ops, gradient flow, memory leaks in training loops
+            - Distributed training pitfalls if the change touches multi-GPU code
+
+            Skip: style nits a linter would catch, taste preferences,
+            speculative refactors.
+
+            ## How to post
+
+            Submit a fresh review (`gh pr review --comment`) with inline
+            findings on specific lines. Then upsert your single summary
+            comment. The summary body MUST begin with these two lines exactly:
+
+                <!-- claude-review:v1 -->
+                [claude-review] summary for commit <short-sha>
+
+            Followed by a markdown list, one bullet per finding, formatted:
+                - **blocking** | **suggestion** | **nit** — `path/to/file:line` — short description
+
+            If the PR is clean, the body after the marker should say
+            "No blocking issues found." in one line. Don't manufacture issues.

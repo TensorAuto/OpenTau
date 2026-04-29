@@ -15,21 +15,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""π05 Mem: A Vision-Language-Action Flow Model with space-time SigLIP video
-encoding and temporal state sequences.
+"""π06: a Vision-Language-Action model built on Gemma 3 4B.
 
-Based on π05, this variant implements the low-level memory architecture from
-Torne, Pertsch, Walke et al. "MEM: Multi-Scale Embodied Memory for Vision
-Language Action Models" (Section III-C + Appendix C):
+Relative to π05 this policy swaps PaliGemma-3B for Gemma 3 4B (34 interleaved
+sliding-window/global layers, SigLIP at 448×448), enlarges the action expert
+to ~860M parameters so it matches the backbone depth, and halves the default
+flow-matching denoising schedule to 5 steps.
 
-  1. Extends the PaliGemma SigLIP image encoder with space-time separable
-     attention every ``spacetime_layer_stride``-th ViT layer. The temporal
-     sublayer re-uses each layer's existing Q/K/V/O projections — no new
-     learnable parameters are introduced. Past-timestep tokens are dropped
-     after the encoder so the prefix matches a single-frame VLA's 256 image
-     tokens exactly.
-  2. Accepts temporal state sequences (B, T, D) and projects each timestep
-     into a separate continuous token for the Gemma backbone.
+References:
+    - π0.6 Model Card, Physical Intelligence, 2025-11-17.
+    - π*0.6: a VLA That Learns From Experience, arXiv:2511.14759.
 """
 
 import builtins
@@ -48,15 +43,18 @@ from transformers import AutoProcessor, AutoTokenizer
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import NormalizationMode
 from opentau.policies.normalize import Normalize, Unnormalize
-from opentau.policies.pi05.paligemma_with_expert import (
-    PaliGemmaWithExpertConfig,
-    PaliGemmaWithExpertModel,
+from opentau.policies.pi06.configuration_pi06 import PI06Config
+from opentau.policies.pi06.gemma3_with_expert import (
+    Gemma3WithExpertConfig,
+    Gemma3WithExpertModel,
 )
-from opentau.policies.pi05_mem.configuration_pi05 import PI05MemConfig
-from opentau.policies.pi05_mem.video_encoder import SpaceTimeSiglipVideoEncoder
 from opentau.policies.pretrained import PreTrainedPolicy, T
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
+
+# Utility helpers — straight copies of the pi05 versions, documented here for
+# locality. If the pi05 file ever evolves, we consciously choose to keep the
+# pi06 version frozen at the shape the π0.6 paper assumes.
 
 
 def _preferred_dtype():
@@ -69,14 +67,14 @@ def create_sinusoidal_pos_embedding(
     """Computes sine-cosine positional embedding vectors for scalar positions.
 
     Args:
-        time: A 2-D tensor of shape (batch_size, action_chunk_length).
+        time: A 2-D tensor of shape `(B, action_chunk_length)`.
         dimension: The dimension of the embedding vectors. Must be divisible by 2.
-        min_period: The minimum period of the sinusoidal functions.
-        max_period: The maximum period of the sinusoidal functions.
-        device: The device to create the tensors on. Defaults to "cpu".
+        min_period: Minimum period of the sinusoidal functions.
+        max_period: Maximum period of the sinusoidal functions.
+        device: The device to create the tensors on.
 
     Returns:
-        A tensor of shape (batch_size, action_chunk_length, dimension).
+        Tensor of shape `(B, action_chunk_length, dimension)` with the embedding.
     """
     if dimension % 2 != 0:
         raise ValueError(f"dimension ({dimension}) must be divisible by 2")
@@ -106,15 +104,25 @@ def make_att_2d_masks(
 ) -> Tensor:
     """Creates a 2-D attention mask given padding and 1-D attention masks.
 
+    Tokens can attend to valid tokens whose cumulative `att_masks` is smaller
+    or equal to theirs. Block semantics match π0.5 exactly — see the pi05
+    docstring for the full table of examples, condensed:
+
+        [[1 1 1 1 1 1]]: pure causal
+        [[0 0 0 1 1 1]]: prefix-LM (first 3 bidirectional, last 3 causal)
+        [[1 0 1 0 1 0 0 1 0 0]]: multi-block causal
+
     Args:
-        pad_masks: bool[B, N] true if its part of the input, false if padding.
-        att_masks: int32[B, N] mask that's 1 where previous tokens cannot depend on
-            it and 0 where it shares the same attention mask as the previous token.
-        n_cross_att_tokens: Add attention mask for cross-attention tokens if provided.
-        cross_att_pad_masks: Padding masks for cross attention tokens.
+        pad_masks: bool `(B, N)` — True for real tokens.
+        att_masks: int32 `(B, N)` — 1 starts a new block, 0 continues.
+        n_cross_att_tokens: If set, prepend a cross-attention mask of that
+            width so suffix tokens can attend back into the cached prefix.
+        cross_att_pad_masks: Prefix pad mask used when building the cross
+            attention block.
 
     Returns:
-        A 2D attention mask tensor.
+        Boolean 2-D attention mask of shape `(B, N, N)` or
+        `(B, N, N + n_cross_att_tokens)` when cross attention is requested.
     """
     if att_masks.ndim != 2:
         raise ValueError(att_masks.ndim)
@@ -140,7 +148,6 @@ def make_att_2d_masks(
             dtype=torch.bool,
             device=att_masks.device,
         )
-
         cross_att_mask = cross_att_mask & pad_masks[:, :, None] & cross_att_pad_masks[:, None, :]
         att_2d_masks = torch.cat((cross_att_mask, att_2d_masks), dim=2)
 
@@ -148,17 +155,17 @@ def make_att_2d_masks(
 
 
 def resize_with_pad(img: Tensor, width: int, height: int, pad_value: int = -1) -> Tensor:
-    """Resizes an image to fit within the specified dimensions while maintaining aspect ratio,
-    and pads the remaining area.
+    """Resizes an image to fit within target dimensions while maintaining aspect
+    ratio, padding the remainder with `pad_value`.
 
     Args:
-        img: Input image tensor of shape (batch_size, channels, current_height, current_width).
+        img: `(B, C, H_src, W_src)` tensor.
         width: Target width.
         height: Target height.
-        pad_value: Value to use for padding. Defaults to -1.
+        pad_value: Padding value (defaults to -1 to match SigLIP's `[-1, 1]` range).
 
     Returns:
-        The resized and padded image tensor of shape (batch_size, channels, height, width).
+        Resized/padded tensor of shape `(B, C, height, width)`.
     """
     if img.ndim != 4:
         raise ValueError(f"(b,c,h,w) expected, but {img.shape}")
@@ -180,21 +187,14 @@ def resize_with_pad(img: Tensor, width: int, height: int, pad_value: int = -1) -
 
 
 def pad_discrete_tokens(tokens: list[list[int]], max_length: int) -> tuple[np.ndarray, np.ndarray]:
-    """Pads or truncates a list of discrete action token sequences to a fixed length.
-
-    Args:
-        tokens: A list of discrete action token sequences.
-        max_length: The target length.
-
-    Returns:
-        A tuple of (discrete_action_tokens, discrete_action_masks) numpy arrays.
-    """
+    """Pads / truncates a ragged list of FAST-tokenized action chunks to a
+    fixed length, returning `(B, max_length)` arrays."""
     discrete_action_tokens = []
     discrete_action_masks = []
     for token in tokens:
         if len(token) > max_length:
             logging.warning(
-                f"Discrete action token length {len(token)} is greater than max_length {max_length}, truncating"
+                f"Discrete action token length {len(token)} > max_length {max_length}; truncating."
             )
             discrete_action_tokens.append(np.array(token[:max_length]))
             discrete_action_masks.append(np.ones(max_length, dtype=bool))
@@ -208,26 +208,32 @@ def pad_discrete_tokens(tokens: list[list[int]], max_length: int) -> tuple[np.nd
     return np.array(discrete_action_tokens), np.array(discrete_action_masks)
 
 
-# Policy wrapper
-class PI05MemPolicy(PreTrainedPolicy):
-    """Wrapper class around PI05MemFlowMatching model.
+# PI06Policy — the public `PreTrainedPolicy` that OpenTau instantiates.
 
-    Uses a space-time SigLIP video encoder (MEM paper low-level memory) and
-    temporal state sequences projected into per-timestep continuous tokens in
-    the VLM embedding space.
-    """
 
-    config_class = PI05MemConfig
-    name = "pi05_mem"
+class PI06Policy(PreTrainedPolicy):
+    """Wrapper around `PI06FlowMatching` for training and inference in OpenTau."""
+
+    config_class = PI06Config
+    name = "pi06"
 
     def __init__(
         self,
-        config: PI05MemConfig,
+        config: PI06Config,
         dataset_stats: dict[str, dict[str, Tensor]] | None = None,
     ):
+        """Initializes the PI06Policy.
+
+        Args:
+            config: `PI06Config` instance.
+            dataset_stats: Optional dataset statistics for input/output
+                normalization; otherwise expected to be loaded via
+                `load_state_dict` before the policy runs.
+        """
         super().__init__(config)
         config.validate_features()
         self.config = config
+
         self.normalize_inputs = Normalize(config.input_features, config.normalization_mapping, dataset_stats)
         self.normalize_targets = Normalize(
             config.output_features, config.normalization_mapping, dataset_stats
@@ -239,22 +245,22 @@ class PI05MemPolicy(PreTrainedPolicy):
             config.output_features, config.normalization_mapping, dataset_stats
         )
 
-        self.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
+        # π0.6 uses Gemma 3's tokenizer. We fall back to the paligemma tokenizer
+        # only if the Hub download fails at module import time in an offline CI,
+        # so users still get a useful error rather than silent drift.
+        self.language_tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-4b-pt")
 
         self.discrete_action_processor = AutoProcessor.from_pretrained(
             "physical-intelligence/fast", trust_remote_code=True
         )
         discrete_action_vocab_size = getattr(self.discrete_action_processor, "vocab_size", None)
-        self.model = PI05MemFlowMatching(config, discrete_action_vocab_size=discrete_action_vocab_size)
+        self.model = PI06FlowMatching(config, discrete_action_vocab_size=discrete_action_vocab_size)
 
         self.reset()
 
     def reset(self) -> None:
-        """This should be called whenever the environment is reset."""
+        """Clears the rolling action queue; call on every environment reset."""
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
-        # Observation history buffers for inference.
-        self._obs_buffers: dict[str, deque] = {}
-        self._state_buffer: deque | None = None
 
     @classmethod
     def from_pretrained(
@@ -272,7 +278,12 @@ class PI05MemPolicy(PreTrainedPolicy):
         strict: bool = True,
         **kwargs,
     ) -> T:
-        """Override the from_pretrained method to handle key remapping."""
+        """Load a pretrained π0.6 checkpoint.
+
+        Mirrors `PI05Policy.from_pretrained` — the only π0.6 specific logic is
+        in `_fix_pytorch_state_dict_keys`, which tolerates both a native π0.6
+        checkpoint layout and weights migrated from π0.5.
+        """
         if pretrained_name_or_path is None:
             raise ValueError("pretrained_name_or_path is required")
 
@@ -280,7 +291,7 @@ class PI05MemPolicy(PreTrainedPolicy):
             config = PreTrainedConfig.from_pretrained(
                 pretrained_name_or_path=pretrained_name_or_path,
                 force_download=force_download,
-                resume_download=resume_download if resume_download is not None else False,
+                resume_download=resume_download,
                 proxies=proxies,
                 token=token,
                 cache_dir=cache_dir,
@@ -295,80 +306,82 @@ class PI05MemPolicy(PreTrainedPolicy):
         is_main_process = acc.is_main_process if acc else True
         try:
             if is_main_process:
-                logging.info("Loading model from: %s", pretrained_name_or_path)
+                print(f"Loading model from: {pretrained_name_or_path}")
             try:
-                from transformers.utils.hub import cached_file
+                from transformers.utils import cached_file
 
                 resolved_file = cached_file(
                     pretrained_name_or_path,
                     "model.safetensors",
-                    cache_dir=cache_dir,
-                    force_download=force_download,
-                    resume_download=resume_download,
-                    proxies=proxies,
-                    token=token,
-                    revision=revision,
-                    local_files_only=local_files_only,
+                    cache_dir=kwargs.get("cache_dir"),
+                    force_download=kwargs.get("force_download", False),
+                    resume_download=kwargs.get("resume_download"),
+                    proxies=kwargs.get("proxies"),
+                    use_auth_token=kwargs.get("use_auth_token"),
+                    revision=kwargs.get("revision"),
+                    local_files_only=kwargs.get("local_files_only", False),
                 )
-                assert resolved_file is not None, "cached_file returned None"
                 from safetensors.torch import load_file
 
                 original_state_dict = load_file(resolved_file)
                 if is_main_process:
-                    logging.info("Loaded state dict from model.safetensors")
+                    print("✓ Loaded state dict from model.safetensors")
             except Exception as e:
                 if is_main_process:
-                    logging.warning("Could not load state dict from remote files: %s", e)
-                    logging.info("Returning model without loading pretrained weights")
+                    print(f"Could not load state dict from remote files: {e}")
+                    print("Returning model without loading pretrained weights")
                 return model
 
             fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
 
             remapped_state_dict = {}
             remap_count = 0
-
             for key, value in fixed_state_dict.items():
                 if not key.startswith("model.") and "normalize" not in key:
                     new_key = f"model.{key}"
                     remapped_state_dict[new_key] = value
                     remap_count += 1
                     if remap_count <= 10 and is_main_process:
-                        logging.debug("Remapped: %s -> %s", key, new_key)
+                        print(f"Remapped: {key} -> {new_key}")
                 else:
                     remapped_state_dict[key] = value
-
             if remap_count > 0 and is_main_process:
-                logging.info("Remapped %d state dict keys", remap_count)
+                print(f"Remapped {remap_count} state dict keys")
 
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
-
             if missing_keys and is_main_process:
-                logging.warning("Missing keys when loading state dict: %d keys", len(missing_keys))
+                print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
                 for key in missing_keys[:20]:
-                    logging.warning("  - %s", key)
+                    print(f"  - {key}")
                 if len(missing_keys) > 20:
-                    logging.warning("  ... and %d more", len(missing_keys) - 20)
-
+                    print(f"  ... and {len(missing_keys) - 20} more")
             if unexpected_keys and is_main_process:
-                logging.warning("Unexpected keys when loading state dict: %d keys", len(unexpected_keys))
+                print(f"Unexpected keys when loading state dict: {len(unexpected_keys)} keys")
                 for key in unexpected_keys[:20]:
-                    logging.warning("  - %s", key)
+                    print(f"  - {key}")
                 if len(unexpected_keys) > 20:
-                    logging.warning("  ... and %d more", len(unexpected_keys) - 20)
-
+                    print(f"  ... and {len(unexpected_keys) - 20} more")
             if not missing_keys and not unexpected_keys and is_main_process:
-                logging.info("All keys loaded successfully!")
+                print("All keys loaded successfully!")
 
         except Exception as e:
             if is_main_process:
-                logging.warning("Could not remap state dict keys: %s", e)
+                print(f"Warning: Could not remap state dict keys: {e}")
 
         return model
 
     def _fix_pytorch_state_dict_keys(
         self, state_dict: dict[str, Tensor], model_config: PreTrainedConfig
     ) -> dict[str, Tensor]:
-        """Fix state dict keys to match current model architecture."""
+        """Tolerate both π0.6 native checkpoints and weights migrated from π0.5.
+
+        Specifically we (a) rewrite the top-level `paligemma_with_expert.*` →
+        `gemma3_with_expert.*` prefix so a user who does
+        `pretrained_path="lerobot/pi05"` as warm-start gets a graceful partial
+        load instead of a full miss, (b) skip layer-norm weights that can't be
+        copied into the new adaRMS layout, and (c) drop `state_proj` (never
+        existed in π0.5/π0.6).
+        """
         import re
 
         fixed_state_dict = {}
@@ -376,117 +389,73 @@ class PI05MemPolicy(PreTrainedPolicy):
         for key, value in state_dict.items():
             new_key = key
 
+            # π0.5 → π0.6 top-level module rename.
+            if new_key.startswith("paligemma_with_expert."):
+                new_key = new_key.replace("paligemma_with_expert.", "gemma3_with_expert.", 1)
+
+            # π0.5 used `paligemma.language_model.*`; π0.6 uses
+            # `gemma3.language_model.*` (transformers exposes Gemma 3's text
+            # tower under the same attribute name on the conditional-generation
+            # wrapper).
+            if "gemma3_with_expert.paligemma." in new_key:
+                new_key = new_key.replace("gemma3_with_expert.paligemma.", "gemma3_with_expert.gemma3.")
+
+            # Ada-RMS weight layout compatibility. When a pi05 checkpoint stores
+            # a plain `.weight`, the new adaRMS expert layer expects
+            # `.dense.weight` + `.dense.bias` — drop the incompatible key.
             if re.match(
-                r"paligemma_with_expert\.gemma_expert\.model\.layers\.\d+\.(input_layernorm|post_attention_layernorm)\.weight",
-                key,
+                r"gemma3_with_expert\.gemma_expert\.model\.layers\.\d+\."
+                r"(input_layernorm|post_attention_layernorm)\.weight",
+                new_key,
             ):
                 expert_uses_adarms = getattr(
-                    self.model.paligemma_with_expert.gemma_expert.config, "use_adarms", False
+                    self.model.gemma3_with_expert.gemma_expert.config, "use_adarms", False
                 )
                 if expert_uses_adarms:
-                    logging.warning(f"Skipping layer norm key (adaRMS mismatch): {key}")
+                    logging.warning(f"Skipping layer norm key (adaRMS mismatch): {new_key}")
                     continue
 
-            if re.match(r"paligemma_with_expert\.gemma_expert\.model\.norm\.weight", key):
+            if re.match(r"gemma3_with_expert\.gemma_expert\.model\.norm\.weight", new_key):
                 expert_uses_adarms = getattr(
-                    self.model.paligemma_with_expert.gemma_expert.config, "use_adarms", False
+                    self.model.gemma3_with_expert.gemma_expert.config, "use_adarms", False
                 )
                 if expert_uses_adarms:
-                    logging.warning(f"Skipping norm key (adaRMS mismatch): {key}")
+                    logging.warning(f"Skipping norm key (adaRMS mismatch): {new_key}")
                     continue
 
-            if key.startswith("action_time_mlp_in."):
-                new_key = key.replace("action_time_mlp_in.", "time_mlp_in.")
-            elif key.startswith("action_time_mlp_out."):
-                new_key = key.replace("action_time_mlp_out.", "time_mlp_out.")
-            if "patch_embedding" in key:
-                logging.warning(f"Vision embedding key might need handling: {key}")
+            # pi05 called these `time_mlp_*` already; legacy checkpoints may use
+            # `action_time_mlp_*`.
+            if new_key.startswith("action_time_mlp_in."):
+                new_key = new_key.replace("action_time_mlp_in.", "time_mlp_in.")
+            elif new_key.startswith("action_time_mlp_out."):
+                new_key = new_key.replace("action_time_mlp_out.", "time_mlp_out.")
+
+            # `state_proj` doesn't exist in either π0.5 or π0.6 — drop silently.
+            if new_key.startswith("state_proj."):
+                logging.warning(f"Skipping state_proj key in pi06 mode: {new_key}")
+                continue
 
             fixed_state_dict[new_key] = value
 
         return fixed_state_dict
 
     def get_optim_params(self) -> dict:
+        """Return all parameters for the optimizer."""
         return self.parameters()
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
-        raise NotImplementedError("Currently not implemented for PI05 Mem")
-
-    def _build_history_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
-        """Buffer the current observation and construct a temporal batch.
-
-        Appends the single-frame observation from ``batch`` to internal deque
-        buffers, then assembles a batch with ``n_obs_steps`` evenly-spaced
-        frames (interval = ``history_interval``).  Early in an episode, missing
-        history slots are zero-padded.
-
-        Expected batch keys:
-            - ``"state"``: (B, D) current proprioceptive state.
-            - image keys matching ``config.image_features``: (B, C, H, W) camera frames.
-            - ``"prompt"``: list[str] language instructions (passed through unchanged).
-            - Any other metadata keys are forwarded unchanged.
-
-        Returns a new dict with ``"state"`` expanded to (B, T, D) and image keys
-        expanded to (B, T, C, H, W), where T = ``n_obs_steps``.
-        """
-        n_hist: int = self.config.n_obs_steps
-        interval = self.config.history_interval or 1
-        buf_maxlen = self.config.obs_buffer_size
-
-        # initialise buffers on first call after reset()
-        if self._state_buffer is None:
-            self._state_buffer = deque(maxlen=buf_maxlen)
-            self._obs_buffers = {}
-
-        img_keys = [key for key in self.config.image_features if key in batch]
-        for key in img_keys:
-            if key not in self._obs_buffers:
-                self._obs_buffers[key] = deque(maxlen=buf_maxlen)
-
-        # append current observation
-        self._state_buffer.append(batch["state"])  # (B, D)
-        for key in img_keys:
-            self._obs_buffers[key].append(batch[key])  # (B, C, H, W)
-
-        # sample n_hist frames at the configured interval
-        buf_len = len(self._state_buffer)
-        missing = buf_maxlen - buf_len  # how many slots are still empty
-
-        # Pass through all non-image, non-state keys (e.g. "prompt" and other metadata).
-        temporal_batch = {key: v for key, v in batch.items() if key not in img_keys and key != "state"}
-
-        # Build state tensor (B, T, D)
-        state_frames = []
-        for i in range(n_hist):
-            idx = i * interval - missing  # index into current buffer
-            if idx < 0:
-                state_frames.append(torch.zeros_like(self._state_buffer[0]))
-            else:
-                state_frames.append(self._state_buffer[idx])
-        temporal_batch["state"] = torch.stack(state_frames, dim=1)  # (B, T, D)
-
-        # Build camera tensors (B, T, C, H, W)
-        for key in img_keys:
-            cam_frames = []
-            for i in range(n_hist):
-                idx = i * interval - missing
-                if idx < 0:
-                    cam_frames.append(torch.zeros_like(self._obs_buffers[key][0]))
-                else:
-                    cam_frames.append(self._obs_buffers[key][idx])
-            temporal_batch[key] = torch.stack(cam_frames, dim=1)  # (B, T, C, H, W)
-
-        return temporal_batch
+        """Action-chunk prediction API (not used for π0.6)."""
+        raise NotImplementedError("Currently not implemented for PI06")
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
-        """Select a single action given environment observations."""
-        self.eval()
+        """Return a single action from the rolling queue, refilling when needed.
 
-        # Build temporal observation history if configured.
-        if self.config.n_obs_steps > 1:
-            batch = self._build_history_batch(batch)
+        Matches pi05 semantics — only safe for simulation loops. Real-robot
+        inference should pipeline `sample_actions` in the ROS node directly.
+        """
+        self.eval()
 
         if len(self._action_queue) == 0 or len(self._action_queue) <= self.config.max_delay:
             action_prefix = None
@@ -516,7 +485,11 @@ class PI05MemPolicy(PreTrainedPolicy):
         delay: Tensor | None = None,
         noise: Tensor | None = None,
     ) -> Tensor:
-        """Sample actions from the policy given environment observations."""
+        """Sample an action chunk.
+
+        The provided `action_prefix` must be *unnormalized* — this method
+        normalizes internally before feeding it to the flow-matching module.
+        """
         if not (torch.compiler.is_compiling() or torch.onnx.is_in_onnx_export()):
             assert delay is None or 0 <= delay.item() <= self.config.max_delay, (
                 f"Delay must be None or between 0 and {self.config.max_delay}"
@@ -524,23 +497,8 @@ class PI05MemPolicy(PreTrainedPolicy):
 
         batch = self.normalize_inputs(batch)
 
-        videos, vid_masks = self.prepare_videos(batch)
+        images, img_masks = self.prepare_images(batch)
         lang_tokens, lang_masks = self.prepare_language(batch)
-        state = self.prepare_state(batch)
-
-        # Shape checks: videos must be 5D (B, T, C, H, W), state must be 3D (B, T, D).
-        for vid in videos:
-            assert vid.ndim == 5, f"Expected 5D video tensor (B, T, C, H, W), got {vid.shape}"
-        assert state.ndim == 3, f"Expected 3D state tensor (B, T, D), got {state.shape}"
-
-        if self.config.n_obs_steps > 1:
-            t_dim = state.shape[1]
-            if t_dim == 1:
-                logging.warning(
-                    "Temporal dimension T=1: no historical frames included. "
-                    "This should only happen at most %d time(s) at the start of an episode.",
-                    self.config.history_interval or 1,
-                )
 
         if delay is None:
             delay = torch.tensor(0, dtype=torch.long, device=lang_tokens.device)
@@ -550,102 +508,73 @@ class PI05MemPolicy(PreTrainedPolicy):
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             action_prefix = torch.zeros(actions_shape, dtype=lang_tokens.dtype, device=lang_tokens.device)
         else:
-            normalized = self.normalize_targets({"actions": action_prefix})["actions"]
-            action_prefix = F.pad(
-                normalized,
-                (0, 0, 0, self.config.chunk_size - normalized.shape[1]),
-            )
+            action_prefix = self.normalize_targets({"actions": action_prefix})["actions"]
+            action_prefix = F.pad(action_prefix, (0, 0, 0, self.config.chunk_size - action_prefix.shape[1]))
 
         actions = self.model.sample_actions(
-            videos,
-            vid_masks,
-            lang_tokens,
-            lang_masks,
-            state,
-            action_prefix,
-            delay,
-            noise=noise,
+            images, img_masks, lang_tokens, lang_masks, action_prefix, delay, noise=noise
         )
 
-        action_feature = self.config.action_feature
-        assert action_feature is not None, "action_feature must be set in output_features"
-        original_action_dim = action_feature.shape[0]
+        original_action_dim = self.config.action_feature.shape[0]
         actions = actions[:, :, :original_action_dim]
-
         actions = self.unnormalize_outputs({"actions": actions})["actions"]
-
         return actions
 
     def forward(
         self, batch: dict[str, Tensor], noise: Tensor | None = None, time: Tensor | None = None
     ) -> dict[str, Tensor]:
-        """Do a full training forward pass to compute the loss."""
+        """Full training forward pass. Returns `{"MSE": ..., "CE": ...}`."""
         batch = self.normalize_inputs(batch)
         batch["discrete_actions"] = self.normalize_discrete_actions(dict(batch))["actions"]
         batch = self.normalize_targets(batch)
 
-        obs_history_is_pad = batch.get("obs_history_is_pad")
-        if obs_history_is_pad is None:
-            logging.warning(
-                "obs_history_is_pad is missing from the training batch. "
-                "Padded observation-history timesteps will not be masked."
-            )
-        videos, vid_masks = self.prepare_videos(batch, obs_history_is_pad=obs_history_is_pad)
+        images, img_masks = self.prepare_images(batch)
         lang_tokens, lang_masks = self.prepare_language(batch)
-        state = self.prepare_state(batch)
+        response_tokens, response_masks = self.prepare_response(batch)
         discrete_actions, discrete_action_masks = self.prepare_discrete_actions(batch)
         actions = batch["actions"]
         actions_is_pad = batch.get("action_is_pad")
 
         losses = self.model.forward(
-            videos,
-            vid_masks,
+            images,
+            img_masks,
             lang_tokens,
             lang_masks,
-            state,
             actions,
             actions_is_pad,
+            response_tokens,
+            response_masks,
             noise,
             time,
             discrete_actions,
             discrete_action_masks,
-            obs_history_is_pad=obs_history_is_pad,
         )
 
         mse_loss = losses["MSE"]
         ce_loss = losses["CE"]
-
         return {"MSE": mse_loss, "CE": ce_loss}
 
-    def prepare_state(self, batch: dict[str, Tensor]) -> Tensor:
-        """Prepares the temporal state tensor, padding or truncating to max_state_dim.
+    # Preprocessing helpers (state discretization, image resize, etc.)
 
-        Args:
-            batch: Batch of data containing "state" tensor of shape (B, T, D).
-
-        Returns:
-            A tensor of shape (B, T, max_state_dim).
+    def prepare_discrete_state(self, batch: dict[str, Tensor]) -> list[str]:
+        """Discretize each state dim into 256 bins and format as a space-joined
+        string, matching the π0.5 / π0.6 "State:" prompt template.
         """
-        state = batch["state"]  # (B, T, D) or (B, D) during inference
-        if state.ndim == 2:
-            if self.config.n_obs_steps > 1:
-                raise ValueError(
-                    f"Expected 3D state tensor (B, T, D) when n_obs_steps > 1, "
-                    f"got shape {state.shape}. Ensure select_action() is being used."
-                )
-            state = state.unsqueeze(1)  # (B, D) -> (B, 1, D)
-        state_dim = state.shape[-1]
-        if state_dim > self.config.max_state_dim:
-            raise ValueError(
-                f"State dimension ({state_dim}) exceeds max_state_dim ({self.config.max_state_dim}). "
-                f"Increase max_state_dim in the config to accommodate the state vector."
+        state = batch["state"]
+        state_cpu = state.to(device="cpu", dtype=torch.float32)
+        if torch.any(state_cpu < -1.0) or torch.any(state_cpu > 1.0):
+            logging.warning(
+                f"State values are not normalized between -1 and 1. "
+                f"Min: {state_cpu.min().item()}, Max: {state_cpu.max().item()}"
             )
-        if state_dim < self.config.max_state_dim:
-            state = F.pad(state, (0, self.config.max_state_dim - state_dim))
-        return state
+        state_clipped = torch.clamp(state_cpu, -1.0, 1.0)
+        bin_indices = ((state_clipped + 1.0) * 128.0).long().clamp(0, 255)
+        discretized_states = bin_indices.cpu().tolist()
+        return [" ".join(map(str, row)) for row in discretized_states]
 
     def prepare_discrete_actions(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
-        """Prepares discrete actions for the model by tokenizing and padding them."""
+        """Tokenize continuous actions with the FAST processor and pad to
+        `discrete_action_max_length`."""
         device = batch["discrete_actions"].device
         discrete_actions = batch["discrete_actions"].to(device="cpu", dtype=torch.float32)
         tokens = self.discrete_action_processor.__call__(discrete_actions)
@@ -656,29 +585,13 @@ class PI05MemPolicy(PreTrainedPolicy):
             discrete_action_masks
         ).to(device=device, dtype=torch.bool)
 
-    def prepare_videos(
-        self, batch: dict[str, Tensor], obs_history_is_pad: Tensor | None = None
-    ) -> tuple[list[Tensor], list[Tensor]]:
-        """Apply preprocessing to the video inputs.
-
-        Each camera key now contains a video tensor of shape (B, T, C, H, W).
-        Frames are resized to 224x224 with padding. Pixel values remain in the
-        ``[0, 1]`` range as produced by the dataset loader; the video encoder
-        rescales to ``[-1, 1]`` (SigLIP's expected range) inside its own
-        forward pass.
-
-        Args:
-            batch: Batch of data containing video tensors.
-            obs_history_is_pad: Optional bool tensor (B, T) indicating which
-                temporal frames are padded. Padded frames are zeroed out before
-                encoding so the video encoder does not see clamped/repeated
-                content.
-
-        Returns:
-            A tuple of (videos, vid_masks) lists.
+    def prepare_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
+        """Resize (with padding) each camera view to `config.resize_imgs_with_padding`
+        (π0.6 default: 448×448) and normalize from `[0, 1]` to `[-1, 1]` as SigLIP
+        expects. Missing views are replaced by all-`-1` tensors up to `empty_cameras`.
         """
-        videos: list[Tensor] = []
-        vid_masks: list[Tensor] = []
+        images = []
+        img_masks = []
 
         present_img_keys = [key for key in self.config.image_features if key in batch]
         missing_img_keys = [key for key in self.config.image_features if key not in batch]
@@ -689,52 +602,50 @@ class PI05MemPolicy(PreTrainedPolicy):
                 f"(batch: {batch.keys()}) (image_features:{self.config.image_features})"
             )
 
-        last_vid: Tensor | None = None
-        last_mask: Tensor | None = None
-
         for key in present_img_keys:
-            vid = batch[key]  # (B, T, C, H, W) or (B, C, H, W) during inference
-            if vid.ndim == 4:
-                if self.config.n_obs_steps > 1:
-                    raise ValueError(
-                        f"Expected 5D video tensor (B, T, C, H, W) when n_obs_steps > 1, "
-                        f"got shape {vid.shape}. Ensure select_action() is being used."
-                    )
-                vid = vid.unsqueeze(1)  # (B, C, H, W) -> (B, 1, C, H, W)
-
-            if obs_history_is_pad is not None:
-                frame_mask = (~obs_history_is_pad)[:, :, None, None, None]  # (B, T, 1, 1, 1)
-                vid = vid * frame_mask
-
+            img = batch[key]
             if self.config.resize_imgs_with_padding is not None:
-                b, t_frames = vid.shape[:2]
-                flat = rearrange(vid, "B T C H W -> (B T) C H W")
-                flat = resize_with_pad(flat, *self.config.resize_imgs_with_padding, pad_value=0)
-                vid = rearrange(flat, "(B T) C H W -> B T C H W", B=b, T=t_frames)
+                img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
 
-            bsize = vid.shape[0]
-            device = vid.device
+            img = img * 2.0 - 1.0
+
+            bsize = img.shape[0]
+            device = img.device
             mask = torch.ones(bsize, dtype=torch.bool, device=device)
-            videos.append(vid)
-            vid_masks.append(mask)
-            last_vid = vid
-            last_mask = mask
+            images.append(img)
+            img_masks.append(mask)
 
-        n_empty = min(len(missing_img_keys), self.config.empty_cameras)
-        if n_empty > 0:
-            assert last_vid is not None and last_mask is not None
-            for _ in range(n_empty):
-                videos.append(torch.zeros_like(last_vid))
-                vid_masks.append(torch.zeros_like(last_mask))
+        for num_empty_cameras in range(len(missing_img_keys)):
+            if num_empty_cameras >= self.config.empty_cameras:
+                break
+            img = torch.ones_like(img) * -1
+            mask = torch.zeros_like(mask)
+            images.append(img)
+            img_masks.append(mask)
 
-        return videos, vid_masks
+        return images, img_masks
 
     def prepare_language(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
-        """Tokenize the text input."""
+        """Tokenize the task prompt together with the discretized state string.
+
+        Format matches π0.5:
+            "Task: {task}<eos>State: {state}<eos>Response:" if predict_response
+            "Task: {task}<eos>State: {state}<eos>Actions:"  otherwise
+        """
         device = batch["state"].device
         tasks = batch["prompt"]
+        state = self.prepare_discrete_state(batch)
 
-        prompt = [f"Task: {task}<eos>Actions:" for task in tasks]
+        if self.config.predict_response:
+            prompt = [
+                f"Task: {task}<eos>State: {state}<eos>Response:"
+                for task, state in zip(tasks, state, strict=False)
+            ]
+        else:
+            prompt = [
+                f"Task: {task}<eos>State: {state}<eos>Actions:"
+                for task, state in zip(tasks, state, strict=False)
+            ]
 
         tokenized_prompt = self.language_tokenizer.__call__(
             prompt,
@@ -746,14 +657,38 @@ class PI05MemPolicy(PreTrainedPolicy):
         )
         lang_tokens = tokenized_prompt["input_ids"].to(device=device)
         lang_masks = tokenized_prompt["attention_mask"].to(device=device, dtype=torch.bool)
-
         return lang_tokens, lang_masks
 
+    def prepare_response(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+        """Tokenize the response field for supervised co-training.
 
-# Flow-matching model
-class PI05MemFlowMatching(nn.Module):
-    """π05 Mem: A Vision-Language-Action Flow Model with space-time SigLIP
-    video encoding and temporal state sequences.
+        Returns `(None, None)` when response prediction is disabled.
+        """
+        if not self.config.predict_response:
+            return None, None
+        device = batch["state"].device
+        responses = batch["response"]
+        response_prompt = [f"{response}<eos>Actions:" for response in responses]
+
+        tokenized_response = self.language_tokenizer.__call__(
+            response_prompt,
+            padding="max_length",
+            padding_side="right",
+            max_length=self.config.response_max_length,
+            return_tensors="pt",
+            truncation=True,
+        )
+        response_tokens = tokenized_response["input_ids"].to(device=device)
+        response_masks = tokenized_response["attention_mask"].to(device=device, dtype=torch.bool)
+        return response_tokens, response_masks
+
+
+# PI06FlowMatching — the core nn.Module doing flow-matching decoding with
+# a shared per-layer KV between the Gemma 3 backbone and the Gemma-v1 expert.
+
+
+class PI06FlowMatching(nn.Module):
+    """π06: Gemma 3 4B backbone + Gemma-v1 action expert + flow matching.
 
     ┌──────────────────────────────────────────┐
     │                   actions                │
@@ -761,61 +696,52 @@ class PI05MemFlowMatching(nn.Module):
     │                  ┌┴─────┐                │
     │      kv cache    │Gemma │                │
     │      ┌──────────►│Expert│                │
-    │      │           │      │                │
-    │     ┌┴─────────┐ │x 10  │                │
+    │      │           │ 34L  │                │
+    │     ┌┴─────────┐ │AdaRMS│                │
     │     │          │ └▲─────┘                │
-    │     │PaliGemma │  │                      │
-    │     │          │  noise                  │
+    │     │Gemma 3 4B│  │                      │
+    │     │(SigLIP   │  noise                  │
+    │     │448×448)  │                         │
     │     └▲──▲──▲──▲                          │
     │      │  │  │  └── discrete actions       │
-    │      │  │  └───── state (T tokens)       │
+    │      │  │  └───── robot state            │
     │      │  └──────── language tokens        │
-    │      └─────────── video (SigLIP+ST)      │
+    │      └─────────── image(s)               │
     └──────────────────────────────────────────┘
     """
 
-    def __init__(self, config: PI05MemConfig, discrete_action_vocab_size: int | None = None):
+    def __init__(self, config: PI06Config, discrete_action_vocab_size: int | None = None):
+        """Initializes the PI06FlowMatching model.
+
+        Args:
+            config: `PI06Config` instance.
+            discrete_action_vocab_size: FAST tokenizer vocabulary size.
+        """
         super().__init__()
         self.config = config
 
-        load_pretrained_paligemma = self.config.init_strategy == "expert_only_he_init"
-        paligemma_with_expert_config = PaliGemmaWithExpertConfig(
+        # Only pull pretrained Gemma 3 weights when the expert is being He-inited
+        # alongside them (i.e. only in the `expert_only_he_init` path). Any other
+        # strategy trains or resumes, so we skip the download.
+        load_pretrained_gemma3 = self.config.init_strategy == "expert_only_he_init"
+        gemma3_with_expert_config = Gemma3WithExpertConfig(
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=self.config.train_expert_only,
             attention_implementation=self.config.attention_implementation,
-            load_pretrained_paligemma=load_pretrained_paligemma,
+            load_pretrained_gemma3=load_pretrained_gemma3,
             discrete_action_vocab_size=discrete_action_vocab_size,
             dropout=self.config.dropout,
-            gradient_checkpointing=self.config.gradient_checkpointing,
         )
-        self.paligemma_with_expert = PaliGemmaWithExpertModel(paligemma_with_expert_config)
+        self.gemma3_with_expert = Gemma3WithExpertModel(gemma3_with_expert_config)
 
-        vlm_hidden_size = self.paligemma_with_expert.config.paligemma_config.text_config.hidden_size
-
-        # Space-time SigLIP video encoder (MEM paper low-level memory).
-        # The encoder is a thin computational wrapper: it holds
-        # ``paligemma_with_expert``'s ``vision_tower`` / ``multi_modal_projector``
-        # by reference (no parameter duplication, no separate HF download) and
-        # mutates a few encoder layers in place to add temporal self-attention.
-        # Freezing and dtype-casting of these modules are already handled by
-        # ``PaliGemmaWithExpertModel``. The encoder introduces no new learnable
-        # parameters, so a regular pi05 checkpoint's state_dict loads directly.
-        self.video_encoder = SpaceTimeSiglipVideoEncoder(
-            vision_tower=self.paligemma_with_expert.paligemma.vision_tower,
-            multi_modal_projector=self.paligemma_with_expert.paligemma.multi_modal_projector,
-            num_frames=config.n_obs_steps,
-            spacetime_layer_stride=config.spacetime_layer_stride,
-            gradient_checkpointing=config.gradient_checkpointing,
-        )
-
-        # Per-timestep state projection: each of the T state vectors becomes one token
-        self.state_proj = nn.Linear(self.config.max_state_dim, vlm_hidden_size)
-
+        # Action projections stay float32 for numerical stability; they're small.
         self.action_in_proj = nn.Linear(self.config.max_action_dim, self.config.proj_width)
         self.action_out_proj = nn.Linear(self.config.proj_width, self.config.max_action_dim)
 
         self.time_mlp_in = nn.Linear(self.config.proj_width, self.config.proj_width)
         self.time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
+
+        self.language_tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-4b-pt")
 
         self._init_model()
 
@@ -835,121 +761,96 @@ class PI05MemFlowMatching(nn.Module):
             for m in self.modules():
                 self._init_weights(m)
         elif self.config.init_strategy == "expert_only_he_init":
-            for m in self.paligemma_with_expert.gemma_expert.modules():
+            for m in self.gemma3_with_expert.gemma_expert.modules():
                 self._init_weights(m)
         else:
             raise ValueError(f"Invalid init strategy: {self.config.init_strategy}")
 
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
+        """Standard Gaussian noise (float32)."""
         return torch.normal(mean=0.0, std=1.0, size=shape, dtype=torch.float32, device=device)
 
     def sample_time(self, bsize: int, device: torch.device | str) -> Tensor:
+        """π0-style flow-matching time sampler: `Beta(1.5, 1.0)` on (0.001, 1.000)."""
         beta_dist = torch.distributions.Beta(concentration1=1.5, concentration0=1.0)
         time_beta = beta_dist.sample((bsize,)).to(device=device, dtype=torch.float32)
-        time = time_beta * 0.999 + 0.001
-        return time
+        return time_beta * 0.999 + 0.001
 
-    def embed_video(self, video: Tensor) -> Tensor:
-        """Encode a video through the space-time SigLIP video encoder.
-
-        The encoder applies standard SigLIP spatial attention on every layer
-        plus a causal temporal attention sublayer every
-        ``spacetime_layer_stride``-th layer. Past-timestep tokens are dropped;
-        only the current frame's 256 tokens are returned.
-
-        Args:
-            video: (B, T, C, H, W) pixel values in [0, 1].
-
-        Returns:
-            (B, num_video_tokens, vlm_hidden_size) current-frame tokens.
-        """
-        return self.video_encoder(video)
+    # Embedding builders — shape matches π0.5 exactly; the block pattern
+    # (image + language bidirectional, response/discrete-action causal, action
+    # suffix bidirectional cross-attending to prefix) is the same as the
+    # π0.6 model card specifies.
 
     def embed_prefix(
         self,
-        videos: list[Tensor],
-        vid_masks: list[Tensor],
+        images: list[Tensor],
+        img_masks: list[Tensor],
         lang_tokens: Tensor,
         lang_masks: Tensor,
-        state: Tensor,
+        response_tokens: Tensor | None = None,
+        response_masks: Tensor | None = None,
         discrete_actions: Tensor | None = None,
         discrete_action_masks: Tensor | None = None,
-        obs_history_is_pad: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """Embed videos with the space-time SigLIP video encoder, language
-        tokens with the embedding layer, and temporal state via per-timestep
-        learned projection.
-
-        Args:
-            videos: List of video tensors, each (B, T, C, H, W).
-            vid_masks: List of video mask tensors, each (B,).
-            lang_tokens: Language token tensor.
-            lang_masks: Language mask tensor.
-            state: Temporal state tensor of shape (B, T, max_state_dim).
-            discrete_actions: Optional discrete action tensor.
-            discrete_action_masks: Optional discrete action mask tensor.
-            obs_history_is_pad: Optional bool tensor (B, T) from the dataloader.
-                True for padded (clamped) timesteps, False for real ones.
-                Used to mask state tokens during training; None during inference.
-
-        Returns:
-            (embs, pad_masks, att_masks) tuple.
-        """
+        """Embed the prefix (image + language + optional response + discrete action
+        tokens) and emit the block-pattern attention masks π0.x uses."""
         embs = []
         pad_masks = []
         att_masks = []
-        bsize = lang_tokens.shape[0]
 
-        for vid, vid_mask in zip(videos, vid_masks, strict=False):
-            vid_emb = self.embed_video(vid)  # (B, num_video_tokens, vlm_hidden)
-            vid_emb = vid_emb.to(dtype=_preferred_dtype())
+        bsize = None
+        for img, img_mask in zip(images, img_masks, strict=False):
+            img_emb = self.gemma3_with_expert.embed_image(img)
+            img_emb = img_emb.to(dtype=_preferred_dtype())
 
-            num_vid_embs = vid_emb.shape[1]
-            vid_mask_expanded = vid_mask[:, None].expand(bsize, num_vid_embs)
+            bsize, num_img_embs = img_emb.shape[:2]
+            img_mask = img_mask[:, None].expand(bsize, num_img_embs)
 
-            embs.append(vid_emb)
-            pad_masks.append(vid_mask_expanded)
+            embs.append(img_emb)
+            pad_masks.append(img_mask)
+            # Image tokens share a bidirectional block with the language tokens.
+            att_masks += [0] * num_img_embs
 
-            att_masks += [0] * num_vid_embs
-
-        lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
-        lang_emb_dim = lang_emb.shape[-1]
-        lang_emb = lang_emb * math.sqrt(lang_emb_dim)
+        # Gemma 3's `embed_tokens` is a `Gemma3TextScaledWordEmbedding` that
+        # already multiplies by sqrt(hidden_size) internally — do NOT scale
+        # again here (unlike pi05, whose PaliGemma Gemma-v1 embedding is a
+        # plain nn.Embedding with the normalizer applied later in the stock
+        # forward that we bypass).
+        lang_emb = self.gemma3_with_expert.embed_language_tokens(lang_tokens)
 
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
-
         num_lang_embs = lang_emb.shape[1]
+        # Language tokens continue the image block (bidirectional within prefix).
         att_masks += [0] * num_lang_embs
 
-        # Project each timestep's state into a separate VLM token
-        # state: (B, T, max_state_dim) -> state_emb: (B, T, vlm_hidden_size)
-        state_emb = self.state_proj(state.to(dtype=_preferred_dtype()))
-        num_state_tokens = state_emb.shape[1]  # T
-        if obs_history_is_pad is not None:
-            state_mask = ~obs_history_is_pad  # True = real, False = padded
-        else:
-            state_mask = torch.ones(bsize, num_state_tokens, dtype=torch.bool, device=state.device)
+        if response_tokens is not None:
+            response_emb = self.gemma3_with_expert.embed_language_tokens(response_tokens)
 
-        embs.append(state_emb)
-        pad_masks.append(state_mask)
-        att_masks += [0] * num_state_tokens  # full attention with video and language
+            embs.append(response_emb)
+            pad_masks.append(response_masks)
+            # Response starts a new causal block.
+            att_masks += [1] * response_emb.shape[1]
 
         if discrete_actions is not None:
-            discrete_action_emb = self.paligemma_with_expert.embed_discrete_actions(discrete_actions)
+            discrete_action_emb = self.gemma3_with_expert.embed_discrete_actions(discrete_actions)
             embs.append(discrete_action_emb.to(dtype=_preferred_dtype()))
             pad_masks.append(discrete_action_masks)
+            # Discrete action tokens start another causal block.
             att_masks += [1] * discrete_action_emb.shape[1]
+
+        if bsize is None:
+            # No images: still need a batch size from the language tokens.
+            bsize = lang_tokens.shape[0]
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
-
         return embs, pad_masks, att_masks
 
     def embed_suffix(self, noisy_actions: Tensor, timestep: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Embed noisy_actions, timestep to prepare for Expert Gemma processing."""
+        """Embed the noisy action chunk + timestep for the expert's bidirectional block."""
         embs = []
         pad_masks = []
         att_masks = []
@@ -965,63 +866,68 @@ class PI05MemFlowMatching(nn.Module):
         noisy_actions = noisy_actions.to(dtype=dtype)
         action_emb = self.action_in_proj(noisy_actions)
 
-        def time_mlp_func(time_emb):
-            x = self.time_mlp_in(time_emb)
+        def time_mlp_func(t):
+            x = self.time_mlp_in(t)
             x = F.silu(x)
             x = self.time_mlp_out(x)
             return F.silu(x)
 
+        # Per-token AdaRMS condition (shape `(B, n_action_steps, proj_width)`)
+        # — matches the π0.5 reference implementation exactly.
         time_emb = time_emb.to(dtype=dtype)
         adarms_cond = time_mlp_func(time_emb)
 
         embs.append(action_emb)
-
-        bsize, action_dim = action_emb.shape[:2]
-        action_mask = torch.ones(bsize, action_dim, dtype=torch.bool, device=device)
+        action_mask = torch.ones(bsize, action_emb.shape[1], dtype=torch.bool, device=device)
         pad_masks.append(action_mask)
-
-        att_masks += [1] + ([0] * (self.config.chunk_size - 1))
+        # Start a new bidirectional block for the action tokens. The leading `1`
+        # breaks the prefix-to-suffix block boundary, the following `0`s keep
+        # all action tokens inside one bidirectional group.
+        att_masks += [1] + ([0] * (self.config.n_action_steps - 1))
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
+        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=device)
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
-
         return embs, pad_masks, att_masks, adarms_cond
+
+    # Training forward — flow matching + discrete-action CE + optional response CE.
 
     def forward(
         self,
-        videos: list[Tensor],
-        vid_masks: list[Tensor],
+        images: list[Tensor],
+        img_masks: list[Tensor],
         lang_tokens: Tensor,
         lang_masks: Tensor,
-        state: Tensor,
         actions: Tensor,
         actions_is_pad: Tensor | None = None,
+        response_tokens: Tensor | None = None,
+        response_masks: Tensor | None = None,
         noise: Tensor | None = None,
         time: Tensor | None = None,
         discrete_actions: Tensor | None = None,
         discrete_action_masks: Tensor | None = None,
-        obs_history_is_pad: Tensor | None = None,
     ) -> dict[str, Tensor]:
-        """Do a full training forward pass and compute the loss."""
+        """Full training forward pass. Returns `{"MSE": ..., "CE": ...}`."""
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            videos,
-            vid_masks,
+            images,
+            img_masks,
             lang_tokens,
             lang_masks,
-            state,
+            response_tokens,
+            response_masks,
             discrete_actions,
             discrete_action_masks,
-            obs_history_is_pad=obs_history_is_pad,
         )
 
         vlm_2d_attention_mask = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         vlm_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
+        # The continuous action expert must not cross-attend to the discrete
+        # action tokens (they're targets, not context). Exclude them from the cache.
         num_cross_att_tokens = prefix_embs.shape[1] - self.config.discrete_action_max_length
 
-        (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
+        (prefix_out, _), past_key_values = self.gemma3_with_expert.forward(
             attention_mask=vlm_2d_attention_mask,
             position_ids=vlm_position_ids,
             past_key_values=None,
@@ -1034,10 +940,10 @@ class PI05MemFlowMatching(nn.Module):
         batch_size = actions.shape[0]
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
-
         if time is None:
             time = self.sample_time(batch_size, actions.device)
 
+        # Real-time inference delay: randomly freeze a prefix of the action chunk.
         delay = torch.randint(0, self.config.max_delay + 1, (batch_size,))
         prefix_mask = rearrange(torch.arange(self.config.chunk_size), "c -> 1 c") < rearrange(
             delay, "b -> b 1"
@@ -1062,23 +968,21 @@ class PI05MemFlowMatching(nn.Module):
         ]
         action_expert_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
-        assert past_key_values is not None
-        kv_cache: dict = past_key_values
-        for layer_idx in kv_cache:
-            kv_cache[layer_idx]["key_states"] = kv_cache[layer_idx]["key_states"].detach()
-            kv_cache[layer_idx]["value_states"] = kv_cache[layer_idx]["value_states"].detach()
+        # Knowledge Insulation: block gradients from the action expert into the VLM.
+        for layer_idx in past_key_values:
+            past_key_values[layer_idx]["key_states"] = past_key_values[layer_idx]["key_states"].detach()
+            past_key_values[layer_idx]["value_states"] = past_key_values[layer_idx]["value_states"].detach()
 
-        (_, suffix_out), _ = self.paligemma_with_expert.forward(
+        (_, suffix_out), _ = self.gemma3_with_expert.forward(
             attention_mask=action_expert_2d_attention_mask,
             position_ids=action_expert_position_ids,
-            past_key_values=kv_cache,
+            past_key_values=past_key_values,
             inputs_embeds=[None, suffix_embs],
             use_cache=True,
             fill_kv_cache=False,
             adarms_cond=[None, adarms_cond],
         )
 
-        assert suffix_out is not None
         suffix_out = suffix_out[:, -self.config.n_action_steps :]
         v_t = self.action_out_proj(suffix_out)
         v_t = v_t.to(dtype=torch.float32)
@@ -1086,54 +990,77 @@ class PI05MemFlowMatching(nn.Module):
         mse_loss = F.mse_loss(u_t, v_t, reduction="none")
 
         postfix_mask = rearrange(torch.logical_not(prefix_mask), "b c -> b c 1")
-
         if actions_is_pad is not None:
             in_episode_bound = ~actions_is_pad
             in_episode_bound = rearrange(in_episode_bound, "b c -> b c 1")
             postfix_mask = torch.logical_and(postfix_mask, in_episode_bound)
-
         mse_loss = mse_loss * postfix_mask
-
         mse_loss = mse_loss[:, :, : self.config.max_action_dim]
-
         postfix_mask_expanded = repeat(postfix_mask, "b c 1 -> b c d", d=mse_loss.shape[-1])
         mse_loss = mse_loss.sum() / (postfix_mask_expanded.sum() + 1e-8)
 
-        assert discrete_actions is not None
-        assert discrete_action_masks is not None
-        assert prefix_out is not None
-        batch_size, seq_len = discrete_actions.shape
+        # Discrete-action cross-entropy (FAST tokens) via the dedicated head.
+        batch_size_da, seq_len = discrete_actions.shape
         discrete_token_start = -self.config.discrete_action_max_length
         discrete_action_slice_object = slice(discrete_token_start - 1, -1)
         discrete_action_out = prefix_out[:, discrete_action_slice_object]
-        logits = self.paligemma_with_expert.da_head(discrete_action_out)
-
+        logits = self.gemma3_with_expert.da_head(discrete_action_out)
         logits = logits.to(dtype=torch.float32)
         logits = rearrange(logits, "b s d -> (b s) d")
         labels = rearrange(discrete_actions, "b s -> (b s)")
         discrete_action_ce_loss = F.cross_entropy(logits, labels, reduction="none")
-
-        discrete_action_ce_loss = rearrange(discrete_action_ce_loss, "(b s) -> b s", b=batch_size, s=seq_len)
-
+        discrete_action_ce_loss = rearrange(
+            discrete_action_ce_loss, "(b s) -> b s", b=batch_size_da, s=seq_len
+        )
         discrete_action_is_pad = ~discrete_action_masks
         discrete_action_ce_loss = discrete_action_ce_loss * ~discrete_action_is_pad
-
         discrete_action_ce_loss = discrete_action_ce_loss.mean()
 
-        return {"MSE": mse_loss, "CE": discrete_action_ce_loss}
+        # Optional response-token cross-entropy (via Gemma 3's shared lm_head).
+        if self.config.predict_response:
+            batch_size_resp, seq_len_resp = response_tokens.shape
+            response_token_start = -self.config.response_max_length - self.config.discrete_action_max_length
+            response_token_end = -self.config.discrete_action_max_length - 1
+            response_slice_object = slice(response_token_start, response_token_end)
+            response_out = prefix_out[:, response_slice_object]
+            response_logits = self._gemma3_lm_head()(response_out)
+            response_slice = slice(1, None)
+            response_logits = response_logits.to(dtype=torch.float32)
+            response_logits = rearrange(response_logits, "b s d -> (b s) d")
+            response_labels = rearrange(response_tokens[:, response_slice], "b s -> (b s)")
+            response_ce_loss = F.cross_entropy(response_logits, response_labels, reduction="none")
+            response_ce_loss = rearrange(
+                response_ce_loss, "(b s) -> b s", b=batch_size_resp, s=seq_len_resp - 1
+            )
+            response_is_pad = ~response_masks
+            response_ce_loss = response_ce_loss * ~response_is_pad[:, response_slice]
+            response_ce_loss = response_ce_loss.mean()
+        else:
+            response_ce_loss = torch.tensor(0.0, device=mse_loss.device)
+
+        return {"MSE": mse_loss, "CE": discrete_action_ce_loss + response_ce_loss}
+
+    def _gemma3_lm_head(self):
+        """Return the language-modeling head of the Gemma 3 backbone, regardless
+        of which transformers version layout is in use."""
+        gemma3 = self.gemma3_with_expert.gemma3
+        if hasattr(gemma3, "lm_head"):
+            return gemma3.lm_head
+        return gemma3.model.lm_head
+
+    # Inference — flow-matching denoising, optional response autoregression.
 
     def sample_actions(
         self,
-        videos: list[Tensor],
-        vid_masks: list[Tensor],
+        images: list[Tensor],
+        img_masks: list[Tensor],
         lang_tokens: Tensor,
         lang_masks: Tensor,
-        state: Tensor,
         action_prefix: Tensor,
         delay: Tensor,
         noise: Tensor | None = None,
     ) -> Tensor:
-        """Do a full inference forward and compute the action."""
+        """Inference: encode prefix once, run `num_steps` Euler steps."""
         bsize = lang_tokens.shape[0]
         device = lang_tokens.device
 
@@ -1142,14 +1069,15 @@ class PI05MemFlowMatching(nn.Module):
             noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            videos, vid_masks, lang_tokens, lang_masks, state
+            images, img_masks, lang_tokens, lang_masks
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None] - 1
         num_cross_att_tokens = prefix_embs.shape[1]
 
-        (prefix_out, _), past_kv = self.paligemma_with_expert.forward(
+        (prefix_out, _), past_key_values = self.gemma3_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
             position_ids=prefix_position_ids,
             past_key_values=None,
@@ -1158,7 +1086,30 @@ class PI05MemFlowMatching(nn.Module):
             use_cache=False,
             fill_kv_cache=True,
         )
-        past_key_values: list[dict[str, Tensor]] = past_kv
+
+        response_tokens = torch.empty((bsize, 0), device=device, dtype=torch.long)
+        if self.config.predict_response:
+            for auto_step in range(self.config.response_max_length):
+                (
+                    prefix_out,
+                    prefix_embs,
+                    prefix_pad_masks,
+                    prefix_att_masks,
+                    prefix_offsets,
+                    response_tokens,
+                    past_key_values,
+                ) = self.infer_response(
+                    prefix_out,
+                    prefix_embs,
+                    prefix_pad_masks,
+                    prefix_att_masks,
+                    past_key_values,
+                    prefix_offsets,
+                    response_tokens,
+                    auto_step,
+                    bsize,
+                    device,
+                )
 
         dt = -1.0 / self.config.num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
@@ -1169,13 +1120,7 @@ class PI05MemFlowMatching(nn.Module):
         while time >= -dt / 2:
             x_t = torch.where(rearrange(prefix_mask, "b c -> b c 1"), action_prefix, x_t)
             masked_time = torch.where(prefix_mask, 0, time)
-            v_t = self.denoise_step(
-                prefix_pad_masks,
-                past_key_values,
-                x_t,
-                masked_time,
-            )
-
+            v_t = self.denoise_step(prefix_pad_masks, past_key_values, x_t, masked_time)
             x_t += dt * v_t
             time += dt
 
@@ -1189,7 +1134,7 @@ class PI05MemFlowMatching(nn.Module):
         x_t: Tensor,
         time: Tensor,
     ) -> Tensor:
-        """Apply one denoising step."""
+        """Apply one Euler step of the flow-matching denoiser."""
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
 
         num_cross_att_tokens = prefix_pad_masks.shape[1]
@@ -1202,7 +1147,7 @@ class PI05MemFlowMatching(nn.Module):
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
         action_expert_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
-        outputs_embeds, _ = self.paligemma_with_expert.forward(
+        outputs_embeds, _ = self.gemma3_with_expert.forward(
             attention_mask=action_expert_2d_attention_mask,
             position_ids=action_expert_position_ids,
             past_key_values=past_key_values,
@@ -1212,8 +1157,86 @@ class PI05MemFlowMatching(nn.Module):
             adarms_cond=[None, adarms_cond],
         )
         suffix_out = outputs_embeds[1]
-        assert suffix_out is not None
         suffix_out = suffix_out[:, -self.config.n_action_steps :]
         v_t = self.action_out_proj(suffix_out)
         v_t = v_t.to(dtype=torch.float32)
         return v_t
+
+    def infer_response(
+        self,
+        prefix_out: Tensor,
+        prefix_embs: Tensor,
+        prefix_pad_masks: Tensor,
+        prefix_att_masks: Tensor,
+        past_key_values: list[dict[str, Tensor]],
+        prefix_offsets: Tensor,
+        response_tokens: Tensor,
+        auto_step: int,
+        bsize: int,
+        device: torch.device,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, list[dict[str, Tensor]]]:
+        """Autoregressive response-token generation for one step."""
+        eos_token_id = self.language_tokenizer.convert_tokens_to_ids(self.language_tokenizer.eos_token)
+        if auto_step == 0:
+            response_token = torch.full(
+                (bsize, 1), self.language_tokenizer.bos_token_id, device=device, dtype=torch.long
+            )
+        else:
+            response_token = prefix_out[:, -1:]
+            response_token = self._gemma3_lm_head()(response_token).argmax(dim=-1)
+
+        pad_token_id = self.language_tokenizer.pad_token_id
+        if response_tokens.shape[1] > 1:
+            prev_tokens = response_tokens
+            has_eos = (prev_tokens == eos_token_id).any(dim=1, keepdim=True)
+            has_pad = (prev_tokens == pad_token_id).any(dim=1, keepdim=True)
+            response_pad_masks = ~(has_eos | has_pad)
+            response_token = torch.where(
+                response_pad_masks,
+                response_token,
+                torch.tensor(pad_token_id, device=device, dtype=response_token.dtype),
+            )
+        else:
+            response_pad_masks = torch.ones((bsize, 1), device=device, dtype=torch.bool)
+
+        response_tokens = torch.cat([response_tokens, response_token], dim=1)
+
+        # Gemma 3's `embed_tokens` already scales by sqrt(hidden_size); see
+        # the note in `embed_prefix`.
+        response_emb = self.gemma3_with_expert.embed_language_tokens(response_token)
+
+        response_att_masks = torch.ones((bsize, 1), device=device, dtype=response_emb.dtype)
+
+        prefix_embs = torch.cat([prefix_embs, response_emb], dim=1)
+        prefix_pad_masks = torch.cat([prefix_pad_masks, response_pad_masks], dim=1)
+        prefix_att_masks = torch.cat([prefix_att_masks, response_att_masks], dim=1)
+
+        num_cross_att_tokens = prefix_pad_masks.shape[1]
+        response_att_2d_masks = make_att_2d_masks(
+            response_pad_masks,
+            response_att_masks,
+            n_cross_att_tokens=num_cross_att_tokens - 1,
+            cross_att_pad_masks=prefix_pad_masks[:, : num_cross_att_tokens - 1],
+        )
+        prefix_offsets = prefix_offsets + response_pad_masks.long()
+        prefix_position_ids = prefix_offsets
+
+        (prefix_out, _), past_key_values = self.gemma3_with_expert.forward(
+            attention_mask=response_att_2d_masks,
+            position_ids=prefix_position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=[response_emb, None],
+            n_cross_att_tokens=num_cross_att_tokens,
+            use_cache=True,
+            fill_kv_cache=True,
+        )
+
+        return (
+            prefix_out,
+            prefix_embs,
+            prefix_pad_masks,
+            prefix_att_masks,
+            prefix_offsets,
+            response_tokens,
+            past_key_values,
+        )
