@@ -131,6 +131,47 @@ def update_policy(
     return train_metrics
 
 
+_VAL_METRIC_KEYS: tuple[str, ...] = ("loss", "mse_loss", "ce_loss", "l1_loss", "accuracy")
+
+
+def _mixture_weighted_aggregate(
+    per_dataset_trackers: dict[str, MetricsTracker],
+    name_to_weight: dict[str, float],
+    metric_keys: tuple[str, ...] = _VAL_METRIC_KEYS,
+) -> dict[str, float]:
+    """Mixture-weighted average of per-dataset validation metrics.
+
+    Weights are taken from ``name_to_weight`` and renormalized over only the
+    names present in ``per_dataset_trackers`` (empty datasets are skipped
+    upstream by ``WeightedDatasetMixture.get_per_dataset_dataloaders`` and so
+    will be missing from the trackers). When the renormalization total is 0
+    -- empty trackers, or all selected datasets have weight 0 -- every metric
+    is returned as ``0.0``.
+
+    Args:
+        per_dataset_trackers: One ``MetricsTracker`` per non-empty validation
+            dataset, keyed by dataset name.
+        name_to_weight: Mapping from dataset name to its mixture weight (need
+            not be normalized; need not be a strict subset/superset of the
+            tracker keys, but must contain every tracker key).
+        metric_keys: The metric attribute names to aggregate.
+
+    Returns:
+        Dict mapping each ``metric_keys`` entry to its weighted average.
+    """
+    weights = {name: name_to_weight[name] for name in per_dataset_trackers}
+    total = sum(weights.values())
+    if total <= 0:
+        return dict.fromkeys(metric_keys, 0.0)
+
+    per_dataset_dicts = {
+        name: tracker.to_dict(use_avg=True) for name, tracker in per_dataset_trackers.items()
+    }
+    return {
+        k: sum((w / total) * per_dataset_dicts[name][k] for name, w in weights.items()) for k in metric_keys
+    }
+
+
 def _find_unused_params_from_env() -> bool:
     """Parse the ``FIND_UNUSED_PARAMS`` env var into a bool.
 
@@ -149,6 +190,35 @@ def _find_unused_params_from_env() -> bool:
     return os.environ.get("FIND_UNUSED_PARAMS", "true").lower() == "true"
 
 
+def _sync_deepspeed_gradient_accumulation_steps(
+    accelerator: accelerate.Accelerator, cfg: TrainPipelineConfig
+) -> None:
+    """Make TrainPipelineConfig the single source of truth for gradient_accumulation_steps.
+
+    When DeepSpeed is the distributed backend, the value declared in the Accelerate YAML's
+    `deepspeed_config.gradient_accumulation_steps` is forcibly overridden to match
+    `cfg.gradient_accumulation_steps`. Must be called on all ranks and before
+    `accelerator.prepare(...)`, because `_prepare_deepspeed` reads this value from
+    `hf_ds_config.config` on every rank at prepare time.
+    """
+    if accelerator.distributed_type != accelerate.DistributedType.DEEPSPEED:
+        return
+
+    ds_config = accelerator.deepspeed_plugin.hf_ds_config.config
+    current = ds_config.get("gradient_accumulation_steps", 1)
+    target = cfg.gradient_accumulation_steps
+    if current != target and accelerator.is_main_process:
+        logging.warning(
+            "Overriding DeepSpeed `gradient_accumulation_steps` (%s) with the value from "
+            "TrainPipelineConfig (%s). TrainPipelineConfig is the single source of truth; "
+            "the value in the Accelerate YAML is ignored.",
+            current,
+            target,
+        )
+    ds_config["gradient_accumulation_steps"] = target
+    accelerator.deepspeed_plugin.gradient_accumulation_steps = target
+
+
 @parser.wrap()
 def train(cfg: TrainPipelineConfig):
     cfg.validate()
@@ -158,16 +228,20 @@ def train(cfg: TrainPipelineConfig):
         "step_scheduler_with_optimizer": False,
         "split_batches": False,  # split_batches == True is not working anyways
         "kwargs_handlers": [DistributedDataParallelKwargs(find_unused_parameters=find_unused)],
+        "gradient_accumulation_steps": cfg.gradient_accumulation_steps,
     }
     if cfg.wandb.enable:
         accelerator_kwargs["log_with"] = "wandb"
-    if cfg.gradient_accumulation_steps > 1:
-        accelerator_kwargs["gradient_accumulation_steps"] = cfg.gradient_accumulation_steps
 
     accelerator = accelerate.Accelerator(**accelerator_kwargs)
     init_logging(accelerator, level=logging.DEBUG if cfg.debug else logging.INFO)
     # Register accelerator globally for use in other modules, (e.g., detect current rank, etc.)
     set_proc_accelerator(accelerator)
+
+    # Must run before `encode_accelerator_state_dict` + `init_trackers` below so the
+    # wandb-logged accelerator config and the value DeepSpeed consumes at prepare()
+    # time both reflect TrainPipelineConfig.
+    _sync_deepspeed_gradient_accumulation_steps(accelerator, cfg)
 
     # Strict guard for gradient_checkpointing: the pi05 custom forward loop
     # wraps layer bodies in torch.utils.checkpoint.checkpoint, which is only
@@ -212,18 +286,6 @@ def train(cfg: TrainPipelineConfig):
     if accelerator.is_main_process:
         accelerator_config = encode_accelerator_state_dict(accelerator.state.__dict__)
         logging.info(pformat(accelerator_config))
-
-        # Ensure `gradient_accumulation_steps` is consistent between TrainPipelineConfig and DeepSpeedConfig
-        if accelerator.distributed_type == accelerate.DistributedType.DEEPSPEED:
-            deepspeed_config, deepspeed_key = accelerator.deepspeed_plugin.hf_ds_config.find_config_node(
-                "gradient_accumulation_steps"
-            )
-            ds_grad_acc_steps = deepspeed_config.get(deepspeed_key, 1)
-            if ds_grad_acc_steps != cfg.gradient_accumulation_steps:
-                raise ValueError(
-                    "The `gradient_accumulation_steps` in TrainPipelineConfig does not match the value "
-                    f"specified in DeepSpeedConfig {cfg.gradient_accumulation_steps} != {ds_grad_acc_steps}. "  # nosec B608
-                )
 
         if cfg.wandb.enable:
             step = load_training_step(cfg.checkpoint_path) if cfg.resume else None
@@ -448,7 +510,6 @@ def train(cfg: TrainPipelineConfig):
                     initial_step=current_step,
                 )
 
-            agg_tracker = _make_val_tracker()
             per_dataset_trackers: dict[str, MetricsTracker] = {
                 name: _make_val_tracker() for name in per_dataset_val_dataloaders
             }
@@ -497,22 +558,13 @@ def train(cfg: TrainPipelineConfig):
                         )
 
                         if accelerator.is_main_process:
-                            for tracker in (ds_tracker, agg_tracker):
-                                tracker.loss = loss
-                                tracker.mse_loss = mse_loss
-                                tracker.ce_loss = ce_loss
-                                tracker.l1_loss = l1_loss
-                                tracker.accuracy = accuracy
+                            ds_tracker.loss = loss
+                            ds_tracker.mse_loss = mse_loss
+                            ds_tracker.ce_loss = ce_loss
+                            ds_tracker.l1_loss = l1_loss
+                            ds_tracker.accuracy = accuracy
 
             if accelerator.is_main_process:
-                logging.info(f"Validation/aggregate {agg_tracker}")
-                agg_dict = agg_tracker.to_dict(use_avg=True)
-                accelerator.log({"Validation/Loss": agg_dict["loss"]}, step=step)
-                accelerator.log({"Validation/MSE Loss": agg_dict["mse_loss"]}, step=step)
-                accelerator.log({"Validation/CE Loss": agg_dict["ce_loss"]}, step=step)
-                accelerator.log({"Validation/L1 Loss": agg_dict["l1_loss"]}, step=step)
-                accelerator.log({"Validation/Accuracy": agg_dict["accuracy"]}, step=step)
-
                 for ds_name, ds_tracker in per_dataset_trackers.items():
                     logging.info(f"Validation/{ds_name} {ds_tracker}")
                     ds_dict = ds_tracker.to_dict(use_avg=True)
@@ -521,6 +573,20 @@ def train(cfg: TrainPipelineConfig):
                     accelerator.log({f"Validation/{ds_name}/CE Loss": ds_dict["ce_loss"]}, step=step)
                     accelerator.log({f"Validation/{ds_name}/L1 Loss": ds_dict["l1_loss"]}, step=step)
                     accelerator.log({f"Validation/{ds_name}/Accuracy": ds_dict["accuracy"]}, step=step)
+
+                # Mixture-weighted aggregate across the per-dataset trackers, so the
+                # overall scalar reflects the training mixture rather than being
+                # implicitly dominated by whichever val subset has the most batches.
+                name_to_weight = dict(
+                    zip(val_dataset.dataset_names, val_dataset.dataset_weights, strict=True)
+                )
+                agg = _mixture_weighted_aggregate(per_dataset_trackers, name_to_weight)
+                logging.info(f"Validation/aggregate {agg}")
+                accelerator.log({"Validation/Loss": agg["loss"]}, step=step)
+                accelerator.log({"Validation/MSE Loss": agg["mse_loss"]}, step=step)
+                accelerator.log({"Validation/CE Loss": agg["ce_loss"]}, step=step)
+                accelerator.log({"Validation/L1 Loss": agg["l1_loss"]}, step=step)
+                accelerator.log({"Validation/Accuracy": agg["accuracy"]}, step=step)
 
             # This barrier is probably necessary to ensure
             # other processes wait for the main process to finish saving

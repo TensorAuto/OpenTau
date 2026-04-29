@@ -84,6 +84,7 @@ Example:
 import contextlib
 import copy
 import functools
+import json
 import logging
 import math
 import shutil
@@ -101,7 +102,7 @@ import torch.nn.functional as F  # noqa: N812
 import torch.utils
 from datasets import concatenate_datasets, load_dataset
 from einops import rearrange
-from huggingface_hub import HfApi, snapshot_download
+from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from huggingface_hub.constants import REPOCARD_NAME
 from huggingface_hub.errors import RevisionNotFoundError
 
@@ -209,6 +210,11 @@ def retry_random_on_failure(f):
 
 
 CODEBASE_VERSION = "v2.1"
+
+# Set of repo_ids for which we've already emitted the "missing control_mode" warning.
+# Keyed at module level so duplicates are suppressed across multiple LeRobotDataset
+# instances within a single process (e.g., train + val constructed for the same repo).
+_CONTROL_MODE_WARNED: set[str] = set()
 
 
 class DatasetMetadata:
@@ -438,6 +444,11 @@ class LeRobotDatasetMetadata(DatasetMetadata):
     def robot_type(self) -> str | None:
         """Robot type used in recording this dataset."""
         return self.info["robot_type"]
+
+    @property
+    def control_mode(self) -> str:
+        """Control-mode label from info.json. Defaults to 'unknown' when absent."""
+        return self.info.get("control_mode", "unknown")
 
     @property
     def fps(self) -> int:
@@ -809,8 +820,9 @@ class BaseDataset(torch.utils.data.Dataset):
         else:
             standard_item["obs_history_is_pad"] = torch.tensor([False], dtype=torch.bool)
 
-        # Emit optional keys (memory, next_memory, speed, mistake, quality, subgoalK)
-        # with their _is_pad siblings, applying training-time dropout rolls.
+        # Emit optional keys (memory, next_memory, speed, mistake, quality,
+        # robot_type, control_mode, subgoalK) with their _is_pad siblings,
+        # applying training-time dropout rolls.
         self._emit_optional_keys(item, standard_item)
 
         # cast all tensors in standard_item to bfloat16
@@ -825,9 +837,10 @@ class BaseDataset(torch.utils.data.Dataset):
 
         All emitted keys are always present (zero/empty-filled when absent or
         masked). Numeric / image keys come with a parallel ``{key}_is_pad``
-        bool; string keys (``response``, ``memory``, ``next_memory``) use the
-        empty string itself as the pad signal — a consumer seeing ``""`` can
-        assume the field was unavailable or was masked this step.
+        bool; string keys (``response``, ``memory``, ``next_memory``,
+        ``robot_type``, ``control_mode``) use the empty string itself as the
+        pad signal — a consumer seeing ``""`` can assume the field was
+        unavailable or was masked this step.
 
         Dropout order:
             1. ``history_state_drop_prob``: zero ``state`` and historical camera
@@ -836,9 +849,9 @@ class BaseDataset(torch.utils.data.Dataset):
                single ``subgoal_is_pad`` flag to True (subgoals are all-or-none).
             3. ``response_drop_prob``: only when subgoals were NOT dropped, mask
                ``response`` to the empty string.
-            4. ``metadata_drop_all_prob``: mask {speed, mistake, quality}
-               together. If this didn't fire, ``metadata_drop_each_prob`` rolls
-               independently for each of the three.
+            4. ``metadata_drop_all_prob``: mask {speed, mistake, quality,
+               robot_type, control_mode} together. If this didn't fire,
+               ``metadata_drop_each_prob`` rolls independently for each field.
 
         Dropout rolls use the default torch RNG (auto-seeded per worker).
 
@@ -909,7 +922,8 @@ class BaseDataset(torch.utils.data.Dataset):
         next_memory_raw = item.get("next_memory_raw")
         standard_item["next_memory"] = next_memory_raw if isinstance(next_memory_raw, str) else ""
 
-        # (5) Metadata drops.
+        # (5) Metadata drops: numeric fields get a _is_pad flag; string
+        # identifier fields use "" as the pad signal (no separate flag).
         drop_meta_all = _roll(self.metadata_drop_all_prob)
         for key, dtype in (("speed", torch.long), ("mistake", torch.bool), ("quality", torch.long)):
             raw_key = f"{key}_raw"
@@ -923,6 +937,10 @@ class BaseDataset(torch.utils.data.Dataset):
                 value = bool(raw) if dtype is torch.bool else int(raw)
                 standard_item[key] = torch.tensor(value, dtype=dtype)
                 standard_item[f"{key}_is_pad"] = torch.tensor(False)
+        for key in ("robot_type", "control_mode"):
+            val = self.meta.info.get(key) or ""
+            drop_this = drop_meta_all or _roll(self.metadata_drop_each_prob)
+            standard_item[key] = "" if drop_this else val
 
     def resize_with_pad(self, img, width, height, pad_value=0) -> torch.Tensor:
         """Resize an image to target dimensions with padding.
@@ -1232,6 +1250,59 @@ class LeRobotDataset(BaseDataset):
         self.meta = LeRobotDatasetMetadata(
             self.repo_id, self.root, self.revision, force_cache_sync=force_cache_sync
         )
+
+        # Overlay setup: when info.json declares a `videos.source_repo`, all video
+        # reads are routed to that upstream repo. Fetch its info.json once (for
+        # the path template + chunks_size) and cache under the canonical
+        # HF_OPENTAU_HOME/<source_repo> location, so a future vanilla load of the
+        # source repo reuses the same files. Must run before get_episodes_file_paths().
+        self._overlay: dict | None = None
+        videos_meta = self.meta.info.get("videos") or {}
+        if videos_meta.get("source_repo"):
+            src_repo = videos_meta["source_repo"]
+            src_revision = videos_meta.get("source_revision")
+            src_root = HF_OPENTAU_HOME / src_repo
+            src_info_path = src_root / INFO_PATH
+            if not src_info_path.is_file():
+                acc = get_proc_accelerator()
+                if acc is not None and acc.num_processes > 1:
+                    if acc.is_main_process:
+                        src_info_path.parent.mkdir(exist_ok=True, parents=True)
+                        hf_hub_download(
+                            repo_id=src_repo,
+                            filename=INFO_PATH,
+                            repo_type="dataset",
+                            revision=src_revision,
+                            local_dir=src_root,
+                        )
+                    acc.wait_for_everyone()
+                else:
+                    src_info_path.parent.mkdir(exist_ok=True, parents=True)
+                    hf_hub_download(
+                        repo_id=src_repo,
+                        filename=INFO_PATH,
+                        repo_type="dataset",
+                        revision=src_revision,
+                        local_dir=src_root,
+                    )
+            src_info = json.loads(src_info_path.read_text())
+            self._overlay = {
+                "source_repo": src_repo,
+                "source_revision": src_revision,
+                "source_root": src_root,
+                "video_path": src_info["video_path"],
+                "chunks_size": src_info["chunks_size"],
+            }
+
+        self.control_mode = self.meta.control_mode
+        if "control_mode" not in self.meta.info and self.repo_id not in _CONTROL_MODE_WARNED:
+            _CONTROL_MODE_WARNED.add(self.repo_id)
+            logging.warning(
+                "Dataset %r has no `control_mode` field in meta/info.json; defaulting to 'unknown'. "
+                "Please add `control_mode` ∈ {'joint', 'ee', 'mixed'} to keep the mixture sampler honest.",
+                self.repo_id,
+            )
+
         if self.episodes is not None and self.meta._version >= packaging.version.parse("v2.1"):
             episodes_stats = [self.meta.episodes_stats[ep_idx] for ep_idx in self.episodes]
             self.stats = aggregate_stats(episodes_stats)
@@ -1400,7 +1471,9 @@ class LeRobotDataset(BaseDataset):
         """
         episodes = self.episodes if self.episodes is not None else list(range(self.meta.total_episodes))
         fpaths = [str(self.meta.get_data_file_path(ep_idx)) for ep_idx in episodes]
-        if len(self.meta.video_keys) > 0:
+        # Overlay repos don't carry videos themselves — those are pulled lazily
+        # from the source repo by _resolve_video_path on first access.
+        if len(self.meta.video_keys) > 0 and self._overlay is None:
             video_files = [
                 str(self.meta.get_video_file_path(ep_idx, vid_key))
                 for vid_key in self.meta.video_keys
@@ -1594,6 +1667,34 @@ class LeRobotDataset(BaseDataset):
             if key not in self.meta.video_keys
         }
 
+    def _resolve_video_path(self, ep_idx: int, vid_key: str) -> Path:
+        """Resolve the on-disk video file path for a given episode + video key.
+
+        For vanilla datasets, returns the local-layout path under ``self.root``.
+        For overlay datasets, formats the source repo's ``video_path`` template
+        (using ``original_episode_index`` from ``meta/episodes.jsonl`` when
+        present, else the dense ``ep_idx``) and lazily downloads the file from
+        the source repo into ``HF_OPENTAU_HOME/<source_repo>/videos/...`` so
+        the cache is shared with future vanilla loads of the source repo.
+        """
+        if self._overlay is None:
+            return self.root / self.meta.get_video_file_path(ep_idx, vid_key)
+
+        src_ep = self.meta.episodes[ep_idx].get("original_episode_index", ep_idx)
+        ovl = self._overlay
+        chunk = src_ep // ovl["chunks_size"]
+        filename = ovl["video_path"].format(episode_chunk=chunk, video_key=vid_key, episode_index=src_ep)
+        local_path = ovl["source_root"] / filename
+        if not local_path.is_file():
+            hf_hub_download(
+                repo_id=ovl["source_repo"],
+                filename=filename,
+                repo_type="dataset",
+                revision=ovl["source_revision"],
+                local_dir=ovl["source_root"],
+            )
+        return local_path
+
     def _query_videos(self, query_timestamps: dict[str, np.ndarray], ep_idx: int) -> dict[str, torch.Tensor]:
         """Note: When using data workers (e.g. DataLoader with num_workers>0), do not call this function
         in the main process (e.g. by using a second Dataloader with num_workers=0). It will result in a
@@ -1602,7 +1703,7 @@ class LeRobotDataset(BaseDataset):
         """
         item = {}
         for vid_key, query_ts in query_timestamps.items():
-            video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
+            video_path = self._resolve_video_path(ep_idx, vid_key)
             frame_indices_soft = query_ts * self.fps
             if self.image_resample_strategy == "linear":
                 frame_indices_floor = np.floor(frame_indices_soft).astype(int)
