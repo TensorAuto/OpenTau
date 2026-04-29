@@ -22,9 +22,7 @@ Insulation gradient-stop) but upgrades the backbone to Gemma 3 4B with 448×448
 vision and a larger action expert.
 """
 
-import logging
 from dataclasses import dataclass, field
-from typing import Literal
 
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
@@ -64,8 +62,6 @@ class PI06Config(PreTrainedConfig):
         dropout: Dropout rate. Defaults to 0.1.
         num_steps: Number of flow matching denoising steps. Defaults to 5
             (halved from π0.5's 10, giving ~63 ms per chunk on an H100).
-        init_strategy: One of "no_init", "full_he_init", "expert_only_he_init".
-            Defaults to "full_he_init".
         attention_implementation: "eager" or "fa2". Defaults to "eager".
         freeze_vision_encoder: Whether to freeze the vision encoder. Defaults to True.
         train_expert_only: Whether to train only the expert module. Defaults to False.
@@ -125,9 +121,6 @@ class PI06Config(PreTrainedConfig):
     # Real Time Inference: maximum number of frozen actions.
     max_delay: int = 0
 
-    # Initialization strategy
-    init_strategy: Literal["no_init", "full_he_init", "expert_only_he_init"] = "full_he_init"
-
     # Attention implementation
     attention_implementation: str = "eager"
 
@@ -158,28 +151,6 @@ class PI06Config(PreTrainedConfig):
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
-
-        assert self.init_strategy in ["no_init", "full_he_init", "expert_only_he_init"], (
-            f"Invalid init strategy: {self.init_strategy} must be one of ['no_init', 'full_he_init', 'expert_only_he_init']"
-        )
-
-        # Official π0.6 weights have not been released at the time of writing; the
-        # guards below mirror pi05's so the machinery is ready when they do ship.
-        if self.init_strategy == "expert_only_he_init" and self.pretrained_path in (
-            "physical-intelligence/pi06",
-            "lerobot/pi06",
-        ):
-            raise ValueError(
-                "You cannot load pretrained π0.6 weights when init_strategy is 'expert_only_he_init' "
-                "due to differences in the Gemma 3 tokenizer vocabulary."
-            )
-
-        if self.pretrained_path is not None and self.pretrained_path not in (
-            "physical-intelligence/pi06",
-            "lerobot/pi06",
-        ):
-            logging.info("Setting init_strategy to 'no_init' because we are resuming from a checkpoint.")
-            self.init_strategy = "no_init"
 
         if self.max_delay > self.chunk_size:
             raise ValueError(
