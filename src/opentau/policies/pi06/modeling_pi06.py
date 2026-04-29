@@ -731,6 +731,7 @@ class PI06FlowMatching(nn.Module):
             load_pretrained_gemma3=load_pretrained_gemma3,
             discrete_action_vocab_size=discrete_action_vocab_size,
             dropout=self.config.dropout,
+            gradient_checkpointing=self.config.gradient_checkpointing,
         )
         self.gemma3_with_expert = Gemma3WithExpertModel(gemma3_with_expert_config)
 

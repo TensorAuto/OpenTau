@@ -208,7 +208,17 @@ class TestGemma3WithExpertConfig:
 
     def test_bad_attention_implementation_raises(self):
         with pytest.raises(ValueError, match="attention_implementation"):
-            Gemma3WithExpertConfig(discrete_action_vocab_size=2048, attention_implementation="sdpa")
+            Gemma3WithExpertConfig(discrete_action_vocab_size=2048, attention_implementation="garbage")
+
+    def test_sdpa_attention_implementation_accepted(self):
+        cfg = Gemma3WithExpertConfig(discrete_action_vocab_size=2048, attention_implementation="sdpa")
+        assert cfg.attention_implementation == "sdpa"
+
+    def test_fa2_falls_back_to_eager_with_warning(self, caplog):
+        with caplog.at_level("WARNING"):
+            cfg = Gemma3WithExpertConfig(discrete_action_vocab_size=2048, attention_implementation="fa2")
+        assert cfg.attention_implementation == "fa2"
+        assert any("falling back to 'eager'" in record.message for record in caplog.records)
 
     def test_vision_image_size_matches_input_resolution(self):
         # Regression: Gemma 3's `Gemma3MultiModalProjector` hardcodes
@@ -476,6 +486,139 @@ class TestNoSlidingWindowEnforcement:
         assert torch.equal(captured_masks[1], attention_mask), (
             "global layer mask differs from input — something is mutating it"
         )
+
+
+# SDPA / gradient-checkpointing equivalence — eager vs sdpa forward outputs
+# match within a tight tolerance, and gradient_checkpointing=True produces
+# the same forward output as =False.
+
+
+class TestPi06AttentionDispatcher:
+    def test_dispatcher_returns_sdpa_for_sdpa_impl(self, monkeypatch):
+        monkeypatch.setattr(g3we, "_preferred_dtype", lambda: torch.float32)
+        _, cfg, _ = _make_tiny_g3we_model()
+        cfg.attention_implementation = "sdpa"
+        model = Gemma3WithExpertModel(cfg)
+        assert model.get_attention_interface() == model.sdpa_attention_forward
+
+    def test_dispatcher_returns_eager_for_eager_impl(self, monkeypatch):
+        monkeypatch.setattr(g3we, "_preferred_dtype", lambda: torch.float32)
+        _, cfg, _ = _make_tiny_g3we_model()
+        cfg.attention_implementation = "eager"
+        model = Gemma3WithExpertModel(cfg)
+        assert model.get_attention_interface() == model.eager_attention_forward
+
+    def test_dispatcher_falls_back_to_eager_for_fa2(self, monkeypatch):
+        monkeypatch.setattr(g3we, "_preferred_dtype", lambda: torch.float32)
+        _, cfg, _ = _make_tiny_g3we_model()
+        cfg.attention_implementation = "fa2"
+        model = Gemma3WithExpertModel(cfg)
+        # The dispatch falls back to eager (no NotImplementedError as before).
+        assert model.get_attention_interface() == model.eager_attention_forward
+
+
+class TestPi06SdpaEquivalence:
+    def test_eager_vs_sdpa_outputs_close(self, monkeypatch):
+        monkeypatch.setattr(g3we, "_preferred_dtype", lambda: torch.float32)
+        _, cfg, _ = _make_tiny_g3we_model()
+        cfg.attention_implementation = "eager"
+
+        torch.manual_seed(0)
+        model_eager = Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+
+        # Re-construct with same seed for an identical-weights SDPA copy.
+        cfg_sdpa = type(cfg).from_dict(cfg.to_dict())
+        cfg_sdpa.attention_implementation = "sdpa"
+        torch.manual_seed(0)
+        model_sdpa = Gemma3WithExpertModel(cfg_sdpa).to(dtype=torch.float32)
+        # Mirror weights so the only delta is the attention math.
+        model_sdpa.load_state_dict(model_eager.state_dict(), strict=True)
+
+        model_eager.eval()
+        model_sdpa.eval()
+
+        batch, seq_len = 1, 4
+        hidden_backbone = torch.randn(batch, seq_len, cfg.gemma3_config.text_config.hidden_size)
+        position_ids = torch.arange(seq_len)[None, :]
+        attention_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool))[None]
+
+        out_eager, _ = model_eager(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=[hidden_backbone, None],
+            n_cross_att_tokens=seq_len,
+            use_cache=False,
+            fill_kv_cache=True,
+        )
+        out_sdpa, _ = model_sdpa(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=[hidden_backbone, None],
+            n_cross_att_tokens=seq_len,
+            use_cache=False,
+            fill_kv_cache=True,
+        )
+
+        assert out_eager[0] is not None and out_sdpa[0] is not None
+        # Eager upcasts QK to fp32; SDPA does fp32 accumulation in softmax
+        # internally. Numerical match is tight in fp32.
+        assert torch.allclose(out_eager[0], out_sdpa[0], atol=1e-4, rtol=1e-4)
+
+
+class TestPi06GradCkptEquivalence:
+    def test_grad_ckpt_forward_matches_no_ckpt(self, monkeypatch):
+        """gradient_checkpointing=True should not change the forward output —
+        it only trades activation memory for recompute. Locks in that
+        ``_run_layer`` extraction is bit-identical to the original inlined
+        loop body.
+        """
+        monkeypatch.setattr(g3we, "_preferred_dtype", lambda: torch.float32)
+        _, cfg, _ = _make_tiny_g3we_model()
+        # dropout=0 + eval mode would bypass the checkpoint wrap entirely
+        # (use_ckpt = self.training and config.gradient_checkpointing); we
+        # need train mode to actually exercise the checkpoint path. Set
+        # dropout=0 on the engine config so train-mode forward is still
+        # deterministic.
+        cfg.dropout = 0.0
+
+        torch.manual_seed(0)
+        model_no_ckpt = Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+        model_no_ckpt.train()
+
+        cfg_ckpt = type(cfg).from_dict(cfg.to_dict())
+        cfg_ckpt.gradient_checkpointing = True
+        torch.manual_seed(0)
+        model_ckpt = Gemma3WithExpertModel(cfg_ckpt).to(dtype=torch.float32)
+        model_ckpt.load_state_dict(model_no_ckpt.state_dict(), strict=True)
+        model_ckpt.train()
+
+        batch, seq_len = 1, 4
+        hidden_backbone = torch.randn(batch, seq_len, cfg.gemma3_config.text_config.hidden_size)
+        position_ids = torch.arange(seq_len)[None, :]
+        attention_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool))[None]
+
+        out_a, _ = model_no_ckpt(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=[hidden_backbone, None],
+            n_cross_att_tokens=seq_len,
+            use_cache=False,
+            fill_kv_cache=True,
+        )
+        out_b, _ = model_ckpt(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=[hidden_backbone, None],
+            n_cross_att_tokens=seq_len,
+            use_cache=False,
+            fill_kv_cache=True,
+        )
+
+        assert out_a[0] is not None and out_b[0] is not None
+        # Forward output should be IDENTICAL: ckpt only re-runs forward in
+        # backward, doesn't change the forward numerics. Allow tiny rtol
+        # for any non-deterministic reductions in dropout-disabled mode.
+        assert torch.allclose(out_a[0], out_b[0], atol=1e-6, rtol=1e-6)
 
 
 # End-to-end integration — guarded because Gemma 3 4B is huge.
