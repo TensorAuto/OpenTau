@@ -39,6 +39,7 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           claude_args: |
+            --model ${{ vars.CLAUDE_MODEL || 'claude-opus-4-7[1m]' }}
             --permission-mode bypassPermissions
           prompt: |
             Review the comments on this merged PR. If any reviewer feedback

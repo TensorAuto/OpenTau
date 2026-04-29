@@ -100,6 +100,7 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           claude_args: |
+            --model ${{ vars.CLAUDE_MODEL || 'claude-opus-4-7[1m]' }}
             --permission-mode bypassPermissions
           prompt: |
             A reviewer asked you to address review feedback on this PR.
@@ -111,16 +112,33 @@ jobs:
             2. For each actionable comment containing `@claude fix`, implement
                the fix on the PR's branch.
             3. Skip comments that are questions, taste preferences, or already addressed.
-            4. Run the test command from CLAUDE.md before pushing.
+            4. Decide whether to run tests:
+               - If the diff is purely documentation, comments, formatting,
+                 string-literal text, or otherwise CANNOT change runtime behavior,
+                 you MAY skip tests. Be honest about confidence — when in doubt, run.
+                 If you skip, the commit body MUST contain a line of the form:
+                     tests: skipped — <one-sentence reason>
+               - Otherwise (changes touching imports, function bodies, control
+                 flow, types, configs read at runtime, dependencies, or build
+                 manifests): run `pytest -m "not gpu" -n auto`. Scope to the
+                 changed subtree where possible (e.g. `pytest tests/policies/test_pi05.py`
+                 for a pi05 change) to keep the run fast. The commit body MUST contain:
+                     tests: passed — <exact command run>
+                 If tests fail: do NOT push; reply on the relevant PR comment
+                 explaining the failure and stop.
             5. Make ONE commit at the end of the session that addresses every
                comment you decided to act on — do NOT push one commit per
                comment. Subject line (must be < 80 chars per CLAUDE.md):
 
                    [claude-fix] address review feedback on #${{ github.event.issue.number || github.event.pull_request.number }}
 
-               Commit body: a bulleted list, one bullet per addressed comment:
+               Commit body: a bulleted list, one bullet per addressed comment,
+               followed by the `tests:` line from step 4:
 
                    - addresses @<reviewer> (<short topic>): <what you changed>
+                   ...
+                   tests: passed — pytest -m "not gpu" tests/policies/test_pi05.py
+                   (or: tests: skipped — comment-only change, no runtime impact)
 
                Then push the single commit to the PR branch.
             6. Reply individually to each addressed comment on the PR with
