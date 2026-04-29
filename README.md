@@ -29,6 +29,7 @@ Whether you use the official OpenPi codebase or LeRobot’s reimplementation, yo
 - Discrete actions for fast VLM convergence in $\pi_{0.5}$
 - Knowledge insulation between the VLM backbone and the action expert
 - Dropout in the VLM to reduce overfitting
+- Authentic $\pi_{0.6}$ policy with a Gemma 3 4B backbone, 448×448 vision, and 5-step flow matching
 - A reinforcement learning pipeline described in $\pi^*_{0.6}$
 - And more...
 
@@ -48,6 +49,7 @@ OpenTau ($\tau$) is a tool developed by *[Tensor][1]* to bridge this gap, and we
 |    Drop-in Training Profiler & Unused-Param Auditor      |            ❌            |                ❌                 |      ✅      |
 |    $\pi^{*}_{0.6}$ style Reinforcement Learning Pipeline |            ❌            |                ❌                 |      ✅      |
 |                               Post-training on Human Data|            ❌            |                ❌                 |      ✅      |
+|            Authentic $\pi_{0.6}$ Policy (Gemma 3 4B backbone, 448×448 vision) |       ❌            |                ❌                 |      ✅      |
 |                                                Framework |      Jax / PyTorch       |             PyTorch               |   PyTorch    |
 
 ## Quick Start
@@ -59,6 +61,8 @@ We provide a [quick start guide](https://opentau.readthedocs.io/en/latest/gettin
 For using local notebooks to train and evaluate models, find the notebooks at [notebooks/pi05_training.ipynb](https://github.com/TensorAuto/OpenTau/blob/main/notebooks/pi05_training.ipynb) and [notebooks/pi05_evaluation_only.ipynb](https://github.com/TensorAuto/OpenTau/blob/main/notebooks/pi05_evaluation_only.ipynb).
 
 For using the Google Colab notebooks to train and evaluate models, find the colab notebooks here: [pi05_training](https://colab.research.google.com/drive/1DeU0lNnEzs1KHo0Nkgh4YKBr-xu9moBM?usp=sharing) and [pi05_evaluation_only](https://colab.research.google.com/drive/1U_AyuH9WYMT4anEWvsOtIT7g01jA0WGm?usp=sharing) respectively.
+
+To spin up a $\pi_{0.6}$ training run, start from [configs/examples/pi06_training_config.json](https://github.com/TensorAuto/OpenTau/blob/main/configs/examples/pi06_training_config.json). The policy is selected by setting `"type": "pi06"` and differs from $\pi_{0.5}$ in its Gemma 3 4B backbone, 448×448 image resolution, ~860M-parameter action expert, and 5-step flow-matching default.
 
 ## Training Diagnostics
 
@@ -93,6 +97,7 @@ We provide fully functioning $\pi_{0.5}$ checkpoints trained with high success r
 | [TensorAuto/moka_pot_libero_sft][6] <br> [TensorAuto/moka_pot_RECAP_R0][7] <br> [TensorAuto/moka_pot_RECAP_R1][8]   | A $\pi_{0}$ RECAP model checkpoint trained on moka pot task on libero. | 83% <br> 89% <br> 90%                                                             |
 | [TensorAuto/tPi0.5-libero][2] | A $\pi_{0.5}$ model checkpoint trained on the LIBERO dataset with discrete actions and knowledge insulation.  | 98.4% (10) <br> 97.6% (Goal) <br> 100% (Object) <br> 98% (Spatial) |
 | [TensorAuto/pi05_base][5]     | A $\pi_{0.5}$ model checkpoint converted from the official openpi checkpoint, with language embeddings added. | N/A                                                                |
+| $\pi_{0.6}$ checkpoints       | Coming soon — the `pi06` policy is implemented and ready to train from scratch; first TensorAuto-published checkpoint will appear here once released. | N/A |
 | More coming soon...           |                                                                                                               |                                                                    |
 
 ## Acknowledgements

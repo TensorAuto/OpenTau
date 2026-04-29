@@ -11,14 +11,3 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-PI05 Mem Policy Module.
-
-This module implements a variant of the π05 (Pi05) Vision-Language-Action Flow
-Model with the low-level memory architecture from Torne, Pertsch, Walke et al.
-"MEM: Multi-Scale Embodied Memory for Vision Language Action Models". The
-SigLIP image encoder is extended with space-time separable attention every
-N-th layer so past frames can inform the current-frame tokens without
-introducing new learnable parameters, and temporal state sequences are
-projected into one continuous token per timestep for the Gemma backbone.
-"""

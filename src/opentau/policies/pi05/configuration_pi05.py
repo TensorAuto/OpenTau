@@ -21,6 +21,7 @@ optimization, scheduling, and data processing.
 """
 
 import logging
+import warnings
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -94,6 +95,10 @@ class PI05Config(PreTrainedConfig):
     max_action_dim: int = 32
     predict_response: bool = False
 
+    # "discrete" encodes state as binned text tokens in the language prompt;
+    # "continuous" projects the raw state vector into VLM embedding space.
+    state_type: Literal["discrete", "continuous"] = "discrete"
+
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (224, 224)
 
@@ -103,6 +108,10 @@ class PI05Config(PreTrainedConfig):
 
     # Language Tokenizer
     prompt_max_length: int = 256
+
+    # Maximum length of the indicator tokens
+    response_indicator_max_length: int = 3
+    discrete_action_indicator_max_length: int = 3
 
     # Response Tokenizer
     response_max_length: int = 52
@@ -182,6 +191,9 @@ class PI05Config(PreTrainedConfig):
             logging.info("Setting init_strategy to 'no_init' because we are resuming from a checkpoint.")
             self.init_strategy = "no_init"
 
+        if self.state_type not in ("discrete", "continuous"):
+            raise ValueError(f"state_type must be 'discrete' or 'continuous', got '{self.state_type}'")
+
         if self.max_delay > self.chunk_size:
             raise ValueError(
                 f"The max delay must be less than or equal to the chunk size. Got {self.max_delay} for `max_delay` and {self.chunk_size} for `chunk_size`."
@@ -254,3 +266,19 @@ class PI05Config(PreTrainedConfig):
             None: As reward deltas are not used.
         """
         return None
+
+
+@PreTrainedConfig.register_subclass("pi05_continuous_state")
+@dataclass
+class PI05ContinuousStateConfig(PI05Config):
+    """Deprecated: use ``PI05Config(state_type="continuous")`` instead."""
+
+    state_type: Literal["discrete", "continuous"] = "continuous"
+
+    def __post_init__(self):
+        warnings.warn(
+            "PI05ContinuousStateConfig is deprecated. Use PI05Config with state_type='continuous' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        super().__post_init__()
