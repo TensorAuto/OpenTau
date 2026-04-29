@@ -19,6 +19,13 @@ on:
     types: [created]
   pull_request_review_comment:
     types: [created]
+  # GitHub does NOT fire pull_request_review_comment.created for line comments
+  # bundled into a submitted review — only for standalone replies via the
+  # inline "Reply" button. Listening to pull_request_review.submitted catches
+  # the bundled-line-comment case (e.g. "Add review" → "Submit review" with
+  # @claude fix in a line comment and an empty review body).
+  pull_request_review:
+    types: [submitted]
 
 # Serialize implement-fix runs against the same PR so two rapid `@claude fix`
 # comments don't race on the PR branch.
@@ -28,10 +35,22 @@ concurrency:
 
 jobs:
   implement:
-    if: |
-      (github.event.issue.pull_request || github.event.pull_request) &&
-      contains(github.event.comment.body, '@claude fix') &&
-      github.event.comment.user.type != 'Bot'
+    if: >-
+      (
+        github.event_name == 'issue_comment'
+        && github.event.issue.pull_request != null
+        && contains(github.event.comment.body, '@claude fix')
+        && github.event.comment.user.type != 'Bot'
+      )
+      || (
+        github.event_name == 'pull_request_review_comment'
+        && contains(github.event.comment.body, '@claude fix')
+        && github.event.comment.user.type != 'Bot'
+      )
+      || (
+        github.event_name == 'pull_request_review'
+        && github.event.review.user.type != 'Bot'
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -40,19 +59,57 @@ jobs:
       issues: write
       id-token: write  # claude-code-action does an OIDC handshake at startup
     steps:
+      # For pull_request_review.submitted, scan the review's line comments
+      # (which the event payload does not include) for the trigger phrase.
+      # If absent, exit before paying for a Claude run. For comment events,
+      # the if: above already filtered on body, so this step is a no-op.
+      - name: Gate on @claude fix presence
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Untrusted user input — never interpolate directly into shell.
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REVIEW_ID: ${{ github.event.review.id }}
+          REVIEW_BODY: ${{ github.event.review.body }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" != "pull_request_review" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          LINE_BODIES=$(gh api \
+            "/repos/${REPO}/pulls/${PR_NUMBER}/reviews/${REVIEW_ID}/comments" \
+            --jq 'map(.body) | join("\n---\n")')
+          if printf '%s\n%s\n' "$REVIEW_BODY" "$LINE_BODIES" | grep -qF '@claude fix'; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No '@claude fix' found in submitted review (body or any line comment); skipping."
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.gate.outputs.should_run == 'true'
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - uses: anthropics/claude-code-action@v1
+        if: steps.gate.outputs.should_run == 'true'
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: |
+            --permission-mode bypassPermissions
           prompt: |
             A reviewer asked you to address review feedback on this PR.
 
             1. Read all review comments on the PR (resolved and unresolved).
-            2. For each actionable comment, implement the fix on the PR's branch.
+               Some line comments may have been bundled into a submitted review
+               — fetch them with:
+                   gh api /repos/${{ github.repository }}/pulls/${{ github.event.issue.number || github.event.pull_request.number }}/reviews/<review_id>/comments
+            2. For each actionable comment containing `@claude fix`, implement
+               the fix on the PR's branch.
             3. Skip comments that are questions, taste preferences, or already addressed.
             4. Run the test command from CLAUDE.md before pushing.
             5. Make ONE commit at the end of the session that addresses every
