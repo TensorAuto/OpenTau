@@ -824,6 +824,12 @@ class BaseDataset(torch.utils.data.Dataset):
         # with their _is_pad siblings, applying training-time dropout rolls.
         self._emit_optional_keys(item, standard_item)
 
+        # Dataset-level identifiers, surfaced per-sample so policies/collators
+        # can read them uniformly. "" signals "field absent in meta/info.json"
+        # (same convention as response / memory / next_memory).
+        standard_item["robot_type"] = self.meta.info.get("robot_type") or ""
+        standard_item["control_mode"] = self.meta.info.get("control_mode") or ""
+
         # cast all tensors in standard_item to bfloat16
         for key, value in standard_item.items():
             if isinstance(value, torch.Tensor) and value.dtype.is_floating_point:
