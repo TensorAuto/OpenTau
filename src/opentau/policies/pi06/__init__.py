@@ -12,9 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-PI05 Continuous State Policy Module.
+PI06 Policy Module.
 
-This module implements a variant of the π05 (Pi05) Vision-Language-Action Flow Model
-that uses continuous state embeddings projected directly into the VLM embedding space,
-rather than discretizing the state into text tokens. Response prediction has been removed.
+This module implements the π06 (Pi06) Vision-Language-Action model from
+Physical Intelligence. Relative to π05, π06 swaps the PaliGemma-3B vision-language
+backbone for a Gemma-3 4B multimodal backbone, enlarges the action expert to
+~860M parameters (matching the backbone depth), raises the default image
+resolution from 224×224 to 448×448, and cuts the flow-matching denoising
+schedule from 10 to 5 steps.
+
+References:
+    - π0.6 Model Card, Physical Intelligence, November 17, 2025.
+    - π*0.6: a VLA That Learns From Experience, arXiv:2511.14759.
 """

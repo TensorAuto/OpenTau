@@ -38,6 +38,7 @@ from opentau.datasets.utils import cycle
 from opentau.envs.factory import make_envs
 from opentau.envs.utils import close_envs
 from opentau.optim.factory import make_optimizer_and_scheduler
+from opentau.optim.master_weights import MasterWeightOptimizer
 from opentau.policies.factory import make_policy
 from opentau.policies.pretrained import PreTrainedPolicy
 from opentau.scripts.eval import consolidate_eval_info, eval_policy_all
@@ -81,7 +82,19 @@ def update_policy(
     accelerator.unscale_gradients(optimizer=optimizer)
 
     if accelerator.sync_gradients:
-        grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+        # When the optimizer is wrapped in ``MasterWeightOptimizer`` (the
+        # DDP / single / FSDP path; see issue #181), gradients live in bf16
+        # on the live params and have not yet been upcast to the fp32 masters.
+        # Calling ``MasterWeightOptimizer.clip_grad_norm_`` performs the
+        # bf16 -> fp32 upcast and clips on the fp32 master grads, so the
+        # subsequent ``optimizer.step`` reads from the clipped fp32 grads.
+        # Under DeepSpeed the inner BF16_Optimizer clips internally, so we
+        # use ``accelerator.clip_grad_norm_`` there.
+        inner_opt = getattr(optimizer, "optimizer", optimizer)
+        if isinstance(inner_opt, MasterWeightOptimizer):
+            grad_norm = inner_opt.clip_grad_norm_(grad_clip_norm)
+        else:
+            grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
         if accelerator.is_main_process:
             train_metrics.grad_norm = grad_norm
 
@@ -119,6 +132,47 @@ def update_policy(
     return train_metrics
 
 
+_VAL_METRIC_KEYS: tuple[str, ...] = ("loss", "mse_loss", "ce_loss", "l1_loss", "accuracy")
+
+
+def _mixture_weighted_aggregate(
+    per_dataset_trackers: dict[str, MetricsTracker],
+    name_to_weight: dict[str, float],
+    metric_keys: tuple[str, ...] = _VAL_METRIC_KEYS,
+) -> dict[str, float]:
+    """Mixture-weighted average of per-dataset validation metrics.
+
+    Weights are taken from ``name_to_weight`` and renormalized over only the
+    names present in ``per_dataset_trackers`` (empty datasets are skipped
+    upstream by ``WeightedDatasetMixture.get_per_dataset_dataloaders`` and so
+    will be missing from the trackers). When the renormalization total is 0
+    -- empty trackers, or all selected datasets have weight 0 -- every metric
+    is returned as ``0.0``.
+
+    Args:
+        per_dataset_trackers: One ``MetricsTracker`` per non-empty validation
+            dataset, keyed by dataset name.
+        name_to_weight: Mapping from dataset name to its mixture weight (need
+            not be normalized; need not be a strict subset/superset of the
+            tracker keys, but must contain every tracker key).
+        metric_keys: The metric attribute names to aggregate.
+
+    Returns:
+        Dict mapping each ``metric_keys`` entry to its weighted average.
+    """
+    weights = {name: name_to_weight[name] for name in per_dataset_trackers}
+    total = sum(weights.values())
+    if total <= 0:
+        return dict.fromkeys(metric_keys, 0.0)
+
+    per_dataset_dicts = {
+        name: tracker.to_dict(use_avg=True) for name, tracker in per_dataset_trackers.items()
+    }
+    return {
+        k: sum((w / total) * per_dataset_dicts[name][k] for name, w in weights.items()) for k in metric_keys
+    }
+
+
 def _find_unused_params_from_env() -> bool:
     """Parse the ``FIND_UNUSED_PARAMS`` env var into a bool.
 
@@ -137,6 +191,35 @@ def _find_unused_params_from_env() -> bool:
     return os.environ.get("FIND_UNUSED_PARAMS", "true").lower() == "true"
 
 
+def _sync_deepspeed_gradient_accumulation_steps(
+    accelerator: accelerate.Accelerator, cfg: TrainPipelineConfig
+) -> None:
+    """Make TrainPipelineConfig the single source of truth for gradient_accumulation_steps.
+
+    When DeepSpeed is the distributed backend, the value declared in the Accelerate YAML's
+    `deepspeed_config.gradient_accumulation_steps` is forcibly overridden to match
+    `cfg.gradient_accumulation_steps`. Must be called on all ranks and before
+    `accelerator.prepare(...)`, because `_prepare_deepspeed` reads this value from
+    `hf_ds_config.config` on every rank at prepare time.
+    """
+    if accelerator.distributed_type != accelerate.DistributedType.DEEPSPEED:
+        return
+
+    ds_config = accelerator.deepspeed_plugin.hf_ds_config.config
+    current = ds_config.get("gradient_accumulation_steps", 1)
+    target = cfg.gradient_accumulation_steps
+    if current != target and accelerator.is_main_process:
+        logging.warning(
+            "Overriding DeepSpeed `gradient_accumulation_steps` (%s) with the value from "
+            "TrainPipelineConfig (%s). TrainPipelineConfig is the single source of truth; "
+            "the value in the Accelerate YAML is ignored.",
+            current,
+            target,
+        )
+    ds_config["gradient_accumulation_steps"] = target
+    accelerator.deepspeed_plugin.gradient_accumulation_steps = target
+
+
 @parser.wrap()
 def train(cfg: TrainPipelineConfig):
     cfg.validate()
@@ -146,34 +229,64 @@ def train(cfg: TrainPipelineConfig):
         "step_scheduler_with_optimizer": False,
         "split_batches": False,  # split_batches == True is not working anyways
         "kwargs_handlers": [DistributedDataParallelKwargs(find_unused_parameters=find_unused)],
+        "gradient_accumulation_steps": cfg.gradient_accumulation_steps,
     }
     if cfg.wandb.enable:
         accelerator_kwargs["log_with"] = "wandb"
-    if cfg.gradient_accumulation_steps > 1:
-        accelerator_kwargs["gradient_accumulation_steps"] = cfg.gradient_accumulation_steps
 
     accelerator = accelerate.Accelerator(**accelerator_kwargs)
     init_logging(accelerator, level=logging.DEBUG if cfg.debug else logging.INFO)
     # Register accelerator globally for use in other modules, (e.g., detect current rank, etc.)
     set_proc_accelerator(accelerator)
 
+    # Must run before `encode_accelerator_state_dict` + `init_trackers` below so the
+    # wandb-logged accelerator config and the value DeepSpeed consumes at prepare()
+    # time both reflect TrainPipelineConfig.
+    _sync_deepspeed_gradient_accumulation_steps(accelerator, cfg)
+
+    # Strict guard for gradient_checkpointing: the pi05 custom forward loop
+    # wraps layer bodies in torch.utils.checkpoint.checkpoint, which is only
+    # semantically safe under distributed backends that do NOT re-shard
+    # parameters during forward. DDP (MULTI_GPU), single-process (NO), and
+    # DeepSpeed ZeRO-1/2 all replicate full params on every rank during
+    # forward — safe. ZeRO-3 and FSDP re-shard and rely on forward-time
+    # all-gather hooks that plain torch.utils.checkpoint does not trigger
+    # during backward recompute, which can silently produce wrong gradients
+    # or hang. Fail loudly at startup instead of corrupting training.
+    if getattr(cfg.policy, "gradient_checkpointing", False):
+        grad_ckpt_allowed = {
+            accelerate.DistributedType.MULTI_GPU,
+            accelerate.DistributedType.NO,
+            accelerate.DistributedType.DEEPSPEED,
+        }
+        if accelerator.distributed_type not in grad_ckpt_allowed:
+            raise ValueError(
+                f"gradient_checkpointing=True is not supported under "
+                f"distributed_type={accelerator.distributed_type}. Supported: "
+                "MULTI_GPU (DDP), NO (single process), DEEPSPEED (ZeRO-1/2 only). "
+                "ZeRO-3 and FSDP need backend-specific activation-checkpointing "
+                "hooks which pi05's custom per-layer forward does not wire up. "
+                "Either set gradient_checkpointing=False or switch to a "
+                "supported backend."
+            )
+        if accelerator.distributed_type == accelerate.DistributedType.DEEPSPEED:
+            zero_stage = accelerator.deepspeed_plugin.hf_ds_config.config.get("zero_optimization", {}).get(
+                "stage", 0
+            )
+            if zero_stage >= 3:
+                raise ValueError(
+                    f"gradient_checkpointing=True is not supported under "
+                    f"DeepSpeed ZeRO stage {zero_stage}. ZeRO-3 re-shards parameters "
+                    "during forward and needs deepspeed.checkpointing.checkpoint "
+                    "rather than torch.utils.checkpoint. Either set "
+                    "gradient_checkpointing=False or use zero_stage: 1 or 2."
+                )
+
     logging.info(pformat(cfg.to_dict()))
 
     if accelerator.is_main_process:
         accelerator_config = encode_accelerator_state_dict(accelerator.state.__dict__)
         logging.info(pformat(accelerator_config))
-
-        # Ensure `gradient_accumulation_steps` is consistent between TrainPipelineConfig and DeepSpeedConfig
-        if accelerator.distributed_type == accelerate.DistributedType.DEEPSPEED:
-            deepspeed_config, deepspeed_key = accelerator.deepspeed_plugin.hf_ds_config.find_config_node(
-                "gradient_accumulation_steps"
-            )
-            ds_grad_acc_steps = deepspeed_config.get(deepspeed_key, 1)
-            if ds_grad_acc_steps != cfg.gradient_accumulation_steps:
-                raise ValueError(
-                    "The `gradient_accumulation_steps` in TrainPipelineConfig does not match the value "
-                    f"specified in DeepSpeedConfig {cfg.gradient_accumulation_steps} != {ds_grad_acc_steps}. "  # nosec B608
-                )
 
         if cfg.wandb.enable:
             step = load_training_step(cfg.checkpoint_path) if cfg.resume else None
@@ -215,9 +328,26 @@ def train(cfg: TrainPipelineConfig):
 
     logging.info("Creating policy")
     policy = make_policy(cfg=cfg.policy, ds_meta=train_dataset.meta)
+    # Keep the policy in bf16 for forward/backward (activation memory + bf16
+    # compute). The optimizer state is kept in fp32 separately: DeepSpeed
+    # ZeRO does this through ``BF16_Optimizer``; under DDP/FSDP/single we
+    # mirror that with ``MasterWeightOptimizer`` (see issue #181).
     policy.to(torch.bfloat16)
     logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
+    # Outside DeepSpeed, wrap the optimizer so it carries fp32 master weights
+    # and fp32 Adam state. DeepSpeed already provides this via BF16_Optimizer
+    # (see ``ds_config['bf16']['enabled']``), so we don't double-wrap there.
+    if accelerator.distributed_type != accelerate.DistributedType.DEEPSPEED:
+        optimizer = MasterWeightOptimizer.from_existing(optimizer)
+        # ``make_optimizer_and_scheduler`` bound the LR scheduler to the
+        # ORIGINAL ``torch.optim.AdamW`` (now discarded in favour of the
+        # wrapper's new inner). Without this rebind, ``lr_scheduler.step()``
+        # would mutate the orphaned optimizer's ``param_groups[i]['lr']``
+        # and the inner AdamW's lr would silently stay at the initial
+        # value forever — schedule applied to nothing.
+        if lr_scheduler is not None:
+            lr_scheduler.optimizer = optimizer
 
     step = 0  # number of policy updates (forward + backward + optim)
 
@@ -231,15 +361,35 @@ def train(cfg: TrainPipelineConfig):
 
     if cfg.val_freq > 0:
         train_dataloader = train_dataset.get_dataloader()
-        val_dataloader = val_dataset.get_dataloader()
-        policy, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
-            policy, optimizer, train_dataloader, val_dataloader, lr_scheduler
+        # One DataLoader per underlying val dataset so we can report per-dataset
+        # validation losses. The aggregate is computed by averaging across all.
+        per_dataset_val_dataloaders = val_dataset.get_per_dataset_dataloaders()
+        val_names = list(per_dataset_val_dataloaders.keys())
+        prepared = accelerator.prepare(
+            policy,
+            optimizer,
+            train_dataloader,
+            lr_scheduler,
+            *per_dataset_val_dataloaders.values(),
         )
+        policy, optimizer, train_dataloader, lr_scheduler = prepared[:4]
+        per_dataset_val_dataloaders = dict(zip(val_names, prepared[4:], strict=True))
     else:
         train_dataloader = train_dataset.get_dataloader()
         policy, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             policy, optimizer, train_dataloader, lr_scheduler
         )
+    # ``accelerator.prepare`` may have moved the policy from CPU to GPU.
+    # When ``MasterWeightOptimizer`` is in use, the fp32 masters were cloned
+    # from the bf16 live params at wrap-time (still on CPU) and would
+    # otherwise stay there — Adam would then run on CPU master tensors,
+    # paying a CPU<->GPU copy on every grad upcast and param downcast and
+    # never letting the masters appear in nvidia-smi accounting. Rebuild
+    # masters from the now-migrated live params so they live on the same
+    # device as the model. No-op when devices already agree.
+    inner_opt_for_migrate = getattr(optimizer, "optimizer", optimizer)
+    if isinstance(inner_opt_for_migrate, MasterWeightOptimizer):
+        inner_opt_for_migrate.rebuild_masters_from_live(policy.parameters())
     train_dl_iter = cycle(train_dataloader)
 
     # Register the LR scheduler for checkpointing
@@ -254,6 +404,16 @@ def train(cfg: TrainPipelineConfig):
         # but missing files (when resuming on more GPUs than were saved) are silently
         # skipped. Re-seed those new ranks deterministically.
         reseed_new_ranks_on_resume(cfg.checkpoint_path, accelerator, cfg.seed)
+
+        # When the master-weights wrapper is in use, the live bf16 weights
+        # have just been overwritten by ``accelerator.load_state``. Rebuild
+        # the fp32 masters from those weights so the inner optimizer's
+        # subsequent steps operate on consistent fp32 master copies.
+        # (Under DeepSpeed this is unnecessary; ZeRO restores its own fp32
+        # masters from its checkpoint.)
+        inner_opt_for_resume = getattr(optimizer, "optimizer", optimizer)
+        if isinstance(inner_opt_for_resume, MasterWeightOptimizer):
+            inner_opt_for_resume.rebuild_masters_from_live(policy.parameters())
 
         # all processes should load the step & rng states
         step = load_training_state(cfg.checkpoint_path)
@@ -342,65 +502,97 @@ def train(cfg: TrainPipelineConfig):
 
         if is_val_step:
             policy.eval()
-            val_metrics = {
-                "loss": AverageMeter("val_total_loss", ":.3f"),
-                "mse_loss": AverageMeter("val_mse_loss", ":.3f"),
-                "ce_loss": AverageMeter("val_ce_loss", ":.3f"),
-                "l1_loss": AverageMeter("val_l1_loss", ":.3f"),
-                "accuracy": AverageMeter("val_accuracy", ":.3f"),
+
+            def _make_val_tracker(current_step: int = step) -> MetricsTracker:
+                return MetricsTracker(
+                    cfg.batch_size * accelerator.num_processes,
+                    {
+                        "loss": AverageMeter("val_total_loss", ":.3f"),
+                        "mse_loss": AverageMeter("val_mse_loss", ":.3f"),
+                        "ce_loss": AverageMeter("val_ce_loss", ":.3f"),
+                        "l1_loss": AverageMeter("val_l1_loss", ":.3f"),
+                        "accuracy": AverageMeter("val_accuracy", ":.3f"),
+                    },
+                    initial_step=current_step,
+                )
+
+            per_dataset_trackers: dict[str, MetricsTracker] = {
+                name: _make_val_tracker() for name in per_dataset_val_dataloaders
             }
-            val_tracker = MetricsTracker(
-                cfg.batch_size * accelerator.num_processes,
-                val_metrics,
-                initial_step=step,
-            )
 
             logging.info(f"Validation at step {step}...")
 
             with torch.no_grad():
-                for batch in val_dataloader:
-                    losses = policy.forward(batch)
-                    loss = cfg.loss_weighting["MSE"] * losses["MSE"] + cfg.loss_weighting["CE"] * losses["CE"]
+                for ds_name, ds_loader in per_dataset_val_dataloaders.items():
+                    ds_tracker = per_dataset_trackers[ds_name]
+                    for batch in ds_loader:
+                        losses = policy.forward(batch)
+                        loss = (
+                            cfg.loss_weighting["MSE"] * losses["MSE"]
+                            + cfg.loss_weighting["CE"] * losses["CE"]
+                        )
 
-                    # Gather and average metrics across processes
-                    _first_loss_tensor = next(lt for lt in losses.values() if isinstance(lt, torch.Tensor))
-                    zero = torch.tensor(0.0, device=_first_loss_tensor.device, dtype=_first_loss_tensor.dtype)
+                        # Gather and average metrics across processes
+                        _first_loss_tensor = next(
+                            lt for lt in losses.values() if isinstance(lt, torch.Tensor)
+                        )
+                        zero = torch.tensor(
+                            0.0, device=_first_loss_tensor.device, dtype=_first_loss_tensor.dtype
+                        )
 
-                    loss = accelerator.gather_for_metrics(loss).mean().item()
-                    mse_loss = (
-                        accelerator.gather_for_metrics(losses["MSE"]).to(dtype=torch.float32).mean().item()
-                    )
-                    ce_loss = (
-                        accelerator.gather_for_metrics(losses["CE"]).to(dtype=torch.float32).mean().item()
-                    )
-                    l1_loss = (
-                        accelerator.gather_for_metrics(losses.get("L1", zero))
-                        .to(dtype=torch.float32)
-                        .mean()
-                        .item()
-                    )
-                    accuracy = (
-                        accelerator.gather_for_metrics(losses.get("Accuracy", zero))
-                        .to(dtype=torch.float32)
-                        .mean()
-                        .item()
-                    )
+                        loss = accelerator.gather_for_metrics(loss).mean().item()
+                        mse_loss = (
+                            accelerator.gather_for_metrics(losses["MSE"])
+                            .to(dtype=torch.float32)
+                            .mean()
+                            .item()
+                        )
+                        ce_loss = (
+                            accelerator.gather_for_metrics(losses["CE"]).to(dtype=torch.float32).mean().item()
+                        )
+                        l1_loss = (
+                            accelerator.gather_for_metrics(losses.get("L1", zero))
+                            .to(dtype=torch.float32)
+                            .mean()
+                            .item()
+                        )
+                        accuracy = (
+                            accelerator.gather_for_metrics(losses.get("Accuracy", zero))
+                            .to(dtype=torch.float32)
+                            .mean()
+                            .item()
+                        )
 
-                    if accelerator.is_main_process:
-                        val_tracker.loss = loss
-                        val_tracker.mse_loss = mse_loss
-                        val_tracker.ce_loss = ce_loss
-                        val_tracker.l1_loss = l1_loss
-                        val_tracker.accuracy = accuracy
+                        if accelerator.is_main_process:
+                            ds_tracker.loss = loss
+                            ds_tracker.mse_loss = mse_loss
+                            ds_tracker.ce_loss = ce_loss
+                            ds_tracker.l1_loss = l1_loss
+                            ds_tracker.accuracy = accuracy
 
             if accelerator.is_main_process:
-                logging.info(val_tracker)
-                val_dict = val_tracker.to_dict(use_avg=True)
-                accelerator.log({"Validation/Loss": val_dict["loss"]}, step=step)
-                accelerator.log({"Validation/MSE Loss": val_dict["mse_loss"]}, step=step)
-                accelerator.log({"Validation/CE Loss": val_dict["ce_loss"]}, step=step)
-                accelerator.log({"Validation/L1 Loss": val_dict["l1_loss"]}, step=step)
-                accelerator.log({"Validation/Accuracy": val_dict["accuracy"]}, step=step)
+                for ds_name, ds_tracker in per_dataset_trackers.items():
+                    logging.info(f"Validation/{ds_name} {ds_tracker}")
+                    ds_dict = ds_tracker.to_dict(use_avg=True)
+                    accelerator.log({f"Validation/{ds_name}/Loss": ds_dict["loss"]}, step=step)
+                    accelerator.log({f"Validation/{ds_name}/MSE Loss": ds_dict["mse_loss"]}, step=step)
+                    accelerator.log({f"Validation/{ds_name}/CE Loss": ds_dict["ce_loss"]}, step=step)
+                    accelerator.log({f"Validation/{ds_name}/L1 Loss": ds_dict["l1_loss"]}, step=step)
+                    accelerator.log({f"Validation/{ds_name}/Accuracy": ds_dict["accuracy"]}, step=step)
+
+                # Mixture-weighted aggregate across the per-dataset trackers, so the
+                # overall scalar reflects the training mixture rather than being
+                # implicitly dominated by whichever val subset has the most batches.
+                name_to_weight = dict(
+                    zip(val_dataset.dataset_names, val_dataset.dataset_weights, strict=True)
+                )
+                agg = _mixture_weighted_aggregate(per_dataset_trackers, name_to_weight)
+                logging.info(f"Validation/aggregate {agg}")
+                accelerator.log({"Validation/Loss": agg["loss"]}, step=step)
+                accelerator.log({"Validation/MSE Loss": agg["mse_loss"]}, step=step)
+                accelerator.log({"Validation/CE Loss": agg["ce_loss"]}, step=step)
+                accelerator.log({"Validation/L1 Loss": agg["l1_loss"]}, step=step)
+                accelerator.log({"Validation/Accuracy": agg["accuracy"]}, step=step)
 
             # This barrier is probably necessary to ensure
             # other processes wait for the main process to finish saving

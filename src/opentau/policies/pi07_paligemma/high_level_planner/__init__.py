@@ -12,13 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-PI05 Mem Policy Module.
+PI07 high level planner Policy Module.
 
-This module implements a variant of the π05 (Pi05) Vision-Language-Action Flow
-Model with the low-level memory architecture from Torne, Pertsch, Walke et al.
-"MEM: Multi-Scale Embodied Memory for Vision Language Action Models". The
-SigLIP image encoder is extended with space-time separable attention every
-N-th layer so past frames can inform the current-frame tokens without
-introducing new learnable parameters, and temporal state sequences are
-projected into one continuous token per timestep for the Gemma backbone.
+This module implements the High level planner for π07 which is basically π05 (Pi05) Vision-Language-model with memory and response prediction,
+designed for high level planning, memory and subtask generation. It includes the policy definition,
+configuration, and model architecture.
 """

@@ -22,9 +22,18 @@ isolated coverage.
 
 from __future__ import annotations
 
+import logging
+from types import SimpleNamespace
+
+import accelerate
 import pytest
 
-from opentau.scripts.train import _find_unused_params_from_env
+from opentau.scripts.train import (
+    _find_unused_params_from_env,
+    _mixture_weighted_aggregate,
+    _sync_deepspeed_gradient_accumulation_steps,
+)
+from opentau.utils.logging_utils import AverageMeter, MetricsTracker
 
 
 class TestFindUnusedParamsFromEnv:
@@ -67,6 +76,154 @@ class TestFindUnusedParamsFromEnv:
         for value in ("yes", "1", "enabled", "Y", "on"):
             monkeypatch.setenv("FIND_UNUSED_PARAMS", value)
             assert _find_unused_params_from_env() is False, f"Expected {value!r} to parse as False, got True"
+
+
+def _make_accelerator(distributed_type, ds_grad_acc, is_main_process=True):
+    plugin = SimpleNamespace(
+        hf_ds_config=SimpleNamespace(config={"gradient_accumulation_steps": ds_grad_acc}),
+        gradient_accumulation_steps=ds_grad_acc,
+    )
+    return SimpleNamespace(
+        distributed_type=distributed_type,
+        is_main_process=is_main_process,
+        deepspeed_plugin=plugin,
+    )
+
+
+def _make_cfg(grad_acc):
+    return SimpleNamespace(gradient_accumulation_steps=grad_acc)
+
+
+def test_non_deepspeed_is_noop(caplog):
+    accelerator = _make_accelerator(accelerate.DistributedType.MULTI_GPU, ds_grad_acc=2)
+    cfg = _make_cfg(grad_acc=4)
+
+    with caplog.at_level(logging.WARNING):
+        _sync_deepspeed_gradient_accumulation_steps(accelerator, cfg)
+
+    assert accelerator.deepspeed_plugin.hf_ds_config.config["gradient_accumulation_steps"] == 2
+    assert accelerator.deepspeed_plugin.gradient_accumulation_steps == 2
+    assert not caplog.records
+
+
+def test_deepspeed_matching_value_no_warning(caplog):
+    accelerator = _make_accelerator(accelerate.DistributedType.DEEPSPEED, ds_grad_acc=2)
+    cfg = _make_cfg(grad_acc=2)
+
+    with caplog.at_level(logging.WARNING):
+        _sync_deepspeed_gradient_accumulation_steps(accelerator, cfg)
+
+    assert accelerator.deepspeed_plugin.hf_ds_config.config["gradient_accumulation_steps"] == 2
+    assert accelerator.deepspeed_plugin.gradient_accumulation_steps == 2
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_deepspeed_mismatch_overrides_and_warns_on_main(caplog):
+    accelerator = _make_accelerator(accelerate.DistributedType.DEEPSPEED, ds_grad_acc=2, is_main_process=True)
+    cfg = _make_cfg(grad_acc=4)
+
+    with caplog.at_level(logging.WARNING):
+        _sync_deepspeed_gradient_accumulation_steps(accelerator, cfg)
+
+    assert accelerator.deepspeed_plugin.hf_ds_config.config["gradient_accumulation_steps"] == 4
+    assert accelerator.deepspeed_plugin.gradient_accumulation_steps == 4
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "2" in message
+    assert "4" in message
+
+
+def test_deepspeed_mismatch_non_main_overrides_without_warning(caplog):
+    accelerator = _make_accelerator(
+        accelerate.DistributedType.DEEPSPEED, ds_grad_acc=2, is_main_process=False
+    )
+    cfg = _make_cfg(grad_acc=4)
+
+    with caplog.at_level(logging.WARNING):
+        _sync_deepspeed_gradient_accumulation_steps(accelerator, cfg)
+
+    assert accelerator.deepspeed_plugin.hf_ds_config.config["gradient_accumulation_steps"] == 4
+    assert accelerator.deepspeed_plugin.gradient_accumulation_steps == 4
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def _make_tracker(
+    loss: float, mse: float = 0.0, ce: float = 0.0, l1: float = 0.0, acc: float = 0.0
+) -> MetricsTracker:
+    """Build a ``MetricsTracker`` with one update per metric.
+
+    A single assignment per attribute means each ``AverageMeter`` ends up with
+    ``avg == val``, which is exactly what we need to exercise the weighted
+    aggregation in isolation.
+    """
+    tracker = MetricsTracker(
+        batch_size=8,
+        metrics={
+            "loss": AverageMeter("val_total_loss", ":.3f"),
+            "mse_loss": AverageMeter("val_mse_loss", ":.3f"),
+            "ce_loss": AverageMeter("val_ce_loss", ":.3f"),
+            "l1_loss": AverageMeter("val_l1_loss", ":.3f"),
+            "accuracy": AverageMeter("val_accuracy", ":.3f"),
+        },
+    )
+    tracker.loss = loss
+    tracker.mse_loss = mse
+    tracker.ce_loss = ce
+    tracker.l1_loss = l1
+    tracker.accuracy = acc
+    return tracker
+
+
+class TestMixtureWeightedAggregate:
+    """``_mixture_weighted_aggregate`` collapses per-dataset trackers using mixture weights."""
+
+    def test_equal_weights_is_simple_mean(self):
+        trackers = {"a": _make_tracker(loss=1.0), "b": _make_tracker(loss=3.0)}
+        weights = {"a": 1.0, "b": 1.0}
+        agg = _mixture_weighted_aggregate(trackers, weights)
+        assert agg["loss"] == pytest.approx(2.0)
+
+    def test_unequal_weights_renormalize(self):
+        # weights [3, 1] -> 0.75 * 1.0 + 0.25 * 5.0 = 2.0
+        trackers = {"a": _make_tracker(loss=1.0), "b": _make_tracker(loss=5.0)}
+        weights = {"a": 3.0, "b": 1.0}
+        agg = _mixture_weighted_aggregate(trackers, weights)
+        assert agg["loss"] == pytest.approx(2.0)
+
+    def test_renormalizes_over_present_keys_only(self):
+        # ``name_to_weight`` includes a name that is missing from
+        # ``per_dataset_trackers`` (e.g. an empty val subset). The aggregate
+        # should ignore it and renormalize over the present keys.
+        trackers = {"a": _make_tracker(loss=1.0), "b": _make_tracker(loss=3.0)}
+        weights = {"a": 1.0, "b": 1.0, "c_empty": 100.0}
+        agg = _mixture_weighted_aggregate(trackers, weights)
+        assert agg["loss"] == pytest.approx(2.0)
+
+    def test_aggregates_all_metric_keys(self):
+        trackers = {
+            "a": _make_tracker(loss=1.0, mse=2.0, ce=3.0, l1=4.0, acc=0.1),
+            "b": _make_tracker(loss=5.0, mse=6.0, ce=7.0, l1=8.0, acc=0.5),
+        }
+        weights = {"a": 1.0, "b": 3.0}
+        agg = _mixture_weighted_aggregate(trackers, weights)
+        # 0.25 * a + 0.75 * b
+        assert agg["loss"] == pytest.approx(0.25 * 1.0 + 0.75 * 5.0)
+        assert agg["mse_loss"] == pytest.approx(0.25 * 2.0 + 0.75 * 6.0)
+        assert agg["ce_loss"] == pytest.approx(0.25 * 3.0 + 0.75 * 7.0)
+        assert agg["l1_loss"] == pytest.approx(0.25 * 4.0 + 0.75 * 8.0)
+        assert agg["accuracy"] == pytest.approx(0.25 * 0.1 + 0.75 * 0.5)
+
+    def test_empty_trackers_returns_zeros(self):
+        agg = _mixture_weighted_aggregate({}, {})
+        assert agg == {"loss": 0.0, "mse_loss": 0.0, "ce_loss": 0.0, "l1_loss": 0.0, "accuracy": 0.0}
+
+    def test_all_zero_weights_returns_zeros(self):
+        trackers = {"a": _make_tracker(loss=1.0), "b": _make_tracker(loss=2.0)}
+        weights = {"a": 0.0, "b": 0.0}
+        agg = _mixture_weighted_aggregate(trackers, weights)
+        # Avoids div-by-zero; behaviour matches "no signal to average".
+        assert agg["loss"] == 0.0
 
 
 if __name__ == "__main__":

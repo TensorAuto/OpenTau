@@ -21,6 +21,7 @@ optimization, scheduling, and data processing.
 """
 
 import logging
+import warnings
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -61,7 +62,10 @@ class PI05Config(PreTrainedConfig):
         num_steps: Number of flow matching steps for decoding. Defaults to 10.
         init_strategy: Initialization strategy. One of "no_init", "full_he_init", "expert_only_he_init".
             Defaults to "full_he_init".
-        attention_implementation: Attention implementation to use ("eager" or "fa2"). Defaults to "eager".
+        attention_implementation: Attention implementation to use ("eager", "sdpa", or "fa2").
+            Defaults to "eager". "sdpa" dispatches to ``torch.nn.functional.scaled_dot_product_attention``
+            (frees ~5.6 GiB on forward at the bs ceiling tested; see PR #182). "fa2" is accepted for
+            backward compatibility but logs a warning and falls back to "eager".
         freeze_vision_encoder: Whether to freeze the vision encoder during fine-tuning. Defaults to True.
         train_expert_only: Whether to train only the expert module. Defaults to False.
         optimizer_lr: Learning rate for the optimizer. Defaults to 2.5e-5.
@@ -91,6 +95,10 @@ class PI05Config(PreTrainedConfig):
     max_action_dim: int = 32
     predict_response: bool = False
 
+    # "discrete" encodes state as binned text tokens in the language prompt;
+    # "continuous" projects the raw state vector into VLM embedding space.
+    state_type: Literal["discrete", "continuous"] = "discrete"
+
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (224, 224)
 
@@ -100,6 +108,10 @@ class PI05Config(PreTrainedConfig):
 
     # Language Tokenizer
     prompt_max_length: int = 256
+
+    # Maximum length of the indicator tokens
+    response_indicator_max_length: int = 3
+    discrete_action_indicator_max_length: int = 3
 
     # Response Tokenizer
     response_max_length: int = 52
@@ -129,6 +141,16 @@ class PI05Config(PreTrainedConfig):
     # Finetuning settings
     freeze_vision_encoder: bool = True
     train_expert_only: bool = False
+    # Wrap each transformer-layer forward in torch.utils.checkpoint to trade
+    # ~25-33% same-batch compute for ~30-40 GB of activation memory per rank,
+    # typically netting +10-25% throughput once the freed memory is spent on
+    # a larger per-rank batch. Only supported with distributed_type=MULTI_GPU
+    # (DDP), NO (single process), or DeepSpeed ZeRO-1/2 — src/opentau/scripts/
+    # train.py raises if the accelerator's distributed_type is anything else
+    # (ZeRO-3, FSDP) because pi05's custom per-layer forward does not wire up
+    # the backend-specific activation-checkpointing hooks those strategies
+    # require. Defaults to False (no ckpt, lowest risk).
+    gradient_checkpointing: bool = False
 
     # Training presets
     optimizer_lr: float = 2.5e-5
@@ -168,6 +190,9 @@ class PI05Config(PreTrainedConfig):
         if self.pretrained_path is not None and self.pretrained_path != "lerobot/pi05":
             logging.info("Setting init_strategy to 'no_init' because we are resuming from a checkpoint.")
             self.init_strategy = "no_init"
+
+        if self.state_type not in ("discrete", "continuous"):
+            raise ValueError(f"state_type must be 'discrete' or 'continuous', got '{self.state_type}'")
 
         if self.max_delay > self.chunk_size:
             raise ValueError(
@@ -241,3 +266,19 @@ class PI05Config(PreTrainedConfig):
             None: As reward deltas are not used.
         """
         return None
+
+
+@PreTrainedConfig.register_subclass("pi05_continuous_state")
+@dataclass
+class PI05ContinuousStateConfig(PI05Config):
+    """Deprecated: use ``PI05Config(state_type="continuous")`` instead."""
+
+    state_type: Literal["discrete", "continuous"] = "continuous"
+
+    def __post_init__(self):
+        warnings.warn(
+            "PI05ContinuousStateConfig is deprecated. Use PI05Config with state_type='continuous' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        super().__post_init__()
