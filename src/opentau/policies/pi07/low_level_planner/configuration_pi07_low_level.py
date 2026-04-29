@@ -88,7 +88,9 @@ class PI07LowLevelPlannerConfig(PreTrainedConfig):
         vlm_config: Bundled :class:`Gemma3WithExpertConfig` for the Gemma 3
             VLM backbone + Gemma-v1 action expert.
         spacetime_layer_stride: Wrap every Nth SigLIP encoder layer with
-            space-time separable attention. ``1`` wraps every layer.
+            space-time separable attention.  Defaults to ``4`` (every 4th
+            of the 27 SigLIP layers, indices ``[3, 7, 11, 15, 19, 23]``),
+            matching the MEM paper / pi05_mem (#171).
         gradient_checkpointing: If True, wrap each SigLIP encoder layer in
             ``torch.utils.checkpoint.checkpoint`` during training.
     """
@@ -167,8 +169,10 @@ class PI07LowLevelPlannerConfig(PreTrainedConfig):
         )
     )
 
-    # SpaceTime settings
-    spacetime_layer_stride: int = 1
+    # SpaceTime settings.  Stride 4 matches the MEM paper and pi05_mem
+    # (#171): every 4th of the 27 SigLIP layers gets wrapped, indices
+    # [3, 7, 11, 15, 19, 23].
+    spacetime_layer_stride: int = 4
     gradient_checkpointing: bool = False
 
     # Training presets
