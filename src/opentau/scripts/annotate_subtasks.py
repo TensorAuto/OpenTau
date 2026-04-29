@@ -554,7 +554,6 @@ def _resolve_root(ds_cfg: dict, hub_cache_dir: Path) -> Path:
         repo_type="dataset",
         revision=revision,
         local_dir=str(local_dir),
-        local_dir_use_symlinks=False,
     )
     return Path(downloaded)
 
