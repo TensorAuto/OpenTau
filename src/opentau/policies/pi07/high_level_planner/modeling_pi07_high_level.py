@@ -675,13 +675,25 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
         """
 
         metadata = []
-        for speed, quality, mistake, speed_is_pad, quality_is_pad, mistake_is_pad in zip(
-            batch["speed"],
-            batch["quality"],
-            batch["mistake"],
-            batch["speed_is_pad"],
-            batch["quality_is_pad"],
-            batch["mistake_is_pad"],
+        batch_size = batch["state"].shape[0]
+        for (
+            speed,
+            quality,
+            mistake,
+            speed_is_pad,
+            quality_is_pad,
+            mistake_is_pad,
+            robot_type,
+            control_mode,
+        ) in zip(
+            batch.get("speed", torch.zeros(batch_size, dtype=torch.float32)),
+            batch.get("quality", torch.zeros(batch_size, dtype=torch.float32)),
+            batch.get("mistake", torch.zeros(batch_size, dtype=torch.float32)),
+            batch.get("speed_is_pad", torch.ones(batch_size, dtype=torch.bool)),
+            batch.get("quality_is_pad", torch.ones(batch_size, dtype=torch.bool)),
+            batch.get("mistake_is_pad", torch.ones(batch_size, dtype=torch.bool)),
+            batch.get("robot_type", [""] * batch_size),
+            batch.get("control_mode", [""] * batch_size),
             strict=True,
         ):
             segments = []
@@ -693,6 +705,12 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
 
             if not mistake_is_pad:
                 segments.append(f"Mistake: {str(mistake.item())}, ")
+
+            if robot_type:
+                segments.append(f"Robot: {robot_type}, ")
+
+            if control_mode:
+                segments.append(f"Control: {control_mode}, ")
 
             metadata.append(f"Metadata: {' '.join(segments)}")
 

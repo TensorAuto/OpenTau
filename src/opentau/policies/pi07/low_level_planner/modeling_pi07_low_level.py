@@ -966,14 +966,26 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         """
 
         metadata = []
+        batch_size = batch["state"].shape[0]
         # safety conditioning if metadata are not passed by sample actions
-        for speed, quality, mistake, speed_is_pad, quality_is_pad, mistake_is_pad in zip(
-            batch.get("speed", torch.zeros(batch["state"].shape[0], dtype=torch.float32)),
-            batch.get("quality", torch.zeros(batch["state"].shape[0], dtype=torch.float32)),
-            batch.get("mistake", torch.zeros(batch["state"].shape[0], dtype=torch.float32)),
-            batch.get("speed_is_pad", torch.zeros(batch["state"].shape[0], dtype=torch.bool)),
-            batch.get("quality_is_pad", torch.zeros(batch["state"].shape[0], dtype=torch.bool)),
-            batch.get("mistake_is_pad", torch.zeros(batch["state"].shape[0], dtype=torch.bool)),
+        for (
+            speed,
+            quality,
+            mistake,
+            speed_is_pad,
+            quality_is_pad,
+            mistake_is_pad,
+            robot_type,
+            control_mode,
+        ) in zip(
+            batch.get("speed", torch.zeros(batch_size, dtype=torch.float32)),
+            batch.get("quality", torch.zeros(batch_size, dtype=torch.float32)),
+            batch.get("mistake", torch.zeros(batch_size, dtype=torch.float32)),
+            batch.get("speed_is_pad", torch.zeros(batch_size, dtype=torch.bool)),
+            batch.get("quality_is_pad", torch.zeros(batch_size, dtype=torch.bool)),
+            batch.get("mistake_is_pad", torch.zeros(batch_size, dtype=torch.bool)),
+            batch.get("robot_type", [""] * batch_size),
+            batch.get("control_mode", [""] * batch_size),
             strict=True,
         ):
             segments = []
@@ -985,6 +997,12 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
             if not mistake_is_pad:
                 segments.append(f"Mistake: {str(mistake.item())}, ")
+
+            if robot_type:
+                segments.append(f"Robot: {robot_type}, ")
+
+            if control_mode:
+                segments.append(f"Control: {control_mode}, ")
 
             metadata.append(f"Metadata: {' '.join(segments)}" if segments else "")
 
