@@ -36,11 +36,17 @@ from opentau.datasets.utils import dataset_to_policy_features
 from opentau.policies.pi0.configuration_pi0 import PI0Config
 from opentau.policies.pi05.configuration_pi05 import PI05Config
 from opentau.policies.pi05_mem.configuration_pi05 import PI05MemConfig
-from opentau.policies.pi07_paligemma.high_level_planner.configuration_pi07_high_level import (
+from opentau.policies.pi07.high_level_planner.configuration_pi07_high_level import (
     PI07HighLevelPlannerConfig,
 )
+from opentau.policies.pi07.low_level_planner.configuration_pi07_low_level import (
+    PI07LowLevelPlannerConfig,
+)
+from opentau.policies.pi07_paligemma.high_level_planner.configuration_pi07_high_level import (
+    PI07HighLevelPlannerConfig as PI07PaligemmaHighLevelPlannerConfig,
+)
 from opentau.policies.pi07_paligemma.low_level_planner.configuration_pi07_low_level import (
-    PI07lowlevelPlannerConfig,
+    PI07lowlevelPlannerConfig as PI07PaligemmaLowLevelPlannerConfig,
 )
 from opentau.policies.pretrained import PreTrainedPolicy
 from opentau.policies.value.configuration_value import ValueConfig
@@ -82,12 +88,24 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         return PI05MemPolicy
     elif name == "pi07_paligemma_high_level_planner":
         from opentau.policies.pi07_paligemma.high_level_planner.modeling_pi07_high_level import (
+            PI07HighLevelPlannerPolicy as PI07PaligemmaHighLevelPlannerPolicy,
+        )
+
+        return PI07PaligemmaHighLevelPlannerPolicy
+    elif name == "pi07_paligemma_low_level_planner":
+        from opentau.policies.pi07_paligemma.low_level_planner.modeling_pi07_low_level import (
+            PI07LowLevelPlannerPolicy as PI07PaligemmaLowLevelPlannerPolicy,
+        )
+
+        return PI07PaligemmaLowLevelPlannerPolicy
+    elif name == "pi07_high_level":
+        from opentau.policies.pi07.high_level_planner.modeling_pi07_high_level import (
             PI07HighLevelPlannerPolicy,
         )
 
         return PI07HighLevelPlannerPolicy
-    elif name == "pi07_paligemma_low_level_planner":
-        from opentau.policies.pi07_paligemma.low_level_planner.modeling_pi07_low_level import (
+    elif name == "pi07_low_level":
+        from opentau.policies.pi07.low_level_planner.modeling_pi07_low_level import (
             PI07LowLevelPlannerPolicy,
         )
 
@@ -128,9 +146,13 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
     elif policy_type == "pi05_mem":
         return PI05MemConfig(**kwargs)
     elif policy_type == "pi07_paligemma_high_level_planner":
-        return PI07HighLevelPlannerConfig(**kwargs)
+        return PI07PaligemmaHighLevelPlannerConfig(**kwargs)
     elif policy_type == "pi07_paligemma_low_level_planner":
-        return PI07lowlevelPlannerConfig(**kwargs)
+        return PI07PaligemmaLowLevelPlannerConfig(**kwargs)
+    elif policy_type == "pi07_high_level":
+        return PI07HighLevelPlannerConfig(**kwargs)
+    elif policy_type == "pi07_low_level":
+        return PI07LowLevelPlannerConfig(**kwargs)
     elif policy_type == "value":
         return ValueConfig(**kwargs)
     else:
