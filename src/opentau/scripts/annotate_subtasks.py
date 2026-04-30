@@ -19,9 +19,7 @@ For every episode the script:
 
 1. Samples ``--sample-fps`` frames per second from the first available video
    track (default 1 fps, giving a 30-50x reduction from typical 30-50 fps
-   recordings).  If the resulting count exceeds ``--max-frames``, the sample
-   rate is reduced proportionally so that at most ``--max-frames`` images are
-   sent per episode.
+   recordings).
 2. Resizes each sampled frame to ``--target-width`` pixels wide (JPEG,
    default 640 px) to reduce image token cost.
 3. Sends all sampled frames together with their timestamps to
@@ -145,28 +143,13 @@ def _to_b64_jpeg(img: Image.Image, quality: int = 85) -> str:
 def _extract_sampled_frames(
     video_path: Path,
     sample_fps: float,
-    max_frames: int,
     target_width: int,
 ) -> tuple[list[Image.Image], list[float]]:
-    """Decode the video and return (images, timestamps) at ≤ sample_fps.
-
-    Decodes sequentially (no seeking) to avoid keyframe alignment issues.
-    The stride is increased if the episode would produce more than max_frames
-    samples, so at most max_frames images are ever returned.
-    """
+    """Decode the video and return (images, timestamps) at sample_fps."""
     with av.open(str(video_path)) as container:
         stream = container.streams.video[0]
         video_fps = float(stream.average_rate)
-        total_frames = stream.frames or 0
-
-        if total_frames == 0 and stream.duration and stream.time_base:
-            total_frames = int(float(stream.duration * stream.time_base) * video_fps)
-
-        n_at_rate = max(1, int(total_frames / max(video_fps, 1.0) * sample_fps))
-        if n_at_rate > max_frames:
-            stride = max(1, round(total_frames / max_frames))
-        else:
-            stride = max(1, round(video_fps / sample_fps))
+        stride = max(1, round(video_fps / sample_fps))
 
         sampled_imgs: list[Image.Image] = []
         sampled_ts: list[float] = []
@@ -177,8 +160,6 @@ def _extract_sampled_frames(
                 img = _resize(frame.to_image(), target_width)
                 sampled_imgs.append(img)
                 sampled_ts.append(round(ts, 3))
-                if len(sampled_imgs) >= max_frames:
-                    break
 
     return sampled_imgs, sampled_ts
 
@@ -268,7 +249,6 @@ def _annotate_episode(
     ep_info: dict,
     subtask_tmpl: str,
     sample_fps: float,
-    max_frames: int,
     target_width: int,
 ) -> bool:
     """Annotate one episode.  Returns True if the episode was processed."""
@@ -296,7 +276,7 @@ def _annotate_episode(
     tasks = ep_info.get("tasks", [])
     task_description = tasks[0] if tasks else "robot manipulation task"
 
-    frames, timestamps = _extract_sampled_frames(video_path, sample_fps, max_frames, target_width)
+    frames, timestamps = _extract_sampled_frames(video_path, sample_fps, target_width)
     if not frames:
         logger.warning("Episode %d: no frames extracted from %s; skipping.", ep_index, video_path)
         return False
@@ -361,7 +341,6 @@ def _process_dataset(
     root: Path,
     model: str,
     sample_fps: float,
-    max_frames: int,
     target_width: int,
     subtask_tmpl: str,
     write_response_column: bool,
@@ -403,7 +382,6 @@ def _process_dataset(
                 ep_info=ep_info,
                 subtask_tmpl=subtask_tmpl,
                 sample_fps=sample_fps,
-                max_frames=max_frames,
                 target_width=target_width,
             )
         except Exception:
@@ -484,14 +462,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Frames per second to sample from each episode video (default: 1.0).",
-    )
-    p.add_argument(
-        "--max-frames",
-        type=int,
-        default=40,
-        help="Maximum sampled frames to send per episode (controls API cost). "
-        "If sampling at --sample-fps would exceed this, the rate is reduced "
-        "proportionally (default: 40).",
     )
     p.add_argument(
         "--target-width",
@@ -589,7 +559,6 @@ def main(argv: list[str] | None = None) -> None:
             root=root,
             model=args.model,
             sample_fps=args.sample_fps,
-            max_frames=args.max_frames,
             target_width=args.target_width,
             subtask_tmpl=args.subtask_path_template,
             write_response_column=args.write_response_column,
