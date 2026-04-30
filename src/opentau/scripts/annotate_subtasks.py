@@ -92,9 +92,9 @@ logger = logging.getLogger(__name__)
 # Prompts
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT = (
+_SYSTEM_PROMPT_TEMPLATE = (
     "You are a robot manipulation expert. "
-    "You will be shown a sequence of video frames sampled at approximately 1 frame per second, "
+    "You will be shown a sequence of video frames sampled at approximately {fps:g} frame(s) per second, "
     "each labelled with its timestamp in seconds. "
     "Your job is to identify every distinct phase of the robot's task and return ONLY a JSON "
     "array — no markdown fences, no prose, no explanation."
@@ -103,7 +103,7 @@ _SYSTEM_PROMPT = (
 _USER_TEMPLATE = """\
 Task: {task}
 
-The frames below are from a single robot episode, sampled at roughly 1 fps. \
+The frames below are from a single robot episode, sampled at roughly {fps:g} fps. \
 Identify each phase where the robot's action meaningfully changes.
 
 Rules:
@@ -188,6 +188,7 @@ def _call_claude(
     task_description: str,
     frames: list[Image.Image],
     timestamps: list[float],
+    sample_fps: float,
 ) -> list[dict]:
     """Send sampled frames to Claude and parse the subtask boundary JSON."""
     content: list[dict] = []
@@ -206,21 +207,35 @@ def _call_claude(
             }
         )
 
-    content.append({"type": "text", "text": _USER_TEMPLATE.format(task=task_description)})
+    content.append({"type": "text", "text": _USER_TEMPLATE.format(task=task_description, fps=sample_fps)})
 
     response = client.messages.create(
         model=model,
         max_tokens=1024,
-        system=_SYSTEM_PROMPT,
+        system=_SYSTEM_PROMPT_TEMPLATE.format(fps=sample_fps),
         messages=[{"role": "user", "content": content}],
     )
 
-    raw_text = response.content[0].text
-    subtasks = _parse_json_response(raw_text)
+    text_blocks = [b for b in response.content if getattr(b, "type", None) == "text"]
+    if not text_blocks:
+        raise ValueError(f"Claude response had no text blocks (stop_reason={response.stop_reason}).")
+    raw_text = text_blocks[0].text
+
+    parsed = _parse_json_response(raw_text)
+    subtasks: list[dict] = []
+    for entry in parsed:
+        if not isinstance(entry, dict) or "time" not in entry or "subtask" not in entry:
+            continue
+        try:
+            subtasks.append({"time": float(entry["time"]), "subtask": str(entry["subtask"])})
+        except (TypeError, ValueError):
+            continue
+    if not subtasks:
+        raise ValueError(f"Claude response had no valid subtask entries: {raw_text!r}")
 
     # Ensure first entry is at time 0.0
-    if not subtasks or subtasks[0].get("time", -1) != 0.0:
-        subtasks.insert(0, {"time": 0.0, "subtask": subtasks[0]["subtask"] if subtasks else task_description})
+    if subtasks[0]["time"] != 0.0:
+        subtasks.insert(0, {"time": 0.0, "subtask": subtasks[0]["subtask"]})
     return subtasks
 
 
@@ -282,7 +297,7 @@ def _annotate_episode(
         logger.warning("Episode %d: no frames extracted from %s; skipping.", ep_index, video_path)
         return False
 
-    subtasks = _call_claude(client, model, task_description, frames, timestamps)
+    subtasks = _call_claude(client, model, task_description, frames, timestamps, sample_fps)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
@@ -316,16 +331,17 @@ def _update_parquet_response(root: Path, info: dict, ep_index: int, subtask_tmpl
         logger.warning("Episode %d: parquet not found at %s; skipping.", ep_index, parquet_path)
         return
 
+    # Skip if already populated — keeps reruns O(1) per episode.
+    # Delete the column (or the cached dataset) to force regeneration.
+    if "response" in pq.read_metadata(parquet_path).schema.names:
+        logger.debug("Episode %d: response column already present, skipping parquet update.", ep_index)
+        return
+
     table = pq.read_table(parquet_path)
     ep_length = table.num_rows
     responses = _build_response_array(subtasks, fps, ep_length, ep_index)
     response_col = pa.array(responses, type=pa.string())
-
-    if "response" in table.column_names:
-        col_idx = table.schema.get_field_index("response")
-        table = table.set_column(col_idx, "response", response_col)
-    else:
-        table = table.append_column("response", response_col)
+    table = table.append_column("response", response_col)
 
     tmp = parquet_path.with_suffix(".parquet.tmp")
     try:
