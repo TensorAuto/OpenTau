@@ -21,7 +21,6 @@ for the PI0 Vision-Language-Action Flow Model. It includes settings for the mode
 optimization, scheduling, and data processing.
 """
 
-import logging
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -63,8 +62,6 @@ class PI0Config(PreTrainedConfig):
         advantage: Advantage conditioning mode. One of "ignore", "on", "use".
             "use" uses values from dataset, "ignore" disables conditioning,
             "on" sets advantage to True (for expert demos). Defaults to "use".
-        init_strategy: Initialization strategy. One of "no_init", "full_he_init", "expert_only_he_init".
-            Defaults to "full_he_init".
         use_cache: Whether to use KV cache during inference. Defaults to True.
         attention_implementation: Attention implementation to use ("eager" or "fa2"). Defaults to "eager".
         freeze_vision_encoder: Whether to freeze the vision encoder during fine-tuning. Defaults to True.
@@ -125,9 +122,6 @@ class PI0Config(PreTrainedConfig):
     # This should only be "on" when training on expert demonstrations or interventions.
     advantage: Literal["ignore", "on", "use"] = "use"
 
-    # Initialization strategy
-    init_strategy: Literal["no_init", "full_he_init", "expert_only_he_init"] = "full_he_init"
-
     # Attention utils
     use_cache: bool = True
     attention_implementation: str = "eager"  # or fa2
@@ -168,19 +162,6 @@ class PI0Config(PreTrainedConfig):
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
-
-        assert self.init_strategy in ["no_init", "full_he_init", "expert_only_he_init"], (
-            f"Invalid init strategy: {self.init_strategy} must be one of ['no_init', 'full_he_init', 'expert_only_he_init']"
-        )
-
-        if self.init_strategy == "expert_only_he_init" and self.pretrained_path == "lerobot/pi0":
-            raise ValueError(
-                "You cannot load pretrained PI0 model when init_strategy is 'expert_only_he_init' due to differences in PaliGemma tokenizer vocab sizes."
-            )
-
-        if self.pretrained_path is not None and self.pretrained_path != "lerobot/pi0":
-            logging.info("Setting init_strategy to 'no_init' because we are resuming from a checkpoint.")
-            self.init_strategy = "no_init"
 
     def validate_features(self) -> None:
         """Validates the features and adds empty cameras if configured.

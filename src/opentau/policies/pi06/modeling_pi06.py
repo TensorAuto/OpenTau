@@ -720,15 +720,10 @@ class PI06FlowMatching(nn.Module):
         super().__init__()
         self.config = config
 
-        # Only pull pretrained Gemma 3 weights when the expert is being He-inited
-        # alongside them (i.e. only in the `expert_only_he_init` path). Any other
-        # strategy trains or resumes, so we skip the download.
-        load_pretrained_gemma3 = self.config.init_strategy == "expert_only_he_init"
         gemma3_with_expert_config = Gemma3WithExpertConfig(
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=self.config.train_expert_only,
             attention_implementation=self.config.attention_implementation,
-            load_pretrained_gemma3=load_pretrained_gemma3,
             discrete_action_vocab_size=discrete_action_vocab_size,
             dropout=self.config.dropout,
         )
@@ -742,29 +737,6 @@ class PI06FlowMatching(nn.Module):
         self.time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
 
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-4b-pt")
-
-        self._init_model()
-
-    def _init_weights(self, module: nn.Module) -> None:
-        if isinstance(module, nn.Linear):
-            nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.LayerNorm):
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
-
-    def _init_model(self) -> None:
-        if self.config.init_strategy == "no_init":
-            return
-        elif self.config.init_strategy == "full_he_init":
-            for m in self.modules():
-                self._init_weights(m)
-        elif self.config.init_strategy == "expert_only_he_init":
-            for m in self.gemma3_with_expert.gemma_expert.modules():
-                self._init_weights(m)
-        else:
-            raise ValueError(f"Invalid init strategy: {self.config.init_strategy}")
 
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
         """Standard Gaussian noise (float32)."""

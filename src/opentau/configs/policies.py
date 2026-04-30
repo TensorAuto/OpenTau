@@ -23,6 +23,7 @@ configurations from pretrained models or local paths.
 import abc
 import json
 import os
+import tempfile
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -52,28 +53,76 @@ _DEPRECATED_LATENCY_FIELDS = (
     "action_decoder_latency_upper",
 )
 
+# Fields that have been removed from the policy config dataclass. Stripped from
+# both incoming JSON (so old saved configs load without erroring on unknown
+# fields) and outgoing JSON (defensive).
+_REMOVED_POLICY_FIELDS = ("init_strategy",)
 
-def strip_deprecated_fields_from_json(path: Path) -> None:
-    """Remove deprecated latency fields from a saved config JSON file in-place.
+_STRIPPED_FIELDS = _DEPRECATED_LATENCY_FIELDS + _REMOVED_POLICY_FIELDS
 
-    Handles both top-level fields (policy configs) and fields nested under a
-    ``"policy"`` key (train configs).
+
+def _strip_keys(data: dict, keys: tuple[str, ...]) -> bool:
+    """Drop ``keys`` from ``data`` (top-level and under a ``"policy"`` sub-dict).
+
+    Returns True if anything changed.
     """
-    with open(path) as f:
-        data = json.load(f)
-
     changed = False
-    for key in _DEPRECATED_LATENCY_FIELDS:
+    for key in keys:
         if key in data:
             del data[key]
             changed = True
         if isinstance(data.get("policy"), dict) and key in data["policy"]:
             del data["policy"][key]
             changed = True
+    return changed
 
-    if changed:
+
+def strip_deprecated_fields_from_json(path: Path) -> None:
+    """Remove deprecated and removed fields from a config JSON file in-place.
+
+    Only safe to call on files we own (e.g. the JSON we just wrote inside a
+    save directory). Do NOT use on user-supplied inputs or HF cache files —
+    HF cache paths are symlinks into a content-addressed blob store, so an
+    in-place rewrite mutates the blob and silently corrupts the cache. For
+    incoming configs, use :func:`load_stripped_config_to_tempfile` instead.
+    """
+    with open(path) as f:
+        data = json.load(f)
+
+    if _strip_keys(data, _STRIPPED_FIELDS):
         with open(path, "w") as f:
             json.dump(data, f, indent=4)
+
+
+def load_stripped_config_to_tempfile(source_path: str | Path) -> Path:
+    """Read a config JSON, strip deprecated/removed fields in memory, write to
+    a fresh temp file, and return its path. Does not mutate ``source_path``.
+
+    Use this on incoming config files (HF Hub downloads, user-supplied paths)
+    before handing them to ``draccus.parse``: HF cache paths are symlinks into
+    a content-addressed blob store, so an in-place rewrite would corrupt the
+    cache; user-supplied paths shouldn't be mutated as a side effect of load.
+    """
+    with open(source_path) as f:
+        data = json.load(f)
+
+    _strip_keys(data, _STRIPPED_FIELDS)
+
+    fd, tmp_path = tempfile.mkstemp(prefix="opentau_config_", suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=4)
+    return Path(tmp_path)
+
+
+def _find_present_keys(data: dict, keys: tuple[str, ...]) -> list[str]:
+    """Return ``keys`` that appear at the top level or under a ``"policy"`` sub-dict."""
+    found: list[str] = []
+    for key in keys:
+        if key in data:
+            found.append(key)
+        if isinstance(data.get("policy"), dict) and key in data["policy"]:
+            found.append(f"policy.{key}")
+    return found
 
 
 def warn_deprecated_latency_fields(config_path: str | Path) -> None:
@@ -86,18 +135,33 @@ def warn_deprecated_latency_fields(config_path: str | Path) -> None:
     with open(config_path) as f:
         data = json.load(f)
 
-    found: list[str] = []
-    for key in _DEPRECATED_LATENCY_FIELDS:
-        if key in data:
-            found.append(key)
-        if isinstance(data.get("policy"), dict) and key in data["policy"]:
-            found.append(f"policy.{key}")
-
+    found = _find_present_keys(data, _DEPRECATED_LATENCY_FIELDS)
     if found:
         warnings.warn(
             f"Config '{config_path}' contains deprecated latency fields that are no longer "
             f"used and will be ignored: {', '.join(found)}. "
             "Consider re-saving the config to remove them.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+
+
+def warn_removed_policy_fields(config_path: str | Path) -> None:
+    """Emit a deprecation warning if a config JSON file contains removed fields.
+
+    Removed fields (e.g. ``init_strategy``) are stripped at load time so old
+    saved configs continue to parse, but the user's explicit choice is dropped
+    on the floor — surface that with a warning so they know to re-save and
+    update any downstream tooling that still emits the old key.
+    """
+    with open(config_path) as f:
+        data = json.load(f)
+
+    found = _find_present_keys(data, _REMOVED_POLICY_FIELDS)
+    if found:
+        warnings.warn(
+            f"Config '{config_path}' contains fields that have been removed and will be "
+            f"ignored: {', '.join(found)}. Re-save the config to drop them.",
             DeprecationWarning,
             stacklevel=3,
         )
@@ -355,10 +419,20 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
                     f"{CONFIG_NAME} not found on the HuggingFace Hub in {model_id}"
                 ) from e
 
-        if config_file is not None:
-            warn_deprecated_latency_fields(config_file)
-
         # HACK: this is very ugly, ideally we'd like to be able to do that natively with draccus
         # something like --policy.path (in addition to --policy.type)
         cli_overrides = policy_kwargs.pop("cli_overrides", [])
-        return draccus.parse(cls, config_file, args=cli_overrides)
+
+        if config_file is None:
+            return draccus.parse(cls, config_file, args=cli_overrides)
+
+        warn_deprecated_latency_fields(config_file)
+        warn_removed_policy_fields(config_file)
+        # Strip deprecated/removed keys via a temp file rather than mutating the
+        # source — `config_file` may be an HF cache symlink to a content-addressed
+        # blob, where a rewrite would silently corrupt the cache.
+        tmp_config = load_stripped_config_to_tempfile(config_file)
+        try:
+            return draccus.parse(cls, str(tmp_config), args=cli_overrides)
+        finally:
+            tmp_config.unlink(missing_ok=True)
