@@ -26,7 +26,7 @@ from opentau.policies.pi07_paligemma.low_level_planner.modeling_pi07_low_level i
 
 # Config defaults used across the test.
 NUM_CAMERAS = 2
-VJEPA2_TOKENS_PER_CAMERA = 256
+SIGLIP_TOKENS_PER_CAMERA = 256
 NUM_SUBGOAL_CAMERAS = 1
 SIGLIP_TOKENS_PER_SUBGOAL = 256
 PROMPT_MAX_LENGTH = 256
@@ -40,7 +40,7 @@ MAX_ACTION_DIM = 32
 # For training the state is provided as (B, n_obs_steps, D) so T = n_obs_steps.
 N_OBS_STEPS = 8
 
-VIDEO_TOKENS = NUM_CAMERAS * VJEPA2_TOKENS_PER_CAMERA  # 512
+VIDEO_TOKENS = NUM_CAMERAS * SIGLIP_TOKENS_PER_CAMERA  # 512
 LANG_START = VIDEO_TOKENS  # 512
 SUBGOAL_TOKENS = NUM_SUBGOAL_CAMERAS * SIGLIP_TOKENS_PER_SUBGOAL  # 256
 

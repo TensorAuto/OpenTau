@@ -88,7 +88,7 @@ class PI07lowlevelPlannerConfig(PreTrainedConfig):
     # inference buffer keeps.  ``history_interval`` is the stride between those
     # frames.  Together they determine ``obs_buffer_size = (n_obs_history-1) *
     # history_interval + 1``.  Typically ``n_obs_history`` should equal
-    # ``n_obs_steps`` so the V-JEPA2 encoder sees the same number of frames at
+    # ``n_obs_steps`` so the video encoder sees the same number of frames at
     # training and inference time.
     # Populated from DatasetMixtureConfig during training if unset.
     n_obs_history: int | None = None

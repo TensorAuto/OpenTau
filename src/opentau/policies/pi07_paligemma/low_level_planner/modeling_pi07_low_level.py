@@ -19,15 +19,16 @@
 action generation.
 
 The low-level planner is one half of the π07 hierarchical architecture.
-Given video observations (encoded by V-JEPA2), a language prompt, an
-optional subtask response from the high-level planner, temporal
-proprioceptive state, optional subgoal images, and optional metadata, it
-produces continuous action chunks via flow matching while simultaneously
-predicting discrete (FAST) action tokens through the VLM backbone.
+Given video observations (encoded by a SpaceTime SigLIP video encoder), a
+language prompt, an optional subtask response from the high-level planner,
+temporal proprioceptive state, optional subgoal images, and optional
+metadata, it produces continuous action chunks via flow matching while
+simultaneously predicting discrete (FAST) action tokens through the VLM
+backbone.
 
 Key differences from the base π05 policy:
-  1. V-JEPA2 video encoder replaces SigLIP, compressing each camera's
-     temporal video into 256 tokens via a Perceiver cross-attention reducer.
+  1. A SpaceTime SigLIP video encoder replaces the per-frame SigLIP image
+     encoder, producing temporally-aware tokens for each camera's video.
   2. Temporal state sequences (B, T, D) are projected per-timestep into
      separate continuous tokens for the Gemma backbone.
   3. Supports optional subtask response, subgoal image, and metadata
@@ -745,7 +746,7 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             batch: Batch of data containing video tensors.
             obs_history_is_pad: Optional bool tensor (B, T) indicating which
                 temporal frames are padded. Padded frames are zeroed out before
-                encoding so V-JEPA2 does not process clamped/repeated content.
+                encoding so the video encoder does not process clamped/repeated content.
 
         Returns:
             A tuple of (videos, vid_masks) lists.
@@ -1024,7 +1025,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         │      │  │  │  └──────── subgoal images, ``Subgoal:`` │
         │      │  │  └────────── response, commas, state, ``State:`` │
         │      │  └──────────── language                        │
-        │      └────────────── video (V-JEPA2)                 │
+        │      └────────────── video (SpaceTime SigLIP)       │
         └───────────────────────────────────────────────────┘
 
     The VLM processes the same prefix layout as :meth:`embed_prefix` (videos, language,
@@ -1079,7 +1080,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         return time
 
     def embed_video(self, video: Tensor) -> Tensor:
-        """Encode a video through V-JEPA2 + Perceiver reducer + projection.
+        """Encode a video through the SpaceTime SigLIP video encoder.
 
         Args:
             video: (B, T, C, H, W)
