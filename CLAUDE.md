@@ -26,7 +26,7 @@ OpenTau is Tensor's open-source PyTorch training toolchain for vision-language-a
 
 ## Environment & install
 
-Dependency management is **`uv` only** — `pyproject.toml`/`uv.lock` are authoritative; do not edit `requirements.txt` (none exists) or call `pip install` against the env.
+Dependency management is **`uv` (>= 0.8.4) only** — `pyproject.toml`/`uv.lock` are authoritative; do not edit `requirements.txt` (none exists) or call `pip install` against the env. The `>= 0.8.4` floor is enforced by `required-version` in `[tool.uv]` and is needed because `[tool.uv].extra-build-dependencies` (which pins `cmake<4` inside `egl-probe`'s PEP 517 build isolation) is only honored by uv 0.8.4+.
 
 ```bash
 uv sync --extra dev --extra libero          # standard dev setup (matches CI)
