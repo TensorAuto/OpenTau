@@ -601,7 +601,25 @@ def test_complete_pi06_pipeline_integration_smoke(lerobot_dataset_metadata):
     config.output_features = {k: ft for k, ft in features.items() if ft.type is FeatureType.ACTION}
     config.input_features = {k: ft for k, ft in features.items() if k not in config.output_features}
 
-    policy = PI06Policy(config, dataset_stats=lerobot_dataset_metadata.stats)
+    # The shared lerobot_dataset_metadata fixture carries actions stats shaped
+    # (50, 32) — matching the default PI06Config(chunk_size=50). This test
+    # uses chunk_size=10 to keep the model small, so override the actions
+    # stats to (10, 32) before constructing Normalize buffers; otherwise
+    # `(actions - min) / (max - min + EPS)` mismatches at dim=1 (actions is
+    # (B, 10, 32) but the buffer is (50, 32)).
+    import copy
+
+    import numpy as np
+
+    dataset_stats = copy.deepcopy(lerobot_dataset_metadata.stats)
+    for k in ("max", "mean", "min", "std"):
+        dataset_stats["actions"][k] = np.full(
+            (config.chunk_size, 32),
+            float(dataset_stats["actions"][k].flatten()[0]),
+            dtype=np.float32,
+        )
+
+    policy = PI06Policy(config, dataset_stats=dataset_stats)
     policy.to(dtype=torch.bfloat16, device="cuda")
 
     batch = {
