@@ -1242,6 +1242,17 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         # actually present. Unconditionally adding "Subgoal: " injects real (non-padded)
         # spurious tokens into every prefix even with subgoal_drop_prob=1.0.
         if subgoal_images and any(mask.any() for mask in subgoal_img_masks):
+            # Per-sample availability: True iff at least one camera slot
+            # has a real subgoal image for that sample. In a mixed batch
+            # (some samples have subgoals, others don't), the "Subgoal: "
+            # header and trailing ", " footer must follow this same mask —
+            # otherwise pad-only samples would receive real (unmasked)
+            # indicator tokens with no image content behind them, which
+            # the prefix-LM block then attends to as if it were grounded.
+            sample_has_subgoal = torch.stack([m.to(dtype=torch.bool) for m in subgoal_img_masks], dim=0).any(
+                dim=0
+            )
+
             subgoal_img_start_indicator_ids = self.language_tokenizer.encode(
                 "Subgoal: ", add_special_tokens=False
             )
@@ -1255,9 +1266,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             subgoal_img_start_emb = subgoal_img_start_emb * math.sqrt(subgoal_img_start_dim)
 
             num_subgoal_img_start_embs = subgoal_img_start_emb.shape[1]
-            subgoal_img_start_mask = torch.ones(
-                bsize, num_subgoal_img_start_embs, dtype=torch.bool, device=lang_tokens.device
-            )
+            subgoal_img_start_mask = sample_has_subgoal[:, None].expand(bsize, num_subgoal_img_start_embs)
 
             embs.append(subgoal_img_start_emb)
             pad_masks.append(subgoal_img_start_mask)
@@ -1293,9 +1302,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             subgoal_img_end_emb = subgoal_img_end_emb * math.sqrt(subgoal_img_end_dim)
 
             num_subgoal_img_end_embs = subgoal_img_end_emb.shape[1]
-            subgoal_img_end_mask = torch.ones(
-                bsize, num_subgoal_img_end_embs, dtype=torch.bool, device=lang_tokens.device
-            )
+            subgoal_img_end_mask = sample_has_subgoal[:, None].expand(bsize, num_subgoal_img_end_embs)
 
             embs.append(subgoal_img_end_emb)
             pad_masks.append(subgoal_img_end_mask)
