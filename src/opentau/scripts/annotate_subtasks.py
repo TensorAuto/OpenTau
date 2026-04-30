@@ -33,7 +33,14 @@ For every episode the script:
    default).
 
 Episodes whose subtask JSON already exists are skipped — making the script
-fully resumable after a crash.
+fully resumable after a crash. The parquet step likewise short-circuits on
+episodes that already have a ``response`` column, so a rerun with a different
+``--sample-fps`` is a no-op. Delete the per-episode subtask JSON (and the
+``response`` column) to force regeneration.
+
+This script targets LeRobot **v2.1** datasets. A non-v2.1 ``codebase_version``
+in ``meta/info.json`` only emits a warning, so pin Hub datasets to a v2.1
+revision via the ``revision`` field in the mixture config.
 
 The config file is read with plain JSON; it accepts both the full training
 config format (``{"dataset_mixture": {"datasets": [...]}}``) and the simpler
@@ -141,15 +148,30 @@ def _to_b64_jpeg(img: Image.Image, quality: int = 85) -> str:
     return base64.standard_b64encode(buf.getvalue()).decode("ascii")
 
 
+# Anthropic Messages API rejects requests with more than 100 images per content
+# array, so any episode longer than (MAX_FRAMES_PER_REQUEST / sample_fps) seconds
+# would otherwise fail mid-run. Above this cap we uniformly subsample the captured
+# frames; the effective sampling rate drops accordingly.
+MAX_FRAMES_PER_REQUEST = 100
+
+
 def _extract_sampled_frames(
     video_path: Path,
     sample_fps: float,
     target_width: int,
+    max_frames: int = MAX_FRAMES_PER_REQUEST,
 ) -> tuple[list[Image.Image], list[float]]:
-    """Decode the video and return (images, timestamps) at sample_fps."""
+    """Decode the video and return (images, timestamps) at sample_fps.
+
+    If the number of frames sampled at ``sample_fps`` exceeds ``max_frames``,
+    the captured frames are uniformly subsampled down to ``max_frames`` so the
+    request stays within the Anthropic Messages API's 100-image limit.
+    """
     with av.open(str(video_path)) as container:
         stream = container.streams.video[0]
         video_fps = float(stream.average_rate)
+        # Guard against sample_fps > video_fps: stride would round to 0,
+        # which would emit every frame and divide-by-zero downstream.
         stride = max(1, round(video_fps / sample_fps))
 
         sampled_imgs: list[Image.Image] = []
@@ -161,6 +183,14 @@ def _extract_sampled_frames(
                 img = _resize(frame.to_image(), target_width)
                 sampled_imgs.append(img)
                 sampled_ts.append(round(ts, 3))
+
+    if len(sampled_imgs) > max_frames:
+        idx = [round(j * (len(sampled_imgs) - 1) / (max_frames - 1)) for j in range(max_frames)]
+        # Deduplicate while preserving order in case rounding collides on short clips.
+        seen: set[int] = set()
+        dedup = [k for k in idx if not (k in seen or seen.add(k))]
+        sampled_imgs = [sampled_imgs[k] for k in dedup]
+        sampled_ts = [sampled_ts[k] for k in dedup]
 
     return sampled_imgs, sampled_ts
 
@@ -180,6 +210,30 @@ def _parse_json_response(text: str) -> list[dict]:
     if not isinstance(parsed, list):
         raise ValueError(f"Expected JSON array, got {type(parsed)}")
     return parsed
+
+
+def _coerce_subtasks(parsed: list, raw_text: str = "") -> list[dict]:
+    """Filter a parsed subtask list down to well-typed ``{time, subtask}`` entries.
+
+    Drops entries that are not dicts, are missing required keys, or whose
+    ``time`` is not coercible to float. Raises ``ValueError`` if no entries
+    survive. Backfills a ``time=0.0`` entry at the head if the first surviving
+    entry starts later, mirroring the contract that downstream consumers
+    (``_build_response_array``) expect.
+    """
+    subtasks: list[dict] = []
+    for entry in parsed:
+        if not isinstance(entry, dict) or "time" not in entry or "subtask" not in entry:
+            continue
+        try:
+            subtasks.append({"time": float(entry["time"]), "subtask": str(entry["subtask"])})
+        except (TypeError, ValueError):
+            continue
+    if not subtasks:
+        raise ValueError(f"Claude response had no valid subtask entries: {raw_text!r}")
+    if subtasks[0]["time"] != 0.0:
+        subtasks.insert(0, {"time": 0.0, "subtask": subtasks[0]["subtask"]})
+    return subtasks
 
 
 def _call_claude(
@@ -222,21 +276,7 @@ def _call_claude(
     raw_text = text_blocks[0].text
 
     parsed = _parse_json_response(raw_text)
-    subtasks: list[dict] = []
-    for entry in parsed:
-        if not isinstance(entry, dict) or "time" not in entry or "subtask" not in entry:
-            continue
-        try:
-            subtasks.append({"time": float(entry["time"]), "subtask": str(entry["subtask"])})
-        except (TypeError, ValueError):
-            continue
-    if not subtasks:
-        raise ValueError(f"Claude response had no valid subtask entries: {raw_text!r}")
-
-    # Ensure first entry is at time 0.0
-    if subtasks[0]["time"] != 0.0:
-        subtasks.insert(0, {"time": 0.0, "subtask": subtasks[0]["subtask"]})
-    return subtasks
+    return _coerce_subtasks(parsed, raw_text)
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +306,7 @@ def _annotate_episode(
     subtask_tmpl: str,
     sample_fps: float,
     target_width: int,
+    max_frames: int,
 ) -> bool:
     """Annotate one episode.  Returns True if the episode was processed."""
     out_path = _subtask_path(root, subtask_tmpl, ep_index)
@@ -292,10 +333,17 @@ def _annotate_episode(
     tasks = ep_info.get("tasks", [])
     task_description = tasks[0] if tasks else "robot manipulation task"
 
-    frames, timestamps = _extract_sampled_frames(video_path, sample_fps, target_width)
+    frames, timestamps = _extract_sampled_frames(video_path, sample_fps, target_width, max_frames)
     if not frames:
         logger.warning("Episode %d: no frames extracted from %s; skipping.", ep_index, video_path)
         return False
+    if len(frames) >= max_frames and timestamps and timestamps[-1] > max_frames / sample_fps:
+        logger.info(
+            "Episode %d: clip is %.1fs long; uniformly subsampled to %d frames to stay within the API limit.",
+            ep_index,
+            timestamps[-1],
+            max_frames,
+        )
 
     subtasks = _call_claude(client, model, task_description, frames, timestamps, sample_fps)
 
@@ -312,7 +360,7 @@ def _annotate_episode(
 # ---------------------------------------------------------------------------
 
 
-def _update_parquet_response(root: Path, info: dict, ep_index: int, subtask_tmpl: str) -> None:
+def _update_parquet_response(root: Path, info: dict, ep_index: int, ep_info: dict, subtask_tmpl: str) -> None:
     """Expand subtask boundaries into a ``response`` column in the episode parquet."""
     fps: int = info["fps"]
     data_tmpl: str = info["data_path"]
@@ -332,14 +380,33 @@ def _update_parquet_response(root: Path, info: dict, ep_index: int, subtask_tmpl
         return
 
     # Skip if already populated — keeps reruns O(1) per episode.
-    # Delete the column (or the cached dataset) to force regeneration.
     if "response" in pq.read_metadata(parquet_path).schema.names:
-        logger.debug("Episode %d: response column already present, skipping parquet update.", ep_index)
+        logger.info(
+            "Episode %d: response column already present in %s; skipping parquet update. "
+            "Delete the column (or the cached dataset) to force regeneration.",
+            ep_index,
+            parquet_path.name,
+        )
         return
 
     table = pq.read_table(parquet_path)
-    ep_length = table.num_rows
+    # Mirror add_subtask_response.py: trust episodes.jsonl as ground truth
+    # for episode length and pad/truncate the response array if the parquet
+    # row count disagrees, so a corrupt parquet surfaces as a warning rather
+    # than silently misaligned data.
+    ep_length: int = ep_info["length"]
     responses = _build_response_array(subtasks, fps, ep_length, ep_index)
+    if table.num_rows != ep_length:
+        logger.warning(
+            "Episode %d: parquet has %d rows but episodes.jsonl reports length %d. Using parquet row count.",
+            ep_index,
+            table.num_rows,
+            ep_length,
+        )
+        if len(responses) < table.num_rows:
+            responses.extend([""] * (table.num_rows - len(responses)))
+        else:
+            responses = responses[: table.num_rows]
     response_col = pa.array(responses, type=pa.string())
     table = table.append_column("response", response_col)
 
@@ -362,6 +429,7 @@ def _process_dataset(
     subtask_tmpl: str,
     write_response_column: bool,
     max_episodes: int | None,
+    max_frames: int,
 ) -> None:
     root = root.resolve()
     if not root.is_dir():
@@ -369,6 +437,14 @@ def _process_dataset(
         return
 
     info = load_info(root)
+    codebase_version = info.get("codebase_version")
+    if codebase_version != "v2.1":
+        logger.warning(
+            "Dataset %s has codebase_version=%r; this script has only been tested against v2.1. "
+            "For Hub datasets upgraded past v2.1, pin to the v2.1 tag via the 'revision' field.",
+            root.name,
+            codebase_version,
+        )
     episodes = load_episodes(root)
     if not episodes:
         logger.warning("No episodes in %s — skipping.", root)
@@ -400,6 +476,7 @@ def _process_dataset(
                 subtask_tmpl=subtask_tmpl,
                 sample_fps=sample_fps,
                 target_width=target_width,
+                max_frames=max_frames,
             )
         except Exception:
             logger.exception("Episode %d: annotation failed.", ep_index)
@@ -426,7 +503,7 @@ def _process_dataset(
 
         for ep_index in tqdm(ep_indices, desc=f"{root.name} (parquet)", unit="ep"):
             try:
-                _update_parquet_response(root, info, ep_index, subtask_tmpl)
+                _update_parquet_response(root, info, ep_index, episodes[ep_index], subtask_tmpl)
             except Exception:
                 logger.exception("Episode %d: parquet update failed.", ep_index)
 
@@ -465,7 +542,8 @@ def _load_datasets_from_config(config_path: Path) -> list[dict]:
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description=__doc__,
+        description="Annotate every episode in a dataset mixture with subtask labels using Claude.",
+        epilog=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
@@ -479,6 +557,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Frames per second to sample from each episode video (default: 1.0).",
+    )
+    p.add_argument(
+        "--max-frames",
+        type=int,
+        default=MAX_FRAMES_PER_REQUEST,
+        help=(
+            "Hard cap on frames per Claude request. Long clips are uniformly subsampled "
+            f"down to this many frames. The Anthropic Messages API rejects requests with "
+            f"more than 100 images, so do not raise above {MAX_FRAMES_PER_REQUEST} "
+            f"(default: {MAX_FRAMES_PER_REQUEST})."
+        ),
     )
     p.add_argument(
         "--target-width",
@@ -509,6 +598,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=None,
         help="Process at most this many episodes per dataset (useful for dry runs).",
+    )
+    p.add_argument(
+        "--max-api-retries",
+        type=int,
+        default=8,
+        help=(
+            "Number of automatic retries for the Anthropic SDK on 429/5xx responses; "
+            "the SDK applies exponential backoff between attempts (default: 8)."
+        ),
     )
     p.add_argument(
         "--hub-cache-dir",
@@ -555,7 +653,10 @@ def main(argv: list[str] | None = None) -> None:
         logger.error("ANTHROPIC_API_KEY is not set in the environment.")
         sys.exit(1)
 
-    client = anthropic.Anthropic(api_key=api_key)
+    # max_retries triggers anthropic-sdk-python's built-in exponential backoff for
+    # 429 rate-limit responses (and 5xx). Default is 2; bump it so a long batch
+    # job does not give up after a transient burst on rate-limited tiers.
+    client = anthropic.Anthropic(api_key=api_key, max_retries=args.max_api_retries)
     datasets = _load_datasets_from_config(args.config_path)
 
     if not datasets:
@@ -580,6 +681,7 @@ def main(argv: list[str] | None = None) -> None:
             subtask_tmpl=args.subtask_path_template,
             write_response_column=args.write_response_column,
             max_episodes=args.max_episodes_per_dataset,
+            max_frames=args.max_frames,
         )
 
     logger.info("Done.")
