@@ -195,16 +195,12 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
             cfg_cls = CONFIG_MAPPING[paligemma_config["model_type"]]
             self.gemma_expert_config = cfg_cls(**gemma_expert_config)
 
-        super().__init__(**kwargs)
-
-    def __post_init__(self):
-        """Validates configuration parameters."""
-        super().__post_init__()
+        # PretrainedConfig has no __post_init__, so validation has to live in
+        # __init__ to actually run (mirrors the pi06 engine config).
         if self.train_expert_only and not self.freeze_vision_encoder:
             raise ValueError(
                 "You set `freeze_vision_encoder=False` and `train_expert_only=True` which are not compatible."
             )
-
         if self.attention_implementation not in ["eager", "sdpa", "fa2"]:
             raise ValueError(
                 f"Wrong value provided for `attention_implementation` ({self.attention_implementation}). "
@@ -216,8 +212,10 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
             # existing configs keep running.
             logging.warning(
                 "attention_implementation='fa2' is not implemented; falling back to 'eager'. "
-                "Consider switching to 'sdpa' for ~10-15%% better throughput."
+                "Consider switching to 'sdpa' for ~10-15% better throughput."
             )
+
+        super().__init__(**kwargs)
 
 
 class PaliGemmaWithExpertModel(PreTrainedModel):
@@ -539,7 +537,7 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         if impl == "sdpa":
             return self.sdpa_attention_forward
         # "eager" and legacy "fa2" both land here; "fa2" already warned
-        # during __post_init__.
+        # during config __init__.
         return self.eager_attention_forward
 
     def eager_attention_forward(

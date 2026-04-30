@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from transformers.models.auto import CONFIG_MAPPING
 
 from opentau.configs.types import FeatureType, PolicyFeature
 from opentau.policies.pi0.configuration_pi0 import PI0Config
@@ -140,12 +141,10 @@ def test_prepare_language_existing_newline(mock_flow_matching, mock_auto_tokeniz
 
 # Engine config — SDPA + gradient checkpointing knobs.
 #
-# Note: `PaliGemmaWithExpertConfig.__post_init__` is dead code in pi0 (and
-# pi05) — `transformers.PretrainedConfig` has no `__post_init__`, so the
-# `super().__post_init__()` call inside it always raises AttributeError if
-# anyone tries to invoke it. The validation it contains never runs in
-# production. The tests below only exercise the constructor + the dispatch
-# path that actually executes at forward time.
+# Validation lives in `PaliGemmaWithExpertConfig.__init__` (PretrainedConfig
+# has no `__post_init__`, so a method by that name on a subclass would never
+# run). Tests below cover both the constructor-time validation/warning paths
+# and the runtime dispatch path.
 
 
 class TestPaliGemmaWithExpertConfig:
@@ -164,6 +163,23 @@ class TestPaliGemmaWithExpertConfig:
     def test_gradient_checkpointing_field_set_via_kwarg(self):
         cfg = PaliGemmaWithExpertConfig(gradient_checkpointing=True)
         assert cfg.gradient_checkpointing is True
+
+    def test_bad_attention_implementation_raises(self):
+        with pytest.raises(ValueError, match="attention_implementation"):
+            PaliGemmaWithExpertConfig(attention_implementation="garbage")
+
+    def test_fa2_falls_back_to_eager_with_warning(self, caplog):
+        # Mirrors pi06's parallel test — fa2 has never been implemented in
+        # PaliGemmaWithExpertModel, so the constructor accepts the value but
+        # warns. The runtime dispatcher then maps fa2 → eager_attention_forward.
+        with caplog.at_level("WARNING"):
+            cfg = PaliGemmaWithExpertConfig(attention_implementation="fa2")
+        assert cfg.attention_implementation == "fa2"
+        assert any("falling back to 'eager'" in record.message for record in caplog.records)
+
+    def test_train_expert_only_incompatible_with_unfrozen_vision(self):
+        with pytest.raises(ValueError, match="not compatible"):
+            PaliGemmaWithExpertConfig(freeze_vision_encoder=False, train_expert_only=True)
 
 
 class TestPi0ConfigSdpaCkpt:
@@ -255,8 +271,137 @@ class TestPi0SdpaEquivalence:
         assert PaliGemmaWithExpertModel.get_attention_interface(fake) == "<eager>"
 
     def test_dispatcher_falls_back_to_eager_for_fa2(self):
-        # The dispatch falls back to eager regardless of whether the dead-code
-        # __post_init__ validation ever ran. The safety net is here in
-        # get_attention_interface itself.
+        # Dispatcher safety net — independent of whether the constructor
+        # warning fired (e.g. for configs reloaded from a checkpoint where
+        # __init__ validation isn't re-run).
         fake = self._fake_for_dispatch("fa2")
         assert PaliGemmaWithExpertModel.get_attention_interface(fake) == "<eager>"
+
+
+# Gradient-checkpointing forward equivalence — locks in that the `_run_layer`
+# extraction is bit-identical to the original inlined loop body. Mirrors
+# pi06's `TestPi06GradCkptEquivalence::test_grad_ckpt_forward_matches_no_ckpt`.
+#
+# `PaliGemmaWithExpertConfig`'s ``elif isinstance(self.paligemma_config, dict)``
+# branch is broken (refs an attribute set only inside the `if` branch above),
+# so we can't pass tiny configs as dicts the way pi06 does. We instead build
+# with default sub-configs and overwrite them post-hoc with tiny PaliGemma /
+# Gemma configs before constructing the model.
+
+
+def _make_tiny_pi0_engine_config():
+    """Builds a `PaliGemmaWithExpertConfig` with tiny sub-configs for fast tests."""
+    cfg = PaliGemmaWithExpertConfig(
+        freeze_vision_encoder=False,
+        train_expert_only=False,
+        dropout=0.0,
+    )
+    text_kwargs = {
+        "model_type": "gemma",
+        "hidden_size": 32,
+        "intermediate_size": 64,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 16,
+        "vocab_size": 128,
+        "max_position_embeddings": 128,
+        "torch_dtype": "float32",
+        "hidden_activation": "gelu_pytorch_tanh",
+    }
+    vision_kwargs = {
+        "model_type": "siglip_vision_model",
+        "hidden_size": 16,
+        "intermediate_size": 32,
+        "num_attention_heads": 2,
+        "num_hidden_layers": 2,
+        "num_image_tokens": 4,
+        "patch_size": 14,
+        "projection_dim": 32,
+        "projector_hidden_act": "gelu_fast",
+        "torch_dtype": "float32",
+        "vision_use_head": False,
+    }
+    cfg.paligemma_config = CONFIG_MAPPING["paligemma"](
+        bos_token_id=2,
+        eos_token_id=1,
+        hidden_size=32,
+        image_token_index=127,
+        pad_token_id=0,
+        projection_dim=32,
+        text_config=text_kwargs,
+        vision_config=vision_kwargs,
+    )
+    cfg.gemma_expert_config = CONFIG_MAPPING["gemma"](
+        attention_bias=False,
+        attention_dropout=0.0,
+        bos_token_id=2,
+        eos_token_id=1,
+        head_dim=16,
+        hidden_act="gelu_pytorch_tanh",
+        hidden_activation="gelu_pytorch_tanh",
+        hidden_size=16,
+        intermediate_size=32,
+        max_position_embeddings=128,
+        num_attention_heads=2,
+        num_hidden_layers=2,
+        num_key_value_heads=1,
+        pad_token_id=0,
+        rms_norm_eps=1e-6,
+        rope_theta=10_000.0,
+        torch_dtype="float32",
+        vocab_size=128,
+    )
+    return cfg
+
+
+class TestPi0GradCkptEquivalence:
+    def test_grad_ckpt_forward_matches_no_ckpt(self):
+        """gradient_checkpointing=True must not change the forward output —
+        it only trades activation memory for recompute. Locks in that
+        ``_run_layer`` is bit-identical to the original inlined loop body.
+
+        Runs in the engine's native bfloat16 (the default after
+        ``to_bfloat16_like_physical_intelligence``) — both models do exactly
+        the same op sequence on the same weights/inputs, so equality is bit-
+        identical even at low precision.
+        """
+        cfg = _make_tiny_pi0_engine_config()
+
+        torch.manual_seed(0)
+        model_no_ckpt = PaliGemmaWithExpertModel(cfg)
+        model_no_ckpt.train()
+
+        cfg_ckpt = _make_tiny_pi0_engine_config()
+        cfg_ckpt.gradient_checkpointing = True
+        torch.manual_seed(0)
+        model_ckpt = PaliGemmaWithExpertModel(cfg_ckpt)
+        model_ckpt.load_state_dict(model_no_ckpt.state_dict(), strict=True)
+        model_ckpt.train()
+
+        batch, seq_len = 1, 4
+        hidden_dim = cfg.paligemma_config.text_config.hidden_size
+        # bf16 input matches the engine's internal hidden dtype after the
+        # explicit `hidden_states.to(bfloat16)` cast in `_run_layer`.
+        hidden = torch.randn(batch, seq_len, hidden_dim, dtype=torch.bfloat16)
+        position_ids = torch.arange(seq_len)[None, :]
+        attention_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool))[None]
+
+        out_a, _ = model_no_ckpt(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=[hidden, None],
+            use_cache=False,
+            fill_kv_cache=False,
+        )
+        out_b, _ = model_ckpt(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=[hidden, None],
+            use_cache=False,
+            fill_kv_cache=False,
+        )
+
+        assert out_a[0] is not None and out_b[0] is not None
+        # Identical op sequence + identical weights + dropout=0.0 ⇒ bit-equal.
+        assert torch.equal(out_a[0], out_b[0])
