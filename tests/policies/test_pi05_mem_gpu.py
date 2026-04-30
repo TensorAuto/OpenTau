@@ -196,7 +196,6 @@ def test_policy_end_to_end_cuda():
     # separate pad/un-pad logic. This is a plumbing smoke test, not a
     # realistic training setup.
     config = PI05MemConfig(
-        init_strategy="no_init",
         n_obs_steps=4,
         history_interval=1,
         chunk_size=10,
@@ -215,7 +214,7 @@ def test_policy_end_to_end_cuda():
     }
 
     # Supply finite stats so the Normalize module doesn't trip its
-    # infinity assertion (init_strategy="no_init" skips pretrained loads).
+    # infinity assertion (pretrained_path=None skips pretrained loads).
     # normalize_discrete_actions uses MIN_MAX, so min/max are also needed.
     dataset_stats = {
         "state": {
@@ -232,7 +231,7 @@ def test_policy_end_to_end_cuda():
         },
     }
 
-    print("[e2e] device=cuda dtype=bfloat16 init=no_init n_obs_steps=4")
+    print("[e2e] device=cuda dtype=bfloat16 pretrained_path=None n_obs_steps=4")
     policy = PI05MemPolicy(config, dataset_stats=dataset_stats).to(device="cuda", dtype=torch.bfloat16)
 
     batch_size = 1

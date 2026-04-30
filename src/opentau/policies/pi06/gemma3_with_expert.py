@@ -112,7 +112,6 @@ class Gemma3WithExpertConfig(PretrainedConfig):
         freeze_vision_encoder: bool = True,
         train_expert_only: bool = True,
         attention_implementation: str = "eager",
-        load_pretrained_gemma3: bool = False,
         discrete_action_vocab_size: int | None = None,
         dropout: float = 0.1,
         gradient_checkpointing: bool = False,
@@ -134,8 +133,6 @@ class Gemma3WithExpertConfig(PretrainedConfig):
                 pattern in ``forward()`` — π0.6 deliberately keeps the same
                 block-causal mask at every layer, so the SDPA call sees a
                 regular bool mask and takes the standard fused path.
-            load_pretrained_gemma3: Whether to pull pretrained Gemma 3 weights
-                from the Hub (only recommended when He-initializing the expert).
             discrete_action_vocab_size: FAST tokenizer vocab size.
             dropout: Dropout probability applied in the per-layer loop.
             gradient_checkpointing: Wrap each interleaved decoder-layer body in
@@ -150,7 +147,6 @@ class Gemma3WithExpertConfig(PretrainedConfig):
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
         self.attention_implementation = attention_implementation
-        self.load_pretrained_gemma3 = load_pretrained_gemma3
         self.discrete_action_vocab_size = discrete_action_vocab_size
         self.dropout = dropout
         self.gradient_checkpointing = gradient_checkpointing
@@ -279,10 +275,7 @@ class Gemma3WithExpertModel(PreTrainedModel):
         super().__init__(config=config)
         self.config = config
 
-        if config.load_pretrained_gemma3:
-            self.gemma3 = Gemma3ForConditionalGeneration.from_pretrained("google/gemma-3-4b-pt")
-        else:
-            self.gemma3 = Gemma3ForConditionalGeneration(config=config.gemma3_config)
+        self.gemma3 = Gemma3ForConditionalGeneration(config=config.gemma3_config)
 
         self.gemma_expert = GemmaForCausalLM(config=config.gemma_expert_config)
         # The expert shares embeddings nowhere — drop the unused token table.

@@ -33,7 +33,6 @@
         "proj_width": 1280,
         "num_steps": 5,
         "resize_imgs_with_padding": [448, 448],
-        "init_strategy": "expert_only_he_init",
         "attention_implementation": "eager",
         "freeze_vision_encoder": true,
         "train_expert_only": true,
