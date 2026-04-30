@@ -205,10 +205,10 @@ For each processed episode the script writes a JSON file at the ``subtask_path``
 .. code-block:: javascript
 
     [
-        {"time": 0.0,  "subtask": "approaching the marker on the table"},
-        {"time": 4.0,  "subtask": "grasping the marker"},
-        {"time": 6.0,  "subtask": "lifting and moving marker toward pot"},
-        {"time": 10.0, "subtask": "placing marker into the pot"}
+        {"time": 0.0,  "subtask": "approach the marker on the table"},
+        {"time": 4.0,  "subtask": "grasp the marker"},
+        {"time": 6.0,  "subtask": "lift and move marker toward pot"},
+        {"time": 10.0, "subtask": "place marker into the pot"}
     ]
 
 ``time`` is in seconds from the start of the episode.  When ``--write-response-column`` is

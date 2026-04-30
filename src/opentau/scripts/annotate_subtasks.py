@@ -111,13 +111,14 @@ Rules:
 - Only add a new entry when there is a clear change in the robot's behaviour.
 - Use timestamps taken directly from the list above (do not interpolate).
 - Keep descriptions concise (5–15 words).
+- Write each subtask as an imperative command (e.g. "reach toward the cup", not "reaching toward the cup").
 - Typical manipulation episodes have 2–6 phases.
 
 Return ONLY a valid JSON array. Example:
 [
-  {{"time": 0.0, "subtask": "reaching toward the red cup"}},
-  {{"time": 3.0, "subtask": "grasping the cup"}},
-  {{"time": 5.0, "subtask": "lifting cup and placing on tray"}}
+  {{"time": 0.0, "subtask": "reach toward the red cup"}},
+  {{"time": 3.0, "subtask": "grasp the cup"}},
+  {{"time": 5.0, "subtask": "lift cup and place on tray"}}
 ]"""
 
 
