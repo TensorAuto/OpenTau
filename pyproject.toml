@@ -147,12 +147,24 @@ libero = { git = "https://github.com/shuheng-liu/LIBERO" , branch = "master" }  
 
 # libero depends on gym, which depends on numpy 1.x, while rerun only supports urdf in v0.28 which requires numpy 2.x
 [tool.uv]
+# `extra-build-dependencies` (used below for egl-probe's CMake pin) is only
+# honored by uv >= 0.8.4. Without this guard, older uv silently ignores the key
+# and the build regresses to the original CMake 4 failure with a confusing
+# message. Bumping this floor errors loudly with a clear pointer instead.
+required-version = ">=0.8.4"
 conflicts = [
   [
     { extra = "libero" },
     { extra = "urdf" },
   ],
 ]
+# egl-probe (transitive via robomimic in the libero extra) ships an sdist whose
+# CMakeLists declares cmake_minimum_required(VERSION 2.8.12). CMake 4.0 dropped
+# pre-3.5 compatibility, so the build aborts on systems where the build's `cmake`
+# resolves to a 4.x binary. Pin cmake<4 in egl-probe's PEP 517 build isolation:
+# uv puts the build venv's bin at the front of PATH for the build subprocess,
+# so the bundled 3.x cmake wins regardless of what's installed system-wide.
+extra-build-dependencies = { egl-probe = ["cmake<4"] }
 
 [tool.setuptools.packages.find]
 where = ["src"]
