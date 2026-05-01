@@ -1766,15 +1766,23 @@ class LeRobotDataset(BaseDataset):
         current segment (clipped to the episode's last frame). Otherwise samples
         a timestamp uniformly in ``[t, t + 4s]`` (wall-clock) and converts it to
         a frame index, clipping to the current segment end and the episode end.
+
+        Episodes that have no ``segments`` annotation in ``episodes.jsonl``
+        skip segment-aware clipping entirely and fall back to a fixed
+        ~4-seconds-ahead subgoal frame (clipped to the episode end). This
+        keeps subgoal supervision available on legacy datasets that never
+        wrote per-episode segment boundaries.
         """
         ep_length = self.episode_lengths[ep_idx]
+        window_frames = int(round(4.0 * self.fps))
+        if "segments" not in self.meta.episodes[ep_idx]:
+            return min(frame_in_ep + window_frames, ep_length - 1)
         seg_idx = self._lookup_segment_index(ep_idx, frame_in_ep)
         seg_end_excl = self._segment_end_in_ep(ep_idx, seg_idx)
         upper = min(seg_end_excl, ep_length) - 1  # inclusive upper bound.
         upper = max(upper, frame_in_ep)
         if at_end_of_segment:
             return upper
-        window_frames = int(round(4.0 * self.fps))
         top = min(frame_in_ep + window_frames, upper)
         if top <= frame_in_ep:
             return frame_in_ep
@@ -1794,21 +1802,21 @@ class LeRobotDataset(BaseDataset):
         When the key IS present:
         - The at-end-of-segment vs uniform sampling roll happens ONCE per
           ``__getitem__`` call (shared across all camera slots); each slot
-          decodes the frame from its own video.
+          fetches the frame from its own source — video file for ``video``
+          dtype features, parquet row for ``image`` dtype features (the
+          latter share the same within-episode frame index).
         - Drop-roll is short-circuited here so a dropped subgoal skips the
-          per-camera ``_query_videos`` decode. When
+          per-camera decode/lookup. When
           ``self.enable_optional_key_dropout`` is False (e.g. the validation
           subset), drop is never rolled — the frame-selection randomness
           stays live because it's about which future frame to read, not
           masking.
-        - Episodes with no ``segments`` entry in ``episodes.jsonl`` still
-          skip sampling (no segment boundaries → nothing to clip against).
+        - Episodes with no ``segments`` entry in ``episodes.jsonl`` fall
+          back to a fixed ~4 s lookahead inside ``_sample_subgoal_frame``
+          rather than skipping subgoal loading, so legacy datasets without
+          segment annotations still get supervision.
         """
-        if self.num_cams <= 0 or len(self.meta.video_keys) == 0:
-            return {}
-        if "subgoals" not in self.meta.info:
-            return {}
-        if "segments" not in self.meta.episodes[ep_idx]:
+        if self.num_cams <= 0 or len(self.meta.camera_keys) == 0:
             return {}
         # Roll drop before any video decoding — at `subgoal_drop_prob=0.75` the
         # old ordering threw away 75% of decodes.
@@ -1818,13 +1826,21 @@ class LeRobotDataset(BaseDataset):
         at_end = bool(torch.rand(()) < self.subgoal_end_of_segment_prob)
         subgoal_frame = self._sample_subgoal_frame(ep_idx, frame_in_ep, at_end_of_segment=at_end)
         ts = subgoal_frame / self.fps
+        ep_start = int(self.episode_data_index["from"][self.epi2idx[ep_idx]].item())
         out: dict[str, torch.Tensor] = {}
         for k in range(self.num_cams):
-            vid_key = name_map.get(f"camera{k}")
-            if vid_key is None or vid_key not in self.meta.video_keys:
+            cam_key = name_map.get(f"camera{k}")
+            if cam_key is None:
                 continue
-            frames = self._query_videos({vid_key: np.array([ts])}, ep_idx)
-            out[f"subgoal{k}_raw"] = frames[vid_key]
+            if cam_key in self.meta.video_keys:
+                frames = self._query_videos({cam_key: np.array([ts])}, ep_idx)
+                out[f"subgoal{k}_raw"] = frames[cam_key]
+            elif cam_key in self.meta.image_keys:
+                # Image-dtype cameras are stored per-frame in the parquet
+                # rows of ``hf_dataset``. The within-episode index returned
+                # by ``_sample_subgoal_frame`` maps directly to the absolute
+                # row ``ep_start + subgoal_frame``.
+                out[f"subgoal{k}_raw"] = self.hf_dataset[ep_start + subgoal_frame][cam_key]
         return out
 
     def _add_padding_keys(self, item: dict, padding: dict[str, list[bool]]) -> dict:
