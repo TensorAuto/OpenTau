@@ -113,7 +113,14 @@ def test_val_split_ratio_no_warning_when_only_mixture_customized():
             datasets=[DatasetConfig(repo_id="foo/bar"), DatasetConfig(repo_id="baz/qux")],
             val_split_ratio=0.1,
         )
-    assert not any(issubclass(w.category, DeprecationWarning) for w in caught)
+    val_split_warnings = [
+        w
+        for w in caught
+        if issubclass(w.category, DeprecationWarning) and "val_split_ratio" in str(w.message)
+    ]
+    assert not val_split_warnings, (
+        f"Unexpected val_split_ratio DeprecationWarning(s): {[str(w.message) for w in val_split_warnings]}"
+    )
 
 
 def test_val_split_ratio_warns_when_child_overrides():
@@ -124,7 +131,10 @@ def test_val_split_ratio_warns_when_child_overrides():
             datasets=[DatasetConfig(repo_id="foo/bar", val_split_ratio=0.2)],
             val_split_ratio=0.1,
         )
-    assert any(issubclass(w.category, DeprecationWarning) for w in caught)
+    assert any(
+        issubclass(w.category, DeprecationWarning) and "val_split_ratio" in str(w.message)
+        for w in caught
+    )
 
 
 class TestDatasetConfigDataMapping:
