@@ -1318,7 +1318,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             pad_masks.append(metadata_masks)
             att_masks += [1] + [0] * (metadata_emb.shape[1] - 1)
 
-        prefix_end_indicator_ids = self.language_tokenizer.encode(";\n ", add_special_tokens=False)
+        prefix_end_indicator_ids = self.language_tokenizer.encode(":\n", add_special_tokens=False)
         prefix_end_tokens = torch.tensor(
             [prefix_end_indicator_ids] * bsize,
             device=lang_tokens.device,
