@@ -110,10 +110,12 @@ class DatasetConfig:
     # mixture-level value is the single source of truth and is applied uniformly
     # to every dataset in the mixture. This per-dataset field is retained only
     # so that pre-existing JSON configs continue to parse; setting it here has
-    # no effect on the actual split. A `DeprecationWarning` is emitted by
-    # `DatasetMixtureConfig.__post_init__` whenever a child's value diverges
-    # from the mixture's. Defaults to 0.05 (matches the mixture default).
-    val_split_ratio: float = 0.05
+    # no effect on the actual split. The default is `None` (sentinel meaning
+    # "user did not set this") so that
+    # `DatasetMixtureConfig.__post_init__` can distinguish a real per-dataset
+    # override from the unset default and only emit a `DeprecationWarning` in
+    # the former case.
+    val_split_ratio: float | None = None
 
     def __post_init__(self):
         """Validate dataset configuration and register custom mappings if provided."""
@@ -285,11 +287,11 @@ class DatasetMixtureConfig:
 
         # `DatasetConfig.val_split_ratio` is deprecated — the mixture-level
         # value is the single source of truth (read by `factory.make_dataset`).
-        # Warn loudly when a child config tries to override it so the user
-        # knows their per-dataset value is being ignored, mirroring the
-        # silently-overwriting behavior of previous versions.
+        # The per-dataset field defaults to `None`; warn only when the user
+        # actually set a value there, since that's the case where their input
+        # is being silently ignored.
         for dataset_cfg in self.datasets:
-            if dataset_cfg.val_split_ratio != self.val_split_ratio:
+            if dataset_cfg.val_split_ratio is not None:
                 warnings.warn(
                     "`DatasetConfig.val_split_ratio` is deprecated and ignored; "
                     "set `val_split_ratio` on `DatasetMixtureConfig` instead. "
