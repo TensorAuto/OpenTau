@@ -105,11 +105,6 @@ class DatasetConfig:
     robot_type: str | None = None
     control_mode: str | None = None
 
-    # Ratio of the dataset to be used for validation. Please specify a value.
-    # If `val_freq` is set to 0, a validation dataset will not be created and this value will be ignored.
-    # Defaults to 0.05.
-    val_split_ratio: float = 0.05
-
     def __post_init__(self):
         """Validate dataset configuration and register custom mappings if provided."""
         if (self.repo_id is None) == (self.vqa is None):
@@ -277,10 +272,6 @@ class DatasetMixtureConfig:
             value = getattr(self, name)
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"`{name}` must be in [0, 1], got {value}.")
-
-        # set the val_split_ratio for all datasets in the mixture
-        for dataset_cfg in self.datasets:
-            dataset_cfg.val_split_ratio = self.val_split_ratio
 
 
 @dataclass

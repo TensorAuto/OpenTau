@@ -169,7 +169,7 @@ def make_dataset(
 
     A train and validation dataset are returned if `train_cfg.val_freq` is greater than 0.
     The validation dataset is a subset of the train dataset, and is used for evaluation during training.
-    The validation dataset is created by splitting the train dataset into train and validation sets based on `cfg.val_split_ratio`.
+    The validation dataset is created by splitting the train dataset into train and validation sets based on `train_cfg.dataset_mixture.val_split_ratio`.
 
     Args:
         cfg (DatasetConfig): A DatasetConfig used to create a LeRobotDataset.
@@ -243,7 +243,7 @@ def make_dataset(
                 dataset.meta.stats[key][stats_type] = np.array(stats, dtype=np.float32)
 
     if train_cfg.val_freq > 0:
-        val_size = int(len(dataset) * cfg.val_split_ratio)
+        val_size = int(len(dataset) * train_cfg.dataset_mixture.val_split_ratio)
         train_size = len(dataset) - val_size
         train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
         train_dataset.meta = copy.deepcopy(dataset.meta)  # type: ignore[assignment]
