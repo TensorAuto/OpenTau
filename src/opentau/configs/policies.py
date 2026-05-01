@@ -34,6 +34,7 @@ from huggingface_hub import hf_hub_download
 from huggingface_hub.constants import CONFIG_NAME
 from huggingface_hub.errors import HfHubHTTPError
 
+from opentau.configs.refs import resolve_refs
 from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from opentau.optim.optimizers import OptimizerConfig
 from opentau.optim.schedulers import LRSchedulerConfig
@@ -95,16 +96,23 @@ def strip_deprecated_fields_from_json(path: Path) -> None:
 
 
 def load_stripped_config_to_tempfile(source_path: str | Path) -> Path:
-    """Read a config JSON, strip deprecated/removed fields in memory, write to
-    a fresh temp file, and return its path. Does not mutate ``source_path``.
+    """Read a config JSON, resolve ``$ref`` includes, strip deprecated/removed
+    fields in memory, write to a fresh temp file, and return its path. Does
+    not mutate ``source_path``.
 
     Use this on incoming config files (HF Hub downloads, user-supplied paths)
     before handing them to ``draccus.parse``: HF cache paths are symlinks into
     a content-addressed blob store, so an in-place rewrite would corrupt the
     cache; user-supplied paths shouldn't be mutated as a side effect of load.
+
+    See :mod:`opentau.configs.refs` for ``$ref`` semantics.
     """
-    with open(source_path) as f:
-        data = json.load(f)
+    data = resolve_refs(source_path)
+    if not isinstance(data, dict):
+        raise TypeError(
+            f"Top-level config at {source_path} must be a JSON object after "
+            f"$ref resolution, got {type(data).__name__}"
+        )
 
     _strip_keys(data, _STRIPPED_FIELDS)
 
@@ -130,10 +138,12 @@ def warn_deprecated_latency_fields(config_path: str | Path) -> None:
 
     Checks both top-level fields and fields nested under a ``"policy"`` key.
     Should be called before loading a config so users are aware the fields
-    will be ignored.
+    will be ignored. Resolves ``$ref`` includes so fields hidden behind a
+    reference are still detected.
     """
-    with open(config_path) as f:
-        data = json.load(f)
+    data = resolve_refs(config_path)
+    if not isinstance(data, dict):
+        return
 
     found = _find_present_keys(data, _DEPRECATED_LATENCY_FIELDS)
     if found:
@@ -152,10 +162,12 @@ def warn_removed_policy_fields(config_path: str | Path) -> None:
     Removed fields (e.g. ``init_strategy``) are stripped at load time so old
     saved configs continue to parse, but the user's explicit choice is dropped
     on the floor — surface that with a warning so they know to re-save and
-    update any downstream tooling that still emits the old key.
+    update any downstream tooling that still emits the old key. Resolves
+    ``$ref`` includes so fields hidden behind a reference are still detected.
     """
-    with open(config_path) as f:
-        data = json.load(f)
+    data = resolve_refs(config_path)
+    if not isinstance(data, dict):
+        return
 
     found = _find_present_keys(data, _REMOVED_POLICY_FIELDS)
     if found:

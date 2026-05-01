@@ -1,0 +1,5 @@
+{
+  "dataset_mixture": {
+    "$ref": "droid_mixture.json"
+  }
+}

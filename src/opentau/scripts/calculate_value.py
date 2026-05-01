@@ -55,6 +55,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from opentau.configs.default import DatasetMixtureConfig
+from opentau.configs.refs import resolve_refs_to_tempfile
 from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.factory import make_dataset
 from opentau.policies.factory import get_policy_class
@@ -128,11 +129,15 @@ def main(cfg: TrainPipelineConfig, args: argparse.Namespace):
 
     if dataset_mixture_path:
         logging.info(f"Overriding dataset: loading mixture from {dataset_mixture_path}")
-        mixture_cfg = draccus.parse(
-            config_class=DatasetMixtureConfig,
-            config_path=dataset_mixture_path,
-            args=[],
-        )
+        tmp_mixture = resolve_refs_to_tempfile(dataset_mixture_path)
+        try:
+            mixture_cfg = draccus.parse(
+                config_class=DatasetMixtureConfig,
+                config_path=str(tmp_mixture),
+                args=[],
+            )
+        finally:
+            tmp_mixture.unlink(missing_ok=True)
     else:
         logging.info("Using dataset mixture from train config")
         mixture_cfg = cfg.dataset_mixture
