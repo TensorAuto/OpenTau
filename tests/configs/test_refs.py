@@ -207,3 +207,99 @@ def test_train_pipeline_config_from_pretrained_with_ref(tmp_path):
         "dummy",
     ]
     assert list(cfg.dataset_mixture.weights) == [1.0, 1.0, 1.0]
+
+
+def _decompose_into_refs(full: dict, sections: tuple[str, ...], out_dir: Path) -> dict:
+    """Split each top-level ``section`` of ``full`` into its own file under
+    ``out_dir`` and replace it in ``full`` with a ``$ref``."""
+    decomposed = dict(full)
+    for section in sections:
+        _write(out_dir / f"{section}.json", full[section])
+        decomposed[section] = {REF_KEY: f"{section}.json"}
+    return decomposed
+
+
+def test_train_config_round_trip_matches_baseline(tmp_path):
+    """Regression: decomposing a real train config across multiple sub-files
+    via $ref must yield a TrainPipelineConfig structurally identical to the
+    one loaded from the original monolithic JSON.
+
+    Covers the sections most likely to bloat a real config (datasets, policy,
+    optimizer, scheduler, wandb), so the round-trip exercises ref resolution
+    against the full draccus type system — not just a contrived dict.
+    """
+    from opentau.configs.train import TrainPipelineConfig
+
+    artifact = Path("tests/artifacts/configs/train_config.json")
+    full = json.loads(artifact.read_text())
+
+    # Baseline: load the original monolithic config.
+    baseline_path = _write(tmp_path / "baseline.json", full)
+    baseline_cfg = TrainPipelineConfig.from_pretrained(pretrained_name_or_path=baseline_path)
+
+    # Decomposed: split several large sections into their own files.
+    decomposed_dir = tmp_path / "decomposed"
+    decomposed_dir.mkdir()
+    decomposed = _decompose_into_refs(
+        full,
+        sections=("dataset_mixture", "policy", "optimizer", "scheduler", "wandb"),
+        out_dir=decomposed_dir,
+    )
+    decomposed_path = _write(decomposed_dir / "train_config.json", decomposed)
+    decomposed_cfg = TrainPipelineConfig.from_pretrained(pretrained_name_or_path=decomposed_path)
+
+    # Compare via draccus.encode — the canonical serialized form. Equality at
+    # this level catches any field that drifted, not just spot-checks.
+    import draccus
+
+    assert draccus.encode(decomposed_cfg) == draccus.encode(baseline_cfg)
+
+
+def test_train_config_chained_refs_match_baseline(tmp_path):
+    """Regression: a $ref chain (parent → mid → leaf) for a real sub-config
+    resolves to the same value as inlining the leaf directly."""
+    from opentau.configs.train import TrainPipelineConfig
+
+    artifact = Path("tests/artifacts/configs/train_config.json")
+    full = json.loads(artifact.read_text())
+
+    baseline_path = _write(tmp_path / "baseline.json", full)
+    baseline_cfg = TrainPipelineConfig.from_pretrained(pretrained_name_or_path=baseline_path)
+
+    # Build a chain: train_config.json → mixture_ref.json → mixture_leaf.json
+    chain_dir = tmp_path / "chain"
+    chain_dir.mkdir()
+    _write(chain_dir / "mixture_leaf.json", full["dataset_mixture"])
+    _write(chain_dir / "mixture_ref.json", {REF_KEY: "mixture_leaf.json"})
+    chained = dict(full)
+    chained["dataset_mixture"] = {REF_KEY: "mixture_ref.json"}
+    chained_path = _write(chain_dir / "train_config.json", chained)
+
+    chained_cfg = TrainPipelineConfig.from_pretrained(pretrained_name_or_path=chained_path)
+
+    import draccus
+
+    assert draccus.encode(chained_cfg) == draccus.encode(baseline_cfg)
+
+
+def test_train_config_sibling_override_applies(tmp_path):
+    """Regression: a sibling key alongside a $ref must override the matching
+    field in the loaded content (deep-merge), not be silently ignored."""
+    from opentau.configs.train import TrainPipelineConfig
+
+    artifact = Path("tests/artifacts/configs/train_config.json")
+    full = json.loads(artifact.read_text())
+
+    # The artifact has weights = [1.0, 1.0, 1.0]; override the first weight to 7.0.
+    _write(tmp_path / "mixture.json", full["dataset_mixture"])
+    full["dataset_mixture"] = {REF_KEY: "mixture.json", "weights": [7.0, 1.0, 1.0]}
+    config_path = _write(tmp_path / "train_config.json", full)
+
+    cfg = TrainPipelineConfig.from_pretrained(pretrained_name_or_path=config_path)
+    assert list(cfg.dataset_mixture.weights) == [7.0, 1.0, 1.0]
+    # The non-overridden fields from the referenced file must still be present.
+    assert [d.repo_id or d.vqa for d in cfg.dataset_mixture.datasets] == [
+        "lerobot/droid_100",
+        "lerobot/aloha_mobile_cabinet",
+        "dummy",
+    ]
