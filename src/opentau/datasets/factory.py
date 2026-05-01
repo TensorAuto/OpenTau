@@ -78,10 +78,10 @@ from opentau.configs.default import DatasetConfig
 from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.dataset_mixture import WeightedDatasetMixture
 from opentau.datasets.lerobot_dataset import (
-    _CONTROL_MODE_WARNED,
     BaseDataset,
     LeRobotDataset,
     LeRobotDatasetMetadata,
+    suppress_control_mode_warning,
 )
 from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
 from opentau.datasets.transforms import ImageTransforms
@@ -202,8 +202,10 @@ def make_dataset(
         dt_mean, dt_std, dt_lower, dt_upper = resolve_delta_timestamps(train_cfg, cfg, ds_meta)
         # Suppress the "missing control_mode" warning when the user is
         # providing an explicit override — they already know it's missing.
+        # Ordering invariant: this MUST run before `LeRobotDataset(...)` below;
+        # once `__init__` emits the warning the suppression is a no-op.
         if cfg.control_mode is not None:
-            _CONTROL_MODE_WARNED.add(cfg.repo_id)
+            suppress_control_mode_warning(cfg.repo_id)
         dataset = LeRobotDataset(
             train_cfg,
             cfg.repo_id,
@@ -296,8 +298,14 @@ def _validate_metadata_requirements(cfg: TrainPipelineConfig, datasets: list, la
         return
 
     dataset_cfgs = cfg.dataset_mixture.datasets
-    if len(dataset_cfgs) != len(datasets):
-        return
+    # Invariant from `make_dataset_mixture`: each dataset_cfg appends exactly
+    # one entry to `datasets` (and at most one to `val_datasets`). Assert
+    # rather than silently skipping so a future refactor that breaks the
+    # invariant doesn't quietly bypass the require_non_empty_* checks.
+    assert len(dataset_cfgs) == len(datasets), (
+        f"dataset_cfgs ({len(dataset_cfgs)}) and {label} datasets ({len(datasets)}) "
+        "must be 1:1; cannot validate metadata requirements."
+    )
 
     bad: list[str] = []
     for dc, ds in zip(dataset_cfgs, datasets, strict=True):
