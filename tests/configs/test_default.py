@@ -132,8 +132,7 @@ def test_val_split_ratio_warns_when_child_overrides():
             val_split_ratio=0.1,
         )
     assert any(
-        issubclass(w.category, DeprecationWarning) and "val_split_ratio" in str(w.message)
-        for w in caught
+        issubclass(w.category, DeprecationWarning) and "val_split_ratio" in str(w.message) for w in caught
     )
 
 
