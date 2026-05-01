@@ -78,6 +78,7 @@ from opentau.configs.default import DatasetConfig
 from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.dataset_mixture import WeightedDatasetMixture
 from opentau.datasets.lerobot_dataset import (
+    _CONTROL_MODE_WARNED,
     BaseDataset,
     LeRobotDataset,
     LeRobotDatasetMetadata,
@@ -92,6 +93,24 @@ IMAGENET_STATS = {
     "mean": [[[0.485]], [[0.456]], [[0.406]]],  # (c,1,1)
     "std": [[[0.229]], [[0.224]], [[0.225]]],  # (c,1,1)
 }
+
+
+def _apply_metadata_overrides(dataset: BaseDataset, dataset_cfg: DatasetConfig) -> None:
+    """Apply ``robot_type`` / ``control_mode`` overrides from a DatasetConfig.
+
+    The overrides are written through to ``dataset.meta.info`` so downstream
+    consumers (``meta.control_mode``, ``_emit_optional_keys``) observe the
+    overridden value. ``None`` means "do not override"; any string value
+    (including ``""``) is applied.
+    """
+    if dataset_cfg.robot_type is not None:
+        dataset.meta.info["robot_type"] = dataset_cfg.robot_type
+    if dataset_cfg.control_mode is not None:
+        dataset.meta.info["control_mode"] = dataset_cfg.control_mode
+        # `LeRobotDataset.__init__` caches `self.control_mode = self.meta.control_mode`
+        # before this override fires, so refresh the attribute when present.
+        if hasattr(dataset, "control_mode"):
+            dataset.control_mode = dataset_cfg.control_mode
 
 
 def resolve_delta_timestamps(
@@ -181,6 +200,10 @@ def make_dataset(
     elif isinstance(cfg.repo_id, str):
         ds_meta = LeRobotDatasetMetadata(cfg.repo_id, root=cfg.root, revision=cfg.revision)
         dt_mean, dt_std, dt_lower, dt_upper = resolve_delta_timestamps(train_cfg, cfg, ds_meta)
+        # Suppress the "missing control_mode" warning when the user is
+        # providing an explicit override — they already know it's missing.
+        if cfg.control_mode is not None:
+            _CONTROL_MODE_WARNED.add(cfg.repo_id)
         dataset = LeRobotDataset(
             train_cfg,
             cfg.repo_id,
@@ -199,6 +222,8 @@ def make_dataset(
         )
     else:
         raise ValueError("Exactly one of `cfg.vqa` and `cfg.repo_id` should be provided.")
+
+    _apply_metadata_overrides(dataset, cfg)
 
     # TODO vqa datasets implement stats in original feature names, but camera_keys are standardized names
     if (
@@ -261,6 +286,38 @@ def _resolve_weights(
     return weights
 
 
+def _validate_metadata_requirements(cfg: TrainPipelineConfig, datasets: list, label: str) -> None:
+    """Raise if the mixture requires non-empty robot_type / control_mode and
+    any dataset (after overrides) still has an empty value.
+    """
+    require_robot = cfg.dataset_mixture.require_non_empty_robot_type
+    require_control = cfg.dataset_mixture.require_non_empty_control_mode
+    if not (require_robot or require_control):
+        return
+
+    dataset_cfgs = cfg.dataset_mixture.datasets
+    if len(dataset_cfgs) != len(datasets):
+        return
+
+    bad: list[str] = []
+    for dc, ds in zip(dataset_cfgs, datasets, strict=True):
+        info = ds.meta.info
+        identifier = dc.repo_id or dc.vqa or type(ds).__name__
+        if require_robot and not (info.get("robot_type") or ""):
+            bad.append(f"{identifier}: robot_type is empty")
+        if require_control and not (info.get("control_mode") or ""):
+            bad.append(f"{identifier}: control_mode is empty")
+
+    if bad:
+        raise ValueError(
+            "DatasetMixtureConfig requires non-empty metadata fields, but the "
+            f"following {label} datasets are missing values after overrides:\n  - "
+            + "\n  - ".join(bad)
+            + "\nSet `DatasetConfig.robot_type` / `DatasetConfig.control_mode` "
+            "on the offending dataset(s) to provide an override."
+        )
+
+
 def make_dataset_mixture(
     cfg: TrainPipelineConfig, return_advantage_input: bool = False
 ) -> Union[WeightedDatasetMixture, Tuple[WeightedDatasetMixture, WeightedDatasetMixture]]:
@@ -285,6 +342,10 @@ def make_dataset_mixture(
             val_datasets.append(res[1])
         else:
             datasets.append(res)
+
+    _validate_metadata_requirements(cfg, datasets, label="train")
+    if val_datasets:
+        _validate_metadata_requirements(cfg, val_datasets, label="val")
 
     train_weights = _resolve_weights(cfg.dataset_mixture.weights, datasets, label="train")
     train_mixture = WeightedDatasetMixture(cfg, datasets, train_weights, cfg.dataset_mixture.action_freq)

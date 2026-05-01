@@ -70,6 +70,14 @@ class DatasetConfig:
             Each value is a dictionary with 'mean' and 'std' arrays. Defaults to None.
         data_features_name_mapping: Optional mapping from dataset feature names to
             standard feature names. Defaults to None.
+        robot_type: Optional override for the dataset's ``robot_type`` metadata
+            field. When provided (including the empty string), takes precedence
+            over the value loaded from ``meta/info.json``. ``None`` (default)
+            leaves the loaded value untouched.
+        control_mode: Optional override for the dataset's ``control_mode``
+            metadata field. When provided (including the empty string), takes
+            precedence over the value loaded from ``meta/info.json``. ``None``
+            (default) leaves the loaded value untouched.
 
     Raises:
         ValueError: If both or neither of `repo_id` and `vqa` are set, or
@@ -90,6 +98,12 @@ class DatasetConfig:
 
     # optional standard data format mapping for the dataset if mapping is not already in standard_data_format_mapping.py
     data_features_name_mapping: dict[str, str] | None = None
+
+    # Optional overrides for the metadata fields read from `meta/info.json`.
+    # `None` means "do not override". Any string value (including "") is
+    # written through to `dataset.meta.info[...]` after the dataset is built.
+    robot_type: str | None = None
+    control_mode: str | None = None
 
     # Ratio of the dataset to be used for validation. Please specify a value.
     # If `val_freq` is set to 0, a validation dataset will not be created and this value will be ignored.
@@ -167,6 +181,14 @@ class DatasetMixtureConfig:
             aren't polluted by training-time augmentation. Subgoal *frame*
             sampling (end-of-segment vs. uniform in the next 4s) stays active
             either way; only the masking logic is gated.
+        require_non_empty_robot_type: If True, every dataset in the mixture
+            must have a non-empty ``robot_type`` after the optional
+            ``DatasetConfig.robot_type`` override has been applied. Defaults to
+            ``False`` (empty / missing values are allowed).
+        require_non_empty_control_mode: If True, every dataset in the mixture
+            must have a non-empty ``control_mode`` after the optional
+            ``DatasetConfig.control_mode`` override has been applied. Defaults
+            to ``False`` (empty / missing values are allowed).
 
     Note:
         Dropout rolls use the default torch RNG. PyTorch DataLoader workers
@@ -214,6 +236,13 @@ class DatasetMixtureConfig:
     # Default keeps validation deterministic-ish (no masking); subgoal frame
     # selection stays random either way.
     val_enable_optional_key_dropout: bool = False
+
+    # When True, require every dataset in the mixture to have a non-empty
+    # robot_type / control_mode after `DatasetConfig.{robot_type,control_mode}`
+    # overrides have been applied. Defaults are False — empty values are
+    # tolerated unless the caller opts in to the stricter check.
+    require_non_empty_robot_type: bool = False
+    require_non_empty_control_mode: bool = False
 
     def __post_init__(self):
         """Validate dataset mixture configuration."""
