@@ -35,10 +35,11 @@ from opentau.configs.default import DatasetMixtureConfig, EvalConfig, WandBConfi
 from opentau.configs.deployment import ServerConfig
 from opentau.configs.policies import (
     PreTrainedConfig,
-    load_stripped_config_to_tempfile,
+    _warn_deprecated_latency_fields_from_dict,
+    _warn_removed_policy_fields_from_dict,
+    load_resolved_config_dict,
     strip_deprecated_fields_from_json,
-    warn_deprecated_latency_fields,
-    warn_removed_policy_fields,
+    write_stripped_config_to_tempfile,
 )
 from opentau.envs.configs import EnvConfig
 from opentau.optim import OptimizerConfig
@@ -407,12 +408,15 @@ class TrainPipelineConfig(HubMixin):
         if config_file is None:
             return draccus.parse(cls, config_file, args=cli_args)
 
-        warn_deprecated_latency_fields(config_file)
-        warn_removed_policy_fields(config_file)
+        # Resolve $refs once and reuse — the warn helpers and the strip step
+        # would otherwise each walk the full ref tree from disk.
+        config_data = load_resolved_config_dict(config_file)
+        _warn_deprecated_latency_fields_from_dict(config_data, config_file)
+        _warn_removed_policy_fields_from_dict(config_data, config_file)
         # Strip deprecated/removed keys via a temp file rather than mutating the
         # source — `config_file` may be an HF cache symlink to a content-addressed
         # blob, where a rewrite would silently corrupt the cache.
-        tmp_config = load_stripped_config_to_tempfile(config_file)
+        tmp_config = write_stripped_config_to_tempfile(config_data)
         try:
             return draccus.parse(cls, str(tmp_config), args=cli_args)
         finally:

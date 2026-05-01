@@ -41,6 +41,12 @@ Rules:
 - Sibling keys are only allowed when the referenced content is a JSON object.
 - Currently only whole-file references are supported (no JSON-pointer
   fragments). HuggingFace Hub paths are not resolved here — only local files.
+- Path resolution follows symlinks (``Path.resolve()``). HuggingFace cache
+  snapshots are symlinks into a content-addressed blob directory, so a
+  relative ``$ref`` inside an HF-cached config will resolve against that
+  flat blob dir — not the snapshot dir — and is unlikely to find the target.
+  Use absolute paths or copy the config out of the HF cache before adding
+  ``$ref`` includes.
 """
 
 import copy
@@ -83,8 +89,12 @@ def resolve_refs_to_tempfile(config_path: str | Path) -> Path:
     """
     resolved = resolve_refs(config_path)
     fd, tmp_path = tempfile.mkstemp(prefix="opentau_refs_", suffix=".json")
-    with os.fdopen(fd, "w") as f:
-        json.dump(resolved, f, indent=4)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(resolved, f, indent=4)
+    except BaseException:
+        Path(tmp_path).unlink(missing_ok=True)
+        raise
     return Path(tmp_path)
 
 

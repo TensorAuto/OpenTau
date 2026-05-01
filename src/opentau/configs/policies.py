@@ -95,6 +95,49 @@ def strip_deprecated_fields_from_json(path: Path) -> None:
             json.dump(data, f, indent=4)
 
 
+def load_resolved_config_dict(source_path: str | Path) -> dict:
+    """Resolve ``$ref`` includes in a config JSON and return the resulting dict.
+
+    Centralizes both the ref resolution and the top-level shape check so that
+    every loader in this module fails consistently on a non-object root, and
+    so that a single ``from_pretrained`` call can resolve once and pass the
+    dict to all downstream helpers (warnings, stripping) instead of re-walking
+    the ref tree from disk for each.
+    """
+    data = resolve_refs(source_path)
+    if not isinstance(data, dict):
+        raise TypeError(
+            f"Top-level config at {source_path} must be a JSON object after "
+            f"$ref resolution, got {type(data).__name__}"
+        )
+    return data
+
+
+def write_stripped_config_to_tempfile(data: dict) -> Path:
+    """Strip deprecated/removed fields from ``data`` and write to a temp file.
+
+    ``data`` is treated as read-only (a defensive copy is made before
+    stripping). Caller owns the returned path and must unlink it.
+    """
+    # `_strip_keys` only ever deletes from the top-level dict and the "policy"
+    # sub-dict, so a two-level shallow copy is enough to keep the caller's
+    # dict untouched without paying for a deep copy of (potentially large)
+    # nested configs.
+    data = dict(data)
+    if isinstance(data.get("policy"), dict):
+        data["policy"] = dict(data["policy"])
+    _strip_keys(data, _STRIPPED_FIELDS)
+
+    fd, tmp_path = tempfile.mkstemp(prefix="opentau_config_", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=4)
+    except BaseException:
+        Path(tmp_path).unlink(missing_ok=True)
+        raise
+    return Path(tmp_path)
+
+
 def load_stripped_config_to_tempfile(source_path: str | Path) -> Path:
     """Read a config JSON, resolve ``$ref`` includes, strip deprecated/removed
     fields in memory, write to a fresh temp file, and return its path. Does
@@ -107,19 +150,7 @@ def load_stripped_config_to_tempfile(source_path: str | Path) -> Path:
 
     See :mod:`opentau.configs.refs` for ``$ref`` semantics.
     """
-    data = resolve_refs(source_path)
-    if not isinstance(data, dict):
-        raise TypeError(
-            f"Top-level config at {source_path} must be a JSON object after "
-            f"$ref resolution, got {type(data).__name__}"
-        )
-
-    _strip_keys(data, _STRIPPED_FIELDS)
-
-    fd, tmp_path = tempfile.mkstemp(prefix="opentau_config_", suffix=".json")
-    with os.fdopen(fd, "w") as f:
-        json.dump(data, f, indent=4)
-    return Path(tmp_path)
+    return write_stripped_config_to_tempfile(load_resolved_config_dict(source_path))
 
 
 def _find_present_keys(data: dict, keys: tuple[str, ...]) -> list[str]:
@@ -133,6 +164,29 @@ def _find_present_keys(data: dict, keys: tuple[str, ...]) -> list[str]:
     return found
 
 
+def _warn_deprecated_latency_fields_from_dict(data: dict, config_path: str | Path) -> None:
+    found = _find_present_keys(data, _DEPRECATED_LATENCY_FIELDS)
+    if found:
+        warnings.warn(
+            f"Config '{config_path}' contains deprecated latency fields that are no longer "
+            f"used and will be ignored: {', '.join(found)}. "
+            "Consider re-saving the config to remove them.",
+            DeprecationWarning,
+            stacklevel=4,
+        )
+
+
+def _warn_removed_policy_fields_from_dict(data: dict, config_path: str | Path) -> None:
+    found = _find_present_keys(data, _REMOVED_POLICY_FIELDS)
+    if found:
+        warnings.warn(
+            f"Config '{config_path}' contains fields that have been removed and will be "
+            f"ignored: {', '.join(found)}. Re-save the config to drop them.",
+            DeprecationWarning,
+            stacklevel=4,
+        )
+
+
 def warn_deprecated_latency_fields(config_path: str | Path) -> None:
     """Emit a deprecation warning if a config JSON file contains latency fields.
 
@@ -141,19 +195,7 @@ def warn_deprecated_latency_fields(config_path: str | Path) -> None:
     will be ignored. Resolves ``$ref`` includes so fields hidden behind a
     reference are still detected.
     """
-    data = resolve_refs(config_path)
-    if not isinstance(data, dict):
-        return
-
-    found = _find_present_keys(data, _DEPRECATED_LATENCY_FIELDS)
-    if found:
-        warnings.warn(
-            f"Config '{config_path}' contains deprecated latency fields that are no longer "
-            f"used and will be ignored: {', '.join(found)}. "
-            "Consider re-saving the config to remove them.",
-            DeprecationWarning,
-            stacklevel=3,
-        )
+    _warn_deprecated_latency_fields_from_dict(load_resolved_config_dict(config_path), config_path)
 
 
 def warn_removed_policy_fields(config_path: str | Path) -> None:
@@ -165,18 +207,7 @@ def warn_removed_policy_fields(config_path: str | Path) -> None:
     update any downstream tooling that still emits the old key. Resolves
     ``$ref`` includes so fields hidden behind a reference are still detected.
     """
-    data = resolve_refs(config_path)
-    if not isinstance(data, dict):
-        return
-
-    found = _find_present_keys(data, _REMOVED_POLICY_FIELDS)
-    if found:
-        warnings.warn(
-            f"Config '{config_path}' contains fields that have been removed and will be "
-            f"ignored: {', '.join(found)}. Re-save the config to drop them.",
-            DeprecationWarning,
-            stacklevel=3,
-        )
+    _warn_removed_policy_fields_from_dict(load_resolved_config_dict(config_path), config_path)
 
 
 @dataclass
@@ -438,12 +469,15 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         if config_file is None:
             return draccus.parse(cls, config_file, args=cli_overrides)
 
-        warn_deprecated_latency_fields(config_file)
-        warn_removed_policy_fields(config_file)
+        # Resolve $refs once and reuse — the warn helpers and the strip step
+        # would otherwise each walk the full ref tree from disk.
+        config_data = load_resolved_config_dict(config_file)
+        _warn_deprecated_latency_fields_from_dict(config_data, config_file)
+        _warn_removed_policy_fields_from_dict(config_data, config_file)
         # Strip deprecated/removed keys via a temp file rather than mutating the
         # source — `config_file` may be an HF cache symlink to a content-addressed
         # blob, where a rewrite would silently corrupt the cache.
-        tmp_config = load_stripped_config_to_tempfile(config_file)
+        tmp_config = write_stripped_config_to_tempfile(config_data)
         try:
             return draccus.parse(cls, str(tmp_config), args=cli_overrides)
         finally:
