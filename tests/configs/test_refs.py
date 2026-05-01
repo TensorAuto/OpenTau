@@ -93,6 +93,17 @@ def test_relative_paths_resolve_against_including_file(tmp_path):
     assert resolve_refs(outer) == {"x": {"shared": True}}
 
 
+def test_absolute_paths_resolve_to_their_target(tmp_path):
+    # An absolute $ref must resolve to that exact file, regardless of the
+    # including file's location. Useful for shared mixtures kept outside the
+    # config tree (e.g. /etc/opentau/datasets.json or a checkout-specific path).
+    target = _write(tmp_path / "shared.json", {"shared": True})
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    outer = _write(sub / "outer.json", {"x": {REF_KEY: str(target.resolve())}})
+    assert resolve_refs(outer) == {"x": {"shared": True}}
+
+
 def test_cycle_raises(tmp_path):
     a = tmp_path / "a.json"
     b = tmp_path / "b.json"
