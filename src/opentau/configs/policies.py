@@ -164,7 +164,11 @@ def _find_present_keys(data: dict, keys: tuple[str, ...]) -> list[str]:
     return found
 
 
-def _warn_deprecated_latency_fields_from_dict(data: dict, config_path: str | Path) -> None:
+def warn_deprecated_latency_fields_from_dict(data: dict, config_path: str | Path) -> None:
+    """Like :func:`warn_deprecated_latency_fields` but operating on an
+    already-resolved config dict, so callers that already loaded the dict
+    don't pay for a second ``$ref`` walk. ``config_path`` is used only for
+    the warning message."""
     found = _find_present_keys(data, _DEPRECATED_LATENCY_FIELDS)
     if found:
         warnings.warn(
@@ -176,7 +180,10 @@ def _warn_deprecated_latency_fields_from_dict(data: dict, config_path: str | Pat
         )
 
 
-def _warn_removed_policy_fields_from_dict(data: dict, config_path: str | Path) -> None:
+def warn_removed_policy_fields_from_dict(data: dict, config_path: str | Path) -> None:
+    """Like :func:`warn_removed_policy_fields` but operating on an
+    already-resolved config dict. ``config_path`` is used only for the
+    warning message."""
     found = _find_present_keys(data, _REMOVED_POLICY_FIELDS)
     if found:
         warnings.warn(
@@ -195,7 +202,7 @@ def warn_deprecated_latency_fields(config_path: str | Path) -> None:
     will be ignored. Resolves ``$ref`` includes so fields hidden behind a
     reference are still detected.
     """
-    _warn_deprecated_latency_fields_from_dict(load_resolved_config_dict(config_path), config_path)
+    warn_deprecated_latency_fields_from_dict(load_resolved_config_dict(config_path), config_path)
 
 
 def warn_removed_policy_fields(config_path: str | Path) -> None:
@@ -207,7 +214,7 @@ def warn_removed_policy_fields(config_path: str | Path) -> None:
     update any downstream tooling that still emits the old key. Resolves
     ``$ref`` includes so fields hidden behind a reference are still detected.
     """
-    _warn_removed_policy_fields_from_dict(load_resolved_config_dict(config_path), config_path)
+    warn_removed_policy_fields_from_dict(load_resolved_config_dict(config_path), config_path)
 
 
 @dataclass
@@ -472,8 +479,8 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         # Resolve $refs once and reuse — the warn helpers and the strip step
         # would otherwise each walk the full ref tree from disk.
         config_data = load_resolved_config_dict(config_file)
-        _warn_deprecated_latency_fields_from_dict(config_data, config_file)
-        _warn_removed_policy_fields_from_dict(config_data, config_file)
+        warn_deprecated_latency_fields_from_dict(config_data, config_file)
+        warn_removed_policy_fields_from_dict(config_data, config_file)
         # Strip deprecated/removed keys via a temp file rather than mutating the
         # source — `config_file` may be an HF cache symlink to a content-addressed
         # blob, where a rewrite would silently corrupt the cache.
