@@ -908,8 +908,11 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
         # Per-sample flag: True means the subgoal was dropped or absent.
         subgoal_is_pad = batch.get(
-            "subgoal_is_pad", torch.zeros(batch["state"].shape[0], dtype=torch.bool)
+            "subgoal_is_pad", torch.ones(batch["state"].shape[0], dtype=torch.bool)
         )  # (B,) bool or None
+
+        last_subgoal_img: Tensor | None = None
+        last_mask: Tensor | None = None
 
         for key in present_subgoal_img_keys:
             subgoal_img = batch[key]
@@ -931,16 +934,16 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
             subgoal_images.append(subgoal_img)
             subgoal_img_masks.append(mask)
+            last_subgoal_img = subgoal_img
+            last_mask = mask
 
-        # Create image features not present in the batch
-        # as fully 0 padded images.
-        for num_empty_cameras in range(len(missing_subgoal_img_keys)):
-            if num_empty_cameras >= self.config.empty_cameras:
-                break
-            subgoal_img = torch.ones_like(subgoal_img) * -1
-            mask = torch.zeros_like(mask)
-            subgoal_images.append(subgoal_img)
-            subgoal_img_masks.append(mask)
+        # Create image features not present in the batch as fully 0 padded images.
+        if last_subgoal_img is not None and last_mask is not None:
+            for num_empty_cameras in range(len(missing_subgoal_img_keys)):
+                if num_empty_cameras >= self.config.empty_cameras:
+                    break
+                subgoal_images.append(torch.ones_like(last_subgoal_img) * -1)
+                subgoal_img_masks.append(torch.zeros_like(last_mask))
 
         return subgoal_images, subgoal_img_masks
 
@@ -965,9 +968,9 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             batch.get("speed", torch.zeros(batch["state"].shape[0], dtype=torch.float32)),
             batch.get("quality", torch.zeros(batch["state"].shape[0], dtype=torch.float32)),
             batch.get("mistake", torch.zeros(batch["state"].shape[0], dtype=torch.float32)),
-            batch.get("speed_is_pad", torch.zeros(batch["state"].shape[0], dtype=torch.bool)),
-            batch.get("quality_is_pad", torch.zeros(batch["state"].shape[0], dtype=torch.bool)),
-            batch.get("mistake_is_pad", torch.zeros(batch["state"].shape[0], dtype=torch.bool)),
+            batch.get("speed_is_pad", torch.ones(batch["state"].shape[0], dtype=torch.bool)),
+            batch.get("quality_is_pad", torch.ones(batch["state"].shape[0], dtype=torch.bool)),
+            batch.get("mistake_is_pad", torch.ones(batch["state"].shape[0], dtype=torch.bool)),
             strict=True,
         ):
             segments = []
@@ -1157,6 +1160,19 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         att_masks = []
         bsize = lang_tokens.shape[0]
 
+        # Per-batch presence flags for the optional middle blocks. When all
+        # are False the prefix layout collapses to ``[videos | language |
+        # State: | state | ":\n" | Action: | discrete_actions]`` (the pi05
+        # all-dropped layout), so the surrounding separators around the
+        # optional blocks must be skipped or switched too — not just the
+        # content.
+        has_response = response_tokens is not None and response_masks is not None and response_masks.any()
+        has_subgoal = (
+            bool(subgoal_images) and bool(subgoal_img_masks) and any(m.any() for m in subgoal_img_masks)
+        )
+        has_metadata = metadata_tokens is not None and metadata_masks is not None and metadata_masks.any()
+        has_any_optional = bool(has_response or has_subgoal or has_metadata)
+
         for vid, vid_mask in zip(videos, vid_masks, strict=True):
             vid_emb = self.embed_video(vid)  # (B, num_video_tokens, vlm_hidden)
             vid_emb = vid_emb.to(dtype=_preferred_dtype())
@@ -1211,7 +1227,10 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         pad_masks.append(state_mask)
         att_masks += [0] * num_state_tokens  # full attention with video and language
 
-        state_end_indicator_ids = self.language_tokenizer.encode(", ", add_special_tokens=False)
+        # ``", "`` opens the optional middle list; ``":\n"`` terminates the
+        # state segment when no optional follows (matches pi05 layout).
+        state_end_str = ", " if has_any_optional else ":\n"
+        state_end_indicator_ids = self.language_tokenizer.encode(state_end_str, add_special_tokens=False)
         state_end_tokens = torch.tensor(
             [state_end_indicator_ids] * bsize,
             device=lang_tokens.device,
@@ -1228,96 +1247,119 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         pad_masks.append(state_end_mask)
         att_masks += [0] * num_state_end_embs
 
-        response_emb = self.paligemma_with_expert.embed_language_tokens(response_tokens)
-        response_emb_dim = response_emb.shape[-1]
-        response_emb = response_emb * math.sqrt(response_emb_dim)
-        embs.append(response_emb)
-        pad_masks.append(response_masks)
-        num_response_embs = response_emb.shape[1]
-        att_masks += [1] + [0] * (num_response_embs - 1)
+        # Only embed response when at least one sample in the batch has real
+        # response tokens. With response_drop_prob=1.0 all masks are False;
+        # skipping avoids a spurious causal-block boundary (att_masks=[1,...])
+        # that would corrupt cumsum for every subsequent token.
+        if has_response:
+            response_emb = self.paligemma_with_expert.embed_language_tokens(response_tokens)
+            response_emb_dim = response_emb.shape[-1]
+            response_emb = response_emb * math.sqrt(response_emb_dim)
+            embs.append(response_emb)
+            pad_masks.append(response_masks)
+            num_response_embs = response_emb.shape[1]
+            att_masks += [1] + [0] * (num_response_embs - 1)
 
-        subgoal_img_start_indicator_ids = self.language_tokenizer.encode(
-            "Subgoal: ", add_special_tokens=False
-        )
-        subgoal_img_start_tokens = torch.tensor(
-            [subgoal_img_start_indicator_ids] * bsize,
-            device=lang_tokens.device,
-            dtype=torch.long,
-        )
-        subgoal_img_start_emb = self.paligemma_with_expert.embed_language_tokens(subgoal_img_start_tokens)
-        subgoal_img_start_dim = subgoal_img_start_emb.shape[-1]
-        subgoal_img_start_emb = subgoal_img_start_emb * math.sqrt(subgoal_img_start_dim)
+        # Only embed the subgoal block (header + images + footer) when subgoal
+        # images are actually present. Unconditionally adding "Subgoal: "
+        # injects real (non-padded) spurious tokens into every prefix even
+        # with subgoal_drop_prob=1.0.
+        if has_subgoal:
+            # Per-sample availability: True iff at least one camera slot has a
+            # real subgoal image for that sample. In a mixed batch (some
+            # samples have subgoals, others don't), the "Subgoal: " header
+            # and trailing ", " footer must follow this same mask — otherwise
+            # pad-only samples would receive real (unmasked) indicator tokens
+            # with no image content behind them.
+            sample_has_subgoal = torch.stack([m.to(dtype=torch.bool) for m in subgoal_img_masks], dim=0).any(
+                dim=0
+            )
 
-        num_subgoal_img_start_embs = subgoal_img_start_emb.shape[1]
-        subgoal_img_start_mask = torch.ones(
-            bsize, num_subgoal_img_start_embs, dtype=torch.bool, device=lang_tokens.device
-        )
+            subgoal_img_start_indicator_ids = self.language_tokenizer.encode(
+                "Subgoal: ", add_special_tokens=False
+            )
+            subgoal_img_start_tokens = torch.tensor(
+                [subgoal_img_start_indicator_ids] * bsize,
+                device=lang_tokens.device,
+                dtype=torch.long,
+            )
+            subgoal_img_start_emb = self.paligemma_with_expert.embed_language_tokens(subgoal_img_start_tokens)
+            subgoal_img_start_dim = subgoal_img_start_emb.shape[-1]
+            subgoal_img_start_emb = subgoal_img_start_emb * math.sqrt(subgoal_img_start_dim)
 
-        embs.append(subgoal_img_start_emb)
-        pad_masks.append(subgoal_img_start_mask)
-        att_masks += [1] + [0] * (num_subgoal_img_start_embs - 1)
+            num_subgoal_img_start_embs = subgoal_img_start_emb.shape[1]
+            subgoal_img_start_mask = sample_has_subgoal[:, None].expand(bsize, num_subgoal_img_start_embs)
 
-        for (
-            subgoal_img,
-            subgoal_img_mask,
-        ) in zip(subgoal_images, subgoal_img_masks, strict=True):
-            subgoal_img_emb = self.paligemma_with_expert.embed_image(subgoal_img)
-            subgoal_img_emb = subgoal_img_emb.to(dtype=_preferred_dtype())
+            embs.append(subgoal_img_start_emb)
+            pad_masks.append(subgoal_img_start_mask)
+            att_masks += [1] + [0] * (num_subgoal_img_start_embs - 1)
 
-            # image embeddings don't need to be unnormalized because `fix/lerobot_openpi` branch of huggingface
-            # already removed the normalization inside PaliGemma
+            for (
+                subgoal_img,
+                subgoal_img_mask,
+            ) in zip(subgoal_images, subgoal_img_masks, strict=True):
+                subgoal_img_emb = self.paligemma_with_expert.embed_image(subgoal_img)
+                subgoal_img_emb = subgoal_img_emb.to(dtype=_preferred_dtype())
 
-            bsize, num_subgoal_img_embs = subgoal_img_emb.shape[:2]
-            subgoal_img_mask = subgoal_img_mask[:, None].expand(bsize, num_subgoal_img_embs)
+                # image embeddings don't need to be unnormalized because `fix/lerobot_openpi` branch of huggingface
+                # already removed the normalization inside PaliGemma
 
-            embs.append(subgoal_img_emb)
-            pad_masks.append(subgoal_img_mask)
+                bsize, num_subgoal_img_embs = subgoal_img_emb.shape[:2]
+                subgoal_img_mask = subgoal_img_mask[:, None].expand(bsize, num_subgoal_img_embs)
 
-            # Create attention masks so that image tokens attend to each other
-            att_masks += [1] + [0] * (num_subgoal_img_embs - 1)
+                embs.append(subgoal_img_emb)
+                pad_masks.append(subgoal_img_mask)
 
-        subgoal_img_end_indicator_ids = self.language_tokenizer.encode(", ", add_special_tokens=False)
-        subgoal_img_end_tokens = torch.tensor(
-            [subgoal_img_end_indicator_ids] * bsize,
-            device=lang_tokens.device,
-            dtype=torch.long,
-        )
-        subgoal_img_end_emb = self.paligemma_with_expert.embed_language_tokens(subgoal_img_end_tokens)
-        subgoal_img_end_dim = subgoal_img_end_emb.shape[-1]
-        subgoal_img_end_emb = subgoal_img_end_emb * math.sqrt(subgoal_img_end_dim)
+                # Create attention masks so that image tokens attend to each other
+                att_masks += [1] + [0] * (num_subgoal_img_embs - 1)
 
-        num_subgoal_img_end_embs = subgoal_img_end_emb.shape[1]
-        subgoal_img_end_mask = torch.ones(
-            bsize, num_subgoal_img_end_embs, dtype=torch.bool, device=lang_tokens.device
-        )
+            subgoal_img_end_indicator_ids = self.language_tokenizer.encode(", ", add_special_tokens=False)
+            subgoal_img_end_tokens = torch.tensor(
+                [subgoal_img_end_indicator_ids] * bsize,
+                device=lang_tokens.device,
+                dtype=torch.long,
+            )
+            subgoal_img_end_emb = self.paligemma_with_expert.embed_language_tokens(subgoal_img_end_tokens)
+            subgoal_img_end_dim = subgoal_img_end_emb.shape[-1]
+            subgoal_img_end_emb = subgoal_img_end_emb * math.sqrt(subgoal_img_end_dim)
 
-        embs.append(subgoal_img_end_emb)
-        pad_masks.append(subgoal_img_end_mask)
-        att_masks += [0] * num_subgoal_img_end_embs
+            num_subgoal_img_end_embs = subgoal_img_end_emb.shape[1]
+            subgoal_img_end_mask = sample_has_subgoal[:, None].expand(bsize, num_subgoal_img_end_embs)
 
-        metadata_emb = self.paligemma_with_expert.embed_language_tokens(metadata_tokens)
-        metadata_emb_dim = metadata_emb.shape[-1]
-        metadata_emb = metadata_emb * math.sqrt(metadata_emb_dim)
-        embs.append(metadata_emb)
-        pad_masks.append(metadata_masks)
-        att_masks += [1] + [0] * (metadata_emb.shape[1] - 1)
+            embs.append(subgoal_img_end_emb)
+            pad_masks.append(subgoal_img_end_mask)
+            att_masks += [0] * num_subgoal_img_end_embs
 
-        prefix_end_indicator_ids = self.language_tokenizer.encode(";\n ", add_special_tokens=False)
-        prefix_end_tokens = torch.tensor(
-            [prefix_end_indicator_ids] * bsize,
-            device=lang_tokens.device,
-            dtype=torch.long,
-        )
-        prefix_end_emb = self.paligemma_with_expert.embed_language_tokens(prefix_end_tokens)
-        prefix_end_dim = prefix_end_emb.shape[-1]
-        prefix_end_emb = prefix_end_emb * math.sqrt(prefix_end_dim)
+        # Only embed metadata when at least one sample has real metadata tokens.
+        if has_metadata:
+            metadata_emb = self.paligemma_with_expert.embed_language_tokens(metadata_tokens)
+            metadata_emb_dim = metadata_emb.shape[-1]
+            metadata_emb = metadata_emb * math.sqrt(metadata_emb_dim)
+            embs.append(metadata_emb)
+            pad_masks.append(metadata_masks)
+            att_masks += [1] + [0] * (metadata_emb.shape[1] - 1)
 
-        num_prefix_end_embs = prefix_end_emb.shape[1]
-        prefix_end_mask = torch.ones(bsize, num_prefix_end_embs, dtype=torch.bool, device=lang_tokens.device)
+        # Prefix-end terminates the optional middle list; skip it entirely
+        # when there is no list to terminate.
+        if has_any_optional:
+            prefix_end_indicator_ids = self.language_tokenizer.encode(";\n ", add_special_tokens=False)
+            prefix_end_tokens = torch.tensor(
+                [prefix_end_indicator_ids] * bsize,
+                device=lang_tokens.device,
+                dtype=torch.long,
+            )
+            prefix_end_emb = self.paligemma_with_expert.embed_language_tokens(prefix_end_tokens)
+            prefix_end_dim = prefix_end_emb.shape[-1]
+            prefix_end_emb = prefix_end_emb * math.sqrt(prefix_end_dim)
 
-        embs.append(prefix_end_emb)
-        pad_masks.append(prefix_end_mask)
-        att_masks += [0] * num_prefix_end_embs
+            num_prefix_end_embs = prefix_end_emb.shape[1]
+            prefix_end_mask = torch.ones(
+                bsize, num_prefix_end_embs, dtype=torch.bool, device=lang_tokens.device
+            )
+
+            embs.append(prefix_end_emb)
+            pad_masks.append(prefix_end_mask)
+            att_masks += [0] * num_prefix_end_embs
 
         if discrete_actions is not None:
             discrete_action_start_indicator_ids = self.language_tokenizer.encode(
@@ -1341,7 +1383,12 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
 
             embs.append(discrete_action_start_emb)
             pad_masks.append(discrete_action_start_mask)
-            att_masks += [1] + [0] * (num_discrete_action_start_embs - 1)
+            # Each indicator token is its own causal block (matches pi05).
+            # The previous ``[1, 0, ...]`` form made the indicator one
+            # bidirectional block, which shifted every following token's
+            # cumsum by ``num_discrete_action_start_embs - 1`` and silently
+            # changed the prefix_out boundary the discrete-action CE reads.
+            att_masks += [1] * num_discrete_action_start_embs
 
             discrete_action_emb = self.paligemma_with_expert.embed_discrete_actions(discrete_actions)
             embs.append(discrete_action_emb.to(dtype=_preferred_dtype()))
@@ -1487,7 +1534,14 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         vlm_2d_attention_mask = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         vlm_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
-        num_cross_att_tokens = prefix_embs.shape[1] - self.config.discrete_action_max_length
+        # Exclude both the "Action: " indicator and the discrete-action tokens
+        # from cross-attention so the action expert sees the same prefix length
+        # at train and inference (at inference, neither is in the prefix).
+        # Matches pi05's discrete_action_indicator_max_length logic.
+        _action_indicator_len = len(self.language_tokenizer.encode("Action: ", add_special_tokens=False))
+        num_cross_att_tokens = (
+            prefix_embs.shape[1] - _action_indicator_len - self.config.discrete_action_max_length
+        )
 
         (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
             attention_mask=vlm_2d_attention_mask,
@@ -1525,9 +1579,10 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             n_cross_att_tokens=num_cross_att_tokens,
             cross_att_pad_masks=prefix_pad_masks[:, :num_cross_att_tokens],
         )
-        prefix_offsets = torch.sum(prefix_pad_masks[:, : -self.config.discrete_action_max_length], dim=-1)[
-            :, None
-        ]
+        prefix_offsets = torch.sum(
+            prefix_pad_masks[:, : -(_action_indicator_len + self.config.discrete_action_max_length)],
+            dim=-1,
+        )[:, None]
         action_expert_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
         assert past_key_values is not None

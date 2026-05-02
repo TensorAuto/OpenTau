@@ -187,7 +187,10 @@ class TestPI07LowLevelPlannerIntegration:
         if inference_mode:
             prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
         else:
-            prefix_offsets = torch.sum(prefix_pad_masks[:, :-DISCRETE_ACTION_MAX_LENGTH], dim=-1)[:, None]
+            action_lead = self._indicator_lens(tokenizer)["action_lead"]
+            prefix_offsets = torch.sum(
+                prefix_pad_masks[:, : -(action_lead + DISCRETE_ACTION_MAX_LENGTH)], dim=-1
+            )[:, None]
 
         expected_suffix = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
         assert torch.equal(suffix_position_ids, expected_suffix)
@@ -208,12 +211,14 @@ class TestPI07LowLevelPlannerIntegration:
         prefix_pad_masks,
         suffix_pad_masks,
         suffix_att_masks,
+        tokenizer,
         inference_mode=False,
     ):
         if inference_mode:
             num_cross = prefix_pad_masks.shape[1]
         else:
-            num_cross = prefix_pad_masks.shape[1] - DISCRETE_ACTION_MAX_LENGTH
+            action_lead = self._indicator_lens(tokenizer)["action_lead"]
+            num_cross = prefix_pad_masks.shape[1] - action_lead - DISCRETE_ACTION_MAX_LENGTH
 
         expected = make_att_2d_masks(
             suffix_pad_masks,
@@ -374,6 +379,7 @@ class TestPI07LowLevelPlannerIntegration:
             captured["prefix_pad_masks"],
             captured["suffix_pad_masks"],
             captured["suffix_att_masks"],
+            tokenizer,
         )
 
         assert isinstance(loss, dict)
@@ -481,6 +487,7 @@ class TestPI07LowLevelPlannerIntegration:
             captured_infer["prefix_pad_masks"],
             captured_infer["suffix_pad_masks"],
             captured_infer["suffix_att_masks"],
+            tokenizer,
             inference_mode=True,
         )
 
