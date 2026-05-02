@@ -1024,12 +1024,13 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         │      └────────────── video (V-JEPA2)                 │
         └───────────────────────────────────────────────────┘
 
-    The VLM processes the same prefix layout as :meth:`embed_prefix` (videos, language,
-    ``State:``, state, commas, response, ``Subgoal:``, subgoal images, ``";\n "``,
-    optional ``Action:``/discrete, metadata). The action expert receives
-    the prefix KV-cache (detached for Knowledge Insulation) together with
-    noisy continuous actions and flow-matching timestep embeddings to
-    predict the velocity field.
+    The VLM processes the same prefix layout as :meth:`embed_prefix` (videos,
+    language, ``State:``, state, comma, response, metadata, ``";\n "``,
+    ``Subgoal:``, subgoal images, comma, optional ``Action:``/discrete) — the
+    image-goal block sits after all text per π0.7 paper Fig. 19. The action
+    expert receives the prefix KV-cache (detached for Knowledge Insulation)
+    together with noisy continuous actions and flow-matching timestep
+    embeddings to predict the velocity field.
     """
 
     def __init__(self, config: PI07lowlevelPlannerConfig, discrete_action_vocab_size: int | None = None):
@@ -1111,20 +1112,28 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Embed all prefix modalities and build the 1-D attention pattern.
 
-        Concatenation order:
+        Concatenation order — matches π0.7 paper Fig. 19's "image goals come
+        after the text prompt" rule (subgoal block sits at the tail, just
+        before the optional discrete-action block):
 
-        ``[videos | language | State: | state(T) | ", " | response |
-        Subgoal: | subgoal_images… | ", " | metadata | ";\\n " |
+        ``[videos | language | State: | state(T) | ", " | response | metadata |
+        ";\\n " | Subgoal: | subgoal_images… | ", " |
         ("Action:" + discrete_actions only when training)]``
 
-        Attention pattern (via ``att_masks`` cumsums):
-            - Video + language: bidirectional (``0``).
-            - ``State:``, projected state timestep tokens, comma after state: bidirectional (``0``).
-            - Response spans: prefix-LM style block opening (``[1, 0, …]`` inside the segment).
-            - ``Subgoal:``: new bidirectional block (``[1, 0, …]``).
-            - Subgoal image patches per camera: bidirectional blocks (``[1, 0, …]``).
-            - Commas/metadata / ``";\\n "``: mostly continued prefix blocks (see code).
-            - Discrete actions (training): causal ``1`` per timestep after ``Action:``.
+        Attention pattern (via ``att_masks`` cumsums) — paper §VI.B says
+        "observation tokens and subgoal image tokens use bidirectional
+        attention within themselves … the following text tokens use causal
+        attention":
+
+            - Video patches: one bidirectional block (``[0] * N``).
+            - All text spans (language, ``State:``, comma, response, metadata,
+              ``";\\n "``, ``Subgoal:``, trailing comma, ``Action:``): one causal
+              block per token (``[1] * N``).
+            - State tokens (per-history-step linear projections): one
+              bidirectional block (``[1] + [0] * (T-1)``).
+            - Subgoal image patches: one bidirectional block per camera
+              (``[1] + [0] * (N-1)``).
+            - Discrete-action FAST tokens (training only): causal ``[1] * N``.
 
         Args:
             videos: List of video tensors, each ``(B, T, C, H, W)``.
@@ -1176,8 +1185,11 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
 
+        # Per π0.7 paper §VI.B: "The following text tokens use causal attention"
+        # — language tokens open one causal block per token after the bidirectional
+        # video prefix (same fix as PR #235 for π0.6).
         num_lang_embs = lang_emb.shape[1]
-        att_masks += [0] * num_lang_embs
+        att_masks += [1] * num_lang_embs
 
         state_start_indicator_ids = self.language_tokenizer.encode("State: ", add_special_tokens=False)
         state_start_tokens = torch.tensor(
@@ -1196,7 +1208,8 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
 
         embs.append(state_start_emb)
         pad_masks.append(state_start_mask)
-        att_masks += [0] * num_state_start_embs
+        # "State: " indicator is text → causal per paper §VI.B.
+        att_masks += [1] * num_state_start_embs
 
         # Project each timestep's state into a separate VLM token
         # state: (B, T, max_state_dim) -> state_emb: (B, T, vlm_hidden_size)
@@ -1209,7 +1222,12 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
 
         embs.append(state_emb)
         pad_masks.append(state_mask)
-        att_masks += [0] * num_state_tokens  # full attention with video and language
+        # State tokens form their own bidirectional block (one per history step).
+        # The paper §VI.B describes state as a linear-projection embedding that is
+        # treated as an individual token, but does not classify it as text-causal,
+        # so we keep the historic bidirectional-among-state behaviour while opening
+        # a fresh block so it does not bleed into the now-causal "State: " indicator.
+        att_masks += [1] + [0] * (num_state_tokens - 1)
 
         state_end_indicator_ids = self.language_tokenizer.encode(", ", add_special_tokens=False)
         state_end_tokens = torch.tensor(
@@ -1226,16 +1244,50 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
 
         embs.append(state_end_emb)
         pad_masks.append(state_end_mask)
-        att_masks += [0] * num_state_end_embs
+        # ", " separator after state is text → causal per paper §VI.B.
+        att_masks += [1] * num_state_end_embs
 
         response_emb = self.paligemma_with_expert.embed_language_tokens(response_tokens)
         response_emb_dim = response_emb.shape[-1]
         response_emb = response_emb * math.sqrt(response_emb_dim)
         embs.append(response_emb)
         pad_masks.append(response_masks)
+        # Response (Subtask) is text → fully causal per paper §VI.B
+        # (was prefix-LM `[1] + [0]*(N-1)` — only the first token was causal).
         num_response_embs = response_emb.shape[1]
-        att_masks += [1] + [0] * (num_response_embs - 1)
+        att_masks += [1] * num_response_embs
 
+        metadata_emb = self.paligemma_with_expert.embed_language_tokens(metadata_tokens)
+        metadata_emb_dim = metadata_emb.shape[-1]
+        metadata_emb = metadata_emb * math.sqrt(metadata_emb_dim)
+        embs.append(metadata_emb)
+        pad_masks.append(metadata_masks)
+        # Metadata is text → causal per paper §VI.B.
+        att_masks += [1] * metadata_emb.shape[1]
+
+        prefix_end_indicator_ids = self.language_tokenizer.encode(";\n ", add_special_tokens=False)
+        prefix_end_tokens = torch.tensor(
+            [prefix_end_indicator_ids] * bsize,
+            device=lang_tokens.device,
+            dtype=torch.long,
+        )
+        prefix_end_emb = self.paligemma_with_expert.embed_language_tokens(prefix_end_tokens)
+        prefix_end_dim = prefix_end_emb.shape[-1]
+        prefix_end_emb = prefix_end_emb * math.sqrt(prefix_end_dim)
+
+        num_prefix_end_embs = prefix_end_emb.shape[1]
+        prefix_end_mask = torch.ones(bsize, num_prefix_end_embs, dtype=torch.bool, device=lang_tokens.device)
+
+        embs.append(prefix_end_emb)
+        pad_masks.append(prefix_end_mask)
+        # ";\n " separator is text → causal per paper §VI.B.
+        att_masks += [1] * num_prefix_end_embs
+
+        # Per π0.7 paper Fig. 19 caption: "When image goals are present, we include
+        # them as an additional block-causal bidirectional block, **after the text
+        # prompt**." So the subgoal block sits at the tail of the prefix, after all
+        # text (lang / state / response / metadata / ";\n ") and before the
+        # training-only discrete-action block.
         subgoal_img_start_indicator_ids = self.language_tokenizer.encode(
             "Subgoal: ", add_special_tokens=False
         )
@@ -1255,7 +1307,8 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
 
         embs.append(subgoal_img_start_emb)
         pad_masks.append(subgoal_img_start_mask)
-        att_masks += [1] + [0] * (num_subgoal_img_start_embs - 1)
+        # "Subgoal: " indicator is text → causal per paper §VI.B.
+        att_masks += [1] * num_subgoal_img_start_embs
 
         for (
             subgoal_img,
@@ -1273,7 +1326,8 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             embs.append(subgoal_img_emb)
             pad_masks.append(subgoal_img_mask)
 
-            # Create attention masks so that image tokens attend to each other
+            # Subgoal images: bidirectional within themselves, can attend everything
+            # earlier in the prefix (paper §VI.B). One bidirectional block per camera.
             att_masks += [1] + [0] * (num_subgoal_img_embs - 1)
 
         subgoal_img_end_indicator_ids = self.language_tokenizer.encode(", ", add_special_tokens=False)
@@ -1293,31 +1347,8 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
 
         embs.append(subgoal_img_end_emb)
         pad_masks.append(subgoal_img_end_mask)
-        att_masks += [0] * num_subgoal_img_end_embs
-
-        metadata_emb = self.paligemma_with_expert.embed_language_tokens(metadata_tokens)
-        metadata_emb_dim = metadata_emb.shape[-1]
-        metadata_emb = metadata_emb * math.sqrt(metadata_emb_dim)
-        embs.append(metadata_emb)
-        pad_masks.append(metadata_masks)
-        att_masks += [1] + [0] * (metadata_emb.shape[1] - 1)
-
-        prefix_end_indicator_ids = self.language_tokenizer.encode(";\n ", add_special_tokens=False)
-        prefix_end_tokens = torch.tensor(
-            [prefix_end_indicator_ids] * bsize,
-            device=lang_tokens.device,
-            dtype=torch.long,
-        )
-        prefix_end_emb = self.paligemma_with_expert.embed_language_tokens(prefix_end_tokens)
-        prefix_end_dim = prefix_end_emb.shape[-1]
-        prefix_end_emb = prefix_end_emb * math.sqrt(prefix_end_dim)
-
-        num_prefix_end_embs = prefix_end_emb.shape[1]
-        prefix_end_mask = torch.ones(bsize, num_prefix_end_embs, dtype=torch.bool, device=lang_tokens.device)
-
-        embs.append(prefix_end_emb)
-        pad_masks.append(prefix_end_mask)
-        att_masks += [0] * num_prefix_end_embs
+        # ", " separator after subgoal images is text → causal per paper §VI.B.
+        att_masks += [1] * num_subgoal_img_end_embs
 
         if discrete_actions is not None:
             discrete_action_start_indicator_ids = self.language_tokenizer.encode(
@@ -1341,7 +1372,8 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
 
             embs.append(discrete_action_start_emb)
             pad_masks.append(discrete_action_start_mask)
-            att_masks += [1] + [0] * (num_discrete_action_start_embs - 1)
+            # "Action: " indicator is text → causal per paper §VI.B.
+            att_masks += [1] * num_discrete_action_start_embs
 
             discrete_action_emb = self.paligemma_with_expert.embed_discrete_actions(discrete_actions)
             embs.append(discrete_action_emb.to(dtype=_preferred_dtype()))
