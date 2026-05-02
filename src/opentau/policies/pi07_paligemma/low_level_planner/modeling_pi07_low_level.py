@@ -1121,6 +1121,13 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         without optional content the state-end already serves as the separator
         before ``"Action: "``, matching pi05's continuous-state layout.
 
+        Note on byte-equivalence with pi05: dropping all optional middle
+        blocks is necessary but not sufficient. pi05's continuous-state path
+        emits exactly one state token, so byte-equivalence further requires
+        ``n_obs_steps == 1`` (i.e. ``state.shape[1] == 1``). With
+        ``n_obs_steps>1`` pi07 emits ``T`` state tokens and the prefix
+        length will differ even when every optional is dropped.
+
         Attention pattern (via ``att_masks`` cumsums):
             - Video + language: bidirectional (``0``).
             - ``State:``, projected state timestep tokens, state-end separator: bidirectional (``0``).
@@ -1256,7 +1263,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         # With response_drop_prob=1.0 all masks are False; skipping avoids a spurious
         # causal-block boundary (att_masks=[1,...]) that would corrupt cumsum for every
         # subsequent token.
-        if response_tokens is not None and response_masks is not None and response_masks.any():
+        if has_response:
             response_emb = self.paligemma_with_expert.embed_language_tokens(response_tokens)
             response_emb_dim = response_emb.shape[-1]
             response_emb = response_emb * math.sqrt(response_emb_dim)
@@ -1268,7 +1275,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         # Only embed the subgoal block (header + images + footer) when subgoal images are
         # actually present. Unconditionally adding "Subgoal: " injects real (non-padded)
         # spurious tokens into every prefix even with subgoal_drop_prob=1.0.
-        if subgoal_images and any(mask.any() for mask in subgoal_img_masks):
+        if has_subgoal:
             # Per-sample availability: True iff at least one camera slot
             # has a real subgoal image for that sample. In a mixed batch
             # (some samples have subgoals, others don't), the "Subgoal: "
@@ -1336,7 +1343,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             att_masks += [0] * num_subgoal_img_end_embs
 
         # Only embed metadata when at least one sample has real metadata tokens.
-        if metadata_tokens is not None and metadata_masks is not None and metadata_masks.any():
+        if has_metadata:
             metadata_emb = self.paligemma_with_expert.embed_language_tokens(metadata_tokens)
             metadata_emb_dim = metadata_emb.shape[-1]
             metadata_emb = metadata_emb * math.sqrt(metadata_emb_dim)
