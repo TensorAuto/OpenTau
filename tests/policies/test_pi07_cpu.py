@@ -634,7 +634,12 @@ class TestEmbedPrefixConditionalGuards:
 
     def test_all_optional_blocks_absent_skips_emission(self):
         """All-False response_masks + no subgoal_images + all-False metadata_masks →
-        the prefix collapses to ``videos + lang + State: + state + ", " + ";\\n "``.
+        the prefix collapses to ``videos + lang + State: + state + ":\\n"``.
+
+        With ``has_any_optional == False`` the state-end separator collapses
+        from ``", "`` to ``":\\n"`` (same fake-tokenizer length: 2 tokens) and
+        the trailing ``";\\n "`` prefix-end is omitted entirely so it cannot
+        dangle as a spurious separator before ``"Action: "``.
         """
         method = _embed_prefix_method()
         fake = _make_fake_flow_matching()
@@ -658,12 +663,11 @@ class TestEmbedPrefixConditionalGuards:
         #   lang:           3 (prompt_len)
         #   "State: ":      2
         #   state(T=1):     1
-        #   ", ":           2
-        #   ";\n ":         2
-        # Total = 13
-        assert embs.shape == (bsize, 13, 4)
-        assert pad_masks.shape == (bsize, 13)
-        assert att_masks.shape == (bsize, 13)
+        #   ":\n":          2  (state-end; collapsed from ", " because no optionals)
+        # Total = 11  (";\n " prefix-end is omitted with no optional content)
+        assert embs.shape == (bsize, 11, 4)
+        assert pad_masks.shape == (bsize, 11)
+        assert att_masks.shape == (bsize, 11)
         # No causal boundaries (1's) anywhere in the att_masks — every block
         # should remain bidirectional with all-skip optional blocks.
         assert int(att_masks[0].sum().item()) == 0, (

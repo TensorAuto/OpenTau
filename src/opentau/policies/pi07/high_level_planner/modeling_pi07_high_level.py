@@ -888,8 +888,15 @@ class PI07HighLevelPlannerModel(nn.Module):
         Gemma 3 embedding layer. **Concatenation order** (training when memory and response
         are provided):
 
-        ``[images | language | metadata | ";\\n " | "Updated Memory: " | memory_tokens |
+        ``[images | language | metadata? | ";\\n "? | "Updated Memory: " | memory_tokens |
         "Subtask: " | response_tokens]``
+
+        ``";\\n "`` is gated on ``metadata_tokens`` — it serves as the metadata →
+        ``"Updated Memory:"`` separator, so when no metadata is provided there is
+        nothing to terminate and emitting it would dangle spurious tokens. The
+        ``"Updated Memory: "`` anchor itself is unconditional because inference
+        relies on it as the autoregressive starting point for memory decoding
+        (memory_tokens is None at inference by design).
 
         When ``memory_tokens`` / ``response_tokens`` are omitted (inference), only the
         fixed spans before those segments are present; memory and subtask text are filled in
@@ -898,7 +905,7 @@ class PI07HighLevelPlannerModel(nn.Module):
         Attention pattern (via ``att_masks`` cumsums):
             - Image + language tokens: bidirectional (``0``).
             - Metadata (if present): new bidirectional block (``[1, 0, …, 0]``).
-            - ``";\\n "`` (same string as ``encode(";\n ", add_special_tokens=False)``): continues previous block (``0``).
+            - ``";\\n "`` (only when metadata present): continues previous block (``0``).
             - ``"Updated Memory: "``: new bidirectional block (``[1, 0, …, 0]``).
             - Memory token slots: causal segment (``1`` per slot).
             - ``"Subtask: "`` (training): new block then causal continuation within span.
@@ -973,20 +980,25 @@ class PI07HighLevelPlannerModel(nn.Module):
             pad_masks.append(metadata_masks)
             att_masks += [1] + [0] * (metadata_emb.shape[1] - 1)
 
-        prefix_end_indicator_ids = self.language_tokenizer.encode(";\n ", add_special_tokens=False)
-        prefix_end_tokens = torch.tensor(
-            [prefix_end_indicator_ids] * bsize,
-            device=lang_tokens.device,
-            dtype=torch.long,
-        )
-        prefix_end_emb = self.gemma3_with_expert.embed_language_tokens(prefix_end_tokens)
+            # ";\n " is the metadata -> "Updated Memory:" separator. With no metadata,
+            # there is nothing to terminate, so omit it; "Updated Memory:" still anchors
+            # AR memory decoding either way.
+            prefix_end_indicator_ids = self.language_tokenizer.encode(";\n ", add_special_tokens=False)
+            prefix_end_tokens = torch.tensor(
+                [prefix_end_indicator_ids] * bsize,
+                device=lang_tokens.device,
+                dtype=torch.long,
+            )
+            prefix_end_emb = self.gemma3_with_expert.embed_language_tokens(prefix_end_tokens)
 
-        num_prefix_end_embs = prefix_end_emb.shape[1]
-        prefix_end_mask = torch.ones(bsize, num_prefix_end_embs, dtype=torch.bool, device=lang_tokens.device)
+            num_prefix_end_embs = prefix_end_emb.shape[1]
+            prefix_end_mask = torch.ones(
+                bsize, num_prefix_end_embs, dtype=torch.bool, device=lang_tokens.device
+            )
 
-        embs.append(prefix_end_emb)
-        pad_masks.append(prefix_end_mask)
-        att_masks += [0] * num_prefix_end_embs
+            embs.append(prefix_end_emb)
+            pad_masks.append(prefix_end_mask)
+            att_masks += [0] * num_prefix_end_embs
 
         memory_start_indicator_ids = self.language_tokenizer.encode(
             "Updated Memory: ", add_special_tokens=False
