@@ -748,3 +748,57 @@ class TestEmbedPrefixConditionalGuards:
         assert per_sample_sum == 1, (
             f"expected exactly one causal boundary from the response block opening, got {per_sample_sum}"
         )
+
+    def test_discrete_actions_indicator_uses_per_token_causal_blocks(self):
+        """The ``"Action: "`` indicator must use ``[1]*N`` (one causal block per
+        token), not ``[1] + [0]*(N-1)`` (single bidirectional block).
+
+        The buggy ``[1] + [0]*(N-1)`` pattern collapses the indicator into one
+        bidirectional block, shifting the cumsum at the indicator -> first-discrete
+        boundary by N-1 and breaking the discrete-action CE loss. This test pins
+        the tail of ``att_masks`` to all 1's after the indicator, so a regression
+        to the old pattern fails immediately.
+        """
+        method = _embed_prefix_method()
+        fake = _make_fake_flow_matching()
+        bsize = 2
+        kwargs = _build_default_inputs(batch_size=bsize)
+        # No optional middle blocks — keeps the prefix layout deterministic so
+        # the indicator + discrete-action span sits exactly at the tail.
+        kwargs["subgoal_images"] = []
+        kwargs["subgoal_img_masks"] = []
+
+        num_action_tokens = 3
+        kwargs["discrete_actions"] = torch.zeros(bsize, num_action_tokens, dtype=torch.long)
+        kwargs["discrete_action_masks"] = torch.ones(bsize, num_action_tokens, dtype=torch.bool)
+
+        _, pad_masks, att_masks = method(fake, **kwargs)
+
+        # Expected layout (no optional blocks; fake tokenizer encodes every
+        # indicator phrase to 2 tokens; ``discrete_action_emb`` matches its
+        # input shape):
+        #   videos(3) + lang(3) + "State: "(2) + state(1) + ":\n"(2)
+        #     + "Action: "(2) + discrete_actions(3) = 16
+        num_indicator_tokens = 2
+        base_prefix_len = 11
+        total_len = base_prefix_len + num_indicator_tokens + num_action_tokens
+        assert att_masks.shape == (bsize, total_len)
+        assert pad_masks.shape == (bsize, total_len)
+
+        # The first ``base_prefix_len`` positions are bidirectional (no causal
+        # boundaries) — same invariant as test_all_optional_blocks_absent.
+        assert int(att_masks[0, :base_prefix_len].sum().item()) == 0
+
+        # Tail invariant: every position from the indicator onward must be 1
+        # (per-token causal blocks for the indicator + one causal step per
+        # discrete action). A regression to ``[1] + [0]*(N-1)`` on the
+        # indicator would put zeros at indices ``base_prefix_len + 1 ..
+        # base_prefix_len + num_indicator_tokens - 1`` and the assertion below
+        # would fail.
+        tail = att_masks[0, base_prefix_len:]
+        assert int(tail.sum().item()) == num_indicator_tokens + num_action_tokens, (
+            f"expected all-ones tail of length {num_indicator_tokens + num_action_tokens} "
+            f"(indicator + discrete actions), got {tail.tolist()} — a zero in the indicator "
+            "span signals a regression to the old [1]+[0]*(N-1) pattern, which shifts the "
+            "cumsum at the indicator -> first-discrete boundary and breaks the CE loss."
+        )

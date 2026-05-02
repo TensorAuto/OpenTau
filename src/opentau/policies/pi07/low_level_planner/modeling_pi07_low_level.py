@@ -1212,7 +1212,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             response_tokens is not None and response_masks is not None and bool(response_masks.any())
         )
         has_subgoal = (
-            bool(subgoal_images) and bool(subgoal_img_masks) and any(m.any() for m in subgoal_img_masks)
+            bool(subgoal_images) and bool(subgoal_img_masks) and any(bool(m.any()) for m in subgoal_img_masks)
         )
         has_metadata = (
             metadata_tokens is not None and metadata_masks is not None and bool(metadata_masks.any())
