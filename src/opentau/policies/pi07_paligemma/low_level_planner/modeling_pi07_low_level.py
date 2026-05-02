@@ -1111,17 +1111,24 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
 
         Concatenation order:
 
-        ``[videos | language | State: | state(T) | ", " | response |
-        Subgoal: | subgoal_images… | ", " | metadata | ";\\n " |
+        ``[videos | language | State: | state(T) | <state-end> | response? |
+        Subgoal: | subgoal_images… | ", " | metadata? | ":\\n"? |
         ("Action:" + discrete_actions only when training)]``
+
+        ``<state-end>`` is ``", "`` when at least one optional middle block
+        (response / subgoal / metadata) contributes real tokens, else ``":\\n"``.
+        The trailing ``":\\n"`` prefix-end is only emitted in the former case;
+        without optional content the state-end already serves as the separator
+        before ``"Action: "``, matching pi05's continuous-state layout.
 
         Attention pattern (via ``att_masks`` cumsums):
             - Video + language: bidirectional (``0``).
-            - ``State:``, projected state timestep tokens, comma after state: bidirectional (``0``).
+            - ``State:``, projected state timestep tokens, state-end separator: bidirectional (``0``).
             - Response spans: prefix-LM style block opening (``[1, 0, …]`` inside the segment).
             - ``Subgoal:``: new bidirectional block (``[1, 0, …]``).
             - Subgoal image patches per camera: bidirectional blocks (``[1, 0, …]``).
-            - Commas/metadata / ``";\\n "``: mostly continued prefix blocks (see code).
+            - Commas/metadata / ``":\\n"``: mostly continued prefix blocks (see code).
+            - ``Action:`` indicator: each token is its own causal block (``[1, 1, …]``), matching pi05.
             - Discrete actions (training): causal ``1`` per timestep after ``Action:``.
 
         Args:
@@ -1154,6 +1161,22 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         pad_masks = []
         att_masks = []
         bsize = lang_tokens.shape[0]
+
+        # Whether any optional middle block (response / subgoal / metadata) will
+        # actually contribute real tokens to the prefix. When all are dropped the
+        # state-end separator collapses to ":\n" and the trailing ":\n" prefix-end
+        # is omitted, so the layout is byte-equivalent to pi05's continuous-state
+        # prefix (no trailing dangling tokens).
+        has_response = (
+            response_tokens is not None and response_masks is not None and bool(response_masks.any())
+        )
+        has_subgoal = (
+            bool(subgoal_images) and bool(subgoal_img_masks) and any(m.any() for m in subgoal_img_masks)
+        )
+        has_metadata = (
+            metadata_tokens is not None and metadata_masks is not None and bool(metadata_masks.any())
+        )
+        has_any_optional = bool(has_response or has_subgoal or has_metadata)
 
         for vid, vid_mask in zip(videos, vid_masks, strict=True):
             vid_emb = self.embed_video(vid)  # (B, num_video_tokens, vlm_hidden)
@@ -1209,7 +1232,10 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         pad_masks.append(state_mask)
         att_masks += [0] * num_state_tokens  # full attention with video and language
 
-        state_end_indicator_ids = self.language_tokenizer.encode(", ", add_special_tokens=False)
+        # When optional middle blocks follow, use ", " as a state→optional separator;
+        # otherwise collapse to ":\n" so the prefix matches pi05's continuous-state layout.
+        state_end_str = ", " if has_any_optional else ":\n"
+        state_end_indicator_ids = self.language_tokenizer.encode(state_end_str, add_special_tokens=False)
         state_end_tokens = torch.tensor(
             [state_end_indicator_ids] * bsize,
             device=lang_tokens.device,
@@ -1318,22 +1344,28 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             pad_masks.append(metadata_masks)
             att_masks += [1] + [0] * (metadata_emb.shape[1] - 1)
 
-        prefix_end_indicator_ids = self.language_tokenizer.encode(":\n", add_special_tokens=False)
-        prefix_end_tokens = torch.tensor(
-            [prefix_end_indicator_ids] * bsize,
-            device=lang_tokens.device,
-            dtype=torch.long,
-        )
-        prefix_end_emb = self.paligemma_with_expert.embed_language_tokens(prefix_end_tokens)
-        prefix_end_dim = prefix_end_emb.shape[-1]
-        prefix_end_emb = prefix_end_emb * math.sqrt(prefix_end_dim)
+        # Only emit the ":\n" prefix-end when at least one optional middle block was added
+        # above. With no optional content, the state-end already collapsed to ":\n" and acts
+        # as the separator before "Action: " — appending another would dangle 2 spurious tokens.
+        if has_any_optional:
+            prefix_end_indicator_ids = self.language_tokenizer.encode(":\n", add_special_tokens=False)
+            prefix_end_tokens = torch.tensor(
+                [prefix_end_indicator_ids] * bsize,
+                device=lang_tokens.device,
+                dtype=torch.long,
+            )
+            prefix_end_emb = self.paligemma_with_expert.embed_language_tokens(prefix_end_tokens)
+            prefix_end_dim = prefix_end_emb.shape[-1]
+            prefix_end_emb = prefix_end_emb * math.sqrt(prefix_end_dim)
 
-        num_prefix_end_embs = prefix_end_emb.shape[1]
-        prefix_end_mask = torch.ones(bsize, num_prefix_end_embs, dtype=torch.bool, device=lang_tokens.device)
+            num_prefix_end_embs = prefix_end_emb.shape[1]
+            prefix_end_mask = torch.ones(
+                bsize, num_prefix_end_embs, dtype=torch.bool, device=lang_tokens.device
+            )
 
-        embs.append(prefix_end_emb)
-        pad_masks.append(prefix_end_mask)
-        att_masks += [0] * num_prefix_end_embs
+            embs.append(prefix_end_emb)
+            pad_masks.append(prefix_end_mask)
+            att_masks += [0] * num_prefix_end_embs
 
         if discrete_actions is not None:
             discrete_action_start_indicator_ids = self.language_tokenizer.encode(
@@ -1357,7 +1389,11 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
 
             embs.append(discrete_action_start_emb)
             pad_masks.append(discrete_action_start_mask)
-            att_masks += [1] + [0] * (num_discrete_action_start_embs - 1)
+            # Match pi05: each "Action: " indicator token is its own causal block.
+            # Using [1] + [0]*(N-1) collapses them into a single bidirectional block,
+            # which shifts the cumsum at the indicator → first-discrete boundary by N-1
+            # and breaks discrete-action CE byte-equivalence with pi05.
+            att_masks += [1] * num_discrete_action_start_embs
 
             discrete_action_emb = self.paligemma_with_expert.embed_discrete_actions(discrete_actions)
             embs.append(discrete_action_emb.to(dtype=_preferred_dtype()))

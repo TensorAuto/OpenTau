@@ -81,12 +81,18 @@ class TestPI07LowLevelPlannerIntegration:
 
     @staticmethod
     def _indicator_lens(tokenizer):
-        """Fixed strings inserted by ``embed_prefix`` (matches modeling layout)."""
+        """Fixed strings inserted by ``embed_prefix`` (matches modeling layout).
+
+        With at least one optional middle block populated (as in this test),
+        the state-end separator is ``", "`` and the trailing prefix-end is
+        ``":\\n"``. With no optional content the state-end collapses to
+        ``":\\n"`` and the prefix-end is omitted entirely.
+        """
         return {
             "state_lead": len(tokenizer.encode("State: ", add_special_tokens=False)),
             "comma": len(tokenizer.encode(", ", add_special_tokens=False)),
             "subgoal_lead": len(tokenizer.encode("Subgoal: ", add_special_tokens=False)),
-            "prefix_end": len(tokenizer.encode(";\n ", add_special_tokens=False)),
+            "prefix_end": len(tokenizer.encode(":\n", add_special_tokens=False)),
             "action_lead": len(tokenizer.encode("Action: ", add_special_tokens=False)),
         }
 
