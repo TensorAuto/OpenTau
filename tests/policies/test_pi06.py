@@ -45,8 +45,9 @@ from opentau.policies.pi06.modeling_pi06 import (
 
 class TestMakeAtt2dMasks:
     """Locks in the block-causal semantics the π0.6 model card depends on:
-    image + text = one bidirectional block, response / discrete-action =
-    subsequent causal blocks, action suffix = its own bidirectional block."""
+    images = bidirectional prefix; language tokens, response and FAST
+    discrete-action tokens = causal (per §2 "use causal attention among the
+    text tokens"); action suffix in the expert = its own bidirectional block."""
 
     def test_pure_bidirectional(self):
         pad = torch.tensor([[True, True, True, True]])
@@ -105,6 +106,35 @@ class TestMakeAtt2dMasks:
         # Padded cross key should be masked out.
         assert not torch.any(mask[0, :, 2])
 
+    def test_embed_prefix_layout_has_causal_language_block(self):
+        """π0.6 model card §2: language tokens use causal attention while
+        sitting after a bidirectional image prefix. This simulates the
+        `att_masks` list `PI06FlowMatching.embed_prefix` builds and asserts
+        the language-vs-language sub-block is strictly causal, while still
+        seeing the full image prefix.
+        """
+        num_img_embs, num_lang_embs = 4, 5
+        att = torch.tensor([[0] * num_img_embs + [1] * num_lang_embs])
+        pad = torch.ones_like(att, dtype=torch.bool)
+        mask = make_att_2d_masks(pad, att)
+
+        img_slice = slice(0, num_img_embs)
+        lang_slice = slice(num_img_embs, num_img_embs + num_lang_embs)
+
+        # Image prefix is fully bidirectional within itself.
+        assert torch.all(mask[0, img_slice, img_slice])
+
+        # Language-vs-language is strictly causal: every lang token sees its
+        # predecessors and itself, but not later lang tokens.
+        lang_block = mask[0, lang_slice, lang_slice]
+        expected_causal = torch.tril(torch.ones(num_lang_embs, num_lang_embs, dtype=torch.bool))
+        assert torch.equal(lang_block, expected_causal)
+
+        # Language still sees the entire image prefix (prefix-LM cross attention).
+        assert torch.all(mask[0, lang_slice, img_slice])
+        # Image tokens do NOT see later language tokens (they precede them).
+        assert not torch.any(mask[0, img_slice, lang_slice])
+
 
 # RoPE shape preservation + different theta values
 
@@ -132,6 +162,64 @@ class TestApplyRope:
         positions = torch.zeros(1, 1, dtype=torch.long)
         out = apply_rope(x, positions, max_wavelength=10_000.0)
         assert torch.allclose(out, x, atol=1e-6)
+
+
+# MSE-loss masking on fully-padded action samples (web / VQA co-training).
+#
+# The π0.6 paper §2 says the VLM is trained jointly on FAST action tokens and
+# co-training examples like multi-modal web data. VQA samples have no real
+# actions, so `VQADataset` sets `actions_is_pad = all-True`. The flow-matching
+# loss in `PI06FlowMatching.forward` must honour that mask, otherwise the
+# action expert is trained to regress to zero on web samples — a silent bug.
+
+
+class TestMSEMaskOnFullyPaddedActions:
+    """Locks in the contract: an item with `actions_is_pad` all-True
+    contributes exactly zero MSE, regardless of the noisy-action targets.
+    Mirrors the masking arithmetic at modeling_pi06.py:962–972."""
+
+    @staticmethod
+    def _masked_mse_like_pi06(
+        u_t: torch.Tensor,
+        v_t: torch.Tensor,
+        actions_is_pad: torch.Tensor,
+        max_action_dim: int,
+    ) -> torch.Tensor:
+        """Replicates the masking arithmetic from `PI06FlowMatching.forward`."""
+        import torch.nn.functional as F  # noqa: N812
+        from einops import rearrange, repeat
+
+        mse_loss = F.mse_loss(u_t, v_t, reduction="none")
+        # No real-time-inference delay in this test → postfix_mask is all-True
+        # before we AND in the actions_is_pad mask.
+        postfix_mask = torch.ones(u_t.shape[:2], dtype=torch.bool)
+        postfix_mask = rearrange(postfix_mask, "b c -> b c 1")
+        in_episode_bound = rearrange(~actions_is_pad, "b c -> b c 1")
+        postfix_mask = torch.logical_and(postfix_mask, in_episode_bound)
+        mse_loss = mse_loss * postfix_mask
+        mse_loss = mse_loss[:, :, :max_action_dim]
+        postfix_mask_expanded = repeat(postfix_mask, "b c 1 -> b c d", d=mse_loss.shape[-1])
+        return mse_loss.sum() / (postfix_mask_expanded.sum() + 1e-8)
+
+    def test_all_padded_yields_zero_loss(self):
+        torch.manual_seed(0)
+        u_t = torch.randn(2, 8, 16)
+        v_t = torch.randn(2, 8, 16)
+        actions_is_pad = torch.ones(2, 8, dtype=torch.bool)
+        loss = self._masked_mse_like_pi06(u_t, v_t, actions_is_pad, max_action_dim=16)
+        assert loss.item() == 0.0
+
+    def test_partial_padded_only_counts_real_steps(self):
+        """Mixed mask: half the chunk is padded; loss should equal the MSE
+        averaged only over the real timesteps."""
+        torch.manual_seed(0)
+        u_t = torch.randn(1, 8, 4)
+        v_t = torch.randn(1, 8, 4)
+        actions_is_pad = torch.tensor([[False, False, False, False, True, True, True, True]])
+        loss = self._masked_mse_like_pi06(u_t, v_t, actions_is_pad, max_action_dim=4)
+        # Independent reference: mean over the first 4 timesteps only.
+        expected = ((u_t[0, :4] - v_t[0, :4]) ** 2).sum() / (4 * 4)
+        assert torch.isclose(loss, expected, atol=1e-6)
 
 
 # PI06Config defaults + validators

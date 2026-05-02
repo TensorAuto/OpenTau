@@ -793,8 +793,10 @@ class PI06FlowMatching(nn.Module):
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
         num_lang_embs = lang_emb.shape[1]
-        # Language tokens continue the image block (bidirectional within prefix).
-        att_masks += [0] * num_lang_embs
+        # Language tokens use causal attention per the π0.6 model card §2:
+        # "use causal attention among the text tokens" — an explicit divergence
+        # from π0.5, whose language tokens shared the image block bidirectionally.
+        att_masks += [1] * num_lang_embs
 
         if response_tokens is not None:
             response_emb = self.gemma3_with_expert.embed_language_tokens(response_tokens)

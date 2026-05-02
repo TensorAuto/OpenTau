@@ -50,6 +50,15 @@ class PI06Config(PreTrainedConfig):
         max_state_dim: Maximum dimension for state vectors. Defaults to 32.
         max_action_dim: Maximum dimension for action vectors. Defaults to 32.
         predict_response: Whether to predict the response. Defaults to False.
+            Enabling this is required to reproduce the paper's hierarchical
+            design (π0.6 model card §1: "preserves the hierarchical design of
+            π0.5, providing high-level subtask prediction and low-level action
+            generation"). When False, π0.6 reduces to a flat low-level-only
+            model. The default is False because most LeRobot-style datasets do
+            not carry subtask annotations. The same field is also used to
+            supervise VQA / grounding-style textual targets during co-training
+            (this is why the field is named "response" rather than "subtask" —
+            it covers both uses, matching the π0.5 pretraining recipe).
         resize_imgs_with_padding: Target image size. Defaults to (448, 448).
         empty_cameras: Number of empty camera inputs to add. Defaults to 0.
             π0.6 pre-training uses up to 4 cameras (base + 2 wrist + optional
