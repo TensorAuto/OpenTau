@@ -322,6 +322,8 @@ class TestDropoutDisabled:
         ds.segment_starts_by_episode = {0: _np.array([0])}
         ds.meta = SimpleNamespace(
             video_keys=["camera0"],
+            image_keys=[],
+            camera_keys=["camera0"],
             episodes={0: {"segments": [0]}},
             fps=30,
             info={"subgoals": {"subgoal0": "camera0"}},  # opt in to subgoal loading
@@ -369,6 +371,8 @@ class TestDropoutDisabled:
         ds.segment_starts_by_episode = {0: _np.array([0])}
         ds.meta = SimpleNamespace(
             video_keys=["camera0"],
+            image_keys=[],
+            camera_keys=["camera0"],
             episodes={0: {"segments": [0]}},
             fps=30,
             info={"subgoals": {"subgoal0": "camera0"}},  # opt in so the drop path is exercised
@@ -405,6 +409,8 @@ class TestDropoutDisabled:
         # No "subgoals" key in info — mirrors every production LeRobot dataset today.
         ds.meta = SimpleNamespace(
             video_keys=["camera0"],
+            image_keys=[],
+            camera_keys=["camera0"],
             episodes={0: {"segments": [0]}},
             fps=30,
             info={},

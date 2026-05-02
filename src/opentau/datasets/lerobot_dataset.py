@@ -1811,12 +1811,19 @@ class LeRobotDataset(BaseDataset):
           subset), drop is never rolled — the frame-selection randomness
           stays live because it's about which future frame to read, not
           masking.
-        - Episodes with no ``segments`` entry in ``episodes.jsonl`` fall
-          back to a fixed ~4 s lookahead inside ``_sample_subgoal_frame``
-          rather than skipping subgoal loading, so legacy datasets without
-          segment annotations still get supervision.
+        - Episodes without a ``segments`` entry in ``episodes.jsonl`` are
+          unsupported — ``_sample_subgoal_frame`` requires a segment to
+          clip the future-frame against. Datasets that opt in to subgoals
+          must annotate every episode with at least one segment boundary.
         """
         if self.num_cams <= 0 or len(self.meta.camera_keys) == 0:
+            return {}
+        # Datasets opt in to subgoal supervision by declaring the ``subgoals``
+        # mapping in info.json. When absent, return early without sampling so
+        # ``BaseDataset._emit_optional_keys`` emits ``subgoal_is_pad=True`` for
+        # every slot — matches the docstring contract and avoids loading a
+        # spurious future-frame from the regular cameras as a "subgoal".
+        if "subgoals" not in self.meta.info:
             return {}
         # Roll drop before any video decoding — at `subgoal_drop_prob=0.75` the
         # old ordering threw away 75% of decodes.
@@ -1826,7 +1833,6 @@ class LeRobotDataset(BaseDataset):
         at_end = bool(torch.rand(()) < self.subgoal_end_of_segment_prob)
         subgoal_frame = self._sample_subgoal_frame(ep_idx, frame_in_ep, at_end_of_segment=at_end)
         ts = subgoal_frame / self.fps
-        ep_start = int(self.episode_data_index["from"][self.epi2idx[ep_idx]].item())
         out: dict[str, torch.Tensor] = {}
         for k in range(self.num_cams):
             cam_key = name_map.get(f"camera{k}")
@@ -1840,6 +1846,7 @@ class LeRobotDataset(BaseDataset):
                 # rows of ``hf_dataset``. The within-episode index returned
                 # by ``_sample_subgoal_frame`` maps directly to the absolute
                 # row ``ep_start + subgoal_frame``.
+                ep_start = int(self.episode_data_index["from"][self.epi2idx[ep_idx]].item())
                 out[f"subgoal{k}_raw"] = self.hf_dataset[ep_start + subgoal_frame][cam_key]
         return out
 
