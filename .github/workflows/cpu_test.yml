@@ -22,6 +22,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: cpu-test-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   GIT_LFS_SKIP_SMUDGE: "1"
   GIT_CLEAN_FLAGS: "-ffdx -e .venv/"
