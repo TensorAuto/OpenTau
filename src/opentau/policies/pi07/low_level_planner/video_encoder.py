@@ -420,10 +420,11 @@ class SpaceTimeSiglipVideoEncoder(nn.Module):
         self.siglip_hidden_size = vision_cfg.hidden_size
 
         # Wrap every stride-th layer with space-time attention. The wrapper
-        # holds the original SiglipEncoderLayer as ``base_layer`` so its
-        # pretrained weights flow through unchanged. State-dict keys for
-        # wrapped layers will carry a ``.base_layer.`` prefix; as long as
-        # reloads round-trip through this code, keys stay consistent.
+        # adopts the base layer's submodules (self_attn / layer_norm{1,2} /
+        # mlp) by reference, so wrapped-layer state-dict keys are byte-for-byte
+        # identical to a vanilla ``SiglipEncoderLayer`` — no ``.base_layer.``
+        # prefix appears. Pinned by ``test_pi07_video_encoder_cpu.py::
+        # test_state_dict_keys_unchanged_after_wrapping``.
         layers = vision_tower.vision_model.encoder.layers
         n_layers = len(layers)
         for i in range(spacetime_layer_stride - 1, n_layers, spacetime_layer_stride):

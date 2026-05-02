@@ -943,7 +943,9 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             last_subgoal_img = subgoal_img
             last_mask = mask
 
-        # Create image features not present in the batch as fully 0 padded images.
+        # Materialize missing-camera placeholders. Filled with -1 (not 0) so
+        # they sit at the "black" end of SigLIP's [-1, 1] input range; the
+        # accompanying False mask still flags these slots as padded.
         if last_subgoal_img is not None and last_mask is not None:
             for num_empty_cameras in range(len(missing_subgoal_img_keys)):
                 if num_empty_cameras >= self.config.empty_cameras:
@@ -1101,6 +1103,13 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         self.time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
 
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-4b-pt")
+
+        # Length of the "Action: " indicator tokens — constant for a given
+        # tokenizer, so cache once instead of re-tokenizing on every forward
+        # call. Used together with discrete_action_max_length to compute the
+        # cross-attention prefix slice in forward()/sample_actions(), so the
+        # action expert sees the same prefix length at train and inference.
+        self._action_indicator_len = len(self.language_tokenizer.encode("Action: ", add_special_tokens=False))
 
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
         return torch.normal(mean=0.0, std=1.0, size=shape, dtype=torch.float32, device=device)
@@ -1527,9 +1536,8 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         # Exclude both the "Action: " indicator tokens and the discrete action tokens from
         # cross-attention so the action expert sees the same prefix length at train and inference
         # (at inference, neither is in the prefix). Matches pi05's discrete_action_indicator_max_length logic.
-        _action_indicator_len = len(self.language_tokenizer.encode("Action: ", add_special_tokens=False))
         num_cross_att_tokens = (
-            prefix_embs.shape[1] - _action_indicator_len - self.config.discrete_action_max_length
+            prefix_embs.shape[1] - self._action_indicator_len - self.config.discrete_action_max_length
         )
 
         (prefix_out, _), past_key_values = self.gemma3_with_expert.forward(
@@ -1569,7 +1577,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             cross_att_pad_masks=prefix_pad_masks[:, :num_cross_att_tokens],
         )
         prefix_offsets = torch.sum(
-            prefix_pad_masks[:, : -(_action_indicator_len + self.config.discrete_action_max_length)],
+            prefix_pad_masks[:, : -(self._action_indicator_len + self.config.discrete_action_max_length)],
             dim=-1,
         )[:, None]
         action_expert_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1

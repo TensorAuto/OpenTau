@@ -1792,14 +1792,15 @@ class LeRobotDataset(BaseDataset):
     def _load_subgoal_frames(self, ep_idx: int, frame_in_ep: int) -> dict[str, torch.Tensor]:
         """Decode subgoal frames — one per camera slot — for this sample.
 
-        Subgoal image paths must be declared in ``meta/info.json`` under the
-        ``subgoals`` key. When the key is missing (the state of every
-        LeRobot dataset today), we assume no subgoal images exist and return
-        ``{}``; :meth:`BaseDataset._emit_optional_keys` then emits
-        ``subgoal_is_pad=True`` for every slot. Datasets opt in by adding
-        the key to info.json.
+        Subgoal supervision is always-on for any dataset that exposes camera
+        keys; the dedicated ``subgoals`` info.json declaration that the older
+        pi07_paligemma path required is no longer consulted. Datasets without
+        any cameras (``self.num_cams == 0`` or empty
+        ``self.meta.camera_keys``) still return ``{}``, which lets
+        :meth:`BaseDataset._emit_optional_keys` emit ``subgoal_is_pad=True``
+        for every slot.
 
-        When the key IS present:
+        Behavior for camera-bearing datasets:
         - The at-end-of-segment vs uniform sampling roll happens ONCE per
           ``__getitem__`` call (shared across all camera slots); each slot
           fetches the frame from its own source — video file for ``video``

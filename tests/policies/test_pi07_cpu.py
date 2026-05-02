@@ -540,3 +540,207 @@ class TestPrepareMetadataSegments:
             assert "Speed:" not in line
             assert "Quality:" not in line
             assert "Mistake:" not in line
+
+
+# `embed_prefix` conditional-block guards
+#
+# The low-level planner skips entire prefix blocks when their availability
+# masks are all-False (response_masks, subgoal_img_masks, metadata_masks).
+# Pinning that on the CPU side means a regression that re-introduces a
+# spurious causal boundary (att_masks=[1,...]) on a fully-padded slot is
+# caught without firing up the Gemma 3 backbone.
+
+
+def _make_fake_flow_matching(*, hidden: int = 4, n_video_tokens: int = 3):
+    """Construct a minimal stand-in for ``PI07LowLevelPlannerFlowMatching``
+    so ``embed_prefix`` runs end-to-end without instantiating the real
+    Gemma 3 backbone.
+
+    All language tokens, image tokens, and video tokens project to deterministic
+    zero tensors with the correct shape — the test only asserts on the
+    structure of ``embs`` / ``pad_masks`` / ``att_masks`` (lengths, sample-mask
+    rows), not on numeric values.
+    """
+    import types
+
+    class _FakeGemma3WithExpert:
+        def embed_language_tokens(self, tokens):
+            return torch.zeros((*tokens.shape, hidden), dtype=torch.float32)
+
+        def embed_image(self, image):
+            # Each image becomes 2 tokens — small enough to keep prefix lengths readable.
+            return torch.zeros(image.shape[0], 2, hidden, dtype=torch.float32)
+
+        def embed_discrete_actions(self, da):
+            return torch.zeros((*da.shape, hidden), dtype=torch.float32)
+
+    class _FakeTokenizer:
+        # Every indicator phrase encodes to exactly 2 tokens. embed_prefix
+        # uses tokenizer.encode() to get the literal token ids, then later
+        # passes them back through embed_language_tokens for the embedding.
+        def encode(self, text, add_special_tokens=False):
+            return [1, 2]
+
+    def _state_proj(state):
+        # state: (B, T, D) → (B, T, hidden)
+        return torch.zeros(state.shape[0], state.shape[1], hidden, dtype=torch.float32)
+
+    def _embed_video(video):
+        # video: (B, T, C, H, W) → (B, n_video_tokens, hidden)
+        return torch.zeros(video.shape[0], n_video_tokens, hidden, dtype=torch.float32)
+
+    fake = types.SimpleNamespace(
+        gemma3_with_expert=_FakeGemma3WithExpert(),
+        language_tokenizer=_FakeTokenizer(),
+        state_proj=_state_proj,
+        embed_video=_embed_video,
+        config=types.SimpleNamespace(discrete_action_max_length=2),
+    )
+    return fake
+
+
+def _embed_prefix_method():
+    from opentau.policies.pi07.low_level_planner.modeling_pi07_low_level import (
+        PI07LowLevelPlannerFlowMatching,
+    )
+
+    return PI07LowLevelPlannerFlowMatching.embed_prefix
+
+
+def _build_default_inputs(*, batch_size: int = 2, prompt_len: int = 3, t_state: int = 1):
+    """Build the minimal kwargs every embed_prefix invocation needs."""
+    return {
+        "videos": [torch.zeros(batch_size, t_state, 3, 4, 4)],
+        "vid_masks": [torch.ones(batch_size, dtype=torch.bool)],
+        "lang_tokens": torch.zeros(batch_size, prompt_len, dtype=torch.long),
+        "lang_masks": torch.ones(batch_size, prompt_len, dtype=torch.bool),
+        "state": torch.zeros(batch_size, t_state, 7),
+        "response_tokens": None,
+        "response_masks": None,
+        "metadata_tokens": None,
+        "metadata_masks": None,
+    }
+
+
+class TestEmbedPrefixConditionalGuards:
+    """Pin per-block toggles in ``embed_prefix``.
+
+    The three conditional emit-or-skip toggles (response, subgoal, metadata)
+    are normally exercised only by the GPU integration tests. These CPU tests
+    fake the Gemma 3 backbone so a regression that emits a spurious header
+    with all-False masks (or fails to emit a real header on a mixed batch)
+    is caught directly.
+    """
+
+    def test_all_optional_blocks_absent_skips_emission(self):
+        """All-False response_masks + no subgoal_images + all-False metadata_masks →
+        the prefix collapses to ``videos + lang + State: + state + ", " + ";\\n "``.
+        """
+        method = _embed_prefix_method()
+        fake = _make_fake_flow_matching()
+        bsize = 2
+        kwargs = _build_default_inputs(batch_size=bsize)
+
+        # Empty response/metadata still passed in: tokens with all-False masks.
+        kwargs["response_tokens"] = torch.zeros(bsize, 5, dtype=torch.long)
+        kwargs["response_masks"] = torch.zeros(bsize, 5, dtype=torch.bool)
+        kwargs["metadata_tokens"] = torch.zeros(bsize, 4, dtype=torch.long)
+        kwargs["metadata_masks"] = torch.zeros(bsize, 4, dtype=torch.bool)
+        # No subgoals at all.
+        kwargs["subgoal_images"] = []
+        kwargs["subgoal_img_masks"] = []
+
+        embs, pad_masks, att_masks = method(fake, **kwargs)
+
+        # Expected layout (each video produces 3 fake video tokens, each
+        # indicator encodes to 2 tokens, hidden=4):
+        #   videos:         3
+        #   lang:           3 (prompt_len)
+        #   "State: ":      2
+        #   state(T=1):     1
+        #   ", ":           2
+        #   ";\n ":         2
+        # Total = 13
+        assert embs.shape == (bsize, 13, 4)
+        assert pad_masks.shape == (bsize, 13)
+        assert att_masks.shape == (bsize, 13)
+        # No causal boundaries (1's) anywhere in the att_masks — every block
+        # should remain bidirectional with all-skip optional blocks.
+        assert int(att_masks[0].sum().item()) == 0, (
+            "att_masks contained a causal boundary — a guarded block was emitted "
+            "anyway: this would corrupt the cumsum for every subsequent token."
+        )
+
+    def test_mixed_subgoal_availability_zeros_pad_only_samples(self):
+        """In a mixed batch (some samples have subgoals, others don't), the
+        ``Subgoal: `` header and trailing comma must follow the per-sample
+        availability mask — pad-only samples get False on those header tokens.
+        """
+        method = _embed_prefix_method()
+        fake = _make_fake_flow_matching()
+        bsize = 2
+        kwargs = _build_default_inputs(batch_size=bsize)
+
+        # Sample 0 has a subgoal, sample 1 does not.
+        per_sample_mask = torch.tensor([True, False])
+        subgoal_img = torch.zeros(bsize, 3, 4, 4)
+        kwargs["subgoal_images"] = [subgoal_img]
+        kwargs["subgoal_img_masks"] = [per_sample_mask]
+        kwargs["metadata_tokens"] = torch.zeros(bsize, 4, dtype=torch.long)
+        kwargs["metadata_masks"] = torch.zeros(bsize, 4, dtype=torch.bool)
+
+        _, pad_masks, _ = method(fake, **kwargs)
+
+        # The Subgoal: header is 2 tokens (fake tokenizer); the image is 2 tokens
+        # (fake embed_image); the trailing ", " is 2 tokens. The mask values for
+        # those 6 tokens must mirror per_sample_mask on every emitted slot.
+        # Easiest assertion: at least one row has pad=False everywhere in the
+        # subgoal block (sample 1), and at least one row has pad=True (sample 0).
+        # We don't pin exact slice boundaries here — instead we check that the
+        # union of per_sample_mask=False rows are all-zero on the subgoal slice.
+        # Total length sanity:
+        #   videos(3) + lang(3) + "State: "(2) + state(1) + ", "(2)
+        #     + "Subgoal: "(2) + subgoal_img(2) + ", "(2)
+        #     + ";\n "(2) = 19
+        assert pad_masks.shape == (bsize, 19)
+        # The subgoal block is the 6 tokens at indices 11..16 (after the
+        # prefix-LM transition); the sample with no subgoal must be False
+        # across all 6, and the sample with a subgoal must be True across all 6.
+        subgoal_block = pad_masks[:, 11:17]
+        assert subgoal_block[0].all().item() is True, (
+            "sample 0 (has subgoal) should have all-True pad mask on the subgoal block"
+        )
+        assert (~subgoal_block[1]).all().item() is True, (
+            "sample 1 (no subgoal) should have all-False pad mask on the subgoal block — "
+            "otherwise the prefix-LM block opening on a pad-only sample injects a "
+            "spurious unmasked indicator token"
+        )
+
+    def test_response_mask_any_true_emits_block(self):
+        """When at least one sample has a real response, the response block
+        IS emitted and contributes a causal boundary token.
+        """
+        method = _embed_prefix_method()
+        fake = _make_fake_flow_matching()
+        bsize = 2
+        kwargs = _build_default_inputs(batch_size=bsize)
+        kwargs["response_tokens"] = torch.zeros(bsize, 5, dtype=torch.long)
+        # Sample 0 has real response; sample 1 is all padded.
+        kwargs["response_masks"] = torch.tensor(
+            [[True, True, True, False, False], [False, False, False, False, False]]
+        )
+        kwargs["subgoal_images"] = []
+        kwargs["subgoal_img_masks"] = []
+        kwargs["metadata_tokens"] = torch.zeros(bsize, 4, dtype=torch.long)
+        kwargs["metadata_masks"] = torch.zeros(bsize, 4, dtype=torch.bool)
+
+        _, _, att_masks = method(fake, **kwargs)
+
+        # Without the response block, att_masks would be all-zeros (see
+        # test_all_optional_blocks_absent_skips_emission). With the response
+        # block, att_masks gets exactly one ``1`` (the prefix-LM block opening
+        # at the start of the 5-token response span).
+        per_sample_sum = int(att_masks[0].sum().item())
+        assert per_sample_sum == 1, (
+            f"expected exactly one causal boundary from the response block opening, got {per_sample_sum}"
+        )
