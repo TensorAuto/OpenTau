@@ -20,6 +20,7 @@ from opentau.policies.pi07_paligemma.low_level_planner.configuration_pi07_low_le
     PI07lowlevelPlannerConfig,
 )
 from opentau.policies.pi07_paligemma.low_level_planner.modeling_pi07_low_level import (
+    PI07LowLevelPlannerFlowMatching,
     PI07LowLevelPlannerPolicy,
     make_att_2d_masks,
 )
@@ -81,12 +82,18 @@ class TestPI07LowLevelPlannerIntegration:
 
     @staticmethod
     def _indicator_lens(tokenizer):
-        """Fixed strings inserted by ``embed_prefix`` (matches modeling layout)."""
+        """Fixed strings inserted by ``embed_prefix`` (matches modeling layout).
+
+        With at least one optional middle block populated (as in this test),
+        the state-end separator is ``", "`` and the trailing prefix-end is
+        ``":\\n"``. With no optional content the state-end collapses to
+        ``":\\n"`` and the prefix-end is omitted entirely.
+        """
         return {
             "state_lead": len(tokenizer.encode("State: ", add_special_tokens=False)),
             "comma": len(tokenizer.encode(", ", add_special_tokens=False)),
             "subgoal_lead": len(tokenizer.encode("Subgoal: ", add_special_tokens=False)),
-            "prefix_end": len(tokenizer.encode(";\n ", add_special_tokens=False)),
+            "prefix_end": len(tokenizer.encode(":\n", add_special_tokens=False)),
             "action_lead": len(tokenizer.encode("Action: ", add_special_tokens=False)),
         }
 
@@ -570,3 +577,208 @@ class TestPI07LowLevelPlannerRegression:
             assert params[name].default is inspect.Parameter.empty, (
                 f"{name} should be a required parameter (no default), got default={params[name].default}"
             )
+
+
+class TestPI07LowLevelPlannerEmbedPrefixNoOptionals:
+    """CPU-only coverage for the ``has_any_optional == False`` branch of ``embed_prefix``.
+
+    The integration test in ``TestPI07LowLevelPlannerIntegration`` populates every
+    optional block, so it only ever exercises the ``True`` branch. The ``False``
+    branch is the actual fix shipped for #226 (state-end collapses to ``":\\n"``,
+    trailing prefix-end is omitted, ``"Action: "`` indicator att_masks is ``[1]*N``).
+    These tests pin all three invariants without requiring a GPU or HF Hub assets
+    by mocking ``paligemma_with_expert``, ``state_proj``, and the tokenizer.
+    """
+
+    # Canned tokenizer outputs — only the *lengths* matter for the assertions,
+    # so distinct integer ranges per string keep test failures readable.
+    _STATE_LEAD_IDS = [10, 11, 12]  # "State: "
+    _COMMA_IDS = [20]  # ", "
+    _COLON_NL_IDS = [30]  # ":\n"
+    _SUBGOAL_LEAD_IDS = [40, 41]  # "Subgoal: "
+    _ACTION_LEAD_IDS = [50, 51]  # "Action: "
+
+    @classmethod
+    def _fake_tokenizer(cls):
+        ids_by_str = {
+            "State: ": cls._STATE_LEAD_IDS,
+            ", ": cls._COMMA_IDS,
+            ":\n": cls._COLON_NL_IDS,
+            "Subgoal: ": cls._SUBGOAL_LEAD_IDS,
+            "Action: ": cls._ACTION_LEAD_IDS,
+        }
+
+        class _FakeTokenizer:
+            @staticmethod
+            def encode(s, add_special_tokens=False):
+                assert add_special_tokens is False
+                return ids_by_str[s]
+
+        return _FakeTokenizer()
+
+    @classmethod
+    def _make_mock_model(cls, hidden_size: int = 8):
+        """Build a minimal ``PI07LowLevelPlannerFlowMatching`` instance with all
+        modeling deps replaced by trivial stand-ins. Enough surface area to drive
+        ``embed_prefix`` end-to-end on CPU without loading PaliGemma. All embedding
+        stubs return ``bfloat16`` to match the dtype that ``_preferred_dtype()``
+        casts ``vid_emb`` / ``state_emb`` / ``subgoal_img_emb`` / ``discrete_action_emb``
+        to — otherwise ``torch.cat`` would fail on dtype mismatch."""
+        model = object.__new__(PI07LowLevelPlannerFlowMatching)
+
+        class _PaliGemmaStub:
+            @staticmethod
+            def embed_language_tokens(tokens):
+                return torch.zeros(tokens.shape[0], tokens.shape[1], hidden_size, dtype=torch.bfloat16)
+
+            @staticmethod
+            def embed_image(img):
+                # 4 dummy patches per image.
+                return torch.zeros(img.shape[0], 4, hidden_size, dtype=torch.bfloat16)
+
+            @staticmethod
+            def embed_discrete_actions(tokens):
+                return torch.zeros(tokens.shape[0], tokens.shape[1], hidden_size, dtype=torch.bfloat16)
+
+        model.paligemma_with_expert = _PaliGemmaStub()
+        model.language_tokenizer = cls._fake_tokenizer()
+        model.state_proj = lambda x: torch.zeros(x.shape[0], x.shape[1], hidden_size, dtype=torch.bfloat16)
+        # Override the bound method ``embed_video`` (signature: ``(self, video)``).
+        model.embed_video = lambda video: torch.zeros(video.shape[0], 6, hidden_size, dtype=torch.bfloat16)
+        return model
+
+    @staticmethod
+    def _empty_mask(bsize: int, length: int) -> torch.Tensor:
+        return torch.zeros(bsize, length, dtype=torch.bool)
+
+    def _drive_no_optionals(self, *, n_obs_steps: int, with_discrete: bool):
+        bsize = 1
+        prompt_len = 5
+        response_len = 7
+        metadata_len = 7
+        discrete_len = 4
+        state_dim = 3
+
+        model = self._make_mock_model()
+
+        videos = [torch.zeros(bsize, n_obs_steps, 3, 8, 8)]
+        vid_masks = [torch.ones(bsize, dtype=torch.bool)]
+        lang_tokens = torch.zeros(bsize, prompt_len, dtype=torch.long)
+        lang_masks = torch.ones(bsize, prompt_len, dtype=torch.bool)
+        state = torch.zeros(bsize, n_obs_steps, state_dim)
+
+        # All-False masks → every optional block is dropped.
+        response_tokens = torch.zeros(bsize, response_len, dtype=torch.long)
+        response_masks = self._empty_mask(bsize, response_len)
+        metadata_tokens = torch.zeros(bsize, metadata_len, dtype=torch.long)
+        metadata_masks = self._empty_mask(bsize, metadata_len)
+
+        kwargs = {
+            "videos": videos,
+            "vid_masks": vid_masks,
+            "lang_tokens": lang_tokens,
+            "lang_masks": lang_masks,
+            "state": state,
+            "response_tokens": response_tokens,
+            "response_masks": response_masks,
+            "metadata_tokens": metadata_tokens,
+            "metadata_masks": metadata_masks,
+            "subgoal_images": None,
+            "subgoal_img_masks": None,
+        }
+        if with_discrete:
+            kwargs["discrete_actions"] = torch.zeros(bsize, discrete_len, dtype=torch.long)
+            kwargs["discrete_action_masks"] = torch.ones(bsize, discrete_len, dtype=torch.bool)
+
+        return PI07LowLevelPlannerFlowMatching.embed_prefix(model, **kwargs), {
+            "bsize": bsize,
+            "prompt_len": prompt_len,
+            "n_obs_steps": n_obs_steps,
+            "discrete_len": discrete_len if with_discrete else 0,
+            "state_lead": len(self._STATE_LEAD_IDS),
+            "comma": len(self._COMMA_IDS),
+            "colon_nl": len(self._COLON_NL_IDS),
+            "action_lead": len(self._ACTION_LEAD_IDS),
+            "video_tokens": 6,
+        }
+
+    def test_state_end_collapses_to_colon_newline_and_no_prefix_end(self):
+        """No optional blocks → state-end is ``":\\n"`` and trailing ``":\\n"`` is omitted."""
+        (_embs, pad_masks, att_masks), m = self._drive_no_optionals(n_obs_steps=1, with_discrete=False)
+
+        # Expected length: video + lang + "State: " + state(T) + ":\n"
+        expected_len = (
+            m["video_tokens"] + m["prompt_len"] + m["state_lead"] + m["n_obs_steps"] + m["colon_nl"]
+        )
+        assert pad_masks.shape == (m["bsize"], expected_len)
+        assert att_masks.shape == pad_masks.shape
+        # Whole prefix is bidirectional: every att_mask entry must be 0/False.
+        assert not bool(att_masks.any()), (
+            "no-optional prefix should contain only bidirectional tokens (att_masks all 0)"
+        )
+
+    def test_action_indicator_is_per_token_causal(self):
+        """``Action: `` indicator's att_masks is ``[1]*N`` (per-token causal), matching pi05."""
+        (_embs, _pad_masks, att_masks), m = self._drive_no_optionals(n_obs_steps=1, with_discrete=True)
+
+        # Indicator slice: starts after [video | lang | "State: " | state(T) | ":\n"].
+        indicator_lo = (
+            m["video_tokens"] + m["prompt_len"] + m["state_lead"] + m["n_obs_steps"] + m["colon_nl"]
+        )
+        indicator_hi = indicator_lo + m["action_lead"]
+        indicator_slice = att_masks[0, indicator_lo:indicator_hi]
+        assert torch.equal(indicator_slice, torch.ones(m["action_lead"], dtype=torch.bool)), (
+            f"Expected Action: indicator att_masks to be all-1 (per-token causal), got {indicator_slice}"
+        )
+
+    def test_byte_equivalent_layout_requires_n_obs_steps_one(self):
+        """Document that byte-equivalence with pi05 hinges on ``n_obs_steps == 1``.
+
+        With ``n_obs_steps>1`` the prefix is still well-formed (state-end still
+        collapses to ``":\\n"``), just longer than pi05's by ``T-1`` state tokens.
+        """
+        (_a, pad_t1, _at1), m1 = self._drive_no_optionals(n_obs_steps=1, with_discrete=False)
+        (_b, pad_t4, _at4), m4 = self._drive_no_optionals(n_obs_steps=4, with_discrete=False)
+        assert pad_t4.shape[1] - pad_t1.shape[1] == 3
+        assert m1["n_obs_steps"] == 1 and m4["n_obs_steps"] == 4
+
+    def test_optionals_present_emits_comma_state_end_and_colon_prefix_end(self):
+        """Sanity-check the ``True`` branch still wires up state-end ``", "`` + trailing ``":\\n"``."""
+        bsize = 1
+        prompt_len = 5
+        response_len = 6
+        metadata_len = 4
+
+        model = self._make_mock_model()
+
+        # Real (non-padded) response tokens → has_response == True drives the True branch.
+        videos = [torch.zeros(bsize, 1, 3, 8, 8)]
+        vid_masks = [torch.ones(bsize, dtype=torch.bool)]
+        lang_tokens = torch.zeros(bsize, prompt_len, dtype=torch.long)
+        lang_masks = torch.ones(bsize, prompt_len, dtype=torch.bool)
+        state = torch.zeros(bsize, 1, 3)
+        response_tokens = torch.zeros(bsize, response_len, dtype=torch.long)
+        response_masks = torch.ones(bsize, response_len, dtype=torch.bool)
+        metadata_tokens = torch.zeros(bsize, metadata_len, dtype=torch.long)
+        metadata_masks = torch.zeros(bsize, metadata_len, dtype=torch.bool)
+
+        (_embs, pad_masks, _att_masks) = PI07LowLevelPlannerFlowMatching.embed_prefix(
+            model,
+            videos=videos,
+            vid_masks=vid_masks,
+            lang_tokens=lang_tokens,
+            lang_masks=lang_masks,
+            state=state,
+            response_tokens=response_tokens,
+            response_masks=response_masks,
+            metadata_tokens=metadata_tokens,
+            metadata_masks=metadata_masks,
+            subgoal_images=None,
+            subgoal_img_masks=None,
+        )
+
+        # video + lang + "State: " + state(1) + ", " + response + ":\n"
+        expected_len = 6 + prompt_len + 3 + 1 + 1 + response_len + 1
+        assert pad_masks.shape[1] == expected_len, (
+            f"True-branch length mismatch: got {pad_masks.shape[1]}, expected {expected_len}"
+        )

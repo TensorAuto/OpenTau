@@ -1792,14 +1792,15 @@ class LeRobotDataset(BaseDataset):
     def _load_subgoal_frames(self, ep_idx: int, frame_in_ep: int) -> dict[str, torch.Tensor]:
         """Decode subgoal frames — one per camera slot — for this sample.
 
-        Subgoal image paths must be declared in ``meta/info.json`` under the
-        ``subgoals`` key. When the key is missing (the state of every
-        LeRobot dataset today), we assume no subgoal images exist and return
-        ``{}``; :meth:`BaseDataset._emit_optional_keys` then emits
-        ``subgoal_is_pad=True`` for every slot. Datasets opt in by adding
-        the key to info.json.
+        Subgoal supervision is always-on for any dataset that exposes camera
+        keys; the dedicated ``subgoals`` info.json declaration that the older
+        pi07_paligemma path required is no longer consulted. Datasets without
+        any cameras (``self.num_cams == 0`` or empty
+        ``self.meta.camera_keys``) still return ``{}``, which lets
+        :meth:`BaseDataset._emit_optional_keys` emit ``subgoal_is_pad=True``
+        for every slot.
 
-        When the key IS present:
+        Behavior for camera-bearing datasets:
         - The at-end-of-segment vs uniform sampling roll happens ONCE per
           ``__getitem__`` call (shared across all camera slots); each slot
           fetches the frame from its own source — video file for ``video``
@@ -1811,10 +1812,10 @@ class LeRobotDataset(BaseDataset):
           subset), drop is never rolled — the frame-selection randomness
           stays live because it's about which future frame to read, not
           masking.
-        - Episodes with no ``segments`` entry in ``episodes.jsonl`` fall
-          back to a fixed ~4 s lookahead inside ``_sample_subgoal_frame``
-          rather than skipping subgoal loading, so legacy datasets without
-          segment annotations still get supervision.
+        - Episodes without a ``segments`` entry in ``episodes.jsonl`` are
+          unsupported — ``_sample_subgoal_frame`` requires a segment to
+          clip the future-frame against. Datasets must annotate every
+          episode with at least one segment boundary.
         """
         if self.num_cams <= 0 or len(self.meta.camera_keys) == 0:
             return {}
@@ -1826,7 +1827,6 @@ class LeRobotDataset(BaseDataset):
         at_end = bool(torch.rand(()) < self.subgoal_end_of_segment_prob)
         subgoal_frame = self._sample_subgoal_frame(ep_idx, frame_in_ep, at_end_of_segment=at_end)
         ts = subgoal_frame / self.fps
-        ep_start = int(self.episode_data_index["from"][self.epi2idx[ep_idx]].item())
         out: dict[str, torch.Tensor] = {}
         for k in range(self.num_cams):
             cam_key = name_map.get(f"camera{k}")
@@ -1840,6 +1840,7 @@ class LeRobotDataset(BaseDataset):
                 # rows of ``hf_dataset``. The within-episode index returned
                 # by ``_sample_subgoal_frame`` maps directly to the absolute
                 # row ``ep_start + subgoal_frame``.
+                ep_start = int(self.episode_data_index["from"][self.epi2idx[ep_idx]].item())
                 out[f"subgoal{k}_raw"] = self.hf_dataset[ep_start + subgoal_frame][cam_key]
         return out
 
