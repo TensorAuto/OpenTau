@@ -25,9 +25,13 @@ permissions:
 
 jobs:
   extract-lessons:
+    # Gate on the head branch name, not user.login: in this repo Claude Code
+    # pushes to a `claude/*` branch and a human opens the PR, so the PR's
+    # `user.login` never contains 'claude'. The branch prefix is the reliable
+    # signal that Claude touched the PR.
     if: >-
       github.event.pull_request.merged == true
-      && contains(github.event.pull_request.user.login, 'claude')
+      && startsWith(github.event.pull_request.head.ref, 'claude/')
       && !startsWith(github.event.pull_request.title, 'chore(claude): learn from')
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -39,6 +43,7 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           claude_args: |
+            --model ${{ vars.CLAUDE_MODEL || 'claude-opus-4-7[1m]' }}
             --permission-mode bypassPermissions
           prompt: |
             Review the comments on this merged PR. If any reviewer feedback
