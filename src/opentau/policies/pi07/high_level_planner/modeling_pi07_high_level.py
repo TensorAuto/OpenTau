@@ -891,12 +891,19 @@ class PI07HighLevelPlannerModel(nn.Module):
         ``[images | language | metadata? | ";\\n "? | "Updated Memory: " | memory_tokens |
         "Subtask: " | response_tokens]``
 
-        ``";\\n "`` is gated on ``metadata_tokens`` — it serves as the metadata →
-        ``"Updated Memory:"`` separator, so when no metadata is provided there is
-        nothing to terminate and emitting it would dangle spurious tokens. The
-        ``"Updated Memory: "`` anchor itself is unconditional because inference
-        relies on it as the autoregressive starting point for memory decoding
-        (memory_tokens is None at inference by design).
+        ``";\\n "`` is gated on real metadata content — it serves as the
+        metadata → ``"Updated Memory:"`` separator, so when no metadata is
+        provided (or every sample's metadata is fully padded) there is
+        nothing to terminate and emitting it would dangle spurious tokens.
+        The gate fires when ``metadata_tokens is None`` *or* every entry of
+        ``metadata_masks`` is ``False`` (matching the low-level planner's
+        ``metadata_masks.any()`` semantics so that training paths with
+        all-padded metadata cleanly drop the metadata + prefix-end blocks).
+        Like the low-level planner, the decision is batch-wide: any sample
+        with real metadata keeps both blocks present for the whole batch.
+        The ``"Updated Memory: "`` anchor itself is unconditional because
+        inference relies on it as the autoregressive starting point for
+        memory decoding (memory_tokens is None at inference by design).
 
         When ``memory_tokens`` / ``response_tokens`` are omitted (inference), only the
         fixed spans before those segments are present; memory and subtask text are filled in
@@ -974,7 +981,16 @@ class PI07HighLevelPlannerModel(nn.Module):
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
-        if metadata_tokens is not None:
+        # Gate on real metadata content (not just `is not None`): `prepare_metadata`
+        # in the LL planner — and any external caller modeled on it — always returns
+        # a tensor even when every sample's metadata segments are empty. Mirroring
+        # the LL planner's `metadata_masks.any()` keeps semantics symmetric and lets
+        # all-padded metadata cleanly drop both the metadata block and the trailing
+        # ";\n " prefix-end. Decision is batch-wide for prefix-length uniformity.
+        has_metadata = (
+            metadata_tokens is not None and metadata_masks is not None and bool(metadata_masks.any())
+        )
+        if has_metadata:
             metadata_emb = self.gemma3_with_expert.embed_language_tokens(metadata_tokens)
             embs.append(metadata_emb)
             pad_masks.append(metadata_masks)

@@ -1162,6 +1162,17 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         without optional content the state-end already serves as the separator
         before ``"Action: "``, so appending another would dangle spurious tokens.
 
+        Note (batch-wide gate): ``has_any_optional`` is computed by OR-ing the
+        masks across the whole batch, so a sample with no optional content
+        sharing a batch with samples that do have optionals still receives the
+        ``", "`` state-end and ``";\\n "`` prefix-end (with all-False masks on
+        the absent optional block). This keeps every sample in the batch
+        aligned to the same prefix layout — all-or-nothing per batch — which
+        is needed because the prefix length determines per-sample position
+        IDs and cross-attention offsets that must be uniform within a batch.
+        Acceptable in practice for the homogeneous batches used in training;
+        per-sample gating would require variable-length prefixes per sample.
+
         Attention pattern (via ``att_masks`` cumsums):
             - Video + language: bidirectional (``0``).
             - ``State:``, projected state timestep tokens, state-end separator: bidirectional (``0``).

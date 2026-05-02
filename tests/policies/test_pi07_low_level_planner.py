@@ -604,6 +604,127 @@ class TestPI07LowLevelPlannerIntegration:
 
         assert action.shape == (1, MAX_ACTION_DIM)
 
+    @pytest.mark.gpu
+    @pytest.mark.slow
+    def test_no_optionals_path_on_real_gemma3(self, lerobot_dataset_metadata):
+        """Lock in the no-optionals prefix layout end-to-end on the real Gemma 3 backbone.
+
+        Constructs a batch with empty response (full ``response_drop_prob=1.0``
+        equivalent), all metadata fields padded (full metadata dropout), and
+        ``subgoal_is_pad=True`` (full ``subgoal_drop_prob=1.0`` equivalent) so
+        that ``has_any_optional`` is False and ``embed_prefix`` should:
+
+          * collapse the state-end separator from ``", "`` to ``":\\n"``,
+          * skip the metadata block entirely,
+          * skip the trailing ``";\\n "`` prefix-end.
+
+        Without this guard a regression that flips ``has_any_optional``
+        semantics would still pass the existing ``_train_prefix_total`` /
+        ``_infer_prefix_total`` shape checks (which hard-code the
+        all-optionals layout) and the structural CPU tests in
+        ``test_pi07_cpu.py``, but produce miscalibrated cross-attention
+        offsets on real Gemma 3 weights.
+        """
+        config = self._make_config()
+        policy = PI07LowLevelPlannerPolicy(config, dataset_stats=lerobot_dataset_metadata.stats)
+        tokenizer = policy.model.language_tokenizer
+
+        batch_size = 1
+        # Zero-action batch so the discrete-action CE path is still exercised
+        # while the optional middle blocks are entirely absent.
+        batch = {
+            "camera0": torch.randn(batch_size, N_OBS_STEPS, 3, IMAGE_SIZE, IMAGE_SIZE),
+            "camera1": torch.randn(batch_size, N_OBS_STEPS, 3, IMAGE_SIZE, IMAGE_SIZE),
+            "subgoal0": torch.randn(batch_size, 3, IMAGE_SIZE, IMAGE_SIZE),
+            "state": torch.randn(batch_size, N_OBS_STEPS, MAX_STATE_DIM),
+            "actions": torch.randn(batch_size, CHUNK_SIZE, MAX_ACTION_DIM),
+            "prompt": ["Pick up the red block"],
+            # Empty response → all-padding response_masks → has_response == False.
+            "response": [""],
+            # All metadata fields padded → empty metadata string → has_metadata == False.
+            "speed": torch.tensor([0]),
+            "quality": torch.tensor([0]),
+            "mistake": torch.tensor([0]),
+            "speed_is_pad": torch.tensor([True]),
+            "quality_is_pad": torch.tensor([True]),
+            "mistake_is_pad": torch.tensor([True]),
+            # Subgoal padded → all-False subgoal_img_masks → has_subgoal == False.
+            "subgoal_is_pad": torch.tensor([True]),
+            "action_is_pad": torch.zeros(batch_size, CHUNK_SIZE, dtype=torch.bool),
+        }
+
+        policy.to(dtype=torch.bfloat16, device="cuda")
+        batch_cuda = {
+            key: value.to("cuda", non_blocking=True, dtype=torch.bfloat16)
+            if isinstance(value, torch.Tensor)
+            else value
+            for key, value in batch.items()
+        }
+        batch_cuda["action_is_pad"] = batch_cuda["action_is_pad"].to(dtype=torch.bool)
+        batch_cuda["speed_is_pad"] = batch_cuda["speed_is_pad"].to(dtype=torch.bool)
+        batch_cuda["quality_is_pad"] = batch_cuda["quality_is_pad"].to(dtype=torch.bool)
+        batch_cuda["mistake_is_pad"] = batch_cuda["mistake_is_pad"].to(dtype=torch.bool)
+        batch_cuda["subgoal_is_pad"] = batch_cuda["subgoal_is_pad"].to(dtype=torch.bool)
+
+        captured = {}
+        original_embed_prefix = policy.model.embed_prefix
+
+        def capture_embed_prefix(*args, **kwargs):
+            result = original_embed_prefix(*args, **kwargs)
+            captured["prefix_pad_masks"] = result[1].clone()
+            captured["prefix_att_masks"] = result[2].clone()
+            return result
+
+        policy.model.embed_prefix = capture_embed_prefix
+        try:
+            loss = policy.forward(batch_cuda)
+        finally:
+            policy.model.embed_prefix = original_embed_prefix
+
+        # Loss is finite — the integrated path on real Gemma 3 weights survived
+        # the no-optionals layout (cross-attention offsets and position IDs both
+        # consistent with the collapsed prefix).
+        assert isinstance(loss, dict)
+        assert all(v.isfinite() for v in loss.values())
+
+        # Pin the collapsed prefix length: VIDEO + LANG + state-block (state_lead
+        # + N_OBS_STEPS + state-end-no-opt) + Action: + DISCRETE — no response,
+        # no subgoal, no metadata, and no ";\n " prefix-end.
+        m = self._indicator_lens(tokenizer)
+        state_end_no_opt_len = len(tokenizer.encode(":\n", add_special_tokens=False))
+        expected_prefix_len = (
+            VIDEO_TOKENS
+            + PROMPT_MAX_LENGTH
+            + m["state_lead"]
+            + N_OBS_STEPS
+            + state_end_no_opt_len
+            + m["action_lead"]
+            + DISCRETE_ACTION_MAX_LENGTH
+        )
+        assert captured["prefix_pad_masks"].shape == (batch_size, expected_prefix_len), (
+            f"no-optionals prefix length mismatch: got {captured['prefix_pad_masks'].shape[1]}, "
+            f"expected {expected_prefix_len}. A regression that re-emits the metadata block, "
+            f"the trailing ';\\n ' prefix-end, or fails to collapse the state-end separator "
+            f"would change this length."
+        )
+
+        # No causal boundaries before the "Action: " indicator: every block in
+        # the collapsed prefix (videos / language / state / state-end) must
+        # remain bidirectional. The first ``1`` should appear at the start of
+        # the indicator span. Mirrors the CPU test invariant in
+        # ``test_pi07_cpu.py::test_all_optional_blocks_absent_skips_emission``
+        # but on the real Gemma 3 tokenizer.
+        prefix_att_masks = captured["prefix_att_masks"][0].cpu()
+        first_one = int((prefix_att_masks == 1).nonzero(as_tuple=False).flatten()[0].item())
+        expected_first_one = (
+            VIDEO_TOKENS + PROMPT_MAX_LENGTH + m["state_lead"] + N_OBS_STEPS + state_end_no_opt_len
+        )
+        assert first_one == expected_first_one, (
+            f"first causal boundary at position {first_one}, expected {expected_first_one} "
+            f"(start of 'Action: ' indicator). An earlier ``1`` signals a spurious optional "
+            f"block was emitted."
+        )
+
 
 class TestPI07LowLevelPlannerRegression:
     """GPU regression tests pinning the low-level planner signature/dtype fixes.

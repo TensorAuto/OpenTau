@@ -525,11 +525,12 @@ def test_complete_pi06_pipeline_integration_smoke(lerobot_dataset_metadata):
 
     dataset_stats = copy.deepcopy(lerobot_dataset_metadata.stats)
     for k in ("max", "mean", "min", "std"):
-        dataset_stats["actions"][k] = np.full(
-            (config.chunk_size, 32),
-            float(dataset_stats["actions"][k].flatten()[0]),
-            dtype=np.float32,
-        )
+        # Tile the original per-step stats to chunk_size rows instead of
+        # collapsing every step to ``stats.flatten()[0]`` — a fixture with
+        # non-trivial per-step structure would otherwise be silently flattened
+        # to a single scalar.
+        original = dataset_stats["actions"][k].astype(np.float32, copy=False)
+        dataset_stats["actions"][k] = np.tile(original[:1], (config.chunk_size, 1))
 
     policy = PI06Policy(config, dataset_stats=dataset_stats)
     policy.to(dtype=torch.bfloat16, device="cuda")
