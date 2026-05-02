@@ -1117,12 +1117,12 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         before the optional discrete-action block):
 
         ``[videos | language | State: | state(T) | ", " | response | metadata |
-        ";\\n " | Subgoal: | subgoal_images… | ", " |
+        ";\\n " | Subgoal: | subgoal_images... | ", " |
         ("Action:" + discrete_actions only when training)]``
 
         Attention pattern (via ``att_masks`` cumsums) — paper §VI.B says
         "observation tokens and subgoal image tokens use bidirectional
-        attention within themselves … the following text tokens use causal
+        attention within themselves ... the following text tokens use causal
         attention":
 
             - Video patches: one bidirectional block (``[0] * N``).
@@ -1393,7 +1393,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         Projects actions through ``action_in_proj`` and computes an
         adaRMS-style conditioning vector from sinusoidal timestep embeddings
         via a two-layer MLP.  The suffix forms a single bidirectional block
-        (``att_masks = [1, 0, …, 0]``).
+        (``att_masks = [1, 0, ..., 0]``).
 
         Args:
             noisy_actions: ``(B, chunk_size, max_action_dim)`` noisy action

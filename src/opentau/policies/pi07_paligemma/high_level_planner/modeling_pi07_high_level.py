@@ -801,7 +801,7 @@ class PI07HighLevelPlannerModel(nn.Module):
         ┌───────────────────────────────────────────┐
         │     response content (subtask text)       │
         │                   ▲                       │
-        │  memory, ``Subtask: ``, lang, ``";\\n "``, images, … │
+        │  memory, ``Subtask: ``, lang, ``";\\n "``, images, ... │
         │     ┌───────────────────────┐             │
         │     │       PaliGemma        │            │
         │     │  (autoregressive LM)   │            │
@@ -864,7 +864,7 @@ class PI07HighLevelPlannerModel(nn.Module):
         via KV-cache decoding plus an explicit ``"Subtask: "`` injection before response AR.
 
         Attention pattern (via ``att_masks`` cumsums) — paper §VI.B says
-        "observation tokens use bidirectional attention within themselves …
+        "observation tokens use bidirectional attention within themselves ...
         the following text tokens use causal attention":
 
             - Image patches: one bidirectional block per camera (``[0] * N``).
