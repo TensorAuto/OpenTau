@@ -802,3 +802,246 @@ class TestEmbedPrefixConditionalGuards:
             "span signals a regression to the old [1]+[0]*(N-1) pattern, which shifts the "
             "cumsum at the indicator -> first-discrete boundary and breaks the CE loss."
         )
+
+
+# Engine-level config validation: SDPA accepted, fa2 falls back to eager with
+# a warning (was: NotImplementedError), garbage values raise.
+
+
+class TestGemma3WithExpertConfig:
+    def test_bad_attention_implementation_raises(self):
+        with pytest.raises(ValueError, match="attention_implementation"):
+            Gemma3WithExpertConfig(discrete_action_vocab_size=2048, attention_implementation="garbage")
+
+    def test_sdpa_attention_implementation_accepted(self):
+        cfg = Gemma3WithExpertConfig(discrete_action_vocab_size=2048, attention_implementation="sdpa")
+        assert cfg.attention_implementation == "sdpa"
+
+    def test_fa2_falls_back_to_eager_with_warning(self, caplog):
+        with caplog.at_level("WARNING"):
+            cfg = Gemma3WithExpertConfig(discrete_action_vocab_size=2048, attention_implementation="fa2")
+        # The config field itself is preserved so callers can introspect what
+        # they asked for; the dispatcher (see TestPi07AttentionDispatcher) is
+        # what falls back to eager at runtime.
+        assert cfg.attention_implementation == "fa2"
+        assert any("falling back to 'eager'" in record.message for record in caplog.records)
+
+
+# Attention dispatcher: routes attention_implementation to the right forward.
+
+
+class TestPi07AttentionDispatcher:
+    def test_dispatcher_returns_sdpa_for_sdpa_impl(self, monkeypatch):
+        monkeypatch.setattr(g3we, "_preferred_dtype", lambda: torch.float32)
+        cfg = _make_tiny_g3we_cfg()
+        cfg.attention_implementation = "sdpa"
+        model = Gemma3WithExpertModel(cfg)
+        assert model.get_attention_interface() == model.sdpa_attention_forward
+
+    def test_dispatcher_returns_eager_for_eager_impl(self, monkeypatch):
+        monkeypatch.setattr(g3we, "_preferred_dtype", lambda: torch.float32)
+        cfg = _make_tiny_g3we_cfg()
+        cfg.attention_implementation = "eager"
+        model = Gemma3WithExpertModel(cfg)
+        assert model.get_attention_interface() == model.eager_attention_forward
+
+    def test_dispatcher_falls_back_to_eager_for_fa2(self, monkeypatch):
+        monkeypatch.setattr(g3we, "_preferred_dtype", lambda: torch.float32)
+        cfg = _make_tiny_g3we_cfg()
+        cfg.attention_implementation = "fa2"
+        model = Gemma3WithExpertModel(cfg)
+        # Old behaviour raised NotImplementedError; new behaviour falls back
+        # to eager (warning was already emitted at config construction time).
+        assert model.get_attention_interface() == model.eager_attention_forward
+
+
+# SDPA vs eager equivalence — drives BOTH streams (backbone + expert) so the
+# Q/K/V concat path along the seq axis is covered. Pi07 is the first policy
+# in this family with that coverage requirement (pi06 tested backbone-only).
+
+
+class TestPi07SdpaEquivalence:
+    def test_eager_vs_sdpa_outputs_close(self, monkeypatch):
+        monkeypatch.setattr(g3we, "_preferred_dtype", lambda: torch.float32)
+        cfg = _make_tiny_g3we_cfg()
+        cfg.attention_implementation = "eager"
+
+        torch.manual_seed(0)
+        model_eager = Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+
+        cfg_sdpa = _make_tiny_g3we_cfg()
+        cfg_sdpa.attention_implementation = "sdpa"
+        torch.manual_seed(0)
+        model_sdpa = Gemma3WithExpertModel(cfg_sdpa).to(dtype=torch.float32)
+        # Mirror weights so the only delta is the attention math.
+        model_sdpa.load_state_dict(model_eager.state_dict(), strict=True)
+
+        model_eager.eval()
+        model_sdpa.eval()
+
+        batch, seq_len = 1, 4
+        backbone_h = cfg.gemma3_config.text_config.hidden_size
+        expert_h = cfg.gemma_expert_config.hidden_size
+        hidden_backbone = torch.randn(batch, seq_len, backbone_h)
+        hidden_expert = torch.randn(batch, seq_len, expert_h)
+        position_ids = torch.arange(seq_len)[None, :]
+        # Both streams concat along the seq axis → (B, 2*seq_len, 2*seq_len).
+        attention_mask = torch.tril(torch.ones(2 * seq_len, 2 * seq_len, dtype=torch.bool))[None]
+        # Expert AdaRMS layers are constructed with cond_dim=adarms_cond_dim
+        # and have no `weight` parameter — passing cond=None into the cond=None
+        # branch would crash. Provide real conditioning matching cond_dim, and
+        # let it broadcast over the per-stream sequence dim.
+        adarms_cond_value = torch.randn(batch, cfg.gemma_expert_config.adarms_cond_dim)
+        adarms_cond = [None, adarms_cond_value]
+
+        out_eager, _ = model_eager(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=[hidden_backbone, hidden_expert],
+            n_cross_att_tokens=2 * seq_len,
+            use_cache=False,
+            fill_kv_cache=True,
+            adarms_cond=adarms_cond,
+        )
+        out_sdpa, _ = model_sdpa(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=[hidden_backbone, hidden_expert],
+            n_cross_att_tokens=2 * seq_len,
+            use_cache=False,
+            fill_kv_cache=True,
+            adarms_cond=adarms_cond,
+        )
+
+        assert out_eager[0] is not None and out_sdpa[0] is not None
+        assert out_eager[1] is not None and out_sdpa[1] is not None
+        # Eager upcasts QK to fp32; SDPA accumulates the softmax in fp32 too.
+        # Numerical match is tight but not bit-identical due to reassociation.
+        assert torch.allclose(out_eager[0], out_sdpa[0], atol=1e-4, rtol=1e-4)
+        assert torch.allclose(out_eager[1], out_sdpa[1], atol=1e-4, rtol=1e-4)
+
+
+# Gradient-checkpointing forward equivalence — pins that ``_run_layer``
+# extraction is bit-identical to the original inlined loop body.
+
+
+class TestPi07GradCkptEquivalence:
+    def test_grad_ckpt_forward_matches_no_ckpt(self, monkeypatch):
+        """``gradient_checkpointing=True`` must not change the forward output.
+
+        Drives BOTH streams (backbone + expert) so the per-layer Q/K/V
+        concat path (which is what ``_run_layer`` wraps) is the actual
+        codepath under test. Train mode + ``dropout=0`` is required: the
+        checkpoint wrap is gated on ``self.training``, and dropout would
+        introduce stochasticity that masks any extraction bug.
+        """
+        monkeypatch.setattr(g3we, "_preferred_dtype", lambda: torch.float32)
+        cfg = _make_tiny_g3we_cfg()
+        cfg.dropout = 0.0
+
+        torch.manual_seed(0)
+        model_no_ckpt = Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+        model_no_ckpt.train()
+
+        cfg_ckpt = _make_tiny_g3we_cfg()
+        cfg_ckpt.dropout = 0.0
+        cfg_ckpt.gradient_checkpointing = True
+        torch.manual_seed(0)
+        model_ckpt = Gemma3WithExpertModel(cfg_ckpt).to(dtype=torch.float32)
+        model_ckpt.load_state_dict(model_no_ckpt.state_dict(), strict=True)
+        model_ckpt.train()
+
+        batch, seq_len = 1, 4
+        backbone_h = cfg.gemma3_config.text_config.hidden_size
+        expert_h = cfg.gemma_expert_config.hidden_size
+        hidden_backbone = torch.randn(batch, seq_len, backbone_h)
+        hidden_expert = torch.randn(batch, seq_len, expert_h)
+        position_ids = torch.arange(seq_len)[None, :]
+        attention_mask = torch.tril(torch.ones(2 * seq_len, 2 * seq_len, dtype=torch.bool))[None]
+        # Expert AdaRMS layers require non-None cond — see TestPi07SdpaEquivalence
+        # for the same construction.
+        adarms_cond_value = torch.randn(batch, cfg.gemma_expert_config.adarms_cond_dim)
+        adarms_cond = [None, adarms_cond_value]
+
+        out_a, _ = model_no_ckpt(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=[hidden_backbone, hidden_expert],
+            n_cross_att_tokens=2 * seq_len,
+            use_cache=False,
+            fill_kv_cache=True,
+            adarms_cond=adarms_cond,
+        )
+        out_b, _ = model_ckpt(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=[hidden_backbone, hidden_expert],
+            n_cross_att_tokens=2 * seq_len,
+            use_cache=False,
+            fill_kv_cache=True,
+            adarms_cond=adarms_cond,
+        )
+
+        assert out_a[0] is not None and out_b[0] is not None
+        assert out_a[1] is not None and out_b[1] is not None
+        # ckpt only re-runs forward in backward; forward numerics are
+        # identical up to floating-point reassociation in autograd.
+        assert torch.allclose(out_a[0], out_b[0], atol=1e-6, rtol=1e-6)
+        assert torch.allclose(out_a[1], out_b[1], atol=1e-6, rtol=1e-6)
+
+
+# Policy-level → vlm_config plumbing in __post_init__ — pins that
+# --policy.attention_implementation and --policy.gradient_checkpointing
+# CLI overrides reach the engine for both planners.
+
+
+class TestPi07ConfigPlumbing:
+    def test_post_init_plumbs_grad_ckpt_into_vlm_config(self):
+        from opentau.policies.pi07.high_level_planner.configuration_pi07_high_level import (
+            PI07HighLevelPlannerConfig,
+        )
+        from opentau.policies.pi07.low_level_planner.configuration_pi07_low_level import (
+            PI07LowLevelPlannerConfig,
+        )
+
+        hl = PI07HighLevelPlannerConfig(gradient_checkpointing=True)
+        assert hl.vlm_config.gradient_checkpointing is True
+
+        ll = PI07LowLevelPlannerConfig(gradient_checkpointing=True)
+        assert ll.vlm_config.gradient_checkpointing is True
+
+    def test_post_init_plumbs_attention_impl_into_vlm_config(self):
+        from opentau.policies.pi07.high_level_planner.configuration_pi07_high_level import (
+            PI07HighLevelPlannerConfig,
+        )
+        from opentau.policies.pi07.low_level_planner.configuration_pi07_low_level import (
+            PI07LowLevelPlannerConfig,
+        )
+
+        hl = PI07HighLevelPlannerConfig(attention_implementation="sdpa")
+        assert hl.vlm_config.attention_implementation == "sdpa"
+
+        ll = PI07LowLevelPlannerConfig(attention_implementation="sdpa")
+        assert ll.vlm_config.attention_implementation == "sdpa"
+
+    def test_post_init_preserves_explicit_vlm_config_when_policy_default(self):
+        """Direct overrides via --policy.vlm_config.* must survive when the
+        policy-level field is at its default ('eager' / False)."""
+        from opentau.policies.pi07.high_level_planner.configuration_pi07_high_level import (
+            PI07HighLevelPlannerConfig,
+        )
+
+        cfg = PI07HighLevelPlannerConfig(
+            vlm_config=Gemma3WithExpertConfig(
+                attention_implementation="sdpa",
+                gradient_checkpointing=True,
+                discrete_action_vocab_size=2048,
+            )
+        )
+        # Policy-level fields stay at their defaults; vlm_config keeps its
+        # explicit values (the __post_init__ plumbing is gated on the
+        # policy-level field being NON-default).
+        assert cfg.attention_implementation == "eager"
+        assert cfg.gradient_checkpointing is False
+        assert cfg.vlm_config.attention_implementation == "sdpa"
+        assert cfg.vlm_config.gradient_checkpointing is True

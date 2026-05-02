@@ -78,10 +78,26 @@ class PI07HighLevelPlannerConfig(PreTrainedConfig):
             for whatever tokenizer the model uses. Defaults to 4.
         dropout: Dropout rate applied in the transformer expert.
             Defaults to 0.1.
-        attention_implementation: Attention backend — ``"eager"`` or
-            ``"fa2"`` (Flash Attention 2). Defaults to ``"eager"``.
+        attention_implementation: Attention backend — ``"eager"``, ``"sdpa"``,
+            or ``"fa2"``. Defaults to ``"eager"``. ``"sdpa"`` dispatches to
+            ``torch.nn.functional.scaled_dot_product_attention`` (typically
+            ~2x faster on A100/H100 + bf16). ``"fa2"`` is accepted for
+            backward compatibility but logs a warning and falls back to
+            eager. The value is propagated to ``vlm_config`` in
+            ``__post_init__`` so a single ``--policy.attention_implementation``
+            override reaches the engine.
         freeze_vision_encoder: Whether to freeze the SigLIP vision encoder
             during fine-tuning. Defaults to True.
+        gradient_checkpointing: Wrap each interleaved Gemma 3 + expert decoder
+            layer body in ``torch.utils.checkpoint.checkpoint`` during
+            training. Trades roughly one extra forward pass per step
+            (~25-33% compute) for a large slice of activation memory per
+            rank, enabling larger per-rank batch sizes. Only safe under
+            plain DDP (MULTI_GPU), single-process (NO), or DeepSpeed
+            ZeRO-1/2 — ``src/opentau/scripts/train.py`` raises if the
+            accelerator's distributed_type is anything else (ZeRO-3, FSDP).
+            Propagated to ``vlm_config.gradient_checkpointing`` in
+            ``__post_init__``. Defaults to False.
         optimizer_lr: Peak learning rate for AdamW. Defaults to 2.5e-5.
         optimizer_betas: Beta parameters for AdamW. Defaults to (0.9, 0.95).
         optimizer_eps: Epsilon for AdamW. Defaults to 1e-8.
@@ -140,6 +156,10 @@ class PI07HighLevelPlannerConfig(PreTrainedConfig):
     # Finetuning settings
     freeze_vision_encoder: bool = True
 
+    # Activation checkpointing for the engine (Gemma 3 backbone + Gemma-v1
+    # expert per-layer body). Plumbed to vlm_config in __post_init__.
+    gradient_checkpointing: bool = False
+
     vlm_config: Gemma3WithExpertConfig = field(
         default_factory=lambda: Gemma3WithExpertConfig(
             freeze_vision_encoder=True,
@@ -163,6 +183,13 @@ class PI07HighLevelPlannerConfig(PreTrainedConfig):
     def __post_init__(self):
         """Validates configuration values after dataclass initialization.
 
+        Also plumbs the policy-level ``attention_implementation`` and
+        ``gradient_checkpointing`` flags into ``vlm_config`` so a single
+        ``--policy.attention_implementation`` / ``--policy.gradient_checkpointing``
+        CLI override reaches the engine. Direct overrides on
+        ``--policy.vlm_config.*`` still work and are honoured as-is when the
+        policy-level field is at its default.
+
         Raises:
             ValueError: If ``n_obs_steps`` is not 1.
         """
@@ -172,6 +199,11 @@ class PI07HighLevelPlannerConfig(PreTrainedConfig):
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
+
+        if self.attention_implementation != "eager":
+            self.vlm_config.attention_implementation = self.attention_implementation
+        if self.gradient_checkpointing:
+            self.vlm_config.gradient_checkpointing = self.gradient_checkpointing
 
     def validate_features(self) -> None:
         """Adds placeholder camera features for empty camera slots.
