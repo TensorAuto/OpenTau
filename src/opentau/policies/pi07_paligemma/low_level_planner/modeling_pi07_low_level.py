@@ -1026,7 +1026,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
 
     The VLM processes the same prefix layout as :meth:`embed_prefix` (videos,
     language, ``State:``, state, comma, response, metadata, ``";\n "``,
-    ``Subgoal:``, subgoal images, comma, optional ``Action:``/discrete) — the
+    ``Subgoal:``, subgoal images, comma, optional ``Action:``/discrete): the
     image-goal block sits after all text per π0.7 paper Fig. 19. The action
     expert receives the prefix KV-cache (detached for Knowledge Insulation)
     together with noisy continuous actions and flow-matching timestep
@@ -1112,7 +1112,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Embed all prefix modalities and build the 1-D attention pattern.
 
-        Concatenation order — matches π0.7 paper Fig. 19's "image goals come
+        Concatenation order -- matches π0.7 paper Fig. 19's "image goals come
         after the text prompt" rule (subgoal block sits at the tail, just
         before the optional discrete-action block):
 
@@ -1120,7 +1120,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         ";\\n " | Subgoal: | subgoal_images... | ", " |
         ("Action:" + discrete_actions only when training)]``
 
-        Attention pattern (via ``att_masks`` cumsums) — paper §VI.B says
+        Attention pattern (via ``att_masks`` cumsums). Paper §VI.B says
         "observation tokens and subgoal image tokens use bidirectional
         attention within themselves ... the following text tokens use causal
         attention":
@@ -1185,8 +1185,8 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
 
-        # Per π0.7 paper §VI.B: "The following text tokens use causal attention"
-        # — language tokens open one causal block per token after the bidirectional
+        # Per π0.7 paper §VI.B: "The following text tokens use causal attention".
+        # Language tokens open one causal block per token after the bidirectional
         # video prefix (same fix as PR #235 for π0.6).
         num_lang_embs = lang_emb.shape[1]
         att_masks += [1] * num_lang_embs
@@ -1253,7 +1253,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         embs.append(response_emb)
         pad_masks.append(response_masks)
         # Response (Subtask) is text → fully causal per paper §VI.B
-        # (was prefix-LM `[1] + [0]*(N-1)` — only the first token was causal).
+        # (was prefix-LM `[1] + [0]*(N-1)`, only the first token was causal).
         num_response_embs = response_emb.shape[1]
         att_masks += [1] * num_response_embs
 

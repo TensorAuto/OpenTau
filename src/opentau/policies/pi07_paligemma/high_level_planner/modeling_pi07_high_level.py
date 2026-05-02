@@ -863,14 +863,14 @@ class PI07HighLevelPlannerModel(nn.Module):
         fixed spans before those segments are present; memory and subtask text are filled in
         via KV-cache decoding plus an explicit ``"Subtask: "`` injection before response AR.
 
-        Attention pattern (via ``att_masks`` cumsums) — paper §VI.B says
+        Attention pattern (via ``att_masks`` cumsums) -- paper §VI.B says
         "observation tokens use bidirectional attention within themselves ...
         the following text tokens use causal attention":
 
             - Image patches: one bidirectional block per camera (``[0] * N``).
             - All text spans (language, metadata, ``";\\n "``,
               ``"Updated Memory: "``, ``"Subtask: "``, memory content,
-              response content): causal — one block per token (``[1] * N``).
+              response content): causal -- one block per token (``[1] * N``).
 
         Args:
             images: List of image tensors, one per camera.
@@ -929,8 +929,8 @@ class PI07HighLevelPlannerModel(nn.Module):
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
 
-        # Per π0.7 paper §VI.B: "The following text tokens use causal attention"
-        # — language tokens open one causal block per token after the bidirectional
+        # Per π0.7 paper §VI.B: "The following text tokens use causal attention".
+        # Language tokens open one causal block per token after the bidirectional
         # image prefix (same fix as PR #235 for π0.6).
         num_lang_embs = lang_emb.shape[1]
         att_masks += [1] * num_lang_embs

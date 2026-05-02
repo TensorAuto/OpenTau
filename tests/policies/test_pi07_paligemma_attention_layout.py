@@ -23,7 +23,7 @@ The tests only exercise the shared :func:`make_att_2d_masks` utility, so
 they run on CPU without instantiating any model. ``make_att_2d_masks`` is
 imported from the high-level planner module to sidestep the unrelated
 ``VJEPA2VideoEncoder`` pre-existing import bug in the low-level planner
-module (tracked separately in #232 / #234) — the implementation is byte-
+module (tracked separately in #232 / #234); the implementation is byte-
 identical in both planners.
 """
 
@@ -70,7 +70,7 @@ class TestPI07LowLevelPlannerAttentionLayout:
     """Locks the low-level planner's post-fix attention layout. The pre-fix
     code violated paper §VI.B in two distinct ways:
       1. ``[0] * N`` for language tokens (same bug as PR #235).
-      2. ``[1] + [0] * (N - 1)`` for the response (Subtask) span — only the
+      2. ``[1] + [0] * (N - 1)`` for the response (Subtask) span: only the
          first token was causal; the remaining N-1 were bidirectional within
          the span, silently leaking future-token information into the
          response loss.
@@ -97,7 +97,7 @@ class TestPI07LowLevelPlannerAttentionLayout:
         assert not torch.any(mask[0, vid_slice, lang_slice])
 
     def test_embed_prefix_layout_has_causal_response_block(self):
-        """The response (Subtask) span is text — every token must open its
+        """The response (Subtask) span is text: every token must open its
         own causal block (``[1] * N``). This test guards against regression
         to the prefix-LM ``[1] + [0] * (N - 1)`` pattern that allowed bytes
         within the response span to attend to one another bidirectionally.
