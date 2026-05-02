@@ -91,8 +91,7 @@ jobs:
           source .venv/bin/activate
           mkdir -p /tmp/libero-assets/libero/libero
           export LIBERO_CONFIG_PATH="$(pwd)/.github/assets/libero"
-          # TODO(#210): drop --ignore=tests/policies/test_pi07_paligemma_low_level_planner.py once pi07 migrates to SpaceTimeSiglipVideoEncoder (#192).
-          pytest -m "gpu" -n 0 -v --ignore=tests/policies/test_pi07_paligemma_low_level_planner.py tests/
+          pytest -m "gpu" -n 0 -v tests/
 
   stop-runner:
     name: Stop GPU Runner
