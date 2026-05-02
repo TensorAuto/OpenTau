@@ -76,6 +76,10 @@ class PI07lowlevelPlannerConfig(PreTrainedConfig):
             Defaults to False.
         spacetime_layer_stride: Wrap every N-th SigLIP layer with space-time
             attention. Defaults to 4.
+        gradient_checkpointing: If True, the SpaceTime SigLIP video encoder
+            wraps each layer in ``torch.utils.checkpoint.checkpoint`` during
+            training. Defaults to False. Honors the same DDP / single-GPU /
+            DeepSpeed ZeRO-1/2 backend guard as pi05_mem.
     """
 
     # Input / output structure.
@@ -141,6 +145,7 @@ class PI07lowlevelPlannerConfig(PreTrainedConfig):
 
     # SpaceTimeSiglip settings
     spacetime_layer_stride: int = 4
+    gradient_checkpointing: bool = False
 
     # Training presets
     optimizer_lr: float = 2.5e-5

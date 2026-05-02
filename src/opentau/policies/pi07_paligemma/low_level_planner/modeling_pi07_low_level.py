@@ -739,8 +739,10 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         """Apply preprocessing to the video inputs.
 
         Each camera key now contains a video tensor of shape (B, T, C, H, W).
-        Frames are resized to 224x224 with padding. ImageNet normalization is
-        assumed to be already applied by the dataset loader.
+        Frames are resized to 224x224 with padding. The dataset yields pixel
+        values in ``[0, 1]``; the SpaceTime SigLIP encoder rescales to
+        ``[-1, 1]`` internally, so no upstream ImageNet normalization is
+        needed (or expected).
 
         Args:
             batch: Batch of data containing video tensors.
@@ -883,6 +885,15 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         subgoal slots for that sample are zeroed out and their masks set to
         ``False`` so that downstream attention ignores them.
 
+        .. note::
+            ``subgoal_is_pad`` defaults to ``torch.ones(B, dtype=bool)``
+            (treat-as-pad) when the key is missing from ``batch``. This is a
+            behavior change from the previous treat-as-real (``torch.zeros``)
+            default. Hand-built inference batches that supply ``subgoal{k}``
+            images but omit ``subgoal_is_pad`` will now have those images
+            silently masked out — pass ``subgoal_is_pad=torch.zeros(...)``
+            explicitly when the subgoal images are real.
+
         Args:
             batch: Batch dict containing subgoal image tensors keyed as
                 ``subgoal{k}`` for each ``camera{k}`` in
@@ -953,6 +964,17 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
         Wraps each metadata string as ``"Metadata: {meta}<eos>"`` and
         pads/truncates to ``metadata_max_length``.
+
+        .. note::
+            ``speed_is_pad`` / ``quality_is_pad`` / ``mistake_is_pad`` each
+            default to ``torch.ones(B, dtype=bool)`` (treat-as-pad) when the
+            key is missing from ``batch``. This is a behavior change from
+            the previous treat-as-real (``torch.zeros``) default. Hand-built
+            inference batches that supply ``"speed"`` / ``"quality"`` /
+            ``"mistake"`` but omit the corresponding ``_is_pad`` flag will
+            now have those metadata fields silently dropped from the prefix
+            string — pass ``..._is_pad=torch.zeros(...)`` explicitly when the
+            metadata is real.
 
         Args:
             batch: Batch dict containing ``"speed"``, ``"quality"``,
@@ -1057,6 +1079,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             multi_modal_projector=self.paligemma_with_expert.paligemma.multi_modal_projector,
             num_frames=config.n_obs_steps,
             spacetime_layer_stride=config.spacetime_layer_stride,
+            gradient_checkpointing=config.gradient_checkpointing,
         )
 
         # Per-timestep state projection: each of the T state vectors becomes one token
@@ -1069,6 +1092,11 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         self.time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
 
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
+
+        # Cache the length of the "Action: " indicator in tokens — used 3× per
+        # forward() (cross-att length, prefix-offset slice, indicator embed).
+        # Parallels pi05's discrete_action_indicator_max_length on its config.
+        self._action_indicator_len = len(self.language_tokenizer.encode("Action: ", add_special_tokens=False))
 
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
         return torch.normal(mean=0.0, std=1.0, size=shape, dtype=torch.float32, device=device)
@@ -1283,9 +1311,9 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             # otherwise pad-only samples would receive real (unmasked)
             # indicator tokens with no image content behind them, which
             # the prefix-LM block then attends to as if it were grounded.
-            sample_has_subgoal = torch.stack([m.to(dtype=torch.bool) for m in subgoal_img_masks], dim=0).any(
-                dim=0
-            )
+            # Each ``mask`` is already bool (built as ``torch.ones(..., dtype=torch.bool)``
+            # in ``prepare_subgoal_images``), so no .to() cast is needed here.
+            sample_has_subgoal = torch.stack(subgoal_img_masks, dim=0).any(dim=0)
 
             subgoal_img_start_indicator_ids = self.language_tokenizer.encode(
                 "Subgoal: ", add_special_tokens=False
@@ -1304,6 +1332,14 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
 
             embs.append(subgoal_img_start_emb)
             pad_masks.append(subgoal_img_start_mask)
+            # ``att_masks`` is a single Python list shared across the batch (broadcast
+            # to ``(B, L)`` by ``att_masks[None, :].expand(...)`` below). The scalar
+            # ``[1, 0, ...]`` is therefore the same on every sample including those
+            # with ``sample_has_subgoal=False``. That spurious causal-block boundary
+            # is harmless because ``make_att_2d_masks`` later zeros rows/cols where
+            # ``pad_mask=False`` (and ``subgoal_img_start_mask`` already follows
+            # ``sample_has_subgoal``); do NOT "fix" this by going per-sample without
+            # also adjusting ``make_att_2d_masks``, or you will double-mask.
             att_masks += [1] + [0] * (num_subgoal_img_start_embs - 1)
 
             for (
@@ -1354,6 +1390,12 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         # Only emit the ":\n" prefix-end when at least one optional middle block was added
         # above. With no optional content, the state-end already collapsed to ":\n" and acts
         # as the separator before "Action: " — appending another would dangle 2 spurious tokens.
+        # Note: this terminator (``":\n"``) intentionally differs from the high-level
+        # planner's ``";\n "`` (see ``high_level_planner/modeling_pi07_high_level.py``).
+        # The low-level prefix is kept byte-equivalent to pi05's continuous-state path
+        # (``encode(":\n", add_special_tokens=False)`` in ``pi05/modeling_pi05.py``);
+        # the high-level planner has its own prefix layout and is not constrained by
+        # pi05 byte-equivalence.
         if has_any_optional:
             prefix_end_indicator_ids = self.language_tokenizer.encode(":\n", add_special_tokens=False)
             prefix_end_tokens = torch.tensor(
@@ -1549,9 +1591,14 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         # Exclude both the "Action: " indicator tokens and the discrete action tokens from
         # cross-attention so the action expert sees the same prefix length at train and inference
         # (at inference, neither is in the prefix). Matches pi05's discrete_action_indicator_max_length logic.
-        _action_indicator_len = len(self.language_tokenizer.encode("Action: ", add_special_tokens=False))
+        # ``self._action_indicator_len`` is cached in __init__; it implicitly assumes
+        # ``discrete_actions is not None`` here (else this subtraction would underflow).
+        assert discrete_actions is not None, (
+            "forward() expects discrete_actions during training; cross-att length subtracts "
+            "Action: indicator + discrete tokens to keep prefix_embs train/inference parity."
+        )
         num_cross_att_tokens = (
-            prefix_embs.shape[1] - _action_indicator_len - self.config.discrete_action_max_length
+            prefix_embs.shape[1] - self._action_indicator_len - self.config.discrete_action_max_length
         )
 
         (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
@@ -1591,7 +1638,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             cross_att_pad_masks=prefix_pad_masks[:, :num_cross_att_tokens],
         )
         prefix_offsets = torch.sum(
-            prefix_pad_masks[:, : -(_action_indicator_len + self.config.discrete_action_max_length)],
+            prefix_pad_masks[:, : -(self._action_indicator_len + self.config.discrete_action_max_length)],
             dim=-1,
         )[:, None]
         action_expert_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1

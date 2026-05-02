@@ -1793,12 +1793,21 @@ class LeRobotDataset(BaseDataset):
         """Decode subgoal frames — one per camera slot — for this sample.
 
         Subgoal supervision is always-on for any dataset that exposes camera
-        keys; the dedicated ``subgoals`` info.json declaration that the older
+        keys; the dedicated ``subgoals`` info.json opt-in that the older
         pi07_paligemma path required is no longer consulted. Datasets without
         any cameras (``self.num_cams == 0`` or empty
         ``self.meta.camera_keys``) still return ``{}``, which lets
         :meth:`BaseDataset._emit_optional_keys` emit ``subgoal_is_pad=True``
         for every slot.
+
+        Behavior change from the prior opt-in design: ``WeightedDatasetMixture``
+        runs that mix subgoal-aware and subgoal-unaware datasets will now
+        silently inject subgoal supervision on the latter (segment-aware
+        sampling for episodes with ``segments`` annotations, or the legacy
+        ~4 s lookahead fallback for episodes without — see
+        :meth:`_sample_subgoal_frame`). Co-trainers should weight the mixture
+        accordingly or filter to subgoal-annotated subsets if the prior
+        treat-as-pad behavior is preferred.
 
         Behavior for camera-bearing datasets:
         - The at-end-of-segment vs uniform sampling roll happens ONCE per
@@ -1812,10 +1821,11 @@ class LeRobotDataset(BaseDataset):
           subset), drop is never rolled — the frame-selection randomness
           stays live because it's about which future frame to read, not
           masking.
-        - Episodes without a ``segments`` entry in ``episodes.jsonl`` are
-          unsupported — ``_sample_subgoal_frame`` requires a segment to
-          clip the future-frame against. Datasets must annotate every
-          episode with at least one segment boundary.
+        - Episodes without a ``segments`` entry in ``episodes.jsonl`` fall
+          back to the legacy ~4 s lookahead inside
+          :meth:`_sample_subgoal_frame` (clipped to the episode end). New
+          datasets are encouraged to annotate ``segments`` per episode for
+          segment-aware sampling, but the legacy path remains supported.
         """
         if self.num_cams <= 0 or len(self.meta.camera_keys) == 0:
             return {}
