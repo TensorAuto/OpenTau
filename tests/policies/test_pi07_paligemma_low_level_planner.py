@@ -574,9 +574,9 @@ class TestPI07LowLevelPlannerRegression:
 
         params = inspect.signature(PI07LowLevelPlannerFlowMatching.embed_prefix).parameters
         for name in ("response_tokens", "response_masks", "metadata_tokens", "metadata_masks"):
-            assert params[name].default is inspect.Parameter.empty, (
-                f"{name} should be a required parameter (no default), got default={params[name].default}"
-            )
+            assert (
+                params[name].default is inspect.Parameter.empty
+            ), f"{name} should be a required parameter (no default), got default={params[name].default}"
 
 
 class TestPI07LowLevelPlannerEmbedPrefixNoOptionals:
@@ -713,9 +713,9 @@ class TestPI07LowLevelPlannerEmbedPrefixNoOptionals:
         assert pad_masks.shape == (m["bsize"], expected_len)
         assert att_masks.shape == pad_masks.shape
         # Whole prefix is bidirectional: every att_mask entry must be 0/False.
-        assert not bool(att_masks.any()), (
-            "no-optional prefix should contain only bidirectional tokens (att_masks all 0)"
-        )
+        assert not bool(
+            att_masks.any()
+        ), "no-optional prefix should contain only bidirectional tokens (att_masks all 0)"
 
     def test_action_indicator_is_per_token_causal(self):
         """``Action: `` indicator's att_masks is ``[1]*N`` (per-token causal), matching pi05."""
@@ -727,9 +727,9 @@ class TestPI07LowLevelPlannerEmbedPrefixNoOptionals:
         )
         indicator_hi = indicator_lo + m["action_lead"]
         indicator_slice = att_masks[0, indicator_lo:indicator_hi]
-        assert torch.equal(indicator_slice, torch.ones(m["action_lead"], dtype=torch.bool)), (
-            f"Expected Action: indicator att_masks to be all-1 (per-token causal), got {indicator_slice}"
-        )
+        assert torch.equal(
+            indicator_slice, torch.ones(m["action_lead"], dtype=torch.bool)
+        ), f"Expected Action: indicator att_masks to be all-1 (per-token causal), got {indicator_slice}"
 
     def test_byte_equivalent_layout_requires_n_obs_steps_one(self):
         """Document that byte-equivalence with pi05 hinges on ``n_obs_steps == 1``.
@@ -779,6 +779,139 @@ class TestPI07LowLevelPlannerEmbedPrefixNoOptionals:
 
         # video + lang + "State: " + state(1) + ", " + response + ":\n"
         expected_len = 6 + prompt_len + 3 + 1 + 1 + response_len + 1
-        assert pad_masks.shape[1] == expected_len, (
-            f"True-branch length mismatch: got {pad_masks.shape[1]}, expected {expected_len}"
+        assert (
+            pad_masks.shape[1] == expected_len
+        ), f"True-branch length mismatch: got {pad_masks.shape[1]}, expected {expected_len}"
+
+    def test_mixed_batch_subgoal_pad_masks_follow_sample_has_subgoal(self):
+        """In a mixed batch, the ``Subgoal: `` header / image / footer pad_masks
+        must follow the per-sample ``sample_has_subgoal`` flag (True for samples
+        that actually have subgoals, False for pad-only samples).
+
+        This is the actual scenario the per-sample gating is meant to handle —
+        the no-optionals tests above only exercise the all-pad path.
+        """
+        bsize = 2
+        prompt_len = 5
+        n_subgoal_patches = 4  # _PaliGemmaStub.embed_image returns 4 patches.
+
+        model = self._make_mock_model()
+
+        videos = [torch.zeros(bsize, 1, 3, 8, 8)]
+        vid_masks = [torch.ones(bsize, dtype=torch.bool)]
+        lang_tokens = torch.zeros(bsize, prompt_len, dtype=torch.long)
+        lang_masks = torch.ones(bsize, prompt_len, dtype=torch.bool)
+        state = torch.zeros(bsize, 1, 3)
+        # No response / metadata to keep the mixed-batch focus on subgoals.
+        response_tokens = torch.zeros(bsize, 3, dtype=torch.long)
+        response_masks = self._empty_mask(bsize, 3)
+        metadata_tokens = torch.zeros(bsize, 3, dtype=torch.long)
+        metadata_masks = self._empty_mask(bsize, 3)
+
+        # Single subgoal camera. Sample 0 has a real subgoal (mask=True);
+        # sample 1 is pad-only (mask=False).
+        subgoal_images = [torch.zeros(bsize, 3, 8, 8)]
+        subgoal_img_masks = [torch.tensor([True, False], dtype=torch.bool)]
+
+        (_embs, pad_masks, att_masks) = PI07LowLevelPlannerFlowMatching.embed_prefix(
+            model,
+            videos=videos,
+            vid_masks=vid_masks,
+            lang_tokens=lang_tokens,
+            lang_masks=lang_masks,
+            state=state,
+            response_tokens=response_tokens,
+            response_masks=response_masks,
+            metadata_tokens=metadata_tokens,
+            metadata_masks=metadata_masks,
+            subgoal_images=subgoal_images,
+            subgoal_img_masks=subgoal_img_masks,
         )
+
+        # Layout (with optionals): video(6) + lang(prompt_len) + "State: "(3) +
+        #   state(1) + ", "(1) + "Subgoal: "(2) + image(4) + ", "(1) + ":\n"(1).
+        video_tokens = 6
+        offset = video_tokens + prompt_len + len(self._STATE_LEAD_IDS) + 1 + len(self._COMMA_IDS)
+        sg_header_lo = offset
+        sg_header_hi = sg_header_lo + len(self._SUBGOAL_LEAD_IDS)
+        sg_image_lo = sg_header_hi
+        sg_image_hi = sg_image_lo + n_subgoal_patches
+        sg_footer_lo = sg_image_hi
+        sg_footer_hi = sg_footer_lo + len(self._COMMA_IDS)
+
+        # Sample 0 (has subgoal): every position in the subgoal block must be 1.
+        assert torch.all(
+            pad_masks[0, sg_header_lo:sg_footer_hi]
+        ), "sample 0 has a real subgoal — header/image/footer pad_masks must be all True"
+        # Sample 1 (no subgoal): every position in the subgoal block must be 0.
+        assert not torch.any(pad_masks[1, sg_header_lo:sg_footer_hi]), (
+            "sample 1 is pad-only — header/image/footer pad_masks must be all False so the "
+            "indicator/image/footer tokens don't participate in attention"
+        )
+
+        # ``att_masks`` is shared across the batch (the [1,0,...,0] block-opener pattern is
+        # stored as a Python list and then broadcast). The header still opens a new causal
+        # block on row 0, position sg_header_lo — verify that scalar shape stays put.
+        assert att_masks.shape == (bsize, pad_masks.shape[1])
+        assert bool(att_masks[0, sg_header_lo]) is True, "header opens a new causal block"
+        assert torch.equal(
+            att_masks[0], att_masks[1]
+        ), "att_masks is broadcast — both samples must see the same 1-D pattern"
+
+    def test_no_optionals_num_cross_att_tokens_matches_pi05_arithmetic(self):
+        """Pin the no-optionals ``num_cross_att_tokens`` / ``prefix_offsets`` arithmetic.
+
+        The cross-attention prefix the action expert sees must equal
+        ``prefix_embs.shape[1] - _action_indicator_len - discrete_action_max_length``,
+        i.e. the prefix length stripped of the ``"Action: "`` indicator and the
+        discrete-action tokens. This matches pi05's
+        ``discrete_action_indicator_max_length`` + ``discrete_action_max_length``
+        subtraction so the action expert sees the same prefix length at train
+        and inference.
+        """
+        n_obs_steps = 1
+        discrete_len = 4
+
+        model = self._make_mock_model()
+        # ``_make_mock_model`` bypasses ``__init__`` (uses ``object.__new__``), so the
+        # cached length normally set in __init__ must be installed manually here.
+        model._action_indicator_len = len(self._ACTION_LEAD_IDS)
+
+        # Drive the no-optionals path with discrete actions present.
+        (_embs, pad_masks, _att_masks), m = self._drive_no_optionals(
+            n_obs_steps=n_obs_steps, with_discrete=True
+        )
+
+        # Sanity: prefix length matches the no-optionals layout.
+        expected_prefix_len = (
+            m["video_tokens"]
+            + m["prompt_len"]
+            + m["state_lead"]
+            + m["n_obs_steps"]
+            + m["colon_nl"]  # state-end collapsed to ":\n", no trailing prefix-end.
+            + m["action_lead"]
+            + discrete_len
+        )
+        assert pad_masks.shape[1] == expected_prefix_len
+
+        # ``num_cross_att_tokens`` (per ``forward()``): strips off the indicator + discrete tokens.
+        num_cross = pad_masks.shape[1] - model._action_indicator_len - discrete_len
+        assert (
+            num_cross
+            == m["video_tokens"] + m["prompt_len"] + m["state_lead"] + m["n_obs_steps"] + m["colon_nl"]
+        )
+
+        # The cross-attention slice must end exactly at the start of the ``Action: `` indicator.
+        # Every position inside the slice belongs to the no-optionals prefix (video + lang + State block).
+        cross_slice = pad_masks[:, :num_cross]
+        action_lead_lo = num_cross
+        action_lead_hi = action_lead_lo + m["action_lead"]
+        # The "Action: " indicator slot is non-padded (always-on indicator tokens).
+        assert torch.all(
+            pad_masks[:, action_lead_lo:action_lead_hi]
+        ), "the slice immediately past num_cross must be the all-real Action: indicator"
+        # ``prefix_offsets`` (per ``forward()``): sum the prefix pad_masks excluding indicator + discrete.
+        prefix_offsets = pad_masks[:, : -(model._action_indicator_len + discrete_len)].sum(dim=-1)
+        assert torch.equal(
+            prefix_offsets, cross_slice.sum(dim=-1)
+        ), "prefix_offsets and num_cross-derived slice must agree on the cross-att length per sample"

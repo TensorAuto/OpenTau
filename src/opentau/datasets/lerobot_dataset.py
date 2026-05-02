@@ -1838,6 +1838,10 @@ class LeRobotDataset(BaseDataset):
         subgoal_frame = self._sample_subgoal_frame(ep_idx, frame_in_ep, at_end_of_segment=at_end)
         ts = subgoal_frame / self.fps
         out: dict[str, torch.Tensor] = {}
+        # ``hf_dataset[idx]`` runs ``hf_transform_to_torch`` over every column of the row, so
+        # it must be done at most once per ``__getitem__`` even when multiple image-dtype
+        # cameras live in the same row.
+        cached_image_row: dict | None = None
         for k in range(self.num_cams):
             cam_key = name_map.get(f"camera{k}")
             if cam_key is None:
@@ -1850,8 +1854,10 @@ class LeRobotDataset(BaseDataset):
                 # rows of ``hf_dataset``. The within-episode index returned
                 # by ``_sample_subgoal_frame`` maps directly to the absolute
                 # row ``ep_start + subgoal_frame``.
-                ep_start = int(self.episode_data_index["from"][self.epi2idx[ep_idx]].item())
-                out[f"subgoal{k}_raw"] = self.hf_dataset[ep_start + subgoal_frame][cam_key]
+                if cached_image_row is None:
+                    ep_start = int(self.episode_data_index["from"][self.epi2idx[ep_idx]].item())
+                    cached_image_row = self.hf_dataset[ep_start + subgoal_frame]
+                out[f"subgoal{k}_raw"] = cached_image_row[cam_key]
         return out
 
     def _add_padding_keys(self, item: dict, padding: dict[str, list[bool]]) -> dict:

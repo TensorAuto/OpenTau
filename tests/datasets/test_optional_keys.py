@@ -477,6 +477,69 @@ class TestDropoutDisabled:
         assert "subgoal0_raw" in out
         assert len(called) == 1, "video decode fired exactly once for the single camera"
 
+    def test_subgoals_load_without_segments_uses_4s_lookahead(self, monkeypatch):
+        """Legacy path: episodes whose ``episodes.jsonl`` entry omits
+        ``segments`` fall back to a fixed ~4 s lookahead in
+        ``_sample_subgoal_frame``, clipped to the episode end.
+
+        Pins the segment-less branch the rewritten ``_load_subgoal_frames``
+        docstring promises (and that ``_sample_subgoal_frame`` still
+        implements) so a future segment-only refactor doesn't silently break
+        legacy datasets.
+        """
+        from types import SimpleNamespace
+
+        import numpy as _np
+
+        import opentau.datasets.lerobot_dataset as _ld
+
+        mapping_key = "_tests/subgoal_no_segments"
+        _ld.DATA_FEATURES_NAME_MAPPING[mapping_key] = {"camera0": "camera0"}
+
+        ep_length = 300  # > 4 s @ 30 fps so the lookahead is not clipped.
+        fps = 30
+
+        ds = _ld.LeRobotDataset.__new__(_ld.LeRobotDataset)
+        ds.enable_optional_key_dropout = False
+        ds.subgoal_end_of_segment_prob = 0.0
+        ds.subgoal_drop_prob = 0.0
+        ds.num_cams = 1
+        ds.resolution = (8, 8)
+        ds.episode_lengths = {0: ep_length}
+        ds.segment_starts_by_episode = {0: _np.array([0])}
+        ds.episode_data_index = {
+            "from": torch.tensor([0], dtype=torch.long),
+            "to": torch.tensor([ep_length], dtype=torch.long),
+        }
+        ds.epi2idx = {0: 0}
+        # Critical: ``episodes[0]`` has NO ``segments`` key — the legacy fallback path.
+        ds.meta = SimpleNamespace(
+            video_keys=["camera0"],
+            image_keys=[],
+            camera_keys=["camera0"],
+            episodes={0: {}},
+            fps=fps,
+            info={},
+        )
+        monkeypatch.setattr(type(ds), "_get_feature_mapping_key", lambda self: mapping_key)
+
+        called: list = []
+
+        def _fake_query_videos(self, query_ts, ep_idx):
+            called.append(dict(query_ts))
+            return {"camera0": torch.zeros((3, *self.resolution))}
+
+        monkeypatch.setattr(type(ds), "_query_videos", _fake_query_videos)
+
+        frame_in_ep = 10
+        out = ds._load_subgoal_frames(0, frame_in_ep)
+        assert "subgoal0_raw" in out, "legacy episodes (no segments) must still emit subgoal frames"
+        assert len(called) == 1
+        # Lookahead is exactly round(4 * fps) frames ahead, clipped to ep_length - 1.
+        expected_subgoal_frame = min(frame_in_ep + int(round(4.0 * fps)), ep_length - 1)
+        expected_ts = expected_subgoal_frame / fps
+        assert abs(called[0]["camera0"][0] - expected_ts) < 1e-9
+
 
 # Default collate tolerates a batch with mixed _is_pad flags.
 
