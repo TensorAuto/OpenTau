@@ -23,7 +23,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: cpu-test-${{ github.ref }}
+  group: cpu-test-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 env:
