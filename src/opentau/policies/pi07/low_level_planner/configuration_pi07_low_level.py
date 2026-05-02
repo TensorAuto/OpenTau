@@ -79,8 +79,14 @@ class PI07LowLevelPlannerConfig(PreTrainedConfig):
         num_steps: Number of flow-matching denoising steps. Defaults to 10.
         max_delay: Maximum number of prefix action steps for real-time
             inference. Defaults to 0.
-        attention_implementation: Attention backend (``"eager"`` or
-            ``"fa2"``). Defaults to ``"eager"``.
+        attention_implementation: Attention backend — ``"eager"``, ``"sdpa"``,
+            or ``"fa2"``. Defaults to ``"eager"``. ``"sdpa"`` dispatches to
+            ``torch.nn.functional.scaled_dot_product_attention`` (typically
+            ~2x faster on A100/H100 + bf16). ``"fa2"`` is accepted for
+            backward compatibility but logs a warning and falls back to
+            eager. Propagated to ``vlm_config`` in ``__post_init__`` so a
+            single ``--policy.attention_implementation`` override reaches
+            the engine.
         freeze_vision_encoder: Whether to freeze the SigLIP vision tower.
             Defaults to True.
         train_expert_only: Whether to train only the action expert.
@@ -91,8 +97,19 @@ class PI07LowLevelPlannerConfig(PreTrainedConfig):
             space-time separable attention.  Defaults to ``4`` (every 4th
             of the 27 SigLIP layers, indices ``[3, 7, 11, 15, 19, 23]``),
             matching the MEM paper / pi05_mem (#171).
-        gradient_checkpointing: If True, wrap each SigLIP encoder layer in
-            ``torch.utils.checkpoint.checkpoint`` during training.
+        gradient_checkpointing: If True, wrap each SpaceTimeSiglip video
+            encoder layer **and** each interleaved Gemma 3 + expert decoder
+            layer body in ``torch.utils.checkpoint.checkpoint`` during
+            training. Trades roughly one extra forward pass per step
+            (~25-33% compute) for a large slice of activation memory per
+            rank, enabling larger per-rank batch sizes. Only safe under
+            plain DDP (MULTI_GPU), single-process (NO), or DeepSpeed
+            ZeRO-1/2 — ``src/opentau/scripts/train.py`` raises if the
+            accelerator's distributed_type is anything else (ZeRO-3, FSDP).
+            The engine half is plumbed via
+            ``vlm_config.gradient_checkpointing`` in ``__post_init__``;
+            the video-encoder half is plumbed at model construction time.
+            Defaults to False.
     """
 
     # Input / output structure.
@@ -198,8 +215,23 @@ class PI07LowLevelPlannerConfig(PreTrainedConfig):
         return (self.n_obs_history - 1) * (self.history_interval or 1) + 1
 
     def __post_init__(self):
-        """Post-initialization validation."""
+        """Post-initialization validation and policy → vlm_config plumbing.
+
+        Plumbs the policy-level ``attention_implementation`` and
+        ``gradient_checkpointing`` flags into ``vlm_config`` so a single
+        ``--policy.attention_implementation`` / ``--policy.gradient_checkpointing``
+        CLI override reaches the engine. The video-encoder half of
+        ``gradient_checkpointing`` is plumbed separately at model construction
+        time (see ``modeling_pi07_low_level.py``). Direct overrides on
+        ``--policy.vlm_config.*`` still work and are honoured as-is when the
+        policy-level field is at its default.
+        """
         super().__post_init__()
+
+        if self.attention_implementation != "eager":
+            self.vlm_config.attention_implementation = self.attention_implementation
+        if self.gradient_checkpointing:
+            self.vlm_config.gradient_checkpointing = self.gradient_checkpointing
 
         if self.n_obs_history is not None:
             if not isinstance(self.n_obs_history, int) or self.n_obs_history < 1:
