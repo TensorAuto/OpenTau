@@ -22,7 +22,7 @@ The module is organized into several key components:
 
     - **Core Datasets**: LeRobotDataset for robot learning data with support for
       temporal alignment, multi-modal data, and version compatibility.
-    - **VQA Datasets**: Vision-language datasets (CLEVR, COCO-QA, PIXMO, VSR)
+    - **VQA Datasets**: Vision-language datasets (CLEVR, COCO-QA, VSR)
       for training visual understanding without robot actions.
     - **Dataset Mixtures**: WeightedDatasetMixture for combining multiple datasets
       with controlled sampling proportions.
@@ -53,7 +53,7 @@ Key Features:
 Main Modules:
 
     - **lerobot_dataset**: Core dataset implementation for robot learning data.
-    - **vqa**: Vision-language vqa datasets (CLEVR, COCO-QA, PIXMO, VSR).
+    - **vqa**: Vision-language vqa datasets (CLEVR, COCO-QA, VSR).
     - **dataset_mixture**: Weighted combination of multiple datasets.
     - **factory**: Factory functions for creating datasets from configurations.
     - **utils**: Utility functions for I/O, metadata management, and validation.
@@ -80,5 +80,5 @@ Example:
 
         >>> from opentau import available_vqa_datasets
         >>> print(list(available_vqa_datasets.keys()))
-        ['clevr', 'cocoqa', 'dummy', 'pixmo', 'vsr']
+        ['clevr', 'cocoqa', 'dummy', 'vsr']
 """

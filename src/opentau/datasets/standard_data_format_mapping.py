@@ -188,13 +188,6 @@ DATA_FEATURES_NAME_MAPPING = {
         "prompt": "task",
         "response": "response",
     },
-    "pixmo": {
-        "camera0": "image",
-        "state": "state",
-        "actions": "actions",
-        "prompt": "prompt",
-        "response": "postfix",
-    },
     "dummy": {
         "camera0": "image",
         "state": "state",

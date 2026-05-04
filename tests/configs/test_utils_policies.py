@@ -20,7 +20,13 @@ import pytest
 from draccus.utils import ParsingError
 from huggingface_hub.constants import CONFIG_NAME
 
-from opentau.configs.policies import PreTrainedConfig
+from opentau.configs.policies import (
+    PreTrainedConfig,
+    _strip_keys,
+    load_stripped_config_to_tempfile,
+    strip_deprecated_fields_from_json,
+    warn_removed_policy_fields,
+)
 from opentau.configs.types import FeatureType, PolicyFeature
 
 ARTIFACT_DIR = Path("tests/artifacts/configs")
@@ -137,3 +143,86 @@ def test_from_pretrained_path_does_not_exits():
     """
     with pytest.raises(FileNotFoundError):
         PreTrainedConfig.from_pretrained(pretrained_name_or_path="bert123")
+
+
+def test_strip_keys_top_level_and_nested():
+    data = {
+        "init_strategy": "expert_only_he_init",
+        "chunk_size": 50,
+        "policy": {"init_strategy": "no_init", "n_action_steps": 10},
+    }
+    changed = _strip_keys(data, ("init_strategy",))
+    assert changed is True
+    assert "init_strategy" not in data
+    assert "init_strategy" not in data["policy"]
+    assert data["chunk_size"] == 50
+    assert data["policy"]["n_action_steps"] == 10
+
+
+def test_strip_keys_no_change():
+    data = {"chunk_size": 50, "policy": {"n_action_steps": 10}}
+    changed = _strip_keys(data, ("init_strategy",))
+    assert changed is False
+    assert data == {"chunk_size": 50, "policy": {"n_action_steps": 10}}
+
+
+def test_load_stripped_config_to_tempfile_does_not_mutate_source(tmp_path):
+    src = tmp_path / "config.json"
+    original = {"chunk_size": 50, "init_strategy": "expert_only_he_init"}
+    src.write_text(json.dumps(original))
+
+    tmp = load_stripped_config_to_tempfile(src)
+    try:
+        assert tmp != src
+        # Source is byte-for-byte unchanged.
+        assert json.loads(src.read_text()) == original
+        # Temp copy has the removed key stripped.
+        assert json.loads(tmp.read_text()) == {"chunk_size": 50}
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def test_load_stripped_config_does_not_follow_symlink(tmp_path):
+    """HF cache paths are symlinks to content-addressed blobs — make sure load
+    never rewrites the linked-to file (which would corrupt the cache)."""
+    blob = tmp_path / "blob.json"
+    original = {"chunk_size": 50, "init_strategy": "no_init"}
+    blob.write_text(json.dumps(original))
+
+    link = tmp_path / "snapshot_link.json"
+    link.symlink_to(blob)
+
+    tmp = load_stripped_config_to_tempfile(link)
+    try:
+        # Both the symlink and the target blob are untouched.
+        assert json.loads(link.read_text()) == original
+        assert json.loads(blob.read_text()) == original
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def test_strip_deprecated_fields_from_json_in_place_for_owned_files(tmp_path):
+    """The in-place variant is still valid for files we just wrote ourselves."""
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"chunk_size": 50, "init_strategy": "no_init"}))
+    strip_deprecated_fields_from_json(path)
+    assert json.loads(path.read_text()) == {"chunk_size": 50}
+
+
+def test_warn_removed_policy_fields_emits_deprecation_warning(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"init_strategy": "expert_only_he_init", "chunk_size": 50}))
+
+    with pytest.warns(DeprecationWarning, match="init_strategy"):
+        warn_removed_policy_fields(path)
+
+
+def test_warn_removed_policy_fields_silent_when_clean(tmp_path):
+    import warnings as _warnings
+
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"chunk_size": 50}))
+
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("error", DeprecationWarning)
+        warn_removed_policy_fields(path)  # must not raise

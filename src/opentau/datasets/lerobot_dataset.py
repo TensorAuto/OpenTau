@@ -217,6 +217,18 @@ CODEBASE_VERSION = "v2.1"
 _CONTROL_MODE_WARNED: set[str] = set()
 
 
+def suppress_control_mode_warning(repo_id: str) -> None:
+    """Mark ``repo_id`` as already-warned so the missing-``control_mode`` warning
+    does not fire for it during subsequent ``LeRobotDataset.__init__`` calls.
+
+    Intended for callers that supply an explicit ``control_mode`` override and
+    therefore already know the on-disk metadata is missing the field. Must be
+    invoked *before* the ``LeRobotDataset`` is constructed for ``repo_id``;
+    once ``__init__`` has emitted the warning, further calls are a no-op.
+    """
+    _CONTROL_MODE_WARNED.add(repo_id)
+
+
 class DatasetMetadata:
     """Base class for dataset metadata containing info and statistics.
 

@@ -20,7 +20,6 @@ for the PI05 Vision-Language-Action Flow Model. It includes settings for the mod
 optimization, scheduling, and data processing.
 """
 
-import logging
 import warnings
 from dataclasses import dataclass, field
 from typing import Literal
@@ -60,9 +59,10 @@ class PI05Config(PreTrainedConfig):
         proj_width: Width of the projection layer. Defaults to 1024.
         dropout: Dropout rate. Defaults to 0.1.
         num_steps: Number of flow matching steps for decoding. Defaults to 10.
-        init_strategy: Initialization strategy. One of "no_init", "full_he_init", "expert_only_he_init".
-            Defaults to "full_he_init".
-        attention_implementation: Attention implementation to use ("eager" or "fa2"). Defaults to "eager".
+        attention_implementation: Attention implementation to use ("eager", "sdpa", or "fa2").
+            Defaults to "eager". "sdpa" dispatches to ``torch.nn.functional.scaled_dot_product_attention``
+            (frees ~5.6 GiB on forward at the bs ceiling tested; see PR #182). "fa2" is accepted for
+            backward compatibility but logs a warning and falls back to "eager".
         freeze_vision_encoder: Whether to freeze the vision encoder during fine-tuning. Defaults to True.
         train_expert_only: Whether to train only the expert module. Defaults to False.
         optimizer_lr: Learning rate for the optimizer. Defaults to 2.5e-5.
@@ -129,9 +129,6 @@ class PI05Config(PreTrainedConfig):
     # maximum number of frozen actions
     max_delay: int = 0
 
-    # Initialization strategy
-    init_strategy: Literal["no_init", "full_he_init", "expert_only_he_init"] = "full_he_init"
-
     # Attention utils
     attention_implementation: str = "eager"
 
@@ -174,19 +171,6 @@ class PI05Config(PreTrainedConfig):
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
-
-        assert self.init_strategy in ["no_init", "full_he_init", "expert_only_he_init"], (
-            f"Invalid init strategy: {self.init_strategy} must be one of ['no_init', 'full_he_init', 'expert_only_he_init']"
-        )
-
-        if self.init_strategy == "expert_only_he_init" and self.pretrained_path == "lerobot/pi05":
-            raise ValueError(
-                "You cannot load pretrained PI0 model when init_strategy is 'expert_only_he_init' due to differences in PaliGemma tokenizer vocab sizes."
-            )
-
-        if self.pretrained_path is not None and self.pretrained_path != "lerobot/pi05":
-            logging.info("Setting init_strategy to 'no_init' because we are resuming from a checkpoint.")
-            self.init_strategy = "no_init"
 
         if self.state_type not in ("discrete", "continuous"):
             raise ValueError(f"state_type must be 'discrete' or 'continuous', got '{self.state_type}'")

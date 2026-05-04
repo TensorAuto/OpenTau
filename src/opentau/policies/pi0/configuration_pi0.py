@@ -21,7 +21,6 @@ for the PI0 Vision-Language-Action Flow Model. It includes settings for the mode
 optimization, scheduling, and data processing.
 """
 
-import logging
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -63,10 +62,11 @@ class PI0Config(PreTrainedConfig):
         advantage: Advantage conditioning mode. One of "ignore", "on", "use".
             "use" uses values from dataset, "ignore" disables conditioning,
             "on" sets advantage to True (for expert demos). Defaults to "use".
-        init_strategy: Initialization strategy. One of "no_init", "full_he_init", "expert_only_he_init".
-            Defaults to "full_he_init".
         use_cache: Whether to use KV cache during inference. Defaults to True.
-        attention_implementation: Attention implementation to use ("eager" or "fa2"). Defaults to "eager".
+        attention_implementation: Attention implementation to use ("eager", "sdpa", or "fa2").
+            Defaults to "eager". "sdpa" dispatches to ``torch.nn.functional.scaled_dot_product_attention``
+            and is typically 2-3x faster on A100 + bf16 (FlashAttention-2 backend). "fa2" is accepted
+            for backward compatibility but logs a warning and falls back to "eager".
         freeze_vision_encoder: Whether to freeze the vision encoder during fine-tuning. Defaults to True.
         train_expert_only: Whether to train only the expert module. Defaults to False.
         train_state_proj: Whether to train the state projection layer. Defaults to True.
@@ -125,17 +125,25 @@ class PI0Config(PreTrainedConfig):
     # This should only be "on" when training on expert demonstrations or interventions.
     advantage: Literal["ignore", "on", "use"] = "use"
 
-    # Initialization strategy
-    init_strategy: Literal["no_init", "full_he_init", "expert_only_he_init"] = "full_he_init"
-
     # Attention utils
     use_cache: bool = True
-    attention_implementation: str = "eager"  # or fa2
+    attention_implementation: str = "eager"  # or "sdpa" / "fa2"
 
     # Finetuning settings
     freeze_vision_encoder: bool = True
     train_expert_only: bool = False
     train_state_proj: bool = True
+
+    # Wrap each transformer-layer forward in torch.utils.checkpoint to trade
+    # ~25-33% same-batch compute for ~30-40 GB of activation memory per rank,
+    # typically netting +10-25% throughput once the freed memory is spent on
+    # a larger per-rank batch. Only supported with distributed_type=MULTI_GPU
+    # (DDP), NO (single process), or DeepSpeed ZeRO-1/2 — src/opentau/scripts/
+    # train.py raises if the accelerator's distributed_type is anything else
+    # (ZeRO-3, FSDP) because pi0's custom per-layer forward does not wire up
+    # the backend-specific activation-checkpointing hooks those strategies
+    # require. Defaults to False (no ckpt, lowest risk).
+    gradient_checkpointing: bool = False
 
     # Training presets
     optimizer_lr: float = 2.5e-5
@@ -168,19 +176,6 @@ class PI0Config(PreTrainedConfig):
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
-
-        assert self.init_strategy in ["no_init", "full_he_init", "expert_only_he_init"], (
-            f"Invalid init strategy: {self.init_strategy} must be one of ['no_init', 'full_he_init', 'expert_only_he_init']"
-        )
-
-        if self.init_strategy == "expert_only_he_init" and self.pretrained_path == "lerobot/pi0":
-            raise ValueError(
-                "You cannot load pretrained PI0 model when init_strategy is 'expert_only_he_init' due to differences in PaliGemma tokenizer vocab sizes."
-            )
-
-        if self.pretrained_path is not None and self.pretrained_path != "lerobot/pi0":
-            logging.info("Setting init_strategy to 'no_init' because we are resuming from a checkpoint.")
-            self.init_strategy = "no_init"
 
     def validate_features(self) -> None:
         """Validates the features and adds empty cameras if configured.

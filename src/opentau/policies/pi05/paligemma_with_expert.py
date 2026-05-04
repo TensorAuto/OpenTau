@@ -88,7 +88,6 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
         freeze_vision_encoder: bool = True,
         train_expert_only: bool = True,
         attention_implementation: str = "eager",
-        load_pretrained_paligemma: bool = False,
         discrete_action_vocab_size: int | None = None,
         dropout: float = 0.1,
         gradient_checkpointing: bool = False,
@@ -103,7 +102,6 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
             train_expert_only: Whether to train only the expert model. Defaults to True.
             attention_implementation: Attention implementation to use ("eager", "sdpa",
                 or "fa2"). Defaults to "eager".
-            load_pretrained_paligemma: Whether to load a pretrained PaliGemma model. Defaults to False.
             discrete_action_vocab_size: Vocabulary size for discrete actions.
             dropout: Dropout probability. Defaults to 0.1.
             gradient_checkpointing: Wrap each decoder-layer body in
@@ -118,7 +116,6 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
         self.attention_implementation = attention_implementation
-        self.load_pretrained_paligemma = load_pretrained_paligemma
         self.discrete_action_vocab_size = discrete_action_vocab_size
         self.dropout = dropout
         self.gradient_checkpointing = gradient_checkpointing
@@ -228,7 +225,7 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
             # existing configs keep running.
             logging.warning(
                 "attention_implementation='fa2' is not implemented; falling back to 'eager'. "
-                "Consider switching to 'sdpa' for ~10-15%% better throughput."
+                "Consider switching to 'sdpa' for ~10-15% better throughput."
             )
 
 
@@ -246,10 +243,7 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         super().__init__(config=config)
         self.config = config
 
-        if config.load_pretrained_paligemma:
-            self.paligemma = PaliGemmaForConditionalGeneration.from_pretrained("google/paligemma-3b-pt-224")
-        else:
-            self.paligemma = PaliGemmaForConditionalGeneration(config=config.paligemma_config)
+        self.paligemma = PaliGemmaForConditionalGeneration(config=config.paligemma_config)
         self.gemma_expert = GemmaForCausalLM(config=config.gemma_expert_config)
         # Remove unused embed_tokens
         self.gemma_expert.model.embed_tokens = None

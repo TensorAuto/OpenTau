@@ -26,7 +26,7 @@ The factory supports two types of datasets:
     1. LeRobot datasets: Standard robot learning datasets loaded from HuggingFace
        repositories with configurable delta timestamps for temporal alignment.
     2. VQA datasets: Vision-language vqa datasets (CLEVR, COCO-QA,
-       PIXMO, VSR, etc.) for multimodal learning tasks.
+       VSR, etc.) for multimodal learning tasks.
 
 Key Features:
     - Delta timestamp resolution: Automatically configures temporal offsets
@@ -71,7 +71,6 @@ import torch
 import opentau.datasets.vqa.clevr  # noqa: F401
 import opentau.datasets.vqa.cocoqa  # noqa: F401
 import opentau.datasets.vqa.dummy  # noqa: F401
-import opentau.datasets.vqa.pixmo  # noqa: F401
 import opentau.datasets.vqa.vsr  # noqa: F401
 from opentau import available_vqa_datasets
 from opentau.configs.default import DatasetConfig
@@ -81,6 +80,7 @@ from opentau.datasets.lerobot_dataset import (
     BaseDataset,
     LeRobotDataset,
     LeRobotDatasetMetadata,
+    suppress_control_mode_warning,
 )
 from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
 from opentau.datasets.transforms import ImageTransforms
@@ -92,6 +92,24 @@ IMAGENET_STATS = {
     "mean": [[[0.485]], [[0.456]], [[0.406]]],  # (c,1,1)
     "std": [[[0.229]], [[0.224]], [[0.225]]],  # (c,1,1)
 }
+
+
+def _apply_metadata_overrides(dataset: BaseDataset, dataset_cfg: DatasetConfig) -> None:
+    """Apply ``robot_type`` / ``control_mode`` overrides from a DatasetConfig.
+
+    The overrides are written through to ``dataset.meta.info`` so downstream
+    consumers (``meta.control_mode``, ``_emit_optional_keys``) observe the
+    overridden value. ``None`` means "do not override"; any string value
+    (including ``""``) is applied.
+    """
+    if dataset_cfg.robot_type is not None:
+        dataset.meta.info["robot_type"] = dataset_cfg.robot_type
+    if dataset_cfg.control_mode is not None:
+        dataset.meta.info["control_mode"] = dataset_cfg.control_mode
+        # `LeRobotDataset.__init__` caches `self.control_mode = self.meta.control_mode`
+        # before this override fires, so refresh the attribute when present.
+        if hasattr(dataset, "control_mode"):
+            dataset.control_mode = dataset_cfg.control_mode
 
 
 def resolve_delta_timestamps(
@@ -150,7 +168,7 @@ def make_dataset(
 
     A train and validation dataset are returned if `train_cfg.val_freq` is greater than 0.
     The validation dataset is a subset of the train dataset, and is used for evaluation during training.
-    The validation dataset is created by splitting the train dataset into train and validation sets based on `cfg.val_split_ratio`.
+    The validation dataset is created by splitting the train dataset into train and validation sets based on `train_cfg.dataset_mixture.val_split_ratio`.
 
     Args:
         cfg (DatasetConfig): A DatasetConfig used to create a LeRobotDataset.
@@ -181,6 +199,12 @@ def make_dataset(
     elif isinstance(cfg.repo_id, str):
         ds_meta = LeRobotDatasetMetadata(cfg.repo_id, root=cfg.root, revision=cfg.revision)
         dt_mean, dt_std, dt_lower, dt_upper = resolve_delta_timestamps(train_cfg, cfg, ds_meta)
+        # Suppress the "missing control_mode" warning when the user is
+        # providing an explicit override — they already know it's missing.
+        # Ordering invariant: this MUST run before `LeRobotDataset(...)` below;
+        # once `__init__` emits the warning the suppression is a no-op.
+        if cfg.control_mode is not None:
+            suppress_control_mode_warning(cfg.repo_id)
         dataset = LeRobotDataset(
             train_cfg,
             cfg.repo_id,
@@ -200,6 +224,8 @@ def make_dataset(
     else:
         raise ValueError("Exactly one of `cfg.vqa` and `cfg.repo_id` should be provided.")
 
+    _apply_metadata_overrides(dataset, cfg)
+
     # TODO vqa datasets implement stats in original feature names, but camera_keys are standardized names
     if (
         not isinstance(cfg.vqa, str)
@@ -216,7 +242,7 @@ def make_dataset(
                 dataset.meta.stats[key][stats_type] = np.array(stats, dtype=np.float32)
 
     if train_cfg.val_freq > 0:
-        val_size = int(len(dataset) * cfg.val_split_ratio)
+        val_size = int(len(dataset) * train_cfg.dataset_mixture.val_split_ratio)
         train_size = len(dataset) - val_size
         train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
         train_dataset.meta = copy.deepcopy(dataset.meta)  # type: ignore[assignment]
@@ -261,6 +287,44 @@ def _resolve_weights(
     return weights
 
 
+def _validate_metadata_requirements(cfg: TrainPipelineConfig, datasets: list, label: str) -> None:
+    """Raise if the mixture requires non-empty robot_type / control_mode and
+    any dataset (after overrides) still has an empty value.
+    """
+    require_robot = cfg.dataset_mixture.require_non_empty_robot_type
+    require_control = cfg.dataset_mixture.require_non_empty_control_mode
+    if not (require_robot or require_control):
+        return
+
+    dataset_cfgs = cfg.dataset_mixture.datasets
+    # Invariant from `make_dataset_mixture`: each dataset_cfg appends exactly
+    # one entry to `datasets` (and at most one to `val_datasets`). Assert
+    # rather than silently skipping so a future refactor that breaks the
+    # invariant doesn't quietly bypass the require_non_empty_* checks.
+    assert len(dataset_cfgs) == len(datasets), (
+        f"dataset_cfgs ({len(dataset_cfgs)}) and {label} datasets ({len(datasets)}) "
+        "must be 1:1; cannot validate metadata requirements."
+    )
+
+    bad: list[str] = []
+    for dc, ds in zip(dataset_cfgs, datasets, strict=True):
+        info = ds.meta.info
+        identifier = dc.repo_id or dc.vqa or type(ds).__name__
+        if require_robot and not (info.get("robot_type") or ""):
+            bad.append(f"{identifier}: robot_type is empty")
+        if require_control and not (info.get("control_mode") or ""):
+            bad.append(f"{identifier}: control_mode is empty")
+
+    if bad:
+        raise ValueError(
+            "DatasetMixtureConfig requires non-empty metadata fields, but the "
+            f"following {label} datasets are missing values after overrides:\n  - "
+            + "\n  - ".join(bad)
+            + "\nSet `DatasetConfig.robot_type` / `DatasetConfig.control_mode` "
+            "on the offending dataset(s) to provide an override."
+        )
+
+
 def make_dataset_mixture(
     cfg: TrainPipelineConfig, return_advantage_input: bool = False
 ) -> Union[WeightedDatasetMixture, Tuple[WeightedDatasetMixture, WeightedDatasetMixture]]:
@@ -285,6 +349,10 @@ def make_dataset_mixture(
             val_datasets.append(res[1])
         else:
             datasets.append(res)
+
+    _validate_metadata_requirements(cfg, datasets, label="train")
+    if val_datasets:
+        _validate_metadata_requirements(cfg, val_datasets, label="val")
 
     train_weights = _resolve_weights(cfg.dataset_mixture.weights, datasets, label="train")
     train_mixture = WeightedDatasetMixture(cfg, datasets, train_weights, cfg.dataset_mixture.action_freq)
