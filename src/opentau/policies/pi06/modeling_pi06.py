@@ -186,6 +186,42 @@ def resize_with_pad(img: Tensor, width: int, height: int, pad_value: int = -1) -
     return padded_img
 
 
+def flow_matching_masked_mse(
+    u_t: Tensor,
+    v_t: Tensor,
+    prefix_mask: Tensor,
+    actions_is_pad: Tensor | None,
+    max_action_dim: int,
+) -> Tensor:
+    """Masked MSE for π0.6 flow matching.
+
+    Zeros out (a) frozen-prefix steps from the real-time inference delay
+    (`prefix_mask=True` ⇒ frozen) and (b) fully-padded action samples — e.g.
+    VQA / web co-training items, where `VQADataset` sets `actions_is_pad`
+    all-True so the action expert is not trained to regress to zero on items
+    that have no real actions.
+
+    Args:
+        u_t: Target velocity field, shape `(B, chunk_size, D)` (D ≥ max_action_dim).
+        v_t: Predicted velocity field, same shape as `u_t`.
+        prefix_mask: bool `(B, chunk_size)` — True where the step is frozen
+            (real-time-inference delay). Pass `torch.zeros(...)` to disable.
+        actions_is_pad: optional bool `(B, chunk_size)` — True where the
+            action chunk is padded (no real action target).
+        max_action_dim: Number of leading action dims to score against;
+            trailing dims are dropped before averaging.
+    """
+    mse_loss = F.mse_loss(u_t, v_t, reduction="none")
+    postfix_mask = rearrange(torch.logical_not(prefix_mask), "b c -> b c 1")
+    if actions_is_pad is not None:
+        in_episode_bound = rearrange(~actions_is_pad, "b c -> b c 1")
+        postfix_mask = torch.logical_and(postfix_mask, in_episode_bound)
+    mse_loss = mse_loss * postfix_mask
+    mse_loss = mse_loss[:, :, :max_action_dim]
+    postfix_mask_expanded = repeat(postfix_mask, "b c 1 -> b c d", d=mse_loss.shape[-1])
+    return mse_loss.sum() / (postfix_mask_expanded.sum() + 1e-8)
+
+
 def pad_discrete_tokens(tokens: list[list[int]], max_length: int) -> tuple[np.ndarray, np.ndarray]:
     """Pads / truncates a ragged list of FAST-tokenized action chunks to a
     fixed length, returning `(B, max_length)` arrays."""
@@ -961,17 +997,13 @@ class PI06FlowMatching(nn.Module):
         v_t = self.action_out_proj(suffix_out)
         v_t = v_t.to(dtype=torch.float32)
 
-        mse_loss = F.mse_loss(u_t, v_t, reduction="none")
-
-        postfix_mask = rearrange(torch.logical_not(prefix_mask), "b c -> b c 1")
-        if actions_is_pad is not None:
-            in_episode_bound = ~actions_is_pad
-            in_episode_bound = rearrange(in_episode_bound, "b c -> b c 1")
-            postfix_mask = torch.logical_and(postfix_mask, in_episode_bound)
-        mse_loss = mse_loss * postfix_mask
-        mse_loss = mse_loss[:, :, : self.config.max_action_dim]
-        postfix_mask_expanded = repeat(postfix_mask, "b c 1 -> b c d", d=mse_loss.shape[-1])
-        mse_loss = mse_loss.sum() / (postfix_mask_expanded.sum() + 1e-8)
+        mse_loss = flow_matching_masked_mse(
+            u_t=u_t,
+            v_t=v_t,
+            prefix_mask=prefix_mask,
+            actions_is_pad=actions_is_pad,
+            max_action_dim=self.config.max_action_dim,
+        )
 
         # Discrete-action cross-entropy (FAST tokens) via the dedicated head.
         batch_size_da, seq_len = discrete_actions.shape

@@ -35,6 +35,7 @@ from opentau.policies.pi06.gemma3_with_expert import (
     apply_rope,
 )
 from opentau.policies.pi06.modeling_pi06 import (
+    flow_matching_masked_mse,
     make_att_2d_masks,
     pad_discrete_tokens,
     resize_with_pad,
@@ -171,42 +172,30 @@ class TestApplyRope:
 # actions, so `VQADataset` sets `actions_is_pad = all-True`. The flow-matching
 # loss in `PI06FlowMatching.forward` must honour that mask, otherwise the
 # action expert is trained to regress to zero on web samples — a silent bug.
+#
+# These tests drive the production helper `flow_matching_masked_mse`
+# (the same function `PI06FlowMatching.forward` calls) so a regression in the
+# masking arithmetic — e.g. dropping the `~actions_is_pad` AND, or moving the
+# slice-then-sum boundary — fails here, not just in slow GPU integration.
 
 
 class TestMSEMaskOnFullyPaddedActions:
     """Locks in the contract: an item with `actions_is_pad` all-True
-    contributes exactly zero MSE, regardless of the noisy-action targets.
-    Mirrors the masking arithmetic at modeling_pi06.py:962–972."""
-
-    @staticmethod
-    def _masked_mse_like_pi06(
-        u_t: torch.Tensor,
-        v_t: torch.Tensor,
-        actions_is_pad: torch.Tensor,
-        max_action_dim: int,
-    ) -> torch.Tensor:
-        """Replicates the masking arithmetic from `PI06FlowMatching.forward`."""
-        import torch.nn.functional as F  # noqa: N812
-        from einops import rearrange, repeat
-
-        mse_loss = F.mse_loss(u_t, v_t, reduction="none")
-        # No real-time-inference delay in this test → postfix_mask is all-True
-        # before we AND in the actions_is_pad mask.
-        postfix_mask = torch.ones(u_t.shape[:2], dtype=torch.bool)
-        postfix_mask = rearrange(postfix_mask, "b c -> b c 1")
-        in_episode_bound = rearrange(~actions_is_pad, "b c -> b c 1")
-        postfix_mask = torch.logical_and(postfix_mask, in_episode_bound)
-        mse_loss = mse_loss * postfix_mask
-        mse_loss = mse_loss[:, :, :max_action_dim]
-        postfix_mask_expanded = repeat(postfix_mask, "b c 1 -> b c d", d=mse_loss.shape[-1])
-        return mse_loss.sum() / (postfix_mask_expanded.sum() + 1e-8)
+    contributes exactly zero MSE, regardless of the noisy-action targets."""
 
     def test_all_padded_yields_zero_loss(self):
         torch.manual_seed(0)
         u_t = torch.randn(2, 8, 16)
         v_t = torch.randn(2, 8, 16)
         actions_is_pad = torch.ones(2, 8, dtype=torch.bool)
-        loss = self._masked_mse_like_pi06(u_t, v_t, actions_is_pad, max_action_dim=16)
+        prefix_mask = torch.zeros(2, 8, dtype=torch.bool)
+        loss = flow_matching_masked_mse(
+            u_t=u_t,
+            v_t=v_t,
+            prefix_mask=prefix_mask,
+            actions_is_pad=actions_is_pad,
+            max_action_dim=16,
+        )
         assert loss.item() == 0.0
 
     def test_partial_padded_only_counts_real_steps(self):
@@ -216,9 +205,33 @@ class TestMSEMaskOnFullyPaddedActions:
         u_t = torch.randn(1, 8, 4)
         v_t = torch.randn(1, 8, 4)
         actions_is_pad = torch.tensor([[False, False, False, False, True, True, True, True]])
-        loss = self._masked_mse_like_pi06(u_t, v_t, actions_is_pad, max_action_dim=4)
+        prefix_mask = torch.zeros(1, 8, dtype=torch.bool)
+        loss = flow_matching_masked_mse(
+            u_t=u_t,
+            v_t=v_t,
+            prefix_mask=prefix_mask,
+            actions_is_pad=actions_is_pad,
+            max_action_dim=4,
+        )
         # Independent reference: mean over the first 4 timesteps only.
         expected = ((u_t[0, :4] - v_t[0, :4]) ** 2).sum() / (4 * 4)
+        assert torch.isclose(loss, expected, atol=1e-6)
+
+    def test_prefix_mask_excludes_frozen_steps(self):
+        """Frozen-prefix steps (real-time-inference delay) must be excluded
+        the same way `actions_is_pad` is — covers the other AND-input."""
+        torch.manual_seed(0)
+        u_t = torch.randn(1, 8, 4)
+        v_t = torch.randn(1, 8, 4)
+        prefix_mask = torch.tensor([[True, True, True, False, False, False, False, False]])
+        loss = flow_matching_masked_mse(
+            u_t=u_t,
+            v_t=v_t,
+            prefix_mask=prefix_mask,
+            actions_is_pad=None,
+            max_action_dim=4,
+        )
+        expected = ((u_t[0, 3:] - v_t[0, 3:]) ** 2).sum() / (5 * 4)
         assert torch.isclose(loss, expected, atol=1e-6)
 
 
