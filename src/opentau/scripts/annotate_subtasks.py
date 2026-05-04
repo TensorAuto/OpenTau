@@ -22,8 +22,10 @@ For every episode the script:
    recordings).
 2. Resizes each sampled frame to ``--target-width`` pixels wide (JPEG,
    default 640 px) to reduce image token cost.
-3. Sends all sampled frames together with their timestamps to
-   ``claude-opus-4-7`` and asks it to identify subtask transition times.
+3. Sends all sampled frames together with their timestamps to the configured
+   model (Anthropic ``claude-opus-4-7`` by default; Google
+   ``gemini-robotics-er-1.6-preview`` is also supported via ``--model``) and
+   asks it to identify subtask transition times.
 4. Saves the returned ``[{"time": float, "subtask": str}, ...]`` list as a
    per-episode JSON at ``{root}/subtasks/episode_{episode_index:06d}.json``.
 5. Updates ``meta/info.json`` with a ``subtask_path`` field (required by
@@ -86,6 +88,8 @@ import anthropic
 import av
 import pyarrow as pa
 import pyarrow.parquet as pq
+from google import genai
+from google.genai import types as genai_types
 from huggingface_hub import snapshot_download
 from PIL import Image
 from tqdm import tqdm
@@ -151,7 +155,8 @@ def _to_b64_jpeg(img: Image.Image, quality: int = 85) -> str:
 # Anthropic Messages API rejects requests with more than 100 images per content
 # array, so any episode longer than (MAX_FRAMES_PER_REQUEST / sample_fps) seconds
 # would otherwise fail mid-run. Above this cap we uniformly subsample the captured
-# frames; the effective sampling rate drops accordingly.
+# frames; the effective sampling rate drops accordingly. Gemini accepts more
+# images per request but the same cap keeps cost/latency bounded for both.
 MAX_FRAMES_PER_REQUEST = 100
 
 
@@ -236,6 +241,12 @@ def _coerce_subtasks(parsed: list, raw_text: str = "") -> list[dict]:
     return subtasks
 
 
+def _is_gemini_model(model: str) -> bool:
+    """Route ``gemini-*`` and ``robotics-er-*`` model IDs to the Google API."""
+    name = model.lower()
+    return name.startswith("gemini") or name.startswith("robotics-er")
+
+
 def _call_claude(
     client: anthropic.Anthropic,
     model: str,
@@ -279,6 +290,62 @@ def _call_claude(
     return _coerce_subtasks(parsed, raw_text)
 
 
+def _call_gemini(
+    client: genai.Client,
+    model: str,
+    task_description: str,
+    frames: list[Image.Image],
+    timestamps: list[float],
+    sample_fps: float,
+) -> list[dict]:
+    """Send sampled frames to a Gemini model and parse the subtask boundary JSON.
+
+    Used for the Gemini Robotics-ER family (e.g. ``gemini-robotics-er-1.6-preview``)
+    as well as general Gemini multimodal models.
+    """
+    contents: list = []
+    for ts, img in zip(timestamps, frames, strict=False):
+        contents.append(f"t={ts:.1f}s:")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        contents.append(genai_types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"))
+
+    contents.append(_USER_TEMPLATE.format(task=task_description, fps=sample_fps))
+
+    response = client.models.generate_content(
+        model=model,
+        contents=contents,
+        config=genai_types.GenerateContentConfig(
+            system_instruction=_SYSTEM_PROMPT_TEMPLATE.format(fps=sample_fps),
+            max_output_tokens=1024,
+            response_mime_type="application/json",
+        ),
+    )
+
+    raw_text = (response.text or "").strip()
+    if not raw_text:
+        raise ValueError(f"Gemini response had no text (finish_reason={response.candidates}).")
+
+    parsed = _parse_json_response(raw_text)
+    return _coerce_subtasks(parsed, raw_text)
+
+
+def _annotate_subtasks(
+    client: anthropic.Anthropic | genai.Client,
+    model: str,
+    task_description: str,
+    frames: list[Image.Image],
+    timestamps: list[float],
+    sample_fps: float,
+) -> list[dict]:
+    """Dispatch to the Anthropic or Gemini call path based on model name."""
+    if _is_gemini_model(model):
+        assert isinstance(client, genai.Client)
+        return _call_gemini(client, model, task_description, frames, timestamps, sample_fps)
+    assert isinstance(client, anthropic.Anthropic)
+    return _call_claude(client, model, task_description, frames, timestamps, sample_fps)
+
+
 # ---------------------------------------------------------------------------
 # Per-episode annotation
 # ---------------------------------------------------------------------------
@@ -297,7 +364,7 @@ def _subtask_path(root: Path, template: str, ep_index: int) -> Path:
 
 
 def _annotate_episode(
-    client: anthropic.Anthropic,
+    client: anthropic.Anthropic | genai.Client,
     model: str,
     root: Path,
     info: dict,
@@ -345,7 +412,7 @@ def _annotate_episode(
             max_frames,
         )
 
-    subtasks = _call_claude(client, model, task_description, frames, timestamps, sample_fps)
+    subtasks = _annotate_subtasks(client, model, task_description, frames, timestamps, sample_fps)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
@@ -421,7 +488,7 @@ def _update_parquet_response(root: Path, info: dict, ep_index: int, ep_info: dic
 
 
 def _process_dataset(
-    client: anthropic.Anthropic,
+    client: anthropic.Anthropic | genai.Client,
     root: Path,
     model: str,
     sample_fps: float,
@@ -584,7 +651,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--model",
         default="claude-opus-4-7",
-        help="Anthropic model ID to use (default: claude-opus-4-7).",
+        help=(
+            "Model ID to use. Anthropic models (e.g. 'claude-opus-4-7', the default) "
+            "go through ANTHROPIC_API_KEY; model IDs starting with 'gemini' or "
+            "'robotics-er' (e.g. 'gemini-robotics-er-1.6-preview') go through "
+            "GEMINI_API_KEY via google-genai."
+        ),
     )
     p.add_argument(
         "--write-response-column",
@@ -605,7 +677,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=8,
         help=(
             "Number of automatic retries for the Anthropic SDK on 429/5xx responses; "
-            "the SDK applies exponential backoff between attempts (default: 8)."
+            "the SDK applies exponential backoff between attempts (default: 8). "
+            "Ignored when using a Gemini model — google-genai's retry policy is "
+            "configured via its own client options."
         ),
     )
     p.add_argument(
@@ -648,15 +722,22 @@ def main(argv: list[str] | None = None) -> None:
 
     args = _parse_args(argv)
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        logger.error("ANTHROPIC_API_KEY is not set in the environment.")
-        sys.exit(1)
-
-    # max_retries triggers anthropic-sdk-python's built-in exponential backoff for
-    # 429 rate-limit responses (and 5xx). Default is 2; bump it so a long batch
-    # job does not give up after a transient burst on rate-limited tiers.
-    client = anthropic.Anthropic(api_key=api_key, max_retries=args.max_api_retries)
+    client: anthropic.Anthropic | genai.Client
+    if _is_gemini_model(args.model):
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            logger.error("GEMINI_API_KEY (or GOOGLE_API_KEY) is not set in the environment.")
+            sys.exit(1)
+        client = genai.Client(api_key=api_key)
+    else:
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            logger.error("ANTHROPIC_API_KEY is not set in the environment.")
+            sys.exit(1)
+        # max_retries triggers anthropic-sdk-python's built-in exponential backoff for
+        # 429 rate-limit responses (and 5xx). Default is 2; bump it so a long batch
+        # job does not give up after a transient burst on rate-limited tiers.
+        client = anthropic.Anthropic(api_key=api_key, max_retries=args.max_api_retries)
     datasets = _load_datasets_from_config(args.config_path)
 
     if not datasets:
