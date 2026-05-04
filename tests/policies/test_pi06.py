@@ -575,7 +575,24 @@ def test_pi06_loc_tokens_extend_vocab_and_resize_embeddings(lerobot_dataset_meta
 
     bare_tok_size = len(AutoTokenizer.from_pretrained("google/gemma-3-4b-pt"))
 
-    policy = PI06Policy(config, dataset_stats=lerobot_dataset_metadata.stats)
+    # `lerobot_dataset_metadata` carries actions stats shaped (50, 32) — the
+    # default chunk_size. This test runs at chunk_size=10 to stay small, so
+    # override the action-stats arrays to (10, 32) before Normalize buffers
+    # are constructed. Otherwise `(actions - min) / (max - min + EPS)` errors
+    # with a shape mismatch (actions is (B, 10, 32); buffer would be (50, 32)).
+    import copy
+
+    import numpy as np
+
+    dataset_stats = copy.deepcopy(lerobot_dataset_metadata.stats)
+    for k in ("max", "mean", "min", "std"):
+        dataset_stats["actions"][k] = np.full(
+            (config.chunk_size, 32),
+            float(dataset_stats["actions"][k].flatten()[0]),
+            dtype=np.float32,
+        )
+
+    policy = PI06Policy(config, dataset_stats=dataset_stats)
 
     inner_tok = policy.model.language_tokenizer
     assert len(inner_tok) == bare_tok_size + 1024, (
