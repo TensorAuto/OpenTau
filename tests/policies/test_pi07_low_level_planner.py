@@ -715,21 +715,20 @@ class TestPI07LowLevelPlannerIntegration:
             f"would change this length."
         )
 
-        # No causal boundaries before the "Action: " indicator: every block in
-        # the collapsed prefix (videos / language / state / state-end) must
-        # remain bidirectional. The first ``1`` should appear at the start of
-        # the indicator span. Mirrors the CPU test invariant in
+        # Per π0.7 paper §VI.B (post-fix): the only bidirectional block at the
+        # head of the prefix is the video span; every text/state span after it
+        # opens its own causal block (text: ``[1] * N``; state: ``[1] + [0]*(T-1)``).
+        # So the first causal boundary should be at the start of the language
+        # span (right after the video block). Mirrors the CPU test invariant in
         # ``test_pi07_cpu.py::test_all_optional_blocks_absent_skips_emission``
         # but on the real Gemma 3 tokenizer.
         prefix_att_masks = captured["prefix_att_masks"][0].cpu()
         first_one = int((prefix_att_masks == 1).nonzero(as_tuple=False).flatten()[0].item())
-        expected_first_one = (
-            VIDEO_TOKENS + PROMPT_MAX_LENGTH + m["state_lead"] + N_OBS_STEPS + state_end_no_opt_len
-        )
+        expected_first_one = VIDEO_TOKENS  # = LANG_START
         assert first_one == expected_first_one, (
             f"first causal boundary at position {first_one}, expected {expected_first_one} "
-            f"(start of 'Action: ' indicator). An earlier ``1`` signals a spurious optional "
-            f"block was emitted."
+            f"(start of language span). A later ``1`` signals a regression to the pre-fix "
+            f"pattern that lumped lang/State:/state-end into the bidirectional video block."
         )
 
 
