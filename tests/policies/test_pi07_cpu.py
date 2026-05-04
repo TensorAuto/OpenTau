@@ -585,8 +585,11 @@ def _make_fake_flow_matching(*, hidden: int = 4, n_video_tokens: int = 3):
         # state: (B, T, D) → (B, T, hidden)
         return torch.zeros(state.shape[0], state.shape[1], hidden, dtype=torch.float32)
 
-    def _embed_video(video):
+    def _embed_video(video, obs_history_is_pad=None):
         # video: (B, T, C, H, W) → (B, n_video_tokens, hidden)
+        # obs_history_is_pad accepted for signature compat; this fake ignores
+        # it (the real encoder uses it to build the temporal attention mask).
+        del obs_history_is_pad
         return torch.zeros(video.shape[0], n_video_tokens, hidden, dtype=torch.float32)
 
     fake = types.SimpleNamespace(
@@ -1278,3 +1281,251 @@ class TestPi07ConfigPlumbing:
         assert cfg.gradient_checkpointing is False
         assert cfg.vlm_config.attention_implementation == "sdpa"
         assert cfg.vlm_config.gradient_checkpointing is True
+
+
+# State mask: current step (t = T-1) must always be marked real, even when
+# obs_history_is_pad sets it to True (e.g. dataset's history_state_drop_prob
+# augmentation flips the entire tensor to all-True). Without the override the
+# policy is conditioned on no state at all when that augmentation fires.
+
+
+def _state_slice_indices(prompt_len: int, n_video_tokens: int, t_state: int) -> slice:
+    """Compute the slice of ``pad_masks`` corresponding to the state tokens.
+
+    Layout (no optional blocks; fake tokenizer encodes every indicator phrase
+    to 2 tokens):
+      videos(n_video_tokens) + lang(prompt_len) + "State: "(2) + state(t_state)
+    """
+    state_lo = n_video_tokens + prompt_len + 2
+    return slice(state_lo, state_lo + t_state)
+
+
+class TestStateMaskCurrentStepAlwaysReal:
+    """Pin the post-fix invariant: state_mask[:, -1] is True regardless of
+    obs_history_is_pad. Bug B from the PR #205 audit (port to pi07).
+    """
+
+    def test_state_mask_current_step_real_when_all_history_padded(self):
+        """``obs_history_is_pad = ones(B, T)`` (the
+        ``history_state_drop_prob=1.0`` case) MUST still leave the current
+        state token (index T-1) marked real, otherwise attention to it is
+        masked out and the policy conditions on no state at all.
+        """
+        method = _embed_prefix_method()
+        fake = _make_fake_flow_matching()
+        bsize = 2
+        t_state = 4  # > 1 so the state span is multi-token
+        kwargs = _build_default_inputs(batch_size=bsize, t_state=t_state)
+        kwargs["obs_history_is_pad"] = torch.ones(bsize, t_state, dtype=torch.bool)
+        # No optional blocks — keeps the layout deterministic.
+        kwargs["response_tokens"] = None
+        kwargs["response_masks"] = None
+        kwargs["metadata_tokens"] = None
+        kwargs["metadata_masks"] = None
+
+        _, pad_masks, _ = method(fake, **kwargs)
+
+        state_slice = _state_slice_indices(prompt_len=3, n_video_tokens=3, t_state=t_state)
+        state_mask = pad_masks[:, state_slice]
+        assert state_mask.shape == (bsize, t_state)
+
+        # Pre-fix: ~obs_history_is_pad = all-False → current also masked out.
+        # Post-fix: state_mask[:, -1] = True override.
+        for i in range(bsize):
+            assert state_mask[i, -1].item() is True, (
+                f"sample {i}: current state token (T-1) is masked out — the "
+                f"history_state_drop_prob augmentation would condition on no "
+                f"state at all. state_mask = {state_mask[i].tolist()}"
+            )
+        # Earlier history tokens are still padded.
+        assert (~state_mask[:, :-1]).all().item() is True
+
+    def test_state_mask_none_branch_assumes_history_padded_keeps_current_real(self):
+        """``obs_history_is_pad = None`` means the caller didn't tell us
+        which slots are real. Post-fix: assume all history is padded so the
+        encoder cannot attend to garbage history slots — but the current step
+        is still real.
+        """
+        method = _embed_prefix_method()
+        fake = _make_fake_flow_matching()
+        bsize = 2
+        t_state = 4
+        kwargs = _build_default_inputs(batch_size=bsize, t_state=t_state)
+        kwargs["obs_history_is_pad"] = None
+        kwargs["response_tokens"] = None
+        kwargs["response_masks"] = None
+        kwargs["metadata_tokens"] = None
+        kwargs["metadata_masks"] = None
+
+        _, pad_masks, _ = method(fake, **kwargs)
+
+        state_slice = _state_slice_indices(prompt_len=3, n_video_tokens=3, t_state=t_state)
+        state_mask = pad_masks[:, state_slice]
+        assert state_mask.shape == (bsize, t_state)
+
+        # Post-fix None-branch: zeros for history, True for current step.
+        for i in range(bsize):
+            assert state_mask[i, -1].item() is True
+            assert (~state_mask[i, :-1]).all().item() is True, (
+                f"sample {i}: history slots should be padded by default in the "
+                f"None-branch, got state_mask = {state_mask[i].tolist()}"
+            )
+
+    def test_state_mask_partial_history_pad_preserves_current(self):
+        """Mixed pad pattern (typical of natural episode-boundary padding):
+        some history slots padded, current step real → state_mask matches
+        ``~obs_history_is_pad`` exactly, with the override a no-op since
+        the current bit was already True.
+        """
+        method = _embed_prefix_method()
+        fake = _make_fake_flow_matching()
+        bsize = 2
+        t_state = 4
+        kwargs = _build_default_inputs(batch_size=bsize, t_state=t_state)
+        # Sample 0: first 2 padded; sample 1: only first padded.
+        kwargs["obs_history_is_pad"] = torch.tensor([[True, True, False, False], [True, False, False, False]])
+        kwargs["response_tokens"] = None
+        kwargs["response_masks"] = None
+        kwargs["metadata_tokens"] = None
+        kwargs["metadata_masks"] = None
+
+        _, pad_masks, _ = method(fake, **kwargs)
+
+        state_slice = _state_slice_indices(prompt_len=3, n_video_tokens=3, t_state=t_state)
+        state_mask = pad_masks[:, state_slice]
+        assert state_mask.shape == (bsize, t_state)
+
+        torch.testing.assert_close(
+            state_mask,
+            torch.tensor([[False, False, True, True], [False, True, True, True]]),
+        )
+
+    def test_state_mask_does_not_mutate_obs_history_is_pad(self):
+        """The override path uses .clone() to avoid mutating the caller's
+        ``obs_history_is_pad`` tensor (which is also threaded into
+        ``embed_video`` for the temporal attention mask).
+        """
+        method = _embed_prefix_method()
+        fake = _make_fake_flow_matching()
+        bsize = 1
+        t_state = 4
+        kwargs = _build_default_inputs(batch_size=bsize, t_state=t_state)
+        original_pad = torch.ones(bsize, t_state, dtype=torch.bool)
+        kwargs["obs_history_is_pad"] = original_pad
+        snapshot = original_pad.clone()
+        kwargs["response_tokens"] = None
+        kwargs["response_masks"] = None
+        kwargs["metadata_tokens"] = None
+        kwargs["metadata_masks"] = None
+
+        method(fake, **kwargs)
+
+        torch.testing.assert_close(original_pad, snapshot)
+
+
+# Inference vs training prompt-construction parity. The embed_prefix code path
+# is the same for both — the only difference is whether ``discrete_actions``
+# is present (training) or None (inference). With identical optional-block
+# inputs, the prefix tensors must agree on every dimension EXCEPT the
+# trailing "Action: " + discrete-action span.
+
+
+class TestPrefixLayoutInferenceMatchesTraining:
+    def test_minimal_inference_batch_collapses_prefix(self):
+        """An inference-style call (``discrete_actions=None``, no optional
+        blocks) produces the collapsed layout
+            videos | lang | "State: " | state | ":\\n"
+        with the state-end separator collapsed from ", " to ":\\n" and no
+        ";\\n " prefix-end. Mirrors what the user sees when calling
+        ``select_action`` with only state + prompt + camera.
+        """
+        method = _embed_prefix_method()
+        fake = _make_fake_flow_matching()
+        bsize = 1
+        kwargs = _build_default_inputs(batch_size=bsize, t_state=1)
+        # No optional blocks AND no discrete_actions (inference signature).
+        kwargs["response_tokens"] = None
+        kwargs["response_masks"] = None
+        kwargs["metadata_tokens"] = None
+        kwargs["metadata_masks"] = None
+
+        embs, pad_masks, att_masks = method(fake, **kwargs)
+
+        # videos(3) + lang(3) + "State: "(2) + state(1) + ":\n"(2) = 11.
+        # NOT videos+lang+State:+state+", "+";\n " = 13 (which would mean
+        # has_any_optional incorrectly evaluated True).
+        expected_len = 11
+        assert embs.shape == (bsize, expected_len, 4)
+        assert pad_masks.shape == (bsize, expected_len)
+        assert att_masks.shape == (bsize, expected_len)
+
+    def test_train_inference_prefix_diff_only_in_action_tail(self):
+        """With identical optional-block inputs, training prefix
+        (``discrete_actions != None``) and inference prefix
+        (``discrete_actions == None``) must agree on every position EXCEPT
+        the trailing "Action: " + discrete-action span. This pins the
+        property that ``prepare_*`` and ``embed_prefix`` produce the same
+        layout for training and inference batches.
+        """
+        method = _embed_prefix_method()
+        fake = _make_fake_flow_matching()
+        bsize = 1
+        kwargs_infer = _build_default_inputs(batch_size=bsize, t_state=1)
+        kwargs_infer["response_tokens"] = None
+        kwargs_infer["response_masks"] = None
+        kwargs_infer["metadata_tokens"] = None
+        kwargs_infer["metadata_masks"] = None
+
+        kwargs_train = dict(kwargs_infer)
+        num_action_tokens = 3
+        kwargs_train["discrete_actions"] = torch.zeros(bsize, num_action_tokens, dtype=torch.long)
+        kwargs_train["discrete_action_masks"] = torch.ones(bsize, num_action_tokens, dtype=torch.bool)
+
+        embs_infer, pad_masks_infer, att_masks_infer = method(fake, **kwargs_infer)
+        embs_train, pad_masks_train, att_masks_train = method(fake, **kwargs_train)
+
+        # Inference prefix is a strict prefix of the training one.
+        infer_len = embs_infer.shape[1]
+        # Training adds "Action: "(2 fake tokens) + discrete_actions(3) = 5.
+        train_len = infer_len + 2 + num_action_tokens
+        assert embs_train.shape[1] == train_len
+
+        # Tensors agree on the shared inference-length prefix.
+        torch.testing.assert_close(embs_train[:, :infer_len], embs_infer)
+        torch.testing.assert_close(pad_masks_train[:, :infer_len], pad_masks_infer)
+        torch.testing.assert_close(att_masks_train[:, :infer_len], att_masks_infer)
+
+    def test_full_optional_blocks_produce_same_layout_train_vs_infer(self):
+        """Same property as above but with ALL optional blocks present
+        (response, metadata, subgoals): training and inference prefixes
+        agree on the shared length, training extends with "Action: " +
+        discrete actions only.
+        """
+        method = _embed_prefix_method()
+        fake = _make_fake_flow_matching()
+        bsize = 2
+
+        def _build(with_actions: bool):
+            kwargs = _build_default_inputs(batch_size=bsize, t_state=1)
+            kwargs["response_tokens"] = torch.zeros(bsize, 5, dtype=torch.long)
+            kwargs["response_masks"] = torch.ones(bsize, 5, dtype=torch.bool)
+            kwargs["metadata_tokens"] = torch.zeros(bsize, 4, dtype=torch.long)
+            kwargs["metadata_masks"] = torch.ones(bsize, 4, dtype=torch.bool)
+            kwargs["subgoal_images"] = [torch.zeros(bsize, 3, 4, 4)]
+            kwargs["subgoal_img_masks"] = [torch.ones(bsize, dtype=torch.bool)]
+            if with_actions:
+                num_action_tokens = 3
+                kwargs["discrete_actions"] = torch.zeros(bsize, num_action_tokens, dtype=torch.long)
+                kwargs["discrete_action_masks"] = torch.ones(bsize, num_action_tokens, dtype=torch.bool)
+            return kwargs
+
+        embs_infer, pad_infer, att_infer = method(fake, **_build(with_actions=False))
+        embs_train, pad_train, att_train = method(fake, **_build(with_actions=True))
+
+        infer_len = embs_infer.shape[1]
+        # Training extends by 2 ("Action: ") + 3 (discrete actions).
+        assert embs_train.shape[1] == infer_len + 5
+
+        torch.testing.assert_close(embs_train[:, :infer_len], embs_infer)
+        torch.testing.assert_close(pad_train[:, :infer_len], pad_infer)
+        torch.testing.assert_close(att_train[:, :infer_len], att_infer)

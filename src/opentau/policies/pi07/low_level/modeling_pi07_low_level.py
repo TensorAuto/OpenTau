@@ -1121,16 +1121,23 @@ class PI07LowLevelFlowMatching(nn.Module):
         time = time_beta * 0.999 + 0.001
         return time
 
-    def embed_video(self, video: Tensor) -> Tensor:
+    def embed_video(self, video: Tensor, obs_history_is_pad: Tensor | None = None) -> Tensor:
         """Encode a video through SpaceTimeSiglip + Perceiver reducer + projection.
 
         Args:
             video: (B, T, C, H, W)
+            obs_history_is_pad: Optional ``(B, T)`` bool mask — ``True`` for
+                padded history frames. Threaded into the SpaceTime SigLIP
+                encoder so temporal attention blocks padded frames (pixel-
+                zeroing alone is insufficient — the patch embedding bias and
+                temporal PE for ``t < T-1`` are non-zero, so zero pixels
+                still produce non-zero hidden states the current frame would
+                otherwise attend to).
 
         Returns:
             (B, num_video_tokens, vlm_hidden_size)
         """
-        return self.video_encoder(video)
+        return self.video_encoder(video, obs_history_is_pad=obs_history_is_pad)
 
     def embed_prefix(
         self,
@@ -1241,7 +1248,7 @@ class PI07LowLevelFlowMatching(nn.Module):
         has_any_optional = bool(has_response or has_subgoal or has_metadata)
 
         for vid, vid_mask in zip(videos, vid_masks, strict=True):
-            vid_emb = self.embed_video(vid)  # (B, num_video_tokens, vlm_hidden)
+            vid_emb = self.embed_video(vid, obs_history_is_pad=obs_history_is_pad)
             vid_emb = vid_emb.to(dtype=_preferred_dtype())
 
             num_vid_embs = vid_emb.shape[1]
@@ -1292,9 +1299,17 @@ class PI07LowLevelFlowMatching(nn.Module):
         state_emb = self.state_proj(state.to(dtype=_preferred_dtype()))
         num_state_tokens = state_emb.shape[1]  # T
         if obs_history_is_pad is not None:
-            state_mask = ~obs_history_is_pad  # True = real, False = padded
+            state_mask = ~obs_history_is_pad  # (B, T)
         else:
-            state_mask = torch.ones(bsize, num_state_tokens, dtype=torch.bool, device=state.device)
+            # Absent → assume all history is padded; only current step is real.
+            state_mask = torch.zeros(bsize, num_state_tokens, dtype=torch.bool, device=state.device)
+        # Current step (t = T-1) is ALWAYS real even when the dataset's
+        # history_state_drop_prob augmentation flips obs_history_is_pad to
+        # all-True. Without this override the policy would condition on no
+        # state at all, since attention to the current state token would be
+        # masked out — defeating the purpose of preserving the current frame.
+        state_mask = state_mask.clone()  # avoid in-place mutation of obs_history_is_pad
+        state_mask[:, -1] = True
 
         embs.append(state_emb)
         pad_masks.append(state_mask)

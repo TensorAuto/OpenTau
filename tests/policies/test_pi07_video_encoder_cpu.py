@@ -353,3 +353,197 @@ class TestSuppressSpacetimeTemporal:
         with suppress_spacetime_temporal(encoder.vision_tower):
             out = wrapper.forward(bad_input)[0]
         assert out.shape == bad_input.shape
+
+
+# Padded-history attention masking (Bug A from the audit against PR #205).
+#
+# Pixel-zeroing of padded frames is not enough — the SigLIP patch embedding
+# carries a learned bias and the temporal positional embedding e(t) is
+# non-zero for t < T-1. So zero pixels still produce non-zero hidden states
+# that the current frame would otherwise attend to. The encoder must build
+# an attention mask blocking padded keys at the SDPA call.
+
+
+class TestTemporalAttentionMaskBlocksPaddedHistory:
+    def test_current_frame_invariant_to_padded_history(self):
+        """Gold-standard: with the first three frames marked padded and
+        identical current frame at ``[:, -1]``, the encoder output must NOT
+        depend on the pixel values of those padded frames.
+
+        Pre-fix code reads contaminated hidden states from padded frames
+        through the temporal attention path and the two outputs diverge.
+        """
+        torch.manual_seed(0)
+        encoder = _make_encoder(num_frames=4, spacetime_stride=4).eval()
+
+        current = torch.rand(1, 1, 3, 224, 224)
+        # vid_a: random padded history.
+        vid_a = torch.cat([torch.rand(1, 3, 3, 224, 224), current], dim=1)
+        # vid_b: zeroed padded history; same current frame.
+        vid_b = torch.cat([torch.zeros(1, 3, 3, 224, 224), current], dim=1)
+
+        obs_history_is_pad = torch.tensor([[True, True, True, False]])
+        with torch.no_grad():
+            out_a = encoder(vid_a, obs_history_is_pad=obs_history_is_pad)
+            out_b = encoder(vid_b, obs_history_is_pad=obs_history_is_pad)
+
+        torch.testing.assert_close(out_a, out_b, rtol=1e-5, atol=1e-5)
+
+    def test_inference_fallback_blocks_all_history(self):
+        """``obs_history_is_pad=None`` triggers the inference fallback that
+        treats every history slot as padded; pins the property that
+        ``select_action`` (which never emits ``obs_history_is_pad``) does
+        not let zero-pixel placeholders contaminate the current frame.
+        """
+        torch.manual_seed(1)
+        encoder = _make_encoder(num_frames=4, spacetime_stride=4).eval()
+
+        current = torch.rand(1, 1, 3, 224, 224)
+        vid_a = torch.cat([torch.rand(1, 3, 3, 224, 224), current], dim=1)
+        vid_b = torch.cat([torch.zeros(1, 3, 3, 224, 224), current], dim=1)
+
+        with torch.no_grad():
+            out_a = encoder(vid_a)  # obs_history_is_pad defaults to None
+            out_b = encoder(vid_b)
+
+        torch.testing.assert_close(out_a, out_b, rtol=1e-5, atol=1e-5)
+
+    def test_temporal_mask_shape_and_values(self):
+        """Exercise ``_build_temporal_attn_mask`` directly. Documents the
+        contract: causal lower-triangular AND key-side ``~obs_history_is_pad``
+        with current-frame override; (B*N, 1, T, T) shape; additive 0/-inf.
+        """
+        obs_history_is_pad = torch.tensor([[True, False, False]])
+        mask = SpaceTimeSiglipVideoEncoder._build_temporal_attn_mask(
+            obs_history_is_pad, num_patches=4, dtype=torch.float32
+        )
+
+        # Shape: B=1, N=4, T=3 → (B*N, 1, T, T) = (4, 1, 3, 3).
+        assert mask.shape == (4, 1, 3, 3)
+        assert mask.dtype == torch.float32
+
+        # All N rows for batch 0 share the same (T, T) submatrix.
+        m = mask[0, 0]  # (3, 3)
+
+        # Diagonal: each query attends to itself when key is real.
+        # Row 0: query=frame0 (padded query, but causal allows j=0 only;
+        # since frame 0 is padded its key is blocked → -inf). The current-frame
+        # override only forces key j=T-1 real, not j=0.
+        assert m[0, 0] == float("-inf"), "padded frame 0 key should be blocked"
+        # Row 1: query=frame1 attends to {0 (padded → -inf), 1 (real → 0)}.
+        assert m[1, 0] == float("-inf")
+        assert m[1, 1] == 0.0
+        # Row 2: query=current attends to {0 (padded → -inf), 1 (real → 0),
+        # 2 (current, always real → 0)}.
+        assert m[2, 0] == float("-inf")
+        assert m[2, 1] == 0.0
+        assert m[2, 2] == 0.0
+
+        # Upper triangular off-diagonals are blocked (causal).
+        assert m[0, 1] == float("-inf")
+        assert m[0, 2] == float("-inf")
+        assert m[1, 2] == float("-inf")
+
+        # Patch rows for the same batch are identical (mask is broadcast over
+        # spatial patch positions).
+        for n in range(1, 4):
+            torch.testing.assert_close(mask[n, 0], mask[0, 0])
+
+    def test_current_frame_override_when_pad_includes_current(self):
+        """Defensive: even if a caller passes ``obs_history_is_pad`` with
+        the current step (T-1) marked padded — as the dataset's
+        ``history_state_drop_prob`` augmentation does — the mask must keep
+        the current frame attendable, otherwise the current query has no
+        valid key and softmax produces NaNs.
+        """
+        all_padded = torch.tensor([[True, True, True, True]])
+        mask = SpaceTimeSiglipVideoEncoder._build_temporal_attn_mask(
+            all_padded, num_patches=1, dtype=torch.float32
+        )
+        # Current row (T-1=3) attends to the current key (T-1=3) at minimum.
+        m = mask[0, 0]
+        assert m[3, 3] == 0.0, "current frame must remain self-attendable"
+
+    def test_pad_tensor_not_mutated(self):
+        """The mask helper must not mutate the caller's ``obs_history_is_pad``
+        tensor (it is also consumed downstream as the state mask).
+        """
+        all_padded = torch.tensor([[True, True, True, True]])
+        snapshot = all_padded.clone()
+        SpaceTimeSiglipVideoEncoder._build_temporal_attn_mask(all_padded, num_patches=1, dtype=torch.float32)
+        torch.testing.assert_close(all_padded, snapshot)
+
+
+# Subgoal images share the video encoder weights — the only set of SigLIP
+# weights that exists. ``embed_image`` (subgoal path) and the encoder's
+# T=1 short-circuit go through the same modules; outputs must match
+# byte-for-byte.
+
+
+class TestSubgoalSharesVideoEncoderWeights:
+    def test_embed_image_via_suppress_matches_encoder_t1(self):
+        """A single-frame forward through ``vision_tower`` under
+        ``suppress_spacetime_temporal`` (the path ``Gemma3WithExpertModel.
+        embed_image`` takes for subgoal images) must produce byte-identical
+        output to ``SpaceTimeSiglipVideoEncoder.forward`` at T=1 on the same
+        image, **before** the [0, 1] → [-1, 1] rescale (since ``embed_image``
+        expects callers to have already rescaled, while the encoder rescales
+        internally).
+        """
+        torch.manual_seed(2)
+        vision_tower, projector = _build_siglip_and_projector()
+        encoder = SpaceTimeSiglipVideoEncoder(
+            vision_tower=vision_tower,
+            multi_modal_projector=projector,
+            num_frames=1,
+            spacetime_layer_stride=4,
+        ).eval()
+
+        # Encoder takes [0, 1] and rescales internally.
+        image_unit = torch.rand(2, 3, 224, 224)
+
+        # embed_image equivalent: the caller pre-rescales to [-1, 1] and
+        # invokes the same vision_tower under suppress_spacetime_temporal.
+        image_siglip = image_unit * 2.0 - 1.0
+        with torch.no_grad():
+            with suppress_spacetime_temporal(vision_tower):
+                last_hidden = vision_tower(pixel_values=image_siglip).last_hidden_state
+            out_image = projector(last_hidden)
+            out_video = encoder(image_unit.unsqueeze(1))  # (B, 1, C, H, W)
+
+        torch.testing.assert_close(out_video, out_image, rtol=1e-5, atol=1e-5)
+
+    def test_encoder_owns_no_siglip_parameters(self):
+        """``SpaceTimeSiglipVideoEncoder`` holds ``vision_tower`` and
+        ``multi_modal_projector`` by reference in lists. Its OWN parameters
+        and state_dict must therefore be empty — proving there is no second
+        copy of the SigLIP weights anywhere in the encoder's tree.
+        """
+        encoder = _make_encoder(num_frames=4, spacetime_stride=4)
+
+        own_param_count = sum(1 for _ in encoder.parameters())
+        assert own_param_count == 0, (
+            f"encoder owns {own_param_count} params; expected 0 — vision_tower "
+            "and multi_modal_projector should be held by reference, not registered"
+        )
+
+        # state_dict contains only registered buffers/params. _temporal_pe is
+        # non-persistent (excluded from state_dict). Adopted submodule keys
+        # are accessed through the wrapped vision_tower, NOT under the
+        # encoder's path. So the encoder's own state_dict must be empty.
+        own_state = encoder.state_dict()
+        assert len(own_state) == 0, f"encoder.state_dict() = {list(own_state.keys())}; expected empty"
+
+    def test_only_one_copy_of_siglip_q_proj(self):
+        """Across the wrapped vision_tower's full state_dict, there is
+        exactly ONE copy of each SigLIP attention weight. Wrapping with
+        space-time attention must not duplicate any q/k/v/o projection.
+        """
+        encoder = _make_encoder(num_frames=4, spacetime_stride=4)
+        keys = list(encoder.vision_tower.state_dict().keys())
+        q_proj_keys = [k for k in keys if k.endswith("self_attn.q_proj.weight")]
+
+        # 27 SigLIP layers → exactly 27 q_proj.weight entries.
+        assert len(q_proj_keys) == 27, (
+            f"expected 27 q_proj entries (one per layer); got {len(q_proj_keys)}: {q_proj_keys}"
+        )
