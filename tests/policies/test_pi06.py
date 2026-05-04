@@ -898,3 +898,128 @@ def test_pi06_loc_tokens_extend_vocab_and_resize_embeddings(lerobot_dataset_meta
         # process don't OOM on a single-GPU dev box.
         del policy
         torch.cuda.empty_cache()
+
+
+# Published `TensorAuto/pi06-untrained` checkpoint — load + weight equivalence.
+#
+# These tests verify the published init checkpoint (issue #239): that it loads
+# cleanly via `PI06Policy.from_pretrained("TensorAuto/pi06-untrained")` with no
+# missing/unexpected keys, and that the VLM / SigLIP submodules are bit-for-bit
+# identical to `google/gemma-3-4b-pt`. Heavy: each fixture loads ~10 GB on CPU,
+# so they're gated behind `gpu` + `slow` to stay out of CPU CI. They do NOT
+# actually require CUDA — comparison is on CPU in bf16 — but the markers double
+# as a "needs heavy infra + network" gate matching the surrounding pi06 tests.
+
+
+@pytest.fixture(scope="module")
+def pi06_untrained_policy():
+    """Load `TensorAuto/pi06-untrained` once on CPU; reused across the module."""
+    from opentau.policies.pi06.modeling_pi06 import PI06Policy
+
+    return PI06Policy.from_pretrained("TensorAuto/pi06-untrained")
+
+
+@pytest.fixture(scope="module")
+def gemma3_4b_pt_aligned():
+    """Reference `google/gemma-3-4b-pt` (bf16, CPU) with vocab extended to match
+    the policy. `ensure_loc_tokens` resizes the embedding/LM head with
+    bit-deterministic new rows under a fixed seed, so `load_state_dict(strict=True)`
+    is well-defined against the policy's `gemma3` submodule."""
+    from transformers import (
+        AutoTokenizer,
+        Gemma3ForConditionalGeneration,  # noqa: I100
+    )
+
+    from opentau.datasets.grounding.tokenizer_utils import ensure_loc_tokens
+
+    model = Gemma3ForConditionalGeneration.from_pretrained("google/gemma-3-4b-pt", torch_dtype=torch.bfloat16)
+    tok = AutoTokenizer.from_pretrained("google/gemma-3-4b-pt")
+    ensure_loc_tokens(tok, model=model)
+    return model
+
+
+def _diff_state_dicts_against_reference(
+    policy_state: dict[str, torch.Tensor],
+    reference_state: dict[str, torch.Tensor],
+    *,
+    name_filter,
+) -> tuple[int, list[str]]:
+    """Compare every entry of `reference_state` whose name passes `name_filter`
+    against the matching entry in `policy_state`. Returns `(checked, mismatches)`.
+
+    `torch.equal` is used (not `allclose`) because the policy weights came from
+    the same source bf16 tensors with no precision-changing transform — they
+    must be byte-identical, and any drift is a real bug worth surfacing.
+    """
+    mismatches: list[str] = []
+    checked = 0
+    for name, ref in reference_state.items():
+        if not name_filter(name):
+            continue
+        pol = policy_state.get(name)
+        if pol is None:
+            mismatches.append(f"{name}: missing in policy state_dict")
+            continue
+        if pol.shape != ref.shape:
+            mismatches.append(f"{name}: shape mismatch {tuple(pol.shape)} vs {tuple(ref.shape)}")
+            continue
+        if not torch.equal(pol, ref):
+            max_abs = (pol.float() - ref.float()).abs().max().item()
+            mismatches.append(f"{name}: tensor not equal (max abs diff {max_abs:g})")
+            continue
+        checked += 1
+    return checked, mismatches
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_pi06_untrained_loads_with_no_missing_or_unexpected_keys(pi06_untrained_policy):
+    """Published `model.safetensors` keys equal the policy's `state_dict()` keys
+    1:1. Catches both missed-on-save and missed-on-load regressions: the
+    standard `from_pretrained` loader uses `strict=False` and only logs the
+    diff, so without this we'd silently ship a checkpoint that, say, dropped
+    the action expert."""
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import load_file
+
+    ckpt_path = hf_hub_download("TensorAuto/pi06-untrained", "model.safetensors")
+    saved_keys = set(load_file(ckpt_path).keys())
+    expected_keys = set(pi06_untrained_policy.state_dict().keys())
+
+    missing = expected_keys - saved_keys
+    unexpected = saved_keys - expected_keys
+    assert not missing and not unexpected, (
+        f"missing in safetensors ({len(missing)}): {sorted(missing)[:10]}\n"
+        f"unexpected in safetensors ({len(unexpected)}): {sorted(unexpected)[:10]}"
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_pi06_untrained_vlm_matches_gemma3_4b_pt(pi06_untrained_policy, gemma3_4b_pt_aligned):
+    """Gemma 3 text tower + multimodal projector inside the published checkpoint
+    are byte-identical to `google/gemma-3-4b-pt` (vision tower checked separately
+    in `test_pi06_untrained_siglip_matches_gemma3_4b_pt`)."""
+    pol_state = pi06_untrained_policy.model.gemma3_with_expert.gemma3.state_dict()
+    ref_state = gemma3_4b_pt_aligned.state_dict()
+
+    checked, mismatches = _diff_state_dicts_against_reference(
+        pol_state, ref_state, name_filter=lambda name: "vision_tower" not in name
+    )
+    assert checked > 0, "Sanity: should have compared at least one VLM (non-vision) param"
+    assert not mismatches, "VLM (Gemma 3 text + projector) mismatches:\n" + "\n".join(mismatches[:20])
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_pi06_untrained_siglip_matches_gemma3_4b_pt(pi06_untrained_policy, gemma3_4b_pt_aligned):
+    """SigLIP vision tower inside the published checkpoint is byte-identical to
+    the vision tower bundled in `google/gemma-3-4b-pt`."""
+    pol_state = pi06_untrained_policy.model.gemma3_with_expert.gemma3.state_dict()
+    ref_state = gemma3_4b_pt_aligned.state_dict()
+
+    checked, mismatches = _diff_state_dicts_against_reference(
+        pol_state, ref_state, name_filter=lambda name: "vision_tower" in name
+    )
+    assert checked > 0, "Sanity: should have compared at least one SigLIP param"
+    assert not mismatches, "SigLIP vision tower mismatches:\n" + "\n".join(mismatches[:20])
