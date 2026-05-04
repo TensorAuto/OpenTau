@@ -531,3 +531,81 @@ def test_complete_pi06_pipeline_integration_smoke(lerobot_dataset_metadata):
     assert isinstance(loss, dict)
     assert "MSE" in loss and "CE" in loss
     assert all(v.isfinite() for v in loss.values())
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_pi06_loc_tokens_extend_vocab_and_resize_embeddings(lerobot_dataset_metadata):
+    """π0.6: confirms the unconditional Gemma 3 vocab extension wired into
+    `PI06FlowMatching.__init__`. The bare `google/gemma-3-4b-pt` tokenizer
+    has no `<locNNNN>` tokens; after policy construction:
+
+    * The tokenizer vocab grows by exactly 1024.
+    * The Gemma 3 input embedding row count matches the new tokenizer length.
+    * The LM head output dim grows by 1024.
+    * `<loc0042>` encodes to a single token id.
+    * A forward pass with a loc-token-bearing response produces finite loss.
+    """
+    from transformers import AutoTokenizer
+
+    from opentau.policies.pi06.modeling_pi06 import PI06Policy
+
+    config = PI06Config(
+        max_state_dim=32,
+        max_action_dim=32,
+        chunk_size=10,
+        n_action_steps=10,
+        discrete_action_max_length=32,
+        predict_response=True,
+    )
+
+    from opentau.configs.types import FeatureType
+    from opentau.datasets.utils import dataset_to_policy_features
+
+    features = dataset_to_policy_features(
+        {
+            "state": {"shape": (32,), "dtype": "float32"},
+            "actions": {"shape": (10, 32), "dtype": "float32"},
+            "camera0": {"shape": (3, 448, 448), "dtype": "image"},
+            "camera1": {"shape": (3, 448, 448), "dtype": "image"},
+        }
+    )
+    config.output_features = {k: ft for k, ft in features.items() if ft.type is FeatureType.ACTION}
+    config.input_features = {k: ft for k, ft in features.items() if k not in config.output_features}
+
+    bare_tok_size = len(AutoTokenizer.from_pretrained("google/gemma-3-4b-pt"))
+
+    policy = PI06Policy(config, dataset_stats=lerobot_dataset_metadata.stats)
+
+    inner_tok = policy.model.language_tokenizer
+    assert len(inner_tok) == bare_tok_size + 1024, (
+        f"Expected vocab size {bare_tok_size + 1024} after extension, got {len(inner_tok)}"
+    )
+    assert len(inner_tok.encode("<loc0042>", add_special_tokens=False)) == 1
+    assert len(inner_tok.encode("<loc1023>", add_special_tokens=False)) == 1
+
+    gemma3 = policy.model.gemma3_with_expert.gemma3
+    assert gemma3.get_input_embeddings().num_embeddings == len(inner_tok)
+    # The LM head output dim should also have grown (tied weights with the
+    # input embedding in Gemma 3 by default).
+    output_emb = gemma3.get_output_embeddings()
+    if output_emb is not None:
+        # Linear layer: out_features matches the resized vocab.
+        assert output_emb.out_features == len(inner_tok)
+
+    policy.to(dtype=torch.bfloat16, device="cuda")
+    batch = {
+        "camera0": torch.randn(1, 3, 448, 448, dtype=torch.bfloat16, device="cuda"),
+        "camera1": torch.randn(1, 3, 448, 448, dtype=torch.bfloat16, device="cuda"),
+        "state": torch.randn(1, 32, dtype=torch.bfloat16, device="cuda"),
+        "actions": torch.randn(1, 10, 32, dtype=torch.bfloat16, device="cuda"),
+        "prompt": ["detect red block"],
+        "response": ["<loc0234><loc0567><loc0890><loc1023> red block"],
+        "img_is_pad": torch.zeros(1, 2, dtype=torch.bool, device="cuda"),
+        "action_is_pad": torch.zeros(1, 10, dtype=torch.bool, device="cuda"),
+    }
+
+    loss = policy.forward(batch)
+    assert isinstance(loss, dict)
+    assert "MSE" in loss and "CE" in loss
+    assert all(v.isfinite() for v in loss.values()), f"Non-finite loss with loc tokens: {loss}"
