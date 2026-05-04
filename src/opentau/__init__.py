@@ -149,7 +149,15 @@ available_datasets = sorted(
 )
 
 # lists all available policies from `src/opentau/policies`
-available_policies = ["pi0", "pi05", "pi05_mem", "pi06", "value"]
+available_policies = [
+    "pi0",
+    "pi05",
+    "pi05_mem",
+    "pi06",
+    "pi07_high_level",
+    "pi07_low_level",
+    "value",
+]
 
 # keys and values refer to yaml files
 available_policies_per_env = {}

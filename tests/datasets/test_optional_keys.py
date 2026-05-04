@@ -320,11 +320,18 @@ class TestDropoutDisabled:
         ds.resolution = (8, 8)
         ds.episode_lengths = {0: 100}
         ds.segment_starts_by_episode = {0: _np.array([0])}
+        ds.episode_data_index = {
+            "from": torch.tensor([0], dtype=torch.long),
+            "to": torch.tensor([100], dtype=torch.long),
+        }
+        ds.epi2idx = {0: 0}
         ds.meta = SimpleNamespace(
             video_keys=["camera0"],
+            image_keys=[],
+            camera_keys=["camera0"],
             episodes={0: {"segments": [0]}},
             fps=30,
-            info={"subgoals": {"subgoal0": "camera0"}},  # opt in to subgoal loading
+            info={},
         )
         monkeypatch.setattr(type(ds), "_get_feature_mapping_key", lambda self: mapping_key)
 
@@ -369,9 +376,11 @@ class TestDropoutDisabled:
         ds.segment_starts_by_episode = {0: _np.array([0])}
         ds.meta = SimpleNamespace(
             video_keys=["camera0"],
+            image_keys=[],
+            camera_keys=["camera0"],
             episodes={0: {"segments": [0]}},
             fps=30,
-            info={"subgoals": {"subgoal0": "camera0"}},  # opt in so the drop path is exercised
+            info={},
         )
         monkeypatch.setattr(type(ds), "_get_feature_mapping_key", lambda self: mapping_key)
 
@@ -383,28 +392,32 @@ class TestDropoutDisabled:
         out = ds._load_subgoal_frames(0, 0)
         assert out == {}, "drop should return an empty dict and skip decoding"
 
-    def test_missing_subgoals_key_in_info_returns_empty(self, monkeypatch):
-        """Default state: info.json has no ``subgoals`` key, so no subgoals load."""
+    def test_no_cameras_returns_empty(self, monkeypatch):
+        """Datasets with no camera keys still short-circuit to ``{}`` so
+        :meth:`BaseDataset._emit_optional_keys` can mark every subgoal slot
+        padded.
+        """
         from types import SimpleNamespace
 
         import numpy as _np
 
         import opentau.datasets.lerobot_dataset as _ld
 
-        mapping_key = "_tests/subgoal_missing_info_key"
+        mapping_key = "_tests/subgoal_no_cameras"
         _ld.DATA_FEATURES_NAME_MAPPING[mapping_key] = {"camera0": "camera0"}
 
         ds = _ld.LeRobotDataset.__new__(_ld.LeRobotDataset)
         ds.enable_optional_key_dropout = False
         ds.subgoal_end_of_segment_prob = 1.0
         ds.subgoal_drop_prob = 0.0
-        ds.num_cams = 1
+        ds.num_cams = 0
         ds.resolution = (8, 8)
         ds.episode_lengths = {0: 100}
         ds.segment_starts_by_episode = {0: _np.array([0])}
-        # No "subgoals" key in info — mirrors every production LeRobot dataset today.
         ds.meta = SimpleNamespace(
-            video_keys=["camera0"],
+            video_keys=[],
+            image_keys=[],
+            camera_keys=[],
             episodes={0: {"segments": [0]}},
             fps=30,
             info={},
@@ -412,11 +425,141 @@ class TestDropoutDisabled:
         monkeypatch.setattr(type(ds), "_get_feature_mapping_key", lambda self: mapping_key)
 
         def _fail_query_videos(self, query_ts, ep_idx):
-            raise AssertionError("_query_videos must not be called when info has no 'subgoals'")
+            raise AssertionError("_query_videos must not be called when no cameras are present")
 
         monkeypatch.setattr(type(ds), "_query_videos", _fail_query_videos)
 
         assert ds._load_subgoal_frames(0, 0) == {}
+
+    def test_subgoals_load_without_info_subgoals_key(self, monkeypatch):
+        """Always-on behavior: info.json with no ``subgoals`` key still
+        triggers subgoal loading from the camera streams.
+
+        Pins the deliberate removal of the prior opt-in gate so a future
+        refactor doesn't silently restore it.
+        """
+        from types import SimpleNamespace
+
+        import numpy as _np
+
+        import opentau.datasets.lerobot_dataset as _ld
+
+        mapping_key = "_tests/subgoal_no_info_key"
+        _ld.DATA_FEATURES_NAME_MAPPING[mapping_key] = {"camera0": "camera0"}
+
+        ds = _ld.LeRobotDataset.__new__(_ld.LeRobotDataset)
+        ds.enable_optional_key_dropout = False
+        ds.subgoal_end_of_segment_prob = 0.0
+        ds.subgoal_drop_prob = 0.0
+        ds.num_cams = 1
+        ds.resolution = (8, 8)
+        ds.episode_lengths = {0: 100}
+        ds.segment_starts_by_episode = {0: _np.array([0])}
+        ds.episode_data_index = {
+            "from": torch.tensor([0], dtype=torch.long),
+            "to": torch.tensor([100], dtype=torch.long),
+        }
+        ds.epi2idx = {0: 0}
+        # info.json deliberately omits "subgoals" — mirrors every legacy
+        # LeRobot dataset that pre-dates this PR.
+        ds.meta = SimpleNamespace(
+            video_keys=["camera0"],
+            image_keys=[],
+            camera_keys=["camera0"],
+            episodes={0: {"segments": [0]}},
+            fps=30,
+            info={},
+        )
+        monkeypatch.setattr(type(ds), "_get_feature_mapping_key", lambda self: mapping_key)
+
+        called: list = []
+
+        def _fake_query_videos(self, query_ts, ep_idx):
+            called.append(dict(query_ts))
+            return {"camera0": torch.zeros((3, *self.resolution))}
+
+        monkeypatch.setattr(type(ds), "_query_videos", _fake_query_videos)
+
+        out = ds._load_subgoal_frames(0, 0)
+        assert "subgoal0_raw" in out
+        assert len(called) == 1, "video decode fired exactly once for the single camera"
+
+    def test_image_dtype_fallback_uses_absolute_row_index(self, monkeypatch):
+        """``image``-dtype cameras read from the parquet rows of
+        ``hf_dataset`` instead of decoding a video. The lookup index must be
+        ``ep_start + subgoal_frame`` — the absolute row in the table — not
+        the within-episode index.
+        """
+        from types import SimpleNamespace
+
+        import numpy as _np
+
+        import opentau.datasets.lerobot_dataset as _ld
+
+        mapping_key = "_tests/subgoal_image_dtype"
+        _ld.DATA_FEATURES_NAME_MAPPING[mapping_key] = {"camera0": "camera0"}
+
+        ds = _ld.LeRobotDataset.__new__(_ld.LeRobotDataset)
+        ds.enable_optional_key_dropout = False
+        ds.subgoal_end_of_segment_prob = 0.0
+        ds.subgoal_drop_prob = 0.0
+        ds.num_cams = 1
+        ds.resolution = (8, 8)
+        # Episode 1 starts at absolute row 100, length 50.
+        ep_start_abs = 100
+        ep_len = 50
+        ds.episode_lengths = {1: ep_len}
+        ds.segment_starts_by_episode = {1: _np.array([0])}
+        ds.episode_data_index = {
+            "from": torch.tensor([0, ep_start_abs], dtype=torch.long),
+            "to": torch.tensor([ep_start_abs, ep_start_abs + ep_len], dtype=torch.long),
+        }
+        ds.epi2idx = {0: 0, 1: 1}
+        ds.meta = SimpleNamespace(
+            video_keys=[],
+            image_keys=["camera0"],
+            camera_keys=["camera0"],
+            episodes={1: {"segments": [0]}},
+            fps=10,
+            info={},
+        )
+        monkeypatch.setattr(type(ds), "_get_feature_mapping_key", lambda self: mapping_key)
+
+        # Pin the within-episode subgoal index so the test asserts a known
+        # absolute row.
+        within_ep_subgoal = 7
+
+        def _fake_sample(self, ep_idx, frame_in_ep, *, at_end_of_segment):
+            assert ep_idx == 1 and frame_in_ep == 0
+            return within_ep_subgoal
+
+        monkeypatch.setattr(type(ds), "_sample_subgoal_frame", _fake_sample)
+
+        # Stub hf_dataset to capture the row index requested and return a
+        # sentinel tensor identifying that row.
+        sentinel_payload = torch.full((3, 8, 8), 0.42, dtype=torch.float32)
+        hf_calls: list[int] = []
+
+        class _HFStub:
+            def __getitem__(self, idx):
+                hf_calls.append(idx)
+                return {"camera0": sentinel_payload}
+
+        ds.hf_dataset = _HFStub()
+
+        def _fail_query_videos(self, query_ts, ep_idx):
+            raise AssertionError("_query_videos must not be called for image-dtype cameras")
+
+        monkeypatch.setattr(type(ds), "_query_videos", _fail_query_videos)
+
+        out = ds._load_subgoal_frames(1, 0)
+
+        assert hf_calls == [ep_start_abs + within_ep_subgoal], (
+            f"image-dtype subgoal lookup used the wrong row: got {hf_calls}, "
+            f"expected [{ep_start_abs + within_ep_subgoal}]"
+        )
+        assert "subgoal0_raw" in out
+        assert torch.equal(out["subgoal0_raw"], sentinel_payload)
 
 
 # Default collate tolerates a batch with mixed _is_pad flags.
