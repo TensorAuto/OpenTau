@@ -919,12 +919,45 @@ def pi06_untrained_policy():
     return PI06Policy.from_pretrained("TensorAuto/pi06-untrained")
 
 
+def _bilinear_resample_pos_embed(old_pos: torch.Tensor, target_num_patches: int) -> torch.Tensor:
+    """Bilinearly resample a (N_patches, dim) SigLIP position-embedding tensor
+    to a different patch count, preserving dtype. N must be a perfect square.
+
+    π0.6 runs the SigLIP tower at 448×448 (1024 patches), but `google/gemma-3-4b-pt`
+    was trained at 896×896 (4096 patches). The build script applies this exact
+    resampling before transferring weights, so the test reference applies it too
+    for byte-equality to hold.
+    """
+    old_n, dim = old_pos.shape
+    if old_n == target_num_patches:
+        return old_pos
+    old_grid = int(old_n**0.5)
+    new_grid = int(target_num_patches**0.5)
+    assert old_grid * old_grid == old_n, f"non-square SigLIP grid: {old_n}"
+    assert new_grid * new_grid == target_num_patches, f"non-square target: {target_num_patches}"
+    grid = old_pos.reshape(old_grid, old_grid, dim).permute(2, 0, 1).unsqueeze(0).float()
+    grid = torch.nn.functional.interpolate(
+        grid, size=(new_grid, new_grid), mode="bilinear", align_corners=False
+    )
+    return grid.squeeze(0).permute(1, 2, 0).reshape(target_num_patches, dim).to(old_pos.dtype)
+
+
+_SIGLIP_POS_EMBED_KEY = "model.vision_tower.vision_model.embeddings.position_embedding.weight"
+
+
 @pytest.fixture(scope="module")
-def gemma3_4b_pt_aligned():
-    """Reference `google/gemma-3-4b-pt` (bf16, CPU) with vocab extended to match
-    the policy. `ensure_loc_tokens` resizes the embedding/LM head with
-    bit-deterministic new rows under a fixed seed, so `load_state_dict(strict=True)`
-    is well-defined against the policy's `gemma3` submodule."""
+def gemma3_4b_pt_aligned_state_dict(pi06_untrained_policy):
+    """`google/gemma-3-4b-pt`'s state_dict, aligned to the policy:
+
+    - `ensure_loc_tokens` extends the embedding/LM head with the same 1024
+      `<locNNNN>` rows the policy carries (deterministic via fixed-seed RNG fork).
+    - The SigLIP `position_embedding` is bilinearly resampled from the published
+      4096 patches (896×896) down to the policy's 1024 patches (448×448) — the
+      same operation the build script applies before saving the checkpoint.
+
+    Returns a `dict[str, Tensor]` rather than the model itself because the
+    resampled position embedding has a different shape than the original
+    `nn.Embedding` parameter — so we can't mutate the model in place."""
     from transformers import (
         AutoTokenizer,
         Gemma3ForConditionalGeneration,  # noqa: I100
@@ -935,7 +968,16 @@ def gemma3_4b_pt_aligned():
     model = Gemma3ForConditionalGeneration.from_pretrained("google/gemma-3-4b-pt", torch_dtype=torch.bfloat16)
     tok = AutoTokenizer.from_pretrained("google/gemma-3-4b-pt")
     ensure_loc_tokens(tok, model=model)
-    return model
+
+    state = model.state_dict()
+    pol_n_patches = pi06_untrained_policy.model.gemma3_with_expert.gemma3.state_dict()[
+        _SIGLIP_POS_EMBED_KEY
+    ].shape[0]
+    state[_SIGLIP_POS_EMBED_KEY] = _bilinear_resample_pos_embed(
+        state[_SIGLIP_POS_EMBED_KEY], target_num_patches=pol_n_patches
+    )
+    del model
+    return state
 
 
 def _diff_state_dicts_against_reference(
@@ -996,15 +1038,14 @@ def test_pi06_untrained_loads_with_no_missing_or_unexpected_keys(pi06_untrained_
 
 @pytest.mark.gpu
 @pytest.mark.slow
-def test_pi06_untrained_vlm_matches_gemma3_4b_pt(pi06_untrained_policy, gemma3_4b_pt_aligned):
+def test_pi06_untrained_vlm_matches_gemma3_4b_pt(pi06_untrained_policy, gemma3_4b_pt_aligned_state_dict):
     """Gemma 3 text tower + multimodal projector inside the published checkpoint
     are byte-identical to `google/gemma-3-4b-pt` (vision tower checked separately
     in `test_pi06_untrained_siglip_matches_gemma3_4b_pt`)."""
     pol_state = pi06_untrained_policy.model.gemma3_with_expert.gemma3.state_dict()
-    ref_state = gemma3_4b_pt_aligned.state_dict()
 
     checked, mismatches = _diff_state_dicts_against_reference(
-        pol_state, ref_state, name_filter=lambda name: "vision_tower" not in name
+        pol_state, gemma3_4b_pt_aligned_state_dict, name_filter=lambda name: "vision_tower" not in name
     )
     assert checked > 0, "Sanity: should have compared at least one VLM (non-vision) param"
     assert not mismatches, "VLM (Gemma 3 text + projector) mismatches:\n" + "\n".join(mismatches[:20])
@@ -1012,14 +1053,16 @@ def test_pi06_untrained_vlm_matches_gemma3_4b_pt(pi06_untrained_policy, gemma3_4
 
 @pytest.mark.gpu
 @pytest.mark.slow
-def test_pi06_untrained_siglip_matches_gemma3_4b_pt(pi06_untrained_policy, gemma3_4b_pt_aligned):
+def test_pi06_untrained_siglip_matches_gemma3_4b_pt(pi06_untrained_policy, gemma3_4b_pt_aligned_state_dict):
     """SigLIP vision tower inside the published checkpoint is byte-identical to
-    the vision tower bundled in `google/gemma-3-4b-pt`."""
+    the vision tower bundled in `google/gemma-3-4b-pt`, modulo a deterministic
+    bilinear resample of `position_embedding` from 4096 (896×896 published) to
+    1024 (448×448 π0.6) patches — the build script applies the same resample,
+    so byte-equality holds."""
     pol_state = pi06_untrained_policy.model.gemma3_with_expert.gemma3.state_dict()
-    ref_state = gemma3_4b_pt_aligned.state_dict()
 
     checked, mismatches = _diff_state_dicts_against_reference(
-        pol_state, ref_state, name_filter=lambda name: "vision_tower" in name
+        pol_state, gemma3_4b_pt_aligned_state_dict, name_filter=lambda name: "vision_tower" in name
     )
     assert checked > 0, "Sanity: should have compared at least one SigLIP param"
     assert not mismatches, "SigLIP vision tower mismatches:\n" + "\n".join(mismatches[:20])
