@@ -594,6 +594,10 @@ def test_pi06_loc_tokens_extend_vocab_and_resize_embeddings(lerobot_dataset_meta
 
     policy = PI06Policy(config, dataset_stats=dataset_stats)
 
+    # PI06Policy and PI06FlowMatching share a single tokenizer instance so
+    # the outer encodes index the inner model's resized embedding correctly
+    # by construction (no risk of revision drift between two loads).
+    assert policy.language_tokenizer is policy.model.language_tokenizer
     inner_tok = policy.model.language_tokenizer
     assert len(inner_tok) == bare_tok_size + 1024, (
         f"Expected vocab size {bare_tok_size + 1024} after extension, got {len(inner_tok)}"

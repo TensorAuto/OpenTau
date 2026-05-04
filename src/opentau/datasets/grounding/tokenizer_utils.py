@@ -40,9 +40,19 @@ from __future__ import annotations
 
 import logging
 
+import torch
 from transformers.tokenization_utils_base import AddedToken
 
 LOC_TOKENS: tuple[str, ...] = tuple(f"<loc{i:04d}>" for i in range(1024))
+
+# Fixed seed used to initialize the new `<locNNNN>` embedding rows on
+# Gemma 3. Hardcoded (not a tunable) so policy construction is bit-stable
+# regardless of when in setup `ensure_loc_tokens` fires. CLAUDE.md hard
+# rule #3 (deterministic seeded reruns of the training loop) depends on
+# this — if the resize were to consume the active RNG, two seeded runs
+# could diverge purely from where the helper is called, even though the
+# loop seed is identical.
+_LOC_EMBEDDING_INIT_SEED: int = 0x10CC0DE
 
 _logger = logging.getLogger(__name__)
 
@@ -57,6 +67,15 @@ def ensure_loc_tokens(tokenizer, model=None) -> int:
     1024 strings are appended as new IDs, and the model's embedding table
     and tied LM head are resized via ``model.resize_token_embeddings`` when
     a model handle is supplied.
+
+    The embedding resize is wrapped in a snapshot/restore of the global torch
+    RNG (CPU + all visible CUDA devices) and re-seeded with a fixed constant
+    inside that block. This guarantees the 1024 new rows are bit-identical
+    across runs regardless of when in construction the helper is called, and
+    leaves the outer RNG state untouched so downstream consumers (the loop
+    seed, dataset shuffler, dropout, etc.) are not perturbed. Without this,
+    construction-time embedding init would couple to the active RNG and
+    silently violate CLAUDE.md hard rule #3 (deterministic seeded reruns).
 
     Safe to call multiple times — once the strings are registered as added
     tokens, subsequent calls neither grow the vocab nor resize.
@@ -82,7 +101,15 @@ def ensure_loc_tokens(tokenizer, model=None) -> int:
     n_new_ids = len(tokenizer) - initial_len
 
     if n_new_ids > 0 and model is not None:
-        model.resize_token_embeddings(len(tokenizer))
+        # Fork RNG so the resize's random init does not consume entropy from
+        # the caller's RNG stream and is reproducible across runs. We fork
+        # CPU + every visible CUDA device; the seed inside the fork is fixed.
+        cuda_devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
+        with torch.random.fork_rng(devices=cuda_devices, enabled=True):
+            torch.manual_seed(_LOC_EMBEDDING_INIT_SEED)
+            if cuda_devices:
+                torch.cuda.manual_seed_all(_LOC_EMBEDDING_INIT_SEED)
+            model.resize_token_embeddings(len(tokenizer))
 
     if n_new_ids > 0:
         _logger.info(

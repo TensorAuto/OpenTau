@@ -49,6 +49,11 @@ MAX_BIN = NUM_BINS - 1
 
 _LOC_TOKEN_RE = re.compile(r"<loc(\d{4})>")
 
+# Segment separator the encoder emits between adjacent box/point entries
+# (e.g. ``"<...> dog ; <...> cat"``). Decoders split on this so that a
+# malformed segment cannot misalign every subsequent one.
+SEGMENT_SEPARATOR = ";"
+
 
 def _quantize(coord: float, extent: float) -> int:
     """Map a single pixel coordinate to a `[0, 1023]` bin index.
@@ -117,22 +122,28 @@ def point_to_loc_tokens(x: float, y: float, img_w: int, img_h: int) -> str:
 def loc_tokens_to_xyxy(s: str, img_w: int, img_h: int) -> list[tuple[float, float, float, float]]:
     """Parse a string of loc tokens into `(x_min, y_min, x_max, y_max)` pixel boxes.
 
-    Tolerant: any segment that does not contain a multiple of four loc tokens
-    is dropped silently. Garbage strings or partial decodes return ``[]``.
+    Tolerant and segment-aware: the input is split on the encoder's segment
+    separator (``;``), and each segment must contribute exactly four loc
+    tokens to yield a box. A segment with any other count (0, 1, 2, 3, 5,
+    ...) is dropped silently — its tokens do NOT spill into the next
+    segment, so a single malformed box cannot misalign every subsequent one.
+    Garbage strings or partial decodes return ``[]``.
 
     Args:
         s: A string that may contain `<locNNNN>` tokens, e.g. a decoded
-            response. Non-loc text is ignored.
+            response. Non-loc text within a segment is ignored.
         img_w: Original image width in pixels.
         img_h: Original image height in pixels.
 
     Returns:
         A list of `(x_min, y_min, x_max, y_max)` tuples in pixel coordinates.
     """
-    bins = [int(m) for m in _LOC_TOKEN_RE.findall(s)]
     boxes: list[tuple[float, float, float, float]] = []
-    for i in range(0, len(bins) - 3, 4):
-        y_min_b, x_min_b, y_max_b, x_max_b = bins[i : i + 4]
+    for segment in s.split(SEGMENT_SEPARATOR):
+        bins = [int(m) for m in _LOC_TOKEN_RE.findall(segment)]
+        if len(bins) != 4:
+            continue
+        y_min_b, x_min_b, y_max_b, x_max_b = bins
         boxes.append(
             (
                 _dequantize(x_min_b, img_w),
@@ -147,12 +158,17 @@ def loc_tokens_to_xyxy(s: str, img_w: int, img_h: int) -> list[tuple[float, floa
 def loc_tokens_to_points(s: str, img_w: int, img_h: int) -> list[tuple[float, float]]:
     """Parse a string of loc tokens into `(x, y)` pixel points.
 
-    Pairs of loc tokens are decoded as `(y, x)` per the PaliGemma convention
-    and returned as `(x, y)`. Lone trailing tokens are dropped.
+    Tolerant and segment-aware in the same sense as `loc_tokens_to_xyxy`:
+    the input is split on ``;``, and each segment must contribute exactly
+    two loc tokens (in `(y, x)` order per the PaliGemma convention) to
+    yield a point. Segments with any other count are dropped — a malformed
+    segment cannot shift later ones.
     """
-    bins = [int(m) for m in _LOC_TOKEN_RE.findall(s)]
     points: list[tuple[float, float]] = []
-    for i in range(0, len(bins) - 1, 2):
-        y_b, x_b = bins[i : i + 2]
+    for segment in s.split(SEGMENT_SEPARATOR):
+        bins = [int(m) for m in _LOC_TOKEN_RE.findall(segment)]
+        if len(bins) != 2:
+            continue
+        y_b, x_b = bins
         points.append((_dequantize(x_b, img_w), _dequantize(y_b, img_h)))
     return points

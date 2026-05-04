@@ -112,17 +112,56 @@ def test_garbage_input_returns_empty() -> None:
     assert loc_tokens_to_points("garbage with no tokens", 100, 100) == []
 
 
-def test_partial_token_count_drops_orphan_pairs() -> None:
-    """A response containing 6 loc tokens decodes to 1 box (4 tokens consumed).
+def test_segment_with_non_four_token_count_is_dropped() -> None:
+    """A single segment with anything other than 4 loc tokens yields 0 boxes.
 
-    The trailing pair is silently dropped — this matches the codec's tolerant
-    contract documented in `loc_tokens_to_xyxy`'s docstring.
+    The decoder is segment-aware (splits on ``;``); a malformed segment is
+    dropped silently rather than spilling its tokens into a neighbour. Six
+    loc tokens in one segment is malformed and produces 0 boxes — not 1
+    box plus two orphans, which would be the buggy behaviour of a global
+    pairing scheme.
     """
     img_w, img_h = 1024, 1024
-    # Six loc tokens — one full box plus two orphans.
     response = "<loc0010><loc0020><loc0030><loc0040><loc0500><loc0600>"
     boxes = loc_tokens_to_xyxy(response, img_w, img_h)
-    assert len(boxes) == 1
+    assert boxes == []
+
+
+def test_malformed_segment_does_not_misalign_following_segments() -> None:
+    """Regression: a 5-loc-token segment must NOT shift the boundary of the next one.
+
+    If the parser collected loc tokens globally and grouped them in fours,
+    the second box would absorb the orphan from the first segment and end
+    up encoding completely wrong coordinates — silent box-to-label
+    misattribution at eval time. Segment-aware parsing drops the bad
+    segment and decodes the next one cleanly.
+    """
+    img_w, img_h = 1024, 1024
+    good_box = xyxy_to_loc_tokens((100.0, 200.0, 300.0, 400.0), img_w, img_h)
+    # 5 loc tokens in the first segment — malformed.
+    bad_segment = "<loc0010><loc0020><loc0030><loc0040><loc0500> dog"
+    response = f"{bad_segment} ; {good_box} cat"
+
+    decoded = loc_tokens_to_xyxy(response, img_w, img_h)
+    assert len(decoded) == 1
+    x_min, y_min, x_max, y_max = decoded[0]
+    assert abs(x_min - 100.0) <= _tol(img_w)
+    assert abs(y_min - 200.0) <= _tol(img_h)
+    assert abs(x_max - 300.0) <= _tol(img_w)
+    assert abs(y_max - 400.0) <= _tol(img_h)
+
+
+def test_points_segment_aware() -> None:
+    """`loc_tokens_to_points` is segment-aware — a 3-token bad segment doesn't shift the next."""
+    img_w, img_h = 1024, 1024
+    good_point = point_to_loc_tokens(500.0, 500.0, img_w, img_h)
+    response = f"<loc0010><loc0020><loc0030> noise ; {good_point} target"
+
+    decoded = loc_tokens_to_points(response, img_w, img_h)
+    assert len(decoded) == 1
+    x, y = decoded[0]
+    assert abs(x - 500.0) <= _tol(img_w)
+    assert abs(y - 500.0) <= _tol(img_h)
 
 
 def test_codec_uses_original_image_dims_not_post_resize() -> None:

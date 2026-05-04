@@ -135,3 +135,52 @@ def test_resize_does_not_fire_on_idempotent_call() -> None:
 
     assert n_added == 0
     assert fake.resize_calls == []
+
+
+@pytest.mark.slow
+def test_ensure_loc_tokens_does_not_perturb_caller_rng() -> None:
+    """The resize must not consume entropy from the caller's RNG stream.
+
+    Two `torch.randn` draws bracketing `ensure_loc_tokens(..., model=...)`
+    must match what the same outer RNG produces without the helper running
+    in between. Otherwise the `model.resize_token_embeddings` random init
+    would couple construction order to RNG state and silently violate
+    CLAUDE.md hard rule #3 (deterministic seeded reruns).
+    """
+    tok = _fresh_gemma3_tokenizer()
+    fake = _FakeResizableModel(initial_vocab=len(tok))
+
+    torch.manual_seed(123)
+    expected = torch.randn(8)
+
+    torch.manual_seed(123)
+    ensure_loc_tokens(tok, model=fake)
+    actual = torch.randn(8)
+
+    assert torch.equal(expected, actual), (
+        "ensure_loc_tokens leaked the resize's RNG draws into the caller's stream"
+    )
+
+
+@pytest.mark.slow
+def test_ensure_loc_tokens_resize_is_seed_independent() -> None:
+    """The resize seeds deterministically, so two calls under different
+    outer RNG states must produce bit-identical new embedding rows.
+    """
+    initial_vocab = len(_fresh_gemma3_tokenizer())
+
+    tok_a = _fresh_gemma3_tokenizer()
+    fake_a = _FakeResizableModel(initial_vocab=initial_vocab, hidden=16)
+    torch.manual_seed(7)
+    ensure_loc_tokens(tok_a, model=fake_a)
+
+    tok_b = _fresh_gemma3_tokenizer()
+    fake_b = _FakeResizableModel(initial_vocab=initial_vocab, hidden=16)
+    torch.manual_seed(99)
+    ensure_loc_tokens(tok_b, model=fake_b)
+
+    new_rows_a = fake_a.embed.weight[initial_vocab:]
+    new_rows_b = fake_b.embed.weight[initial_vocab:]
+    assert torch.equal(new_rows_a, new_rows_b), (
+        "new <locNNNN> embedding rows differ between runs — RNG snapshot/restore failed"
+    )

@@ -591,11 +591,14 @@ def test_pi05_loc_tokens_in_response_produce_finite_loss(pi05_training_config, l
     config = pi05_training_config.policy
     policy = PI05Policy(config, dataset_stats=lerobot_dataset_metadata.stats)
 
-    # The promotion makes <locNNNN> a single-token match on both tokenizer
-    # instances — the policy-level one and the inner FlowMatching one.
-    for tok in (policy.language_tokenizer, policy.model.language_tokenizer):
-        assert len(tok.encode("<loc0042>", add_special_tokens=False)) == 1
-        assert len(tok.encode("<loc1023>", add_special_tokens=False)) == 1
+    # PI05Policy and PI05FlowMatching share a single tokenizer instance so
+    # token IDs cannot drift between the two layers.
+    assert policy.language_tokenizer is policy.model.language_tokenizer
+    # The promotion makes <locNNNN> a single-token match on the (shared)
+    # tokenizer.
+    tok = policy.language_tokenizer
+    assert len(tok.encode("<loc0042>", add_special_tokens=False)) == 1
+    assert len(tok.encode("<loc1023>", add_special_tokens=False)) == 1
 
     batch_size = 1
     batch = {
