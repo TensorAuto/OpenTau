@@ -574,9 +574,9 @@ class TestPI07LowLevelPlannerRegression:
 
         params = inspect.signature(PI07LowLevelPlannerFlowMatching.embed_prefix).parameters
         for name in ("response_tokens", "response_masks", "metadata_tokens", "metadata_masks"):
-            assert (
-                params[name].default is inspect.Parameter.empty
-            ), f"{name} should be a required parameter (no default), got default={params[name].default}"
+            assert params[name].default is inspect.Parameter.empty, (
+                f"{name} should be a required parameter (no default), got default={params[name].default}"
+            )
 
 
 class TestPI07LowLevelPlannerEmbedPrefixNoOptionals:
@@ -713,9 +713,9 @@ class TestPI07LowLevelPlannerEmbedPrefixNoOptionals:
         assert pad_masks.shape == (m["bsize"], expected_len)
         assert att_masks.shape == pad_masks.shape
         # Whole prefix is bidirectional: every att_mask entry must be 0/False.
-        assert not bool(
-            att_masks.any()
-        ), "no-optional prefix should contain only bidirectional tokens (att_masks all 0)"
+        assert not bool(att_masks.any()), (
+            "no-optional prefix should contain only bidirectional tokens (att_masks all 0)"
+        )
 
     def test_action_indicator_is_per_token_causal(self):
         """``Action: `` indicator's att_masks is ``[1]*N`` (per-token causal), matching pi05."""
@@ -727,9 +727,9 @@ class TestPI07LowLevelPlannerEmbedPrefixNoOptionals:
         )
         indicator_hi = indicator_lo + m["action_lead"]
         indicator_slice = att_masks[0, indicator_lo:indicator_hi]
-        assert torch.equal(
-            indicator_slice, torch.ones(m["action_lead"], dtype=torch.bool)
-        ), f"Expected Action: indicator att_masks to be all-1 (per-token causal), got {indicator_slice}"
+        assert torch.equal(indicator_slice, torch.ones(m["action_lead"], dtype=torch.bool)), (
+            f"Expected Action: indicator att_masks to be all-1 (per-token causal), got {indicator_slice}"
+        )
 
     def test_byte_equivalent_layout_requires_n_obs_steps_one(self):
         """Document that byte-equivalence with pi05 hinges on ``n_obs_steps == 1``.
@@ -779,9 +779,9 @@ class TestPI07LowLevelPlannerEmbedPrefixNoOptionals:
 
         # video + lang + "State: " + state(1) + ", " + response + ":\n"
         expected_len = 6 + prompt_len + 3 + 1 + 1 + response_len + 1
-        assert (
-            pad_masks.shape[1] == expected_len
-        ), f"True-branch length mismatch: got {pad_masks.shape[1]}, expected {expected_len}"
+        assert pad_masks.shape[1] == expected_len, (
+            f"True-branch length mismatch: got {pad_masks.shape[1]}, expected {expected_len}"
+        )
 
     def test_mixed_batch_subgoal_pad_masks_follow_sample_has_subgoal(self):
         """In a mixed batch, the ``Subgoal: `` header / image / footer pad_masks
@@ -840,9 +840,9 @@ class TestPI07LowLevelPlannerEmbedPrefixNoOptionals:
         sg_footer_hi = sg_footer_lo + len(self._COMMA_IDS)
 
         # Sample 0 (has subgoal): every position in the subgoal block must be 1.
-        assert torch.all(
-            pad_masks[0, sg_header_lo:sg_footer_hi]
-        ), "sample 0 has a real subgoal — header/image/footer pad_masks must be all True"
+        assert torch.all(pad_masks[0, sg_header_lo:sg_footer_hi]), (
+            "sample 0 has a real subgoal — header/image/footer pad_masks must be all True"
+        )
         # Sample 1 (no subgoal): every position in the subgoal block must be 0.
         assert not torch.any(pad_masks[1, sg_header_lo:sg_footer_hi]), (
             "sample 1 is pad-only — header/image/footer pad_masks must be all False so the "
@@ -854,9 +854,9 @@ class TestPI07LowLevelPlannerEmbedPrefixNoOptionals:
         # block on row 0, position sg_header_lo — verify that scalar shape stays put.
         assert att_masks.shape == (bsize, pad_masks.shape[1])
         assert bool(att_masks[0, sg_header_lo]) is True, "header opens a new causal block"
-        assert torch.equal(
-            att_masks[0], att_masks[1]
-        ), "att_masks is broadcast — both samples must see the same 1-D pattern"
+        assert torch.equal(att_masks[0], att_masks[1]), (
+            "att_masks is broadcast — both samples must see the same 1-D pattern"
+        )
 
     def test_no_optionals_num_cross_att_tokens_matches_pi05_arithmetic(self):
         """Pin the no-optionals ``num_cross_att_tokens`` / ``prefix_offsets`` arithmetic.
@@ -907,11 +907,11 @@ class TestPI07LowLevelPlannerEmbedPrefixNoOptionals:
         action_lead_lo = num_cross
         action_lead_hi = action_lead_lo + m["action_lead"]
         # The "Action: " indicator slot is non-padded (always-on indicator tokens).
-        assert torch.all(
-            pad_masks[:, action_lead_lo:action_lead_hi]
-        ), "the slice immediately past num_cross must be the all-real Action: indicator"
+        assert torch.all(pad_masks[:, action_lead_lo:action_lead_hi]), (
+            "the slice immediately past num_cross must be the all-real Action: indicator"
+        )
         # ``prefix_offsets`` (per ``forward()``): sum the prefix pad_masks excluding indicator + discrete.
         prefix_offsets = pad_masks[:, : -(model._action_indicator_len + discrete_len)].sum(dim=-1)
-        assert torch.equal(
-            prefix_offsets, cross_slice.sum(dim=-1)
-        ), "prefix_offsets and num_cross-derived slice must agree on the cross-att length per sample"
+        assert torch.equal(prefix_offsets, cross_slice.sum(dim=-1)), (
+            "prefix_offsets and num_cross-derived slice must agree on the cross-att length per sample"
+        )
