@@ -233,10 +233,20 @@ class TestResizeAndCenterCrop:
         out = _resize_and_center_crop(img, 448)
         assert out.size == (448, 448)
 
-    def test_smaller_than_target_is_upscaled(self):
+    def test_smaller_than_target_passes_through(self):
         img = Image.new("RGB", (224, 224), color="red")
         out = _resize_and_center_crop(img, 448)
-        assert out.size == (448, 448)
+        assert out.size == (224, 224)
+
+    def test_non_square_smaller_than_target_passes_through(self):
+        img = Image.new("RGB", (300, 400), color="red")
+        out = _resize_and_center_crop(img, 448)
+        assert out.size == (300, 400)
+
+    def test_short_side_at_target_passes_through_without_cropping(self):
+        img = Image.new("RGB", (448, 600), color="red")
+        out = _resize_and_center_crop(img, 448)
+        assert out.size == (448, 600)
 
     def test_arbitrary_target_size(self):
         img = Image.new("RGB", (1280, 720), color="red")

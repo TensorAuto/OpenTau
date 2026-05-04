@@ -29,10 +29,13 @@ Gemini Robotics-ER family — as the annotator. For every episode the script:
    without a ``camera0`` mapping fall back to the first ``dtype=='video'``
    feature in ``meta/info.json``; datasets whose ``camera0`` resolves to a
    non-video feature are skipped (not a LeRobot video dataset).
-2. Resizes each sampled frame to a ``--target-size`` × ``--target-size``
-   square (default 448 × 448) by scaling the shorter side to the target
-   and center-cropping, then JPEG-encodes the result. This matches the
-   standard VLM preprocessing pipeline and reduces image token cost.
+2. Downsamples each sampled frame to a ``--target-size`` × ``--target-size``
+   square (default 448 × 448) only when its shorter side already exceeds
+   the target — by scaling the shorter side down to the target and
+   center-cropping. Frames whose shorter side is already ``<= target-size``
+   are left at their native resolution (we never upsample, since that
+   inflates image-token cost without adding information). The result is
+   then JPEG-encoded.
 3. Sends all sampled frames together with their timestamps to the configured
    model (Anthropic ``claude-opus-4-7`` by default; Google
    ``gemini-robotics-er-1.6-preview`` is also supported via ``--model``) and
@@ -151,21 +154,23 @@ Return ONLY a valid JSON array. Example:
 
 
 def _resize_and_center_crop(img: Image.Image, target_size: int) -> Image.Image:
-    """Scale the shorter side to ``target_size`` and center-crop to a square.
+    """Downsample to ``target_size × target_size`` only when the input is larger.
 
-    Mirrors the standard VLM preprocessing pipeline: aspect-preserving resize
-    so the shorter side equals ``target_size``, followed by a center crop to
-    ``target_size × target_size``. Already-square inputs at the right
-    resolution pass through untouched.
+    If the shorter side exceeds ``target_size``, do an aspect-preserving resize
+    so the shorter side equals ``target_size`` and then center-crop to a
+    ``target_size × target_size`` square. If the shorter side is already
+    ``<= target_size`` the image is returned untouched — we never upsample,
+    because that just inflates image-token cost without adding information.
     """
     w, h = img.size
     short = min(w, h)
-    if short != target_size:
-        scale = target_size / short
-        new_w = max(target_size, round(w * scale))
-        new_h = max(target_size, round(h * scale))
-        img = img.resize((new_w, new_h), Image.LANCZOS)
-        w, h = img.size
+    if short <= target_size:
+        return img
+    scale = target_size / short
+    new_w = max(target_size, round(w * scale))
+    new_h = max(target_size, round(h * scale))
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+    w, h = img.size
     if w == target_size and h == target_size:
         return img
     left = (w - target_size) // 2
@@ -199,12 +204,14 @@ def _extract_sampled_frames(
 ) -> tuple[list[Image.Image], list[float]]:
     """Decode the video and return (images, timestamps) at sample_fps.
 
-    Each sampled frame is resized so its shorter side equals ``target_size``
-    and then center-cropped to a ``target_size × target_size`` square. If the
-    number of frames sampled at ``sample_fps`` exceeds ``max_frames``, the
-    captured frames are uniformly subsampled down to ``max_frames`` so the
-    request stays within the Anthropic Messages API's 100-image limit (Gemini
-    accepts more, but the same cap keeps cost/latency bounded for both).
+    Frames whose shorter side already exceeds ``target_size`` are downsampled
+    so the shorter side equals ``target_size`` and then center-cropped to a
+    ``target_size × target_size`` square; smaller frames are passed through
+    unchanged so we never upsample. If the number of frames sampled at
+    ``sample_fps`` exceeds ``max_frames``, the captured frames are uniformly
+    subsampled down to ``max_frames`` so the request stays within the
+    Anthropic Messages API's 100-image limit (Gemini accepts more, but the
+    same cap keeps cost/latency bounded for both).
     """
     with av.open(str(video_path)) as container:
         stream = container.streams.video[0]
@@ -736,8 +743,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--target-size",
         type=int,
         default=448,
-        help="Resize each frame so its shorter side is this many pixels, then center-crop "
-        "to a target_size × target_size square before encoding as JPEG (default: 448).",
+        help="Downsample each frame whose shorter side exceeds this many pixels so its "
+        "shorter side equals target_size, then center-crop to a target_size × target_size "
+        "square before encoding as JPEG. Frames already at or below target_size pass "
+        "through unchanged — this only downsamples, it never upsamples (default: 448).",
     )
     p.add_argument(
         "--subtask-path-template",
