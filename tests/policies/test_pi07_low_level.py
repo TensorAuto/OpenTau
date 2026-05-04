@@ -146,7 +146,7 @@ SUBGOAL_TOKENS = NUM_SUBGOAL_CAMERAS * SIGLIP_TOKENS_PER_SUBGOAL  # 256
 INFER_STATE_TOKENS = N_OBS_STEPS
 
 
-class TestPI07LowLevelPlannerIntegration:
+class TestPI07LowLevelIntegration:
     """Integration tests for the PI07 low-level planner pipeline."""
 
     @staticmethod
@@ -732,7 +732,7 @@ class TestPI07LowLevelPlannerIntegration:
         )
 
 
-class TestPI07LowLevelPlannerRegression:
+class TestPI07LowLevelRegression:
     """GPU regression tests pinning the low-level planner signature/dtype fixes.
 
     Covers the changes made to ``embed_prefix``, ``embed_suffix``,
@@ -741,7 +741,7 @@ class TestPI07LowLevelPlannerRegression:
 
     @staticmethod
     def _make_policy(lerobot_dataset_metadata) -> PI07LowLevelPlannerPolicy:
-        config = TestPI07LowLevelPlannerIntegration._make_config()
+        config = TestPI07LowLevelIntegration._make_config()
         policy = PI07LowLevelPlannerPolicy(config, dataset_stats=lerobot_dataset_metadata.stats)
         policy.to(dtype=torch.bfloat16, device="cuda")
         return policy

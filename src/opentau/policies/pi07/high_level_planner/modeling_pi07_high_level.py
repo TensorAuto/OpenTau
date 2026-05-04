@@ -737,6 +737,7 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
             max_length=self.config.metadata_max_length,
             return_tensors="pt",
             truncation=True,
+            add_special_tokens=False,
         )
         metadata_tokens = tokenized_metadata["input_ids"].to(device=device)
         metadata_masks = tokenized_metadata["attention_mask"].to(device=device, dtype=torch.bool)

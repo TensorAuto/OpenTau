@@ -744,8 +744,11 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         """Apply preprocessing to the video inputs.
 
         Each camera key now contains a video tensor of shape (B, T, C, H, W).
-        Frames are resized to 224x224 with padding. ImageNet normalization is
-        assumed to be already applied by the dataset loader.
+        Frames are resized to 224x224 with padding. The dataset loader is
+        expected to yield raw ``[0, 1]`` floats — the SpaceTime SigLIP encoder
+        rescales to ``[-1, 1]`` internally (see
+        ``video_encoder.SpaceTimeSiglipVideoEncoder.forward``), so callers
+        should NOT pre-apply ImageNet normalization.
 
         Args:
             batch: Batch of data containing video tensors.
@@ -876,8 +879,8 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         ``camera{k}`` the corresponding batch key is ``subgoal{k}`` (the
         naming convention used by ``LeRobotDataset._emit_optional_keys``).
         If no ``subgoal{k}`` keys are present, a warning is logged and
-        zero-filled images with masks all ``False`` are returned (no subgoal
-        signal), matching a fully padded subgoal batch.
+        ``([], [])`` is returned; downstream gating in ``embed_prefix``
+        short-circuits the subgoal branch when the lists are empty.
 
         Resizes each subgoal image to 224×224 with aspect-ratio padding and
         converts the pixel range from ``[0, 1]`` to ``[-1, 1]`` as expected
