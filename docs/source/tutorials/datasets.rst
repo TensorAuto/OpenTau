@@ -82,8 +82,10 @@ Automatically annotating subtasks with a VLM
 ---------------------------------------------
 
 ``annotate_subtasks.py`` generates per-frame subtask labels for every episode in a dataset
-mixture automatically, using ``claude-opus-4-7`` as a vision-language model.  It is the
-recommended way to produce the ``response`` column required by policies such as π0.5.
+mixture automatically, using a vision-language model.  Anthropic's ``claude-opus-4-7`` is
+the default; Google's Gemini family — including ``gemini-robotics-er-1.6-preview`` — is
+also supported via ``--model``.  This is the recommended way to produce the ``response``
+column required by policies such as π0.5.
 
 How it works
 ^^^^^^^^^^^^
@@ -94,7 +96,7 @@ For each episode the script:
    giving a 30-50× reduction over the raw frame rate.
 2. Resizes each frame to 640 px wide (configurable via ``--target-width``) before JPEG
    encoding, keeping image-token costs low.
-3. Sends all sampled frames with their timestamps to ``claude-opus-4-7`` in a **single API
+3. Sends all sampled frames with their timestamps to the selected model in a **single API
    call** and asks it to identify subtask transition times.
 4. Saves the returned boundaries as a per-episode JSON file under
    ``{root}/subtasks/episode_{N:06d}.json``.
@@ -108,11 +110,15 @@ after a crash.
 Prerequisites
 ^^^^^^^^^^^^^
 
-Set your Anthropic API key:
+Set the API key for the provider you intend to use:
 
 .. code-block:: bash
 
+    # Anthropic (default)
     export ANTHROPIC_API_KEY="sk-ant-..."
+
+    # Gemini (when using --model gemini-* or --model robotics-er-*)
+    export GEMINI_API_KEY="..."   # or GOOGLE_API_KEY
 
 Datasets with a ``root`` field are processed directly from disk.  Hub-only datasets (no
 ``root``) are automatically downloaded to
@@ -163,6 +169,14 @@ For a dry run that annotates only 1 episode per dataset and skips the parquet up
         --max-episodes-per-dataset 1 \
         --no-write-response-column
 
+To annotate with Gemini Robotics-ER 1.6 instead of Claude:
+
+.. code-block:: bash
+
+    GEMINI_API_KEY=... python src/opentau/scripts/annotate_subtasks.py \
+        --config-path configs/examples/train_mixture_config.json \
+        --model gemini-robotics-er-1.6-preview
+
 Full list of flags:
 
 .. list-table::
@@ -186,7 +200,10 @@ Full list of flags:
      - Template for per-episode subtask JSON paths, relative to the dataset root.
    * - ``--model``
      - ``claude-opus-4-7``
-     - Anthropic model ID to use.
+     - Model ID to use.  Anthropic IDs (e.g. ``claude-opus-4-7``) go through
+       ``ANTHROPIC_API_KEY``; IDs starting with ``gemini`` or ``robotics-er``
+       (e.g. ``gemini-robotics-er-1.6-preview``) go through ``GEMINI_API_KEY``
+       (or ``GOOGLE_API_KEY``) via ``google-genai``.
    * - ``--write-response-column`` / ``--no-write-response-column``
      - enabled
      - Whether to expand subtask boundaries into a ``response`` parquet column after annotation.
@@ -221,7 +238,8 @@ enabled (the default), the script also:
 API cost estimate
 ^^^^^^^^^^^^^^^^^
 
-At 1 fps sampling with frames resized to 640 px wide (≈ 410 image tokens each):
+At 1 fps sampling with frames resized to 640 px wide (≈ 410 image tokens each), using
+``claude-opus-4-7``:
 
 .. list-table::
    :header-rows: 1
