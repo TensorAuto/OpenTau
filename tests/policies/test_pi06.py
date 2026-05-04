@@ -1016,20 +1016,47 @@ def _diff_state_dicts_against_reference(
 @pytest.mark.gpu
 @pytest.mark.slow
 def test_pi06_untrained_loads_with_no_missing_or_unexpected_keys(pi06_untrained_policy):
-    """Published `model.safetensors` keys equal the policy's `state_dict()` keys
-    1:1. Catches both missed-on-save and missed-on-load regressions: the
-    standard `from_pretrained` loader uses `strict=False` and only logs the
-    diff, so without this we'd silently ship a checkpoint that, say, dropped
-    the action expert."""
+    """Every key in the loaded policy's `state_dict()` is either present in the
+    published `model.safetensors`, or shares storage with a key that is. The
+    second case covers Gemma 3's tied embed_tokens/lm_head, which
+    `save_model_as_safetensor` de-duplicates on save (only one name on disk;
+    both are populated at load time via the model's `_tie_weights()` hook).
+    No safetensors key may be unexpected.
+
+    Catches the regression we actually care about: a save flow that silently
+    drops a non-tied parameter (e.g. an action-expert layer) would surface
+    here because that parameter has its own data_ptr and so won't be in any
+    tied group."""
     from huggingface_hub import hf_hub_download
     from safetensors.torch import load_file
 
     ckpt_path = hf_hub_download("TensorAuto/pi06-untrained", "model.safetensors")
     saved_keys = set(load_file(ckpt_path).keys())
-    expected_keys = set(pi06_untrained_policy.state_dict().keys())
+    loaded_state = pi06_untrained_policy.state_dict()
+    expected_keys = set(loaded_state.keys())
 
-    missing = expected_keys - saved_keys
+    # Build groups of state_dict keys that share storage (tied weights).
+    ptr_to_names: dict[int, list[str]] = {}
+    for name, tensor in loaded_state.items():
+        ptr_to_names.setdefault(tensor.data_ptr(), []).append(name)
+    tied_groups = [names for names in ptr_to_names.values() if len(names) > 1]
+
+    # Each tied group must have exactly one representative on disk.
+    tied_group_violations = []
+    allowed_missing: set[str] = set()
+    for group in tied_groups:
+        on_disk = [n for n in group if n in saved_keys]
+        if len(on_disk) != 1:
+            tied_group_violations.append(
+                f"tied group {sorted(group)}: expected exactly 1 on disk, got {len(on_disk)}"
+            )
+        for n in group:
+            if n not in saved_keys:
+                allowed_missing.add(n)
+
+    missing = expected_keys - saved_keys - allowed_missing
     unexpected = saved_keys - expected_keys
+    assert not tied_group_violations, "\n".join(tied_group_violations)
     assert not missing and not unexpected, (
         f"missing in safetensors ({len(missing)}): {sorted(missing)[:10]}\n"
         f"unexpected in safetensors ({len(unexpected)}): {sorted(unexpected)[:10]}"
