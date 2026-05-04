@@ -1529,3 +1529,134 @@ class TestPrefixLayoutInferenceMatchesTraining:
         torch.testing.assert_close(embs_train[:, :infer_len], embs_infer)
         torch.testing.assert_close(pad_train[:, :infer_len], pad_infer)
         torch.testing.assert_close(att_train[:, :infer_len], att_infer)
+
+
+# `_build_history_batch` emits ``obs_history_is_pad`` so the encoder can use
+# real mid-episode history while still masking start-of-episode zero-fill.
+# Without this emit, the encoder's None-fallback masks ALL history at
+# inference (mid-episode regression flagged in the PR #253 review).
+
+
+class TestBuildHistoryBatchEmitsObsHistoryIsPad:
+    @staticmethod
+    def _make_policy_stub(*, n_obs_history: int, history_interval: int, image_keys: list[str]):
+        """Construct a partial PI07LowLevelPolicy that exposes only the
+        attrs ``_build_history_batch`` reads: ``config.{n_obs_history,
+        history_interval, obs_buffer_size, image_features}`` plus the deque
+        slots. Skips Gemma 3 init so the test stays CPU-cheap.
+        """
+        import types
+
+        from opentau.policies.pi07.low_level.modeling_pi07_low_level import (
+            PI07LowLevelPolicy,
+        )
+
+        policy = PI07LowLevelPolicy.__new__(PI07LowLevelPolicy)
+        buf_size = (n_obs_history - 1) * history_interval + 1
+        policy.config = types.SimpleNamespace(
+            n_obs_history=n_obs_history,
+            history_interval=history_interval,
+            obs_buffer_size=buf_size,
+            image_features=dict.fromkeys(image_keys),
+        )
+        policy._state_buffer = None
+        policy._obs_buffers = None
+        return policy
+
+    def _make_batch(self, image_keys: list[str], state_dim: int = 4) -> dict:
+        return {
+            "state": torch.zeros(1, state_dim),
+            **{k: torch.zeros(1, 3, 8, 8) for k in image_keys},
+        }
+
+    def test_first_step_marks_all_but_current_padded(self):
+        """At episode start, only the very first observation is in the
+        buffer; every other slot in the requested history was zero-filled.
+        Mask should be ``[True, ..., True, False]`` — the canonical case
+        the PR's Bug A fix protects against contamination from.
+        """
+        policy = self._make_policy_stub(n_obs_history=4, history_interval=1, image_keys=["camera0"])
+        out = policy._build_history_batch(self._make_batch(["camera0"]))
+
+        assert "obs_history_is_pad" in out
+        assert out["obs_history_is_pad"].shape == (1, 4)
+        assert out["obs_history_is_pad"].dtype == torch.bool
+        assert out["obs_history_is_pad"].tolist() == [[True, True, True, False]]
+
+    def test_buffer_full_emits_all_false(self):
+        """Once the buffer is full (after ``obs_buffer_size`` calls), every
+        slot maps to a real observation — mask is all-False. This is the
+        mid-episode case the previous PR regressed: with the None-fallback,
+        the encoder masked these real frames out as if they were padded.
+        """
+        policy = self._make_policy_stub(n_obs_history=4, history_interval=2, image_keys=["camera0"])
+        # obs_buffer_size = (4-1)*2 + 1 = 7. Need 7 calls to fill.
+        batch = self._make_batch(["camera0"])
+        for _ in range(7):
+            out = policy._build_history_batch(batch)
+        assert out["obs_history_is_pad"].tolist() == [[False, False, False, False]]
+
+    def test_partial_fill_marks_only_unfilled_slots(self):
+        """After ``k < obs_buffer_size`` calls, the leading ``T -
+        ceil(k / interval)`` slots are still virtual past-steps. With
+        ``n_obs_history=4, history_interval=2`` (buffer_size=7), after 4
+        calls the deque has 4 entries → ``missing = 3`` → slots with
+        ``i*interval - 3 < 0`` are padded: i=0 → -3 (T), i=1 → -1 (T),
+        i=2 → 1 (F), i=3 → 3 (F). So mask = [T, T, F, F].
+        """
+        policy = self._make_policy_stub(n_obs_history=4, history_interval=2, image_keys=["camera0"])
+        batch = self._make_batch(["camera0"])
+        for _ in range(4):
+            out = policy._build_history_batch(batch)
+        assert out["obs_history_is_pad"].tolist() == [[True, True, False, False]]
+
+    def test_mask_is_broadcast_over_batch(self):
+        """The buffer is shared across batch elements (every sample sees
+        the same buffer length at any given step), so the (B, T) mask is
+        the same across the batch dim. Verify by emitting from a B=3 batch.
+        """
+        policy = self._make_policy_stub(n_obs_history=4, history_interval=1, image_keys=["camera0"])
+        batch = {
+            "state": torch.zeros(3, 4),
+            "camera0": torch.zeros(3, 3, 8, 8),
+        }
+        out = policy._build_history_batch(batch)
+
+        assert out["obs_history_is_pad"].shape == (3, 4)
+        # Every batch element sees the same mask.
+        assert torch.all(out["obs_history_is_pad"] == out["obs_history_is_pad"][0:1])
+
+    def test_n_obs_history_one_emits_all_false(self):
+        """With ``n_obs_history=1`` the buffer always contains the current
+        frame — no historical slots exist, so the (B, 1) mask is False
+        from step 1. (In practice ``select_action`` skips
+        ``_build_history_batch`` entirely when ``n_obs_history <= 1``, so
+        this is just defending the function's own contract.)
+        """
+        policy = self._make_policy_stub(n_obs_history=1, history_interval=1, image_keys=["camera0"])
+        out = policy._build_history_batch(self._make_batch(["camera0"]))
+        assert out["obs_history_is_pad"].tolist() == [[False]]
+
+    def test_state_and_camera_padding_match_emitted_mask(self):
+        """The emitted mask must agree slot-for-slot with the actual
+        zero-padding pattern of state and camera tensors. State / camera
+        are zeroed where ``idx < 0``; the mask flags the same slots ``True``.
+        """
+        policy = self._make_policy_stub(n_obs_history=3, history_interval=1, image_keys=["camera0"])
+        # Inject a non-zero observation so we can detect zero-fill.
+        batch = {
+            "state": torch.full((1, 4), 7.0),
+            "camera0": torch.full((1, 3, 8, 8), 5.0),
+        }
+        out = policy._build_history_batch(batch)
+        # After one call: missing = 2; mask = [True, True, False].
+        is_pad = out["obs_history_is_pad"][0]  # (T,)
+        state = out["state"][0]  # (T, D)
+        cam = out["camera0"][0]  # (T, C, H, W)
+        for t, padded in enumerate(is_pad.tolist()):
+            if padded:
+                assert torch.all(state[t] == 0.0), f"state[{t}] not zero-filled"
+                assert torch.all(cam[t] == 0.0), f"camera[{t}] not zero-filled"
+            else:
+                assert torch.all(state[t] == 7.0), f"state[{t}] zero-filled but mask says real"
+                assert torch.all(cam[t] == 5.0), f"camera[{t}] zero-filled but mask says real"

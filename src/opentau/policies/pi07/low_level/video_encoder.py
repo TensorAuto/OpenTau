@@ -291,8 +291,10 @@ class SpaceTimeEncoderLayerWrapper(nn.Module):
         """hidden_states: (B*T, N, D) -> tuple starting with (B*T, N, D).
 
         Signature extends ``SiglipEncoderLayer.forward`` with an extra
-        ``temporal_attn_mask`` kwarg (ignored by vanilla layers via
-        ``SiglipEncoder``'s positional dispatch).
+        ``temporal_attn_mask`` kwarg. Vanilla ``SiglipEncoderLayer`` instances
+        never receive it: ``SpaceTimeSiglipVideoEncoder.forward`` dispatches
+        it only to ``SpaceTimeEncoderLayerWrapper`` instances via an
+        ``isinstance`` check, bypassing ``SiglipEncoder.forward`` entirely.
 
         Args:
             temporal_attn_mask: Optional ``(B*N, 1, T, T)`` additive float mask
@@ -506,8 +508,9 @@ class SpaceTimeSiglipVideoEncoder(nn.Module):
         # callers (e.g. the dataset's history_state_drop_prob augmentation)
         # set obs_history_is_pad to all-True; without this override, the
         # current frame would have no key to attend to and produce NaNs.
+        # `~obs_history_is_pad` allocates a fresh tensor, so the in-place
+        # write below does not reach the caller's `obs_history_is_pad`.
         key_valid = ~obs_history_is_pad  # (B, T)
-        key_valid = key_valid.clone()  # avoid in-place mutation of caller's tensor
         key_valid[:, -1] = True
 
         # Combined: (B, T_query, T_key)
