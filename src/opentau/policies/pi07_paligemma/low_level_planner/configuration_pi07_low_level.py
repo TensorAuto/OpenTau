@@ -134,7 +134,9 @@ class PI07lowlevelPlannerConfig(PreTrainedConfig):
     proj_width: int = 1024
 
     # Dropout
-    dropout: float = 0.1
+    # Default kept at 0.0 so that pi07_paligemma matches pi05's deterministic behaviour
+    # when configs share other knobs; opt in via --policy.dropout=0.1 if regularisation is desired.
+    dropout: float = 0.0
 
     # Decoding
     num_steps: int = 10

@@ -350,7 +350,7 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         try:
             # Try to load the pytorch_model.bin or model.safetensors file
             if is_main_process:
-                print(f"Loading model from: {pretrained_name_or_path}")
+                logging.info("Loading model from: %s", pretrained_name_or_path)
             try:
                 from transformers.utils import cached_file
 
@@ -370,11 +370,11 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
                 original_state_dict = load_file(resolved_file)
                 if is_main_process:
-                    print("✓ Loaded state dict from model.safetensors")
+                    logging.info("Loaded state dict from model.safetensors")
             except Exception as e:
                 if is_main_process:
-                    print(f"Could not load state dict from remote files: {e}")
-                    print("Returning model without loading pretrained weights")
+                    logging.warning("Could not load state dict from remote files: %s", e)
+                    logging.info("Returning model without loading pretrained weights")
                 return model
 
             # First, fix any key differences # see openpi `model.py, _fix_pytorch_state_dict_keys`
@@ -389,43 +389,37 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
                     new_key = f"model.{key}"
                     remapped_state_dict[new_key] = value
                     remap_count += 1
-                    if remap_count <= 10 and is_main_process:  # Only print first 10 to avoid spam
-                        print(f"Remapped: {key} -> {new_key}")
+                    if remap_count <= 10 and is_main_process:
+                        logging.debug("Remapped: %s -> %s", key, new_key)
                 else:
                     remapped_state_dict[key] = value
 
             if remap_count > 0 and is_main_process:
-                print(f"Remapped {remap_count} state dict keys")
+                logging.info("Remapped %d state dict keys", remap_count)
 
             # Load the remapped state dict into the model
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
 
             if missing_keys and is_main_process:
-                print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
-                if len(missing_keys) <= 20:
-                    for key in missing_keys:
-                        print(f"  - {key}")
-                else:
-                    for key in missing_keys[:20]:
-                        print(f"  - {key}")
-                    print(f"  ... and {len(missing_keys) - 20} more")
+                logging.warning("Missing keys when loading state dict: %d keys", len(missing_keys))
+                for key in missing_keys[:20]:
+                    logging.warning("  - %s", key)
+                if len(missing_keys) > 20:
+                    logging.warning("  ... and %d more", len(missing_keys) - 20)
 
             if unexpected_keys and is_main_process:
-                print(f"Unexpected keys when loading state dict: {len(unexpected_keys)} keys")
-                if len(unexpected_keys) <= 20:
-                    for key in unexpected_keys:
-                        print(f"  - {key}")
-                else:
-                    for key in unexpected_keys[:20]:
-                        print(f"  - {key}")
-                    print(f"  ... and {len(unexpected_keys) - 20} more")
+                logging.warning("Unexpected keys when loading state dict: %d keys", len(unexpected_keys))
+                for key in unexpected_keys[:20]:
+                    logging.warning("  - %s", key)
+                if len(unexpected_keys) > 20:
+                    logging.warning("  ... and %d more", len(unexpected_keys) - 20)
 
             if not missing_keys and not unexpected_keys and is_main_process:
-                print("All keys loaded successfully!")
+                logging.info("All keys loaded successfully!")
 
         except Exception as e:
             if is_main_process:
-                print(f"Warning: Could not remap state dict keys: {e}")
+                logging.warning("Could not remap state dict keys: %s", e)
 
         return model
 
@@ -993,10 +987,13 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             last_vid = vid
             last_mask = mask
 
+        # Pad to len(subgoal_keys) regardless of empty_cameras so the prefix
+        # length matches the all-missing-keys path above. With mixed
+        # present/missing keys and empty_cameras=0, the prior loop produced
+        # fewer slots than subgoal_keys and made the prefix length depend on
+        # which subgoal{k} keys happened to be in the batch.
         if last_vid is not None and last_mask is not None:
-            for num_empty in range(len(missing_keys)):
-                if num_empty >= self.config.empty_cameras:
-                    break
+            for _ in missing_keys:
                 subgoal_videos.append(torch.zeros_like(last_vid))
                 subgoal_vid_masks.append(torch.zeros_like(last_mask))
 
@@ -1545,10 +1542,33 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         vlm_h = self.paligemma_with_expert.config.paligemma_config.text_config.hidden_size
         n_sg_tokens = self.video_encoder.num_video_tokens
         sg_dtype = _preferred_dtype()
+        # SpaceTime SigLIP is constructed with num_frames=n_obs_history; subgoal
+        # videos arrive single-frame (B, 1, C, H, W). Pad to (B, num_frames, ...)
+        # with the real subgoal as the last frame and zeros for prior frames,
+        # then mask out the padded history via obs_history_is_pad so temporal
+        # attention sees only the current (subgoal) frame.
+        sg_num_frames = self.video_encoder.num_frames
 
         for sg_vid, sg_vid_mask in zip(subgoal_videos, subgoal_vid_masks, strict=True):
             if any_subgoal_in_batch:
-                sg_vid_emb = self.embed_video(sg_vid)  # (B, num_tokens, H)
+                sg_vid_padded = sg_vid
+                sg_obs_pad: Tensor | None = None
+                t_in = sg_vid.shape[1]
+                if t_in != sg_num_frames:
+                    if t_in != 1:
+                        raise ValueError(f"Expected subgoal video T=1 or T={sg_num_frames}; got T={t_in}.")
+                    b_sg = sg_vid.shape[0]
+                    pad_frames = torch.zeros(
+                        b_sg,
+                        sg_num_frames - 1,
+                        *sg_vid.shape[2:],
+                        device=sg_vid.device,
+                        dtype=sg_vid.dtype,
+                    )
+                    sg_vid_padded = torch.cat([pad_frames, sg_vid], dim=1)
+                    sg_obs_pad = torch.ones(b_sg, sg_num_frames, dtype=torch.bool, device=sg_vid.device)
+                    sg_obs_pad[:, -1] = False
+                sg_vid_emb = self.embed_video(sg_vid_padded, obs_history_is_pad=sg_obs_pad)
                 sg_vid_emb = sg_vid_emb.to(dtype=sg_dtype)
             else:
                 sg_vid_emb = torch.zeros(bsize, n_sg_tokens, vlm_h, device=lang_tokens.device, dtype=sg_dtype)

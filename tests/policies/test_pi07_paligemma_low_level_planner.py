@@ -821,7 +821,11 @@ class TestPI07LowLevelPlannerStateEmbedding:
             def embed_discrete_actions(tokens):
                 return torch.zeros(tokens.shape[0], tokens.shape[1], h, dtype=torch.bfloat16)
 
-        _video_enc = type("_VideoEncoderStub", (), {"num_video_tokens": 6})()
+        _video_enc = type(
+            "_VideoEncoderStub",
+            (),
+            {"num_video_tokens": 6, "num_frames": 1},
+        )()
 
         model.paligemma_with_expert = _PaliGemmaStub()
         model.video_encoder = _video_enc
@@ -830,9 +834,14 @@ class TestPI07LowLevelPlannerStateEmbedding:
         torch.nn.init.ones_(_real_proj.weight)
         torch.nn.init.zeros_(_real_proj.bias)
         model.state_proj = lambda x: _real_proj(x.float()).to(torch.bfloat16)
-        model.embed_video = lambda video, obs_history_is_pad=None: torch.zeros(
-            video.shape[0], 6, h, dtype=torch.bfloat16
-        )
+
+        def _embed_video(video, obs_history_is_pad=None):
+            t = video.shape[1]
+            if t != model.video_encoder.num_frames:
+                raise ValueError(f"Expected T={model.video_encoder.num_frames} frames; got {t}.")
+            return torch.zeros(video.shape[0], 6, h, dtype=torch.bfloat16)
+
+        model.embed_video = _embed_video
         return model
 
     @classmethod
@@ -848,6 +857,7 @@ class TestPI07LowLevelPlannerStateEmbedding:
         """Helper that calls ``embed_prefix`` and returns (embs, pad_masks, att_masks)
         plus metadata dict for locating the state slice."""
         model = cls._make_mock_model(hidden_size=hidden_size)
+        model.video_encoder.num_frames = n_obs_steps
         prompt_len = 5
         response_len = 4
         metadata_len = 3
@@ -950,6 +960,7 @@ class TestPI07LowLevelPlannerStateEmbedding:
         prompt_len = 5
 
         model = self._make_mock_model(hidden_size=hidden_size)
+        model.video_encoder.num_frames = t
         state = torch.randn(bsize, t, state_dim)
         videos = [torch.zeros(bsize, t, 3, 8, 8)]
         vid_masks = [torch.ones(bsize, dtype=torch.bool)]
@@ -1109,6 +1120,7 @@ class TestPI07LowLevelPlannerStateEmbedding:
 
         bsize, t, state_dim = 2, 4, 8
         prompt_len = 5
+        model.video_encoder.num_frames = t
 
         pad = torch.ones(bsize, t, dtype=torch.bool)
         pad[:, -1] = False
@@ -1253,15 +1265,24 @@ class TestPI07LowLevelPlannerResponseEmbedding:
             def embed_discrete_actions(tokens):
                 return torch.zeros(tokens.shape[0], tokens.shape[1], h, dtype=torch.bfloat16)
 
-        _video_enc = type("_VideoEncoderStub", (), {"num_video_tokens": 6})()
+        _video_enc = type(
+            "_VideoEncoderStub",
+            (),
+            {"num_video_tokens": 6, "num_frames": 1},
+        )()
 
         model.paligemma_with_expert = _PaliGemmaStub()
         model.video_encoder = _video_enc
         model.language_tokenizer = cls._fake_tokenizer()
         model.state_proj = lambda x: torch.zeros(x.shape[0], x.shape[1], h, dtype=torch.bfloat16)
-        model.embed_video = lambda video, obs_history_is_pad=None: torch.zeros(
-            video.shape[0], 6, h, dtype=torch.bfloat16
-        )
+
+        def _embed_video(video, obs_history_is_pad=None):
+            t = video.shape[1]
+            if t != model.video_encoder.num_frames:
+                raise ValueError(f"Expected T={model.video_encoder.num_frames} frames; got {t}.")
+            return torch.zeros(video.shape[0], 6, h, dtype=torch.bfloat16)
+
+        model.embed_video = _embed_video
         return model
 
     @classmethod
@@ -1279,6 +1300,7 @@ class TestPI07LowLevelPlannerResponseEmbedding:
         """Drive embed_prefix and return (embs, pad_masks, att_masks) plus
         a metadata dict with index boundaries for the comma + response slice."""
         model = cls._make_mock_model(hidden_size=hidden_size)
+        model.video_encoder.num_frames = n_obs_steps
 
         (embs, pad_masks, att_masks) = PI07LowLevelPlannerFlowMatching.embed_prefix(
             model,
@@ -1818,6 +1840,7 @@ class TestPI07LowLevelPlannerSubgoalEmbedding:
         hidden_size: int = 8,
     ) -> tuple[torch.Tensor, dict]:
         model = TestPI07LowLevelPlannerResponseEmbedding._make_mock_model(hidden_size=hidden_size)
+        model.video_encoder.num_frames = n_obs_steps
         assert len(subgoal_videos) == len(subgoal_vid_masks)
 
         (_, pad_masks, _) = PI07LowLevelPlannerFlowMatching.embed_prefix(
@@ -2093,3 +2116,61 @@ class TestPI07LowLevelPlannerSubgoalEmbedding:
             subgoal_vid_masks=m2,
         )
         assert torch.equal(pm_a, pm_b)
+
+    # ------------------------------------------------------------------ #
+    # n_obs_history > 1: subgoal videos must be padded to (B, num_frames, …)
+    # before reaching the SpaceTime SigLIP encoder, with obs_history_is_pad
+    # blocking all but the current frame. Regression test for the crash
+    # at video_encoder.py:485 (T != num_frames) when any sample has a real
+    # subgoal and the encoder was constructed with num_frames > 1.
+    # ------------------------------------------------------------------ #
+    def test_subgoal_padded_to_num_frames_when_n_obs_history_gt_one(self):
+        bsz = 2
+        n_obs_steps = 4
+        batch = self._subgoal_batch(
+            bsz,
+            include_tensors=True,
+            subgoal_is_pad=torch.tensor([True, False]),
+        )
+        sg_videos, sg_masks = self._prepare_subgoal(batch)
+        rt, rm, mt, mm = self._empty_response_metadata(bsz)
+
+        captured: list[tuple[tuple[int, ...], torch.Tensor | None]] = []
+        model = TestPI07LowLevelPlannerResponseEmbedding._make_mock_model(hidden_size=8)
+        model.video_encoder.num_frames = n_obs_steps
+
+        def _capturing_embed_video(video, obs_history_is_pad=None):
+            t = video.shape[1]
+            if t != model.video_encoder.num_frames:
+                raise ValueError(f"Expected T={model.video_encoder.num_frames} frames; got {t}.")
+            captured.append((tuple(video.shape), obs_history_is_pad))
+            return torch.zeros(video.shape[0], 6, 8, dtype=torch.bfloat16)
+
+        model.embed_video = _capturing_embed_video
+
+        # Call embed_prefix directly so we can install the capturing mock.
+        PI07LowLevelPlannerFlowMatching.embed_prefix(
+            model,
+            videos=[torch.zeros(bsz, n_obs_steps, 3, 8, 8)],
+            vid_masks=[torch.ones(bsz, dtype=torch.bool)],
+            lang_tokens=torch.zeros(bsz, 5, dtype=torch.long),
+            lang_masks=torch.ones(bsz, 5, dtype=torch.bool),
+            state=torch.zeros(bsz, n_obs_steps, 8),
+            response_tokens=rt,
+            response_masks=rm,
+            metadata_tokens=mt,
+            metadata_masks=mm,
+            subgoal_videos=sg_videos,
+            subgoal_vid_masks=sg_masks,
+        )
+
+        # Expect one embed_video call per main-video camera (T=n_obs_steps,
+        # obs_history_is_pad=None), then one per subgoal camera with the same
+        # T and obs_history_is_pad marking only the last frame as not-padded.
+        assert len(captured) == 1 + len(sg_videos)
+        for shape, pad in captured[1:]:
+            assert shape == (bsz, n_obs_steps, 3, 224, 224), shape
+            assert pad is not None
+            assert pad.shape == (bsz, n_obs_steps)
+            assert torch.all(pad[:, :-1])
+            assert torch.all(~pad[:, -1])
