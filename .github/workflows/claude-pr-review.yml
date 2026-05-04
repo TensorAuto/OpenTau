@@ -31,13 +31,22 @@ permissions:
 
 jobs:
   review:
-    # Skip on `synchronize` when the pusher is a Claude bot — otherwise the
-    # implement-fixes workflow's pushes would re-trigger us in a loop and we'd
-    # end up reviewing our own fixes. Always run on `opened` (auto-reviewing a
-    # Claude-opened PR is the whole point of this workflow).
+    # Two gates AND'd together:
+    #   (1) Trust gate — only org owners/members/collaborators or claude[bot]
+    #       (which opens `chore(claude): learn from #N` PRs). author_association
+    #       is NONE for bots, so the login OR is required.
+    #   (2) Loop gate — on `synchronize` triggered by claude[bot] pushing a
+    #       fix commit (from claude-implement-fixes.yml), skip; otherwise we'd
+    #       review our own fixes ad infinitum. `opened` always passes.
     if: >-
-      github.event.action == 'opened'
-      || !contains(github.event.sender.login, 'claude')
+      (
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
+        || github.event.pull_request.user.login == 'claude[bot]'
+      )
+      && (
+        github.event.action == 'opened'
+        || github.event.sender.login != 'claude[bot]'
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -49,6 +58,9 @@ jobs:
       - uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Match the bot allowlist in the job-level `if:` above. Never `*` on
+          # a public repo (per the action's docs warning).
+          allowed_bots: "claude[bot]"
           claude_args: |
             --model ${{ vars.CLAUDE_MODEL || 'claude-opus-4-7[1m]' }}
             --permission-mode bypassPermissions

@@ -37,6 +37,13 @@ env:
 
 jobs:
   cpu-tests:
+    # Block PRs from non-org accounts to keep fork code off our runners.
+    # `push` and `workflow_dispatch` already require write access, so the
+    # short-circuit lets them through unchanged.
+    if: >-
+      github.event_name != 'pull_request'
+      || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
+      || github.event.pull_request.user.login == 'claude[bot]'
     name: CPU Tests
     runs-on: ubuntu-latest
     steps:

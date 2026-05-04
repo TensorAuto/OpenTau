@@ -23,6 +23,12 @@ permissions:
 
 jobs:
   check-checklist:
+    # Only validate checklists on PRs from trusted accounts. Outsider PRs
+    # require maintainer approval to run any workflow; the maintainer reads
+    # the PR body manually before approving.
+    if: >-
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
+      || github.event.pull_request.user.login == 'claude[bot]'
     runs-on: ubuntu-latest
     steps:
       - name: Validate Checklist

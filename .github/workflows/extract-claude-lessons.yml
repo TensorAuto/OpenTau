@@ -25,14 +25,23 @@ permissions:
 
 jobs:
   extract-lessons:
-    # Gate on the head branch name, not user.login: in this repo Claude Code
-    # pushes to a `claude/*` branch and a human opens the PR, so the PR's
-    # `user.login` never contains 'claude'. The branch prefix is the reliable
-    # signal that Claude touched the PR.
+    # Four AND'd gates:
+    #   (1) PR was merged.
+    #   (2) Head branch is `claude/*` (Claude Code touched it). Per #212,
+    #       this is the reliable signal even when a human opens the PR.
+    #   (3) Title isn't already a learn-from-N PR (avoid recursion).
+    #   (4) Trust: PR opener is org owner/member/collaborator OR claude[bot].
+    #       Defense-in-depth against an outside collaborator naming their
+    #       fork branch `claude/...` and getting a merge through.
+    #       author_association is NONE for bots, so the login OR is required.
     if: >-
       github.event.pull_request.merged == true
       && startsWith(github.event.pull_request.head.ref, 'claude/')
       && !startsWith(github.event.pull_request.title, 'chore(claude): learn from')
+      && (
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
+        || github.event.pull_request.user.login == 'claude[bot]'
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -42,6 +51,9 @@ jobs:
       - uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Match the bot allowlist in the job-level `if:` above. Never `*` on
+          # a public repo (per the action's docs warning).
+          allowed_bots: "claude[bot]"
           claude_args: |
             --model ${{ vars.CLAUDE_MODEL || 'claude-opus-4-7[1m]' }}
             --permission-mode bypassPermissions
