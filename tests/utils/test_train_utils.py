@@ -25,6 +25,7 @@ from opentau.utils.train_utils import (
     get_step_identifier,
     load_training_step,
     prune_old_checkpoints,
+    reseed_new_ranks_on_resume,
     save_training_step,
     update_last_checkpoint,
 )
@@ -233,3 +234,88 @@ class TestPruneOldCheckpoints:
             mock_logging.info.assert_called_once_with(
                 "Starting cleanup in '/path/to/checkpoints'. Keeping checkpoint: '000100'"
             )
+
+
+def _make_accelerator(num_processes: int, process_index: int, is_main: bool | None = None):
+    """Build a stub Accelerator that ``reseed_new_ranks_on_resume`` and ``set_seed`` accept."""
+    acc = Mock()
+    acc.num_processes = num_processes
+    acc.process_index = process_index
+    acc.is_main_process = is_main if is_main is not None else (process_index == 0)
+    return acc
+
+
+def _populate_rng_files(checkpoint_dir: Path, count: int) -> None:
+    for i in range(count):
+        (checkpoint_dir / f"random_states_{i}.pkl").write_bytes(b"\x00")
+
+
+class TestReseedNewRanksOnResume:
+    """Cover the file-counting branches of ``reseed_new_ranks_on_resume``."""
+
+    def test_same_world_size_is_noop(self, tmp_path):
+        _populate_rng_files(tmp_path, 4)
+        acc = _make_accelerator(num_processes=4, process_index=2)
+        with patch("opentau.utils.random_utils.set_seed") as mock_set_seed:
+            reseed_new_ranks_on_resume(tmp_path, acc, seed=1234)
+        mock_set_seed.assert_not_called()
+
+    def test_scale_up_reseeds_only_new_ranks(self, tmp_path):
+        # Saved on 4 ranks, resuming on 8: ranks 4..7 must be reseeded.
+        _populate_rng_files(tmp_path, 4)
+        with patch("opentau.utils.random_utils.set_seed") as mock_set_seed:
+            for rank in range(8):
+                acc = _make_accelerator(num_processes=8, process_index=rank)
+                reseed_new_ranks_on_resume(tmp_path, acc, seed=42)
+        # Only ranks 4..7 should have triggered a reseed.
+        assert mock_set_seed.call_count == 4
+        reseeded_ranks = sorted(
+            call.kwargs["accelerator"].process_index for call in mock_set_seed.call_args_list
+        )
+        assert reseeded_ranks == [4, 5, 6, 7]
+
+    def test_scale_up_with_seed_none_skips_set_seed(self, tmp_path, caplog):
+        _populate_rng_files(tmp_path, 2)
+        acc = _make_accelerator(num_processes=4, process_index=3)
+        with (
+            patch("opentau.utils.random_utils.set_seed") as mock_set_seed,
+            caplog.at_level("WARNING"),
+        ):
+            reseed_new_ranks_on_resume(tmp_path, acc, seed=None)
+        mock_set_seed.assert_not_called()
+        assert any("cfg.seed is None" in rec.message for rec in caplog.records)
+
+    def test_scale_down_does_not_reseed(self, tmp_path):
+        _populate_rng_files(tmp_path, 8)
+        acc = _make_accelerator(num_processes=4, process_index=0)
+        with patch("opentau.utils.random_utils.set_seed") as mock_set_seed:
+            reseed_new_ranks_on_resume(tmp_path, acc, seed=42)
+        mock_set_seed.assert_not_called()
+
+    def test_no_rng_files_early_returns_without_zerodiv(self, tmp_path, caplog):
+        # Empty checkpoint dir: must not raise ZeroDivisionError, must warn on main only.
+        acc_main = _make_accelerator(num_processes=4, process_index=0, is_main=True)
+        with (
+            patch("opentau.utils.random_utils.set_seed") as mock_set_seed,
+            caplog.at_level("WARNING"),
+        ):
+            reseed_new_ranks_on_resume(tmp_path, acc_main, seed=42)
+        mock_set_seed.assert_not_called()
+        assert any("No random_states_*.pkl files found" in rec.message for rec in caplog.records)
+
+    def test_top_level_log_gated_on_main_process(self, tmp_path, caplog):
+        _populate_rng_files(tmp_path, 2)
+        # Non-main rank should not emit the high-level scale-up warning.
+        acc_nonmain = _make_accelerator(num_processes=4, process_index=1, is_main=False)
+        with patch("opentau.utils.random_utils.set_seed"), caplog.at_level("WARNING"):
+            reseed_new_ranks_on_resume(tmp_path, acc_nonmain, seed=42)
+        scale_up_msgs = [rec for rec in caplog.records if "Resuming on more processes" in rec.message]
+        assert scale_up_msgs == []
+
+    def test_scale_down_log_gated_on_main_process(self, tmp_path, caplog):
+        _populate_rng_files(tmp_path, 8)
+        acc_nonmain = _make_accelerator(num_processes=4, process_index=2, is_main=False)
+        with caplog.at_level("INFO"):
+            reseed_new_ranks_on_resume(tmp_path, acc_nonmain, seed=42)
+        scale_down_msgs = [rec for rec in caplog.records if "Resuming on fewer processes" in rec.message]
+        assert scale_down_msgs == []
