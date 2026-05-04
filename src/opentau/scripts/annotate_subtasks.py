@@ -13,9 +13,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Annotate each episode in a dataset mixture with subtask labels using Claude.
+"""Annotate each episode in a dataset mixture with subtask labels using a VLM.
 
-For every episode the script:
+Supports both Anthropic Claude (default) and Google Gemini — including the
+Gemini Robotics-ER family — as the annotator. For every episode the script:
 
 1. Samples ``--sample-fps`` frames per second from the first available video
    track (default 1 fps, giving a 30-50x reduction from typical 30-50 fps
@@ -146,10 +147,14 @@ def _resize(img: Image.Image, target_width: int) -> Image.Image:
     return img.resize((target_width, new_h), Image.LANCZOS)
 
 
-def _to_b64_jpeg(img: Image.Image, quality: int = 85) -> str:
+def _to_jpeg_bytes(img: Image.Image, quality: int = 85) -> bytes:
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality)
-    return base64.standard_b64encode(buf.getvalue()).decode("ascii")
+    return buf.getvalue()
+
+
+def _to_b64_jpeg(img: Image.Image, quality: int = 85) -> str:
+    return base64.standard_b64encode(_to_jpeg_bytes(img, quality=quality)).decode("ascii")
 
 
 # Anthropic Messages API rejects requests with more than 100 images per content
@@ -170,7 +175,8 @@ def _extract_sampled_frames(
 
     If the number of frames sampled at ``sample_fps`` exceeds ``max_frames``,
     the captured frames are uniformly subsampled down to ``max_frames`` so the
-    request stays within the Anthropic Messages API's 100-image limit.
+    request stays within the Anthropic Messages API's 100-image limit (Gemini
+    accepts more, but the same cap keeps cost/latency bounded for both).
     """
     with av.open(str(video_path)) as container:
         stream = container.streams.video[0]
@@ -235,7 +241,7 @@ def _coerce_subtasks(parsed: list, raw_text: str = "") -> list[dict]:
         except (TypeError, ValueError):
             continue
     if not subtasks:
-        raise ValueError(f"Claude response had no valid subtask entries: {raw_text!r}")
+        raise ValueError(f"Model response had no valid subtask entries: {raw_text!r}")
     if subtasks[0]["time"] != 0.0:
         subtasks.insert(0, {"time": 0.0, "subtask": subtasks[0]["subtask"]})
     return subtasks
@@ -306,9 +312,7 @@ def _call_gemini(
     contents: list = []
     for ts, img in zip(timestamps, frames, strict=False):
         contents.append(f"t={ts:.1f}s:")
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85)
-        contents.append(genai_types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"))
+        contents.append(genai_types.Part.from_bytes(data=_to_jpeg_bytes(img), mime_type="image/jpeg"))
 
     contents.append(_USER_TEMPLATE.format(task=task_description, fps=sample_fps))
 
@@ -324,7 +328,8 @@ def _call_gemini(
 
     raw_text = (response.text or "").strip()
     if not raw_text:
-        raise ValueError(f"Gemini response had no text (finish_reason={response.candidates}).")
+        finish_reason = response.candidates[0].finish_reason if response.candidates else None
+        raise ValueError(f"Gemini response had no text (finish_reason={finish_reason}).")
 
     parsed = _parse_json_response(raw_text)
     return _coerce_subtasks(parsed, raw_text)
@@ -609,7 +614,11 @@ def _load_datasets_from_config(config_path: Path) -> list[dict]:
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Annotate every episode in a dataset mixture with subtask labels using Claude.",
+        description=(
+            "Annotate every episode in a dataset mixture with subtask labels using a VLM "
+            "(Anthropic Claude by default; Google Gemini / Gemini Robotics-ER also supported "
+            "via --model)."
+        ),
         epilog=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -630,10 +639,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=MAX_FRAMES_PER_REQUEST,
         help=(
-            "Hard cap on frames per Claude request. Long clips are uniformly subsampled "
+            "Hard cap on frames per model request. Long clips are uniformly subsampled "
             f"down to this many frames. The Anthropic Messages API rejects requests with "
-            f"more than 100 images, so do not raise above {MAX_FRAMES_PER_REQUEST} "
-            f"(default: {MAX_FRAMES_PER_REQUEST})."
+            f"more than 100 images, so do not raise above {MAX_FRAMES_PER_REQUEST} when "
+            f"using Claude; Gemini tolerates more, but the same cap keeps cost/latency "
+            f"bounded (default: {MAX_FRAMES_PER_REQUEST})."
         ),
     )
     p.add_argument(
