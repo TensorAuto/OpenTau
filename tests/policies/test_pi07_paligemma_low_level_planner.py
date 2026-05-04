@@ -57,6 +57,7 @@ class TestPI07LowLevelPlannerIntegration:
     def _make_config() -> PI07lowlevelPlannerConfig:
         config = PI07lowlevelPlannerConfig(
             n_obs_steps=N_OBS_STEPS,
+            n_obs_history=N_OBS_STEPS,
             chunk_size=CHUNK_SIZE,
             n_action_steps=CHUNK_SIZE,
             max_state_dim=MAX_STATE_DIM,
