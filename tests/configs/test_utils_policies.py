@@ -14,7 +14,7 @@
 
 import json
 from pathlib import Path
-from unittest.mock import mock_open, patch
+from unittest.mock import patch
 
 import pytest
 from draccus.utils import ParsingError
@@ -92,27 +92,30 @@ def test_feature_properties_return_none_when_not_found(get_inherited_pretrainedc
 
 
 def test_save_pretrained(tmp_path, get_inherited_pretrainedconfig):
-    """
-    Tests that _save_pretrained writes a file using draccus.dump.
-    """
-    # Setup: Mock the file system and draccus dependencies
-    with (
-        patch("draccus.dump") as mock_dump,
-        patch("builtins.open", mock_open()),
-        patch("opentau.configs.policies.strip_deprecated_fields_from_json"),
-    ):
-        config = get_inherited_pretrainedconfig()
+    """`_save_pretrained` writes a JSON file at `<dir>/CONFIG_NAME` whose top
+    contains the choice-type discriminator (`type`) so the file round-trips
+    through `PreTrainedConfig.from_pretrained` (which dispatches off the
+    parent class and needs `type` to pick a subclass)."""
+    config = get_inherited_pretrainedconfig()
 
-        # Act
-        config._save_pretrained(tmp_path)
+    config._save_pretrained(tmp_path)
 
-        # Assert
-        # Check that open was called with the correct file path
-        open.assert_called_once_with(tmp_path / CONFIG_NAME, "w")
-
-        # Check that draccus.dump was called with the config instance
-        # We check the first argument of the first call to draccus.dump
-        assert mock_dump.call_args[0][0] is config
+    config_path = tmp_path / CONFIG_NAME
+    assert config_path.is_file(), f"{config_path} was not written"
+    with open(config_path) as f:
+        data = json.load(f)
+    # The discriminator must be present (the key invariant from_pretrained
+    # depends on); for this fixture it's "concrete_test" per its
+    # @PreTrainedConfig.register_subclass decorator.
+    assert data.get("type") == config.type, (
+        f"expected top-level type={config.type!r}, got {data.get('type')!r}"
+    )
+    # Round-trip: load via the parent class and confirm we get the original
+    # subclass back. This is the failure mode that motivated the fix.
+    loaded = PreTrainedConfig.from_pretrained(tmp_path)
+    assert isinstance(loaded, type(config)), (
+        f"round-trip lost subclass: expected {type(config).__name__}, got {type(loaded).__name__}"
+    )
 
 
 def test_from_pretrained(tmp_path):
