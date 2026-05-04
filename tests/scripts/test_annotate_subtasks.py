@@ -19,13 +19,17 @@ from unittest.mock import MagicMock, patch
 import anthropic
 import pytest
 from google import genai
+from PIL import Image
 
+from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
 from opentau.scripts import annotate_subtasks
 from opentau.scripts.annotate_subtasks import (
     _annotate_subtasks,
     _coerce_subtasks,
     _is_gemini_model,
     _parse_json_response,
+    _resize_and_center_crop,
+    _resolve_camera0_video_key,
 )
 
 
@@ -211,3 +215,105 @@ class TestAnnotateSubtasksDispatch:
         gemini_client = MagicMock(spec=genai.Client)
         with pytest.raises(AssertionError):
             _annotate_subtasks(gemini_client, "claude-opus-4-7", **self._make_inputs())
+
+
+class TestResizeAndCenterCrop:
+    def test_landscape_input_yields_square(self):
+        img = Image.new("RGB", (640, 480), color="red")
+        out = _resize_and_center_crop(img, 448)
+        assert out.size == (448, 448)
+
+    def test_portrait_input_yields_square(self):
+        img = Image.new("RGB", (480, 640), color="red")
+        out = _resize_and_center_crop(img, 448)
+        assert out.size == (448, 448)
+
+    def test_already_square_at_target_passes_through(self):
+        img = Image.new("RGB", (448, 448), color="red")
+        out = _resize_and_center_crop(img, 448)
+        assert out.size == (448, 448)
+
+    def test_smaller_than_target_is_upscaled(self):
+        img = Image.new("RGB", (224, 224), color="red")
+        out = _resize_and_center_crop(img, 448)
+        assert out.size == (448, 448)
+
+    def test_arbitrary_target_size(self):
+        img = Image.new("RGB", (1280, 720), color="red")
+        out = _resize_and_center_crop(img, 256)
+        assert out.size == (256, 256)
+
+
+class TestResolveCamera0VideoKey:
+    @staticmethod
+    def _info(features: dict) -> dict:
+        return {"features": features}
+
+    def test_inline_mapping_takes_precedence_over_global(self, monkeypatch):
+        monkeypatch.setitem(DATA_FEATURES_NAME_MAPPING, "fake/repo", {"camera0": "global_cam"})
+        info = self._info(
+            {
+                "global_cam": {"dtype": "video"},
+                "inline_cam": {"dtype": "video"},
+            }
+        )
+        ds_cfg = {
+            "repo_id": "fake/repo",
+            "data_features_name_mapping": {"camera0": "inline_cam"},
+        }
+        assert _resolve_camera0_video_key(info, ds_cfg) == "inline_cam"
+
+    def test_global_mapping_used_when_no_inline(self, monkeypatch):
+        monkeypatch.setitem(DATA_FEATURES_NAME_MAPPING, "fake/repo", {"camera0": "global_cam"})
+        info = self._info({"global_cam": {"dtype": "video"}})
+        ds_cfg = {"repo_id": "fake/repo"}
+        assert _resolve_camera0_video_key(info, ds_cfg) == "global_cam"
+
+    def test_falls_back_to_first_video_feature_when_no_mapping(self):
+        info = self._info(
+            {
+                "observation.state": {"dtype": "float32"},
+                "observation.images.cam0": {"dtype": "video"},
+                "observation.images.cam1": {"dtype": "video"},
+            }
+        )
+        ds_cfg = {"repo_id": "no/such-repo-in-global-map"}
+        assert _resolve_camera0_video_key(info, ds_cfg) == "observation.images.cam0"
+
+    def test_falls_back_when_repo_id_absent(self):
+        info = self._info({"observation.images.cam0": {"dtype": "video"}})
+        ds_cfg: dict = {}
+        assert _resolve_camera0_video_key(info, ds_cfg) == "observation.images.cam0"
+
+    def test_returns_none_when_mapping_points_to_missing_feature(self, monkeypatch):
+        monkeypatch.setitem(DATA_FEATURES_NAME_MAPPING, "fake/repo", {"camera0": "missing_cam"})
+        info = self._info({"observation.images.cam0": {"dtype": "video"}})
+        ds_cfg = {"repo_id": "fake/repo"}
+        assert _resolve_camera0_video_key(info, ds_cfg) is None
+
+    def test_returns_none_when_mapping_points_to_non_video_feature(self):
+        # Mirrors the dummy/vsr/cocoqa rows in DATA_FEATURES_NAME_MAPPING where
+        # camera0 → "image" (dtype=='image', not 'video'): not a LeRobot video
+        # dataset, must be skipped rather than silently misinterpreted.
+        info = self._info({"image": {"dtype": "image"}})
+        ds_cfg = {
+            "repo_id": "irrelevant",
+            "data_features_name_mapping": {"camera0": "image"},
+        }
+        assert _resolve_camera0_video_key(info, ds_cfg) is None
+
+    def test_returns_none_when_no_mapping_and_no_video_features(self):
+        info = self._info({"observation.state": {"dtype": "float32"}})
+        ds_cfg = {"repo_id": "no/such-repo-in-global-map"}
+        assert _resolve_camera0_video_key(info, ds_cfg) is None
+
+    def test_inline_empty_dict_falls_through_to_global(self, monkeypatch):
+        # An inline mapping that has other keys but no camera0 entry should not
+        # short-circuit the global lookup.
+        monkeypatch.setitem(DATA_FEATURES_NAME_MAPPING, "fake/repo", {"camera0": "global_cam"})
+        info = self._info({"global_cam": {"dtype": "video"}})
+        ds_cfg = {
+            "repo_id": "fake/repo",
+            "data_features_name_mapping": {"state": "observation.state"},
+        }
+        assert _resolve_camera0_video_key(info, ds_cfg) == "global_cam"

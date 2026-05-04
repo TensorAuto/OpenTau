@@ -18,11 +18,21 @@
 Supports both Anthropic Claude (default) and Google Gemini — including the
 Gemini Robotics-ER family — as the annotator. For every episode the script:
 
-1. Samples ``--sample-fps`` frames per second from the first available video
-   track (default 1 fps, giving a 30-50x reduction from typical 30-50 fps
-   recordings).
-2. Resizes each sampled frame to ``--target-width`` pixels wide (JPEG,
-   default 640 px) to reduce image token cost.
+1. Samples ``--sample-fps`` frames per second from the dataset's ``camera0``
+   video track (default 1 fps, giving a 30-50x reduction from typical 30-50
+   fps recordings). The mapping from the standard ``camera0`` name to the
+   dataset's actual feature key is read first from
+   ``DatasetConfig.data_features_name_mapping`` in the mixture config (per
+   ``src/opentau/configs/default.py``) and, failing that, from
+   ``DATA_FEATURES_NAME_MAPPING`` in
+   ``src/opentau/datasets/standard_data_format_mapping.py``. Datasets
+   without a ``camera0`` mapping fall back to the first ``dtype=='video'``
+   feature in ``meta/info.json``; datasets whose ``camera0`` resolves to a
+   non-video feature are skipped (not a LeRobot video dataset).
+2. Resizes each sampled frame to a ``--target-size`` × ``--target-size``
+   square (default 448 × 448) by scaling the shorter side to the target
+   and center-cropping, then JPEG-encodes the result. This matches the
+   standard VLM preprocessing pipeline and reduces image token cost.
 3. Sends all sampled frames together with their timestamps to the configured
    model (Anthropic ``claude-opus-4-7`` by default; Google
    ``gemini-robotics-er-1.6-preview`` is also supported via ``--model``) and
@@ -95,6 +105,7 @@ from huggingface_hub import snapshot_download
 from PIL import Image
 from tqdm import tqdm
 
+from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
 from opentau.datasets.utils import DEFAULT_CHUNK_SIZE, load_episodes, load_info, write_info
 from opentau.scripts.add_subtask_response import _build_response_array, _get_parquet_path
 
@@ -139,12 +150,27 @@ Return ONLY a valid JSON array. Example:
 # ---------------------------------------------------------------------------
 
 
-def _resize(img: Image.Image, target_width: int) -> Image.Image:
+def _resize_and_center_crop(img: Image.Image, target_size: int) -> Image.Image:
+    """Scale the shorter side to ``target_size`` and center-crop to a square.
+
+    Mirrors the standard VLM preprocessing pipeline: aspect-preserving resize
+    so the shorter side equals ``target_size``, followed by a center crop to
+    ``target_size × target_size``. Already-square inputs at the right
+    resolution pass through untouched.
+    """
     w, h = img.size
-    if w == target_width:
+    short = min(w, h)
+    if short != target_size:
+        scale = target_size / short
+        new_w = max(target_size, round(w * scale))
+        new_h = max(target_size, round(h * scale))
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+        w, h = img.size
+    if w == target_size and h == target_size:
         return img
-    new_h = max(1, int(h * target_width / w))
-    return img.resize((target_width, new_h), Image.LANCZOS)
+    left = (w - target_size) // 2
+    top = (h - target_size) // 2
+    return img.crop((left, top, left + target_size, top + target_size))
 
 
 def _to_jpeg_bytes(img: Image.Image, quality: int = 85) -> bytes:
@@ -168,13 +194,15 @@ MAX_FRAMES_PER_REQUEST = 100
 def _extract_sampled_frames(
     video_path: Path,
     sample_fps: float,
-    target_width: int,
+    target_size: int,
     max_frames: int = MAX_FRAMES_PER_REQUEST,
 ) -> tuple[list[Image.Image], list[float]]:
     """Decode the video and return (images, timestamps) at sample_fps.
 
-    If the number of frames sampled at ``sample_fps`` exceeds ``max_frames``,
-    the captured frames are uniformly subsampled down to ``max_frames`` so the
+    Each sampled frame is resized so its shorter side equals ``target_size``
+    and then center-cropped to a ``target_size × target_size`` square. If the
+    number of frames sampled at ``sample_fps`` exceeds ``max_frames``, the
+    captured frames are uniformly subsampled down to ``max_frames`` so the
     request stays within the Anthropic Messages API's 100-image limit (Gemini
     accepts more, but the same cap keeps cost/latency bounded for both).
     """
@@ -191,7 +219,7 @@ def _extract_sampled_frames(
         for i, frame in enumerate(container.decode(video=0)):
             if i % stride == 0:
                 ts = float(frame.pts * stream.time_base) if frame.pts is not None else i / max(video_fps, 1.0)
-                img = _resize(frame.to_image(), target_width)
+                img = _resize_and_center_crop(frame.to_image(), target_size)
                 sampled_imgs.append(img)
                 sampled_ts.append(round(ts, 3))
 
@@ -364,6 +392,62 @@ def _find_video_key(info: dict) -> str | None:
     return None
 
 
+def _resolve_camera0_video_key(info: dict, ds_cfg: dict) -> str | None:
+    """Resolve the dataset's ``camera0`` to a video feature key in ``info.json``.
+
+    Lookup order:
+
+    1. ``ds_cfg['data_features_name_mapping']['camera0']`` — the inline
+       per-dataset override on ``DatasetConfig`` (see
+       ``src/opentau/configs/default.py``).
+    2. ``DATA_FEATURES_NAME_MAPPING[ds_cfg['repo_id']]['camera0']`` — the
+       project-wide mapping in
+       ``src/opentau/datasets/standard_data_format_mapping.py``.
+    3. Fallback: the first feature in ``info.json`` with ``dtype=='video'``.
+
+    Returns ``None`` if (1) or (2) resolved to a feature that is missing
+    from ``info.json`` or whose ``dtype`` is not ``'video'`` — those datasets
+    are not LeRobot video datasets and cannot be annotated by this script.
+    Also returns ``None`` if the fallback finds no video features at all.
+    The caller should skip the dataset in either case.
+    """
+    features = info.get("features", {})
+    repo_id = ds_cfg.get("repo_id")
+    inline_map = ds_cfg.get("data_features_name_mapping") or {}
+    inline = inline_map.get("camera0")
+    global_map = DATA_FEATURES_NAME_MAPPING.get(repo_id, {}) if repo_id else {}
+    mapped = inline if inline is not None else global_map.get("camera0")
+
+    if mapped is not None:
+        feat = features.get(mapped)
+        if feat is None:
+            logger.warning(
+                "camera0 maps to feature %r but that feature is not present in info.json — "
+                "not a LeRobot video dataset; skipping.",
+                mapped,
+            )
+            return None
+        if feat.get("dtype") != "video":
+            logger.warning(
+                "camera0 maps to feature %r with dtype=%r (expected 'video') — "
+                "not a LeRobot video dataset; skipping.",
+                mapped,
+                feat.get("dtype"),
+            )
+            return None
+        return mapped
+
+    fallback = _find_video_key(info)
+    if fallback is None:
+        logger.warning("No camera0 mapping and no video features in info.json; skipping.")
+    else:
+        logger.info(
+            "No camera0 mapping for this dataset; falling back to first video feature %r in info.json.",
+            fallback,
+        )
+    return fallback
+
+
 def _subtask_path(root: Path, template: str, ep_index: int) -> Path:
     return root / template.format(episode_index=ep_index)
 
@@ -373,23 +457,18 @@ def _annotate_episode(
     model: str,
     root: Path,
     info: dict,
+    video_key: str,
     ep_index: int,
     ep_info: dict,
     subtask_tmpl: str,
     sample_fps: float,
-    target_width: int,
+    target_size: int,
     max_frames: int,
 ) -> bool:
     """Annotate one episode.  Returns True if the episode was processed."""
     out_path = _subtask_path(root, subtask_tmpl, ep_index)
     if out_path.exists():
         logger.debug("Episode %d: subtask file exists, skipping.", ep_index)
-        return False
-
-    # Locate the video file
-    video_key = _find_video_key(info)
-    if video_key is None:
-        logger.warning("Episode %d: no video feature found in info.json; skipping.", ep_index)
         return False
 
     video_tmpl: str = info["video_path"]
@@ -405,7 +484,7 @@ def _annotate_episode(
     tasks = ep_info.get("tasks", [])
     task_description = tasks[0] if tasks else "robot manipulation task"
 
-    frames, timestamps = _extract_sampled_frames(video_path, sample_fps, target_width, max_frames)
+    frames, timestamps = _extract_sampled_frames(video_path, sample_fps, target_size, max_frames)
     if not frames:
         logger.warning("Episode %d: no frames extracted from %s; skipping.", ep_index, video_path)
         return False
@@ -495,9 +574,10 @@ def _update_parquet_response(root: Path, info: dict, ep_index: int, ep_info: dic
 def _process_dataset(
     client: anthropic.Anthropic | genai.Client,
     root: Path,
+    ds_cfg: dict,
     model: str,
     sample_fps: float,
-    target_width: int,
+    target_size: int,
     subtask_tmpl: str,
     write_response_column: bool,
     max_episodes: int | None,
@@ -522,6 +602,11 @@ def _process_dataset(
         logger.warning("No episodes in %s — skipping.", root)
         return
 
+    video_key = _resolve_camera0_video_key(info, ds_cfg)
+    if video_key is None:
+        logger.warning("Dataset %s: no usable camera0 video feature; skipping.", root.name)
+        return
+
     # Register the subtask_path in info.json if not already present
     if "subtask_path" not in info:
         info["subtask_path"] = subtask_tmpl
@@ -543,11 +628,12 @@ def _process_dataset(
                 model=model,
                 root=root,
                 info=info,
+                video_key=video_key,
                 ep_index=ep_index,
                 ep_info=ep_info,
                 subtask_tmpl=subtask_tmpl,
                 sample_fps=sample_fps,
-                target_width=target_width,
+                target_size=target_size,
                 max_frames=max_frames,
             )
         except Exception:
@@ -647,10 +733,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     p.add_argument(
-        "--target-width",
+        "--target-size",
         type=int,
-        default=640,
-        help="Resize each frame to this width (px) before encoding as JPEG (default: 640).",
+        default=448,
+        help="Resize each frame so its shorter side is this many pixels, then center-crop "
+        "to a target_size × target_size square before encoding as JPEG (default: 448).",
     )
     p.add_argument(
         "--subtask-path-template",
@@ -766,9 +853,10 @@ def main(argv: list[str] | None = None) -> None:
         _process_dataset(
             client=client,
             root=root,
+            ds_cfg=ds_cfg,
             model=args.model,
             sample_fps=args.sample_fps,
-            target_width=args.target_width,
+            target_size=args.target_size,
             subtask_tmpl=args.subtask_path_template,
             write_response_column=args.write_response_column,
             max_episodes=args.max_episodes_per_dataset,
