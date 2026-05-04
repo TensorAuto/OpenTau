@@ -79,6 +79,20 @@ class DatasetConfig:
             metadata field. When provided (including the empty string), takes
             precedence over the value loaded from ``meta/info.json``. ``None``
             (default) leaves the loaded value untouched.
+        tolerance_s: Optional per-dataset override for the timestamp-sync
+            tolerance (in seconds) passed to ``LeRobotDataset``'s load-time
+            ``check_timestamps_sync`` call. ``None`` (default) inherits the
+            mixture-wide ``DatasetMixtureConfig.tolerance_s`` value. Set this
+            to a larger value (e.g. ``1e-3``) when a single dataset in the
+            mixture has slightly off-fps timestamps but you don't want to
+            loosen the check for the others. Must be ``>= 0`` when set.
+        skip_timestamp_check: Optional per-dataset override that bypasses the
+            load-time ``check_timestamps_sync`` call entirely. ``None``
+            (default) inherits the mixture-wide
+            ``DatasetMixtureConfig.skip_timestamp_check``. ``True`` skips the
+            check (a warning is logged); ``False`` forces the check on for this
+            dataset even if the mixture default is ``True``. Does not affect
+            the record-time check inside ``add_episode``.
 
     Raises:
         ValueError: If both or neither of `repo_id` and `vqa` are set, or
@@ -105,6 +119,13 @@ class DatasetConfig:
     # written through to `dataset.meta.info[...]` after the dataset is built.
     robot_type: str | None = None
     control_mode: str | None = None
+
+    # Per-dataset overrides for the load-time timestamp-sync check. `None`
+    # inherits from `DatasetMixtureConfig.{tolerance_s, skip_timestamp_check}`.
+    # A non-None value here wins over the mixture default for this dataset
+    # only — useful when one dataset in a mixture has off-fps timestamps.
+    tolerance_s: float | None = None
+    skip_timestamp_check: bool | None = None
 
     # DEPRECATED. Set `val_split_ratio` on `DatasetMixtureConfig` instead — the
     # mixture-level value is the single source of truth and is applied uniformly
@@ -196,6 +217,20 @@ class DatasetMixtureConfig:
             must have a non-empty ``control_mode`` after the optional
             ``DatasetConfig.control_mode`` override has been applied. Defaults
             to ``False`` (empty / missing values are allowed).
+        tolerance_s: Mixture-wide default tolerance (in seconds) for the
+            load-time ``check_timestamps_sync`` call inside
+            ``LeRobotDataset.__init__``. Each dataset's frame-to-frame
+            timestamp spacing must lie within ``1/fps +/- tolerance_s`` or the
+            check raises. Defaults to ``1e-4``. A per-dataset
+            ``DatasetConfig.tolerance_s`` overrides this value when set. Must
+            be ``>= 0``.
+        skip_timestamp_check: If True, bypass the load-time
+            ``check_timestamps_sync`` call for every dataset in the mixture
+            (a warning is logged per dataset). Useful as a debug knob when
+            the timing data is known-bad but you still want the mixture to
+            load. Defaults to ``False``. A per-dataset
+            ``DatasetConfig.skip_timestamp_check`` overrides this value when
+            set. Does not affect the record-time check inside ``add_episode``.
 
     Note:
         Dropout rolls use the default torch RNG. PyTorch DataLoader workers
@@ -251,6 +286,13 @@ class DatasetMixtureConfig:
     require_non_empty_robot_type: bool = False
     require_non_empty_control_mode: bool = False
 
+    # Mixture-wide defaults for the load-time timestamp-sync check. Each
+    # dataset can override these via `DatasetConfig.{tolerance_s,
+    # skip_timestamp_check}`. The default tolerance matches
+    # `LeRobotDataset.__init__`'s historical default.
+    tolerance_s: float = 1e-4
+    skip_timestamp_check: bool = False
+
     def __post_init__(self):
         """Validate dataset mixture configuration."""
         if self.weights is not None and len(self.datasets) != len(self.weights):
@@ -267,6 +309,15 @@ class DatasetMixtureConfig:
             )
         if self.val_split_ratio < 0 or self.val_split_ratio > 1:
             raise ValueError(f"`val_split_ratio` must be between 0 and 1, got {self.val_split_ratio}.")
+        if self.tolerance_s < 0:
+            raise ValueError(f"`tolerance_s` must be >= 0, got {self.tolerance_s}.")
+        for dataset_cfg in self.datasets:
+            if dataset_cfg.tolerance_s is not None and dataset_cfg.tolerance_s < 0:
+                identifier = dataset_cfg.repo_id or dataset_cfg.vqa or "<unidentified dataset>"
+                raise ValueError(
+                    f"`DatasetConfig.tolerance_s` must be >= 0 (or None to inherit), "
+                    f"got {dataset_cfg.tolerance_s} for {identifier}."
+                )
         if self.n_obs_history is not None and (
             not isinstance(self.n_obs_history, int) or self.n_obs_history < 1
         ):

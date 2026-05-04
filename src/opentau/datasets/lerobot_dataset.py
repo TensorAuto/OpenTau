@@ -1092,6 +1092,7 @@ class LeRobotDataset(BaseDataset):
         vector_resample_strategy: str = "nearest",
         standardize: bool = True,
         return_advantage_input: bool = False,
+        skip_timestamp_check: bool = False,
     ):
         """Initialize LeRobotDataset.
 
@@ -1215,6 +1216,12 @@ class LeRobotDataset(BaseDataset):
                 Defaults to 'nearest'.
             standardize (bool, Optional): Flag to enable standardization in `__getitem__`. Defaults to True.
             return_advantage_input (bool, Optional): Flag to return advantage inputs ("success", "episode_end_idx", "current_idx", "last_step", "episode_index", "timestamp", ). Defaults to False. Ignored if standardize is False.
+            skip_timestamp_check (bool, Optional): If True, bypass the load-time
+                ``check_timestamps_sync`` call (a warning is logged). Frame-to-frame
+                spacing is NOT verified against ``1/fps``; downstream
+                ``delta_timestamps`` lookups may sample unintended frames. Defaults
+                to False. Does not affect the record-time check inside
+                ``add_episode``.
         """
         super().__init__(cfg)
         self.cfg = cfg
@@ -1229,6 +1236,7 @@ class LeRobotDataset(BaseDataset):
         )
         self.episodes = episodes
         self.tolerance_s = tolerance_s
+        self.skip_timestamp_check = skip_timestamp_check
         self.revision = revision if revision else CODEBASE_VERSION
         self.video_backend = video_backend if video_backend else get_safe_default_codec()
 
@@ -1337,12 +1345,20 @@ class LeRobotDataset(BaseDataset):
 
         # Check timestamps
         # If transform is set, with_transform will decode all columns of a row before returning the desired column(s).
-        no_transform_ds = self.hf_dataset.with_transform(None).with_format("numpy")
-        logging.info("Checking timestamps synchronization...")
-        timestamps = np.asarray(no_transform_ds["timestamp"], dtype=np.float32)
-        episode_indices = np.asarray(no_transform_ds["episode_index"], dtype=np.int64)
-        ep_data_index_np = {k: t.numpy() for k, t in self.episode_data_index.items()}
-        check_timestamps_sync(timestamps, episode_indices, ep_data_index_np, self.fps, self.tolerance_s)
+        if self.skip_timestamp_check:
+            logging.warning(
+                "Skipping timestamp sync check for %s (skip_timestamp_check=True). "
+                "Frame-to-frame spacing is NOT verified against 1/fps; downstream "
+                "delta_timestamps lookups may sample unintended frames.",
+                self.repo_id,
+            )
+        else:
+            no_transform_ds = self.hf_dataset.with_transform(None).with_format("numpy")
+            logging.info("Checking timestamps synchronization...")
+            timestamps = np.asarray(no_transform_ds["timestamp"], dtype=np.float32)
+            episode_indices = np.asarray(no_transform_ds["episode_index"], dtype=np.int64)
+            ep_data_index_np = {k: t.numpy() for k, t in self.episode_data_index.items()}
+            check_timestamps_sync(timestamps, episode_indices, ep_data_index_np, self.fps, self.tolerance_s)
 
         # Per-episode caches used by the optional-key emission path. Populated
         # from meta/episodes.jsonl annotations when present, else filled with

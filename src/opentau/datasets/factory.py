@@ -205,6 +205,16 @@ def make_dataset(
         # once `__init__` emits the warning the suppression is a no-op.
         if cfg.control_mode is not None:
             suppress_control_mode_warning(cfg.repo_id)
+        # Per-dataset values win over the mixture-wide default; `None` means
+        # "inherit". See `DatasetConfig` / `DatasetMixtureConfig` docstrings.
+        effective_tolerance = (
+            cfg.tolerance_s if cfg.tolerance_s is not None else train_cfg.dataset_mixture.tolerance_s
+        )
+        effective_skip = (
+            cfg.skip_timestamp_check
+            if cfg.skip_timestamp_check is not None
+            else train_cfg.dataset_mixture.skip_timestamp_check
+        )
         dataset = LeRobotDataset(
             train_cfg,
             cfg.repo_id,
@@ -214,12 +224,14 @@ def make_dataset(
             delta_timestamps_std=dt_std,
             delta_timestamps_lower=dt_lower,
             delta_timestamps_upper=dt_upper,
+            tolerance_s=effective_tolerance,
             image_transforms=image_transforms,
             revision=cfg.revision,
             video_backend=cfg.video_backend,
             image_resample_strategy=train_cfg.dataset_mixture.image_resample_strategy,
             vector_resample_strategy=train_cfg.dataset_mixture.vector_resample_strategy,
             return_advantage_input=return_advantage_input,
+            skip_timestamp_check=effective_skip,
         )
     else:
         raise ValueError("Exactly one of `cfg.vqa` and `cfg.repo_id` should be provided.")
