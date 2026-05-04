@@ -22,7 +22,7 @@ lumped into a bidirectional image / prefix-LM block.
 The tests only exercise the shared :func:`make_att_2d_masks` utility, so
 they run on CPU without instantiating any model. ``make_att_2d_masks`` is
 imported from the high-level planner module; the implementation is byte-
-identical in the low-level planner module.
+identical in the low-level component module.
 """
 
 import torch
@@ -64,8 +64,8 @@ class TestPI07HighLevelPlannerAttentionLayout:
         assert not torch.any(mask[0, img_slice, lang_slice])
 
 
-class TestPI07LowLevelPlannerAttentionLayout:
-    """Locks the low-level planner's post-fix attention layout. The pre-fix
+class TestPI07LowLevelAttentionLayout:
+    """Locks the low-level component's post-fix attention layout. The pre-fix
     code violated paper §VI.B in two distinct ways:
       1. ``[0] * N`` for language tokens (same bug as PR #235).
       2. ``[1] + [0] * (N - 1)`` for the response (Subtask) span: only the

@@ -11,14 +11,29 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-π07 Low-Level Planner Module.
+"""DEPRECATED: use ``opentau.policies.pi07.low_level`` instead.
 
-This module implements the low-level planner of the π07 hierarchical
-architecture. It uses SpaceTimeSiglip as a video encoder, processes temporal state
-sequences (one continuous token per timestep), and supports optional subtask
-response, subgoal image, and metadata conditioning.  Action generation
-combines flow matching (continuous actions via an action expert) with FAST
-discrete token prediction (through the VLM backbone with Knowledge
-Insulation).
+The ``low_level_planner`` directory is preserved as a thin re-export
+shim so older user code and pickled checkpoints that reference the old
+import path / class names keep working. New code should import from
+``opentau.policies.pi07.low_level``. This shim will be removed in a
+future release.
+
+Class renames:
+
+- ``PI07LowLevelPlannerConfig`` → ``PI07LowLevelConfig``
+- ``PI07LowLevelPlannerPolicy`` → ``PI07LowLevelPolicy``
+- ``PI07LowLevelPlannerFlowMatching`` → ``PI07LowLevelFlowMatching``
 """
+
+import warnings as _warnings
+
+_warnings.warn(
+    "opentau.policies.pi07.low_level_planner is deprecated; "
+    "use opentau.policies.pi07.low_level instead. "
+    "PI07LowLevelPlannerConfig was renamed to PI07LowLevelConfig, "
+    "PI07LowLevelPlannerPolicy to PI07LowLevelPolicy, and "
+    "PI07LowLevelPlannerFlowMatching to PI07LowLevelFlowMatching.",
+    DeprecationWarning,
+    stacklevel=2,
+)

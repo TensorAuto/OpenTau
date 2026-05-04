@@ -40,7 +40,7 @@ import copy
 import pytest
 import torch
 
-from opentau.policies.pi07.low_level_planner.video_encoder import (
+from opentau.policies.pi07.low_level.video_encoder import (
     SpaceTimeEncoderLayerWrapper,
     SpaceTimeSiglipVideoEncoder,
     _build_temporal_sinusoidal_pe,

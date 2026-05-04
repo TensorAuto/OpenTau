@@ -405,7 +405,7 @@ class Gemma3WithExpertModel(PreTrainedModel):
         tensor.
 
         When the vision tower has been wrapped with space-time attention by
-        :class:`SpaceTimeSiglipVideoEncoder` (low-level planner), suppress the
+        :class:`SpaceTimeSiglipVideoEncoder` (low-level component), suppress the
         temporal sublayer here — single-image inputs have no time axis to
         attend over.  The context manager is a no-op when no wrappers are
         present.
@@ -413,7 +413,7 @@ class Gemma3WithExpertModel(PreTrainedModel):
         # Local import keeps ``gemma3_with_expert`` importable from the
         # high-level planner (which never constructs a video encoder) without
         # forcing a transitive import of einops/F at module load time.
-        from opentau.policies.pi07.low_level_planner.video_encoder import (
+        from opentau.policies.pi07.low_level.video_encoder import (
             suppress_spacetime_temporal,
         )
 

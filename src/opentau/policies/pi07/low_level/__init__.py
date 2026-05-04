@@ -11,18 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""DEPRECATED shim: use ``opentau.policies.pi07.low_level.video_encoder``.
-
-See ``opentau.policies.pi07.low_level_planner.__init__`` for the
-deprecation warning.
 """
+π07 Low-Level Module.
 
-from opentau.policies.pi07.low_level.video_encoder import (
-    SpaceTimeEncoderLayerWrapper as SpaceTimeEncoderLayerWrapper,
-)
-from opentau.policies.pi07.low_level.video_encoder import (
-    SpaceTimeSiglipVideoEncoder as SpaceTimeSiglipVideoEncoder,
-)
-from opentau.policies.pi07.low_level.video_encoder import (
-    suppress_spacetime_temporal as suppress_spacetime_temporal,
-)
+This module implements the low-level component of the π07 hierarchical
+architecture — a flow-matching action generator (not a "planner"; the
+actual planning happens in the high-level module). It uses SpaceTimeSiglip
+as a video encoder, processes temporal state sequences (one continuous
+token per timestep), and supports optional subtask response, subgoal
+image, and metadata conditioning. Action generation combines flow
+matching (continuous actions via an action expert) with FAST discrete
+token prediction (through the VLM backbone with Knowledge Insulation).
+"""

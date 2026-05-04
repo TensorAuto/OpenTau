@@ -24,8 +24,8 @@ from opentau.policies.pi06.modeling_pi06 import PI06Policy
 from opentau.policies.pi07.high_level_planner.modeling_pi07_high_level import (
     PI07HighLevelPlannerPolicy,
 )
-from opentau.policies.pi07.low_level_planner.modeling_pi07_low_level import (
-    PI07LowLevelPlannerPolicy,
+from opentau.policies.pi07.low_level.modeling_pi07_low_level import (
+    PI07LowLevelPolicy,
 )
 from opentau.policies.value.modeling_value import ValueFunction
 
@@ -42,7 +42,7 @@ def test_available_policies():
         PI05MemPolicy,
         PI06Policy,
         PI07HighLevelPlannerPolicy,
-        PI07LowLevelPlannerPolicy,
+        PI07LowLevelPolicy,
     ]
     policies = [pol_cls.name for pol_cls in policy_classes]
     assert set(policies) == set(opentau.available_policies), policies

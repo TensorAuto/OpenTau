@@ -897,10 +897,10 @@ class PI07HighLevelPlannerModel(nn.Module):
         provided (or every sample's metadata is fully padded) there is
         nothing to terminate and emitting it would dangle spurious tokens.
         The gate fires when ``metadata_tokens is None`` *or* every entry of
-        ``metadata_masks`` is ``False`` (matching the low-level planner's
+        ``metadata_masks`` is ``False`` (matching the low-level component's
         ``metadata_masks.any()`` semantics so that training paths with
         all-padded metadata cleanly drop the metadata + prefix-end blocks).
-        Like the low-level planner, the decision is batch-wide: any sample
+        Like the low-level component, the decision is batch-wide: any sample
         with real metadata keeps both blocks present for the whole batch.
         The ``"Updated Memory: "`` anchor itself is unconditional because
         inference relies on it as the autoregressive starting point for

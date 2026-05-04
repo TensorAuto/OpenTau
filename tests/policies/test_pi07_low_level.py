@@ -17,12 +17,12 @@ import torch
 
 from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from opentau.policies.pi07.gemma3_with_expert import Gemma3WithExpertConfig
-from opentau.policies.pi07.low_level_planner.configuration_pi07_low_level import (
-    PI07LowLevelPlannerConfig,
+from opentau.policies.pi07.low_level.configuration_pi07_low_level import (
+    PI07LowLevelConfig,
 )
-from opentau.policies.pi07.low_level_planner.modeling_pi07_low_level import (
-    PI07LowLevelPlannerFlowMatching,
-    PI07LowLevelPlannerPolicy,
+from opentau.policies.pi07.low_level.modeling_pi07_low_level import (
+    PI07LowLevelFlowMatching,
+    PI07LowLevelPolicy,
     make_att_2d_masks,
 )
 
@@ -147,11 +147,11 @@ INFER_STATE_TOKENS = N_OBS_STEPS
 
 
 class TestPI07LowLevelIntegration:
-    """Integration tests for the PI07 low-level planner pipeline."""
+    """Integration tests for the PI07 low-level component pipeline."""
 
     @staticmethod
-    def _make_config() -> PI07LowLevelPlannerConfig:
-        config = PI07LowLevelPlannerConfig(
+    def _make_config() -> PI07LowLevelConfig:
+        config = PI07LowLevelConfig(
             n_obs_steps=N_OBS_STEPS,
             chunk_size=CHUNK_SIZE,
             n_action_steps=CHUNK_SIZE,
@@ -355,10 +355,10 @@ class TestPI07LowLevelIntegration:
     @pytest.mark.gpu
     @pytest.mark.slow
     def test_complete_pi07_low_level_pipeline(self, lerobot_dataset_metadata):
-        """Test the PI07 low-level planner pipeline: forward (training) and select_action (inference)."""
+        """Test the PI07 low-level component pipeline: forward (training) and select_action (inference)."""
 
         config = self._make_config()
-        policy = PI07LowLevelPlannerPolicy(config, dataset_stats=lerobot_dataset_metadata.stats)
+        policy = PI07LowLevelPolicy(config, dataset_stats=lerobot_dataset_metadata.stats)
         tokenizer = policy.model.language_tokenizer
 
         batch_size = 1
@@ -633,7 +633,7 @@ class TestPI07LowLevelIntegration:
         offsets on real Gemma 3 weights.
         """
         config = self._make_config()
-        policy = PI07LowLevelPlannerPolicy(config, dataset_stats=lerobot_dataset_metadata.stats)
+        policy = PI07LowLevelPolicy(config, dataset_stats=lerobot_dataset_metadata.stats)
         tokenizer = policy.model.language_tokenizer
 
         batch_size = 1
@@ -733,16 +733,16 @@ class TestPI07LowLevelIntegration:
 
 
 class TestPI07LowLevelRegression:
-    """GPU regression tests pinning the low-level planner signature/dtype fixes.
+    """GPU regression tests pinning the low-level component signature/dtype fixes.
 
     Covers the changes made to ``embed_prefix``, ``embed_suffix``,
     ``prepare_metadata``, and the metadata-zip ``strict=True`` switch.
     """
 
     @staticmethod
-    def _make_policy(lerobot_dataset_metadata) -> PI07LowLevelPlannerPolicy:
+    def _make_policy(lerobot_dataset_metadata) -> PI07LowLevelPolicy:
         config = TestPI07LowLevelIntegration._make_config()
-        policy = PI07LowLevelPlannerPolicy(config, dataset_stats=lerobot_dataset_metadata.stats)
+        policy = PI07LowLevelPolicy(config, dataset_stats=lerobot_dataset_metadata.stats)
         policy.to(dtype=torch.bfloat16, device="cuda")
         return policy
 
@@ -806,7 +806,7 @@ class TestPI07LowLevelRegression:
         """response_tokens / response_masks / metadata_tokens / metadata_masks are positional, no defaults."""
         import inspect
 
-        params = inspect.signature(PI07LowLevelPlannerFlowMatching.embed_prefix).parameters
+        params = inspect.signature(PI07LowLevelFlowMatching.embed_prefix).parameters
         for name in ("response_tokens", "response_masks", "metadata_tokens", "metadata_masks"):
             assert params[name].default is inspect.Parameter.empty, (
                 f"{name} should be a required parameter (no default), got default={params[name].default}"
