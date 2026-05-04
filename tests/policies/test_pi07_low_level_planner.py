@@ -196,29 +196,33 @@ class TestPI07LowLevelPlannerIntegration:
 
     @classmethod
     def _train_prefix_total(cls, tokenizer) -> int:
+        # Layout (per π0.7 paper Fig. 19, image goals after the text prompt):
+        # video | lang | "State: " | state(T) | ", " | response | metadata |
+        # ";\n " | "Subgoal: " | subgoal_imgs | ", " | "Action: " | discrete
         m = cls._indicator_lens(tokenizer)
         p = 0
         p += VIDEO_TOKENS
         p += PROMPT_MAX_LENGTH
         p += m["state_lead"] + N_OBS_STEPS + m["comma"]
         p += RESPONSE_MAX_LENGTH
-        p += m["subgoal_lead"] + SUBGOAL_TOKENS + m["comma"]
         p += METADATA_MAX_LENGTH
         p += m["prefix_end"]
+        p += m["subgoal_lead"] + SUBGOAL_TOKENS + m["comma"]
         p += m["action_lead"] + DISCRETE_ACTION_MAX_LENGTH
         return p
 
     @classmethod
     def _infer_prefix_total(cls, tokenizer) -> int:
+        # Same Fig. 19 layout as training, minus the discrete-action block.
         m = cls._indicator_lens(tokenizer)
         p = 0
         p += VIDEO_TOKENS
         p += PROMPT_MAX_LENGTH
         p += m["state_lead"] + INFER_STATE_TOKENS + m["comma"]
         p += RESPONSE_MAX_LENGTH
-        p += m["subgoal_lead"] + SUBGOAL_TOKENS + m["comma"]
         p += METADATA_MAX_LENGTH
         p += m["prefix_end"]
+        p += m["subgoal_lead"] + SUBGOAL_TOKENS + m["comma"]
         return p
 
     @staticmethod
@@ -253,24 +257,27 @@ class TestPI07LowLevelPlannerIntegration:
         lang_slice = slice(LANG_START, LANG_START + PROMPT_MAX_LENGTH)
         state_t = INFER_STATE_TOKENS if inference_mode else N_OBS_STEPS
 
+        # Layout (post-Fig. 19): video | lang | "State: " | state | ", " |
+        # response | metadata | ";\n " | "Subgoal: " | subgoal_imgs | ", " |
+        # "Action: " | discrete
         resp_lo = LANG_START + PROMPT_MAX_LENGTH + m["state_lead"] + state_t + m["comma"]
         resp_slice = slice(resp_lo, resp_lo + RESPONSE_MAX_LENGTH)
 
-        sg_lo = resp_lo + RESPONSE_MAX_LENGTH + m["subgoal_lead"]
-        sg_slice = slice(sg_lo, sg_lo + SUBGOAL_TOKENS)
-
-        meta_lo = sg_lo + SUBGOAL_TOKENS + m["comma"]
+        meta_lo = resp_lo + RESPONSE_MAX_LENGTH
         meta_slice = slice(meta_lo, meta_lo + METADATA_MAX_LENGTH)
+
+        sg_lo = meta_lo + METADATA_MAX_LENGTH + m["prefix_end"] + m["subgoal_lead"]
+        sg_slice = slice(sg_lo, sg_lo + SUBGOAL_TOKENS)
 
         for i in range(prefix_pad_masks.shape[0]):
             assert torch.all(prefix_pad_masks[i, :VIDEO_TOKENS] == 1)
             self._check_ones_before_zeros(prefix_pad_masks[i, lang_slice])
             self._check_ones_before_zeros(prefix_pad_masks[i, resp_slice])
-            assert torch.all(prefix_pad_masks[i, sg_slice] == 1)
             self._check_ones_before_zeros(prefix_pad_masks[i, meta_slice])
+            assert torch.all(prefix_pad_masks[i, sg_slice] == 1)
 
             if not inference_mode:
-                da_lo = meta_lo + METADATA_MAX_LENGTH + m["prefix_end"] + m["action_lead"]
+                da_lo = sg_lo + SUBGOAL_TOKENS + m["comma"] + m["action_lead"]
                 da_slice = slice(da_lo, da_lo + DISCRETE_ACTION_MAX_LENGTH)
                 self._check_ones_before_zeros(prefix_pad_masks[i, da_slice])
 
@@ -708,21 +715,20 @@ class TestPI07LowLevelPlannerIntegration:
             f"would change this length."
         )
 
-        # No causal boundaries before the "Action: " indicator: every block in
-        # the collapsed prefix (videos / language / state / state-end) must
-        # remain bidirectional. The first ``1`` should appear at the start of
-        # the indicator span. Mirrors the CPU test invariant in
+        # Per π0.7 paper §VI.B (post-fix): the only bidirectional block at the
+        # head of the prefix is the video span; every text/state span after it
+        # opens its own causal block (text: ``[1] * N``; state: ``[1] + [0]*(T-1)``).
+        # So the first causal boundary should be at the start of the language
+        # span (right after the video block). Mirrors the CPU test invariant in
         # ``test_pi07_cpu.py::test_all_optional_blocks_absent_skips_emission``
         # but on the real Gemma 3 tokenizer.
         prefix_att_masks = captured["prefix_att_masks"][0].cpu()
         first_one = int((prefix_att_masks == 1).nonzero(as_tuple=False).flatten()[0].item())
-        expected_first_one = (
-            VIDEO_TOKENS + PROMPT_MAX_LENGTH + m["state_lead"] + N_OBS_STEPS + state_end_no_opt_len
-        )
+        expected_first_one = VIDEO_TOKENS  # = LANG_START
         assert first_one == expected_first_one, (
             f"first causal boundary at position {first_one}, expected {expected_first_one} "
-            f"(start of 'Action: ' indicator). An earlier ``1`` signals a spurious optional "
-            f"block was emitted."
+            f"(start of language span). A later ``1`` signals a regression to the pre-fix "
+            f"pattern that lumped lang/State:/state-end into the bidirectional video block."
         )
 
 

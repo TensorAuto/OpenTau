@@ -1150,10 +1150,13 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Embed all prefix modalities and build the 1-D attention pattern.
 
-        Concatenation order:
+        Concatenation order -- matches π0.7 paper Fig. 19's "image goals come
+        after the text prompt" rule (subgoal block sits at the tail, just
+        before the optional discrete-action block):
 
-        ``[videos | language | State: | state(T) | <state-end> | response? |
-        Subgoal: | subgoal_images… | ", " | metadata? | ";\\n "? |
+        ``[videos | language | State: | state(T) | <state-end> |
+        response? | metadata? | ";\\n "? |
+        Subgoal: subgoal_images... ", "? |
         ("Action:" + discrete_actions only when training)]``
 
         ``<state-end>`` is ``", "`` when at least one optional middle block
@@ -1173,15 +1176,21 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         Acceptable in practice for the homogeneous batches used in training;
         per-sample gating would require variable-length prefixes per sample.
 
-        Attention pattern (via ``att_masks`` cumsums):
-            - Video + language: bidirectional (``0``).
-            - ``State:``, projected state timestep tokens, state-end separator: bidirectional (``0``).
-            - Response spans: prefix-LM style block opening (``[1, 0, …]`` inside the segment).
-            - ``Subgoal:``: new bidirectional block (``[1, 0, …]``).
-            - Subgoal image patches per camera: bidirectional blocks (``[1, 0, …]``).
-            - Commas/metadata / ``";\\n "``: mostly continued prefix blocks (see code).
-            - ``Action:`` indicator: each token is its own causal block (``[1, 1, …]``).
-            - Discrete actions (training): causal ``1`` per timestep after ``Action:``.
+        Attention pattern (via ``att_masks`` cumsums). Paper §VI.B says
+        "observation tokens and subgoal image tokens use bidirectional
+        attention within themselves ... the following text tokens use causal
+        attention":
+
+            - Video patches: one bidirectional block (``[0] * N``).
+            - All text spans (language, ``State:``, state-end ``", "`` /
+              ``":\\n"``, response, metadata, ``";\\n "``, ``Subgoal:``,
+              trailing ``", "`` after subgoals, ``Action:``): one causal
+              block per token (``[1] * N``).
+            - State tokens (per-history-step linear projections): one
+              bidirectional block (``[1] + [0] * (T-1)``).
+            - Subgoal image patches: one bidirectional block per camera
+              (``[1] + [0] * (N-1)``).
+            - Discrete-action FAST tokens (training only): causal ``[1] * N``.
 
         Args:
             videos: List of video tensors, each ``(B, T, C, H, W)``.
@@ -1253,8 +1262,11 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
 
+        # Per π0.7 paper §VI.B: "The following text tokens use causal attention".
+        # Language tokens open one causal block per token after the bidirectional
+        # video prefix.
         num_lang_embs = lang_emb.shape[1]
-        att_masks += [0] * num_lang_embs
+        att_masks += [1] * num_lang_embs
 
         state_start_indicator_ids = self.language_tokenizer.encode("State: ", add_special_tokens=False)
         state_start_tokens = torch.tensor(
@@ -1271,7 +1283,8 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
 
         embs.append(state_start_emb)
         pad_masks.append(state_start_mask)
-        att_masks += [0] * num_state_start_embs
+        # "State: " indicator is text → causal per paper §VI.B.
+        att_masks += [1] * num_state_start_embs
 
         # Project each timestep's state into a separate VLM token
         # state: (B, T, max_state_dim) -> state_emb: (B, T, vlm_hidden_size)
@@ -1284,7 +1297,12 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
 
         embs.append(state_emb)
         pad_masks.append(state_mask)
-        att_masks += [0] * num_state_tokens  # full attention with video and language
+        # State tokens form their own bidirectional block (one per history step).
+        # The paper §VI.B describes state as a linear-projection embedding that is
+        # treated as an individual token, but does not classify it as text-causal,
+        # so we keep the bidirectional-among-state behaviour while opening a fresh
+        # block so it does not bleed into the now-causal "State: " indicator.
+        att_masks += [1] + [0] * (num_state_tokens - 1)
 
         # When optional middle blocks follow, use ", " as a state -> optional separator;
         # otherwise collapse to ":\n" so the trailing prefix-end can be omitted.
@@ -1302,7 +1320,8 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
 
         embs.append(state_end_emb)
         pad_masks.append(state_end_mask)
-        att_masks += [0] * num_state_end_embs
+        # state-end separator (", " or ":\n") is text → causal per paper §VI.B.
+        att_masks += [1] * num_state_end_embs
 
         # Only embed response when at least one sample in the batch has real response tokens.
         # With response_drop_prob=1.0 all masks are False; skipping avoids a spurious
@@ -1312,82 +1331,19 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             response_emb = self.gemma3_with_expert.embed_language_tokens(response_tokens)
             embs.append(response_emb)
             pad_masks.append(response_masks)
+            # Response (Subtask) is text → fully causal per paper §VI.B (was
+            # prefix-LM `[1] + [0]*(N-1)`, leaking future-token information into
+            # the response loss).
             num_response_embs = response_emb.shape[1]
-            att_masks += [1] + [0] * (num_response_embs - 1)
-
-        # Only embed the subgoal block (header + images + footer) when subgoal images are
-        # actually present. Unconditionally adding "Subgoal: " injects real (non-padded)
-        # spurious tokens into every prefix even with subgoal_drop_prob=1.0.
-        if subgoal_images and any(mask.any() for mask in subgoal_img_masks):
-            # Per-sample availability: True iff at least one camera slot
-            # has a real subgoal image for that sample. In a mixed batch
-            # (some samples have subgoals, others don't), the "Subgoal: "
-            # header and trailing ", " footer must follow this same mask —
-            # otherwise pad-only samples would receive real (unmasked)
-            # indicator tokens with no image content behind them, which
-            # the prefix-LM block then attends to as if it were grounded.
-            sample_has_subgoal = torch.stack([m.to(dtype=torch.bool) for m in subgoal_img_masks], dim=0).any(
-                dim=0
-            )
-
-            subgoal_img_start_indicator_ids = self.language_tokenizer.encode(
-                "Subgoal: ", add_special_tokens=False
-            )
-            subgoal_img_start_tokens = torch.tensor(
-                [subgoal_img_start_indicator_ids] * bsize,
-                device=lang_tokens.device,
-                dtype=torch.long,
-            )
-            subgoal_img_start_emb = self.gemma3_with_expert.embed_language_tokens(subgoal_img_start_tokens)
-
-            num_subgoal_img_start_embs = subgoal_img_start_emb.shape[1]
-            subgoal_img_start_mask = sample_has_subgoal[:, None].expand(bsize, num_subgoal_img_start_embs)
-
-            embs.append(subgoal_img_start_emb)
-            pad_masks.append(subgoal_img_start_mask)
-            att_masks += [1] + [0] * (num_subgoal_img_start_embs - 1)
-
-            for (
-                subgoal_img,
-                subgoal_img_mask,
-            ) in zip(subgoal_images, subgoal_img_masks, strict=True):
-                subgoal_img_emb = self.gemma3_with_expert.embed_image(subgoal_img)
-                subgoal_img_emb = subgoal_img_emb.to(dtype=_preferred_dtype())
-
-                # Gemma 3's projector does not apply the `/ sqrt(text_hidden_size)`
-                # scaling that stock PaliGemma does, so no un-normalization is
-                # required here (matches `embed_image` in `gemma3_with_expert.py`).
-
-                bsize, num_subgoal_img_embs = subgoal_img_emb.shape[:2]
-                subgoal_img_mask = subgoal_img_mask[:, None].expand(bsize, num_subgoal_img_embs)
-
-                embs.append(subgoal_img_emb)
-                pad_masks.append(subgoal_img_mask)
-
-                # Create attention masks so that image tokens attend to each other
-                att_masks += [1] + [0] * (num_subgoal_img_embs - 1)
-
-            subgoal_img_end_indicator_ids = self.language_tokenizer.encode(", ", add_special_tokens=False)
-            subgoal_img_end_tokens = torch.tensor(
-                [subgoal_img_end_indicator_ids] * bsize,
-                device=lang_tokens.device,
-                dtype=torch.long,
-            )
-            subgoal_img_end_emb = self.gemma3_with_expert.embed_language_tokens(subgoal_img_end_tokens)
-
-            num_subgoal_img_end_embs = subgoal_img_end_emb.shape[1]
-            subgoal_img_end_mask = sample_has_subgoal[:, None].expand(bsize, num_subgoal_img_end_embs)
-
-            embs.append(subgoal_img_end_emb)
-            pad_masks.append(subgoal_img_end_mask)
-            att_masks += [0] * num_subgoal_img_end_embs
+            att_masks += [1] * num_response_embs
 
         # Only embed metadata when at least one sample has real metadata tokens.
         if metadata_tokens is not None and metadata_masks is not None and metadata_masks.any():
             metadata_emb = self.gemma3_with_expert.embed_language_tokens(metadata_tokens)
             embs.append(metadata_emb)
             pad_masks.append(metadata_masks)
-            att_masks += [1] + [0] * (metadata_emb.shape[1] - 1)
+            # Metadata is text → causal per paper §VI.B.
+            att_masks += [1] * metadata_emb.shape[1]
 
         # Only emit the ";\n " prefix-end when at least one optional middle block was added
         # above. With no optional content, the state-end already collapsed to ":\n" and acts
@@ -1408,7 +1364,84 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
 
             embs.append(prefix_end_emb)
             pad_masks.append(prefix_end_mask)
-            att_masks += [0] * num_prefix_end_embs
+            # ";\n " separator is text → causal per paper §VI.B.
+            att_masks += [1] * num_prefix_end_embs
+
+        # Per π0.7 paper Fig. 19 caption: "When image goals are present, we include
+        # them as an additional block-causal bidirectional block, **after the text
+        # prompt**." So the subgoal block sits at the tail of the prefix, after all
+        # text (lang / state / response / metadata / ";\n ") and before the
+        # training-only discrete-action block.
+        #
+        # Only embed the subgoal block (header + images + footer) when subgoal images are
+        # actually present. Unconditionally adding "Subgoal: " injects real (non-padded)
+        # spurious tokens into every prefix even with subgoal_drop_prob=1.0.
+        if subgoal_images and any(mask.any() for mask in subgoal_img_masks):
+            # Per-sample availability: True iff at least one camera slot
+            # has a real subgoal image for that sample. In a mixed batch
+            # (some samples have subgoals, others don't), the "Subgoal: "
+            # header and trailing ", " footer must follow this same mask —
+            # otherwise pad-only samples would receive real (unmasked)
+            # indicator tokens with no image content behind them, which
+            # the model would then attend to as if they were grounded.
+            sample_has_subgoal = torch.stack([m.to(dtype=torch.bool) for m in subgoal_img_masks], dim=0).any(
+                dim=0
+            )
+
+            subgoal_img_start_indicator_ids = self.language_tokenizer.encode(
+                "Subgoal: ", add_special_tokens=False
+            )
+            subgoal_img_start_tokens = torch.tensor(
+                [subgoal_img_start_indicator_ids] * bsize,
+                device=lang_tokens.device,
+                dtype=torch.long,
+            )
+            subgoal_img_start_emb = self.gemma3_with_expert.embed_language_tokens(subgoal_img_start_tokens)
+
+            num_subgoal_img_start_embs = subgoal_img_start_emb.shape[1]
+            subgoal_img_start_mask = sample_has_subgoal[:, None].expand(bsize, num_subgoal_img_start_embs)
+
+            embs.append(subgoal_img_start_emb)
+            pad_masks.append(subgoal_img_start_mask)
+            # "Subgoal: " indicator is text → causal per paper §VI.B.
+            att_masks += [1] * num_subgoal_img_start_embs
+
+            for (
+                subgoal_img,
+                subgoal_img_mask,
+            ) in zip(subgoal_images, subgoal_img_masks, strict=True):
+                subgoal_img_emb = self.gemma3_with_expert.embed_image(subgoal_img)
+                subgoal_img_emb = subgoal_img_emb.to(dtype=_preferred_dtype())
+
+                # Gemma 3's projector does not apply the `/ sqrt(text_hidden_size)`
+                # scaling that stock PaliGemma does, so no un-normalization is
+                # required here (matches `embed_image` in `gemma3_with_expert.py`).
+
+                bsize, num_subgoal_img_embs = subgoal_img_emb.shape[:2]
+                subgoal_img_mask = subgoal_img_mask[:, None].expand(bsize, num_subgoal_img_embs)
+
+                embs.append(subgoal_img_emb)
+                pad_masks.append(subgoal_img_mask)
+
+                # Subgoal images: bidirectional within themselves, can attend everything
+                # earlier in the prefix (paper §VI.B). One bidirectional block per camera.
+                att_masks += [1] + [0] * (num_subgoal_img_embs - 1)
+
+            subgoal_img_end_indicator_ids = self.language_tokenizer.encode(", ", add_special_tokens=False)
+            subgoal_img_end_tokens = torch.tensor(
+                [subgoal_img_end_indicator_ids] * bsize,
+                device=lang_tokens.device,
+                dtype=torch.long,
+            )
+            subgoal_img_end_emb = self.gemma3_with_expert.embed_language_tokens(subgoal_img_end_tokens)
+
+            num_subgoal_img_end_embs = subgoal_img_end_emb.shape[1]
+            subgoal_img_end_mask = sample_has_subgoal[:, None].expand(bsize, num_subgoal_img_end_embs)
+
+            embs.append(subgoal_img_end_emb)
+            pad_masks.append(subgoal_img_end_mask)
+            # ", " separator after subgoal images is text → causal per paper §VI.B.
+            att_masks += [1] * num_subgoal_img_end_embs
 
         if discrete_actions is not None:
             discrete_action_start_indicator_ids = self.language_tokenizer.encode(

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU-only locking tests for the π0.7 PaliGemma attention layout.
+"""CPU-only locking tests for the π0.7 (Gemma 3 + SpaceTime SigLIP) attention layout.
 
 These tests pin the post-PR-#235-style fix: the π0.7 paper §VI.B says
 *"The following text tokens use causal attention"*, so every text span in
@@ -21,15 +21,13 @@ lumped into a bidirectional image / prefix-LM block.
 
 The tests only exercise the shared :func:`make_att_2d_masks` utility, so
 they run on CPU without instantiating any model. ``make_att_2d_masks`` is
-imported from the high-level planner module to sidestep the unrelated
-``VJEPA2VideoEncoder`` pre-existing import bug in the low-level planner
-module (tracked separately in #232 / #234); the implementation is byte-
-identical in both planners.
+imported from the high-level planner module; the implementation is byte-
+identical in the low-level planner module.
 """
 
 import torch
 
-from opentau.policies.pi07_paligemma.high_level_planner.modeling_pi07_high_level import (
+from opentau.policies.pi07.high_level_planner.modeling_pi07_high_level import (
     make_att_2d_masks,
 )
 
