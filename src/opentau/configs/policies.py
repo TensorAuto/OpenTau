@@ -395,6 +395,19 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         config_path = save_directory / CONFIG_NAME
         with open(config_path, "w") as f, draccus.config_type("json"):
             draccus.dump(self, f, indent=4)
+        # `draccus.dump` of a registered choice-type subclass (e.g. `PI06Config`)
+        # does NOT include the `type` discriminator at the top level — it only
+        # serializes dataclass fields, and `type` is a class-level attr from
+        # `register_subclass(...)`. Without `type` in the file,
+        # `PreTrainedConfig.from_pretrained(...)` (which delegates to
+        # `draccus.parse(PreTrainedConfig, ...)`) fails because it can't pick
+        # a subclass. Inject it post-hoc so the round-trip works.
+        with open(config_path) as f:
+            data = json.load(f)
+        if "type" not in data:
+            data = {"type": self.type, **data}
+            with open(config_path, "w") as f:
+                json.dump(data, f, indent=4)
         strip_deprecated_fields_from_json(config_path)
 
     @classmethod
