@@ -16,7 +16,7 @@
 """Configuration module for the π07 Low-Level Component.
 
 This module defines the ``PI07LowLevelConfig`` class, which handles
-configuration parameters for the π07 low-level component. This planner uses
+configuration parameters for the π07 low-level component. This component uses
 SpaceTimeSiglip (the Gemma 3 SigLIP vision tower wrapped with space-time
 separable attention) as a video encoder, processes temporal state sequences
 (one continuous token per timestep), and supports optional subtask response,
