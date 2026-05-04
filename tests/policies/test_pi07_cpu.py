@@ -851,6 +851,192 @@ class TestEmbedPrefixConditionalGuards:
         )
 
 
+# `embed_prefix` attention layout — high-level planner
+#
+# The HL planner mirrors the post-fix paper §VI.B layout: bidirectional image
+# block, then every text span (language / metadata / ";\n " / "Updated Memory: "
+# / memory / "Subtask: " / response) opens one causal block per token. The
+# response (Subtask) span specifically must be fully causal `[1] * N` — a
+# regression to the prefix-LM `[1] + [0] * (N-1)` would silently leak future
+# tokens into the response loss and would only fire on the GPU integration
+# tests. This CPU coverage matches what TestEmbedPrefixConditionalGuards does
+# for the LL planner.
+
+
+def _make_fake_high_level(*, hidden: int = 4, n_img_tokens: int = 3):
+    """Construct a minimal stand-in for ``PI07HighLevelPlannerModel`` so its
+    ``embed_prefix`` runs end-to-end without instantiating the real Gemma 3
+    backbone. Mirrors :func:`_make_fake_flow_matching` for the LL planner.
+    """
+    import types
+
+    class _FakeGemma3WithExpert:
+        def embed_language_tokens(self, tokens):
+            return torch.zeros((*tokens.shape, hidden), dtype=torch.float32)
+
+        def embed_image(self, image):
+            return torch.zeros(image.shape[0], n_img_tokens, hidden, dtype=torch.float32)
+
+    class _FakeTokenizer:
+        # Every indicator phrase encodes to exactly 2 tokens (matches LL fake).
+        def encode(self, text, add_special_tokens=False):
+            return [1, 2]
+
+    return types.SimpleNamespace(
+        gemma3_with_expert=_FakeGemma3WithExpert(),
+        language_tokenizer=_FakeTokenizer(),
+    )
+
+
+def _hl_embed_prefix_method():
+    from opentau.policies.pi07.high_level_planner.modeling_pi07_high_level import (
+        PI07HighLevelPlannerModel,
+    )
+
+    return PI07HighLevelPlannerModel.embed_prefix
+
+
+def _build_hl_default_inputs(*, batch_size: int = 2, prompt_len: int = 3):
+    """Minimal kwargs every HL ``embed_prefix`` invocation needs."""
+    return {
+        "images": [torch.zeros(batch_size, 3, 4, 4)],
+        "img_masks": [torch.ones(batch_size, dtype=torch.bool)],
+        "lang_tokens": torch.zeros(batch_size, prompt_len, dtype=torch.long),
+        "lang_masks": torch.ones(batch_size, prompt_len, dtype=torch.bool),
+        "response_tokens": None,
+        "response_masks": None,
+        "memory_tokens": None,
+        "memory_masks": None,
+        "metadata_tokens": None,
+        "metadata_masks": None,
+    }
+
+
+class TestHighLevelEmbedPrefixConditionalGuards:
+    """CPU coverage of the HL planner's ``embed_prefix`` att_masks layout.
+
+    Mirrors :class:`TestEmbedPrefixConditionalGuards` (the LL counterpart). A
+    regression that re-introduces the prefix-LM ``[1] + [0]*(N-1)`` pattern on
+    the response span — the exact bug the response-block layout test is meant
+    to guard — would otherwise slip past CPU CI and only fire on the GPU
+    integration tests.
+    """
+
+    def test_inference_layout_no_memory_no_response(self):
+        """Inference: ``memory_tokens`` and ``response_tokens`` are None,
+        metadata is all-padded → prefix collapses to
+        ``[images | lang | "Updated Memory: "]``. ``;\\n "`` is dropped because
+        metadata is empty; ``"Updated Memory: "`` is unconditional (anchors
+        AR memory decoding).
+
+        Per paper §VI.B the image span is bidirectional and the language /
+        ``"Updated Memory: "`` spans are per-token causal.
+        """
+        method = _hl_embed_prefix_method()
+        fake = _make_fake_high_level()
+        bsize = 2
+        kwargs = _build_hl_default_inputs(batch_size=bsize)
+        kwargs["metadata_tokens"] = torch.zeros(bsize, 4, dtype=torch.long)
+        kwargs["metadata_masks"] = torch.zeros(bsize, 4, dtype=torch.bool)
+
+        embs, pad_masks, att_masks = method(fake, **kwargs)
+
+        # images(3) + lang(3) + "Updated Memory: "(2) = 8
+        num_img_tokens = 3
+        total_len = 8
+        assert embs.shape == (bsize, total_len, 4)
+        assert pad_masks.shape == (bsize, total_len)
+        assert att_masks.shape == (bsize, total_len)
+
+        img_span = att_masks[0, :num_img_tokens]
+        post_img = att_masks[0, num_img_tokens:]
+        assert int(img_span.sum().item()) == 0, (
+            f"image span should be bidirectional ([0]*N), got {img_span.tolist()}"
+        )
+        assert int(post_img.sum().item()) == total_len - num_img_tokens, (
+            f"every post-image token should open its own causal block (text causal "
+            f"per paper §VI.B); got {post_img.tolist()}"
+        )
+
+    def test_metadata_present_emits_metadata_and_prefix_end_blocks(self):
+        """``metadata_masks.any() == True`` → metadata block AND the trailing
+        ``;\\n "`` separator are both emitted, both fully causal per paper §VI.B.
+        """
+        method = _hl_embed_prefix_method()
+        fake = _make_fake_high_level()
+        bsize = 2
+        kwargs = _build_hl_default_inputs(batch_size=bsize)
+        meta_len = 4
+        kwargs["metadata_tokens"] = torch.zeros(bsize, meta_len, dtype=torch.long)
+        # Sample 0 has real metadata; sample 1 is fully padded — the gate is
+        # batch-wide (any-True triggers emission) so both blocks must fire.
+        kwargs["metadata_masks"] = torch.tensor([[True, True, False, False], [False, False, False, False]])
+
+        _, pad_masks, att_masks = method(fake, **kwargs)
+
+        # images(3) + lang(3) + metadata(4) + ";\n "(2) + "Updated Memory: "(2) = 14
+        num_img_tokens = 3
+        total_len = 14
+        assert pad_masks.shape == (bsize, total_len)
+        assert att_masks.shape == (bsize, total_len)
+
+        img_span = att_masks[0, :num_img_tokens]
+        post_img = att_masks[0, num_img_tokens:]
+        assert int(img_span.sum().item()) == 0, f"image span should be bidirectional, got {img_span.tolist()}"
+        assert int(post_img.sum().item()) == total_len - num_img_tokens, (
+            f"every post-image token must open its own causal block per paper §VI.B; got {post_img.tolist()}"
+        )
+
+    def test_training_response_block_is_fully_causal(self):
+        """Training: with both ``memory_tokens`` and ``response_tokens`` set,
+        the response (Subtask) span must be fully causal ``[1] * N`` per paper
+        §VI.B. A regression to ``[1] + [0] * (N-1)`` would put a single
+        bidirectional block over the response and silently leak future tokens
+        into the response CE loss.
+        """
+        method = _hl_embed_prefix_method()
+        fake = _make_fake_high_level()
+        bsize = 2
+        kwargs = _build_hl_default_inputs(batch_size=bsize)
+        memory_len = 3
+        response_len = 5
+        kwargs["memory_tokens"] = torch.zeros(bsize, memory_len, dtype=torch.long)
+        kwargs["memory_masks"] = torch.ones(bsize, memory_len, dtype=torch.bool)
+        kwargs["response_tokens"] = torch.zeros(bsize, response_len, dtype=torch.long)
+        kwargs["response_masks"] = torch.ones(bsize, response_len, dtype=torch.bool)
+        # Metadata padded → metadata + ";\n " blocks are skipped.
+        kwargs["metadata_tokens"] = torch.zeros(bsize, 4, dtype=torch.long)
+        kwargs["metadata_masks"] = torch.zeros(bsize, 4, dtype=torch.bool)
+
+        _, _, att_masks = method(fake, **kwargs)
+
+        # Layout (no metadata):
+        #   images(3) + lang(3) + "Updated Memory: "(2) + memory(3)
+        #     + "Subtask: "(2) + response(5) = 18
+        num_img_tokens = 3
+        total_len = 18
+        assert att_masks.shape == (bsize, total_len)
+
+        img_span = att_masks[0, :num_img_tokens]
+        post_img = att_masks[0, num_img_tokens:]
+        assert int(img_span.sum().item()) == 0, f"image span should be bidirectional, got {img_span.tolist()}"
+        assert int(post_img.sum().item()) == total_len - num_img_tokens, (
+            f"every post-image token must open its own causal block per paper §VI.B "
+            f"(incl. the response span fully causal, NOT prefix-LM `[1] + [0]*(N-1)`); "
+            f"got {post_img.tolist()}"
+        )
+
+        # Lock the response sub-block specifically: a regression to the old
+        # prefix-LM pattern would put `[1, 0, 0, 0, 0]` in those slots.
+        # Response sits at the tail, right after "Subtask: " (2 tokens).
+        response_start = total_len - response_len
+        response_block = att_masks[0, response_start:total_len]
+        assert torch.all(response_block == 1), (
+            f"response sub-block must be fully causal `[1] * N` per paper §VI.B, "
+            f"got {response_block.tolist()} (regression to prefix-LM `[1] + [0]*(N-1)`)"
+        )
+
+
 # Engine-level config validation: SDPA accepted, fa2 falls back to eager with
 # a warning (was: NotImplementedError), garbage values raise.
 

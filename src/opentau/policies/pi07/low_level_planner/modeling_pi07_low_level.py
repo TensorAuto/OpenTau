@@ -1264,7 +1264,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
 
         # Per π0.7 paper §VI.B: "The following text tokens use causal attention".
         # Language tokens open one causal block per token after the bidirectional
-        # video prefix (same fix as PR #235 for π0.6).
+        # video prefix.
         num_lang_embs = lang_emb.shape[1]
         att_masks += [1] * num_lang_embs
 

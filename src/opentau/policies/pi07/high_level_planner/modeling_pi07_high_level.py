@@ -913,7 +913,8 @@ class PI07HighLevelPlannerModel(nn.Module):
         "observation tokens use bidirectional attention within themselves ...
         the following text tokens use causal attention":
 
-            - Image patches: one bidirectional block per camera (``[0] * N``).
+            - Image patches: one bidirectional block shared across all cameras
+              (``[0] * N``).
             - All text spans (language, metadata, ``";\\n "``,
               ``"Updated Memory: "``, ``"Subtask: "``, memory content,
               response content): causal -- one block per token (``[1] * N``).
@@ -979,7 +980,7 @@ class PI07HighLevelPlannerModel(nn.Module):
 
         # Per π0.7 paper §VI.B: "The following text tokens use causal attention".
         # Language tokens open one causal block per token after the bidirectional
-        # image prefix (same fix as PR #235 for π0.6).
+        # image prefix.
         num_lang_embs = lang_emb.shape[1]
         att_masks += [1] * num_lang_embs
 
