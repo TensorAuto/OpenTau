@@ -345,7 +345,7 @@ class TestNoManualSqrtScalingInPlannerSource:
     @pytest.mark.parametrize(
         "module_path",
         [
-            "src/opentau/policies/pi07/low_level_planner/modeling_pi07_low_level.py",
+            "src/opentau/policies/pi07/low_level/modeling_pi07_low_level.py",
             "src/opentau/policies/pi07/high_level_planner/modeling_pi07_high_level.py",
         ],
     )
@@ -423,7 +423,7 @@ class TestPrepareMetadataSegments:
       * ``robot_type`` / ``control_mode`` (PR-introduced) emit ``"Robot: ..."``
         and ``"Control: ..."`` segments only when non-empty.
       * Missing batch keys default to "fully padded" → empty string.
-      * The high- and low-level planners agree on the all-empty case.
+      * The high- and low-level components agree on the all-empty case.
     """
 
     @staticmethod
@@ -431,12 +431,12 @@ class TestPrepareMetadataSegments:
         from opentau.policies.pi07.high_level_planner.modeling_pi07_high_level import (
             PI07HighLevelPlannerPolicy,
         )
-        from opentau.policies.pi07.low_level_planner.modeling_pi07_low_level import (
-            PI07LowLevelPlannerPolicy,
+        from opentau.policies.pi07.low_level.modeling_pi07_low_level import (
+            PI07LowLevelPolicy,
         )
 
         return {
-            "low": PI07LowLevelPlannerPolicy.prepare_metadata,
+            "low": PI07LowLevelPolicy.prepare_metadata,
             "high": PI07HighLevelPlannerPolicy.prepare_metadata,
         }
 
@@ -520,15 +520,15 @@ class TestPrepareMetadataSegments:
 
     def test_low_level_missing_speed_pad_does_not_fabricate_value(self):
         """Regression for the zeros→ones default fix: with ``speed`` and
-        ``speed_is_pad`` both absent from the batch, the low-level planner
+        ``speed_is_pad`` both absent from the batch, the low-level component
         must NOT emit ``"Speed: 0.0"`` — that would surface a value the
         caller never provided.
         """
-        from opentau.policies.pi07.low_level_planner.modeling_pi07_low_level import (
-            PI07LowLevelPlannerPolicy,
+        from opentau.policies.pi07.low_level.modeling_pi07_low_level import (
+            PI07LowLevelPolicy,
         )
 
-        method = PI07LowLevelPlannerPolicy.prepare_metadata
+        method = PI07LowLevelPolicy.prepare_metadata
         fake, captured = _make_fake_planner()
 
         batch_size = 2
@@ -544,7 +544,7 @@ class TestPrepareMetadataSegments:
 
 # `embed_prefix` conditional-block guards
 #
-# The low-level planner skips entire prefix blocks when their availability
+# The low-level component skips entire prefix blocks when their availability
 # masks are all-False (response_masks, subgoal_img_masks, metadata_masks).
 # Pinning that on the CPU side means a regression that re-introduces a
 # spurious causal boundary (att_masks=[1,...]) on a fully-padded slot is
@@ -552,7 +552,7 @@ class TestPrepareMetadataSegments:
 
 
 def _make_fake_flow_matching(*, hidden: int = 4, n_video_tokens: int = 3):
-    """Construct a minimal stand-in for ``PI07LowLevelPlannerFlowMatching``
+    """Construct a minimal stand-in for ``PI07LowLevelFlowMatching``
     so ``embed_prefix`` runs end-to-end without instantiating the real
     Gemma 3 backbone.
 
@@ -600,11 +600,11 @@ def _make_fake_flow_matching(*, hidden: int = 4, n_video_tokens: int = 3):
 
 
 def _embed_prefix_method():
-    from opentau.policies.pi07.low_level_planner.modeling_pi07_low_level import (
-        PI07LowLevelPlannerFlowMatching,
+    from opentau.policies.pi07.low_level.modeling_pi07_low_level import (
+        PI07LowLevelFlowMatching,
     )
 
-    return PI07LowLevelPlannerFlowMatching.embed_prefix
+    return PI07LowLevelFlowMatching.embed_prefix
 
 
 def _build_default_inputs(*, batch_size: int = 2, prompt_len: int = 3, t_state: int = 1):
@@ -1233,28 +1233,28 @@ class TestPi07ConfigPlumbing:
         from opentau.policies.pi07.high_level_planner.configuration_pi07_high_level import (
             PI07HighLevelPlannerConfig,
         )
-        from opentau.policies.pi07.low_level_planner.configuration_pi07_low_level import (
-            PI07LowLevelPlannerConfig,
+        from opentau.policies.pi07.low_level.configuration_pi07_low_level import (
+            PI07LowLevelConfig,
         )
 
         hl = PI07HighLevelPlannerConfig(gradient_checkpointing=True)
         assert hl.vlm_config.gradient_checkpointing is True
 
-        ll = PI07LowLevelPlannerConfig(gradient_checkpointing=True)
+        ll = PI07LowLevelConfig(gradient_checkpointing=True)
         assert ll.vlm_config.gradient_checkpointing is True
 
     def test_post_init_plumbs_attention_impl_into_vlm_config(self):
         from opentau.policies.pi07.high_level_planner.configuration_pi07_high_level import (
             PI07HighLevelPlannerConfig,
         )
-        from opentau.policies.pi07.low_level_planner.configuration_pi07_low_level import (
-            PI07LowLevelPlannerConfig,
+        from opentau.policies.pi07.low_level.configuration_pi07_low_level import (
+            PI07LowLevelConfig,
         )
 
         hl = PI07HighLevelPlannerConfig(attention_implementation="sdpa")
         assert hl.vlm_config.attention_implementation == "sdpa"
 
-        ll = PI07LowLevelPlannerConfig(attention_implementation="sdpa")
+        ll = PI07LowLevelConfig(attention_implementation="sdpa")
         assert ll.vlm_config.attention_implementation == "sdpa"
 
     def test_post_init_preserves_explicit_vlm_config_when_policy_default(self):

@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Configuration module for the π07 Low-Level Planner.
+"""Configuration module for the π07 Low-Level Component.
 
-This module defines the ``PI07LowLevelPlannerConfig`` class, which handles
-configuration parameters for the π07 low-level planner. This planner uses
+This module defines the ``PI07LowLevelConfig`` class, which handles
+configuration parameters for the π07 low-level component. This component uses
 SpaceTimeSiglip (the Gemma 3 SigLIP vision tower wrapped with space-time
 separable attention) as a video encoder, processes temporal state sequences
 (one continuous token per timestep), and supports optional subtask response,
@@ -37,10 +37,10 @@ from opentau.policies.pi07.gemma3_with_expert import Gemma3WithExpertConfig
 
 @PreTrainedConfig.register_subclass("pi07_low_level")
 @dataclass
-class PI07LowLevelPlannerConfig(PreTrainedConfig):
-    """Configuration for the π07 low-level planner.
+class PI07LowLevelConfig(PreTrainedConfig):
+    """Configuration for the π07 low-level component.
 
-    The low-level planner generates continuous action chunks via flow matching
+    The low-level component generates continuous action chunks via flow matching
     and discrete FAST action tokens through the VLM backbone. It uses
     :class:`SpaceTimeSiglipVideoEncoder` (the Gemma 3 SigLIP vision tower
     wrapped with space-time separable attention) as a video encoder and

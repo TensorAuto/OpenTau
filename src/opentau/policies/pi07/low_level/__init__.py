@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-π07 Low-Level Planner Module.
+π07 Low-Level Module.
 
-This module implements the low-level planner of the π07 hierarchical
-architecture. It uses SpaceTimeSiglip as a video encoder, processes temporal state
-sequences (one continuous token per timestep), and supports optional subtask
-response, subgoal image, and metadata conditioning.  Action generation
-combines flow matching (continuous actions via an action expert) with FAST
-discrete token prediction (through the VLM backbone with Knowledge
-Insulation).
+This module implements the low-level component of the π07 hierarchical
+architecture — a flow-matching action generator (not a "planner"; the
+actual planning happens in the high-level module). It uses SpaceTimeSiglip
+as a video encoder, processes temporal state sequences (one continuous
+token per timestep), and supports optional subtask response, subgoal
+image, and metadata conditioning. Action generation combines flow
+matching (continuous actions via an action expert) with FAST discrete
+token prediction (through the VLM backbone with Knowledge Insulation).
 """

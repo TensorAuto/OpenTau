@@ -40,8 +40,8 @@ from opentau.policies.pi06.configuration_pi06 import PI06Config
 from opentau.policies.pi07.high_level_planner.configuration_pi07_high_level import (
     PI07HighLevelPlannerConfig,
 )
-from opentau.policies.pi07.low_level_planner.configuration_pi07_low_level import (
-    PI07LowLevelPlannerConfig,
+from opentau.policies.pi07.low_level.configuration_pi07_low_level import (
+    PI07LowLevelConfig,
 )
 from opentau.policies.pi07_paligemma.high_level_planner.configuration_pi07_high_level import (
     PI07HighLevelPlannerConfig as PI07PaligemmaHighLevelPlannerConfig,
@@ -110,11 +110,11 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
 
         return PI07HighLevelPlannerPolicy
     elif name == "pi07_low_level":
-        from opentau.policies.pi07.low_level_planner.modeling_pi07_low_level import (
-            PI07LowLevelPlannerPolicy,
+        from opentau.policies.pi07.low_level.modeling_pi07_low_level import (
+            PI07LowLevelPolicy,
         )
 
-        return PI07LowLevelPlannerPolicy
+        return PI07LowLevelPolicy
     elif name == "value":
         from opentau.policies.value.modeling_value import ValueFunction
 
@@ -159,7 +159,7 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
     elif policy_type == "pi07_high_level":
         return PI07HighLevelPlannerConfig(**kwargs)
     elif policy_type == "pi07_low_level":
-        return PI07LowLevelPlannerConfig(**kwargs)
+        return PI07LowLevelConfig(**kwargs)
     elif policy_type == "value":
         return ValueConfig(**kwargs)
     else:

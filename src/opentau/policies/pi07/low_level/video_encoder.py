@@ -37,7 +37,7 @@ Key properties:
     always ``False`` by construction.
 
 The encoder does NOT own its own copy of the SigLIP weights. The caller
-(``PI07LowLevelPlannerFlowMatching``) constructs a ``Gemma3WithExpertModel``
+(``PI07LowLevelFlowMatching``) constructs a ``Gemma3WithExpertModel``
 — which already owns ``vision_tower`` and ``multi_modal_projector`` (under
 ``gemma3.model``) — and passes them in by reference. This avoids duplicating
 ~400M parameters in memory.
@@ -375,7 +375,7 @@ class SpaceTimeSiglipVideoEncoder(nn.Module):
     module holds them by reference (via a list, so ``nn.Module`` does not
     re-register their parameters under this module's path) and mutates the
     vision_tower's encoder in place to wrap every ``spacetime_layer_stride``-th
-    layer. In practice the only caller is ``PI07LowLevelPlannerFlowMatching``,
+    layer. In practice the only caller is ``PI07LowLevelFlowMatching``,
     which passes in the ``Gemma3WithExpertModel``'s SigLIP vision components
     (resolved via ``_vision_tower()`` / ``_multi_modal_projector()``).
     """

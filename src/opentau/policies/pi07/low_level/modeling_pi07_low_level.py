@@ -15,10 +15,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""π07 Low-Level Planner: a Vision-Language-Action Flow Model for continuous
+"""π07 Low-Level Component: a Vision-Language-Action Flow Model for continuous
 action generation.
 
-The low-level planner is one half of the π07 hierarchical architecture.
+The low-level component is one half of the π07 hierarchical architecture.
 Given video observations (encoded by SpaceTimeSiglip), a language prompt, an
 optional subtask response from the high-level planner, temporal
 proprioceptive state, optional subgoal images, and optional metadata, it
@@ -55,10 +55,10 @@ from opentau.policies.normalize import Normalize, Unnormalize
 from opentau.policies.pi07.gemma3_with_expert import (
     Gemma3WithExpertModel,
 )
-from opentau.policies.pi07.low_level_planner.configuration_pi07_low_level import (
-    PI07LowLevelPlannerConfig,
+from opentau.policies.pi07.low_level.configuration_pi07_low_level import (
+    PI07LowLevelConfig,
 )
-from opentau.policies.pi07.low_level_planner.video_encoder import SpaceTimeSiglipVideoEncoder
+from opentau.policies.pi07.low_level.video_encoder import SpaceTimeSiglipVideoEncoder
 from opentau.policies.pretrained import PreTrainedPolicy, T
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
@@ -214,20 +214,20 @@ def pad_discrete_tokens(tokens: list[list[int]], max_length: int) -> tuple[np.nd
 
 
 # Policy wrapper
-class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
-    """Policy wrapper for the π07 low-level planner.
+class PI07LowLevelPolicy(PreTrainedPolicy):
+    """Policy wrapper for the π07 low-level component.
 
     Handles tokenization, normalization, observation-history buffering, and
     action queue management around the inner
-    :class:`PI07LowLevelPlannerFlowMatching` model.
+    :class:`PI07LowLevelFlowMatching` model.
     """
 
-    config_class = PI07LowLevelPlannerConfig
+    config_class = PI07LowLevelConfig
     name = "pi07_low_level"
 
     def __init__(
         self,
-        config: PI07LowLevelPlannerConfig,
+        config: PI07LowLevelConfig,
         dataset_stats: dict[str, dict[str, Tensor]] | None = None,
     ):
         super().__init__(config)
@@ -250,9 +250,7 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             "physical-intelligence/fast", trust_remote_code=True
         )
         discrete_action_vocab_size = getattr(self.discrete_action_processor, "vocab_size", None)
-        self.model = PI07LowLevelPlannerFlowMatching(
-            config, discrete_action_vocab_size=discrete_action_vocab_size
-        )
+        self.model = PI07LowLevelFlowMatching(config, discrete_action_vocab_size=discrete_action_vocab_size)
 
         self.reset()
 
@@ -425,7 +423,7 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
-        raise NotImplementedError("Currently not implemented for PI07 low-level planner")
+        raise NotImplementedError("Currently not implemented for PI07 low-level component")
 
     def _build_history_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         """Buffer the current observation and construct a temporal batch.
@@ -848,7 +846,7 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         Wraps each response string as ``"Subtask: {response}, "`` and
         pads/truncates to ``response_max_length``. Uses ``add_special_tokens=False`` so
         no BOS (or other special tokens) are inserted; the prefix already encodes a
-        ``"Subtask: "`` span in :meth:`PI07LowLevelPlannerFlowMatching.embed_prefix`.
+        ``"Subtask: "`` span in :meth:`PI07LowLevelFlowMatching.embed_prefix`.
 
         Args:
             batch: Batch dict containing ``"response"`` (list of strings).
@@ -1038,8 +1036,8 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
 
 # Flow-matching model
-class PI07LowLevelPlannerFlowMatching(nn.Module):
-    """π07 Low-Level Planner: flow-matching action generation with Knowledge Insulation.
+class PI07LowLevelFlowMatching(nn.Module):
+    """π07 Low-Level Component: flow-matching action generation with Knowledge Insulation.
 
     Architecture overview::
 
@@ -1071,7 +1069,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
     predict the velocity field.
     """
 
-    def __init__(self, config: PI07LowLevelPlannerConfig, discrete_action_vocab_size: int | None = None):
+    def __init__(self, config: PI07LowLevelConfig, discrete_action_vocab_size: int | None = None):
         super().__init__()
         self.config = config
 
