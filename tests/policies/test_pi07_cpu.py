@@ -640,6 +640,14 @@ class TestEmbedPrefixConditionalGuards:
         from ``", "`` to ``":\\n"`` (same fake-tokenizer length: 2 tokens) and
         the trailing ``";\\n "`` prefix-end is omitted entirely so it cannot
         dangle as a spurious separator before ``"Action: "``.
+
+        Per π0.7 paper §VI.B, the post-fix att_masks pattern is:
+            videos: ``[0] * 3`` (one bidirectional video block)
+            lang:   ``[1] * 3`` (text → causal)
+            "State: ": ``[1] * 2`` (text → causal)
+            state:  ``[1]`` (own bidirectional block; T=1 here)
+            ":\\n":  ``[1] * 2`` (text → causal)
+        So the only zeros are in the video span.
         """
         method = _embed_prefix_method()
         fake = _make_fake_flow_matching()
@@ -665,14 +673,24 @@ class TestEmbedPrefixConditionalGuards:
         #   state(T=1):     1
         #   ":\n":          2  (state-end; collapsed from ", " because no optionals)
         # Total = 11  (";\n " prefix-end is omitted with no optional content)
-        assert embs.shape == (bsize, 11, 4)
-        assert pad_masks.shape == (bsize, 11)
-        assert att_masks.shape == (bsize, 11)
-        # No causal boundaries (1's) anywhere in the att_masks — every block
-        # should remain bidirectional with all-skip optional blocks.
-        assert int(att_masks[0].sum().item()) == 0, (
-            "att_masks contained a causal boundary — a guarded block was emitted "
-            "anyway: this would corrupt the cumsum for every subsequent token."
+        num_video_tokens = 3
+        total_len = 11
+        assert embs.shape == (bsize, total_len, 4)
+        assert pad_masks.shape == (bsize, total_len)
+        assert att_masks.shape == (bsize, total_len)
+        # Video span is bidirectional, every text/state span after it is causal.
+        # A regression that re-emits a guarded block would push the total length
+        # past 11 (caught by the shape assertion above) AND would inject extra
+        # causal boundaries beyond the per-text-token expectation.
+        video_span = att_masks[0, :num_video_tokens]
+        post_video = att_masks[0, num_video_tokens:]
+        assert int(video_span.sum().item()) == 0, (
+            f"video span should be bidirectional ([0]*N), got {video_span.tolist()}"
+        )
+        assert int(post_video.sum().item()) == total_len - num_video_tokens, (
+            f"every post-video token should open its own causal block (text causal "
+            f"per paper §VI.B; state opens own bidirectional block of size 1), "
+            f"got {post_video.tolist()}"
         )
 
     def test_mixed_subgoal_availability_zeros_pad_only_samples(self):
@@ -695,22 +713,17 @@ class TestEmbedPrefixConditionalGuards:
 
         _, pad_masks, _ = method(fake, **kwargs)
 
-        # The Subgoal: header is 2 tokens (fake tokenizer); the image is 2 tokens
-        # (fake embed_image); the trailing ", " is 2 tokens. The mask values for
-        # those 6 tokens must mirror per_sample_mask on every emitted slot.
-        # Easiest assertion: at least one row has pad=False everywhere in the
-        # subgoal block (sample 1), and at least one row has pad=True (sample 0).
-        # We don't pin exact slice boundaries here — instead we check that the
-        # union of per_sample_mask=False rows are all-zero on the subgoal slice.
-        # Total length sanity:
+        # Layout (post-Fig. 19 reorder; subgoal block sits at the tail):
         #   videos(3) + lang(3) + "State: "(2) + state(1) + ", "(2)
-        #     + "Subgoal: "(2) + subgoal_img(2) + ", "(2)
-        #     + ";\n "(2) = 19
+        #     + ";\n "(2)
+        #     + "Subgoal: "(2) + subgoal_img(2) + ", "(2) = 19
+        # (metadata is skipped: metadata_masks all False)
         assert pad_masks.shape == (bsize, 19)
-        # The subgoal block is the 6 tokens at indices 11..16 (after the
-        # prefix-LM transition); the sample with no subgoal must be False
-        # across all 6, and the sample with a subgoal must be True across all 6.
-        subgoal_block = pad_masks[:, 11:17]
+        # The subgoal block (header + image + trailing ", ") is the 6 tokens at
+        # indices 13..18 in the post-Fig. 19 layout; the sample with no subgoal
+        # must be False across all 6, and the sample with a subgoal must be True
+        # across all 6.
+        subgoal_block = pad_masks[:, 13:19]
         assert subgoal_block[0].all().item() is True, (
             "sample 0 (has subgoal) should have all-True pad mask on the subgoal block"
         )
@@ -722,13 +735,14 @@ class TestEmbedPrefixConditionalGuards:
 
     def test_response_mask_any_true_emits_block(self):
         """When at least one sample has a real response, the response block
-        IS emitted and contributes a causal boundary token.
+        IS emitted with the post-fix fully-causal pattern (one block per token).
         """
         method = _embed_prefix_method()
         fake = _make_fake_flow_matching()
         bsize = 2
         kwargs = _build_default_inputs(batch_size=bsize)
-        kwargs["response_tokens"] = torch.zeros(bsize, 5, dtype=torch.long)
+        response_len = 5
+        kwargs["response_tokens"] = torch.zeros(bsize, response_len, dtype=torch.long)
         # Sample 0 has real response; sample 1 is all padded.
         kwargs["response_masks"] = torch.tensor(
             [[True, True, True, False, False], [False, False, False, False, False]]
@@ -740,13 +754,33 @@ class TestEmbedPrefixConditionalGuards:
 
         _, _, att_masks = method(fake, **kwargs)
 
-        # Without the response block, att_masks would be all-zeros (see
-        # test_all_optional_blocks_absent_skips_emission). With the response
-        # block, att_masks gets exactly one ``1`` (the prefix-LM block opening
-        # at the start of the 5-token response span).
-        per_sample_sum = int(att_masks[0].sum().item())
-        assert per_sample_sum == 1, (
-            f"expected exactly one causal boundary from the response block opening, got {per_sample_sum}"
+        # Layout (has_response=True triggers state-end="," and trailing ";\n "):
+        #   videos(3) + lang(3) + "State: "(2) + state(1) + ", "(2)
+        #     + response(5) + ";\n "(2) = 18
+        num_video_tokens = 3
+        total_len = 18
+        assert att_masks.shape == (bsize, total_len)
+        # Per paper §VI.B post-fix: video span bidirectional, every text/state
+        # token after it opens its own causal block (response is fully causal,
+        # not prefix-LM `[1] + [0]*(N-1)` which would leak future tokens into
+        # the response loss). Sum = total_len - num_video_tokens.
+        video_span = att_masks[0, :num_video_tokens]
+        post_video = att_masks[0, num_video_tokens:]
+        assert int(video_span.sum().item()) == 0, (
+            f"video span should be bidirectional, got {video_span.tolist()}"
+        )
+        assert int(post_video.sum().item()) == total_len - num_video_tokens, (
+            f"post-video tokens should each open their own causal block (incl. the "
+            f"5-token response span fully causal per paper §VI.B); got {post_video.tolist()}"
+        )
+        # Lock the response sub-block specifically: a regression to the old
+        # prefix-LM pattern would put `[1, 0, 0, 0, 0]` in those slots.
+        # Response sits right after state-end (", "): index 11..15.
+        response_slice_start = num_video_tokens + 3 + 2 + 1 + 2  # 11
+        response_block = att_masks[0, response_slice_start : response_slice_start + response_len]
+        assert torch.all(response_block == 1), (
+            f"response sub-block must be fully causal `[1] * N` per paper §VI.B, "
+            f"got {response_block.tolist()} (regression to prefix-LM `[1] + [0]*(N-1)`)"
         )
 
     def test_discrete_actions_indicator_uses_per_token_causal_blocks(self):
@@ -779,22 +813,35 @@ class TestEmbedPrefixConditionalGuards:
         # input shape):
         #   videos(3) + lang(3) + "State: "(2) + state(1) + ":\n"(2)
         #     + "Action: "(2) + discrete_actions(3) = 16
+        num_video_tokens = 3
         num_indicator_tokens = 2
         base_prefix_len = 11
         total_len = base_prefix_len + num_indicator_tokens + num_action_tokens
         assert att_masks.shape == (bsize, total_len)
         assert pad_masks.shape == (bsize, total_len)
 
-        # The first ``base_prefix_len`` positions are bidirectional (no causal
-        # boundaries) — same invariant as test_all_optional_blocks_absent.
-        assert int(att_masks[0, :base_prefix_len].sum().item()) == 0
+        # Post-fix (paper §VI.B): video span bidirectional, every text/state
+        # span after it is causal (one block per token). The original test
+        # asserted `att_masks[:base_prefix_len]` was all-zeros, but that was
+        # the pre-fix pattern that lumped lang/State:/state-end into the
+        # bidirectional video block.
+        video_span = att_masks[0, :num_video_tokens]
+        post_video = att_masks[0, num_video_tokens:]
+        assert int(video_span.sum().item()) == 0, (
+            f"video span should be bidirectional ([0]*N), got {video_span.tolist()}"
+        )
+        assert int(post_video.sum().item()) == total_len - num_video_tokens, (
+            f"every post-video token must open its own causal block (text causal "
+            f"per paper §VI.B; state opens own bidirectional block of size 1; "
+            f"discrete-action block per-token causal); got {post_video.tolist()}"
+        )
 
-        # Tail invariant: every position from the indicator onward must be 1
-        # (per-token causal blocks for the indicator + one causal step per
-        # discrete action). A regression to ``[1] + [0]*(N-1)`` on the
-        # indicator would put zeros at indices ``base_prefix_len + 1 ..
-        # base_prefix_len + num_indicator_tokens - 1`` and the assertion below
-        # would fail.
+        # Tail invariant: every position from the "Action: " indicator onward
+        # must be 1 (per-token causal blocks for the indicator + one causal
+        # step per discrete action). A regression to ``[1] + [0]*(N-1)`` on
+        # the indicator would put zeros at indices ``base_prefix_len + 1 ..
+        # base_prefix_len + num_indicator_tokens - 1`` and the assertion
+        # below would fail.
         tail = att_masks[0, base_prefix_len:]
         assert int(tail.sum().item()) == num_indicator_tokens + num_action_tokens, (
             f"expected all-ones tail of length {num_indicator_tokens + num_action_tokens} "

@@ -196,29 +196,33 @@ class TestPI07LowLevelPlannerIntegration:
 
     @classmethod
     def _train_prefix_total(cls, tokenizer) -> int:
+        # Layout (per π0.7 paper Fig. 19, image goals after the text prompt):
+        # video | lang | "State: " | state(T) | ", " | response | metadata |
+        # ";\n " | "Subgoal: " | subgoal_imgs | ", " | "Action: " | discrete
         m = cls._indicator_lens(tokenizer)
         p = 0
         p += VIDEO_TOKENS
         p += PROMPT_MAX_LENGTH
         p += m["state_lead"] + N_OBS_STEPS + m["comma"]
         p += RESPONSE_MAX_LENGTH
-        p += m["subgoal_lead"] + SUBGOAL_TOKENS + m["comma"]
         p += METADATA_MAX_LENGTH
         p += m["prefix_end"]
+        p += m["subgoal_lead"] + SUBGOAL_TOKENS + m["comma"]
         p += m["action_lead"] + DISCRETE_ACTION_MAX_LENGTH
         return p
 
     @classmethod
     def _infer_prefix_total(cls, tokenizer) -> int:
+        # Same Fig. 19 layout as training, minus the discrete-action block.
         m = cls._indicator_lens(tokenizer)
         p = 0
         p += VIDEO_TOKENS
         p += PROMPT_MAX_LENGTH
         p += m["state_lead"] + INFER_STATE_TOKENS + m["comma"]
         p += RESPONSE_MAX_LENGTH
-        p += m["subgoal_lead"] + SUBGOAL_TOKENS + m["comma"]
         p += METADATA_MAX_LENGTH
         p += m["prefix_end"]
+        p += m["subgoal_lead"] + SUBGOAL_TOKENS + m["comma"]
         return p
 
     @staticmethod
@@ -253,24 +257,27 @@ class TestPI07LowLevelPlannerIntegration:
         lang_slice = slice(LANG_START, LANG_START + PROMPT_MAX_LENGTH)
         state_t = INFER_STATE_TOKENS if inference_mode else N_OBS_STEPS
 
+        # Layout (post-Fig. 19): video | lang | "State: " | state | ", " |
+        # response | metadata | ";\n " | "Subgoal: " | subgoal_imgs | ", " |
+        # "Action: " | discrete
         resp_lo = LANG_START + PROMPT_MAX_LENGTH + m["state_lead"] + state_t + m["comma"]
         resp_slice = slice(resp_lo, resp_lo + RESPONSE_MAX_LENGTH)
 
-        sg_lo = resp_lo + RESPONSE_MAX_LENGTH + m["subgoal_lead"]
-        sg_slice = slice(sg_lo, sg_lo + SUBGOAL_TOKENS)
-
-        meta_lo = sg_lo + SUBGOAL_TOKENS + m["comma"]
+        meta_lo = resp_lo + RESPONSE_MAX_LENGTH
         meta_slice = slice(meta_lo, meta_lo + METADATA_MAX_LENGTH)
+
+        sg_lo = meta_lo + METADATA_MAX_LENGTH + m["prefix_end"] + m["subgoal_lead"]
+        sg_slice = slice(sg_lo, sg_lo + SUBGOAL_TOKENS)
 
         for i in range(prefix_pad_masks.shape[0]):
             assert torch.all(prefix_pad_masks[i, :VIDEO_TOKENS] == 1)
             self._check_ones_before_zeros(prefix_pad_masks[i, lang_slice])
             self._check_ones_before_zeros(prefix_pad_masks[i, resp_slice])
-            assert torch.all(prefix_pad_masks[i, sg_slice] == 1)
             self._check_ones_before_zeros(prefix_pad_masks[i, meta_slice])
+            assert torch.all(prefix_pad_masks[i, sg_slice] == 1)
 
             if not inference_mode:
-                da_lo = meta_lo + METADATA_MAX_LENGTH + m["prefix_end"] + m["action_lead"]
+                da_lo = sg_lo + SUBGOAL_TOKENS + m["comma"] + m["action_lead"]
                 da_slice = slice(da_lo, da_lo + DISCRETE_ACTION_MAX_LENGTH)
                 self._check_ones_before_zeros(prefix_pad_masks[i, da_slice])
 

@@ -909,14 +909,14 @@ class PI07HighLevelPlannerModel(nn.Module):
         fixed spans before those segments are present; memory and subtask text are filled in
         via KV-cache decoding plus an explicit ``"Subtask: "`` injection before response AR.
 
-        Attention pattern (via ``att_masks`` cumsums):
-            - Image + language tokens: bidirectional (``0``).
-            - Metadata (if present): new bidirectional block (``[1, 0, …, 0]``).
-            - ``";\\n "`` (only when metadata present): continues previous block (``0``).
-            - ``"Updated Memory: "``: new bidirectional block (``[1, 0, …, 0]``).
-            - Memory token slots: causal segment (``1`` per slot).
-            - ``"Subtask: "`` (training): new block then causal continuation within span.
-            - Response token slots: causal (``1`` per slot).
+        Attention pattern (via ``att_masks`` cumsums) -- paper §VI.B says
+        "observation tokens use bidirectional attention within themselves ...
+        the following text tokens use causal attention":
+
+            - Image patches: one bidirectional block per camera (``[0] * N``).
+            - All text spans (language, metadata, ``";\\n "``,
+              ``"Updated Memory: "``, ``"Subtask: "``, memory content,
+              response content): causal -- one block per token (``[1] * N``).
 
         Args:
             images: List of image tensors, one per camera.
@@ -977,9 +977,11 @@ class PI07HighLevelPlannerModel(nn.Module):
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
 
-        # full attention between image and language inputs
+        # Per π0.7 paper §VI.B: "The following text tokens use causal attention".
+        # Language tokens open one causal block per token after the bidirectional
+        # image prefix (same fix as PR #235 for π0.6).
         num_lang_embs = lang_emb.shape[1]
-        att_masks += [0] * num_lang_embs
+        att_masks += [1] * num_lang_embs
 
         # Gate on real metadata content (not just `is not None`): `prepare_metadata`
         # in the LL planner — and any external caller modeled on it — always returns
@@ -994,7 +996,8 @@ class PI07HighLevelPlannerModel(nn.Module):
             metadata_emb = self.gemma3_with_expert.embed_language_tokens(metadata_tokens)
             embs.append(metadata_emb)
             pad_masks.append(metadata_masks)
-            att_masks += [1] + [0] * (metadata_emb.shape[1] - 1)
+            # Metadata is text → causal per paper §VI.B.
+            att_masks += [1] * metadata_emb.shape[1]
 
             # ";\n " is the metadata -> "Updated Memory:" separator. With no metadata,
             # there is nothing to terminate, so omit it; "Updated Memory:" still anchors
@@ -1014,7 +1017,8 @@ class PI07HighLevelPlannerModel(nn.Module):
 
             embs.append(prefix_end_emb)
             pad_masks.append(prefix_end_mask)
-            att_masks += [0] * num_prefix_end_embs
+            # ";\n " separator is text → causal per paper §VI.B.
+            att_masks += [1] * num_prefix_end_embs
 
         memory_start_indicator_ids = self.language_tokenizer.encode(
             "Updated Memory: ", add_special_tokens=False
@@ -1033,7 +1037,8 @@ class PI07HighLevelPlannerModel(nn.Module):
 
         embs.append(memory_start_emb)
         pad_masks.append(memory_start_mask)
-        att_masks += [1] + [0] * (num_memory_start_embs - 1)
+        # "Updated Memory: " indicator is text → causal per paper §VI.B.
+        att_masks += [1] * num_memory_start_embs
 
         if memory_tokens is not None:
             memory_emb = self.gemma3_with_expert.embed_language_tokens(memory_tokens)
@@ -1063,7 +1068,8 @@ class PI07HighLevelPlannerModel(nn.Module):
 
             embs.append(response_start_emb)
             pad_masks.append(response_start_mask)
-            att_masks += [1] + [0] * (num_response_start_embs - 1)
+            # "Subtask: " indicator is text → causal per paper §VI.B.
+            att_masks += [1] * num_response_start_embs
 
             response_emb = self.gemma3_with_expert.embed_language_tokens(response_tokens)
 
@@ -1302,21 +1308,15 @@ class PI07HighLevelPlannerModel(nn.Module):
         # Match training `embed_prefix`: "Subtask: " must be in the KV cache before subtask
         # autoregression (inference does not call `embed_prefix` with `response_tokens`).
         response_start_indicator_ids = self.language_tokenizer.encode("Subtask: ", add_special_tokens=False)
-        for i, tid in enumerate(response_start_indicator_ids):
+        for tid in response_start_indicator_ids:
             token = torch.full((bsize, 1), int(tid), device=device, dtype=torch.long)
             # Gemma 3's `embed_tokens` already scales by sqrt(hidden_size); see
             # the note in `embed_prefix`.
             emb = self.gemma3_with_expert.embed_language_tokens(token)
             pad_row = torch.ones((bsize, 1), device=device, dtype=prefix_pad_masks.dtype)
-            if prefix_att_masks.dtype == torch.bool:
-                new_att = torch.full((bsize, 1), i == 0, device=device, dtype=torch.bool)
-            else:
-                new_att = torch.full(
-                    (bsize, 1),
-                    1.0 if i == 0 else 0.0,
-                    device=device,
-                    dtype=prefix_att_masks.dtype,
-                )
+            # Each "Subtask: " token opens its own causal block, mirroring the
+            # `[1] * N` training-time pattern (paper §VI.B).
+            new_att = torch.ones((bsize, 1), device=device, dtype=prefix_att_masks.dtype)
             prefix_embs = torch.cat([prefix_embs, emb], dim=1)
             prefix_pad_masks = torch.cat([prefix_pad_masks, pad_row], dim=1)
             prefix_att_masks = torch.cat([prefix_att_masks, new_att], dim=1)
