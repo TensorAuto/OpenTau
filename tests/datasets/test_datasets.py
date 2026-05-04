@@ -19,7 +19,7 @@ import logging
 import re
 from copy import deepcopy
 from importlib import import_module
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -413,6 +413,129 @@ def test_do_not_use_imagenet_stats(dataset_config, train_pipeline_config, repo_i
     item = dataset[0]
 
     check_standard_data_format(item, delta_timestamps_params, dataset, train_pipeline_config)
+
+
+def test_skip_timestamp_check_bypasses_load_check(tmp_path, lerobot_dataset_factory):
+    """`skip_timestamp_check=True` must suppress the load-time `check_timestamps_sync` call."""
+    with patch("opentau.datasets.lerobot_dataset.check_timestamps_sync") as mock_check:
+        dataset = lerobot_dataset_factory(
+            root=tmp_path / "skip_check_test",
+            skip_timestamp_check=True,
+        )
+
+    assert dataset.skip_timestamp_check is True
+    # Only the load path is exercised here (no save_episode), so the call
+    # count reflects whether the load-time gate was honored.
+    assert mock_check.call_count == 0
+
+
+def test_default_runs_load_check(tmp_path, lerobot_dataset_factory):
+    """Without the flag, the load-time `check_timestamps_sync` runs exactly once."""
+    with patch("opentau.datasets.lerobot_dataset.check_timestamps_sync") as mock_check:
+        dataset = lerobot_dataset_factory(root=tmp_path / "default_check_test")
+
+    assert dataset.skip_timestamp_check is False
+    assert mock_check.call_count == 1
+
+
+def _register_mapping(repo_id):
+    """Temporarily install an empty entry into DATA_FEATURES_NAME_MAPPING.
+
+    `factory.resolve_delta_timestamps` does a hard dict lookup on the mapping;
+    callers that mock out `LeRobotDatasetMetadata` still need an entry to exist
+    or they get a `KeyError`. Returns a no-arg cleanup callable.
+    """
+    from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
+
+    sentinel = object()
+    original = DATA_FEATURES_NAME_MAPPING.get(repo_id, sentinel)
+    DATA_FEATURES_NAME_MAPPING[repo_id] = {}
+
+    def _cleanup():
+        if original is sentinel:
+            DATA_FEATURES_NAME_MAPPING.pop(repo_id, None)
+        else:
+            DATA_FEATURES_NAME_MAPPING[repo_id] = original
+
+    return _cleanup
+
+
+def test_make_dataset_per_dataset_overrides_win(train_pipeline_config):
+    """When set, `DatasetConfig.{tolerance_s,skip_timestamp_check}` win over mixture defaults."""
+    dataset_cfg = train_pipeline_config.dataset_mixture.datasets[0]
+    cleanup = _register_mapping(dataset_cfg.repo_id)
+    try:
+        dataset_cfg.tolerance_s = 2e-3
+        dataset_cfg.skip_timestamp_check = True
+        train_pipeline_config.dataset_mixture.tolerance_s = 5e-4
+        train_pipeline_config.dataset_mixture.skip_timestamp_check = False
+
+        with (
+            patch("opentau.datasets.factory.LeRobotDatasetMetadata") as mock_meta_cls,
+            patch("opentau.datasets.factory.LeRobotDataset") as mock_ds_cls,
+        ):
+            mock_meta_cls.return_value = MagicMock(features=[])
+            mock_ds_cls.return_value = MagicMock(meta=MagicMock(info={}, stats={}, camera_keys=[]))
+
+            make_dataset(dataset_cfg, train_pipeline_config)
+
+        kwargs = mock_ds_cls.call_args.kwargs
+        assert kwargs["tolerance_s"] == 2e-3
+        assert kwargs["skip_timestamp_check"] is True
+    finally:
+        cleanup()
+
+
+def test_make_dataset_inherits_mixture_defaults(train_pipeline_config):
+    """When per-dataset overrides are None, the mixture-wide defaults flow through."""
+    dataset_cfg = train_pipeline_config.dataset_mixture.datasets[0]
+    cleanup = _register_mapping(dataset_cfg.repo_id)
+    try:
+        # Per-dataset values left at None (the dataclass default).
+        assert dataset_cfg.tolerance_s is None
+        assert dataset_cfg.skip_timestamp_check is None
+        train_pipeline_config.dataset_mixture.tolerance_s = 7e-3
+        train_pipeline_config.dataset_mixture.skip_timestamp_check = True
+
+        with (
+            patch("opentau.datasets.factory.LeRobotDatasetMetadata") as mock_meta_cls,
+            patch("opentau.datasets.factory.LeRobotDataset") as mock_ds_cls,
+        ):
+            mock_meta_cls.return_value = MagicMock(features=[])
+            mock_ds_cls.return_value = MagicMock(meta=MagicMock(info={}, stats={}, camera_keys=[]))
+
+            make_dataset(dataset_cfg, train_pipeline_config)
+
+        kwargs = mock_ds_cls.call_args.kwargs
+        assert kwargs["tolerance_s"] == 7e-3
+        assert kwargs["skip_timestamp_check"] is True
+    finally:
+        cleanup()
+
+
+def test_make_dataset_per_dataset_skip_false_overrides_mixture_true(train_pipeline_config):
+    """`DatasetConfig.skip_timestamp_check=False` must force the check on for one
+    dataset even when the mixture default opts to skip — the override is true
+    bidirectional, not a "set-only-when-True" sentinel.
+    """
+    dataset_cfg = train_pipeline_config.dataset_mixture.datasets[0]
+    cleanup = _register_mapping(dataset_cfg.repo_id)
+    try:
+        dataset_cfg.skip_timestamp_check = False
+        train_pipeline_config.dataset_mixture.skip_timestamp_check = True
+
+        with (
+            patch("opentau.datasets.factory.LeRobotDatasetMetadata") as mock_meta_cls,
+            patch("opentau.datasets.factory.LeRobotDataset") as mock_ds_cls,
+        ):
+            mock_meta_cls.return_value = MagicMock(features=[])
+            mock_ds_cls.return_value = MagicMock(meta=MagicMock(info={}, stats={}, camera_keys=[]))
+
+            make_dataset(dataset_cfg, train_pipeline_config)
+
+        assert mock_ds_cls.call_args.kwargs["skip_timestamp_check"] is False
+    finally:
+        cleanup()
 
 
 # TODO(aliberts): Move to more appropriate location

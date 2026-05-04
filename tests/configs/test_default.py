@@ -136,6 +136,44 @@ def test_val_split_ratio_warns_when_child_overrides():
     )
 
 
+def test_dataset_mixture_config_tolerance_defaults():
+    """Mixture-level timestamp-sync defaults match the historical `LeRobotDataset` behavior."""
+    cfg = DatasetMixtureConfig()
+    assert cfg.tolerance_s == 1e-4
+    assert cfg.skip_timestamp_check is False
+
+
+def test_dataset_config_tolerance_defaults():
+    """Per-dataset timestamp-sync overrides default to None (inherit from mixture)."""
+    cfg = DatasetConfig(repo_id="foo/bar")
+    assert cfg.tolerance_s is None
+    assert cfg.skip_timestamp_check is None
+
+
+def test_invalid_negative_mixture_tolerance_raises():
+    """Mixture-level `tolerance_s` must be non-negative."""
+    with pytest.raises(ValueError, match=r"`tolerance_s` must be >= 0, got -1\.0"):
+        DatasetMixtureConfig(tolerance_s=-1.0)
+
+
+def test_invalid_negative_per_dataset_tolerance_raises():
+    """Per-dataset `tolerance_s` must be non-negative when set."""
+    with pytest.raises(
+        ValueError,
+        match=r"`DatasetConfig\.tolerance_s` must be >= 0 \(or None to inherit\), got -0\.5",
+    ):
+        DatasetMixtureConfig(datasets=[DatasetConfig(repo_id="foo/bar", tolerance_s=-0.5)])
+
+
+def test_invalid_negative_bare_dataset_tolerance_raises():
+    """Bare `DatasetConfig` must validate `tolerance_s` without going through a mixture."""
+    with pytest.raises(
+        ValueError,
+        match=r"`DatasetConfig\.tolerance_s` must be >= 0 \(or None to inherit\), got -1\.0 for foo/bar",
+    ):
+        DatasetConfig(repo_id="foo/bar", tolerance_s=-1.0)
+
+
 class TestDatasetConfigDataMapping:
     """Test class for DatasetConfig data mapping functionality."""
 
