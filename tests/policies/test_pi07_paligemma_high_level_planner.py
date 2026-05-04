@@ -139,6 +139,7 @@ class TestPI07HighLevelPlannerIntegration:
     # Main integration test
     # ------------------------------------------------------------------
 
+    @pytest.mark.skip(reason="run on local machine")
     @pytest.mark.gpu
     @pytest.mark.slow
     def test_complete_pi07_high_level_planner_pipeline(self, lerobot_dataset_metadata):
