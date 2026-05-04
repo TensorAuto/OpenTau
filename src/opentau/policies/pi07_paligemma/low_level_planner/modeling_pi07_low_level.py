@@ -284,6 +284,7 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         """This should be called whenever the environment is reset."""
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
         self._state_buffer: deque | None = None
+        self._obs_buffers: dict[str, deque] = {}
 
     @classmethod
     def from_pretrained(
@@ -509,35 +510,45 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         """
         raise NotImplementedError("Currently not implemented for PI05")
 
-    def _build_state_history_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
-        """Buffer the current state and construct a temporal batch (state only).
+    def _build_history_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Buffer the current observations and construct a temporal batch.
 
-        Appends the single-step state from ``batch`` to an internal deque,
-        then assembles a batch with ``n_obs_history`` evenly-spaced state
-        frames (interval = ``history_interval``).  Early in an episode,
-        missing history slots are zero-padded.
+        Appends single-step state ``(B, D)`` and single-frame images
+        ``(B, C, H, W)`` from ``batch`` into internal deques, then
+        assembles a batch with ``n_obs_history`` evenly-spaced frames
+        (interval = ``history_interval``).  Early in an episode, missing
+        history slots are zero-padded and marked in ``obs_history_is_pad``.
 
-        All non-state keys (images, prompt, metadata, etc.) are passed
-        through unchanged.
-
-        Returns a new dict with ``"state"`` expanded to (B, T, D),
-        where T = ``n_obs_history``.
+        Returns a new dict with:
+        - ``"state"`` expanded to ``(B, T, D)``
+        - each image key expanded to ``(B, T, C, H, W)``
+        - ``"obs_history_is_pad"`` as ``(B, T)`` bool
         """
         assert self.config.n_obs_history is not None
         n_hist: int = self.config.n_obs_history
         interval = self.config.history_interval or 1
         buf_maxlen = self.config.obs_buffer_size
 
+        # --- buffer state ---
         if self._state_buffer is None:
             self._state_buffer = deque(maxlen=buf_maxlen)
-
         self._state_buffer.append(batch["state"])  # (B, D)
+
+        # --- buffer images ---
+        img_keys = [k for k in self.config.image_features if k in batch]
+        for key in img_keys:
+            if key not in self._obs_buffers:
+                self._obs_buffers[key] = deque(maxlen=buf_maxlen)
+            self._obs_buffers[key].append(batch[key])  # (B, C, H, W)
 
         buf_len = len(self._state_buffer)
         missing = buf_maxlen - buf_len
 
-        temporal_batch = {key: v for key, v in batch.items() if key != "state"}
+        # Keys that are neither state nor image pass through unchanged.
+        skip_keys = {"state"} | set(img_keys)
+        temporal_batch = {k: v for k, v in batch.items() if k not in skip_keys}
 
+        # --- assemble state history ---
         state_frames = []
         is_pad = []
         for i in range(n_hist):
@@ -549,6 +560,18 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
                 state_frames.append(self._state_buffer[idx])
                 is_pad.append(False)
         temporal_batch["state"] = torch.stack(state_frames, dim=1)  # (B, T, D)
+
+        # --- assemble image history (per camera) ---
+        for key in img_keys:
+            cam_buf = self._obs_buffers[key]
+            frames = []
+            for i in range(n_hist):
+                idx = i * interval - missing
+                if idx < 0:
+                    frames.append(torch.zeros_like(cam_buf[0]))
+                else:
+                    frames.append(cam_buf[idx])
+            temporal_batch[key] = torch.stack(frames, dim=1)  # (B, T, C, H, W)
 
         bsize = temporal_batch["state"].shape[0]
         device = temporal_batch["state"].device
@@ -575,7 +598,7 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         self.eval()
 
         if self.config.n_obs_history is not None and self.config.n_obs_history > 1:
-            batch = self._build_state_history_batch(batch)
+            batch = self._build_history_batch(batch)
 
         if len(self._action_queue) == 0 or len(self._action_queue) <= self.config.max_delay:
             # Use current queue as action prefix to replenish
@@ -643,6 +666,8 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
         self._hydrate_optional_conditioning_batch(batch)
 
+        obs_history_is_pad = batch.get("obs_history_is_pad")
+
         videos, vid_masks = self.prepare_videos(batch)
         lang_tokens, lang_masks = self.prepare_language(batch)
         response_tokens, response_masks = self.prepare_response(batch)
@@ -675,8 +700,6 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
                 self.config.n_obs_history,
                 t_dim,
             )
-
-        obs_history_is_pad = batch.get("obs_history_is_pad")
 
         actions = self.model.sample_actions(
             videos,
@@ -824,7 +847,8 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         """Preprocess camera inputs into (B, T, C, H, W) video tensors.
 
         Pixel values stay in [0, 1]; the SpaceTime SigLIP encoder rescales
-        to [-1, 1] internally.
+        to [-1, 1] internally.  Padded history frames are handled inside the
+        video encoder via temporal attention masking (not pixel zeroing).
 
         Args:
             batch: Batch of data containing image/video tensors.
@@ -1319,18 +1343,21 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         time = time_beta * 0.999 + 0.001
         return time
 
-    def embed_video(self, video: Tensor) -> Tensor:
+    def embed_video(self, video: Tensor, obs_history_is_pad: Tensor | None = None) -> Tensor:
         """Encode a video through the SpaceTime SigLIP video encoder.
 
         At T=1 this is byte-identical to ``paligemma_with_expert.embed_image``.
 
         Args:
             video: (B, T, C, H, W) pixel values in [0, 1].
+            obs_history_is_pad: Optional ``(B, T)`` bool mask — ``True`` for
+                padded history frames.  Passed to the video encoder so that
+                temporal attention blocks padded frames.
 
         Returns:
             (B, num_video_tokens, vlm_hidden_size)
         """
-        return self.video_encoder(video)
+        return self.video_encoder(video, obs_history_is_pad=obs_history_is_pad)
 
     def embed_prefix(
         self,
@@ -1378,7 +1405,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         att_masks = []
 
         for vid, vid_mask in zip(videos, vid_masks, strict=False):
-            vid_emb = self.embed_video(vid)  # (B, num_video_tokens, vlm_hidden)
+            vid_emb = self.embed_video(vid, obs_history_is_pad=obs_history_is_pad)
             vid_emb = vid_emb.to(dtype=_preferred_dtype())
 
             bsize, num_vid_embs = vid_emb.shape[:2]
@@ -1419,10 +1446,10 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
 
         if obs_history_is_pad is not None:
             state_mask = ~obs_history_is_pad  # (B, T)
-            # The current (last) timestep is always real, never masked out.
-            state_mask[:, -1] = True
         else:
-            state_mask = torch.ones(bsize, t_steps, dtype=torch.bool, device=state.device)
+            # Absent → assume all history is padded; only current step is real.
+            state_mask = torch.zeros(bsize, t_steps, dtype=torch.bool, device=state.device)
+        state_mask[:, -1] = True
 
         embs.append(state_emb)
         pad_masks.append(state_mask)

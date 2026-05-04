@@ -130,8 +130,16 @@ class _TemporalSelfAttention(nn.Module):
     def attn(self) -> SiglipAttention:
         return self._attn_ref[0]
 
-    def forward(self, hidden_states: Tensor) -> Tensor:
-        """hidden_states: (B*N, T, D) -> (B*N, T, D)."""
+    def forward(self, hidden_states: Tensor, temporal_attn_mask: Tensor | None = None) -> Tensor:
+        """hidden_states: (B*N, T, D) -> (B*N, T, D).
+
+        Args:
+            hidden_states: ``(B*N, T, D)`` hidden states reshaped for
+                temporal attention (one sequence per spatial patch position).
+            temporal_attn_mask: Optional ``(B*N, 1, T, T)`` float mask.
+                ``0`` = attend, ``-inf`` = block.  When ``None``, a standard
+                causal (lower-triangular) mask is used via ``is_causal=True``.
+        """
         attn = self.attn
         bn, t, d = hidden_states.shape
         num_heads = attn.num_heads
@@ -141,11 +149,26 @@ class _TemporalSelfAttention(nn.Module):
         k = attn.k_proj(hidden_states).view(bn, t, num_heads, head_dim).transpose(1, 2)
         v = attn.v_proj(hidden_states).view(bn, t, num_heads, head_dim).transpose(1, 2)
 
-        # is_causal=True -> lower-triangular mask, each position attends to
-        # itself and earlier positions (our convention: t=T-1 is current).
-        out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=None, is_causal=True, dropout_p=0.0, scale=attn.scale
-        )
+        if temporal_attn_mask is not None:
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=temporal_attn_mask,
+                is_causal=False,
+                dropout_p=0.0,
+                scale=attn.scale,
+            )
+        else:
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                is_causal=True,
+                dropout_p=0.0,
+                scale=attn.scale,
+            )
         out = out.transpose(1, 2).reshape(bn, t, d)
         return attn.out_proj(out)
 
@@ -262,11 +285,17 @@ class SpaceTimeEncoderLayerWrapper(nn.Module):
         hidden_states: Tensor,
         attention_mask: Optional[Tensor] = None,
         output_attentions: bool = False,
+        temporal_attn_mask: Tensor | None = None,
     ) -> tuple[Tensor, ...]:
         """hidden_states: (B*T, N, D) -> tuple starting with (B*T, N, D).
 
-        Signature matches ``SiglipEncoderLayer.forward`` so ``SiglipEncoder``
-        can dispatch unchanged.
+        Signature extends ``SiglipEncoderLayer.forward`` with an extra
+        ``temporal_attn_mask`` kwarg (ignored by vanilla layers).
+
+        Args:
+            temporal_attn_mask: Optional ``(B*N, 1, T, T)`` float mask for
+                temporal attention. ``0`` = attend, ``-inf`` = block.
+                When ``None``, the standard causal mask is used.
         """
         t = self.num_frames
         bt, n, d = hidden_states.shape
@@ -291,17 +320,12 @@ class SpaceTimeEncoderLayerWrapper(nn.Module):
 
         # Temporal sublayer.
         x = rearrange(hidden_states, "(b t) n d -> b t n d", b=b, t=t)
-        # Cast PE to match tensor device/dtype each call. Both are no-ops if
-        # already aligned (the common case — the buffer is constructed on
-        # the base layer's device). The cast only allocates when something
-        # external has moved the inputs onto a different device without
-        # propagating ``.to()`` through to this wrapper.
         pe = self._temporal_pe.to(device=x.device, dtype=x.dtype).view(1, t, 1, d)
         x_pe = x + pe
 
         t_in = rearrange(x_pe, "b t n d -> (b n) t d")
         t_norm = self.layer_norm1(t_in)
-        t_out = self._temporal_attn(t_norm)
+        t_out = self._temporal_attn(t_norm, temporal_attn_mask=temporal_attn_mask)
         # Residual on the pre-PE hidden (not on x_pe): PE is a transient
         # positional signal, not a feature perturbation to carry forward.
         t_res = rearrange(x, "b t n d -> (b n) t d") + t_out
@@ -397,13 +421,59 @@ class SpaceTimeSiglipVideoEncoder(nn.Module):
     def multi_modal_projector(self) -> PaliGemmaMultiModalProjector:
         return self._multi_modal_projector_ref[0]
 
-    def forward(self, video: Tensor) -> Tensor:
+    @staticmethod
+    def _build_temporal_attn_mask(
+        obs_history_is_pad: Tensor,
+        num_patches: int,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        """Build a causal temporal attention mask that blocks padded frames.
+
+        Args:
+            obs_history_is_pad: ``(B, T)`` bool — ``True`` for padded steps.
+            num_patches: ``N``, number of spatial patches per frame.
+            dtype: Float dtype for the mask (matches hidden states).
+
+        Returns:
+            ``(B*N, 1, T, T)`` float mask where ``0`` = attend, ``-inf`` =
+            block.  Row ``i`` can attend to column ``j`` iff ``j <= i``
+            (causal) **and** ``obs_history_is_pad[:, j]`` is ``False``.
+            The current frame (last column) is always attendable.
+        """
+        b, t = obs_history_is_pad.shape
+        device = obs_history_is_pad.device
+
+        # Causal: position i attends to j <= i
+        causal = torch.tril(torch.ones(t, t, dtype=torch.bool, device=device))  # (T, T)
+
+        # Key-side visibility: True where frame j is real (not padded).
+        # Force last frame always real.
+        key_valid = ~obs_history_is_pad  # (B, T)
+        key_valid[:, -1] = True
+
+        # Combined: (B, T_query, T_key)
+        mask = causal.unsqueeze(0) & key_valid.unsqueeze(1)  # (B, T, T)
+
+        # Convert bool → float: True → 0.0, False → -inf
+        float_mask = torch.zeros(b, t, t, dtype=dtype, device=device)
+        float_mask.masked_fill_(~mask, float("-inf"))
+
+        # Expand for (B*N) batch dimension: (B, 1, T, T) → repeat N times → (B*N, 1, T, T)
+        float_mask = float_mask.unsqueeze(1)  # (B, 1, T, T)
+        float_mask = float_mask.repeat_interleave(num_patches, dim=0)  # (B*N, 1, T, T)
+
+        return float_mask
+
+    def forward(self, video: Tensor, obs_history_is_pad: Tensor | None = None) -> Tensor:
         """Encode a video clip and return the current-frame tokens.
 
         Args:
             video: ``(B, T, C, H, W)`` pixel values in ``[0, 1]``, with
                 ``T == num_frames``, ``C == 3``, and spatial size matching
                 the SigLIP config (224x224 by default).
+            obs_history_is_pad: Optional ``(B, T)`` bool mask where ``True``
+                marks padded history frames.  Padded frames are blocked in
+                the temporal attention so the current frame cannot see them.
 
         Returns:
             ``(B, num_video_tokens, vlm_hidden_size)`` current-frame tokens,
@@ -428,6 +498,24 @@ class SpaceTimeSiglipVideoEncoder(nn.Module):
         # Patch embedding + learned spatial position embedding.
         hidden = self.vision_tower.vision_model.embeddings(flat)
 
+        # Build temporal attention mask if needed.
+        temporal_attn_mask: Tensor | None = None
+        if obs_history_is_pad is not None and t > 1:
+            temporal_attn_mask = self._build_temporal_attn_mask(
+                obs_history_is_pad,
+                self.num_video_tokens,
+                hidden.dtype,
+            )
+        elif t > 1 and obs_history_is_pad is None:
+            # Absent → assume all history padded; only current frame attends.
+            fallback_pad = torch.ones(b, t, dtype=torch.bool, device=hidden.device)
+            fallback_pad[:, -1] = False
+            temporal_attn_mask = self._build_temporal_attn_mask(
+                fallback_pad,
+                self.num_video_tokens,
+                hidden.dtype,
+            )
+
         # Encoder stack: standard spatial layers + wrapped every-Nth layer
         # with temporal attention. SpaceTimeEncoderLayerWrapper matches the
         # SiglipEncoderLayer signature, so we drive the loop manually here
@@ -436,12 +524,26 @@ class SpaceTimeSiglipVideoEncoder(nn.Module):
         # the same explicit pattern PaliGemmaWithExpertModel uses.
         use_ckpt = self.gradient_checkpointing and self.training
         for layer in self.vision_tower.vision_model.encoder.layers:
+            is_spacetime = isinstance(layer, SpaceTimeEncoderLayerWrapper)
             if use_ckpt:
-                layer_outputs = torch.utils.checkpoint.checkpoint(
-                    layer, hidden, None, False, use_reentrant=False
-                )
+                if is_spacetime:
+                    layer_outputs = torch.utils.checkpoint.checkpoint(
+                        layer,
+                        hidden,
+                        None,
+                        False,
+                        temporal_attn_mask,
+                        use_reentrant=False,
+                    )
+                else:
+                    layer_outputs = torch.utils.checkpoint.checkpoint(
+                        layer, hidden, None, False, use_reentrant=False
+                    )
             else:
-                layer_outputs = layer(hidden, None, False)
+                if is_spacetime:
+                    layer_outputs = layer(hidden, None, False, temporal_attn_mask=temporal_attn_mask)
+                else:
+                    layer_outputs = layer(hidden, None, False)
             hidden = layer_outputs[0]
 
         hidden = self.vision_tower.vision_model.post_layernorm(hidden)
