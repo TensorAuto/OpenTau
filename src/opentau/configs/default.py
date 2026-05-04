@@ -86,6 +86,10 @@ class DatasetConfig:
             to a larger value (e.g. ``1e-3``) when a single dataset in the
             mixture has slightly off-fps timestamps but you don't want to
             loosen the check for the others. Must be ``>= 0`` when set.
+            This also applies to frames decoded from video files: the same
+            value is used as the per-frame match tolerance in
+            ``query_video_frames_*``, so loosening it widens the
+            video-frame match window as well.
         skip_timestamp_check: Optional per-dataset override that bypasses the
             load-time ``check_timestamps_sync`` call entirely. ``None``
             (default) inherits the mixture-wide
@@ -142,6 +146,12 @@ class DatasetConfig:
         """Validate dataset configuration and register custom mappings if provided."""
         if (self.repo_id is None) == (self.vqa is None):
             raise ValueError("Exactly one of `repo_id` or `vqa` for Dataset config should be set.")
+
+        if self.tolerance_s is not None and self.tolerance_s < 0:
+            raise ValueError(
+                f"`DatasetConfig.tolerance_s` must be >= 0 (or None to inherit), "
+                f"got {self.tolerance_s} for {self.repo_id or self.vqa}."
+            )
 
         # If data_features_name_mapping is provided, upsert it into the global DATA_FEATURES_NAME_MAPPING
         if self.data_features_name_mapping is not None:
@@ -223,7 +233,10 @@ class DatasetMixtureConfig:
             timestamp spacing must lie within ``1/fps +/- tolerance_s`` or the
             check raises. Defaults to ``1e-4``. A per-dataset
             ``DatasetConfig.tolerance_s`` overrides this value when set. Must
-            be ``>= 0``.
+            be ``>= 0``. This also applies to frames decoded from video
+            files: the same value is used as the per-frame match tolerance
+            in ``query_video_frames_*``, so loosening it widens the
+            video-frame match window as well.
         skip_timestamp_check: If True, bypass the load-time
             ``check_timestamps_sync`` call for every dataset in the mixture
             (a warning is logged per dataset). Useful as a debug knob when
@@ -311,13 +324,6 @@ class DatasetMixtureConfig:
             raise ValueError(f"`val_split_ratio` must be between 0 and 1, got {self.val_split_ratio}.")
         if self.tolerance_s < 0:
             raise ValueError(f"`tolerance_s` must be >= 0, got {self.tolerance_s}.")
-        for dataset_cfg in self.datasets:
-            if dataset_cfg.tolerance_s is not None and dataset_cfg.tolerance_s < 0:
-                identifier = dataset_cfg.repo_id or dataset_cfg.vqa or "<unidentified dataset>"
-                raise ValueError(
-                    f"`DatasetConfig.tolerance_s` must be >= 0 (or None to inherit), "
-                    f"got {dataset_cfg.tolerance_s} for {identifier}."
-                )
         if self.n_obs_history is not None and (
             not isinstance(self.n_obs_history, int) or self.n_obs_history < 1
         ):

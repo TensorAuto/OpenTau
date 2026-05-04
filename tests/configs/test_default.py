@@ -165,6 +165,15 @@ def test_invalid_negative_per_dataset_tolerance_raises():
         DatasetMixtureConfig(datasets=[DatasetConfig(repo_id="foo/bar", tolerance_s=-0.5)])
 
 
+def test_invalid_negative_bare_dataset_tolerance_raises():
+    """Bare `DatasetConfig` must validate `tolerance_s` without going through a mixture."""
+    with pytest.raises(
+        ValueError,
+        match=r"`DatasetConfig\.tolerance_s` must be >= 0 \(or None to inherit\), got -1\.0 for foo/bar",
+    ):
+        DatasetConfig(repo_id="foo/bar", tolerance_s=-1.0)
+
+
 class TestDatasetConfigDataMapping:
     """Test class for DatasetConfig data mapping functionality."""
 
