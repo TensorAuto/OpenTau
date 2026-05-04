@@ -650,3 +650,184 @@ class TestDatasetMixtureOptionalKeyDropProbs:
         # Boundary values are permitted (0 disables dropout, 1 forces it).
         DatasetMixtureConfig(**{field: 0.0})
         DatasetMixtureConfig(**{field: 1.0})
+
+
+class TestRobotTypeControlModeOverridesAndRequirements:
+    """Dataset-level override + mixture-level non-empty requirement contracts.
+
+    Covers the pair introduced in PR #204:
+        - ``DatasetConfig.{robot_type,control_mode}`` write through to
+          ``dataset.meta.info`` after construction.
+        - ``DatasetMixtureConfig.require_non_empty_{robot_type,control_mode}``
+          flag empty values across the mixture, defaulting OFF (empty allowed).
+    """
+
+    def test_dataset_config_defaults_allow_empty(self):
+        # Defaults match the project contract: no override, empty allowed.
+        cfg = DatasetConfig(repo_id="x/y")
+        assert cfg.robot_type is None
+        assert cfg.control_mode is None
+
+    def test_dataset_config_accepts_overrides(self):
+        cfg = DatasetConfig(repo_id="x/y", robot_type="aloha", control_mode="joint")
+        assert cfg.robot_type == "aloha"
+        assert cfg.control_mode == "joint"
+
+    def test_dataset_config_accepts_explicit_empty_string(self):
+        # Empty string is an explicit "clear the loaded value" override —
+        # distinct from None, which means "do not override".
+        cfg = DatasetConfig(repo_id="x/y", robot_type="", control_mode="")
+        assert cfg.robot_type == ""
+        assert cfg.control_mode == ""
+
+    def test_mixture_config_require_flags_default_off(self):
+        cfg = DatasetMixtureConfig()
+        assert cfg.require_non_empty_robot_type is False
+        assert cfg.require_non_empty_control_mode is False
+
+    def test_apply_metadata_overrides_writes_through(self):
+        from opentau.datasets.factory import _apply_metadata_overrides
+
+        # Minimal stand-in for a BaseDataset: only `meta.info` is read.
+        dataset = SimpleNamespace(meta=SimpleNamespace(info={}), control_mode="unknown")
+        cfg = DatasetConfig(repo_id="x/y", robot_type="panda", control_mode="ee")
+        _apply_metadata_overrides(dataset, cfg)
+        assert dataset.meta.info["robot_type"] == "panda"
+        assert dataset.meta.info["control_mode"] == "ee"
+        # The cached LeRobotDataset attribute is refreshed in lock-step.
+        assert dataset.control_mode == "ee"
+
+    def test_apply_metadata_overrides_none_is_noop(self):
+        from opentau.datasets.factory import _apply_metadata_overrides
+
+        info = {"robot_type": "aloha", "control_mode": "joint"}
+        dataset = SimpleNamespace(meta=SimpleNamespace(info=info), control_mode="joint")
+        cfg = DatasetConfig(repo_id="x/y")  # no overrides
+        _apply_metadata_overrides(dataset, cfg)
+        assert dataset.meta.info["robot_type"] == "aloha"
+        assert dataset.meta.info["control_mode"] == "joint"
+        assert dataset.control_mode == "joint"
+
+    def test_apply_metadata_overrides_empty_string_is_explicit_clear(self):
+        from opentau.datasets.factory import _apply_metadata_overrides
+
+        info = {"robot_type": "aloha", "control_mode": "joint"}
+        dataset = SimpleNamespace(meta=SimpleNamespace(info=info), control_mode="joint")
+        cfg = DatasetConfig(repo_id="x/y", robot_type="", control_mode="")
+        _apply_metadata_overrides(dataset, cfg)
+        assert dataset.meta.info["robot_type"] == ""
+        assert dataset.meta.info["control_mode"] == ""
+
+    def test_apply_metadata_overrides_skips_control_mode_attr_when_absent(self):
+        """VQA datasets don't define the ``control_mode`` attribute. The helper
+        must still update ``meta.info`` without raising AttributeError.
+        """
+        from opentau.datasets.factory import _apply_metadata_overrides
+
+        # No `control_mode` attribute on the dataset object.
+        dataset = SimpleNamespace(meta=SimpleNamespace(info={}))
+        cfg = DatasetConfig(vqa="dummy", control_mode="ee")
+        _apply_metadata_overrides(dataset, cfg)
+        assert dataset.meta.info["control_mode"] == "ee"
+        assert not hasattr(dataset, "control_mode")
+
+    @staticmethod
+    def _mixture_cfg(**mixture_kwargs):
+        """Build a TrainPipelineConfig stand-in that exposes only what
+        ``_validate_metadata_requirements`` reads.
+        """
+        ds_cfgs = mixture_kwargs.pop("datasets", [])
+        return SimpleNamespace(
+            dataset_mixture=SimpleNamespace(
+                datasets=ds_cfgs,
+                require_non_empty_robot_type=mixture_kwargs.get("require_non_empty_robot_type", False),
+                require_non_empty_control_mode=mixture_kwargs.get("require_non_empty_control_mode", False),
+            )
+        )
+
+    @staticmethod
+    def _stub_dataset(info: dict):
+        return SimpleNamespace(meta=SimpleNamespace(info=info))
+
+    def test_validate_metadata_requirements_noop_when_flags_off(self):
+        from opentau.datasets.factory import _validate_metadata_requirements
+
+        cfg = self._mixture_cfg(datasets=[DatasetConfig(repo_id="x/y")])
+        # Both flags off — empty values are tolerated.
+        _validate_metadata_requirements(cfg, [self._stub_dataset({})], label="train")
+
+    def test_validate_metadata_requirements_passes_when_values_present(self):
+        from opentau.datasets.factory import _validate_metadata_requirements
+
+        cfg = self._mixture_cfg(
+            datasets=[DatasetConfig(repo_id="x/y")],
+            require_non_empty_robot_type=True,
+            require_non_empty_control_mode=True,
+        )
+        ds = self._stub_dataset({"robot_type": "panda", "control_mode": "joint"})
+        _validate_metadata_requirements(cfg, [ds], label="train")
+
+    def test_validate_metadata_requirements_raises_for_empty_robot_type(self):
+        from opentau.datasets.factory import _validate_metadata_requirements
+
+        cfg = self._mixture_cfg(
+            datasets=[DatasetConfig(repo_id="x/y")],
+            require_non_empty_robot_type=True,
+        )
+        ds = self._stub_dataset({"robot_type": "", "control_mode": "ee"})
+        with pytest.raises(ValueError, match="robot_type is empty"):
+            _validate_metadata_requirements(cfg, [ds], label="train")
+
+    def test_validate_metadata_requirements_raises_for_none_robot_type(self):
+        from opentau.datasets.factory import _validate_metadata_requirements
+
+        cfg = self._mixture_cfg(
+            datasets=[DatasetConfig(repo_id="x/y")],
+            require_non_empty_robot_type=True,
+        )
+        # Legacy datasets store robot_type=None; the validator treats None as empty.
+        ds = self._stub_dataset({"robot_type": None})
+        with pytest.raises(ValueError, match="robot_type is empty"):
+            _validate_metadata_requirements(cfg, [ds], label="train")
+
+    def test_validate_metadata_requirements_raises_for_missing_control_mode(self):
+        from opentau.datasets.factory import _validate_metadata_requirements
+
+        cfg = self._mixture_cfg(
+            datasets=[DatasetConfig(repo_id="x/y")],
+            require_non_empty_control_mode=True,
+        )
+        ds = self._stub_dataset({"robot_type": "panda"})  # no control_mode key
+        with pytest.raises(ValueError, match="control_mode is empty"):
+            _validate_metadata_requirements(cfg, [ds], label="train")
+
+    def test_validate_metadata_requirements_reports_label_and_repo_id(self):
+        from opentau.datasets.factory import _validate_metadata_requirements
+
+        cfg = self._mixture_cfg(
+            datasets=[DatasetConfig(repo_id="acme/dataset")],
+            require_non_empty_robot_type=True,
+        )
+        ds = self._stub_dataset({})
+        with pytest.raises(ValueError) as excinfo:
+            _validate_metadata_requirements(cfg, [ds], label="val")
+        msg = str(excinfo.value)
+        assert "val" in msg
+        assert "acme/dataset" in msg
+
+    def test_validate_metadata_requirements_aggregates_multiple_failures(self):
+        from opentau.datasets.factory import _validate_metadata_requirements
+
+        cfg = self._mixture_cfg(
+            datasets=[DatasetConfig(repo_id="a/x"), DatasetConfig(repo_id="b/y")],
+            require_non_empty_robot_type=True,
+            require_non_empty_control_mode=True,
+        )
+        datasets = [self._stub_dataset({}), self._stub_dataset({"robot_type": "panda"})]
+        with pytest.raises(ValueError) as excinfo:
+            _validate_metadata_requirements(cfg, datasets, label="train")
+        msg = str(excinfo.value)
+        assert "a/x: robot_type is empty" in msg
+        assert "a/x: control_mode is empty" in msg
+        assert "b/y: control_mode is empty" in msg
+        assert "b/y: robot_type is empty" not in msg  # b/y has a robot_type

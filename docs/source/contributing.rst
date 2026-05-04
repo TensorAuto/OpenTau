@@ -114,8 +114,12 @@ Follow these steps to start contributing:
 
    🚨 **Do not** work on the ``main`` branch.
 
-4. for development, we advise to use a tool like ``uv`` instead of just ``pip`` to easily track our dependencies.
+4. for development, we advise to use a tool like ``uv`` (>= 0.8.4) instead of just ``pip`` to easily track our dependencies.
    Follow the instructions to `install uv <https://docs.astral.sh/uv/getting-started/installation/#installation-methods>`_ if you don't have it already.
+   OpenTau requires ``uv >= 0.8.4`` (enforced by ``required-version`` in ``[tool.uv]``)
+   because ``[tool.uv].extra-build-dependencies`` is only honored by that version
+   onwards; older ``uv`` would silently skip the ``cmake<4`` pin needed to build
+   ``egl-probe`` from the ``libero`` extra. Upgrade with ``uv self update`` if needed.
    To develop on OpenTau, you will at least need to install the ``dev`` extras dependencies along with the core library:
 
    using ``uv``

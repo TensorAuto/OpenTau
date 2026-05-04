@@ -23,6 +23,13 @@ permissions:
 
 jobs:
   pre-commit:
+    # Block PRs from non-org accounts to keep fork code off our runners.
+    # `push` already requires write access, so the short-circuit lets it
+    # through unchanged.
+    if: >-
+      github.event_name != 'pull_request'
+      || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
+      || github.event.pull_request.user.login == 'claude[bot]'
     name: Pre-commit Hooks
     runs-on: ubuntu-latest
     steps:

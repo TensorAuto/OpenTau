@@ -571,3 +571,61 @@ class TestPI05Integration:
         )
 
         assert action.shape == (1, policy.config.max_action_dim)
+
+
+# Loc-token regression — confirm the `<locNNNN>` strings flow through pi05's
+# tokenizer + embedding + response_ce_loss path without shape errors and
+# produce a finite loss. Guarded by GPU because instantiating the full
+# PaliGemma backbone is heavy.
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_pi05_loc_tokens_in_response_produce_finite_loss(pi05_training_config, lerobot_dataset_metadata):
+    """π0.5: a response containing `<loc0042>` should encode each loc string
+    as a single token (not BPE-fragment), get embedded by the existing
+    PaliGemma `embed_language_tokens`, and produce a finite `response_ce_loss`
+    on a one-batch forward pass. Regression for the `ensure_loc_tokens`
+    promotion wired in `PI05Policy.__init__` / `PI05FlowMatching.__init__`."""
+
+    config = pi05_training_config.policy
+    policy = PI05Policy(config, dataset_stats=lerobot_dataset_metadata.stats)
+
+    # PI05Policy and PI05FlowMatching share a single tokenizer instance so
+    # token IDs cannot drift between the two layers.
+    assert policy.language_tokenizer is policy.model.language_tokenizer
+    # The promotion makes <locNNNN> a single-token match on the (shared)
+    # tokenizer.
+    tok = policy.language_tokenizer
+    assert len(tok.encode("<loc0042>", add_special_tokens=False)) == 1
+    assert len(tok.encode("<loc1023>", add_special_tokens=False)) == 1
+
+    batch_size = 1
+    batch = {
+        "camera0": torch.randn(batch_size, 3, 224, 224),
+        "camera1": torch.randn(batch_size, 3, 224, 224),
+        "state": torch.randn(batch_size, config.max_state_dim),
+        "actions": torch.randn(batch_size, config.chunk_size, config.max_action_dim),
+        "prompt": ["detect red block"],
+        "response": ["<loc0234><loc0567><loc0890><loc1023> red block"],
+        "img_is_pad": torch.zeros(batch_size, 2, dtype=torch.bool),
+        "action_is_pad": torch.zeros(batch_size, config.chunk_size, dtype=torch.bool),
+    }
+
+    policy.to(dtype=torch.bfloat16, device="cuda")
+    batch_cuda = {
+        k: v.to("cuda", non_blocking=True, dtype=torch.bfloat16) if isinstance(v, torch.Tensor) else v
+        for k, v in batch.items()
+    }
+    batch_cuda["action_is_pad"] = batch_cuda["action_is_pad"].to(dtype=torch.bool)
+
+    try:
+        loss = policy.forward(batch_cuda)
+        assert isinstance(loss, dict)
+        assert "MSE" in loss and "CE" in loss
+        assert all(v.isfinite() for v in loss.values()), f"Non-finite loss with loc tokens: {loss}"
+    finally:
+        # Free ~6 GB of PaliGemma weights so adjacent GPU tests in the same
+        # process don't OOM on a single-GPU dev box.
+        del policy
+        torch.cuda.empty_cache()

@@ -26,7 +26,7 @@ OpenTau is Tensor's open-source PyTorch training toolchain for vision-language-a
 
 ## Environment & install
 
-Dependency management is **`uv` only** — `pyproject.toml`/`uv.lock` are authoritative; do not edit `requirements.txt` (none exists) or call `pip install` against the env.
+Dependency management is **`uv` (>= 0.8.4) only** — `pyproject.toml`/`uv.lock` are authoritative; do not edit `requirements.txt` (none exists) or call `pip install` against the env. The `>= 0.8.4` floor is enforced by `required-version` in `[tool.uv]` and is needed because `[tool.uv].extra-build-dependencies` (which pins `cmake<4` inside `egl-probe`'s PEP 517 build isolation) is only honored by uv 0.8.4+.
 
 ```bash
 uv sync --extra dev --extra libero          # standard dev setup (matches CI)
@@ -105,7 +105,7 @@ Key invariant on `TrainPipelineConfig`: `batch_size == dataloader_batch_size * g
 - `envs/` — gym/gymnasium envs (currently LIBERO); `factory.make_envs()`
 - `optim/` — optimizer + LR-scheduler dataclass-configured factories
 - `planner/` — high-level planner using `prompts.yaml`
-- `policies/` — `pi0`, `pi05`, `pi05_mem`, `pi07_paligemma/{high_level_planner,low_level_planner}`, `value`. Each subdir has a `configuration_*.py` and `modeling_*.py`. Vision backbone wrapper is `paligemma_with_expert.py`.
+- `policies/` — `pi0`, `pi05`, `pi05_mem`, `pi06`, `pi07/{high_level_planner,low_level}` (current π0.7 impl: Gemma 3 backbone + SpaceTime SigLIP video encoder; note `low_level/` — not `low_level_planner/`, since the low-level policy is a controller, not a planner), `pi07_paligemma/{high_level_planner,low_level_planner}` (legacy PaliGemma variant of π0.7 — kept for older checkpoints; a fix targeting π0.7 usually needs to land in `pi07/`, not here), `value`. Each subdir has a `configuration_*.py` and `modeling_*.py`. Vision backbone wrappers: `paligemma_with_expert.py` (pi0/pi05/pi05_mem/pi07_paligemma) and `gemma3_with_expert.py` (pi06/pi07).
 - `scripts/` — entry points (train/eval/launch), profilers, dataset converters (LIBERO, ROS, human video, RECAP), gRPC inference server, ONNX/TensorRT export
 - `utils/` — `accelerate_utils` (sets process-global accelerator for rank detection), `train_utils` (checkpoint save/load/prune), `logging_utils` (`AverageMeter`, `MetricsTracker`), `transformers_patch`, `monkey_patch`
 

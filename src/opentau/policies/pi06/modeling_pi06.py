@@ -42,6 +42,7 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import NormalizationMode
+from opentau.datasets.grounding.tokenizer_utils import ensure_loc_tokens
 from opentau.policies.normalize import Normalize, Unnormalize
 from opentau.policies.pi06.configuration_pi06 import PI06Config
 from opentau.policies.pi06.gemma3_with_expert import (
@@ -186,6 +187,42 @@ def resize_with_pad(img: Tensor, width: int, height: int, pad_value: int = -1) -
     return padded_img
 
 
+def flow_matching_masked_mse(
+    u_t: Tensor,
+    v_t: Tensor,
+    prefix_mask: Tensor,
+    actions_is_pad: Tensor | None,
+    max_action_dim: int,
+) -> Tensor:
+    """Masked MSE for π0.6 flow matching.
+
+    Zeros out (a) frozen-prefix steps from the real-time inference delay
+    (`prefix_mask=True` ⇒ frozen) and (b) fully-padded action samples — e.g.
+    VQA / web co-training items, where `VQADataset` sets `actions_is_pad`
+    all-True so the action expert is not trained to regress to zero on items
+    that have no real actions.
+
+    Args:
+        u_t: Target velocity field, shape `(B, chunk_size, D)` (D ≥ max_action_dim).
+        v_t: Predicted velocity field, same shape as `u_t`.
+        prefix_mask: bool `(B, chunk_size)` — True where the step is frozen
+            (real-time-inference delay). Pass `torch.zeros(...)` to disable.
+        actions_is_pad: optional bool `(B, chunk_size)` — True where the
+            action chunk is padded (no real action target).
+        max_action_dim: Number of leading action dims to score against;
+            trailing dims are dropped before averaging.
+    """
+    mse_loss = F.mse_loss(u_t, v_t, reduction="none")
+    postfix_mask = rearrange(torch.logical_not(prefix_mask), "b c -> b c 1")
+    if actions_is_pad is not None:
+        in_episode_bound = rearrange(~actions_is_pad, "b c -> b c 1")
+        postfix_mask = torch.logical_and(postfix_mask, in_episode_bound)
+    mse_loss = mse_loss * postfix_mask
+    mse_loss = mse_loss[:, :, :max_action_dim]
+    postfix_mask_expanded = repeat(postfix_mask, "b c 1 -> b c d", d=mse_loss.shape[-1])
+    return mse_loss.sum() / (postfix_mask_expanded.sum() + 1e-8)
+
+
 def pad_discrete_tokens(tokens: list[list[int]], max_length: int) -> tuple[np.ndarray, np.ndarray]:
     """Pads / truncates a ragged list of FAST-tokenized action chunks to a
     fixed length, returning `(B, max_length)` arrays."""
@@ -245,16 +282,24 @@ class PI06Policy(PreTrainedPolicy):
             config.output_features, config.normalization_mapping, dataset_stats
         )
 
-        # π0.6 uses Gemma 3's tokenizer. We fall back to the paligemma tokenizer
-        # only if the Hub download fails at module import time in an offline CI,
-        # so users still get a useful error rather than silent drift.
+        # π0.6 uses Gemma 3's tokenizer. The same instance is shared with the
+        # inner `PI06FlowMatching` so vocab extension happens exactly once and
+        # token IDs cannot drift between the two layers (e.g. if anyone
+        # introduces a non-deterministic adder, two independent loads at
+        # different revisions, or reorders the calls). The single
+        # `ensure_loc_tokens` call inside the inner ctor extends both this
+        # tokenizer and resizes the model embeddings together.
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-4b-pt")
 
         self.discrete_action_processor = AutoProcessor.from_pretrained(
             "physical-intelligence/fast", trust_remote_code=True
         )
         discrete_action_vocab_size = getattr(self.discrete_action_processor, "vocab_size", None)
-        self.model = PI06FlowMatching(config, discrete_action_vocab_size=discrete_action_vocab_size)
+        self.model = PI06FlowMatching(
+            config,
+            discrete_action_vocab_size=discrete_action_vocab_size,
+            language_tokenizer=self.language_tokenizer,
+        )
 
         self.reset()
 
@@ -710,27 +755,33 @@ class PI06FlowMatching(nn.Module):
     └──────────────────────────────────────────┘
     """
 
-    def __init__(self, config: PI06Config, discrete_action_vocab_size: int | None = None):
+    def __init__(
+        self,
+        config: PI06Config,
+        discrete_action_vocab_size: int | None = None,
+        language_tokenizer: AutoTokenizer | None = None,
+    ):
         """Initializes the PI06FlowMatching model.
 
         Args:
             config: `PI06Config` instance.
             discrete_action_vocab_size: FAST tokenizer vocabulary size.
+            language_tokenizer: Optional pre-loaded Gemma 3 tokenizer to share
+                with the enclosing `PI06Policy`. When ``None`` (e.g. unit tests
+                that construct the inner module directly) the tokenizer is
+                loaded here. Either way, the same instance is used by both
+                layers — there is no second copy to fall out of sync.
         """
         super().__init__()
         self.config = config
 
-        # Only pull pretrained Gemma 3 weights when the expert is being He-inited
-        # alongside them (i.e. only in the `expert_only_he_init` path). Any other
-        # strategy trains or resumes, so we skip the download.
-        load_pretrained_gemma3 = self.config.init_strategy == "expert_only_he_init"
         gemma3_with_expert_config = Gemma3WithExpertConfig(
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=self.config.train_expert_only,
             attention_implementation=self.config.attention_implementation,
-            load_pretrained_gemma3=load_pretrained_gemma3,
             discrete_action_vocab_size=discrete_action_vocab_size,
             dropout=self.config.dropout,
+            gradient_checkpointing=self.config.gradient_checkpointing,
         )
         self.gemma3_with_expert = Gemma3WithExpertModel(gemma3_with_expert_config)
 
@@ -741,30 +792,20 @@ class PI06FlowMatching(nn.Module):
         self.time_mlp_in = nn.Linear(self.config.proj_width, self.config.proj_width)
         self.time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
 
-        self.language_tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-4b-pt")
-
-        self._init_model()
-
-    def _init_weights(self, module: nn.Module) -> None:
-        if isinstance(module, nn.Linear):
-            nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.LayerNorm):
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
-
-    def _init_model(self) -> None:
-        if self.config.init_strategy == "no_init":
-            return
-        elif self.config.init_strategy == "full_he_init":
-            for m in self.modules():
-                self._init_weights(m)
-        elif self.config.init_strategy == "expert_only_he_init":
-            for m in self.gemma3_with_expert.gemma_expert.modules():
-                self._init_weights(m)
-        else:
-            raise ValueError(f"Invalid init strategy: {self.config.init_strategy}")
+        if language_tokenizer is None:
+            language_tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-4b-pt")
+        self.language_tokenizer = language_tokenizer
+        # π0.6 uses Gemma 3, whose stock tokenizer does NOT carry the 1024
+        # <loc0000>..<loc1023> grounding tokens that PaliGemma reserves. We
+        # unconditionally extend the vocab here so any grounding/VQA training
+        # data containing loc tokens flows through the same response_ce_loss
+        # path as on PaliGemma backbones. The new embedding rows are random-
+        # init under a forked, fixed-seed RNG (see `ensure_loc_tokens`); there
+        # is NO PaliGemma loc-embedding transfer. The resize must happen after
+        # `Gemma3WithExpertModel(...)` has already loaded the public Gemma 3
+        # weights (above), so the original 256K rows survive and only the 1024
+        # new rows are freshly initialized.
+        ensure_loc_tokens(self.language_tokenizer, model=self.gemma3_with_expert.gemma3)
 
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
         """Standard Gaussian noise (float32)."""
@@ -821,8 +862,10 @@ class PI06FlowMatching(nn.Module):
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
         num_lang_embs = lang_emb.shape[1]
-        # Language tokens continue the image block (bidirectional within prefix).
-        att_masks += [0] * num_lang_embs
+        # Language tokens use causal attention per the π0.6 model card §2:
+        # "use causal attention among the text tokens" — an explicit divergence
+        # from π0.5, whose language tokens shared the image block bidirectionally.
+        att_masks += [1] * num_lang_embs
 
         if response_tokens is not None:
             response_emb = self.gemma3_with_expert.embed_language_tokens(response_tokens)
@@ -987,17 +1030,13 @@ class PI06FlowMatching(nn.Module):
         v_t = self.action_out_proj(suffix_out)
         v_t = v_t.to(dtype=torch.float32)
 
-        mse_loss = F.mse_loss(u_t, v_t, reduction="none")
-
-        postfix_mask = rearrange(torch.logical_not(prefix_mask), "b c -> b c 1")
-        if actions_is_pad is not None:
-            in_episode_bound = ~actions_is_pad
-            in_episode_bound = rearrange(in_episode_bound, "b c -> b c 1")
-            postfix_mask = torch.logical_and(postfix_mask, in_episode_bound)
-        mse_loss = mse_loss * postfix_mask
-        mse_loss = mse_loss[:, :, : self.config.max_action_dim]
-        postfix_mask_expanded = repeat(postfix_mask, "b c 1 -> b c d", d=mse_loss.shape[-1])
-        mse_loss = mse_loss.sum() / (postfix_mask_expanded.sum() + 1e-8)
+        mse_loss = flow_matching_masked_mse(
+            u_t=u_t,
+            v_t=v_t,
+            prefix_mask=prefix_mask,
+            actions_is_pad=actions_is_pad,
+            max_action_dim=self.config.max_action_dim,
+        )
 
         # Discrete-action cross-entropy (FAST tokens) via the dedicated head.
         batch_size_da, seq_len = discrete_actions.shape

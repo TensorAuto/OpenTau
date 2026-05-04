@@ -31,13 +31,20 @@ permissions:
 
 jobs:
   review:
-    # Skip on `synchronize` when the pusher is a Claude bot — otherwise the
-    # implement-fixes workflow's pushes would re-trigger us in a loop and we'd
-    # end up reviewing our own fixes. Always run on `opened` (auto-reviewing a
-    # Claude-opened PR is the whole point of this workflow).
+    # Trust gate — only org owners/members/collaborators or claude[bot]
+    # (which opens `chore(claude): learn from #N` PRs). author_association
+    # is NONE for bots, so the login OR is required.
+    #
+    # Note: we deliberately DO NOT skip when github.event.sender is claude[bot].
+    # Each review invocation is a fresh claude-code-action session, so reviewing
+    # a `[claude-fix]` commit is just a normal review with no shared context —
+    # and that fresh-eyes pass is exactly what we want on bot-authored fixes.
+    # The previously-feared review→fix loop requires a review comment to
+    # contain the literal `@claude fix`; the prompt template below never emits
+    # that string, so the loop is not reachable in practice.
     if: >-
-      github.event.action == 'opened'
-      || !contains(github.event.sender.login, 'claude')
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
+      || github.event.pull_request.user.login == 'claude[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -49,6 +56,9 @@ jobs:
       - uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Match the bot allowlist in the job-level `if:` above. Never `*` on
+          # a public repo (per the action's docs warning).
+          allowed_bots: "claude[bot]"
           claude_args: |
             --model ${{ vars.CLAUDE_MODEL || 'claude-opus-4-7[1m]' }}
             --permission-mode bypassPermissions

@@ -33,7 +33,6 @@
         "proj_width": 1024,
         "dropout": 0.1,
         "num_steps": 10,
-        "init_strategy": "full_he_init",
         "attention_implementation": "eager",
         "freeze_vision_encoder": true,
         "train_expert_only": false,

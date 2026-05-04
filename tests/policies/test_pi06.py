@@ -35,6 +35,7 @@ from opentau.policies.pi06.gemma3_with_expert import (
     apply_rope,
 )
 from opentau.policies.pi06.modeling_pi06 import (
+    flow_matching_masked_mse,
     make_att_2d_masks,
     pad_discrete_tokens,
     resize_with_pad,
@@ -45,8 +46,9 @@ from opentau.policies.pi06.modeling_pi06 import (
 
 class TestMakeAtt2dMasks:
     """Locks in the block-causal semantics the π0.6 model card depends on:
-    image + text = one bidirectional block, response / discrete-action =
-    subsequent causal blocks, action suffix = its own bidirectional block."""
+    images = bidirectional prefix; language tokens, response and FAST
+    discrete-action tokens = causal (per §2 "use causal attention among the
+    text tokens"); action suffix in the expert = its own bidirectional block."""
 
     def test_pure_bidirectional(self):
         pad = torch.tensor([[True, True, True, True]])
@@ -105,6 +107,35 @@ class TestMakeAtt2dMasks:
         # Padded cross key should be masked out.
         assert not torch.any(mask[0, :, 2])
 
+    def test_embed_prefix_layout_has_causal_language_block(self):
+        """π0.6 model card §2: language tokens use causal attention while
+        sitting after a bidirectional image prefix. This simulates the
+        `att_masks` list `PI06FlowMatching.embed_prefix` builds and asserts
+        the language-vs-language sub-block is strictly causal, while still
+        seeing the full image prefix.
+        """
+        num_img_embs, num_lang_embs = 4, 5
+        att = torch.tensor([[0] * num_img_embs + [1] * num_lang_embs])
+        pad = torch.ones_like(att, dtype=torch.bool)
+        mask = make_att_2d_masks(pad, att)
+
+        img_slice = slice(0, num_img_embs)
+        lang_slice = slice(num_img_embs, num_img_embs + num_lang_embs)
+
+        # Image prefix is fully bidirectional within itself.
+        assert torch.all(mask[0, img_slice, img_slice])
+
+        # Language-vs-language is strictly causal: every lang token sees its
+        # predecessors and itself, but not later lang tokens.
+        lang_block = mask[0, lang_slice, lang_slice]
+        expected_causal = torch.tril(torch.ones(num_lang_embs, num_lang_embs, dtype=torch.bool))
+        assert torch.equal(lang_block, expected_causal)
+
+        # Language still sees the entire image prefix (prefix-LM cross attention).
+        assert torch.all(mask[0, lang_slice, img_slice])
+        # Image tokens do NOT see later language tokens (they precede them).
+        assert not torch.any(mask[0, img_slice, lang_slice])
+
 
 # RoPE shape preservation + different theta values
 
@@ -132,6 +163,76 @@ class TestApplyRope:
         positions = torch.zeros(1, 1, dtype=torch.long)
         out = apply_rope(x, positions, max_wavelength=10_000.0)
         assert torch.allclose(out, x, atol=1e-6)
+
+
+# MSE-loss masking on fully-padded action samples (web / VQA co-training).
+#
+# The π0.6 paper §2 says the VLM is trained jointly on FAST action tokens and
+# co-training examples like multi-modal web data. VQA samples have no real
+# actions, so `VQADataset` sets `actions_is_pad = all-True`. The flow-matching
+# loss in `PI06FlowMatching.forward` must honour that mask, otherwise the
+# action expert is trained to regress to zero on web samples — a silent bug.
+#
+# These tests drive the production helper `flow_matching_masked_mse`
+# (the same function `PI06FlowMatching.forward` calls) so a regression in the
+# masking arithmetic — e.g. dropping the `~actions_is_pad` AND, or moving the
+# slice-then-sum boundary — fails here, not just in slow GPU integration.
+
+
+class TestMSEMaskOnFullyPaddedActions:
+    """Locks in the contract: an item with `actions_is_pad` all-True
+    contributes exactly zero MSE, regardless of the noisy-action targets."""
+
+    def test_all_padded_yields_zero_loss(self):
+        torch.manual_seed(0)
+        u_t = torch.randn(2, 8, 16)
+        v_t = torch.randn(2, 8, 16)
+        actions_is_pad = torch.ones(2, 8, dtype=torch.bool)
+        prefix_mask = torch.zeros(2, 8, dtype=torch.bool)
+        loss = flow_matching_masked_mse(
+            u_t=u_t,
+            v_t=v_t,
+            prefix_mask=prefix_mask,
+            actions_is_pad=actions_is_pad,
+            max_action_dim=16,
+        )
+        assert loss.item() == 0.0
+
+    def test_partial_padded_only_counts_real_steps(self):
+        """Mixed mask: half the chunk is padded; loss should equal the MSE
+        averaged only over the real timesteps."""
+        torch.manual_seed(0)
+        u_t = torch.randn(1, 8, 4)
+        v_t = torch.randn(1, 8, 4)
+        actions_is_pad = torch.tensor([[False, False, False, False, True, True, True, True]])
+        prefix_mask = torch.zeros(1, 8, dtype=torch.bool)
+        loss = flow_matching_masked_mse(
+            u_t=u_t,
+            v_t=v_t,
+            prefix_mask=prefix_mask,
+            actions_is_pad=actions_is_pad,
+            max_action_dim=4,
+        )
+        # Independent reference: mean over the first 4 timesteps only.
+        expected = ((u_t[0, :4] - v_t[0, :4]) ** 2).sum() / (4 * 4)
+        assert torch.isclose(loss, expected, atol=1e-6)
+
+    def test_prefix_mask_excludes_frozen_steps(self):
+        """Frozen-prefix steps (real-time-inference delay) must be excluded
+        the same way `actions_is_pad` is — covers the other AND-input."""
+        torch.manual_seed(0)
+        u_t = torch.randn(1, 8, 4)
+        v_t = torch.randn(1, 8, 4)
+        prefix_mask = torch.tensor([[True, True, True, False, False, False, False, False]])
+        loss = flow_matching_masked_mse(
+            u_t=u_t,
+            v_t=v_t,
+            prefix_mask=prefix_mask,
+            actions_is_pad=None,
+            max_action_dim=4,
+        )
+        expected = ((u_t[0, 3:] - v_t[0, 3:]) ** 2).sum() / (5 * 4)
+        assert torch.isclose(loss, expected, atol=1e-6)
 
 
 # PI06Config defaults + validators
@@ -208,7 +309,17 @@ class TestGemma3WithExpertConfig:
 
     def test_bad_attention_implementation_raises(self):
         with pytest.raises(ValueError, match="attention_implementation"):
-            Gemma3WithExpertConfig(discrete_action_vocab_size=2048, attention_implementation="sdpa")
+            Gemma3WithExpertConfig(discrete_action_vocab_size=2048, attention_implementation="garbage")
+
+    def test_sdpa_attention_implementation_accepted(self):
+        cfg = Gemma3WithExpertConfig(discrete_action_vocab_size=2048, attention_implementation="sdpa")
+        assert cfg.attention_implementation == "sdpa"
+
+    def test_fa2_falls_back_to_eager_with_warning(self, caplog):
+        with caplog.at_level("WARNING"):
+            cfg = Gemma3WithExpertConfig(discrete_action_vocab_size=2048, attention_implementation="fa2")
+        assert cfg.attention_implementation == "fa2"
+        assert any("falling back to 'eager'" in record.message for record in caplog.records)
 
     def test_vision_image_size_matches_input_resolution(self):
         # Regression: Gemma 3's `Gemma3MultiModalProjector` hardcodes
@@ -478,6 +589,139 @@ class TestNoSlidingWindowEnforcement:
         )
 
 
+# SDPA / gradient-checkpointing equivalence — eager vs sdpa forward outputs
+# match within a tight tolerance, and gradient_checkpointing=True produces
+# the same forward output as =False.
+
+
+class TestPi06AttentionDispatcher:
+    def test_dispatcher_returns_sdpa_for_sdpa_impl(self, monkeypatch):
+        monkeypatch.setattr(g3we, "_preferred_dtype", lambda: torch.float32)
+        _, cfg, _ = _make_tiny_g3we_model()
+        cfg.attention_implementation = "sdpa"
+        model = Gemma3WithExpertModel(cfg)
+        assert model.get_attention_interface() == model.sdpa_attention_forward
+
+    def test_dispatcher_returns_eager_for_eager_impl(self, monkeypatch):
+        monkeypatch.setattr(g3we, "_preferred_dtype", lambda: torch.float32)
+        _, cfg, _ = _make_tiny_g3we_model()
+        cfg.attention_implementation = "eager"
+        model = Gemma3WithExpertModel(cfg)
+        assert model.get_attention_interface() == model.eager_attention_forward
+
+    def test_dispatcher_falls_back_to_eager_for_fa2(self, monkeypatch):
+        monkeypatch.setattr(g3we, "_preferred_dtype", lambda: torch.float32)
+        _, cfg, _ = _make_tiny_g3we_model()
+        cfg.attention_implementation = "fa2"
+        model = Gemma3WithExpertModel(cfg)
+        # The dispatch falls back to eager (no NotImplementedError as before).
+        assert model.get_attention_interface() == model.eager_attention_forward
+
+
+class TestPi06SdpaEquivalence:
+    def test_eager_vs_sdpa_outputs_close(self, monkeypatch):
+        monkeypatch.setattr(g3we, "_preferred_dtype", lambda: torch.float32)
+        _, cfg, _ = _make_tiny_g3we_model()
+        cfg.attention_implementation = "eager"
+
+        torch.manual_seed(0)
+        model_eager = Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+
+        # Re-construct with same seed for an identical-weights SDPA copy.
+        cfg_sdpa = type(cfg).from_dict(cfg.to_dict())
+        cfg_sdpa.attention_implementation = "sdpa"
+        torch.manual_seed(0)
+        model_sdpa = Gemma3WithExpertModel(cfg_sdpa).to(dtype=torch.float32)
+        # Mirror weights so the only delta is the attention math.
+        model_sdpa.load_state_dict(model_eager.state_dict(), strict=True)
+
+        model_eager.eval()
+        model_sdpa.eval()
+
+        batch, seq_len = 1, 4
+        hidden_backbone = torch.randn(batch, seq_len, cfg.gemma3_config.text_config.hidden_size)
+        position_ids = torch.arange(seq_len)[None, :]
+        attention_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool))[None]
+
+        out_eager, _ = model_eager(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=[hidden_backbone, None],
+            n_cross_att_tokens=seq_len,
+            use_cache=False,
+            fill_kv_cache=True,
+        )
+        out_sdpa, _ = model_sdpa(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=[hidden_backbone, None],
+            n_cross_att_tokens=seq_len,
+            use_cache=False,
+            fill_kv_cache=True,
+        )
+
+        assert out_eager[0] is not None and out_sdpa[0] is not None
+        # Eager upcasts QK to fp32; SDPA does fp32 accumulation in softmax
+        # internally. Numerical match is tight in fp32.
+        assert torch.allclose(out_eager[0], out_sdpa[0], atol=1e-4, rtol=1e-4)
+
+
+class TestPi06GradCkptEquivalence:
+    def test_grad_ckpt_forward_matches_no_ckpt(self, monkeypatch):
+        """gradient_checkpointing=True should not change the forward output —
+        it only trades activation memory for recompute. Locks in that
+        ``_run_layer`` extraction is bit-identical to the original inlined
+        loop body.
+        """
+        monkeypatch.setattr(g3we, "_preferred_dtype", lambda: torch.float32)
+        _, cfg, _ = _make_tiny_g3we_model()
+        # dropout=0 + eval mode would bypass the checkpoint wrap entirely
+        # (use_ckpt = self.training and config.gradient_checkpointing); we
+        # need train mode to actually exercise the checkpoint path. Set
+        # dropout=0 on the engine config so train-mode forward is still
+        # deterministic.
+        cfg.dropout = 0.0
+
+        torch.manual_seed(0)
+        model_no_ckpt = Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+        model_no_ckpt.train()
+
+        cfg_ckpt = type(cfg).from_dict(cfg.to_dict())
+        cfg_ckpt.gradient_checkpointing = True
+        torch.manual_seed(0)
+        model_ckpt = Gemma3WithExpertModel(cfg_ckpt).to(dtype=torch.float32)
+        model_ckpt.load_state_dict(model_no_ckpt.state_dict(), strict=True)
+        model_ckpt.train()
+
+        batch, seq_len = 1, 4
+        hidden_backbone = torch.randn(batch, seq_len, cfg.gemma3_config.text_config.hidden_size)
+        position_ids = torch.arange(seq_len)[None, :]
+        attention_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool))[None]
+
+        out_a, _ = model_no_ckpt(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=[hidden_backbone, None],
+            n_cross_att_tokens=seq_len,
+            use_cache=False,
+            fill_kv_cache=True,
+        )
+        out_b, _ = model_ckpt(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=[hidden_backbone, None],
+            n_cross_att_tokens=seq_len,
+            use_cache=False,
+            fill_kv_cache=True,
+        )
+
+        assert out_a[0] is not None and out_b[0] is not None
+        # Forward output should be IDENTICAL: ckpt only re-runs forward in
+        # backward, doesn't change the forward numerics. Allow tiny rtol
+        # for any non-deterministic reductions in dropout-disabled mode.
+        assert torch.allclose(out_a[0], out_b[0], atol=1e-6, rtol=1e-6)
+
+
 # End-to-end integration — guarded because Gemma 3 4B is huge.
 
 
@@ -513,7 +757,26 @@ def test_complete_pi06_pipeline_integration_smoke(lerobot_dataset_metadata):
     config.output_features = {k: ft for k, ft in features.items() if ft.type is FeatureType.ACTION}
     config.input_features = {k: ft for k, ft in features.items() if k not in config.output_features}
 
-    policy = PI06Policy(config, dataset_stats=lerobot_dataset_metadata.stats)
+    # The shared lerobot_dataset_metadata fixture carries actions stats shaped
+    # (50, 32) — matching the default PI06Config(chunk_size=50). This test
+    # uses chunk_size=10 to keep the model small, so override the actions
+    # stats to (10, 32) before constructing Normalize buffers; otherwise
+    # `(actions - min) / (max - min + EPS)` mismatches at dim=1 (actions is
+    # (B, 10, 32) but the buffer is (50, 32)).
+    import copy
+
+    import numpy as np
+
+    dataset_stats = copy.deepcopy(lerobot_dataset_metadata.stats)
+    for k in ("max", "mean", "min", "std"):
+        # Tile the original per-step stats to chunk_size rows instead of
+        # collapsing every step to ``stats.flatten()[0]`` — a fixture with
+        # non-trivial per-step structure would otherwise be silently flattened
+        # to a single scalar.
+        original = dataset_stats["actions"][k].astype(np.float32, copy=False)
+        dataset_stats["actions"][k] = np.tile(original[:1], (config.chunk_size, 1))
+
+    policy = PI06Policy(config, dataset_stats=dataset_stats)
     policy.to(dtype=torch.bfloat16, device="cuda")
 
     batch = {
@@ -531,3 +794,281 @@ def test_complete_pi06_pipeline_integration_smoke(lerobot_dataset_metadata):
     assert isinstance(loss, dict)
     assert "MSE" in loss and "CE" in loss
     assert all(v.isfinite() for v in loss.values())
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_pi06_loc_tokens_extend_vocab_and_resize_embeddings(lerobot_dataset_metadata):
+    """π0.6: confirms the unconditional Gemma 3 vocab extension wired into
+    `PI06FlowMatching.__init__`. The bare `google/gemma-3-4b-pt` tokenizer
+    has no `<locNNNN>` tokens; after policy construction:
+
+    * The tokenizer vocab grows by exactly 1024.
+    * The Gemma 3 input embedding row count matches the new tokenizer length.
+    * The LM head output dim grows by 1024.
+    * `<loc0042>` encodes to a single token id.
+    * A forward pass with a loc-token-bearing response produces finite loss.
+    """
+    from transformers import AutoTokenizer
+
+    from opentau.policies.pi06.modeling_pi06 import PI06Policy
+
+    config = PI06Config(
+        max_state_dim=32,
+        max_action_dim=32,
+        chunk_size=10,
+        n_action_steps=10,
+        discrete_action_max_length=32,
+        predict_response=True,
+    )
+
+    from opentau.configs.types import FeatureType
+    from opentau.datasets.utils import dataset_to_policy_features
+
+    features = dataset_to_policy_features(
+        {
+            "state": {"shape": (32,), "dtype": "float32"},
+            "actions": {"shape": (10, 32), "dtype": "float32"},
+            "camera0": {"shape": (3, 448, 448), "dtype": "image"},
+            "camera1": {"shape": (3, 448, 448), "dtype": "image"},
+        }
+    )
+    config.output_features = {k: ft for k, ft in features.items() if ft.type is FeatureType.ACTION}
+    config.input_features = {k: ft for k, ft in features.items() if k not in config.output_features}
+
+    bare_tok_size = len(AutoTokenizer.from_pretrained("google/gemma-3-4b-pt"))
+
+    # `lerobot_dataset_metadata` carries actions stats shaped (50, 32) — the
+    # default chunk_size. This test runs at chunk_size=10 to stay small, so
+    # override the action-stats arrays to (10, 32) before Normalize buffers
+    # are constructed. Otherwise `(actions - min) / (max - min + EPS)` errors
+    # with a shape mismatch (actions is (B, 10, 32); buffer would be (50, 32)).
+    import copy
+
+    import numpy as np
+
+    dataset_stats = copy.deepcopy(lerobot_dataset_metadata.stats)
+    for k in ("max", "mean", "min", "std"):
+        dataset_stats["actions"][k] = np.full(
+            (config.chunk_size, 32),
+            float(dataset_stats["actions"][k].flatten()[0]),
+            dtype=np.float32,
+        )
+
+    policy = PI06Policy(config, dataset_stats=dataset_stats)
+
+    # PI06Policy and PI06FlowMatching share a single tokenizer instance so
+    # the outer encodes index the inner model's resized embedding correctly
+    # by construction (no risk of revision drift between two loads).
+    assert policy.language_tokenizer is policy.model.language_tokenizer
+    inner_tok = policy.model.language_tokenizer
+    assert len(inner_tok) == bare_tok_size + 1024, (
+        f"Expected vocab size {bare_tok_size + 1024} after extension, got {len(inner_tok)}"
+    )
+    assert len(inner_tok.encode("<loc0042>", add_special_tokens=False)) == 1
+    assert len(inner_tok.encode("<loc1023>", add_special_tokens=False)) == 1
+
+    gemma3 = policy.model.gemma3_with_expert.gemma3
+    assert gemma3.get_input_embeddings().num_embeddings == len(inner_tok)
+    # The LM head output dim should also have grown (tied weights with the
+    # input embedding in Gemma 3 by default).
+    output_emb = gemma3.get_output_embeddings()
+    if output_emb is not None:
+        # Linear layer: out_features matches the resized vocab.
+        assert output_emb.out_features == len(inner_tok)
+
+    policy.to(dtype=torch.bfloat16, device="cuda")
+    batch = {
+        "camera0": torch.randn(1, 3, 448, 448, dtype=torch.bfloat16, device="cuda"),
+        "camera1": torch.randn(1, 3, 448, 448, dtype=torch.bfloat16, device="cuda"),
+        "state": torch.randn(1, 32, dtype=torch.bfloat16, device="cuda"),
+        "actions": torch.randn(1, 10, 32, dtype=torch.bfloat16, device="cuda"),
+        "prompt": ["detect red block"],
+        "response": ["<loc0234><loc0567><loc0890><loc1023> red block"],
+        "img_is_pad": torch.zeros(1, 2, dtype=torch.bool, device="cuda"),
+        "action_is_pad": torch.zeros(1, 10, dtype=torch.bool, device="cuda"),
+    }
+
+    try:
+        loss = policy.forward(batch)
+        assert isinstance(loss, dict)
+        assert "MSE" in loss and "CE" in loss
+        assert all(v.isfinite() for v in loss.values()), f"Non-finite loss with loc tokens: {loss}"
+    finally:
+        # Free ~8 GB of Gemma 3 weights so adjacent GPU tests in the same
+        # process don't OOM on a single-GPU dev box.
+        del policy
+        torch.cuda.empty_cache()
+
+
+# Published `TensorAuto/pi06-untrained` checkpoint — load + weight equivalence.
+#
+# These tests verify the published init checkpoint (issue #239): that it loads
+# cleanly via `PI06Policy.from_pretrained("TensorAuto/pi06-untrained")` with no
+# missing/unexpected keys, and that the VLM / SigLIP submodules are bit-for-bit
+# identical to `google/gemma-3-4b-pt`. Heavy: each fixture loads ~10 GB on CPU,
+# so they're gated behind `gpu` + `slow` to stay out of CPU CI. They do NOT
+# actually require CUDA — comparison is on CPU in bf16 — but the markers double
+# as a "needs heavy infra + network" gate matching the surrounding pi06 tests.
+
+
+@pytest.fixture(scope="module")
+def pi06_untrained_policy():
+    """Load `TensorAuto/pi06-untrained` once on CPU; reused across the module."""
+    from opentau.policies.pi06.modeling_pi06 import PI06Policy
+
+    return PI06Policy.from_pretrained("TensorAuto/pi06-untrained")
+
+
+_SIGLIP_POS_EMBED_KEY = "model.vision_tower.vision_model.embeddings.position_embedding.weight"
+
+
+@pytest.fixture(scope="module")
+def gemma3_4b_pt_aligned_state_dict(pi06_untrained_policy):
+    """`google/gemma-3-4b-pt`'s state_dict, aligned to the policy:
+
+    - `ensure_loc_tokens` extends the embedding/LM head with the same 1024
+      `<locNNNN>` rows the policy carries (deterministic via fixed-seed RNG fork).
+    - The SigLIP `position_embedding` is bilinearly resampled from the published
+      4096 patches (896×896) down to the policy's 1024 patches (448×448) — the
+      same operation the build script applies before saving the checkpoint.
+
+    Returns a `dict[str, Tensor]` rather than the model itself because the
+    resampled position embedding has a different shape than the original
+    `nn.Embedding` parameter — so we can't mutate the model in place."""
+    from transformers import (
+        AutoTokenizer,
+        Gemma3ForConditionalGeneration,  # noqa: I100
+    )
+
+    from opentau.datasets.grounding.tokenizer_utils import ensure_loc_tokens
+    from opentau.utils.vision_utils import bilinear_resample_pos_embed
+
+    model = Gemma3ForConditionalGeneration.from_pretrained("google/gemma-3-4b-pt", torch_dtype=torch.bfloat16)
+    tok = AutoTokenizer.from_pretrained("google/gemma-3-4b-pt")
+    ensure_loc_tokens(tok, model=model)
+
+    state = model.state_dict()
+    pol_n_patches = pi06_untrained_policy.model.gemma3_with_expert.gemma3.state_dict()[
+        _SIGLIP_POS_EMBED_KEY
+    ].shape[0]
+    state[_SIGLIP_POS_EMBED_KEY] = bilinear_resample_pos_embed(
+        state[_SIGLIP_POS_EMBED_KEY], target_num_patches=pol_n_patches
+    )
+    del model
+    return state
+
+
+def _diff_state_dicts_against_reference(
+    policy_state: dict[str, torch.Tensor],
+    reference_state: dict[str, torch.Tensor],
+    *,
+    name_filter,
+) -> tuple[int, list[str]]:
+    """Compare every entry of `reference_state` whose name passes `name_filter`
+    against the matching entry in `policy_state`. Returns `(checked, mismatches)`.
+
+    `torch.equal` is used (not `allclose`) because the policy weights came from
+    the same source bf16 tensors with no precision-changing transform — they
+    must be byte-identical, and any drift is a real bug worth surfacing.
+    """
+    mismatches: list[str] = []
+    checked = 0
+    for name, ref in reference_state.items():
+        if not name_filter(name):
+            continue
+        pol = policy_state.get(name)
+        if pol is None:
+            mismatches.append(f"{name}: missing in policy state_dict")
+            continue
+        if pol.shape != ref.shape:
+            mismatches.append(f"{name}: shape mismatch {tuple(pol.shape)} vs {tuple(ref.shape)}")
+            continue
+        if not torch.equal(pol, ref):
+            max_abs = (pol.float() - ref.float()).abs().max().item()
+            mismatches.append(f"{name}: tensor not equal (max abs diff {max_abs:g})")
+            continue
+        checked += 1
+    return checked, mismatches
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_pi06_untrained_loads_with_no_missing_or_unexpected_keys(pi06_untrained_policy):
+    """Every key in the loaded policy's `state_dict()` is either present in the
+    published `model.safetensors`, or shares storage with a key that is. The
+    second case covers Gemma 3's tied embed_tokens/lm_head, which
+    `save_model_as_safetensor` de-duplicates on save (only one name on disk;
+    both are populated at load time via the model's `_tie_weights()` hook).
+    No safetensors key may be unexpected.
+
+    Catches the regression we actually care about: a save flow that silently
+    drops a non-tied parameter (e.g. an action-expert layer) would surface
+    here because that parameter has its own data_ptr and so won't be in any
+    tied group."""
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import load_file
+
+    ckpt_path = hf_hub_download("TensorAuto/pi06-untrained", "model.safetensors")
+    saved_keys = set(load_file(ckpt_path).keys())
+    loaded_state = pi06_untrained_policy.state_dict()
+    expected_keys = set(loaded_state.keys())
+
+    # Build groups of state_dict keys that share storage (tied weights).
+    ptr_to_names: dict[int, list[str]] = {}
+    for name, tensor in loaded_state.items():
+        ptr_to_names.setdefault(tensor.data_ptr(), []).append(name)
+    tied_groups = [names for names in ptr_to_names.values() if len(names) > 1]
+
+    # Each tied group must have exactly one representative on disk.
+    tied_group_violations = []
+    allowed_missing: set[str] = set()
+    for group in tied_groups:
+        on_disk = [n for n in group if n in saved_keys]
+        if len(on_disk) != 1:
+            tied_group_violations.append(
+                f"tied group {sorted(group)}: expected exactly 1 on disk, got {len(on_disk)}"
+            )
+        for n in group:
+            if n not in saved_keys:
+                allowed_missing.add(n)
+
+    missing = expected_keys - saved_keys - allowed_missing
+    unexpected = saved_keys - expected_keys
+    assert not tied_group_violations, "\n".join(tied_group_violations)
+    assert not missing and not unexpected, (
+        f"missing in safetensors ({len(missing)}): {sorted(missing)[:10]}\n"
+        f"unexpected in safetensors ({len(unexpected)}): {sorted(unexpected)[:10]}"
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_pi06_untrained_vlm_matches_gemma3_4b_pt(pi06_untrained_policy, gemma3_4b_pt_aligned_state_dict):
+    """Gemma 3 text tower + multimodal projector inside the published checkpoint
+    are byte-identical to `google/gemma-3-4b-pt` (vision tower checked separately
+    in `test_pi06_untrained_siglip_matches_gemma3_4b_pt`)."""
+    pol_state = pi06_untrained_policy.model.gemma3_with_expert.gemma3.state_dict()
+
+    checked, mismatches = _diff_state_dicts_against_reference(
+        pol_state, gemma3_4b_pt_aligned_state_dict, name_filter=lambda name: "vision_tower" not in name
+    )
+    assert checked > 0, "Sanity: should have compared at least one VLM (non-vision) param"
+    assert not mismatches, "VLM (Gemma 3 text + projector) mismatches:\n" + "\n".join(mismatches[:20])
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_pi06_untrained_siglip_matches_gemma3_4b_pt(pi06_untrained_policy, gemma3_4b_pt_aligned_state_dict):
+    """SigLIP vision tower inside the published checkpoint is byte-identical to
+    the vision tower bundled in `google/gemma-3-4b-pt`, modulo a deterministic
+    bilinear resample of `position_embedding` from 4096 (896×896 published) to
+    1024 (448×448 π0.6) patches — the build script applies the same resample,
+    so byte-equality holds."""
+    pol_state = pi06_untrained_policy.model.gemma3_with_expert.gemma3.state_dict()
+
+    checked, mismatches = _diff_state_dicts_against_reference(
+        pol_state, gemma3_4b_pt_aligned_state_dict, name_filter=lambda name: "vision_tower" in name
+    )
+    assert checked > 0, "Sanity: should have compared at least one SigLIP param"
+    assert not mismatches, "SigLIP vision tower mismatches:\n" + "\n".join(mismatches[:20])

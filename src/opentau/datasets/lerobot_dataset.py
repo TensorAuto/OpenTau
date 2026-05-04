@@ -217,6 +217,18 @@ CODEBASE_VERSION = "v2.1"
 _CONTROL_MODE_WARNED: set[str] = set()
 
 
+def suppress_control_mode_warning(repo_id: str) -> None:
+    """Mark ``repo_id`` as already-warned so the missing-``control_mode`` warning
+    does not fire for it during subsequent ``LeRobotDataset.__init__`` calls.
+
+    Intended for callers that supply an explicit ``control_mode`` override and
+    therefore already know the on-disk metadata is missing the field. Must be
+    invoked *before* the ``LeRobotDataset`` is constructed for ``repo_id``;
+    once ``__init__`` has emitted the warning, further calls are a no-op.
+    """
+    _CONTROL_MODE_WARNED.add(repo_id)
+
+
 class DatasetMetadata:
     """Base class for dataset metadata containing info and statistics.
 
@@ -1793,21 +1805,12 @@ class LeRobotDataset(BaseDataset):
         """Decode subgoal frames — one per camera slot — for this sample.
 
         Subgoal supervision is always-on for any dataset that exposes camera
-        keys; the dedicated ``subgoals`` info.json opt-in that the older
+        keys; the dedicated ``subgoals`` info.json declaration that the older
         pi07_paligemma path required is no longer consulted. Datasets without
         any cameras (``self.num_cams == 0`` or empty
         ``self.meta.camera_keys``) still return ``{}``, which lets
         :meth:`BaseDataset._emit_optional_keys` emit ``subgoal_is_pad=True``
         for every slot.
-
-        Behavior change from the prior opt-in design: ``WeightedDatasetMixture``
-        runs that mix subgoal-aware and subgoal-unaware datasets will now
-        silently inject subgoal supervision on the latter (segment-aware
-        sampling for episodes with ``segments`` annotations, or the legacy
-        ~4 s lookahead fallback for episodes without — see
-        :meth:`_sample_subgoal_frame`). Co-trainers should weight the mixture
-        accordingly or filter to subgoal-annotated subsets if the prior
-        treat-as-pad behavior is preferred.
 
         Behavior for camera-bearing datasets:
         - The at-end-of-segment vs uniform sampling roll happens ONCE per
@@ -1821,11 +1824,10 @@ class LeRobotDataset(BaseDataset):
           subset), drop is never rolled — the frame-selection randomness
           stays live because it's about which future frame to read, not
           masking.
-        - Episodes without a ``segments`` entry in ``episodes.jsonl`` fall
-          back to the legacy ~4 s lookahead inside
-          :meth:`_sample_subgoal_frame` (clipped to the episode end). New
-          datasets are encouraged to annotate ``segments`` per episode for
-          segment-aware sampling, but the legacy path remains supported.
+        - Episodes with no ``segments`` entry in ``episodes.jsonl`` fall
+          back to a fixed ~4 s lookahead inside ``_sample_subgoal_frame``
+          rather than skipping subgoal loading, so legacy datasets without
+          segment annotations still get supervision.
         """
         if self.num_cams <= 0 or len(self.meta.camera_keys) == 0:
             return {}
@@ -1837,11 +1839,11 @@ class LeRobotDataset(BaseDataset):
         at_end = bool(torch.rand(()) < self.subgoal_end_of_segment_prob)
         subgoal_frame = self._sample_subgoal_frame(ep_idx, frame_in_ep, at_end_of_segment=at_end)
         ts = subgoal_frame / self.fps
+        ep_start = int(self.episode_data_index["from"][self.epi2idx[ep_idx]].item())
         out: dict[str, torch.Tensor] = {}
         # ``hf_dataset[idx]`` runs ``hf_transform_to_torch`` over every column of the row, so
         # it must be done at most once per ``__getitem__`` even when multiple image-dtype
         # cameras live in the same row.
-        cached_image_row: dict | None = None
         for k in range(self.num_cams):
             cam_key = name_map.get(f"camera{k}")
             if cam_key is None:
@@ -1854,10 +1856,7 @@ class LeRobotDataset(BaseDataset):
                 # rows of ``hf_dataset``. The within-episode index returned
                 # by ``_sample_subgoal_frame`` maps directly to the absolute
                 # row ``ep_start + subgoal_frame``.
-                if cached_image_row is None:
-                    ep_start = int(self.episode_data_index["from"][self.epi2idx[ep_idx]].item())
-                    cached_image_row = self.hf_dataset[ep_start + subgoal_frame]
-                out[f"subgoal{k}_raw"] = cached_image_row[cam_key]
+                out[f"subgoal{k}_raw"] = self.hf_dataset[ep_start + subgoal_frame][cam_key]
         return out
 
     def _add_padding_keys(self, item: dict, padding: dict[str, list[bool]]) -> dict:

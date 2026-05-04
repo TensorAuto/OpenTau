@@ -32,6 +32,8 @@ adaptive RMSNorm and `_gated_residual`. The Gemma 3 backbone remains stock —
 its layer-norms return a plain tensor and are used without a `cond=` argument.
 """
 
+import logging
+
 import torch
 from torch import nn
 from transformers import (
@@ -110,9 +112,9 @@ class Gemma3WithExpertConfig(PretrainedConfig):
         freeze_vision_encoder: bool = True,
         train_expert_only: bool = True,
         attention_implementation: str = "eager",
-        load_pretrained_gemma3: bool = False,
         discrete_action_vocab_size: int | None = None,
         dropout: float = 0.1,
+        gradient_checkpointing: bool = False,
         **kwargs,
     ):
         """Initializes the configuration.
@@ -124,19 +126,30 @@ class Gemma3WithExpertConfig(PretrainedConfig):
                 Defaults to a ~860M-parameter Gemma with AdaRMS enabled.
             freeze_vision_encoder: Freeze the SigLIP tower during training.
             train_expert_only: Only update the expert and its heads.
-            attention_implementation: "eager" or "fa2" (fa2 not yet supported).
-            load_pretrained_gemma3: Whether to pull pretrained Gemma 3 weights
-                from the Hub (only recommended when He-initializing the expert).
+            attention_implementation: "eager", "sdpa", or "fa2". "fa2" is not
+                implemented and falls back to eager with a warning. "sdpa"
+                dispatches to ``torch.nn.functional.scaled_dot_product_attention``;
+                see the per-layer note about Gemma 3's interleaved local/global
+                pattern in ``forward()`` — π0.6 deliberately keeps the same
+                block-causal mask at every layer, so the SDPA call sees a
+                regular bool mask and takes the standard fused path.
             discrete_action_vocab_size: FAST tokenizer vocab size.
             dropout: Dropout probability applied in the per-layer loop.
+            gradient_checkpointing: Wrap each interleaved decoder-layer body in
+                ``torch.utils.checkpoint.checkpoint`` during training. Trades
+                roughly one extra forward pass per step (~25-33% compute) for
+                a large slice of activation memory per rank, enabling larger
+                per-rank batch sizes. Only safe under plain DDP (MULTI_GPU),
+                single-process (NO), or DeepSpeed ZeRO-1/2 — see the train.py
+                guard. Defaults to False.
             **kwargs: Passed to `PretrainedConfig`.
         """
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
         self.attention_implementation = attention_implementation
-        self.load_pretrained_gemma3 = load_pretrained_gemma3
         self.discrete_action_vocab_size = discrete_action_vocab_size
         self.dropout = dropout
+        self.gradient_checkpointing = gradient_checkpointing
 
         # Gemma 3 backbone defaults (match google/gemma-3-4b-pt).
         if gemma3_config is None:
@@ -235,10 +248,19 @@ class Gemma3WithExpertConfig(PretrainedConfig):
             raise ValueError(
                 "You set `freeze_vision_encoder=False` and `train_expert_only=True` which are not compatible."
             )
-        if self.attention_implementation not in ["eager", "fa2"]:
+        if self.attention_implementation not in ["eager", "sdpa", "fa2"]:
             raise ValueError(
                 f"Wrong value provided for `attention_implementation` ({self.attention_implementation}). "
-                "Expected 'eager' or 'fa2'."
+                "Expected 'eager', 'sdpa', or 'fa2'."
+            )
+        if self.attention_implementation == "fa2":
+            # fa2 has been considered but never implemented for pi06 because of
+            # Gemma 3's interleaved sliding-window/global mask pattern. Fall
+            # back to eager so configs that historically passed fa2 keep
+            # running; surface a one-time warning so callers can switch.
+            logging.warning(
+                "attention_implementation='fa2' is not implemented for pi06; falling back to 'eager'. "
+                "Use 'sdpa' for the fused PyTorch path (typically ~2x faster on A100 + bf16)."
             )
 
         super().__init__(**kwargs)
@@ -253,10 +275,7 @@ class Gemma3WithExpertModel(PreTrainedModel):
         super().__init__(config=config)
         self.config = config
 
-        if config.load_pretrained_gemma3:
-            self.gemma3 = Gemma3ForConditionalGeneration.from_pretrained("google/gemma-3-4b-pt")
-        else:
-            self.gemma3 = Gemma3ForConditionalGeneration(config=config.gemma3_config)
+        self.gemma3 = Gemma3ForConditionalGeneration(config=config.gemma3_config)
 
         self.gemma_expert = GemmaForCausalLM(config=config.gemma_expert_config)
         # The expert shares embeddings nowhere — drop the unused token table.
@@ -376,11 +395,25 @@ class Gemma3WithExpertModel(PreTrainedModel):
     # Attention core
 
     def get_attention_interface(self):
-        if self.config.attention_implementation == "fa2":
-            raise NotImplementedError(
-                "fa2 attention is not supported for pi06 yet because of the interleaved "
-                "local/global mask pattern — use 'eager' instead."
-            )
+        """Returns the attention implementation function based on config.
+
+        Dispatches on ``self.config.attention_implementation``:
+          - ``"eager"``: per-layer matmul-softmax-matmul in fp32 (historical
+            default; see ``eager_attention_forward``).
+          - ``"sdpa"``: ``torch.nn.functional.scaled_dot_product_attention``
+            which on A100 + bf16 dispatches to FlashAttention-2 / mem-efficient
+            backends. Note π0.6 keeps the same block-causal mask at every
+            layer (sliding window deliberately not enforced — see the comment
+            near ``apply_rope``), so SDPA sees a regular bool mask and does
+            not need a per-layer mask shape branch.
+          - ``"fa2"``: accepted for backward compatibility; falls back to
+            eager with a warning emitted at config validation time.
+        """
+        impl = self.config.attention_implementation
+        if impl == "sdpa":
+            return self.sdpa_attention_forward
+        # "eager" and legacy "fa2" both land here; "fa2" already warned during
+        # config construction.
         return self.eager_attention_forward
 
     def eager_attention_forward(
@@ -435,6 +468,92 @@ class Gemma3WithExpertModel(PreTrainedModel):
         att_output = att_output.reshape(batch_size, -1, num_key_value_heads * num_key_value_groups * head_dim)
         return att_output
 
+    def sdpa_attention_forward(
+        self,
+        attention_mask: torch.Tensor,
+        batch_size: int,
+        head_dim: int,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        scaling: float | None = None,
+    ) -> torch.Tensor:
+        """SDPA attention forward pass using ``F.scaled_dot_product_attention``.
+
+        Same output shape and semantics as ``eager_attention_forward`` but
+        delegates the scores-softmax-matmul chain to PyTorch's fused SDPA
+        kernel. On A100 + bf16 PyTorch typically dispatches to
+        FlashAttention-2. Q/K are not upcast to float32 (modern attention
+        kernels accumulate the softmax in fp32 internally); training dynamics
+        match eager within bf16 reassociation noise.
+
+        Args:
+            attention_mask: Boolean mask of shape (B, Q, K_total); ``True`` =
+                attend. π0.6 keeps the same block-causal mask at every layer.
+            batch_size: Batch size.
+            head_dim: Per-head dimension.
+            query_states: (B, Q, num_attention_heads, head_dim).
+            key_states: (B, K_total, num_key_value_heads, head_dim).
+            value_states: (B, K_total, num_key_value_heads, head_dim).
+            scaling: Override for the QK scaling factor. Gemma 3 uses
+                ``query_pre_attn_scalar ** -0.5`` rather than the default
+                ``head_dim ** -0.5``; the caller passes this through.
+
+        Returns:
+            torch.Tensor: Attention output of shape
+            (B, Q, num_attention_heads * head_dim).
+        """
+        num_att_heads = self._text_config.num_attention_heads
+        num_key_value_heads = self._text_config.num_key_value_heads
+        num_key_value_groups = num_att_heads // num_key_value_heads
+        sequence_length = key_states.shape[1]
+
+        # GQA expansion mirroring eager_attention_forward; cheap memory-view.
+        key_states = key_states[:, :, :, None, :].expand(
+            batch_size, sequence_length, num_key_value_heads, num_key_value_groups, head_dim
+        )
+        key_states = key_states.reshape(
+            batch_size, sequence_length, num_key_value_heads * num_key_value_groups, head_dim
+        )
+        value_states = value_states[:, :, :, None, :].expand(
+            batch_size, sequence_length, num_key_value_heads, num_key_value_groups, head_dim
+        )
+        value_states = value_states.reshape(
+            batch_size, sequence_length, num_key_value_heads * num_key_value_groups, head_dim
+        )
+
+        # SDPA expects (B, H, S, D_h).
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
+        # Bool mask broadcast across heads. SDPA accepts bool: True = attend.
+        attn_mask = attention_mask[:, None, :, :]
+
+        # Pass `scale=` only when the caller provided one — otherwise SDPA
+        # uses its built-in default of head_dim**-0.5, which matches the
+        # eager fallback when ``scaling`` is None.
+        sdpa_kwargs = {
+            "attn_mask": attn_mask,
+            "dropout_p": 0.0,
+            "is_causal": False,
+        }
+        if scaling is not None:
+            sdpa_kwargs["scale"] = scaling
+
+        att_output = nn.functional.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            **sdpa_kwargs,
+        )
+
+        # (B, H, S, D_h) → (B, S, H * D_h)
+        att_output = att_output.permute(0, 2, 1, 3)
+        att_output = att_output.reshape(batch_size, -1, num_key_value_heads * num_key_value_groups * head_dim)
+
+        return att_output
+
     # Per-layer interleaved forward
 
     def forward(
@@ -474,8 +593,6 @@ class Gemma3WithExpertModel(PreTrainedModel):
         if adarms_cond is None:
             adarms_cond = [None, None]
 
-        backbone_layers = self._backbone_layers()
-        expert_layers = self.gemma_expert.model.layers
         backbone_norm = self._backbone_final_norm()
         expert_norm = self.gemma_expert.model.norm
 
@@ -490,154 +607,51 @@ class Gemma3WithExpertModel(PreTrainedModel):
 
         head_dim = self._head_dim
 
+        # Hoist the lazy ``past_key_values = {}`` initialization out of the
+        # per-layer body so ``_run_layer`` always receives a non-None dict
+        # when ``fill_kv_cache`` is True. Important for checkpoint recompute
+        # to be idempotent — _run_layer must not mutate past_key_values from
+        # None to {} during recompute (saved-tensor hooks would see a
+        # different argument identity on the second pass).
+        if fill_kv_cache and past_key_values is None:
+            past_key_values = {}
+
+        use_ckpt = self.config.gradient_checkpointing and self.training
         for layer_idx in range(self._num_layers):
-            layer_type = self._layer_types[layer_idx]
-            is_sliding = layer_type == "sliding_attention"
-            layer_rope_theta = self._rope_local if is_sliding else self._rope_global
-
-            layers_this_step = [backbone_layers[layer_idx], expert_layers[layer_idx]]
-            # Both streams MUST use the same RoPE base at this layer. Shared
-            # attention concatenates Q/K along the sequence axis; the dot-product
-            # invariant `R(q,p)·R(k,q) = q·R(q-p)k` only holds when the same θ
-            # produced both rotations. For global Gemma-3 layers (θ=1M) this
-            # means the expert also rotates at 1M even though the config carries
-            # a single fallback `rope_theta=10k`.
-            rope_thetas = [layer_rope_theta, layer_rope_theta]
-
-            query_states = []
-            key_states = []
-            value_states = []
-            gates = []
-            # Track the pre-attention residual + post-attn layernorm output for the
-            # Gemma-3 backbone side, since it needs a second residual around the MLP
-            # using `pre_feedforward_layernorm` / `post_feedforward_layernorm`.
-            backbone_preattn_residual = None
-
-            for stream_idx, hidden_states in enumerate(inputs_embeds):
-                if hidden_states is None:
-                    gates.append(None)
-                    query_states.append(None)
-                    key_states.append(None)
-                    value_states.append(None)
-                    continue
-
-                layer = layers_this_step[stream_idx]
-
-                if stream_idx == 0:
-                    # Gemma 3 backbone.
-                    backbone_preattn_residual = hidden_states
-                    h = layer.input_layernorm(hidden_states)
-                    gate = None
-                else:
-                    # Gemma-v1 expert (patched to return (tensor, gate)).
-                    h, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[stream_idx])
-
-                gates.append(gate)
-                bsize, seq_len, _ = h.shape
-                h = h.to(dtype=_preferred_dtype())
-
-                q = layer.self_attn.q_proj(h).view(bsize, seq_len, -1, head_dim)
-                k = layer.self_attn.k_proj(h).view(bsize, seq_len, -1, head_dim)
-                v = layer.self_attn.v_proj(h).view(bsize, seq_len, -1, head_dim)
-
-                if stream_idx == 0:
-                    # Gemma-3 applies an extra per-head RMSNorm on Q and K.
-                    q_norm = getattr(layer.self_attn, "q_norm", None)
-                    k_norm = getattr(layer.self_attn, "k_norm", None)
-                    if q_norm is not None:
-                        q = q_norm(q)
-                    if k_norm is not None:
-                        k = k_norm(k)
-
-                q = apply_rope(q, position_ids, max_wavelength=rope_thetas[stream_idx])
-                k = apply_rope(k, position_ids, max_wavelength=rope_thetas[stream_idx])
-
-                query_states.append(q)
-                key_states.append(k)
-                value_states.append(v)
-
-            # Drop Nones before concatenating.
-            q_list = [q for q in query_states if q is not None]
-            k_list = [k for k in key_states if k is not None]
-            v_list = [v for v in value_states if v is not None]
-
-            q_concat = torch.cat(q_list, dim=1)
-            k_concat = torch.cat(k_list, dim=1)
-            v_concat = torch.cat(v_list, dim=1)
-
-            if use_cache and past_key_values is not None and layer_idx in past_key_values:
-                k_concat = torch.cat([past_key_values[layer_idx]["key_states"], k_concat], dim=1)
-                v_concat = torch.cat([past_key_values[layer_idx]["value_states"], v_concat], dim=1)
-
-            if fill_kv_cache:
-                if past_key_values is None:
-                    past_key_values = {}
-                if n_cross_att_tokens is None:
-                    raise ValueError("n_cross_att_tokens must be provided when fill_kv_cache is True")
-                past_key_values[layer_idx] = {
-                    "key_states": k_concat[:, :n_cross_att_tokens, :, :],
-                    "value_states": v_concat[:, :n_cross_att_tokens, :, :],
-                }
-
-            # π0.6 keeps the prefix block-causal mask at every layer — the
-            # Gemma 3 sliding-window pattern is deliberately not applied
-            # (see the note next to `apply_rope`).
-            layer_attention_mask = attention_mask
-
-            attention_interface = self.get_attention_interface()
-            att_output = attention_interface(
-                layer_attention_mask,
-                batch_size,
-                head_dim,
-                q_concat,
-                k_concat,
-                v_concat,
-                scaling=self._query_pre_attn_scaling,
-            )
-            att_output = att_output.to(dtype=_preferred_dtype())
-
-            outputs_embeds: list[torch.Tensor | None] = []
-            start = 0
-            for stream_idx, hidden_states in enumerate(inputs_embeds):
-                if hidden_states is None:
-                    outputs_embeds.append(None)
-                    continue
-
-                layer = layers_this_step[stream_idx]
-                seq_len = hidden_states.shape[1]
-                end = start + seq_len
-                part = att_output[:, start:end]
-                start = end
-
-                if part.dtype != layer.self_attn.o_proj.weight.dtype:
-                    part = part.to(layer.self_attn.o_proj.weight.dtype)
-                part = layer.self_attn.o_proj(part)
-                part = self.dropout(part)
-
-                if stream_idx == 0:
-                    # Gemma 3 block: residual + post_attn_norm(attn); then a second
-                    # residual with pre_feedforward_layernorm / mlp / post_feedforward_layernorm.
-                    post_attn = layer.post_attention_layernorm(part)
-                    h = backbone_preattn_residual + post_attn
-
-                    ff_residual = h
-                    h = layer.pre_feedforward_layernorm(h)
-                    h = layer.mlp(h)
-                    h = self.dropout(h)
-                    h = layer.post_feedforward_layernorm(h)
-                    h = ff_residual + h
-                    outputs_embeds.append(h)
-                else:
-                    # Gemma-v1 expert block with AdaRMS gates.
-                    h = modeling_gemma._gated_residual(hidden_states, part, gates[stream_idx])  # noqa: SLF001
-                    ff_residual = h.clone()
-                    h, gate2 = layer.post_attention_layernorm(h, cond=adarms_cond[stream_idx])
-                    h = layer.mlp(h)
-                    h = self.dropout(h)
-                    h = modeling_gemma._gated_residual(ff_residual, h, gate2)  # noqa: SLF001
-                    outputs_embeds.append(h)
-
-            inputs_embeds = outputs_embeds
+            if use_ckpt:
+                # use_reentrant=False is the modern, DDP-safe path; it
+                # preserves RNG state across recompute so dropout is
+                # deterministic, and participates cleanly in autograd's
+                # saved_tensors_hooks.
+                inputs_embeds = torch.utils.checkpoint.checkpoint(
+                    self._run_layer,
+                    layer_idx,
+                    inputs_embeds,
+                    attention_mask,
+                    position_ids,
+                    past_key_values,
+                    n_cross_att_tokens,
+                    use_cache,
+                    fill_kv_cache,
+                    adarms_cond,
+                    batch_size,
+                    head_dim,
+                    use_reentrant=False,
+                )
+            else:
+                inputs_embeds = self._run_layer(
+                    layer_idx,
+                    inputs_embeds,
+                    attention_mask,
+                    position_ids,
+                    past_key_values,
+                    n_cross_att_tokens,
+                    use_cache,
+                    fill_kv_cache,
+                    adarms_cond,
+                    batch_size,
+                    head_dim,
+                )
 
         # Final norms.
         final_outputs: list[torch.Tensor | None] = []
@@ -652,6 +666,178 @@ class Gemma3WithExpertModel(PreTrainedModel):
                 final_outputs.append(out)
 
         return final_outputs, past_key_values
+
+    def _run_layer(
+        self,
+        layer_idx: int,
+        inputs_embeds: list[torch.FloatTensor | None],
+        attention_mask: torch.Tensor | None,
+        position_ids: torch.LongTensor | None,
+        past_key_values: dict | None,
+        n_cross_att_tokens: int | None,
+        use_cache: bool | None,
+        fill_kv_cache: bool | None,
+        adarms_cond: list[torch.Tensor | None],
+        batch_size: int,
+        head_dim: int,
+    ) -> list[torch.FloatTensor | None]:
+        """Run a single layer of the interleaved backbone/expert decoder loop.
+
+        Extracted from ``forward()`` as a standalone method so it can be the
+        unit of ``torch.utils.checkpoint.checkpoint`` wrapping when
+        ``config.gradient_checkpointing`` is enabled. Behavior is bit-identical
+        to the original inlined loop body; the KV-cache write is idempotent
+        across checkpoint recompute because each layer writes its own unique
+        key with the same K/V tensors.
+        """
+        backbone_layers = self._backbone_layers()
+        expert_layers = self.gemma_expert.model.layers
+
+        layer_type = self._layer_types[layer_idx]
+        is_sliding = layer_type == "sliding_attention"
+        layer_rope_theta = self._rope_local if is_sliding else self._rope_global
+
+        layers_this_step = [backbone_layers[layer_idx], expert_layers[layer_idx]]
+        # Both streams MUST use the same RoPE base at this layer. Shared
+        # attention concatenates Q/K along the sequence axis; the dot-product
+        # invariant `R(q,p)·R(k,q) = q·R(q-p)k` only holds when the same θ
+        # produced both rotations. For global Gemma-3 layers (θ=1M) this
+        # means the expert also rotates at 1M even though the config carries
+        # a single fallback `rope_theta=10k`.
+        rope_thetas = [layer_rope_theta, layer_rope_theta]
+
+        query_states: list[torch.Tensor | None] = []
+        key_states: list[torch.Tensor | None] = []
+        value_states: list[torch.Tensor | None] = []
+        gates: list[torch.Tensor | None] = []
+        # Track the pre-attention residual + post-attn layernorm output for the
+        # Gemma-3 backbone side, since it needs a second residual around the MLP
+        # using `pre_feedforward_layernorm` / `post_feedforward_layernorm`.
+        backbone_preattn_residual = None
+
+        for stream_idx, hidden_states in enumerate(inputs_embeds):
+            if hidden_states is None:
+                gates.append(None)
+                query_states.append(None)
+                key_states.append(None)
+                value_states.append(None)
+                continue
+
+            layer = layers_this_step[stream_idx]
+
+            if stream_idx == 0:
+                # Gemma 3 backbone.
+                backbone_preattn_residual = hidden_states
+                h = layer.input_layernorm(hidden_states)
+                gate = None
+            else:
+                # Gemma-v1 expert (patched to return (tensor, gate)).
+                h, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[stream_idx])
+
+            gates.append(gate)
+            bsize, seq_len, _ = h.shape
+            h = h.to(dtype=_preferred_dtype())
+
+            q = layer.self_attn.q_proj(h).view(bsize, seq_len, -1, head_dim)
+            k = layer.self_attn.k_proj(h).view(bsize, seq_len, -1, head_dim)
+            v = layer.self_attn.v_proj(h).view(bsize, seq_len, -1, head_dim)
+
+            if stream_idx == 0:
+                # Gemma-3 applies an extra per-head RMSNorm on Q and K.
+                q_norm = getattr(layer.self_attn, "q_norm", None)
+                k_norm = getattr(layer.self_attn, "k_norm", None)
+                if q_norm is not None:
+                    q = q_norm(q)
+                if k_norm is not None:
+                    k = k_norm(k)
+
+            q = apply_rope(q, position_ids, max_wavelength=rope_thetas[stream_idx])
+            k = apply_rope(k, position_ids, max_wavelength=rope_thetas[stream_idx])
+
+            query_states.append(q)
+            key_states.append(k)
+            value_states.append(v)
+
+        # Drop Nones before concatenating.
+        q_list = [q for q in query_states if q is not None]
+        k_list = [k for k in key_states if k is not None]
+        v_list = [v for v in value_states if v is not None]
+
+        q_concat = torch.cat(q_list, dim=1)
+        k_concat = torch.cat(k_list, dim=1)
+        v_concat = torch.cat(v_list, dim=1)
+
+        if use_cache and past_key_values is not None and layer_idx in past_key_values:
+            k_concat = torch.cat([past_key_values[layer_idx]["key_states"], k_concat], dim=1)
+            v_concat = torch.cat([past_key_values[layer_idx]["value_states"], v_concat], dim=1)
+
+        if fill_kv_cache:
+            if n_cross_att_tokens is None:
+                raise ValueError("n_cross_att_tokens must be provided when fill_kv_cache is True")
+            past_key_values[layer_idx] = {
+                "key_states": k_concat[:, :n_cross_att_tokens, :, :],
+                "value_states": v_concat[:, :n_cross_att_tokens, :, :],
+            }
+
+        # π0.6 keeps the prefix block-causal mask at every layer — the
+        # Gemma 3 sliding-window pattern is deliberately not applied
+        # (see the note next to `apply_rope`).
+        layer_attention_mask = attention_mask
+
+        attention_interface = self.get_attention_interface()
+        att_output = attention_interface(
+            layer_attention_mask,
+            batch_size,
+            head_dim,
+            q_concat,
+            k_concat,
+            v_concat,
+            scaling=self._query_pre_attn_scaling,
+        )
+        att_output = att_output.to(dtype=_preferred_dtype())
+
+        outputs_embeds: list[torch.Tensor | None] = []
+        start = 0
+        for stream_idx, hidden_states in enumerate(inputs_embeds):
+            if hidden_states is None:
+                outputs_embeds.append(None)
+                continue
+
+            layer = layers_this_step[stream_idx]
+            seq_len = hidden_states.shape[1]
+            end = start + seq_len
+            part = att_output[:, start:end]
+            start = end
+
+            if part.dtype != layer.self_attn.o_proj.weight.dtype:
+                part = part.to(layer.self_attn.o_proj.weight.dtype)
+            part = layer.self_attn.o_proj(part)
+            part = self.dropout(part)
+
+            if stream_idx == 0:
+                # Gemma 3 block: residual + post_attn_norm(attn); then a second
+                # residual with pre_feedforward_layernorm / mlp / post_feedforward_layernorm.
+                post_attn = layer.post_attention_layernorm(part)
+                h = backbone_preattn_residual + post_attn
+
+                ff_residual = h
+                h = layer.pre_feedforward_layernorm(h)
+                h = layer.mlp(h)
+                h = self.dropout(h)
+                h = layer.post_feedforward_layernorm(h)
+                h = ff_residual + h
+                outputs_embeds.append(h)
+            else:
+                # Gemma-v1 expert block with AdaRMS gates.
+                h = modeling_gemma._gated_residual(hidden_states, part, gates[stream_idx])  # noqa: SLF001
+                ff_residual = h.clone()
+                h, gate2 = layer.post_attention_layernorm(h, cond=adarms_cond[stream_idx])
+                h = layer.mlp(h)
+                h = self.dropout(h)
+                h = modeling_gemma._gated_residual(ff_residual, h, gate2)  # noqa: SLF001
+                outputs_embeds.append(h)
+
+        return outputs_embeds
 
     # Gemma 3 structural accessors
 

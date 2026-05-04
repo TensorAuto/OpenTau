@@ -1,0 +1,9 @@
+{
+  "datasets": [
+    {
+      "repo_id": "lerobot/droid_100",
+      "revision": "v2.1"
+    }
+  ],
+  "weights": [1.0]
+}

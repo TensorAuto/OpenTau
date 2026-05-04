@@ -33,6 +33,13 @@ env:
 
 jobs:
   cpu-tests:
+    # Block PRs from non-org accounts to keep fork code off our runners.
+    # `push` and `workflow_dispatch` already require write access, so the
+    # short-circuit lets them through unchanged.
+    if: >-
+      github.event_name != 'pull_request'
+      || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
+      || github.event.pull_request.user.login == 'claude[bot]'
     name: CPU Tests
     runs-on: ubuntu-latest
     steps:
@@ -102,9 +109,7 @@ jobs:
           python3 -c "import sys; print(sys.path)"
           python3 -c "import libero.libero" && echo "LIBERO config set successfully."
           echo "Running cpu based pytest and generating coverage report..."
-          # TODO(#210): drop --ignore=tests/policies/test_pi07_paligemma_low_level_planner.py once pi07 migrates to SpaceTimeSiglipVideoEncoder (#192).
-          # TODO(#210): drop --ignore=tests/policies/test_pi07_paligemma_low_level_planner.py once pi07 migrates to SpaceTimeSiglipVideoEncoder (#192).
-          pytest -m "not gpu" -n auto -v --cov=lerobot/ --cov-report=xml:cpu_test/cpu_test.xml --ignore=tests/planner/test_planner.py --ignore tests/utils/test_libero_utils.py --ignore=tests/policies/test_pi07_paligemma_low_level_planner.py --deselect=tests/envs/test_factory.py::TestMakeEnv::test_make_env_async_vector_env --deselect=tests/envs/test_factory.py::TestMakeEnv::test_make_env_sync_vector_env tests/
+          pytest -m "not gpu" -n auto -v --cov=lerobot/ --cov-report=xml:cpu_test/cpu_test.xml --ignore=tests/planner/test_planner.py --ignore tests/utils/test_libero_utils.py --deselect=tests/envs/test_factory.py::TestMakeEnv::test_make_env_async_vector_env --deselect=tests/envs/test_factory.py::TestMakeEnv::test_make_env_sync_vector_env tests/
           echo "Pytest execution and coverage report generation completed."
 
       - name: Upload coverage reports

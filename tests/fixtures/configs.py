@@ -21,6 +21,7 @@ from opentau.optim.optimizers import OptimizerConfig
 from opentau.optim.schedulers import LRSchedulerConfig
 
 
+@PreTrainedConfig.register_subclass("concrete_test")
 @dataclass
 class ConcretePolicyConfig(PreTrainedConfig):
     @property

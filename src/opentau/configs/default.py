@@ -22,6 +22,7 @@ This module provides default configuration classes for:
 - Evaluation settings and parameters
 """
 
+import warnings
 from dataclasses import dataclass, field
 
 import draccus
@@ -70,6 +71,14 @@ class DatasetConfig:
             Each value is a dictionary with 'mean' and 'std' arrays. Defaults to None.
         data_features_name_mapping: Optional mapping from dataset feature names to
             standard feature names. Defaults to None.
+        robot_type: Optional override for the dataset's ``robot_type`` metadata
+            field. When provided (including the empty string), takes precedence
+            over the value loaded from ``meta/info.json``. ``None`` (default)
+            leaves the loaded value untouched.
+        control_mode: Optional override for the dataset's ``control_mode``
+            metadata field. When provided (including the empty string), takes
+            precedence over the value loaded from ``meta/info.json``. ``None``
+            (default) leaves the loaded value untouched.
 
     Raises:
         ValueError: If both or neither of `repo_id` and `vqa` are set, or
@@ -91,10 +100,22 @@ class DatasetConfig:
     # optional standard data format mapping for the dataset if mapping is not already in standard_data_format_mapping.py
     data_features_name_mapping: dict[str, str] | None = None
 
-    # Ratio of the dataset to be used for validation. Please specify a value.
-    # If `val_freq` is set to 0, a validation dataset will not be created and this value will be ignored.
-    # Defaults to 0.05.
-    val_split_ratio: float = 0.05
+    # Optional overrides for the metadata fields read from `meta/info.json`.
+    # `None` means "do not override". Any string value (including "") is
+    # written through to `dataset.meta.info[...]` after the dataset is built.
+    robot_type: str | None = None
+    control_mode: str | None = None
+
+    # DEPRECATED. Set `val_split_ratio` on `DatasetMixtureConfig` instead — the
+    # mixture-level value is the single source of truth and is applied uniformly
+    # to every dataset in the mixture. This per-dataset field is retained only
+    # so that pre-existing JSON configs continue to parse; setting it here has
+    # no effect on the actual split. The default is `None` (sentinel meaning
+    # "user did not set this") so that
+    # `DatasetMixtureConfig.__post_init__` can distinguish a real per-dataset
+    # override from the unset default and only emit a `DeprecationWarning` in
+    # the former case.
+    val_split_ratio: float | None = None
 
     def __post_init__(self):
         """Validate dataset configuration and register custom mappings if provided."""
@@ -167,6 +188,14 @@ class DatasetMixtureConfig:
             aren't polluted by training-time augmentation. Subgoal *frame*
             sampling (end-of-segment vs. uniform in the next 4s) stays active
             either way; only the masking logic is gated.
+        require_non_empty_robot_type: If True, every dataset in the mixture
+            must have a non-empty ``robot_type`` after the optional
+            ``DatasetConfig.robot_type`` override has been applied. Defaults to
+            ``False`` (empty / missing values are allowed).
+        require_non_empty_control_mode: If True, every dataset in the mixture
+            must have a non-empty ``control_mode`` after the optional
+            ``DatasetConfig.control_mode`` override has been applied. Defaults
+            to ``False`` (empty / missing values are allowed).
 
     Note:
         Dropout rolls use the default torch RNG. PyTorch DataLoader workers
@@ -215,6 +244,13 @@ class DatasetMixtureConfig:
     # selection stays random either way.
     val_enable_optional_key_dropout: bool = False
 
+    # When True, require every dataset in the mixture to have a non-empty
+    # robot_type / control_mode after `DatasetConfig.{robot_type,control_mode}`
+    # overrides have been applied. Defaults are False — empty values are
+    # tolerated unless the caller opts in to the stricter check.
+    require_non_empty_robot_type: bool = False
+    require_non_empty_control_mode: bool = False
+
     def __post_init__(self):
         """Validate dataset mixture configuration."""
         if self.weights is not None and len(self.datasets) != len(self.weights):
@@ -249,9 +285,22 @@ class DatasetMixtureConfig:
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"`{name}` must be in [0, 1], got {value}.")
 
-        # set the val_split_ratio for all datasets in the mixture
+        # `DatasetConfig.val_split_ratio` is deprecated — the mixture-level
+        # value is the single source of truth (read by `factory.make_dataset`).
+        # The per-dataset field defaults to `None`; warn only when the user
+        # actually set a value there, since that's the case where their input
+        # is being silently ignored.
         for dataset_cfg in self.datasets:
-            dataset_cfg.val_split_ratio = self.val_split_ratio
+            if dataset_cfg.val_split_ratio is not None:
+                warnings.warn(
+                    "`DatasetConfig.val_split_ratio` is deprecated and ignored; "
+                    "set `val_split_ratio` on `DatasetMixtureConfig` instead. "
+                    f"Got dataset value {dataset_cfg.val_split_ratio} "
+                    f"vs. mixture value {self.val_split_ratio}; the mixture "
+                    "value will be used.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
 
 
 @dataclass

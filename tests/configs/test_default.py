@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
+
 import pytest
 
 from opentau.configs.default import DatasetConfig, DatasetMixtureConfig
@@ -95,6 +97,43 @@ def test_invalid_vector_resample_strategy_raises_error():
         match=rf"`vector_resample_strategy` must be one of \['linear', 'nearest'\], got {strategy}.",
     ):
         DatasetMixtureConfig(vector_resample_strategy=strategy)
+
+
+def test_val_split_ratio_no_warning_when_only_mixture_customized():
+    """Setting only the mixture-level `val_split_ratio` must not warn.
+
+    This is the common path users follow after the deprecation; previously
+    a per-dataset default of 0.05 made every customized mixture trip a
+    false-positive `DeprecationWarning` because every child still had its
+    default value.
+    """
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        DatasetMixtureConfig(
+            datasets=[DatasetConfig(repo_id="foo/bar"), DatasetConfig(repo_id="baz/qux")],
+            val_split_ratio=0.1,
+        )
+    val_split_warnings = [
+        w
+        for w in caught
+        if issubclass(w.category, DeprecationWarning) and "val_split_ratio" in str(w.message)
+    ]
+    assert not val_split_warnings, (
+        f"Unexpected val_split_ratio DeprecationWarning(s): {[str(w.message) for w in val_split_warnings]}"
+    )
+
+
+def test_val_split_ratio_warns_when_child_overrides():
+    """Setting `val_split_ratio` on a child `DatasetConfig` must emit a DeprecationWarning."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        DatasetMixtureConfig(
+            datasets=[DatasetConfig(repo_id="foo/bar", val_split_ratio=0.2)],
+            val_split_ratio=0.1,
+        )
+    assert any(
+        issubclass(w.category, DeprecationWarning) and "val_split_ratio" in str(w.message) for w in caught
+    )
 
 
 class TestDatasetConfigDataMapping:

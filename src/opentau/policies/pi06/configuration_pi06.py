@@ -22,9 +22,7 @@ Insulation gradient-stop) but upgrades the backbone to Gemma 3 4B with 448×448
 vision and a larger action expert.
 """
 
-import logging
 from dataclasses import dataclass, field
-from typing import Literal
 
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
@@ -52,6 +50,15 @@ class PI06Config(PreTrainedConfig):
         max_state_dim: Maximum dimension for state vectors. Defaults to 32.
         max_action_dim: Maximum dimension for action vectors. Defaults to 32.
         predict_response: Whether to predict the response. Defaults to False.
+            Enabling this is required to reproduce the paper's hierarchical
+            design (π0.6 model card §1: "preserves the hierarchical design of
+            π0.5, providing high-level subtask prediction and low-level action
+            generation"). When False, π0.6 reduces to a flat low-level-only
+            model. The default is False because most LeRobot-style datasets do
+            not carry subtask annotations. The same field is also used to
+            supervise VQA / grounding-style textual targets during co-training
+            (this is why the field is named "response" rather than "subtask" —
+            it covers both uses, matching the π0.5 pretraining recipe).
         resize_imgs_with_padding: Target image size. Defaults to (448, 448).
         empty_cameras: Number of empty camera inputs to add. Defaults to 0.
             π0.6 pre-training uses up to 4 cameras (base + 2 wrist + optional
@@ -64,9 +71,10 @@ class PI06Config(PreTrainedConfig):
         dropout: Dropout rate. Defaults to 0.1.
         num_steps: Number of flow matching denoising steps. Defaults to 5
             (halved from π0.5's 10, giving ~63 ms per chunk on an H100).
-        init_strategy: One of "no_init", "full_he_init", "expert_only_he_init".
-            Defaults to "full_he_init".
-        attention_implementation: "eager" or "fa2". Defaults to "eager".
+        attention_implementation: "eager", "sdpa", or "fa2". Defaults to "eager".
+            "sdpa" dispatches to ``torch.nn.functional.scaled_dot_product_attention``
+            (typically 2-3x faster on A100 + bf16). "fa2" is accepted for backward
+            compatibility but logs a warning and falls back to eager.
         freeze_vision_encoder: Whether to freeze the vision encoder. Defaults to True.
         train_expert_only: Whether to train only the expert module. Defaults to False.
         optimizer_lr: AdamW learning rate. Defaults to 2.5e-5.
@@ -125,15 +133,23 @@ class PI06Config(PreTrainedConfig):
     # Real Time Inference: maximum number of frozen actions.
     max_delay: int = 0
 
-    # Initialization strategy
-    init_strategy: Literal["no_init", "full_he_init", "expert_only_he_init"] = "full_he_init"
-
     # Attention implementation
     attention_implementation: str = "eager"
 
     # Finetuning settings
     freeze_vision_encoder: bool = True
     train_expert_only: bool = False
+
+    # Wrap each interleaved transformer-layer forward in torch.utils.checkpoint
+    # to trade ~25-33% same-batch compute for a large slice of activation memory
+    # per rank, typically netting +10-25% throughput once the freed memory is
+    # spent on a larger per-rank batch. Only supported with distributed_type=
+    # MULTI_GPU (DDP), NO (single process), or DeepSpeed ZeRO-1/2 — src/opentau/
+    # scripts/train.py raises if the accelerator's distributed_type is anything
+    # else (ZeRO-3, FSDP) because pi06's custom interleaved per-layer forward
+    # does not wire up the backend-specific activation-checkpointing hooks
+    # those strategies require. Defaults to False (no ckpt, lowest risk).
+    gradient_checkpointing: bool = False
 
     # Training presets
     optimizer_lr: float = 2.5e-5
@@ -158,28 +174,6 @@ class PI06Config(PreTrainedConfig):
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
-
-        assert self.init_strategy in ["no_init", "full_he_init", "expert_only_he_init"], (
-            f"Invalid init strategy: {self.init_strategy} must be one of ['no_init', 'full_he_init', 'expert_only_he_init']"
-        )
-
-        # Official π0.6 weights have not been released at the time of writing; the
-        # guards below mirror pi05's so the machinery is ready when they do ship.
-        if self.init_strategy == "expert_only_he_init" and self.pretrained_path in (
-            "physical-intelligence/pi06",
-            "lerobot/pi06",
-        ):
-            raise ValueError(
-                "You cannot load pretrained π0.6 weights when init_strategy is 'expert_only_he_init' "
-                "due to differences in the Gemma 3 tokenizer vocabulary."
-            )
-
-        if self.pretrained_path is not None and self.pretrained_path not in (
-            "physical-intelligence/pi06",
-            "lerobot/pi06",
-        ):
-            logging.info("Setting init_strategy to 'no_init' because we are resuming from a checkpoint.")
-            self.init_strategy = "no_init"
 
         if self.max_delay > self.chunk_size:
             raise ValueError(

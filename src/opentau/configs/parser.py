@@ -31,6 +31,7 @@ from typing import Sequence
 
 import draccus
 
+from opentau.configs.refs import resolve_refs_to_tempfile
 from opentau.utils.utils import has_method
 
 PATH_KEY = "path"
@@ -383,8 +384,14 @@ def wrap(config_path: Path | None = None):
                 if has_method(argtype, "from_pretrained") and config_path_cli:
                     cli_args = filter_arg("config_path", cli_args)
                     cfg = argtype.from_pretrained(config_path_cli, cli_args=cli_args)
+                elif config_path is not None:
+                    tmp_config = resolve_refs_to_tempfile(config_path)
+                    try:
+                        cfg = draccus.parse(config_class=argtype, config_path=str(tmp_config), args=cli_args)
+                    finally:
+                        tmp_config.unlink(missing_ok=True)
                 else:
-                    cfg = draccus.parse(config_class=argtype, config_path=config_path, args=cli_args)
+                    cfg = draccus.parse(config_class=argtype, config_path=None, args=cli_args)
             response = fn(cfg, *args, **kwargs)
             return response
 

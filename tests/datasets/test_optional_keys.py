@@ -320,6 +320,11 @@ class TestDropoutDisabled:
         ds.resolution = (8, 8)
         ds.episode_lengths = {0: 100}
         ds.segment_starts_by_episode = {0: _np.array([0])}
+        ds.episode_data_index = {
+            "from": torch.tensor([0], dtype=torch.long),
+            "to": torch.tensor([100], dtype=torch.long),
+        }
+        ds.epi2idx = {0: 0}
         ds.meta = SimpleNamespace(
             video_keys=["camera0"],
             image_keys=[],
@@ -455,6 +460,8 @@ class TestDropoutDisabled:
             "to": torch.tensor([100], dtype=torch.long),
         }
         ds.epi2idx = {0: 0}
+        # info.json deliberately omits "subgoals" — mirrors every legacy
+        # LeRobot dataset that pre-dates this PR.
         ds.meta = SimpleNamespace(
             video_keys=["camera0"],
             image_keys=[],
@@ -477,15 +484,11 @@ class TestDropoutDisabled:
         assert "subgoal0_raw" in out
         assert len(called) == 1, "video decode fired exactly once for the single camera"
 
-    def test_subgoals_load_without_segments_uses_4s_lookahead(self, monkeypatch):
-        """Legacy path: episodes whose ``episodes.jsonl`` entry omits
-        ``segments`` fall back to a fixed ~4 s lookahead in
-        ``_sample_subgoal_frame``, clipped to the episode end.
-
-        Pins the segment-less branch the rewritten ``_load_subgoal_frames``
-        docstring promises (and that ``_sample_subgoal_frame`` still
-        implements) so a future segment-only refactor doesn't silently break
-        legacy datasets.
+    def test_image_dtype_fallback_uses_absolute_row_index(self, monkeypatch):
+        """``image``-dtype cameras read from the parquet rows of
+        ``hf_dataset`` instead of decoding a video. The lookup index must be
+        ``ep_start + subgoal_frame`` — the absolute row in the table — not
+        the within-episode index.
         """
         from types import SimpleNamespace
 
@@ -493,11 +496,8 @@ class TestDropoutDisabled:
 
         import opentau.datasets.lerobot_dataset as _ld
 
-        mapping_key = "_tests/subgoal_no_segments"
+        mapping_key = "_tests/subgoal_image_dtype"
         _ld.DATA_FEATURES_NAME_MAPPING[mapping_key] = {"camera0": "camera0"}
-
-        ep_length = 300  # > 4 s @ 30 fps so the lookahead is not clipped.
-        fps = 30
 
         ds = _ld.LeRobotDataset.__new__(_ld.LeRobotDataset)
         ds.enable_optional_key_dropout = False
@@ -505,40 +505,61 @@ class TestDropoutDisabled:
         ds.subgoal_drop_prob = 0.0
         ds.num_cams = 1
         ds.resolution = (8, 8)
-        ds.episode_lengths = {0: ep_length}
-        ds.segment_starts_by_episode = {0: _np.array([0])}
+        # Episode 1 starts at absolute row 100, length 50.
+        ep_start_abs = 100
+        ep_len = 50
+        ds.episode_lengths = {1: ep_len}
+        ds.segment_starts_by_episode = {1: _np.array([0])}
         ds.episode_data_index = {
-            "from": torch.tensor([0], dtype=torch.long),
-            "to": torch.tensor([ep_length], dtype=torch.long),
+            "from": torch.tensor([0, ep_start_abs], dtype=torch.long),
+            "to": torch.tensor([ep_start_abs, ep_start_abs + ep_len], dtype=torch.long),
         }
-        ds.epi2idx = {0: 0}
-        # Critical: ``episodes[0]`` has NO ``segments`` key — the legacy fallback path.
+        ds.epi2idx = {0: 0, 1: 1}
         ds.meta = SimpleNamespace(
-            video_keys=["camera0"],
-            image_keys=[],
+            video_keys=[],
+            image_keys=["camera0"],
             camera_keys=["camera0"],
-            episodes={0: {}},
-            fps=fps,
+            episodes={1: {"segments": [0]}},
+            fps=10,
             info={},
         )
         monkeypatch.setattr(type(ds), "_get_feature_mapping_key", lambda self: mapping_key)
 
-        called: list = []
+        # Pin the within-episode subgoal index so the test asserts a known
+        # absolute row.
+        within_ep_subgoal = 7
 
-        def _fake_query_videos(self, query_ts, ep_idx):
-            called.append(dict(query_ts))
-            return {"camera0": torch.zeros((3, *self.resolution))}
+        def _fake_sample(self, ep_idx, frame_in_ep, *, at_end_of_segment):
+            assert ep_idx == 1 and frame_in_ep == 0
+            return within_ep_subgoal
 
-        monkeypatch.setattr(type(ds), "_query_videos", _fake_query_videos)
+        monkeypatch.setattr(type(ds), "_sample_subgoal_frame", _fake_sample)
 
-        frame_in_ep = 10
-        out = ds._load_subgoal_frames(0, frame_in_ep)
-        assert "subgoal0_raw" in out, "legacy episodes (no segments) must still emit subgoal frames"
-        assert len(called) == 1
-        # Lookahead is exactly round(4 * fps) frames ahead, clipped to ep_length - 1.
-        expected_subgoal_frame = min(frame_in_ep + int(round(4.0 * fps)), ep_length - 1)
-        expected_ts = expected_subgoal_frame / fps
-        assert abs(called[0]["camera0"][0] - expected_ts) < 1e-9
+        # Stub hf_dataset to capture the row index requested and return a
+        # sentinel tensor identifying that row.
+        sentinel_payload = torch.full((3, 8, 8), 0.42, dtype=torch.float32)
+        hf_calls: list[int] = []
+
+        class _HFStub:
+            def __getitem__(self, idx):
+                hf_calls.append(idx)
+                return {"camera0": sentinel_payload}
+
+        ds.hf_dataset = _HFStub()
+
+        def _fail_query_videos(self, query_ts, ep_idx):
+            raise AssertionError("_query_videos must not be called for image-dtype cameras")
+
+        monkeypatch.setattr(type(ds), "_query_videos", _fail_query_videos)
+
+        out = ds._load_subgoal_frames(1, 0)
+
+        assert hf_calls == [ep_start_abs + within_ep_subgoal], (
+            f"image-dtype subgoal lookup used the wrong row: got {hf_calls}, "
+            f"expected [{ep_start_abs + within_ep_subgoal}]"
+        )
+        assert "subgoal0_raw" in out
+        assert torch.equal(out["subgoal0_raw"], sentinel_payload)
 
 
 # Default collate tolerates a batch with mixed _is_pad flags.

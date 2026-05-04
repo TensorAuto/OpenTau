@@ -35,6 +35,7 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import NormalizationMode
+from opentau.datasets.grounding.tokenizer_utils import ensure_loc_tokens
 from opentau.policies.normalize import Normalize, Unnormalize
 from opentau.policies.pi05.configuration_pi05 import PI05Config
 from opentau.policies.pi05.paligemma_with_expert import (
@@ -264,6 +265,10 @@ class PI05Policy(PreTrainedPolicy):
             config.output_features, config.normalization_mapping, dataset_stats
         )
 
+        # The same PaliGemma tokenizer instance is shared with the inner
+        # `PI05FlowMatching`. The single `ensure_loc_tokens` call inside the
+        # inner ctor promotes the reserved <loc0000>..<loc1023> entries on
+        # both layers at once — no second load, no risk of revision drift.
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
 
         self.discrete_action_processor = AutoProcessor.from_pretrained(
@@ -271,7 +276,11 @@ class PI05Policy(PreTrainedPolicy):
         )
         # Get vocab size from processor
         discrete_action_vocab_size = getattr(self.discrete_action_processor, "vocab_size", None)
-        self.model = PI05FlowMatching(config, discrete_action_vocab_size=discrete_action_vocab_size)
+        self.model = PI05FlowMatching(
+            config,
+            discrete_action_vocab_size=discrete_action_vocab_size,
+            language_tokenizer=self.language_tokenizer,
+        )
 
         self.reset()
 
@@ -912,24 +921,30 @@ class PI05FlowMatching(nn.Module):
     └──────────────────────────────────────────┘
     """
 
-    def __init__(self, config: PI05Config, discrete_action_vocab_size: int | None = None):
+    def __init__(
+        self,
+        config: PI05Config,
+        discrete_action_vocab_size: int | None = None,
+        language_tokenizer: AutoTokenizer | None = None,
+    ):
         """Initializes the PI05FlowMatching model.
 
         Args:
             config: Model configuration.
             discrete_action_vocab_size: Size of the discrete action vocabulary.
+            language_tokenizer: Optional pre-loaded PaliGemma tokenizer to share
+                with the enclosing `PI05Policy`. When ``None`` (e.g. unit tests
+                that construct the inner module directly) the tokenizer is
+                loaded here. Either way, the same instance is used by both
+                layers, and `ensure_loc_tokens` runs once.
         """
         super().__init__()
         self.config = config
 
-        load_pretrained_paligemma = (
-            self.config.init_strategy == "expert_only_he_init"
-        )  # only load pretrained paligemma if we are He-initializing the expert only
         paligemma_with_expert_config = PaliGemmaWithExpertConfig(
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=self.config.train_expert_only,
             attention_implementation=self.config.attention_implementation,
-            load_pretrained_paligemma=load_pretrained_paligemma,
             discrete_action_vocab_size=discrete_action_vocab_size,
             dropout=self.config.dropout,
             gradient_checkpointing=self.config.gradient_checkpointing,
@@ -947,36 +962,16 @@ class PI05FlowMatching(nn.Module):
         self.time_mlp_in = nn.Linear(self.config.proj_width, self.config.proj_width)
         self.time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
 
-        self.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
-
-        self._init_model()
-
-    def _init_weights(self, module: nn.Module) -> None:
-        """Initialize weights using He (Kaiming) initialization.
-
-        Args:
-            module: The module to initialize.
-        """
-        if isinstance(module, nn.Linear):
-            nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.LayerNorm):
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
-
-    def _init_model(self) -> None:
-        """Initialize the model weights based on the configuration."""
-        if self.config.init_strategy == "no_init":
-            return
-        elif self.config.init_strategy == "full_he_init":
-            for m in self.modules():
-                self._init_weights(m)
-        elif self.config.init_strategy == "expert_only_he_init":
-            for m in self.paligemma_with_expert.gemma_expert.modules():
-                self._init_weights(m)
-        else:
-            raise ValueError(f"Invalid init strategy: {self.config.init_strategy}")
+        if language_tokenizer is None:
+            language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
+        self.language_tokenizer = language_tokenizer
+        # PaliGemma reserves <loc0000>..<loc1023> at IDs 256000..257023, but
+        # the bare HF tokenizer does not register them as added/special
+        # tokens — a string "<loc0000>" otherwise BPE-fragments into seven
+        # pieces. This call promotes the reserved entries to single-token
+        # match mode (no new IDs, no embedding resize on PaliGemma) and
+        # mutates the shared tokenizer instance for `PI05Policy` too.
+        ensure_loc_tokens(self.language_tokenizer)
 
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
         """Samples Gaussian noise.
