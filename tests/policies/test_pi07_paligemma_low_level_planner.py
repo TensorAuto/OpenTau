@@ -92,18 +92,15 @@ class TestPI07LowLevelPlannerIntegration:
 
     @classmethod
     def _train_prefix_total(cls, tokenizer) -> int:
-        # Layout matches the post-fix ``embed_prefix`` order: subgoal block
-        # sits at the tail (per π0.7 paper Fig. 19: image goals come AFTER
-        # the text prompt), just before the optional discrete-action block.
         m = cls._indicator_lens(tokenizer)
         p = 0
         p += VIDEO_TOKENS
         p += PROMPT_MAX_LENGTH
         p += m["state_lead"] + N_OBS_STEPS + m["comma"]
         p += RESPONSE_MAX_LENGTH
+        p += m["subgoal_lead"] + SUBGOAL_TOKENS + m["comma"]
         p += METADATA_MAX_LENGTH
         p += m["prefix_end"]
-        p += m["subgoal_lead"] + SUBGOAL_TOKENS + m["comma"]
         p += m["action_lead"] + DISCRETE_ACTION_MAX_LENGTH
         return p
 
@@ -115,9 +112,9 @@ class TestPI07LowLevelPlannerIntegration:
         p += PROMPT_MAX_LENGTH
         p += m["state_lead"] + INFER_STATE_TOKENS + m["comma"]
         p += RESPONSE_MAX_LENGTH
+        p += m["subgoal_lead"] + SUBGOAL_TOKENS + m["comma"]
         p += METADATA_MAX_LENGTH
         p += m["prefix_end"]
-        p += m["subgoal_lead"] + SUBGOAL_TOKENS + m["comma"]
         return p
 
     @staticmethod
@@ -149,30 +146,27 @@ class TestPI07LowLevelPlannerIntegration:
 
         m = self._indicator_lens(tokenizer)
 
-        # Layout (post-PR-#235-style fix + Fig. 19 reorder): subgoals at the
-        # tail, just before the optional discrete-action block. Metadata and
-        # ";\n " sit between response and the subgoal block.
         lang_slice = slice(LANG_START, LANG_START + PROMPT_MAX_LENGTH)
         state_t = INFER_STATE_TOKENS if inference_mode else N_OBS_STEPS
 
         resp_lo = LANG_START + PROMPT_MAX_LENGTH + m["state_lead"] + state_t + m["comma"]
         resp_slice = slice(resp_lo, resp_lo + RESPONSE_MAX_LENGTH)
 
-        meta_lo = resp_lo + RESPONSE_MAX_LENGTH
-        meta_slice = slice(meta_lo, meta_lo + METADATA_MAX_LENGTH)
-
-        sg_lo = meta_lo + METADATA_MAX_LENGTH + m["prefix_end"] + m["subgoal_lead"]
+        sg_lo = resp_lo + RESPONSE_MAX_LENGTH + m["subgoal_lead"]
         sg_slice = slice(sg_lo, sg_lo + SUBGOAL_TOKENS)
+
+        meta_lo = sg_lo + SUBGOAL_TOKENS + m["comma"]
+        meta_slice = slice(meta_lo, meta_lo + METADATA_MAX_LENGTH)
 
         for i in range(prefix_pad_masks.shape[0]):
             assert torch.all(prefix_pad_masks[i, :VIDEO_TOKENS] == 1)
             self._check_ones_before_zeros(prefix_pad_masks[i, lang_slice])
             self._check_ones_before_zeros(prefix_pad_masks[i, resp_slice])
-            self._check_ones_before_zeros(prefix_pad_masks[i, meta_slice])
             assert torch.all(prefix_pad_masks[i, sg_slice] == 1)
+            self._check_ones_before_zeros(prefix_pad_masks[i, meta_slice])
 
             if not inference_mode:
-                da_lo = sg_lo + SUBGOAL_TOKENS + m["comma"] + m["action_lead"]
+                da_lo = meta_lo + METADATA_MAX_LENGTH + m["prefix_end"] + m["action_lead"]
                 da_slice = slice(da_lo, da_lo + DISCRETE_ACTION_MAX_LENGTH)
                 self._check_ones_before_zeros(prefix_pad_masks[i, da_slice])
 
