@@ -42,6 +42,7 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import NormalizationMode
+from opentau.datasets.grounding.tokenizer_utils import ensure_loc_tokens
 from opentau.policies.normalize import Normalize, Unnormalize
 from opentau.policies.pi06.configuration_pi06 import PI06Config
 from opentau.policies.pi06.gemma3_with_expert import (
@@ -249,6 +250,9 @@ class PI06Policy(PreTrainedPolicy):
         # only if the Hub download fails at module import time in an offline CI,
         # so users still get a useful error rather than silent drift.
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-4b-pt")
+        # Tokenizer-side extension; the matching embedding/LM-head resize fires
+        # inside PI06FlowMatching.__init__, where the Gemma 3 model handle exists.
+        ensure_loc_tokens(self.language_tokenizer)
 
         self.discrete_action_processor = AutoProcessor.from_pretrained(
             "physical-intelligence/fast", trust_remote_code=True
@@ -737,6 +741,17 @@ class PI06FlowMatching(nn.Module):
         self.time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
 
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-4b-pt")
+        # π0.6 uses Gemma 3, whose stock tokenizer does NOT carry the 1024
+        # <loc0000>..<loc1023> grounding tokens that PaliGemma reserves. We
+        # unconditionally extend the vocab here so any grounding/VQA training
+        # data containing loc tokens flows through the same response_ce_loss
+        # path as on PaliGemma backbones. The new embedding rows are random-
+        # init — they learn from grounding data on first use; there is NO
+        # PaliGemma loc-embedding transfer. The resize must happen after
+        # `Gemma3WithExpertModel(...)` has already loaded the public Gemma 3
+        # weights (line above), so the original 256K rows survive and only
+        # the 1024 new rows are freshly initialized.
+        ensure_loc_tokens(self.language_tokenizer, model=self.gemma3_with_expert.gemma3)
 
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
         """Standard Gaussian noise (float32)."""

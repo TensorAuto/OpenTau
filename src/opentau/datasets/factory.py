@@ -26,7 +26,7 @@ The factory supports two types of datasets:
     1. LeRobot datasets: Standard robot learning datasets loaded from HuggingFace
        repositories with configurable delta timestamps for temporal alignment.
     2. VQA datasets: Vision-language vqa datasets (CLEVR, COCO-QA,
-       PIXMO, VSR, etc.) for multimodal learning tasks.
+       VSR, etc.) for multimodal learning tasks.
 
 Key Features:
     - Delta timestamp resolution: Automatically configures temporal offsets
@@ -71,7 +71,6 @@ import torch
 import opentau.datasets.vqa.clevr  # noqa: F401
 import opentau.datasets.vqa.cocoqa  # noqa: F401
 import opentau.datasets.vqa.dummy  # noqa: F401
-import opentau.datasets.vqa.pixmo  # noqa: F401
 import opentau.datasets.vqa.vsr  # noqa: F401
 from opentau import available_vqa_datasets
 from opentau.configs.default import DatasetConfig

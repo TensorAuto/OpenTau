@@ -35,6 +35,7 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import NormalizationMode
+from opentau.datasets.grounding.tokenizer_utils import ensure_loc_tokens
 from opentau.policies.normalize import Normalize, Unnormalize
 from opentau.policies.pi05.configuration_pi05 import PI05Config
 from opentau.policies.pi05.paligemma_with_expert import (
@@ -265,6 +266,12 @@ class PI05Policy(PreTrainedPolicy):
         )
 
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
+        # PaliGemma reserves <loc0000>..<loc1023> at IDs 256000..257023, but
+        # the bare HF tokenizer does not register them as added/special
+        # tokens — a string "<loc0000>" otherwise BPE-fragments into seven
+        # pieces. This call promotes the reserved entries to single-token
+        # match mode (no new IDs, no embedding resize on PaliGemma).
+        ensure_loc_tokens(self.language_tokenizer)
 
         self.discrete_action_processor = AutoProcessor.from_pretrained(
             "physical-intelligence/fast", trust_remote_code=True
@@ -944,6 +951,9 @@ class PI05FlowMatching(nn.Module):
         self.time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
 
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
+        # See PI05Policy.__init__ — promotes the reserved <locNNNN> entries
+        # to single-token match mode on this tokenizer instance as well.
+        ensure_loc_tokens(self.language_tokenizer)
 
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
         """Samples Gaussian noise.

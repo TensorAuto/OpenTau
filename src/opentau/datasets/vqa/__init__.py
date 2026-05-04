@@ -34,8 +34,6 @@ Available Datasets:
         for visual question answering with synthetic scenes.
     - COCO-QA: Visual question answering dataset based on COCO images,
         filtered for spatial reasoning tasks.
-    - PIXMO: Pixel-level manipulation vqa dataset for object
-        localization and manipulation tasks.
     - VSR: Visual Spatial Reasoning dataset for true/false statement
         vqa about spatial relationships in images.
     - dummy: Synthetic test dataset with simple black, white, and gray
@@ -51,7 +49,6 @@ Modules:
     clevr: CLEVR dataset implementation.
     cocoqa: COCO-QA dataset implementation.
     dummy: Dummy test dataset implementation.
-    pixmo: PIXMO dataset implementation.
     vsr: VSR dataset implementation.
 
 Example:
@@ -63,5 +60,5 @@ Example:
     Access available vqa datasets:
         >>> from opentau import available_vqa_datasets
         >>> print(list(available_vqa_datasets.keys()))
-        ['clevr', 'cocoqa', 'dummy', 'pixmo', 'vsr']
+        ['clevr', 'cocoqa', 'dummy', 'vsr']
 """
