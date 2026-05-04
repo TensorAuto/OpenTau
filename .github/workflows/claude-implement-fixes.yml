@@ -35,37 +35,33 @@ concurrency:
 
 jobs:
   implement:
-    # Trust gate per event source: only org owners/members/collaborators (or
-    # claude[bot]) may trigger `@claude fix`. This workflow has
-    # `contents: write` + bypassPermissions, so the blast radius for a wrong
-    # allow is high. The body-match `@claude fix` and the
-    # pull_request_review-late-gate (in the `Gate on @claude fix presence`
-    # step) are unchanged. The previous `user.type != 'Bot'` checks are
-    # subsumed by the positive author_association allowlist.
+    # Trust gate per event source: only humans (user.type == 'User') with
+    # MEMBER/OWNER/COLLABORATOR association may trigger `@claude fix`. The
+    # author_association allowlist is a cheap pre-filter — it does NOT prove
+    # write access (a MEMBER may be an org member with no team binding, and a
+    # COLLABORATOR may have read/triage). The `Verify actor has write access`
+    # step below makes the actual write/admin check via the collaborators API
+    # before any privileged work runs. This workflow holds `contents: write`
+    # + bypassPermissions, so the blast radius for a wrong allow is high;
+    # bots (including claude[bot]) are NOT permitted to trigger.
     if: >-
       (
         github.event_name == 'issue_comment'
         && github.event.issue.pull_request != null
+        && github.event.comment.user.type == 'User'
         && contains(github.event.comment.body, '@claude fix')
-        && (
-          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
-          || github.event.comment.user.login == 'claude[bot]'
-        )
+        && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
       )
       || (
         github.event_name == 'pull_request_review_comment'
+        && github.event.comment.user.type == 'User'
         && contains(github.event.comment.body, '@claude fix')
-        && (
-          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
-          || github.event.comment.user.login == 'claude[bot]'
-        )
+        && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
       )
       || (
         github.event_name == 'pull_request_review'
-        && (
-          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association)
-          || github.event.review.user.login == 'claude[bot]'
-        )
+        && github.event.review.user.type == 'User'
+        && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association)
       )
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -75,6 +71,28 @@ jobs:
       issues: write
       id-token: write  # claude-code-action does an OIDC handshake at startup
     steps:
+      # The job-level if: filters by author_association (cheap, no API call),
+      # but MEMBER/COLLABORATOR do not strictly imply write permission. This
+      # step asserts that github.actor actually has admin or write on this
+      # repo before any privileged step runs.
+      - name: Verify actor has write access
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          PERM=$(gh api "repos/${REPO}/collaborators/${ACTOR}/permission" --jq '.permission')
+          case "$PERM" in
+            admin|write)
+              echo "actor ${ACTOR} has '${PERM}' permission — proceeding"
+              ;;
+            *)
+              echo "::error::actor ${ACTOR} permission is '${PERM}'; require admin or write"
+              exit 1
+              ;;
+          esac
+
       # For pull_request_review.submitted, scan the review's line comments
       # (which the event payload does not include) for the trigger phrase.
       # If absent, exit before paying for a Claude run. For comment events,
@@ -115,8 +133,11 @@ jobs:
         if: steps.gate.outputs.should_run == 'true'
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          # Match the bot allowlist in the job-level `if:` above. Never `*` on
-          # a public repo (per the action's docs warning).
+          # The job-level `if:` no longer trusts any bot to TRIGGER this
+          # workflow. `allowed_bots` here governs which bot-authored comments
+          # the agent reads as trusted input while resolving feedback —
+          # claude[bot] review summaries are still trustworthy in that role.
+          # Never `*` on a public repo (per the action's docs warning).
           allowed_bots: "claude[bot]"
           claude_args: |
             --model ${{ vars.CLAUDE_MODEL || 'claude-opus-4-7[1m]' }}
