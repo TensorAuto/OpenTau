@@ -12,13 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-π07 Low-Level Planner Module.
+Low-level planner for π07 (PaliGemma variant).
 
 This module implements the low-level planner of the π07 hierarchical
-architecture. It uses V-JEPA2 as a video encoder, processes temporal state
-sequences (one continuous token per timestep), and supports optional subtask
-response, subgoal image, and metadata conditioning.  Action generation
+architecture. It uses a SpaceTime SigLIP video encoder, processes temporal
+state sequences (one continuous token per timestep), and supports optional
+subtask response, subgoal image, and metadata conditioning. Action generation
 combines flow matching (continuous actions via an action expert) with FAST
-discrete token prediction (through the VLM backbone with Knowledge
-Insulation).
+discrete token prediction (through the VLM backbone with Knowledge Insulation).
 """

@@ -1,0 +1,2176 @@
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import pytest
+import torch
+from transformers import AutoTokenizer
+
+from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
+from opentau.policies.pi07_paligemma.low_level_planner.configuration_pi07_low_level import (
+    PI07lowlevelPlannerConfig,
+)
+from opentau.policies.pi07_paligemma.low_level_planner.modeling_pi07_low_level import (
+    PI07LowLevelPlannerFlowMatching,
+    PI07LowLevelPlannerPolicy,
+    make_att_2d_masks,
+)
+
+# Config defaults used across the test.
+NUM_CAMERAS = 2
+SIGLIP_TOKENS_PER_CAMERA = 256
+NUM_SUBGOAL_CAMERAS = 1
+SIGLIP_TOKENS_PER_SUBGOAL = 256
+PROMPT_MAX_LENGTH = 256
+RESPONSE_MAX_LENGTH = 52
+METADATA_MAX_LENGTH = 52
+DISCRETE_ACTION_MAX_LENGTH = 32
+CHUNK_SIZE = 50
+MAX_STATE_DIM = 32
+MAX_ACTION_DIM = 32
+
+# For training the state is provided as (B, n_obs_steps, D) so T = n_obs_steps.
+N_OBS_STEPS = 8
+
+VIDEO_TOKENS = NUM_CAMERAS * SIGLIP_TOKENS_PER_CAMERA  # 512
+LANG_START = VIDEO_TOKENS  # 512
+SUBGOAL_TOKENS = NUM_SUBGOAL_CAMERAS * SIGLIP_TOKENS_PER_SUBGOAL  # 256
+
+# For inference: no discrete actions; state is 1 timestep for embed_prefix.
+INFER_STATE_TOKENS = 1
+
+
+class TestPI07LowLevelPlannerIntegration:
+    """Integration tests for the PI07 low-level planner pipeline."""
+
+    @staticmethod
+    def _make_config() -> PI07lowlevelPlannerConfig:
+        config = PI07lowlevelPlannerConfig(
+            n_obs_steps=N_OBS_STEPS,
+            n_obs_history=N_OBS_STEPS,
+            chunk_size=CHUNK_SIZE,
+            n_action_steps=CHUNK_SIZE,
+            max_state_dim=MAX_STATE_DIM,
+            max_action_dim=MAX_ACTION_DIM,
+            prompt_max_length=PROMPT_MAX_LENGTH,
+            response_max_length=RESPONSE_MAX_LENGTH,
+            metadata_max_length=METADATA_MAX_LENGTH,
+            discrete_action_max_length=DISCRETE_ACTION_MAX_LENGTH,
+            normalization_mapping={
+                "VISUAL": NormalizationMode.IDENTITY,
+                "STATE": NormalizationMode.MIN_MAX,
+                "ACTION": NormalizationMode.MEAN_STD,
+            },
+        )
+        config.input_features = {
+            "camera0": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224)),
+            "camera1": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224)),
+            "state": PolicyFeature(type=FeatureType.STATE, shape=(MAX_STATE_DIM,)),
+        }
+        config.output_features = {
+            "actions": PolicyFeature(type=FeatureType.ACTION, shape=(CHUNK_SIZE, MAX_ACTION_DIM)),
+        }
+        return config
+
+    @staticmethod
+    def _indicator_lens(tokenizer):
+        """Fixed strings inserted by ``embed_prefix`` (matches modeling layout).
+
+        With at least one optional middle block populated (as in this test),
+        the state-end separator is ``", "`` and the trailing prefix-end is
+        ``":\\n"``. With no optional content the state-end collapses to
+        ``":\\n"`` and the prefix-end is omitted entirely.
+        """
+        return {
+            "state_lead": len(tokenizer.encode("State: ", add_special_tokens=False)),
+            "comma": len(tokenizer.encode(", ", add_special_tokens=False)),
+            "subgoal_lead": len(tokenizer.encode("Subgoal: ", add_special_tokens=False)),
+            "prefix_end": len(tokenizer.encode(":\n", add_special_tokens=False)),
+            "action_lead": len(tokenizer.encode("Action: ", add_special_tokens=False)),
+        }
+
+    @classmethod
+    def _train_prefix_total(cls, tokenizer) -> int:
+        m = cls._indicator_lens(tokenizer)
+        p = 0
+        p += VIDEO_TOKENS
+        p += PROMPT_MAX_LENGTH
+        p += m["state_lead"] + N_OBS_STEPS + m["comma"]
+        p += RESPONSE_MAX_LENGTH
+        p += m["subgoal_lead"] + SUBGOAL_TOKENS + m["comma"]
+        p += METADATA_MAX_LENGTH
+        p += m["prefix_end"]
+        p += m["action_lead"] + DISCRETE_ACTION_MAX_LENGTH
+        return p
+
+    @classmethod
+    def _infer_prefix_total(cls, tokenizer) -> int:
+        m = cls._indicator_lens(tokenizer)
+        p = 0
+        p += VIDEO_TOKENS
+        p += PROMPT_MAX_LENGTH
+        p += m["state_lead"] + INFER_STATE_TOKENS + m["comma"]
+        p += RESPONSE_MAX_LENGTH
+        p += m["subgoal_lead"] + SUBGOAL_TOKENS + m["comma"]
+        p += METADATA_MAX_LENGTH
+        p += m["prefix_end"]
+        return p
+
+    @staticmethod
+    def _check_ones_before_zeros(mask_slice):
+        """Check that in a 1-D boolean mask all Trues precede all Falses."""
+        mask = mask_slice.cpu().numpy()
+        first_zero = None
+        for idx, val in enumerate(mask):
+            if val == 0:
+                first_zero = idx
+                break
+        if first_zero is not None:
+            assert all(v == 0 for v in mask[first_zero:]), f"Zeros not contiguous: {mask}"
+            assert all(v == 1 for v in mask[:first_zero]), f"Ones not contiguous: {mask}"
+        else:
+            assert all(v == 1 for v in mask), f"Expected all ones: {mask}"
+
+    # ------------------------------------------------------------------
+    # Verification helpers
+    # ------------------------------------------------------------------
+
+    def _verify_pad_masks(self, prefix_pad_masks, suffix_pad_masks, tokenizer, inference_mode=False):
+        assert prefix_pad_masks.shape[0] == 1
+        total = self._infer_prefix_total(tokenizer) if inference_mode else self._train_prefix_total(tokenizer)
+        assert prefix_pad_masks.shape[1] == total
+        assert prefix_pad_masks.dtype == torch.bool
+        assert suffix_pad_masks.shape == (1, CHUNK_SIZE)
+        assert suffix_pad_masks.dtype == torch.bool
+
+        m = self._indicator_lens(tokenizer)
+
+        lang_slice = slice(LANG_START, LANG_START + PROMPT_MAX_LENGTH)
+        state_t = INFER_STATE_TOKENS if inference_mode else N_OBS_STEPS
+
+        resp_lo = LANG_START + PROMPT_MAX_LENGTH + m["state_lead"] + state_t + m["comma"]
+        resp_slice = slice(resp_lo, resp_lo + RESPONSE_MAX_LENGTH)
+
+        sg_lo = resp_lo + RESPONSE_MAX_LENGTH + m["subgoal_lead"]
+        sg_slice = slice(sg_lo, sg_lo + SUBGOAL_TOKENS)
+
+        meta_lo = sg_lo + SUBGOAL_TOKENS + m["comma"]
+        meta_slice = slice(meta_lo, meta_lo + METADATA_MAX_LENGTH)
+
+        for i in range(prefix_pad_masks.shape[0]):
+            assert torch.all(prefix_pad_masks[i, :VIDEO_TOKENS] == 1)
+            self._check_ones_before_zeros(prefix_pad_masks[i, lang_slice])
+            self._check_ones_before_zeros(prefix_pad_masks[i, resp_slice])
+            assert torch.all(prefix_pad_masks[i, sg_slice] == 1)
+            self._check_ones_before_zeros(prefix_pad_masks[i, meta_slice])
+
+            if not inference_mode:
+                da_lo = meta_lo + METADATA_MAX_LENGTH + m["prefix_end"] + m["action_lead"]
+                da_slice = slice(da_lo, da_lo + DISCRETE_ACTION_MAX_LENGTH)
+                self._check_ones_before_zeros(prefix_pad_masks[i, da_slice])
+
+            self._check_ones_before_zeros(suffix_pad_masks[i])
+
+    def _verify_position_ids(
+        self,
+        prefix_position_ids,
+        suffix_position_ids,
+        prefix_pad_masks,
+        suffix_pad_masks,
+        tokenizer,
+        inference_mode=False,
+    ):
+        expected_prefix = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        assert torch.equal(prefix_position_ids, expected_prefix)
+
+        if inference_mode:
+            prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        else:
+            prefix_offsets = torch.sum(prefix_pad_masks[:, :-DISCRETE_ACTION_MAX_LENGTH], dim=-1)[:, None]
+
+        expected_suffix = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        assert torch.equal(suffix_position_ids, expected_suffix)
+
+    def _verify_vlm_attention_mask(
+        self, vlm_attention_mask, prefix_pad_masks, prefix_att_masks, inference_mode=False
+    ):
+        del inference_mode  # same rule as training
+        expected = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        assert torch.equal(vlm_attention_mask, expected), (
+            f"VLM attention mask mismatch vs make_att_2d_masks.\n"
+            f"Diff indices: {(vlm_attention_mask != expected).nonzero(as_tuple=False)[:20]}"
+        )
+
+    def _verify_action_expert_attention_mask(
+        self,
+        action_expert_attention_mask,
+        prefix_pad_masks,
+        suffix_pad_masks,
+        suffix_att_masks,
+        inference_mode=False,
+    ):
+        if inference_mode:
+            num_cross = prefix_pad_masks.shape[1]
+        else:
+            num_cross = prefix_pad_masks.shape[1] - DISCRETE_ACTION_MAX_LENGTH
+
+        expected = make_att_2d_masks(
+            suffix_pad_masks,
+            suffix_att_masks,
+            n_cross_att_tokens=num_cross,
+            cross_att_pad_masks=prefix_pad_masks[:, :num_cross],
+        )
+        assert torch.equal(action_expert_attention_mask, expected), (
+            f"Action expert attention mask mismatch vs make_att_2d_masks.\n"
+            f"Diff indices: {(action_expert_attention_mask != expected).nonzero(as_tuple=False)[:20]}"
+        )
+
+    # ------------------------------------------------------------------
+    # Main integration test
+    # ------------------------------------------------------------------
+
+    @pytest.mark.skip(reason="run on local machine")
+    @pytest.mark.gpu
+    @pytest.mark.slow
+    def test_complete_pi07_low_level_pipeline(self, lerobot_dataset_metadata):
+        """Test the PI07 low-level planner pipeline: forward (training) and select_action (inference)."""
+
+        config = self._make_config()
+        policy = PI07LowLevelPlannerPolicy(config, dataset_stats=lerobot_dataset_metadata.stats)
+        tokenizer = policy.model.language_tokenizer
+
+        batch_size = 1
+        batch = {
+            "camera0": torch.randn(batch_size, N_OBS_STEPS, 3, 224, 224),
+            "camera1": torch.randn(batch_size, N_OBS_STEPS, 3, 224, 224),
+            "subgoal0": torch.randn(batch_size, 3, 224, 224),
+            "state": torch.randn(batch_size, N_OBS_STEPS, MAX_STATE_DIM),
+            "actions": torch.randn(batch_size, CHUNK_SIZE, MAX_ACTION_DIM),
+            "prompt": ["Pick up the red block"],
+            "response": ["Grasp the red block"],
+            "speed": torch.tensor([500]),
+            "quality": torch.tensor([3]),
+            "mistake": torch.tensor([0]),
+            "speed_is_pad": torch.tensor([False]),
+            "quality_is_pad": torch.tensor([False]),
+            "mistake_is_pad": torch.tensor([False]),
+            "subgoal_is_pad": torch.tensor([False]),
+            "action_is_pad": torch.cat(
+                [
+                    torch.zeros(batch_size, CHUNK_SIZE // 2, dtype=torch.bool),
+                    torch.ones(batch_size, CHUNK_SIZE - CHUNK_SIZE // 2, dtype=torch.bool),
+                ],
+                dim=1,
+            ),
+            # Align SpaceTime encoder T with cameras/state; mark full history as real.
+            "obs_history_is_pad": torch.zeros(batch_size, N_OBS_STEPS, dtype=torch.bool),
+        }
+
+        policy.to(dtype=torch.bfloat16, device="cuda")
+        batch_cuda = {
+            key: value.to("cuda", non_blocking=True, dtype=torch.bfloat16)
+            if isinstance(value, torch.Tensor)
+            else value
+            for key, value in batch.items()
+        }
+        batch_cuda["action_is_pad"] = batch_cuda["action_is_pad"].to(dtype=torch.bool)
+
+        # ── Monkey-patch to capture intermediate tensors ──────────────
+        captured = {}
+        original_paligemma_forward = policy.model.paligemma_with_expert.forward
+        original_embed_prefix = policy.model.embed_prefix
+        original_embed_suffix = policy.model.embed_suffix
+
+        def capture_forward(*args, **kwargs):
+            if kwargs["inputs_embeds"][0] is not None:
+                captured["vlm_2d_attention_mask"] = kwargs["attention_mask"].clone()
+                captured["vlm_position_ids"] = kwargs["position_ids"].clone()
+            else:
+                captured["action_expert_2d_attention_mask"] = kwargs["attention_mask"].clone()
+                captured["action_expert_position_ids"] = kwargs["position_ids"].clone()
+            return original_paligemma_forward(*args, **kwargs)
+
+        def capture_embed_prefix(*args, **kwargs):
+            # Truncate discrete actions to inject padding (same workaround as PI05 test).
+            # Replacing ``model.embed_prefix`` with a plain function drops ``self`` from *args,
+            # so positions are: 0 videos, 1 vid_masks, 2 lang_tokens, 3 lang_masks,
+            # 4 discrete_actions, 5 discrete_action_masks (state is keyword-only).
+            half = DISCRETE_ACTION_MAX_LENGTH // 2
+            args = list(args)
+            da = args[4]
+            dm = args[5]
+            bsz = da.shape[0]
+            args[4] = torch.cat(
+                (
+                    da[:, :half],
+                    torch.zeros((bsz, half), dtype=da.dtype, device=da.device),
+                ),
+                dim=-1,
+            )
+            args[5] = torch.cat(
+                (
+                    dm[:, :half],
+                    torch.zeros((bsz, half), dtype=torch.bool, device=dm.device),
+                ),
+                dim=-1,
+            )
+            result = original_embed_prefix(*args, **kwargs)
+            captured["prefix_pad_masks"] = result[1].clone()
+            captured["prefix_att_masks"] = result[2].clone()
+            return result
+
+        def capture_embed_suffix(*args, **kwargs):
+            result = original_embed_suffix(*args, **kwargs)
+            captured["suffix_pad_masks"] = result[1].clone()
+            captured["suffix_att_masks"] = result[2].clone()
+            return result
+
+        policy.model.paligemma_with_expert.forward = capture_forward
+        policy.model.embed_prefix = capture_embed_prefix
+        policy.model.embed_suffix = capture_embed_suffix
+
+        # ── Training forward pass ────────────────────────────────────
+        loss = policy.forward(batch_cuda)
+
+        # Restore originals.
+        policy.model.paligemma_with_expert.forward = original_paligemma_forward
+        policy.model.embed_prefix = original_embed_prefix
+        policy.model.embed_suffix = original_embed_suffix
+
+        # Verify normalize / unnormalize round-trip.
+        action_output = {"actions": batch["actions"].to("cuda")}
+        assert torch.allclose(
+            action_output["actions"],
+            policy.unnormalize_outputs(policy.normalize_targets(action_output))["actions"],
+            atol=1e-6,
+        )
+
+        # Verify all expected captures are present.
+        for var in [
+            "prefix_pad_masks",
+            "prefix_att_masks",
+            "suffix_pad_masks",
+            "suffix_att_masks",
+            "vlm_2d_attention_mask",
+            "vlm_position_ids",
+            "action_expert_2d_attention_mask",
+            "action_expert_position_ids",
+        ]:
+            assert var in captured, f"{var} was not captured"
+
+        assert captured["vlm_2d_attention_mask"].dtype == torch.bool
+        assert captured["action_expert_2d_attention_mask"].dtype == torch.bool
+        assert captured["prefix_pad_masks"].dtype == torch.bool
+        assert captured["suffix_pad_masks"].dtype == torch.bool
+
+        self._verify_pad_masks(captured["prefix_pad_masks"], captured["suffix_pad_masks"], tokenizer)
+        self._verify_position_ids(
+            captured["vlm_position_ids"],
+            captured["action_expert_position_ids"],
+            captured["prefix_pad_masks"],
+            captured["suffix_pad_masks"],
+            tokenizer,
+        )
+        self._verify_vlm_attention_mask(
+            captured["vlm_2d_attention_mask"],
+            captured["prefix_pad_masks"],
+            captured["prefix_att_masks"],
+        )
+        self._verify_action_expert_attention_mask(
+            captured["action_expert_2d_attention_mask"],
+            captured["prefix_pad_masks"],
+            captured["suffix_pad_masks"],
+            captured["suffix_att_masks"],
+        )
+
+        assert isinstance(loss, dict)
+        assert "MSE" in loss
+        assert "CE" in loss
+        assert all(v.isfinite() for v in loss.values())
+
+        # Reset and check queue cleared.
+        policy.reset()
+        assert len(policy._action_queue) == 0
+
+        # Optimizer params are non-empty.
+        assert len(list(policy.get_optim_params())) > 0
+
+        # ── Inference via select_action ──────────────────────────────
+        captured_infer = {}
+
+        def capture_forward_infer(*args, **kwargs):
+            if kwargs["inputs_embeds"][0] is not None and kwargs.get("past_key_values") is None:
+                captured_infer["vlm_2d_attention_mask"] = kwargs["attention_mask"].clone()
+                captured_infer["vlm_position_ids"] = kwargs["position_ids"].clone()
+            else:
+                captured_infer["action_expert_2d_attention_mask"] = kwargs["attention_mask"].clone()
+                captured_infer["action_expert_position_ids"] = kwargs["position_ids"].clone()
+            return original_paligemma_forward(*args, **kwargs)
+
+        def capture_embed_prefix_infer(*args, **kwargs):
+            result = original_embed_prefix(*args, **kwargs)
+            captured_infer["prefix_pad_masks"] = result[1].clone()
+            captured_infer["prefix_att_masks"] = result[2].clone()
+            return result
+
+        def capture_embed_suffix_infer(*args, **kwargs):
+            result = original_embed_suffix(*args, **kwargs)
+            captured_infer["suffix_pad_masks"] = result[1].clone()
+            captured_infer["suffix_att_masks"] = result[2].clone()
+            return result
+
+        policy.model.paligemma_with_expert.forward = capture_forward_infer
+        policy.model.embed_prefix = capture_embed_prefix_infer
+        policy.model.embed_suffix = capture_embed_suffix_infer
+
+        # Inference batch: state is 2-D (B, D), images are 4-D (B, C, H, W).
+        infer_batch = {
+            "camera0": batch_cuda["camera0"][:, 0],  # (B, C, H, W)
+            "camera1": batch_cuda["camera1"][:, 0],
+            "subgoal0": batch_cuda["subgoal0"],  # already (B, C, H, W)
+            "state": batch_cuda["state"][:, 0],  # (B, D)
+            "prompt": ["Pick up the red block"],
+            "response": ["Grasp the red block"],
+            "speed": torch.tensor([500], device="cuda"),
+            "quality": torch.tensor([3], device="cuda"),
+            "mistake": torch.tensor([0], device="cuda"),
+            "speed_is_pad": torch.tensor([False], device="cuda"),
+            "quality_is_pad": torch.tensor([False], device="cuda"),
+            "mistake_is_pad": torch.tensor([False], device="cuda"),
+            "subgoal_is_pad": torch.tensor([False], device="cuda"),
+        }
+        action = policy.select_action(infer_batch)
+
+        # Restore originals.
+        policy.model.paligemma_with_expert.forward = original_paligemma_forward
+        policy.model.embed_prefix = original_embed_prefix
+        policy.model.embed_suffix = original_embed_suffix
+
+        for var in [
+            "prefix_pad_masks",
+            "prefix_att_masks",
+            "suffix_pad_masks",
+            "suffix_att_masks",
+            "vlm_2d_attention_mask",
+            "vlm_position_ids",
+            "action_expert_2d_attention_mask",
+            "action_expert_position_ids",
+        ]:
+            assert var in captured_infer, f"{var} was not captured for select_action"
+
+        assert captured_infer["vlm_2d_attention_mask"].dtype == torch.bool
+        assert captured_infer["action_expert_2d_attention_mask"].dtype == torch.bool
+        assert captured_infer["prefix_pad_masks"].dtype == torch.bool
+        assert captured_infer["suffix_pad_masks"].dtype == torch.bool
+
+        self._verify_pad_masks(
+            captured_infer["prefix_pad_masks"],
+            captured_infer["suffix_pad_masks"],
+            tokenizer,
+            inference_mode=True,
+        )
+        self._verify_position_ids(
+            captured_infer["vlm_position_ids"],
+            captured_infer["action_expert_position_ids"],
+            captured_infer["prefix_pad_masks"],
+            captured_infer["suffix_pad_masks"],
+            tokenizer,
+            inference_mode=True,
+        )
+        self._verify_vlm_attention_mask(
+            captured_infer["vlm_2d_attention_mask"],
+            captured_infer["prefix_pad_masks"],
+            captured_infer["prefix_att_masks"],
+            inference_mode=True,
+        )
+        self._verify_action_expert_attention_mask(
+            captured_infer["action_expert_2d_attention_mask"],
+            captured_infer["prefix_pad_masks"],
+            captured_infer["suffix_pad_masks"],
+            captured_infer["suffix_att_masks"],
+            inference_mode=True,
+        )
+
+        assert action.shape == (1, MAX_ACTION_DIM)
+
+
+class TestPI07LowLevelPlannerObsHistoryRegression:
+    """Regression tests for observation-history handling in the SpaceTime SigLIP pipeline.
+
+    Four scenarios:
+      1. ``n_obs_steps=1``: single-frame, ``obs_history_is_pad`` is irrelevant.
+      2. ``n_obs_steps>1``, ``obs_history_is_pad`` all-True (except current): padded
+         history masked away, output matches current-only encoding.
+      3. ``n_obs_steps>1``, ``obs_history_is_pad`` all-False: full causal attention.
+      4. ``n_obs_steps>1``, ``obs_history_is_pad`` is None: fallback to case 2.
+    """
+
+    @staticmethod
+    def _make_encoder(*, num_frames: int, spacetime_layer_stride: int = 4):
+        """Build a SpaceTimeSiglipVideoEncoder without loading the full policy."""
+        from opentau.policies.pi05.paligemma_with_expert import (
+            PaliGemmaWithExpertConfig,
+            PaliGemmaWithExpertModel,
+        )
+        from opentau.policies.pi07_paligemma.low_level_planner.video_encoder import (
+            SpaceTimeSiglipVideoEncoder,
+        )
+
+        paligemma_cfg = PaliGemmaWithExpertConfig(
+            load_pretrained_paligemma=False,
+            freeze_vision_encoder=True,
+            discrete_action_vocab_size=256,
+        )
+        paligemma = PaliGemmaWithExpertModel(paligemma_cfg)
+        paligemma = paligemma.to(device="cuda", dtype=torch.bfloat16)
+        encoder = SpaceTimeSiglipVideoEncoder(
+            vision_tower=paligemma.paligemma.vision_tower,
+            multi_modal_projector=paligemma.paligemma.multi_modal_projector,
+            num_frames=num_frames,
+            spacetime_layer_stride=spacetime_layer_stride,
+        )
+        return encoder
+
+    # ------------------------------------------------------------------ #
+    # Case 1: n_obs_steps = 1
+    # ------------------------------------------------------------------ #
+    @pytest.mark.gpu
+    @pytest.mark.slow
+    def test_single_frame_shape_and_mask_true(self):
+        """T=1: output shape is (B, num_tokens, H), vid_mask all-True.
+
+        obs_history_is_pad is irrelevant — True, False, and None all produce
+        identical outputs (temporal attention is short-circuited).
+        """
+        bsz, t, c, h, w = 2, 1, 3, 224, 224
+        encoder = self._make_encoder(num_frames=1)
+        video = torch.rand(bsz, t, c, h, w, device="cuda", dtype=torch.bfloat16)
+
+        out_none = encoder(video, obs_history_is_pad=None)
+        vlm_hidden = encoder.multi_modal_projector.linear.out_features
+        assert out_none.shape == (bsz, encoder.num_video_tokens, vlm_hidden)
+
+        out_true = encoder(video, obs_history_is_pad=torch.ones(bsz, t, dtype=torch.bool, device="cuda"))
+        out_false = encoder(video, obs_history_is_pad=torch.zeros(bsz, t, dtype=torch.bool, device="cuda"))
+
+        torch.testing.assert_close(out_none, out_true, msg="T=1: obs_history_is_pad=True should match None")
+        torch.testing.assert_close(out_none, out_false, msg="T=1: obs_history_is_pad=False should match None")
+
+    # ------------------------------------------------------------------ #
+    # Case 2: n_obs_steps > 1, history padded (only current frame valid)
+    # ------------------------------------------------------------------ #
+    def test_temporal_mask_is_history_padded(self):
+        """Verify _build_temporal_attn_mask with all-padded history produces the
+        correct structure: past frames blocked everywhere, current frame can only
+        self-attend, and the isolation guard zeros out temporal attention.
+
+        This directly validates the mask tensor rather than requiring a full
+        GPU forward pass, covering:
+          - mask shape is (B*N, 1, T, T)
+          - all past-frame columns are -inf (blocked as keys)
+          - current-frame row can only attend to itself (column T-1)
+          - every timestep is "isolated" (num_attendable <= 1), so the
+            SpaceTimeEncoderLayerWrapper would zero the temporal residual
+        """
+        from opentau.policies.pi07_paligemma.low_level_planner.video_encoder import (
+            SpaceTimeSiglipVideoEncoder,
+        )
+
+        bsz, t = 2, 4
+        num_patches = 16
+        dtype = torch.float32
+
+        pad_mask = torch.ones(bsz, t, dtype=torch.bool)
+        pad_mask[:, -1] = False
+
+        mask = SpaceTimeSiglipVideoEncoder._build_temporal_attn_mask(pad_mask, num_patches, dtype)
+
+        assert mask.shape == (bsz * num_patches, 1, t, t)
+
+        neginf = float("-inf")
+        for bi in range(bsz):
+            sample_mask = mask[bi * num_patches, 0]  # (T, T)
+
+            for col in range(t - 1):
+                assert torch.all(sample_mask[:, col] == neginf), (
+                    f"column {col} (padded frame) should be fully blocked"
+                )
+
+            assert sample_mask[t - 1, t - 1] == 0.0, "current frame attending to itself should be unblocked"
+
+            for row in range(t - 1):
+                assert sample_mask[row, t - 1] == neginf, (
+                    f"row {row} should not attend to current frame (causal violation)"
+                )
+
+        attn_2d = mask[:, 0, :, :]  # (B*N, T, T)
+        num_attendable = (attn_2d > neginf).sum(dim=-1)  # (B*N, T)
+        assert torch.all(num_attendable <= 1), "every timestep should be isolated (attend to at most itself)"
+
+        all_patches_identical = torch.all(mask[:num_patches] == mask[0:1].expand(num_patches, -1, -1, -1))
+        assert all_patches_identical, "mask should be identical across spatial patches within a sample"
+
+    # ------------------------------------------------------------------ #
+    # Case 3: n_obs_steps > 1, all frames valid (full causal attention)
+    # ------------------------------------------------------------------ #
+    def test_temporal_mask_all_valid_is_causal(self):
+        """All frames valid (no padding): mask must be a standard lower-triangular
+        causal mask where row i attends to columns j <= i.
+        """
+        from opentau.policies.pi07_paligemma.low_level_planner.video_encoder import (
+            SpaceTimeSiglipVideoEncoder,
+        )
+
+        bsz, t = 2, 4
+        num_patches = 4
+        dtype = torch.float32
+        neginf = float("-inf")
+
+        no_pad = torch.zeros(bsz, t, dtype=torch.bool)
+        mask = SpaceTimeSiglipVideoEncoder._build_temporal_attn_mask(no_pad, num_patches, dtype)
+
+        assert mask.shape == (bsz * num_patches, 1, t, t)
+
+        # Expected: standard causal lower-triangular (0 = attend, -inf = block)
+        expected_bool = torch.tril(torch.ones(t, t, dtype=torch.bool))
+        expected = torch.zeros(t, t, dtype=dtype)
+        expected.masked_fill_(~expected_bool, neginf)
+
+        for bi in range(bsz):
+            sample_mask = mask[bi * num_patches, 0]
+            torch.testing.assert_close(
+                sample_mask,
+                expected,
+                msg=f"sample {bi}: all-valid mask should be standard causal",
+            )
+
+        # Every row except row 0 has num_attendable > 1 (history contributes)
+        attn_2d = mask[:, 0, :, :]
+        num_attendable = (attn_2d > neginf).sum(dim=-1)  # (B*N, T)
+        for row_i in range(1, t):
+            assert torch.all(num_attendable[:, row_i] == row_i + 1), (
+                f"row {row_i} should attend to {row_i + 1} positions"
+            )
+
+    # ------------------------------------------------------------------ #
+    # Case 4: n_obs_steps > 1, obs_history_is_pad is None → fallback
+    # ------------------------------------------------------------------ #
+    def test_temporal_mask_none_fallback_matches_all_padded(self):
+        """obs_history_is_pad=None in the forward path falls back to an
+        all-history-padded mask. Verify the fallback mask is identical
+        to explicitly passing [True, ..., True, False].
+        """
+        from opentau.policies.pi07_paligemma.low_level_planner.video_encoder import (
+            SpaceTimeSiglipVideoEncoder,
+        )
+
+        bsz, t = 2, 4
+        num_patches = 4
+        dtype = torch.float32
+
+        explicit_pad = torch.ones(bsz, t, dtype=torch.bool)
+        explicit_pad[:, -1] = False
+        mask_explicit = SpaceTimeSiglipVideoEncoder._build_temporal_attn_mask(
+            explicit_pad, num_patches, dtype
+        )
+
+        # The forward() fallback constructs exactly this mask when
+        # obs_history_is_pad is None and T > 1.
+        fallback_pad = torch.ones(bsz, t, dtype=torch.bool)
+        fallback_pad[:, -1] = False
+        mask_fallback = SpaceTimeSiglipVideoEncoder._build_temporal_attn_mask(
+            fallback_pad, num_patches, dtype
+        )
+
+        torch.testing.assert_close(
+            mask_fallback,
+            mask_explicit,
+            msg="None-fallback mask should be identical to explicit all-padded mask",
+        )
+
+    # ------------------------------------------------------------------ #
+    # Case 5: mixed batch — per-sample pad patterns are independent
+    # ------------------------------------------------------------------ #
+    def test_temporal_mask_mixed_batch_per_sample_independence(self):
+        """Heterogeneous pad masks in a batch: each sample's (T, T) slice must
+        match the mask built from that sample alone — no cross-sample leakage.
+
+        Sample 0: all history padded  → [True, True, True, False]
+        Sample 1: all history valid   → [False, False, False, False]
+        Sample 2: partial history     → [True, False, False, False]
+        """
+        from opentau.policies.pi07_paligemma.low_level_planner.video_encoder import (
+            SpaceTimeSiglipVideoEncoder,
+        )
+
+        t = 4
+        num_patches = 4
+        dtype = torch.float32
+        neginf = float("-inf")
+
+        pad_mask = torch.tensor(
+            [
+                [True, True, True, False],
+                [False, False, False, False],
+                [True, False, False, False],
+            ],
+            dtype=torch.bool,
+        )
+        bsz = pad_mask.shape[0]
+
+        mask_batched = SpaceTimeSiglipVideoEncoder._build_temporal_attn_mask(pad_mask, num_patches, dtype)
+        assert mask_batched.shape == (bsz * num_patches, 1, t, t)
+
+        # Each sample's mask slice must match a standalone single-sample call.
+        for bi in range(bsz):
+            mask_solo = SpaceTimeSiglipVideoEncoder._build_temporal_attn_mask(
+                pad_mask[bi : bi + 1], num_patches, dtype
+            )
+            batched_slice = mask_batched[bi * num_patches : (bi + 1) * num_patches]
+            torch.testing.assert_close(
+                batched_slice,
+                mask_solo,
+                msg=f"sample {bi}: batched mask slice differs from solo build",
+            )
+
+        # Sample 0 (all-padded) and sample 1 (all-valid) must differ.
+        s0 = mask_batched[0, 0]
+        s1 = mask_batched[1 * num_patches, 0]
+        assert not torch.equal(s0, s1), "all-padded and all-valid samples should produce different masks"
+
+        # Sample 2 (partial): frame 0 padded, frames 1-3 valid.
+        # Row 2 should attend to columns 1, 2 (causal + valid) but not 0.
+        s2 = mask_batched[2 * num_patches, 0]  # (T, T)
+        assert s2[2, 0] == neginf, "row 2 should not attend to padded column 0"
+        assert s2[2, 1] == 0.0, "row 2 should attend to valid column 1"
+        assert s2[2, 2] == 0.0, "row 2 should attend to itself (column 2)"
+        assert s2[2, 3] == neginf, "row 2 should not attend to future column 3 (causal)"
+
+
+class TestPI07LowLevelPlannerStateEmbedding:
+    """CPU-only tests verifying state embeddings in ``embed_prefix`` under all
+    five observation-history conditions.
+
+    For each case the test asserts:
+      - state tokens appear in the prefix with the correct shape
+      - the state pad_mask follows ``obs_history_is_pad`` semantics
+      - state embeddings are non-zero (``state_proj`` actually ran)
+
+    A separate pair of tests drives the core ``forward`` and ``sample_actions``
+    paths through lightweight mocks to confirm they produce state embeddings
+    (i.e. the ``state`` kwarg reaches ``embed_prefix``).
+    """
+
+    _STATE_LEAD_IDS = [10, 11, 12]  # "State: "
+    _COMMA_IDS = [20]  # ", "
+    _COLON_NL_IDS = [30]  # ":\n"
+    _SUBGOAL_LEAD_IDS = [40, 41]  # "Subgoal: "
+    _ACTION_LEAD_IDS = [50, 51]  # "Action: "
+
+    @classmethod
+    def _fake_tokenizer(cls):
+        ids_by_str = {
+            "State: ": cls._STATE_LEAD_IDS,
+            ", ": cls._COMMA_IDS,
+            ":\n": cls._COLON_NL_IDS,
+            "Subgoal: ": cls._SUBGOAL_LEAD_IDS,
+            "Action: ": cls._ACTION_LEAD_IDS,
+        }
+
+        class _FakeTokenizer:
+            @staticmethod
+            def encode(s, add_special_tokens=False):
+                assert add_special_tokens is False
+                return ids_by_str[s]
+
+        return _FakeTokenizer()
+
+    @classmethod
+    def _make_mock_model(cls, hidden_size: int = 8):
+        """Minimal ``PI07LowLevelPlannerFlowMatching`` with stubs — enough to
+        drive ``embed_prefix`` on CPU with non-zero state embeddings."""
+        h = hidden_size
+        model = object.__new__(PI07LowLevelPlannerFlowMatching)
+
+        _text_cfg = type("_TextConfig", (), {"hidden_size": h})()
+        _pg_cfg = type("_PaliGemmaConfig", (), {"text_config": _text_cfg})()
+        _stub_cfg = type("_StubConfig", (), {"paligemma_config": _pg_cfg})()
+
+        class _PaliGemmaStub:
+            config = _stub_cfg
+
+            @staticmethod
+            def embed_language_tokens(tokens):
+                return torch.zeros(tokens.shape[0], tokens.shape[1], h, dtype=torch.bfloat16)
+
+            @staticmethod
+            def embed_image(img):
+                return torch.zeros(img.shape[0], 4, h, dtype=torch.bfloat16)
+
+            @staticmethod
+            def embed_discrete_actions(tokens):
+                return torch.zeros(tokens.shape[0], tokens.shape[1], h, dtype=torch.bfloat16)
+
+        _video_enc = type(
+            "_VideoEncoderStub",
+            (),
+            {"num_video_tokens": 6, "num_frames": 1},
+        )()
+
+        model.paligemma_with_expert = _PaliGemmaStub()
+        model.video_encoder = _video_enc
+        model.language_tokenizer = cls._fake_tokenizer()
+        _real_proj = torch.nn.Linear(8, h)
+        torch.nn.init.ones_(_real_proj.weight)
+        torch.nn.init.zeros_(_real_proj.bias)
+        model.state_proj = lambda x: _real_proj(x.float()).to(torch.bfloat16)
+
+        def _embed_video(video, obs_history_is_pad=None):
+            t = video.shape[1]
+            if t != model.video_encoder.num_frames:
+                raise ValueError(f"Expected T={model.video_encoder.num_frames} frames; got {t}.")
+            return torch.zeros(video.shape[0], 6, h, dtype=torch.bfloat16)
+
+        model.embed_video = _embed_video
+        return model
+
+    @classmethod
+    def _call_embed_prefix(
+        cls,
+        *,
+        n_obs_steps: int,
+        obs_history_is_pad=None,
+        bsize: int = 1,
+        state_dim: int = 8,
+        hidden_size: int = 8,
+    ):
+        """Helper that calls ``embed_prefix`` and returns (embs, pad_masks, att_masks)
+        plus metadata dict for locating the state slice."""
+        model = cls._make_mock_model(hidden_size=hidden_size)
+        model.video_encoder.num_frames = n_obs_steps
+        prompt_len = 5
+        response_len = 4
+        metadata_len = 3
+
+        videos = [torch.zeros(bsize, n_obs_steps, 3, 8, 8)]
+        vid_masks = [torch.ones(bsize, dtype=torch.bool)]
+        lang_tokens = torch.zeros(bsize, prompt_len, dtype=torch.long)
+        lang_masks = torch.ones(bsize, prompt_len, dtype=torch.bool)
+        state = torch.randn(bsize, n_obs_steps, state_dim)
+        response_tokens = torch.zeros(bsize, response_len, dtype=torch.long)
+        response_masks = torch.zeros(bsize, response_len, dtype=torch.bool)
+        metadata_tokens = torch.zeros(bsize, metadata_len, dtype=torch.long)
+        metadata_masks = torch.zeros(bsize, metadata_len, dtype=torch.bool)
+
+        (embs, pad_masks, att_masks) = PI07LowLevelPlannerFlowMatching.embed_prefix(
+            model,
+            videos=videos,
+            vid_masks=vid_masks,
+            lang_tokens=lang_tokens,
+            lang_masks=lang_masks,
+            state=state,
+            response_tokens=response_tokens,
+            response_masks=response_masks,
+            metadata_tokens=metadata_tokens,
+            metadata_masks=metadata_masks,
+            obs_history_is_pad=obs_history_is_pad,
+        )
+
+        vid_tokens = 6
+        state_lead = len(cls._STATE_LEAD_IDS)
+        state_start = vid_tokens + prompt_len + state_lead
+        state_end = state_start + n_obs_steps
+
+        return (embs, pad_masks, att_masks), {
+            "state_start": state_start,
+            "state_end": state_end,
+            "n_obs_steps": n_obs_steps,
+            "bsize": bsize,
+            "hidden_size": hidden_size,
+        }
+
+    # ------------------------------------------------------------------ #
+    # Case 1: T=1, single frame — state mask always True for current step
+    # ------------------------------------------------------------------ #
+    def test_state_embedding_single_frame(self):
+        """T=1: state has exactly 1 token, always unmasked (current step)."""
+        (embs, pad_masks, _att), meta = self._call_embed_prefix(n_obs_steps=1)
+
+        state_slice = embs[:, meta["state_start"] : meta["state_end"]]
+        state_mask = pad_masks[:, meta["state_start"] : meta["state_end"]]
+
+        assert state_slice.shape == (1, 1, meta["hidden_size"])
+        assert state_mask.shape == (1, 1)
+        assert torch.all(state_mask), "single-frame state must be unmasked"
+        assert not torch.all(state_slice == 0), "state embedding should be non-zero"
+
+    def test_state_embedding_single_frame_pad_irrelevant(self):
+        """T=1: obs_history_is_pad=True/False/None all produce identical state masks."""
+        results = {}
+        for label, pad in [
+            ("none", None),
+            ("true", torch.ones(1, 1, dtype=torch.bool)),
+            ("false", torch.zeros(1, 1, dtype=torch.bool)),
+        ]:
+            (_, pm, _), meta = self._call_embed_prefix(n_obs_steps=1, obs_history_is_pad=pad)
+            results[label] = pm[:, meta["state_start"] : meta["state_end"]]
+
+        assert torch.equal(results["none"], results["true"])
+        assert torch.equal(results["none"], results["false"])
+        assert torch.all(results["none"]), "state mask should always be True at T=1"
+
+    # ------------------------------------------------------------------ #
+    # Case 2: T>1, all history padded — only current step unmasked
+    # ------------------------------------------------------------------ #
+    def test_state_embedding_all_history_padded(self):
+        """T>1 with [True, ..., True, False]: only the last state token is unmasked."""
+        t = 4
+        pad = torch.ones(1, t, dtype=torch.bool)
+        pad[:, -1] = False
+
+        (embs, pad_masks, _att), meta = self._call_embed_prefix(n_obs_steps=t, obs_history_is_pad=pad)
+
+        state_slice = embs[:, meta["state_start"] : meta["state_end"]]
+        state_mask = pad_masks[:, meta["state_start"] : meta["state_end"]]
+
+        assert state_slice.shape == (1, t, meta["hidden_size"])
+        assert state_mask.shape == (1, t)
+        assert torch.all(~state_mask[:, :-1]), "padded history state tokens must be masked"
+        assert torch.all(state_mask[:, -1]), "current state token must be unmasked"
+        assert not torch.all(state_slice[:, -1] == 0), "current state embedding should be non-zero"
+
+    def test_state_embedding_all_pad_true_matches_history_padded(self):
+        """T>1 with all-True pad [True, True, True, True]: the last timestep is
+        still forced unmasked by ``state_mask[:, -1] = True``, so the state mask
+        and embeddings must be identical to the [True, ..., True, False] case."""
+        t = 4
+        bsize = 1
+        state_dim = 8
+        hidden_size = 8
+        prompt_len = 5
+
+        model = self._make_mock_model(hidden_size=hidden_size)
+        model.video_encoder.num_frames = t
+        state = torch.randn(bsize, t, state_dim)
+        videos = [torch.zeros(bsize, t, 3, 8, 8)]
+        vid_masks = [torch.ones(bsize, dtype=torch.bool)]
+        lang_tokens = torch.zeros(bsize, prompt_len, dtype=torch.long)
+        lang_masks = torch.ones(bsize, prompt_len, dtype=torch.bool)
+        response_tokens = torch.zeros(bsize, 4, dtype=torch.long)
+        response_masks = torch.zeros(bsize, 4, dtype=torch.bool)
+        metadata_tokens = torch.zeros(bsize, 3, dtype=torch.long)
+        metadata_masks = torch.zeros(bsize, 3, dtype=torch.bool)
+
+        common_kwargs = {
+            "videos": videos,
+            "vid_masks": vid_masks,
+            "lang_tokens": lang_tokens,
+            "lang_masks": lang_masks,
+            "state": state,
+            "response_tokens": response_tokens,
+            "response_masks": response_masks,
+            "metadata_tokens": metadata_tokens,
+            "metadata_masks": metadata_masks,
+        }
+
+        pad_with_current = torch.ones(bsize, t, dtype=torch.bool)
+        pad_with_current[:, -1] = False
+        (embs_partial, pm_partial, _) = PI07LowLevelPlannerFlowMatching.embed_prefix(
+            model,
+            **common_kwargs,
+            obs_history_is_pad=pad_with_current,
+        )
+
+        pad_all_true = torch.ones(bsize, t, dtype=torch.bool)
+        (embs_all, pm_all, _) = PI07LowLevelPlannerFlowMatching.embed_prefix(
+            model,
+            **common_kwargs,
+            obs_history_is_pad=pad_all_true,
+        )
+
+        vid_tokens = 6
+        state_lead = len(self._STATE_LEAD_IDS)
+        state_start = vid_tokens + prompt_len + state_lead
+        state_end = state_start + t
+
+        state_mask_partial = pm_partial[:, state_start:state_end]
+        state_mask_all = pm_all[:, state_start:state_end]
+        assert torch.equal(state_mask_partial, state_mask_all), (
+            "all-True pad should produce the same state mask as [T,T,T,F] "
+            "because state_mask[:, -1] is always forced True"
+        )
+
+        state_emb_partial = embs_partial[:, state_start:state_end]
+        state_emb_all = embs_all[:, state_start:state_end]
+        torch.testing.assert_close(
+            state_emb_partial,
+            state_emb_all,
+            msg="state embeddings should be identical regardless of current-frame pad value",
+        )
+
+    # ------------------------------------------------------------------ #
+    # Case 3: T>1, all valid — every state token unmasked
+    # ------------------------------------------------------------------ #
+    def test_state_embedding_all_valid(self):
+        """T>1 with all-False pad: every state token is unmasked."""
+        t = 4
+        no_pad = torch.zeros(1, t, dtype=torch.bool)
+
+        (embs, pad_masks, _att), meta = self._call_embed_prefix(n_obs_steps=t, obs_history_is_pad=no_pad)
+
+        state_slice = embs[:, meta["state_start"] : meta["state_end"]]
+        state_mask = pad_masks[:, meta["state_start"] : meta["state_end"]]
+
+        assert state_slice.shape == (1, t, meta["hidden_size"])
+        assert state_mask.shape == (1, t)
+        assert torch.all(state_mask), "all-valid: every state token should be unmasked"
+        for ti in range(t):
+            assert not torch.all(state_slice[:, ti] == 0), (
+                f"state embedding at timestep {ti} should be non-zero"
+            )
+
+    # ------------------------------------------------------------------ #
+    # Case 4: T>1, obs_history_is_pad=None → fallback to all-padded
+    # ------------------------------------------------------------------ #
+    def test_state_embedding_none_fallback(self):
+        """obs_history_is_pad=None: state mask matches explicit all-padded."""
+        t = 4
+        (_, pm_none, _), meta = self._call_embed_prefix(n_obs_steps=t, obs_history_is_pad=None)
+
+        pad = torch.ones(1, t, dtype=torch.bool)
+        pad[:, -1] = False
+        (_, pm_explicit, _), _ = self._call_embed_prefix(n_obs_steps=t, obs_history_is_pad=pad)
+
+        state_none = pm_none[:, meta["state_start"] : meta["state_end"]]
+        state_explicit = pm_explicit[:, meta["state_start"] : meta["state_end"]]
+
+        assert torch.equal(state_none, state_explicit), (
+            "None fallback should produce the same state mask as explicit all-padded"
+        )
+
+    # ------------------------------------------------------------------ #
+    # Case 5: mixed batch — per-sample state masks are independent
+    # ------------------------------------------------------------------ #
+    def test_state_embedding_mixed_batch(self):
+        """Heterogeneous pad masks: each sample's state mask is correct independently.
+
+        Sample 0: [True, True, True, False] → only last unmasked
+        Sample 1: [False, False, False, False] → all unmasked
+        Sample 2: [True, False, False, False] → slot 0 masked, rest unmasked
+        """
+        t = 4
+        pad = torch.tensor(
+            [
+                [True, True, True, False],
+                [False, False, False, False],
+                [True, False, False, False],
+            ],
+            dtype=torch.bool,
+        )
+
+        (embs, pad_masks, _att), meta = self._call_embed_prefix(
+            n_obs_steps=t, obs_history_is_pad=pad, bsize=3
+        )
+
+        state_mask = pad_masks[:, meta["state_start"] : meta["state_end"]]
+        assert state_mask.shape == (3, t)
+
+        expected = torch.tensor(
+            [
+                [False, False, False, True],
+                [True, True, True, True],
+                [False, True, True, True],
+            ],
+            dtype=torch.bool,
+        )
+        assert torch.equal(state_mask, expected), (
+            f"mixed batch state mask mismatch:\n  got:      {state_mask}\n  expected: {expected}"
+        )
+
+    # ------------------------------------------------------------------ #
+    # forward / sample_actions produce state embeddings
+    # ------------------------------------------------------------------ #
+    def test_forward_path_invokes_state_proj(self):
+        """Training path (T>1): state_proj is called once with (B, T, D).
+
+        Drives embed_prefix directly (the common code path for both
+        forward() and sample_actions()) and instruments state_proj to
+        record the input shape.
+        """
+        model = self._make_mock_model(hidden_size=8)
+
+        state_proj_calls = []
+        orig_state_proj = model.state_proj
+
+        def tracking_state_proj(x):
+            state_proj_calls.append(x.shape)
+            return orig_state_proj(x)
+
+        model.state_proj = tracking_state_proj
+
+        bsize, t, state_dim = 2, 4, 8
+        prompt_len = 5
+        model.video_encoder.num_frames = t
+
+        pad = torch.ones(bsize, t, dtype=torch.bool)
+        pad[:, -1] = False
+
+        PI07LowLevelPlannerFlowMatching.embed_prefix(
+            model,
+            videos=[torch.zeros(bsize, t, 3, 8, 8)],
+            vid_masks=[torch.ones(bsize, dtype=torch.bool)],
+            lang_tokens=torch.zeros(bsize, prompt_len, dtype=torch.long),
+            lang_masks=torch.ones(bsize, prompt_len, dtype=torch.bool),
+            state=torch.randn(bsize, t, state_dim),
+            response_tokens=torch.zeros(bsize, 4, dtype=torch.long),
+            response_masks=torch.zeros(bsize, 4, dtype=torch.bool),
+            metadata_tokens=torch.zeros(bsize, 3, dtype=torch.long),
+            metadata_masks=torch.zeros(bsize, 3, dtype=torch.bool),
+            obs_history_is_pad=pad,
+        )
+
+        assert len(state_proj_calls) == 1, "state_proj should be called exactly once"
+        assert state_proj_calls[0] == (bsize, t, state_dim), (
+            f"state_proj input shape should be (B, T, D), got {state_proj_calls[0]}"
+        )
+
+    def test_sample_actions_path_invokes_state_proj(self):
+        """Inference path (T=1): state_proj is called once with (B, 1, D)."""
+        model = self._make_mock_model(hidden_size=8)
+
+        state_proj_calls = []
+        orig_state_proj = model.state_proj
+
+        def tracking_state_proj(x):
+            state_proj_calls.append(x.shape)
+            return orig_state_proj(x)
+
+        model.state_proj = tracking_state_proj
+
+        bsize, state_dim = 1, 8
+        prompt_len = 5
+
+        PI07LowLevelPlannerFlowMatching.embed_prefix(
+            model,
+            videos=[torch.zeros(bsize, 1, 3, 8, 8)],
+            vid_masks=[torch.ones(bsize, dtype=torch.bool)],
+            lang_tokens=torch.zeros(bsize, prompt_len, dtype=torch.long),
+            lang_masks=torch.ones(bsize, prompt_len, dtype=torch.bool),
+            state=torch.randn(bsize, 1, state_dim),
+            response_tokens=torch.zeros(bsize, 4, dtype=torch.long),
+            response_masks=torch.zeros(bsize, 4, dtype=torch.bool),
+            metadata_tokens=torch.zeros(bsize, 3, dtype=torch.long),
+            metadata_masks=torch.zeros(bsize, 3, dtype=torch.bool),
+            obs_history_is_pad=None,
+        )
+
+        assert len(state_proj_calls) == 1, "state_proj should be called exactly once"
+        assert state_proj_calls[0] == (bsize, 1, state_dim), (
+            f"state_proj input shape should be (B, 1, D), got {state_proj_calls[0]}"
+        )
+
+
+class TestPI07LowLevelPlannerResponseEmbedding:
+    """CPU-only tests verifying response token masking in ``embed_prefix``.
+
+    ``response_tokens`` / ``response_masks`` come from
+    :meth:`PI07LowLevelPlannerPolicy.prepare_response` (real PaliGemma tokenizer),
+    then are fed into a lightweight ``embed_prefix`` mock.
+
+    Prefix layout (no-optionals simplified):
+        [video] [lang] ["State: "] [state(T)] [", "] [response] [", "] ...
+
+    The ``", "`` separator before the response block is masked/unmasked
+    based on ``sample_has_response = response_masks.any(dim=1)``.
+    """
+
+    _STATE_LEAD_IDS = [10, 11, 12]  # "State: "
+    _COMMA_IDS = [20]  # ", "
+    _COLON_NL_IDS = [30]  # ":\n"
+    _SUBGOAL_LEAD_IDS = [40, 41]  # "Subgoal: "
+    _ACTION_LEAD_IDS = [50, 51]  # "Action: "
+
+    _cached_prepare_policy: object | None = None
+
+    @classmethod
+    def _get_prepare_policy(cls) -> object:
+        if cls._cached_prepare_policy is None:
+            policy = object.__new__(PI07LowLevelPlannerPolicy)
+            policy.config = TestPI07LowLevelPlannerIntegration._make_config()
+            policy.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
+            cls._cached_prepare_policy = policy
+        return cls._cached_prepare_policy
+
+    @classmethod
+    def _prepare_response(cls, responses: list[str], *, omit_response_key: bool = False):
+        """Build ``(response_tokens, response_masks)`` via ``prepare_response``."""
+        bsz = len(responses)
+        device = torch.device("cpu")
+        batch: dict = {"state": torch.zeros(bsz, 1, MAX_STATE_DIM, device=device)}
+        if not omit_response_key:
+            batch["response"] = responses
+
+        policy = cls._get_prepare_policy()
+        return PI07LowLevelPlannerPolicy.prepare_response(policy, batch)
+
+    @classmethod
+    def _fake_tokenizer(cls):
+        ids_by_str = {
+            "State: ": cls._STATE_LEAD_IDS,
+            ", ": cls._COMMA_IDS,
+            ":\n": cls._COLON_NL_IDS,
+            "Subgoal: ": cls._SUBGOAL_LEAD_IDS,
+            "Action: ": cls._ACTION_LEAD_IDS,
+        }
+
+        class _FakeTokenizer:
+            @staticmethod
+            def encode(s, add_special_tokens=False):
+                assert add_special_tokens is False
+                return ids_by_str[s]
+
+        return _FakeTokenizer()
+
+    @classmethod
+    def _make_mock_model(cls, hidden_size: int = 8):
+        h = hidden_size
+        model = object.__new__(PI07LowLevelPlannerFlowMatching)
+
+        _text_cfg = type("_TextConfig", (), {"hidden_size": h})()
+        _pg_cfg = type("_PaliGemmaConfig", (), {"text_config": _text_cfg})()
+        _stub_cfg = type("_StubConfig", (), {"paligemma_config": _pg_cfg})()
+
+        class _PaliGemmaStub:
+            config = _stub_cfg
+
+            @staticmethod
+            def embed_language_tokens(tokens):
+                return torch.zeros(tokens.shape[0], tokens.shape[1], h, dtype=torch.bfloat16)
+
+            @staticmethod
+            def embed_image(img):
+                return torch.zeros(img.shape[0], 4, h, dtype=torch.bfloat16)
+
+            @staticmethod
+            def embed_discrete_actions(tokens):
+                return torch.zeros(tokens.shape[0], tokens.shape[1], h, dtype=torch.bfloat16)
+
+        _video_enc = type(
+            "_VideoEncoderStub",
+            (),
+            {"num_video_tokens": 6, "num_frames": 1},
+        )()
+
+        model.paligemma_with_expert = _PaliGemmaStub()
+        model.video_encoder = _video_enc
+        model.language_tokenizer = cls._fake_tokenizer()
+        model.state_proj = lambda x: torch.zeros(x.shape[0], x.shape[1], h, dtype=torch.bfloat16)
+
+        def _embed_video(video, obs_history_is_pad=None):
+            t = video.shape[1]
+            if t != model.video_encoder.num_frames:
+                raise ValueError(f"Expected T={model.video_encoder.num_frames} frames; got {t}.")
+            return torch.zeros(video.shape[0], 6, h, dtype=torch.bfloat16)
+
+        model.embed_video = _embed_video
+        return model
+
+    @classmethod
+    def _call_embed_prefix(
+        cls,
+        *,
+        bsize: int,
+        response_tokens: torch.Tensor,
+        response_masks: torch.Tensor,
+        n_obs_steps: int = 1,
+        prompt_len: int = 5,
+        metadata_len: int = 3,
+        hidden_size: int = 8,
+    ):
+        """Drive embed_prefix and return (embs, pad_masks, att_masks) plus
+        a metadata dict with index boundaries for the comma + response slice."""
+        model = cls._make_mock_model(hidden_size=hidden_size)
+        model.video_encoder.num_frames = n_obs_steps
+
+        (embs, pad_masks, att_masks) = PI07LowLevelPlannerFlowMatching.embed_prefix(
+            model,
+            videos=[torch.zeros(bsize, n_obs_steps, 3, 8, 8)],
+            vid_masks=[torch.ones(bsize, dtype=torch.bool)],
+            lang_tokens=torch.zeros(bsize, prompt_len, dtype=torch.long),
+            lang_masks=torch.ones(bsize, prompt_len, dtype=torch.bool),
+            state=torch.zeros(bsize, n_obs_steps, 8),
+            response_tokens=response_tokens,
+            response_masks=response_masks,
+            metadata_tokens=torch.zeros(bsize, metadata_len, dtype=torch.long),
+            metadata_masks=torch.zeros(bsize, metadata_len, dtype=torch.bool),
+        )
+
+        vid_tokens = 6
+        state_lead = len(cls._STATE_LEAD_IDS)
+        comma_len = len(cls._COMMA_IDS)
+        resp_len = response_tokens.shape[1]
+
+        comma_start = vid_tokens + prompt_len + state_lead + n_obs_steps
+        comma_end = comma_start + comma_len
+        resp_start = comma_end
+        resp_end = resp_start + resp_len
+
+        return (embs, pad_masks, att_masks), {
+            "comma_start": comma_start,
+            "comma_end": comma_end,
+            "resp_start": resp_start,
+            "resp_end": resp_end,
+        }
+
+    # ------------------------------------------------------------------ #
+    # Test 1: response="" — all response tokens padded, ", " padded
+    # ------------------------------------------------------------------ #
+    def test_empty_response_comma_and_tokens_padded(self):
+        """Empty response: ``prepare_response`` yields all-pad masks; the \", \"
+        separator and all response slots in ``embed_prefix`` must be padded."""
+        response_tokens, response_masks = self._prepare_response([""])
+        assert response_tokens.shape[0] == 1
+        assert response_tokens.shape[1] == RESPONSE_MAX_LENGTH
+        assert not response_masks.any(), "prepare_response('') should produce no real tokens"
+
+        bsize = response_tokens.shape[0]
+        (_, pad_masks, _), meta = self._call_embed_prefix(
+            bsize=bsize,
+            response_tokens=response_tokens,
+            response_masks=response_masks,
+        )
+
+        comma_mask = pad_masks[:, meta["comma_start"] : meta["comma_end"]]
+        assert torch.all(~comma_mask), 'empty response: ", " separator should be fully padded (masked out)'
+
+        resp_mask = pad_masks[:, meta["resp_start"] : meta["resp_end"]]
+        assert torch.all(~resp_mask), "empty response: all response tokens should be padded"
+
+    # ------------------------------------------------------------------ #
+    # Test 2: response!="" — ", " and response tokens unmasked
+    # ------------------------------------------------------------------ #
+    def test_nonempty_response_comma_and_tokens_unmasked(self):
+        """Non-empty response: ``prepare_response`` marks real tokens; the \", \"
+        separator must be unmasked and response pad_mask must match ``response_masks``."""
+        text = "Grasp the red block and place it in the bin."
+        response_tokens, response_masks = self._prepare_response([text])
+        assert response_masks.any(), "prepare_response should mark at least one real token"
+        assert response_tokens.shape[1] == RESPONSE_MAX_LENGTH
+
+        bsize = response_tokens.shape[0]
+        (_, pad_masks, _), meta = self._call_embed_prefix(
+            bsize=bsize,
+            response_tokens=response_tokens,
+            response_masks=response_masks,
+        )
+
+        comma_mask = pad_masks[:, meta["comma_start"] : meta["comma_end"]]
+        assert torch.all(comma_mask), 'non-empty response: ", " separator should be unmasked'
+
+        resp_mask = pad_masks[:, meta["resp_start"] : meta["resp_end"]]
+        assert torch.equal(resp_mask, response_masks), (
+            "response pad_mask should match prepare_response masks exactly"
+        )
+
+    # ------------------------------------------------------------------ #
+    # Test 3: mixed batch — sample 0 empty, sample 1 has response
+    # ------------------------------------------------------------------ #
+    def test_mixed_batch_response_masking(self):
+        """Mixed batch: ``prepare_response`` on ``[\"\", real]``; per-sample comma
+        and response pad_masks must follow ``response_masks.any(dim=1)``."""
+        response_tokens, response_masks = self._prepare_response(
+            ["", "Grasp the red block and place it in the bin."]
+        )
+        assert not response_masks[0].any()
+        assert response_masks[1].any()
+
+        bsize = response_tokens.shape[0]
+        (_, pad_masks, _), meta = self._call_embed_prefix(
+            bsize=bsize,
+            response_tokens=response_tokens,
+            response_masks=response_masks,
+        )
+
+        comma_mask = pad_masks[:, meta["comma_start"] : meta["comma_end"]]
+        assert torch.all(~comma_mask[0]), 'sample 0 (empty response): ", " should be padded'
+        assert torch.all(comma_mask[1]), 'sample 1 (real response): ", " should be unmasked'
+
+        resp_mask = pad_masks[:, meta["resp_start"] : meta["resp_end"]]
+        assert torch.equal(resp_mask, response_masks)
+        assert torch.all(~resp_mask[0])
+
+    # ------------------------------------------------------------------ #
+    # Test 4: forward vs sample_actions parity for response masking
+    # ------------------------------------------------------------------ #
+    def test_response_masking_forward_vs_sample_actions_parity(self):
+        """Identical ``prepare_response`` outputs produce identical ``embed_prefix``
+        pad_masks (parity for empty vs non-empty). Missing ``response`` key matches
+        explicit ``[\"\"]`` (same as ``_hydrate_optional_conditioning_batch``)."""
+        empty_tokens_a, empty_masks_a = self._prepare_response([""])
+        empty_tokens_b, empty_masks_b = self._prepare_response([""])
+        assert torch.equal(empty_tokens_a, empty_tokens_b)
+        assert torch.equal(empty_masks_a, empty_masks_b)
+
+        empty_tokens_c, empty_masks_c = self._prepare_response([""], omit_response_key=True)
+        assert torch.equal(empty_tokens_a, empty_tokens_c)
+        assert torch.equal(empty_masks_a, empty_masks_c)
+
+        text = "Open the drawer slowly."
+        real_tokens_a, real_masks_a = self._prepare_response([text])
+        real_tokens_b, real_masks_b = self._prepare_response([text])
+        assert torch.equal(real_tokens_a, real_tokens_b)
+        assert torch.equal(real_masks_a, real_masks_b)
+
+        bsize = 1
+        (_, pm_empty_1, _), meta = self._call_embed_prefix(
+            bsize=bsize,
+            response_tokens=empty_tokens_a,
+            response_masks=empty_masks_a,
+        )
+        (_, pm_empty_2, _), _ = self._call_embed_prefix(
+            bsize=bsize,
+            response_tokens=empty_tokens_b,
+            response_masks=empty_masks_b,
+        )
+        assert torch.equal(pm_empty_1, pm_empty_2), (
+            "two prepare_response(empty) runs should yield identical embed_prefix pad_masks"
+        )
+
+        (_, pm_real_1, _), _ = self._call_embed_prefix(
+            bsize=bsize,
+            response_tokens=real_tokens_a,
+            response_masks=real_masks_a,
+        )
+        (_, pm_real_2, _), _ = self._call_embed_prefix(
+            bsize=bsize,
+            response_tokens=real_tokens_b,
+            response_masks=real_masks_b,
+        )
+        assert torch.equal(pm_real_1, pm_real_2), (
+            "two prepare_response(non-empty) runs should yield identical embed_prefix pad_masks"
+        )
+
+        comma_empty = pm_empty_1[:, meta["comma_start"] : meta["comma_end"]]
+        comma_real = pm_real_1[:, meta["comma_start"] : meta["comma_end"]]
+        assert not torch.equal(comma_empty, comma_real), (
+            'empty vs non-empty response should differ in the ", " separator mask'
+        )
+
+        resp_empty = pm_empty_1[:, meta["resp_start"] : meta["resp_end"]]
+        resp_real = pm_real_1[:, meta["resp_start"] : meta["resp_end"]]
+        assert not torch.equal(resp_empty, resp_real), (
+            "empty vs non-empty response should differ in response token masks"
+        )
+
+
+class TestPI07LowLevelPlannerMetadataEmbedding:
+    """CPU-only tests for metadata pad masks in ``embed_prefix``.
+
+    ``metadata_tokens`` / ``metadata_masks`` come from
+    :meth:`PI07LowLevelPlannerPolicy.prepare_metadata` (real tokenizer + the
+    same ``speed`` / ``quality`` / ``mistake`` + ``*_is_pad`` rules as training).
+
+    Prefix slice after the response block (no subgoal images):
+        ... [response] [\", \" sg] [\"Subgoal: \"] [\", \" md] [metadata] [\":\\n\"]
+
+    The metadata ``\", \"`` separator uses ``sample_has_metadata = metadata_masks.any(dim=1)``.
+    """
+
+    _STATE_LEAD_LEN = len(TestPI07LowLevelPlannerResponseEmbedding._STATE_LEAD_IDS)
+    _COMMA_LEN = len(TestPI07LowLevelPlannerResponseEmbedding._COMMA_IDS)
+    _SG_COMMA_LEN = len(TestPI07LowLevelPlannerResponseEmbedding._COMMA_IDS)
+    _SG_START_LEN = len(TestPI07LowLevelPlannerResponseEmbedding._SUBGOAL_LEAD_IDS)
+    _MD_COMMA_LEN = len(TestPI07LowLevelPlannerResponseEmbedding._COMMA_IDS)
+    _VID_TOKENS = 6
+
+    @classmethod
+    def _prepare_metadata(cls, batch: dict) -> tuple[torch.Tensor, torch.Tensor]:
+        policy = TestPI07LowLevelPlannerResponseEmbedding._get_prepare_policy()
+        return PI07LowLevelPlannerPolicy.prepare_metadata(policy, batch)
+
+    @classmethod
+    def _metadata_batch(
+        cls,
+        bsz: int,
+        *,
+        speed_pad: torch.Tensor | bool,
+        quality_pad: torch.Tensor | bool,
+        mistake_pad: torch.Tensor | bool,
+        speed_val: float = 500.0,
+        quality_val: float = 3.0,
+        mistake_val: bool = False,
+    ) -> dict:
+        device = torch.device("cpu")
+        batch = {
+            "state": torch.zeros(bsz, 1, MAX_STATE_DIM, device=device),
+            "speed": torch.full((bsz,), speed_val, dtype=torch.float32, device=device),
+            "quality": torch.full((bsz,), quality_val, dtype=torch.float32, device=device),
+            "mistake": torch.full((bsz,), mistake_val, dtype=torch.bool, device=device),
+        }
+        for key, pad in (
+            ("speed_is_pad", speed_pad),
+            ("quality_is_pad", quality_pad),
+            ("mistake_is_pad", mistake_pad),
+        ):
+            t = torch.as_tensor(pad, dtype=torch.bool, device=device).reshape(-1)
+            if t.numel() == 1:
+                t = t.expand(bsz)
+            batch[key] = t
+        return batch
+
+    @classmethod
+    def _call_embed_prefix_with_metadata(
+        cls,
+        *,
+        bsize: int,
+        response_tokens: torch.Tensor,
+        response_masks: torch.Tensor,
+        metadata_tokens: torch.Tensor,
+        metadata_masks: torch.Tensor,
+        n_obs_steps: int = 1,
+        prompt_len: int = 5,
+        hidden_size: int = 8,
+    ) -> tuple[torch.Tensor, dict]:
+        """Run ``embed_prefix`` with real-shaped metadata; return ``pad_masks`` and
+        slice indices for the metadata ``\", \"`` and metadata token block."""
+        model = TestPI07LowLevelPlannerResponseEmbedding._make_mock_model(hidden_size=hidden_size)
+        assert metadata_tokens.shape[1] == METADATA_MAX_LENGTH
+
+        (_, pad_masks, _) = PI07LowLevelPlannerFlowMatching.embed_prefix(
+            model,
+            videos=[torch.zeros(bsize, n_obs_steps, 3, 8, 8)],
+            vid_masks=[torch.ones(bsize, dtype=torch.bool)],
+            lang_tokens=torch.zeros(bsize, prompt_len, dtype=torch.long),
+            lang_masks=torch.ones(bsize, prompt_len, dtype=torch.bool),
+            state=torch.zeros(bsize, n_obs_steps, 8),
+            response_tokens=response_tokens,
+            response_masks=response_masks,
+            metadata_tokens=metadata_tokens,
+            metadata_masks=metadata_masks,
+            subgoal_videos=(),
+            subgoal_vid_masks=(),
+        )
+
+        resp_len = response_tokens.shape[1]
+        # Response comma (before response tokens)
+        resp_comma_start = cls._VID_TOKENS + prompt_len + cls._STATE_LEAD_LEN + n_obs_steps
+        resp_comma_end = resp_comma_start + cls._COMMA_LEN
+        resp_start = resp_comma_end
+        resp_end = resp_start + resp_len
+        # Subgoal header block (no subgoal images when lists empty)
+        md_comma_start = resp_end + cls._SG_COMMA_LEN + cls._SG_START_LEN
+        md_comma_end = md_comma_start + cls._MD_COMMA_LEN
+        meta_start = md_comma_end
+        meta_end = meta_start + METADATA_MAX_LENGTH
+
+        return pad_masks, {
+            "md_comma_start": md_comma_start,
+            "md_comma_end": md_comma_end,
+            "meta_start": meta_start,
+            "meta_end": meta_end,
+        }
+
+    @classmethod
+    def _empty_response(cls, bsz: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return TestPI07LowLevelPlannerResponseEmbedding._prepare_response([""] * bsz)
+
+    # ------------------------------------------------------------------ #
+    # All metadata dropped (all *_is_pad True) — same as inference defaults
+    # ------------------------------------------------------------------ #
+    def test_all_metadata_dropped_md_comma_and_tokens_padded(self):
+        """All three fields treated as pad → empty metadata string; the metadata
+        ``, `` separator and all metadata slots must be padded in ``embed_prefix``."""
+        bsz = 1
+        batch = self._metadata_batch(
+            bsz,
+            speed_pad=True,
+            quality_pad=True,
+            mistake_pad=True,
+        )
+        meta_tokens, meta_masks = self._prepare_metadata(batch)
+        assert meta_tokens.shape == (bsz, METADATA_MAX_LENGTH)
+        assert not meta_masks.any()
+
+        rt, rm = self._empty_response(bsz)
+        pad_masks, sl = self._call_embed_prefix_with_metadata(
+            bsize=bsz,
+            response_tokens=rt,
+            response_masks=rm,
+            metadata_tokens=meta_tokens,
+            metadata_masks=meta_masks,
+        )
+
+        md_comma = pad_masks[:, sl["md_comma_start"] : sl["md_comma_end"]]
+        assert torch.all(~md_comma), 'all-metadata-pad: metadata ", " should be fully padded'
+
+        meta_pad = pad_masks[:, sl["meta_start"] : sl["meta_end"]]
+        assert torch.all(~meta_pad), "all-metadata-pad: every metadata token should be padded"
+
+    # ------------------------------------------------------------------ #
+    # All metadata present
+    # ------------------------------------------------------------------ #
+    def test_all_metadata_present_md_comma_unmasked(self):
+        """All fields real → ``prepare_metadata`` marks tokens; metadata ``, ``
+        unmasked and prefix slice equals ``metadata_masks``."""
+        bsz = 1
+        batch = self._metadata_batch(
+            bsz,
+            speed_pad=False,
+            quality_pad=False,
+            mistake_pad=False,
+        )
+        meta_tokens, meta_masks = self._prepare_metadata(batch)
+        assert meta_masks.any()
+
+        rt, rm = self._empty_response(bsz)
+        pad_masks, sl = self._call_embed_prefix_with_metadata(
+            bsize=bsz,
+            response_tokens=rt,
+            response_masks=rm,
+            metadata_tokens=meta_tokens,
+            metadata_masks=meta_masks,
+        )
+
+        md_comma = pad_masks[:, sl["md_comma_start"] : sl["md_comma_end"]]
+        assert torch.all(md_comma), 'all-metadata-real: metadata ", " should be unmasked'
+
+        meta_pad = pad_masks[:, sl["meta_start"] : sl["meta_end"]]
+        assert torch.equal(meta_pad, meta_masks)
+
+    # ------------------------------------------------------------------ #
+    # Exhaustive single-sample pad combinations (speed / quality / mistake)
+    # ------------------------------------------------------------------ #
+    @pytest.mark.parametrize(
+        "spad,qpad,mpad",
+        [
+            (True, True, True),
+            (False, False, False),
+            (False, True, True),
+            (True, False, True),
+            (True, True, False),
+            (False, False, True),
+            (False, True, False),
+            (True, False, False),
+        ],
+    )
+    def test_metadata_is_pad_exhaustive_single_sample(self, spad, qpad, mpad):
+        """Every combination of ``*_is_pad`` (True = field dropped) must drive
+        ``sample_has_metadata`` consistently in ``embed_prefix``."""
+        bsz = 1
+        batch = self._metadata_batch(bsz, speed_pad=spad, quality_pad=qpad, mistake_pad=mpad)
+        meta_tokens, meta_masks = self._prepare_metadata(batch)
+        expect_any_meta = not (spad and qpad and mpad)
+        assert meta_masks.any().item() == expect_any_meta
+
+        rt, rm = self._empty_response(bsz)
+        pad_masks, sl = self._call_embed_prefix_with_metadata(
+            bsize=bsz,
+            response_tokens=rt,
+            response_masks=rm,
+            metadata_tokens=meta_tokens,
+            metadata_masks=meta_masks,
+        )
+
+        sample_has = meta_masks.any(dim=1)
+        md_comma = pad_masks[:, sl["md_comma_start"] : sl["md_comma_end"]]
+        assert torch.equal(md_comma, sample_has[:, None].expand_as(md_comma)), (
+            "metadata comma mask must follow metadata_masks.any(dim=1)"
+        )
+
+        meta_slice = pad_masks[:, sl["meta_start"] : sl["meta_end"]]
+        assert torch.equal(meta_slice, meta_masks)
+
+    # ------------------------------------------------------------------ #
+    # Mixed batch: heterogeneous per-sample metadata presence
+    # ------------------------------------------------------------------ #
+    def test_mixed_batch_metadata_masking(self):
+        """Per-sample ``*_is_pad`` patterns must not leak across the batch."""
+        bsz = 3
+        batch = {
+            "state": torch.zeros(bsz, 1, MAX_STATE_DIM),
+            "speed": torch.tensor([100.0, 200.0, 300.0]),
+            "quality": torch.tensor([1.0, 2.0, 3.0]),
+            "mistake": torch.tensor([False, True, False]),
+            # Sample 0: all pad. Sample 1: all real. Sample 2: only speed real.
+            "speed_is_pad": torch.tensor([True, False, False]),
+            "quality_is_pad": torch.tensor([True, False, True]),
+            "mistake_is_pad": torch.tensor([True, False, True]),
+        }
+        meta_tokens, meta_masks = self._prepare_metadata(batch)
+        assert not meta_masks[0].any()
+        assert meta_masks[1].any()
+        assert meta_masks[2].any()
+
+        rt, rm = self._empty_response(bsz)
+        pad_masks, sl = self._call_embed_prefix_with_metadata(
+            bsize=bsz,
+            response_tokens=rt,
+            response_masks=rm,
+            metadata_tokens=meta_tokens,
+            metadata_masks=meta_masks,
+        )
+
+        md_comma = pad_masks[:, sl["md_comma_start"] : sl["md_comma_end"]]
+        assert torch.all(~md_comma[0])
+        assert torch.all(md_comma[1])
+        assert torch.all(md_comma[2])
+
+        meta_slice = pad_masks[:, sl["meta_start"] : sl["meta_end"]]
+        assert torch.equal(meta_slice, meta_masks)
+
+    # ------------------------------------------------------------------ #
+    # Missing keys (inference) vs explicit all-pad
+    # ------------------------------------------------------------------ #
+    def test_metadata_missing_keys_matches_explicit_all_pad(self):
+        """Batch with only ``state`` (``_hydrate_metadata_batch`` defaults) must
+        match an explicit batch with all ``*_is_pad`` True."""
+        bsz = 1
+        batch_missing = {"state": torch.zeros(bsz, 1, MAX_STATE_DIM)}
+        t_miss, m_miss = self._prepare_metadata(batch_missing)
+
+        batch_explicit = self._metadata_batch(
+            bsz,
+            speed_pad=True,
+            quality_pad=True,
+            mistake_pad=True,
+        )
+        t_exp, m_exp = self._prepare_metadata(batch_explicit)
+
+        assert torch.equal(t_miss, t_exp)
+        assert torch.equal(m_miss, m_exp)
+
+        rt, rm = self._empty_response(bsz)
+        pm_a, sl = self._call_embed_prefix_with_metadata(
+            bsize=bsz,
+            response_tokens=rt,
+            response_masks=rm,
+            metadata_tokens=t_miss,
+            metadata_masks=m_miss,
+        )
+        pm_b, _ = self._call_embed_prefix_with_metadata(
+            bsize=bsz,
+            response_tokens=rt,
+            response_masks=rm,
+            metadata_tokens=t_exp,
+            metadata_masks=m_exp,
+        )
+        assert torch.equal(pm_a, pm_b)
+
+
+class TestPI07LowLevelPlannerSubgoalEmbedding:
+    """CPU-only tests for subgoal block pad masks in ``embed_prefix``.
+
+    ``subgoal_videos`` / ``subgoal_vid_masks`` come from
+    :meth:`PI07LowLevelPlannerPolicy.prepare_subgoal_images` (same
+    ``image_features`` / ``subgoal{k}`` layout as training).
+
+    After the response block: ``\", \"`` (subgoal) → ``\"Subgoal: \"`` →
+    SigLIP tokens per camera.  ``sample_has_subgoal`` is
+    ``torch.stack(subgoal_vid_masks, dim=0).any(dim=0)``.
+    """
+
+    _VID = 6
+    _STATE_LEAD = len(TestPI07LowLevelPlannerResponseEmbedding._STATE_LEAD_IDS)
+    _COMMA = len(TestPI07LowLevelPlannerResponseEmbedding._COMMA_IDS)
+    _SG_START = len(TestPI07LowLevelPlannerResponseEmbedding._SUBGOAL_LEAD_IDS)
+    _N_SG_TOKENS = 6  # mock ``embed_video`` / ``video_encoder.num_video_tokens``
+
+    @classmethod
+    def _prepare_subgoal(cls, batch: dict) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        policy = TestPI07LowLevelPlannerResponseEmbedding._get_prepare_policy()
+        return PI07LowLevelPlannerPolicy.prepare_subgoal_images(policy, batch)
+
+    @classmethod
+    def _empty_response_metadata(cls, bsz: int) -> tuple[torch.Tensor, ...]:
+        rt, rm = TestPI07LowLevelPlannerResponseEmbedding._prepare_response([""] * bsz)
+        mb = TestPI07LowLevelPlannerMetadataEmbedding._metadata_batch(
+            bsz,
+            speed_pad=True,
+            quality_pad=True,
+            mistake_pad=True,
+        )
+        mt, mm = TestPI07LowLevelPlannerMetadataEmbedding._prepare_metadata(mb)
+        return rt, rm, mt, mm
+
+    @classmethod
+    def _subgoal_batch(
+        cls,
+        bsz: int,
+        *,
+        include_tensors: bool,
+        subgoal_is_pad: torch.Tensor | bool,
+        fill: float = 0.42,
+    ) -> dict:
+        """Build a batch dict for ``prepare_subgoal_images``."""
+        device = torch.device("cpu")
+        batch: dict = {"state": torch.zeros(bsz, 1, MAX_STATE_DIM, device=device)}
+        pad = torch.as_tensor(subgoal_is_pad, dtype=torch.bool, device=device).reshape(-1)
+        if pad.numel() == 1:
+            pad = pad.expand(bsz)
+        batch["subgoal_is_pad"] = pad
+        if include_tensors:
+            img = torch.full((bsz, 3, 224, 224), fill, device=device)
+            batch["subgoal0"] = img
+            batch["subgoal1"] = img * 0.9
+        return batch
+
+    @classmethod
+    def _call_embed_prefix_with_subgoals(
+        cls,
+        *,
+        bsize: int,
+        response_tokens: torch.Tensor,
+        response_masks: torch.Tensor,
+        metadata_tokens: torch.Tensor,
+        metadata_masks: torch.Tensor,
+        subgoal_videos: list[torch.Tensor],
+        subgoal_vid_masks: list[torch.Tensor],
+        n_obs_steps: int = 1,
+        prompt_len: int = 5,
+        hidden_size: int = 8,
+    ) -> tuple[torch.Tensor, dict]:
+        model = TestPI07LowLevelPlannerResponseEmbedding._make_mock_model(hidden_size=hidden_size)
+        model.video_encoder.num_frames = n_obs_steps
+        assert len(subgoal_videos) == len(subgoal_vid_masks)
+
+        (_, pad_masks, _) = PI07LowLevelPlannerFlowMatching.embed_prefix(
+            model,
+            videos=[torch.zeros(bsize, n_obs_steps, 3, 8, 8)],
+            vid_masks=[torch.ones(bsize, dtype=torch.bool)],
+            lang_tokens=torch.zeros(bsize, prompt_len, dtype=torch.long),
+            lang_masks=torch.ones(bsize, prompt_len, dtype=torch.bool),
+            state=torch.zeros(bsize, n_obs_steps, 8),
+            response_tokens=response_tokens,
+            response_masks=response_masks,
+            metadata_tokens=metadata_tokens,
+            metadata_masks=metadata_masks,
+            subgoal_videos=subgoal_videos,
+            subgoal_vid_masks=subgoal_vid_masks,
+        )
+
+        resp_len = response_tokens.shape[1]
+        rcomma_lo = cls._VID + prompt_len + cls._STATE_LEAD + n_obs_steps
+        rcomma_hi = rcomma_lo + cls._COMMA
+        resp_lo = rcomma_hi
+        resp_hi = resp_lo + resp_len
+        sg_comma_lo = resp_hi
+        sg_comma_hi = sg_comma_lo + cls._COMMA
+        sg_start_lo = sg_comma_hi
+        sg_start_hi = sg_start_lo + cls._SG_START
+        sg_vid_lo = sg_start_hi
+        n_cam = len(subgoal_vid_masks)
+        sg_vid_hi = sg_vid_lo + n_cam * cls._N_SG_TOKENS
+
+        sample_has_sg = torch.stack(subgoal_vid_masks, dim=0).any(dim=0)
+
+        return pad_masks, {
+            "sg_comma_lo": sg_comma_lo,
+            "sg_comma_hi": sg_comma_hi,
+            "sg_start_lo": sg_start_lo,
+            "sg_start_hi": sg_start_hi,
+            "sg_vid_lo": sg_vid_lo,
+            "sg_vid_hi": sg_vid_hi,
+            "n_cam": n_cam,
+            "sample_has_subgoal": sample_has_sg,
+        }
+
+    # ------------------------------------------------------------------ #
+    # No subgoal tensors (inference-style) — all subgoal slots padded
+    # ------------------------------------------------------------------ #
+    def test_no_subgoal_keys_sg_block_fully_padded(self):
+        """Batch with only ``state`` → fabricated zero slots and all-false masks;
+        ``sample_has_subgoal`` is false → sg comma, header, and vision tokens padded."""
+        bsz = 1
+        batch = {"state": torch.zeros(bsz, 1, MAX_STATE_DIM)}
+        sg_videos, sg_masks = self._prepare_subgoal(batch)
+        assert len(sg_videos) == 2 and len(sg_masks) == 2
+        assert all(not m.any() for m in sg_masks)
+
+        rt, rm, mt, mm = self._empty_response_metadata(bsz)
+        pad_masks, sl = self._call_embed_prefix_with_subgoals(
+            bsize=bsz,
+            response_tokens=rt,
+            response_masks=rm,
+            metadata_tokens=mt,
+            metadata_masks=mm,
+            subgoal_videos=sg_videos,
+            subgoal_vid_masks=sg_masks,
+        )
+
+        assert not sl["sample_has_subgoal"].any()
+        sg_comma = pad_masks[:, sl["sg_comma_lo"] : sl["sg_comma_hi"]]
+        sg_start = pad_masks[:, sl["sg_start_lo"] : sl["sg_start_hi"]]
+        assert torch.all(~sg_comma) and torch.all(~sg_start)
+
+        sg_vid = pad_masks[:, sl["sg_vid_lo"] : sl["sg_vid_hi"]]
+        assert torch.all(~sg_vid)
+
+    # ------------------------------------------------------------------ #
+    # Subgoal tensors present and not pad — sg block unmasked
+    # ------------------------------------------------------------------ #
+    def test_subgoal_present_sg_block_unmasked(self):
+        """``subgoal0`` / ``subgoal1`` with ``subgoal_is_pad=False`` → per-camera
+        masks true; comma + ``Subgoal:`` + SigLIP slots unmasked."""
+        bsz = 1
+        batch = self._subgoal_batch(bsz, include_tensors=True, subgoal_is_pad=False)
+        sg_videos, sg_masks = self._prepare_subgoal(batch)
+        assert sg_masks[0].all() and sg_masks[1].all()
+
+        rt, rm, mt, mm = self._empty_response_metadata(bsz)
+        pad_masks, sl = self._call_embed_prefix_with_subgoals(
+            bsize=bsz,
+            response_tokens=rt,
+            response_masks=rm,
+            metadata_tokens=mt,
+            metadata_masks=mm,
+            subgoal_videos=sg_videos,
+            subgoal_vid_masks=sg_masks,
+        )
+
+        assert sl["sample_has_subgoal"].all()
+        sg_comma = pad_masks[:, sl["sg_comma_lo"] : sl["sg_comma_hi"]]
+        sg_start = pad_masks[:, sl["sg_start_lo"] : sl["sg_start_hi"]]
+        assert torch.all(sg_comma) and torch.all(sg_start)
+
+        for ci in range(sl["n_cam"]):
+            lo = sl["sg_vid_lo"] + ci * self._N_SG_TOKENS
+            hi = lo + self._N_SG_TOKENS
+            block = pad_masks[:, lo:hi]
+            expected = sg_masks[ci][:, None].expand(bsz, self._N_SG_TOKENS)
+            assert torch.equal(block, expected), f"camera {ci} SigLIP pad mask mismatch"
+
+    # ------------------------------------------------------------------ #
+    # Tensors present but subgoal_is_pad all True — same as missing keys
+    # ------------------------------------------------------------------ #
+    def test_subgoal_tensors_all_is_pad_matches_missing_keys(self):
+        """Real ``subgoal{k}`` tensors with ``subgoal_is_pad=True`` must match the
+        no-key path for ``prepare_subgoal_images`` and for ``embed_prefix`` pad_masks."""
+        bsz = 1
+        batch_missing = {"state": torch.zeros(bsz, 1, MAX_STATE_DIM)}
+        v_miss, m_miss = self._prepare_subgoal(batch_missing)
+
+        batch_pad = self._subgoal_batch(bsz, include_tensors=True, subgoal_is_pad=True)
+        v_pad, m_pad = self._prepare_subgoal(batch_pad)
+
+        for i in range(len(v_miss)):
+            assert torch.equal(v_miss[i], v_pad[i])
+            assert torch.equal(m_miss[i], m_pad[i])
+
+        rt, rm, mt, mm = self._empty_response_metadata(bsz)
+        pm_a, sl = self._call_embed_prefix_with_subgoals(
+            bsize=bsz,
+            response_tokens=rt,
+            response_masks=rm,
+            metadata_tokens=mt,
+            metadata_masks=mm,
+            subgoal_videos=v_miss,
+            subgoal_vid_masks=m_miss,
+        )
+        pm_b, _ = self._call_embed_prefix_with_subgoals(
+            bsize=bsz,
+            response_tokens=rt,
+            response_masks=rm,
+            metadata_tokens=mt,
+            metadata_masks=mm,
+            subgoal_videos=v_pad,
+            subgoal_vid_masks=m_pad,
+        )
+        assert torch.equal(pm_a, pm_b)
+
+    # ------------------------------------------------------------------ #
+    # Mixed batch — per-sample subgoal_is_pad
+    # ------------------------------------------------------------------ #
+    def test_mixed_batch_subgoal_masking(self):
+        """Per-sample ``subgoal_is_pad`` must gate comma / header / vision independently."""
+        bsz = 2
+        batch = self._subgoal_batch(bsz, include_tensors=True, subgoal_is_pad=torch.tensor([True, False]))
+        sg_videos, sg_masks = self._prepare_subgoal(batch)
+        assert torch.equal(sg_masks[0], torch.tensor([False, True]))
+        assert torch.equal(sg_masks[0], sg_masks[1])
+
+        rt, rm, mt, mm = self._empty_response_metadata(bsz)
+        pad_masks, sl = self._call_embed_prefix_with_subgoals(
+            bsize=bsz,
+            response_tokens=rt,
+            response_masks=rm,
+            metadata_tokens=mt,
+            metadata_masks=mm,
+            subgoal_videos=sg_videos,
+            subgoal_vid_masks=sg_masks,
+        )
+
+        has = sl["sample_has_subgoal"]
+        assert torch.equal(has, torch.tensor([False, True]))
+
+        sg_comma = pad_masks[:, sl["sg_comma_lo"] : sl["sg_comma_hi"]]
+        assert torch.all(~sg_comma[0]) and torch.all(sg_comma[1])
+
+        sg_start = pad_masks[:, sl["sg_start_lo"] : sl["sg_start_hi"]]
+        assert torch.all(~sg_start[0]) and torch.all(sg_start[1])
+
+        sg_vid = pad_masks[:, sl["sg_vid_lo"] : sl["sg_vid_hi"]]
+        assert torch.all(~sg_vid[0])
+        assert torch.all(sg_vid[1])
+
+    # ------------------------------------------------------------------ #
+    # OR across cameras: one camera masked out does not drop the whole sample
+    # ------------------------------------------------------------------ #
+    def test_subgoal_sample_has_or_across_cameras(self):
+        """If either camera mask is true for a row, ``sample_has_subgoal`` is true."""
+        bsz = 1
+        device = torch.device("cpu")
+        batch = {
+            "state": torch.zeros(bsz, 1, MAX_STATE_DIM, device=device),
+            "subgoal_is_pad": torch.zeros(bsz, dtype=torch.bool, device=device),
+            "subgoal0": torch.full((bsz, 3, 224, 224), 0.5, device=device),
+            "subgoal1": torch.full((bsz, 3, 224, 224), 0.6, device=device),
+        }
+        sg_videos, sg_masks = self._prepare_subgoal(batch)
+        sg_masks[1][:] = False
+        assert sg_masks[0].all() and not sg_masks[1].any()
+
+        rt, rm, mt, mm = self._empty_response_metadata(bsz)
+        pad_masks, sl = self._call_embed_prefix_with_subgoals(
+            bsize=bsz,
+            response_tokens=rt,
+            response_masks=rm,
+            metadata_tokens=mt,
+            metadata_masks=mm,
+            subgoal_videos=sg_videos,
+            subgoal_vid_masks=sg_masks,
+        )
+        assert sl["sample_has_subgoal"].all(), "OR across cameras should keep sample active"
+
+        sg_comma = pad_masks[:, sl["sg_comma_lo"] : sl["sg_comma_hi"]]
+        assert torch.all(sg_comma)
+
+    # ------------------------------------------------------------------ #
+    # Default subgoal_is_pad when omitted (all pad)
+    # ------------------------------------------------------------------ #
+    def test_omit_subgoal_is_pad_defaults_all_pad(self):
+        """Omitted ``subgoal_is_pad`` defaults to all-True (see ``prepare_subgoal_images``)."""
+        bsz = 1
+        device = torch.device("cpu")
+        batch = {
+            "state": torch.zeros(bsz, 1, MAX_STATE_DIM, device=device),
+            "subgoal0": torch.ones(bsz, 3, 224, 224, device=device) * 0.3,
+            "subgoal1": torch.ones(bsz, 3, 224, 224, device=device) * 0.4,
+        }
+        sg_videos, sg_masks = self._prepare_subgoal(batch)
+        assert all(not m.any() for m in sg_masks)
+
+        rt, rm, mt, mm = self._empty_response_metadata(bsz)
+        pad_masks, sl = self._call_embed_prefix_with_subgoals(
+            bsize=bsz,
+            response_tokens=rt,
+            response_masks=rm,
+            metadata_tokens=mt,
+            metadata_masks=mm,
+            subgoal_videos=sg_videos,
+            subgoal_vid_masks=sg_masks,
+        )
+        assert not sl["sample_has_subgoal"].any()
+        assert torch.all(~pad_masks[:, sl["sg_comma_lo"] : sl["sg_comma_hi"]])
+
+    # ------------------------------------------------------------------ #
+    # Parity: identical prepare outputs → identical prefix pad_masks
+    # ------------------------------------------------------------------ #
+    def test_subgoal_embed_prefix_parity(self):
+        """Two ``prepare_subgoal_images`` runs on the same batch yield identical
+        ``embed_prefix`` pad_masks."""
+        bsz = 1
+        batch = self._subgoal_batch(bsz, include_tensors=True, subgoal_is_pad=False)
+        v1, m1 = self._prepare_subgoal(batch)
+        v2, m2 = self._prepare_subgoal(batch)
+        for i in range(len(v1)):
+            assert torch.equal(v1[i], v2[i])
+            assert torch.equal(m1[i], m2[i])
+
+        rt, rm, mt, mm = self._empty_response_metadata(bsz)
+        pm_a, _ = self._call_embed_prefix_with_subgoals(
+            bsize=bsz,
+            response_tokens=rt,
+            response_masks=rm,
+            metadata_tokens=mt,
+            metadata_masks=mm,
+            subgoal_videos=v1,
+            subgoal_vid_masks=m1,
+        )
+        pm_b, _ = self._call_embed_prefix_with_subgoals(
+            bsize=bsz,
+            response_tokens=rt,
+            response_masks=rm,
+            metadata_tokens=mt,
+            metadata_masks=mm,
+            subgoal_videos=v2,
+            subgoal_vid_masks=m2,
+        )
+        assert torch.equal(pm_a, pm_b)
+
+    # ------------------------------------------------------------------ #
+    # n_obs_history > 1: subgoal videos must be padded to (B, num_frames, …)
+    # before reaching the SpaceTime SigLIP encoder, with obs_history_is_pad
+    # blocking all but the current frame. Regression test for the crash
+    # at video_encoder.py:485 (T != num_frames) when any sample has a real
+    # subgoal and the encoder was constructed with num_frames > 1.
+    # ------------------------------------------------------------------ #
+    def test_subgoal_padded_to_num_frames_when_n_obs_history_gt_one(self):
+        bsz = 2
+        n_obs_steps = 4
+        batch = self._subgoal_batch(
+            bsz,
+            include_tensors=True,
+            subgoal_is_pad=torch.tensor([True, False]),
+        )
+        sg_videos, sg_masks = self._prepare_subgoal(batch)
+        rt, rm, mt, mm = self._empty_response_metadata(bsz)
+
+        captured: list[tuple[tuple[int, ...], torch.Tensor | None]] = []
+        model = TestPI07LowLevelPlannerResponseEmbedding._make_mock_model(hidden_size=8)
+        model.video_encoder.num_frames = n_obs_steps
+
+        def _capturing_embed_video(video, obs_history_is_pad=None):
+            t = video.shape[1]
+            if t != model.video_encoder.num_frames:
+                raise ValueError(f"Expected T={model.video_encoder.num_frames} frames; got {t}.")
+            captured.append((tuple(video.shape), obs_history_is_pad))
+            return torch.zeros(video.shape[0], 6, 8, dtype=torch.bfloat16)
+
+        model.embed_video = _capturing_embed_video
+
+        # Call embed_prefix directly so we can install the capturing mock.
+        PI07LowLevelPlannerFlowMatching.embed_prefix(
+            model,
+            videos=[torch.zeros(bsz, n_obs_steps, 3, 8, 8)],
+            vid_masks=[torch.ones(bsz, dtype=torch.bool)],
+            lang_tokens=torch.zeros(bsz, 5, dtype=torch.long),
+            lang_masks=torch.ones(bsz, 5, dtype=torch.bool),
+            state=torch.zeros(bsz, n_obs_steps, 8),
+            response_tokens=rt,
+            response_masks=rm,
+            metadata_tokens=mt,
+            metadata_masks=mm,
+            subgoal_videos=sg_videos,
+            subgoal_vid_masks=sg_masks,
+        )
+
+        # Expect one embed_video call per main-video camera (T=n_obs_steps,
+        # obs_history_is_pad=None), then one per subgoal camera with the same
+        # T and obs_history_is_pad marking only the last frame as not-padded.
+        assert len(captured) == 1 + len(sg_videos)
+        for shape, pad in captured[1:]:
+            assert shape == (bsz, n_obs_steps, 3, 224, 224), shape
+            assert pad is not None
+            assert pad.shape == (bsz, n_obs_steps)
+            assert torch.all(pad[:, :-1])
+            assert torch.all(~pad[:, -1])

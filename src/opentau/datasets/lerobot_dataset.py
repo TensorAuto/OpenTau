@@ -1857,6 +1857,9 @@ class LeRobotDataset(BaseDataset):
         ts = subgoal_frame / self.fps
         ep_start = int(self.episode_data_index["from"][self.epi2idx[ep_idx]].item())
         out: dict[str, torch.Tensor] = {}
+        # ``hf_dataset[idx]`` runs ``hf_transform_to_torch`` over every column of the row, so
+        # it must be done at most once per ``__getitem__`` even when multiple image-dtype
+        # cameras live in the same row.
         for k in range(self.num_cams):
             cam_key = name_map.get(f"camera{k}")
             if cam_key is None:
