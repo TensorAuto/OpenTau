@@ -919,29 +919,6 @@ def pi06_untrained_policy():
     return PI06Policy.from_pretrained("TensorAuto/pi06-untrained")
 
 
-def _bilinear_resample_pos_embed(old_pos: torch.Tensor, target_num_patches: int) -> torch.Tensor:
-    """Bilinearly resample a (N_patches, dim) SigLIP position-embedding tensor
-    to a different patch count, preserving dtype. N must be a perfect square.
-
-    π0.6 runs the SigLIP tower at 448×448 (1024 patches), but `google/gemma-3-4b-pt`
-    was trained at 896×896 (4096 patches). The build script applies this exact
-    resampling before transferring weights, so the test reference applies it too
-    for byte-equality to hold.
-    """
-    old_n, dim = old_pos.shape
-    if old_n == target_num_patches:
-        return old_pos
-    old_grid = int(old_n**0.5)
-    new_grid = int(target_num_patches**0.5)
-    assert old_grid * old_grid == old_n, f"non-square SigLIP grid: {old_n}"
-    assert new_grid * new_grid == target_num_patches, f"non-square target: {target_num_patches}"
-    grid = old_pos.reshape(old_grid, old_grid, dim).permute(2, 0, 1).unsqueeze(0).float()
-    grid = torch.nn.functional.interpolate(
-        grid, size=(new_grid, new_grid), mode="bilinear", align_corners=False
-    )
-    return grid.squeeze(0).permute(1, 2, 0).reshape(target_num_patches, dim).to(old_pos.dtype)
-
-
 _SIGLIP_POS_EMBED_KEY = "model.vision_tower.vision_model.embeddings.position_embedding.weight"
 
 
@@ -964,6 +941,7 @@ def gemma3_4b_pt_aligned_state_dict(pi06_untrained_policy):
     )
 
     from opentau.datasets.grounding.tokenizer_utils import ensure_loc_tokens
+    from opentau.utils.vision_utils import bilinear_resample_pos_embed
 
     model = Gemma3ForConditionalGeneration.from_pretrained("google/gemma-3-4b-pt", torch_dtype=torch.bfloat16)
     tok = AutoTokenizer.from_pretrained("google/gemma-3-4b-pt")
@@ -973,7 +951,7 @@ def gemma3_4b_pt_aligned_state_dict(pi06_untrained_policy):
     pol_n_patches = pi06_untrained_policy.model.gemma3_with_expert.gemma3.state_dict()[
         _SIGLIP_POS_EMBED_KEY
     ].shape[0]
-    state[_SIGLIP_POS_EMBED_KEY] = _bilinear_resample_pos_embed(
+    state[_SIGLIP_POS_EMBED_KEY] = bilinear_resample_pos_embed(
         state[_SIGLIP_POS_EMBED_KEY], target_num_patches=pol_n_patches
     )
     del model
