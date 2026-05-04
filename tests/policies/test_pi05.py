@@ -616,7 +616,13 @@ def test_pi05_loc_tokens_in_response_produce_finite_loss(pi05_training_config, l
     }
     batch_cuda["action_is_pad"] = batch_cuda["action_is_pad"].to(dtype=torch.bool)
 
-    loss = policy.forward(batch_cuda)
-    assert isinstance(loss, dict)
-    assert "MSE" in loss and "CE" in loss
-    assert all(v.isfinite() for v in loss.values()), f"Non-finite loss with loc tokens: {loss}"
+    try:
+        loss = policy.forward(batch_cuda)
+        assert isinstance(loss, dict)
+        assert "MSE" in loss and "CE" in loss
+        assert all(v.isfinite() for v in loss.values()), f"Non-finite loss with loc tokens: {loss}"
+    finally:
+        # Free ~6 GB of PaliGemma weights so adjacent GPU tests in the same
+        # process don't OOM on a single-GPU dev box.
+        del policy
+        torch.cuda.empty_cache()

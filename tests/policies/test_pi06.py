@@ -622,7 +622,13 @@ def test_pi06_loc_tokens_extend_vocab_and_resize_embeddings(lerobot_dataset_meta
         "action_is_pad": torch.zeros(1, 10, dtype=torch.bool, device="cuda"),
     }
 
-    loss = policy.forward(batch)
-    assert isinstance(loss, dict)
-    assert "MSE" in loss and "CE" in loss
-    assert all(v.isfinite() for v in loss.values()), f"Non-finite loss with loc tokens: {loss}"
+    try:
+        loss = policy.forward(batch)
+        assert isinstance(loss, dict)
+        assert "MSE" in loss and "CE" in loss
+        assert all(v.isfinite() for v in loss.values()), f"Non-finite loss with loc tokens: {loss}"
+    finally:
+        # Free ~8 GB of Gemma 3 weights so adjacent GPU tests in the same
+        # process don't OOM on a single-GPU dev box.
+        del policy
+        torch.cuda.empty_cache()
