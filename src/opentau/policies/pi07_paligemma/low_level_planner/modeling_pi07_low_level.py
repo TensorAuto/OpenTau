@@ -1211,28 +1211,58 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
 
 class PI07LowLevelPlannerFlowMatching(nn.Module):
-    """
-    π05: A Vision-Language-Action Flow Model for General Robot Control
+    """π07 Low-Level Planner — A Vision-Language-Action Flow Matching model with
+    SpaceTime SigLIP video, subtask/subgoal conditioning, and episode metadata.
 
-    [Paper](https://www.physicalintelligence.company/download/pi05.pdf)
+    Architecturally inherits the π0.5 PaliGemma + Gemma-Expert flow-matching
+    backbone ([π0.5 paper](https://www.physicalintelligence.company/download/pi05.pdf))
+    and extends the prefix to ingest, on top of the original (image, language,
+    state, discrete actions) tokens:
 
-    ┌──────────────────────────────────────────┐
-    │                   actions                │
-    │                   ▲                      │
-    │                  ┌┴─────┐                │
-    │      kv cache    │Gemma │                │
-    │      ┌──────────►│Expert│                │
-    │      │           │      │                │
-    │     ┌┴─────────┐ │x 10  │                │
-    │     │          │ └▲─────┘                │
-    │     │PaliGemma │  │                      │
-    │     │          │  noise                  │
-    │     └▲──▲──▲──▲                          │
-    │      │  │  │  └── discrete actions       │
-    │      │  │  └───── robot state            │
-    │      │  └──────── language tokens        │
-    │      └─────────── image(s)               │
-    └──────────────────────────────────────────┘
+    * **Image history** — encoded by :class:`SpaceTimeSiglipVideoEncoder`.
+      ``n_obs_history`` frames per camera; T=1 is byte-identical to plain SigLIP,
+      T>1 inserts space-time separable temporal attention every
+      ``spacetime_layer_stride`` SigLIP layers (MEM-paper recipe).
+    * **Per-timestep robot state stream** ``(B, T, max_state_dim)`` — one VLM
+      token per history step, masked according to ``obs_history_is_pad``
+      (current step is always real).
+    * **Subtask response tokens** — the natural-language subtask emitted by
+      :class:`PI07HighLevelPlannerModel`; fully masked out per-sample when the
+      high-level planner is dropped, in which case only the leading attention
+      "boundary" token is kept.
+    * **Subgoal image(s)** — optional future-state visual goal frame(s), routed
+      through the same SpaceTime SigLIP encoder; per-sample masked, and the
+      subgoal SigLIP forward is skipped entirely when no sample in the batch has
+      a subgoal (saves ~2× SigLIP compute).
+    * **Episode metadata tokens** — optional ``"Speed: …, Quality: …, Mistake:
+      …"`` string assembled from ``speed`` / ``quality`` / ``mistake`` features
+      and tokenized to ``metadata_max_length``.
+
+    The flow-matching action expert (Gemma expert with adaRMS time conditioning,
+    ``num_steps``-step Euler integration, FAST-token discrete-action prefix that
+    is excluded from continuous-action cross-attention via ``n_cross_att_tokens``)
+    is unchanged from π0.5.
+
+    ┌────────────────────────────────────────────────────────────┐
+    │                         actions                            │
+    │                            ▲                               │
+    │                         ┌──┴───┐                           │
+    │      kv cache           │Gemma │                           │
+    │      ┌─────────────────►│Expert│ ◄── adaRMS(time)          │
+    │      │                  │      │                           │
+    │     ┌┴────────────┐     │ x 10 │                           │
+    │     │             │     └──▲───┘                           │
+    │     │  PaliGemma  │        │                               │
+    │     │             │       noise                            │
+    │     └▲─▲─▲─▲─▲─▲─▲                                         │
+    │      │ │ │ │ │ │ └── discrete actions                      │
+    │      │ │ │ │ │ └──── episode metadata                      │
+    │      │ │ │ │ └────── subgoal image(s)                      │
+    │      │ │ │ └──────── subtask response                      │
+    │      │ │ └────────── robot state                           │
+    │      │ └──────────── language tokens                       │
+    │      └────────────── video (image history)                 │
+    └────────────────────────────────────────────────────────────┘
     """
 
     def __init__(self, config: PI07lowlevelPlannerConfig, discrete_action_vocab_size: int | None = None):
