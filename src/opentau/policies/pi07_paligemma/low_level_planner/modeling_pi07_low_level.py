@@ -283,6 +283,7 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
     def reset(self) -> None:
         """This should be called whenever the environment is reset."""
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
+        self._state_buffer: deque | None = None
 
     @classmethod
     def from_pretrained(
@@ -508,25 +509,73 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         """
         raise NotImplementedError("Currently not implemented for PI05")
 
+    def _build_state_history_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Buffer the current state and construct a temporal batch (state only).
+
+        Appends the single-step state from ``batch`` to an internal deque,
+        then assembles a batch with ``n_obs_history`` evenly-spaced state
+        frames (interval = ``history_interval``).  Early in an episode,
+        missing history slots are zero-padded.
+
+        All non-state keys (images, prompt, metadata, etc.) are passed
+        through unchanged.
+
+        Returns a new dict with ``"state"`` expanded to (B, T, D),
+        where T = ``n_obs_history``.
+        """
+        assert self.config.n_obs_history is not None
+        n_hist: int = self.config.n_obs_history
+        interval = self.config.history_interval or 1
+        buf_maxlen = self.config.obs_buffer_size
+
+        if self._state_buffer is None:
+            self._state_buffer = deque(maxlen=buf_maxlen)
+
+        self._state_buffer.append(batch["state"])  # (B, D)
+
+        buf_len = len(self._state_buffer)
+        missing = buf_maxlen - buf_len
+
+        temporal_batch = {key: v for key, v in batch.items() if key != "state"}
+
+        state_frames = []
+        is_pad = []
+        for i in range(n_hist):
+            idx = i * interval - missing
+            if idx < 0:
+                state_frames.append(torch.zeros_like(self._state_buffer[0]))
+                is_pad.append(True)
+            else:
+                state_frames.append(self._state_buffer[idx])
+                is_pad.append(False)
+        temporal_batch["state"] = torch.stack(state_frames, dim=1)  # (B, T, D)
+
+        bsize = temporal_batch["state"].shape[0]
+        device = temporal_batch["state"].device
+        temporal_batch["obs_history_is_pad"] = (
+            torch.tensor(is_pad, dtype=torch.bool, device=device).unsqueeze(0).expand(bsize, -1)
+        )  # (B, T)
+
+        return temporal_batch
+
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
-        """Select a single action given environment observations.
+        """Select a single action from the queue, regenerating if needed.
 
-        This method uses an action queue that is replenished when it has config.max_delay or fewer actions (or is empty).
-        When replenishing, the current queue contents are used as action_prefix for sample_actions,
-        then the queue is refilled with the new chunk.
-
-        Note: This method should only be called when running a policy in simulation. For real world inference,
-        this method should be written in the ROS client node.
+        Builds temporal state history when configured, runs flow-matching
+        inference to fill the action queue, and pops the next action.
 
         Args:
-            batch: Batch of data containing environment observations.
-            noise: Optional noise tensor to be used during sampling.
+            batch: Environment observation dict.
+            noise: Optional pre-sampled noise for deterministic evaluation.
 
         Returns:
-            The selected action tensor.
+            A single action tensor of shape ``(B, action_dim)``.
         """
         self.eval()
+
+        if self.config.n_obs_history is not None and self.config.n_obs_history > 1:
+            batch = self._build_state_history_batch(batch)
 
         if len(self._action_queue) == 0 or len(self._action_queue) <= self.config.max_delay:
             # Use current queue as action prefix to replenish
@@ -616,6 +665,19 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
         state = self.prepare_state(batch)
 
+        assert state.ndim == 3, f"Expected state (B, T, D) but got {state.shape}"
+
+        t_dim = state.shape[1]
+        if self.config.n_obs_history is not None and self.config.n_obs_history > 1 and t_dim == 1:
+            logging.warning(
+                "n_obs_history=%d but state has T=%d (single timestep). "
+                "History buffering may not have been called.",
+                self.config.n_obs_history,
+                t_dim,
+            )
+
+        obs_history_is_pad = batch.get("obs_history_is_pad")
+
         actions = self.model.sample_actions(
             videos,
             vid_masks,
@@ -623,14 +685,15 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             lang_masks,
             action_prefix,
             delay,
+            state,
             noise=noise,
-            state=state,
             response_tokens=response_tokens,
             response_masks=response_masks,
             subgoal_videos=subgoal_videos,
             subgoal_vid_masks=subgoal_vid_masks,
             metadata_tokens=metadata_tokens,
             metadata_masks=metadata_masks,
+            obs_history_is_pad=obs_history_is_pad,
         )
 
         # Unpad actions
@@ -660,6 +723,8 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
         self._hydrate_optional_conditioning_batch(batch)
 
+        obs_history_is_pad = batch.get("obs_history_is_pad")
+
         videos, vid_masks = self.prepare_videos(batch)
         lang_tokens, lang_masks = self.prepare_language(batch)
         response_tokens, response_masks = self.prepare_response(batch)
@@ -688,6 +753,7 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             subgoal_vid_masks=subgoal_vid_masks,
             metadata_tokens=metadata_tokens,
             metadata_masks=metadata_masks,
+            obs_history_is_pad=obs_history_is_pad,
         )
 
         mse_loss = losses["MSE"]
@@ -698,17 +764,31 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
     def prepare_state(self, batch: dict[str, Tensor]) -> Tensor:
         """Prepares the continuous state tensor, padding or truncating to max_state_dim.
 
+        Accepts either ``(B, D)`` (single timestep) or ``(B, T, D)``
+        (multi-timestep history).  Single-timestep tensors are unsqueezed
+        to ``(B, 1, D)`` so downstream code always receives 3-D state.
+
         Args:
-            batch: Batch of data containing the "state" tensor of shape (batch_size, state_dim).
+            batch: Batch of data containing the ``"state"`` tensor.
 
         Returns:
-            A tensor of shape (batch_size, max_state_dim).
+            A tensor of shape ``(B, T, max_state_dim)``.
 
         Raises:
-            ValueError: If the state dimension exceeds max_state_dim.
+            ValueError: If the state dimension exceeds ``max_state_dim``
+                or if ``n_obs_history > 1`` but a 2-D state is provided.
         """
-
         state = batch["state"]
+
+        if state.ndim == 2:
+            if self.config.n_obs_history is not None and self.config.n_obs_history > 1:
+                raise ValueError(
+                    f"n_obs_history={self.config.n_obs_history} requires a "
+                    f"(B, T, D) state tensor, but got shape {tuple(state.shape)}. "
+                    f"Ensure _build_state_history_batch was called before prepare_state."
+                )
+            state = state.unsqueeze(1)  # (B, D) -> (B, 1, D)
+
         state_dim = state.shape[-1]
         if state_dim > self.config.max_state_dim:
             raise ValueError(
@@ -1268,6 +1348,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         metadata_masks: Tensor,
         subgoal_videos: list[Tensor] = (),
         subgoal_vid_masks: list[Tensor] = (),
+        obs_history_is_pad: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Embed video/images with SpaceTime SigLIP and language tokens to prepare
         for PaliGemma transformer processing.
@@ -1279,13 +1360,15 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             lang_masks: Language mask tensor.
             discrete_actions: Optional discrete action tensor.
             discrete_action_masks: Optional discrete action mask tensor.
-            state: Optional continuous state tensor of shape (batch_size, max_state_dim).
+            state: Optional continuous state tensor of shape ``(B, T, max_state_dim)``.
             response_tokens: Subtask response token IDs ``(B, response_max_length)``.
             response_masks: Boolean mask for response tokens (never ``None``).
             metadata_tokens: Metadata token IDs ``(B, metadata_max_length)`` (never ``None``).
             metadata_masks: Boolean mask for metadata tokens (never ``None``).
             subgoal_videos: List of subgoal video tensors, each (B, 1, C, H, W) in [0, 1].
             subgoal_vid_masks: List of boolean masks, each (B,).
+            obs_history_is_pad: Optional ``(B, T)`` boolean mask where ``True``
+                marks padded (missing) history timesteps.
 
         Returns:
             A tuple (embs, pad_masks, att_masks).
@@ -1330,13 +1413,20 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         pad_masks.append(state_indicator_mask)
         att_masks += [0] * state_indicator_emb.shape[1]
 
-        state_emb = self.state_proj(state.to(dtype=_preferred_dtype()))
-        state_emb = rearrange(state_emb, "b d -> b 1 d")
-        state_mask = torch.ones(bsize, 1, dtype=torch.bool, device=state.device)
+        # state: (B, T, max_state_dim) — one VLM token per timestep
+        state_emb = self.state_proj(state.to(dtype=_preferred_dtype()))  # (B, T, vlm_hidden)
+        t_steps = state_emb.shape[1]
+
+        if obs_history_is_pad is not None:
+            state_mask = ~obs_history_is_pad  # (B, T)
+            # The current (last) timestep is always real, never masked out.
+            state_mask[:, -1] = True
+        else:
+            state_mask = torch.ones(bsize, t_steps, dtype=torch.bool, device=state.device)
 
         embs.append(state_emb)
         pad_masks.append(state_mask)
-        att_masks += [0]  # full attention with images and language
+        att_masks += [0] * t_steps
 
         # Per-sample flag: True for samples that have at least one real
         # response token, False for samples whose response was dropped.
@@ -1554,6 +1644,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         metadata_masks: Tensor,
         subgoal_videos: list[Tensor] = (),
         subgoal_vid_masks: list[Tensor] = (),
+        obs_history_is_pad: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """Do a full training forward pass and compute the loss.
 
@@ -1568,13 +1659,14 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             time: Optional time tensor.
             discrete_actions: Optional discrete action tensor.
             discrete_action_masks: Optional discrete action mask tensor.
-            state: Optional continuous state tensor of shape (batch_size, max_state_dim).
+            state: Optional continuous state tensor of shape ``(B, T, max_state_dim)``.
             response_tokens: Subtask response token IDs ``(B, response_max_length)``.
             response_masks: Boolean mask for response tokens.
             metadata_tokens: Metadata token IDs ``(B, metadata_max_length)``.
             metadata_masks: Boolean mask for metadata tokens.
             subgoal_videos: List of subgoal video tensors, each (B, 1, C, H, W) in [0, 1].
             subgoal_vid_masks: List of boolean masks, each (B,).
+            obs_history_is_pad: Optional ``(B, T)`` bool mask for padded history steps.
 
         Returns:
             A dictionary containing the loss components ("MSE" and "CE").
@@ -1593,6 +1685,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             metadata_masks=metadata_masks,
             subgoal_videos=subgoal_videos,
             subgoal_vid_masks=subgoal_vid_masks,
+            obs_history_is_pad=obs_history_is_pad,
         )
 
         vlm_2d_attention_mask = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
@@ -1732,8 +1825,8 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         lang_masks: Tensor,
         action_prefix: Tensor,
         delay: Tensor,
-        noise: Tensor | None = None,
         state: Tensor | None = None,
+        noise: Tensor | None = None,
         *,
         response_tokens: Tensor,
         response_masks: Tensor,
@@ -1741,6 +1834,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         metadata_masks: Tensor,
         subgoal_videos: list[Tensor] = (),
         subgoal_vid_masks: list[Tensor] = (),
+        obs_history_is_pad: Tensor | None = None,
     ) -> Tensor:
         """Do a full inference forward and compute the action.
 
@@ -1751,8 +1845,8 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             lang_masks: Language mask tensor.
             action_prefix: Action prefix tensor.
             delay: Number of delay actions.
+            state: Optional continuous state tensor of shape ``(B, T, max_state_dim)``.
             noise: Optional noise tensor.
-            state: Optional continuous state tensor.
             response_tokens: Subtask response token IDs ``(B, response_max_length)``.
             response_masks: Boolean mask for response tokens.
             metadata_tokens: Metadata token IDs ``(B, metadata_max_length)``.
@@ -1782,6 +1876,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             metadata_masks=metadata_masks,
             subgoal_videos=subgoal_videos,
             subgoal_vid_masks=subgoal_vid_masks,
+            obs_history_is_pad=obs_history_is_pad,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1

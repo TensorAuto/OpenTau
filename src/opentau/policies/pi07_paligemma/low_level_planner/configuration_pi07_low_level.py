@@ -173,6 +173,18 @@ class PI07lowlevelPlannerConfig(PreTrainedConfig):
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
 
+    @property
+    def obs_buffer_size(self) -> int:
+        """Total raw frames the state history buffer must keep.
+
+        With ``n_obs_history=T`` and ``history_interval=k``, the buffer stores
+        the most recent ``(T-1)*k + 1`` frames so that ``T`` evenly-spaced
+        frames can be selected.
+        """
+        if self.n_obs_history is None or self.n_obs_history <= 1:
+            return 1
+        return (self.n_obs_history - 1) * (self.history_interval or 1) + 1
+
     def __post_init__(self):
         """Post-initialization validation."""
         super().__post_init__()
