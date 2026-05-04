@@ -31,22 +31,20 @@ permissions:
 
 jobs:
   review:
-    # Two gates AND'd together:
-    #   (1) Trust gate — only org owners/members/collaborators or claude[bot]
-    #       (which opens `chore(claude): learn from #N` PRs). author_association
-    #       is NONE for bots, so the login OR is required.
-    #   (2) Loop gate — on `synchronize` triggered by claude[bot] pushing a
-    #       fix commit (from claude-implement-fixes.yml), skip; otherwise we'd
-    #       review our own fixes ad infinitum. `opened` always passes.
+    # Trust gate — only org owners/members/collaborators or claude[bot]
+    # (which opens `chore(claude): learn from #N` PRs). author_association
+    # is NONE for bots, so the login OR is required.
+    #
+    # Note: we deliberately DO NOT skip when github.event.sender is claude[bot].
+    # Each review invocation is a fresh claude-code-action session, so reviewing
+    # a `[claude-fix]` commit is just a normal review with no shared context —
+    # and that fresh-eyes pass is exactly what we want on bot-authored fixes.
+    # The previously-feared review→fix loop requires a review comment to
+    # contain the literal `@claude fix`; the prompt template below never emits
+    # that string, so the loop is not reachable in practice.
     if: >-
-      (
-        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
-        || github.event.pull_request.user.login == 'claude[bot]'
-      )
-      && (
-        github.event.action == 'opened'
-        || github.event.sender.login != 'claude[bot]'
-      )
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
+      || github.event.pull_request.user.login == 'claude[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
