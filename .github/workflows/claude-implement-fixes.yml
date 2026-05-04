@@ -35,37 +35,31 @@ concurrency:
 
 jobs:
   implement:
-    # Trust gate per event source: only org owners/members/collaborators (or
-    # claude[bot]) may trigger `@claude fix`. This workflow has
-    # `contents: write` + bypassPermissions, so the blast radius for a wrong
-    # allow is high. The body-match `@claude fix` and the
-    # pull_request_review-late-gate (in the `Gate on @claude fix presence`
-    # step) are unchanged. The previous `user.type != 'Bot'` checks are
-    # subsumed by the positive author_association allowlist.
+    # Trust gate per event source: only humans (user.type == 'User') with
+    # OWNER/MEMBER/COLLABORATOR association on this repo may trigger
+    # `@claude fix`. Bots — including claude[bot] — are NOT permitted to
+    # trigger; this also closes the only realistic review→fix loop, since a
+    # `@claude fix` string in a claude[bot] review summary can no longer fire
+    # this workflow. This workflow holds `contents: write` + bypassPermissions,
+    # so the blast radius for a wrong allow is high.
     if: >-
       (
         github.event_name == 'issue_comment'
         && github.event.issue.pull_request != null
+        && github.event.comment.user.type == 'User'
         && contains(github.event.comment.body, '@claude fix')
-        && (
-          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
-          || github.event.comment.user.login == 'claude[bot]'
-        )
+        && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
       )
       || (
         github.event_name == 'pull_request_review_comment'
+        && github.event.comment.user.type == 'User'
         && contains(github.event.comment.body, '@claude fix')
-        && (
-          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
-          || github.event.comment.user.login == 'claude[bot]'
-        )
+        && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
       )
       || (
         github.event_name == 'pull_request_review'
-        && (
-          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association)
-          || github.event.review.user.login == 'claude[bot]'
-        )
+        && github.event.review.user.type == 'User'
+        && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association)
       )
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -115,8 +109,11 @@ jobs:
         if: steps.gate.outputs.should_run == 'true'
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          # Match the bot allowlist in the job-level `if:` above. Never `*` on
-          # a public repo (per the action's docs warning).
+          # No bot can TRIGGER this workflow (per the job-level `if:` above).
+          # `allowed_bots` here governs which bot-authored comments the agent
+          # treats as trusted input while resolving feedback — claude[bot]
+          # review summaries remain trustworthy in that role. Never `*` on a
+          # public repo (per the action's docs warning).
           allowed_bots: "claude[bot]"
           claude_args: |
             --model ${{ vars.CLAUDE_MODEL || 'claude-opus-4-7[1m]' }}
