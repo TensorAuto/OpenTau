@@ -616,16 +616,14 @@ class Gemma3WithExpertModel(PreTrainedModel):
         backbone_layers = self._backbone_layers()
         if len(backbone_layers) != self._num_layers:
             raise ValueError(
-                f"Expected backbone to have {self._num_layers} layers; "
-                f"got backbone={len(backbone_layers)}."
+                f"Expected backbone to have {self._num_layers} layers; got backbone={len(backbone_layers)}."
             )
 
         if self.gemma_expert is not None:
             expert_layers = self.gemma_expert.model.layers
             if len(expert_layers) != self._num_layers:
                 raise ValueError(
-                    f"Expected expert to have {self._num_layers} layers; "
-                    f"got expert={len(expert_layers)}."
+                    f"Expected expert to have {self._num_layers} layers; got expert={len(expert_layers)}."
                 )
         else:
             expert_layers = None
