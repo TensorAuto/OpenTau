@@ -282,12 +282,20 @@ def profile(cfg: TrainPipelineConfig):
         # memory footprint is ~half of what production training pays under the
         # PR #182 fix, so the benchmark would systematically under-report
         # memory and over-report the largest batch that fits. See issue #181.
-        # DeepSpeed ZeRO already provides equivalent fp32-master semantics via
-        # BF16_Optimizer; FSDP provides them via MixedPrecision and manages
-        # the inner optimizer's view of the FlatParameter shards directly,
-        # so wrapping under either backend would double-allocate (and under
-        # FSDP would also misalign with FSDP's flat-param parameter handles
-        # — observed empirically as a NCCL desync during the first backward).
+        # DeepSpeed ZeRO provides equivalent fp32-master semantics via
+        # BF16_Optimizer.
+        # FSDP in this PR runs in **pure bf16** (no fp32 master): the model's
+        # ``Gemma3WithExpertModel.__init__`` calls
+        # ``to_bfloat16_like_physical_intelligence`` unconditionally, so by
+        # the time accelerate.prepare wraps the policy under FSDP, params
+        # are already bf16 — FSDP's ``MixedPrecision(param_dtype=bf16, ...)``
+        # is a no-op for storage and the optimizer steps on bf16 sharded
+        # params. Wrapping with ``MasterWeightOptimizer`` on top would clone
+        # the bf16 sharded params into a redundant in-rank fp32 copy without
+        # restoring the cross-rank fp32 master that a fp32-built model would
+        # have, so we skip the wrap (also: would misalign with FSDP's
+        # flat-param parameter handles — observed empirically as a NCCL
+        # desync during the first backward).
         if accelerator.distributed_type not in (
             accelerate.DistributedType.DEEPSPEED,
             accelerate.DistributedType.FSDP,

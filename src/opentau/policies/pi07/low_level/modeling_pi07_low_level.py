@@ -1305,6 +1305,16 @@ class PI07LowLevelFlowMatching(nn.Module):
         # collectives. Ranks whose local data is all-dropped still embed real
         # tokens with all-False masks; downstream attention / loss respect the
         # mask, so accuracy is preserved.
+        #
+        # Scope of the sync: this only protects against per-rank divergence of
+        # the ``.any()`` outcome on a field that *is* present everywhere. The
+        # inner branch (``if has_response and response_tokens is not None
+        # and response_masks is not None``) still gates on per-rank Nones,
+        # which assumes field presence is a global property of the dataset
+        # config (true today — every rank instantiates the same ``embed_prefix``
+        # contract). If a future heterogeneous-mixture change makes some ranks
+        # carry e.g. ``response_tokens=None`` while others carry a Tensor, the
+        # branches would re-desync and need their own None-vs-Tensor sync.
         device = lang_tokens.device
         has_response_local = (
             response_tokens is not None and response_masks is not None and bool(response_masks.any())
