@@ -177,15 +177,21 @@ class DatasetMixtureMetadata:
         for cam_idx in range(self.cfg.num_cams):
             if f"camera{cam_idx}" in standard_stats:
                 continue
-            standard_stats[f"camera{cam_idx}"] = {
+            cam_stats: dict[str, np.ndarray] = {
                 "min": np.zeros((3, 1, 1), dtype=np.float32),
                 "max": np.ones((3, 1, 1), dtype=np.float32),
                 "mean": np.zeros((3, 1, 1), dtype=np.float32),
                 "std": np.zeros((3, 1, 1), dtype=np.float32),
-                "count": np.array(
-                    standard_stats["state"]["count"]
-                ),  # create a copy in case this gets modified
             }
+            # `count` is only present in v2.1+ stats; v2.0 datasets like
+            # `physical-intelligence/libero` (LeRobot v2.0 format) carry
+            # only mean/std/min/max. Mirror it from the state stats when
+            # available — the empty-camera placeholder doesn't actually
+            # need a meaningful count, but downstream code that asserts
+            # the field's presence shouldn't crash. Issue #264.
+            if "count" in standard_stats.get("state", {}):
+                cam_stats["count"] = np.array(standard_stats["state"]["count"])
+            standard_stats[f"camera{cam_idx}"] = cam_stats
 
         # check for missing keys
         for data in standard_stats:
