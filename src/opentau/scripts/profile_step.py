@@ -283,8 +283,15 @@ def profile(cfg: TrainPipelineConfig):
         # PR #182 fix, so the benchmark would systematically under-report
         # memory and over-report the largest batch that fits. See issue #181.
         # DeepSpeed ZeRO already provides equivalent fp32-master semantics via
-        # BF16_Optimizer, so we skip the wrap on that backend.
-        if accelerator.distributed_type != accelerate.DistributedType.DEEPSPEED:
+        # BF16_Optimizer; FSDP provides them via MixedPrecision and manages
+        # the inner optimizer's view of the FlatParameter shards directly,
+        # so wrapping under either backend would double-allocate (and under
+        # FSDP would also misalign with FSDP's flat-param parameter handles
+        # — observed empirically as a NCCL desync during the first backward).
+        if accelerator.distributed_type not in (
+            accelerate.DistributedType.DEEPSPEED,
+            accelerate.DistributedType.FSDP,
+        ):
             optimizer = MasterWeightOptimizer.from_existing(optimizer)
             # Same rebind train.py performs immediately after from_existing:
             # ``make_optimizer_and_scheduler`` left ``lr_scheduler.optimizer``
