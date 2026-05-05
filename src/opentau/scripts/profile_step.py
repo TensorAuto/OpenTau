@@ -21,13 +21,31 @@ loop that splits wall-clock per step into phases:
   5. ``optim_step``       — ``optimizer.step()`` (includes ZeRO partition
                              update + parameter all-gather)
   6. ``zero_grad_sched``  — ``optimizer.zero_grad()`` + scheduler step
-  7. ``backward_step``    — sum of phases 3–6 (kept as an aggregate row
-                             for easy comparison with earlier runs that
-                             only reported the combined number)
-  8. ``sync_gather``      — the 5 ``gather_for_metrics(...).item()`` calls
+  7. ``sync_gather``      — the 5 ``gather_for_metrics(...).item()`` calls
+
+A ``backward_step`` aggregate (= phases 3+4+5+6) is also collected and
+emitted into the JSON dump for backward-compatibility with older
+reports, but is omitted from the human-readable phase table to avoid
+double-counting against its components.
 
 All ranks call ``torch.cuda.synchronize()`` at phase boundaries so the
-reported times include collective + H2D sync costs. Only rank 0 prints.
+reported times include collective + H2D sync costs.
+
+Throughput is reported as a *global* number using the slowest-rank step
+time (gather across ranks, take ``max``); collectives gate on the
+slowest rank, so that's the true ceiling. Peak GPU memory is also
+tracked per-rank (``torch.cuda.max_memory_{allocated,reserved}``)
+across the measured loop only — peak stats are reset at the
+warmup→measured transition. The worst-rank values are reported.
+
+NOTE: under DeepSpeed, optim work fuses into backward hooks, so
+``optim_step``/``unscale_clip`` will appear near-zero (tens of µs)
+while FSDP/DDP show real time there. Only ``total`` step time is
+directly comparable across backends.
+
+The script does NOT use ``with accelerator.accumulate(policy):``, so
+``cfg.gradient_accumulation_steps`` must be 1 (asserted at start);
+sweep ``dataloader_batch_size`` for per-rank batch.
 
 Usage (same launch incantation as train.py):
 
@@ -101,6 +119,17 @@ def _fmt_ms(seconds_list):
 @parser.wrap()
 def profile(cfg: TrainPipelineConfig):
     cfg.validate()
+
+    # The loop below has no `with accelerator.accumulate(policy):` context, so
+    # optimizer.step() runs every iteration regardless of cfg.gradient_accumulation_steps.
+    # That makes ga>1 silently incorrect: optim fires every micro-step (not every ga
+    # micro-steps) and the throughput math at the bottom would over-report by ga.
+    # Sweep `dataloader_batch_size` for per-rank batch instead.
+    assert cfg.gradient_accumulation_steps == 1, (
+        "profile_step.py only supports gradient_accumulation_steps=1; "
+        f"got {cfg.gradient_accumulation_steps}. Pass --gradient_accumulation_steps=1 "
+        "on the CLI to override the accelerate yaml default."
+    )
 
     # Match train.py's default of find_unused_parameters=True, but allow opting
     # out via env var. The kwarg is silently ignored under DeepSpeed, but under
@@ -358,6 +387,13 @@ def profile(cfg: TrainPipelineConfig):
     for step in range(total_steps):
         measuring = step >= WARMUP_STEPS
 
+        # Reset CUDA peak-memory stats at the warmup→measured transition so the
+        # final ``max_memory_allocated/reserved`` readings reflect only the
+        # measured loop (not warmup spikes from cuDNN autotune / first-step
+        # FSDP all-gather staging buffers).
+        if step == WARMUP_STEPS and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
         # Phase 1: dataload_wait
         _sync()
         t0 = time.perf_counter()
@@ -441,17 +477,56 @@ def profile(cfg: TrainPipelineConfig):
 
     loop_wall = time.perf_counter() - loop_start
 
+    # All-rank aggregation. Must run on every rank (collective ops), so it lives
+    # outside the rank-0 print block. We compute a global step time as the *max*
+    # across ranks (slowest rank gates collectives, so global throughput is
+    # bounded by it), and gather peak HBM so the worst-rank ceiling is visible.
+    local_total_mean = mean(phases["total"]) if phases["total"] else 0.0
+    if torch.cuda.is_available():
+        device = accelerator.device
+        local_peak_alloc_gb = torch.cuda.max_memory_allocated() / 1e9
+        local_peak_reserved_gb = torch.cuda.max_memory_reserved() / 1e9
+        gather_tensor = torch.tensor(
+            [local_total_mean, local_peak_alloc_gb, local_peak_reserved_gb],
+            dtype=torch.float64,
+            device=device,
+        )
+        gathered = accelerator.gather(gather_tensor.unsqueeze(0)).cpu()
+        per_rank_total_mean = gathered[:, 0].tolist()
+        per_rank_peak_alloc_gb = gathered[:, 1].tolist()
+        per_rank_peak_reserved_gb = gathered[:, 2].tolist()
+    else:
+        per_rank_total_mean = [local_total_mean]
+        per_rank_peak_alloc_gb = [0.0]
+        per_rank_peak_reserved_gb = [0.0]
+    global_total_mean = max(per_rank_total_mean) if per_rank_total_mean else 0.0
+    worst_peak_alloc_gb = max(per_rank_peak_alloc_gb) if per_rank_peak_alloc_gb else 0.0
+    worst_peak_reserved_gb = max(per_rank_peak_reserved_gb) if per_rank_peak_reserved_gb else 0.0
+
     if accelerator.is_main_process:
-        print("\n=========== profile_step results (rank 0) ===========")
+        is_deepspeed = accelerator.distributed_type == accelerate.DistributedType.DEEPSPEED
+        print("\n=========== profile_step results ===========")
         print(f"warmup={WARMUP_STEPS} measured={measure_steps} ranks={accelerator.num_processes}")
         print(
             f"batch_size={cfg.batch_size} num_workers={cfg.num_workers} prefetch_factor={cfg.prefetch_factor}"
         )
-        print(f"wall-clock over full loop: {loop_wall:.2f}s")
+        print(f"distributed_type={accelerator.distributed_type}")
+        print(f"wall-clock over full loop (rank 0): {loop_wall:.2f}s")
+        if is_deepspeed:
+            print(
+                "NOTE: under DeepSpeed, optim cost is accounted inside the bwd phase "
+                "(engine attaches optim to backward hooks). optim_step/unscale_clip "
+                "will look near-zero; compare TOTAL step time across backends, not "
+                "per-phase breakdowns."
+            )
         print()
-        print(f"{'phase':<16} {'stats':<60} {'share':>8}")
+        print(f"{'phase':<16} {'stats (rank 0)':<60} {'share':>8}")
         print("-" * 90)
-        total_mean = mean(phases["total"]) if phases["total"] else 0.0
+        rank0_total_mean = local_total_mean  # share % is rank-0-relative for legibility
+        # backward_step is intentionally omitted from the print table — it's an
+        # aggregate of bwd+unscale_clip+optim_step+zero_grad_sched and would
+        # double-count if printed alongside its components. Still kept in the
+        # JSON output below for backward compatibility with earlier reports.
         ordered_keys = [
             "dataload_wait",
             "forward",
@@ -459,24 +534,35 @@ def profile(cfg: TrainPipelineConfig):
             "unscale_clip",
             "optim_step",
             "zero_grad_sched",
-            "backward_step",
             "sync_gather",
             "total",
         ]
         for key in ordered_keys:
             vals = phases[key]
-            share = (mean(vals) / total_mean * 100.0) if vals and total_mean > 0 else 0.0
-            if key == "total":
-                marker = "  <-- total"
-            elif key == "backward_step":
-                marker = f"{share:6.1f}% (= bwd+unscale_clip+optim_step+zero_grad_sched)"
-            else:
-                marker = f"{share:6.1f}%"
+            share = (mean(vals) / rank0_total_mean * 100.0) if vals and rank0_total_mean > 0 else 0.0
+            marker = "  <-- total" if key == "total" else f"{share:6.1f}%"
             print(f"{key:<16} {_fmt_ms(vals):<60} {marker}")
         print()
-        steps_per_sec = 1.0 / total_mean if total_mean > 0 else 0.0
+        # Global throughput: use slowest-rank step time (collectives gate on it).
+        steps_per_sec = 1.0 / global_total_mean if global_total_mean > 0 else 0.0
         samples_per_sec = steps_per_sec * cfg.batch_size * accelerator.num_processes
-        print(f"throughput: {steps_per_sec:.2f} steps/s, {samples_per_sec:.1f} global samples/s")
+        print("throughput (global, gated by slowest rank):")
+        print(f"  global step time:  {global_total_mean * 1000.0:7.2f} ms")
+        print(f"  steps/s:           {steps_per_sec:.3f}")
+        print(
+            f"  global samples/s:  {samples_per_sec:.1f}  "
+            f"(= {cfg.batch_size} per-rank batch * {accelerator.num_processes} ranks / step time)"
+        )
+        print(
+            f"  per-rank step time means (ms): "
+            f"[{', '.join(f'{x * 1000.0:.2f}' for x in per_rank_total_mean)}]"
+        )
+        print()
+        print("peak GPU memory (worst rank):")
+        print(f"  allocated:   {worst_peak_alloc_gb:6.2f} GB")
+        print(f"  reserved:    {worst_peak_reserved_gb:6.2f} GB")
+        print(f"  per-rank allocated (GB): [{', '.join(f'{x:.2f}' for x in per_rank_peak_alloc_gb)}]")
+        print(f"  per-rank reserved (GB):  [{', '.join(f'{x:.2f}' for x in per_rank_peak_reserved_gb)}]")
         print("=====================================================\n")
 
         # Also dump raw numbers for comparison across runs
@@ -488,11 +574,23 @@ def profile(cfg: TrainPipelineConfig):
                         "warmup": WARMUP_STEPS,
                         "measured": measure_steps,
                         "num_processes": accelerator.num_processes,
+                        "distributed_type": str(accelerator.distributed_type),
                         "batch_size": cfg.batch_size,
                         "num_workers": cfg.num_workers,
                         "prefetch_factor": cfg.prefetch_factor,
                         "phase_means_s": {k: mean(v) for k, v in phases.items() if v},
                         "phase_medians_s": {k: median(v) for k, v in phases.items() if v},
+                        "global_step_time_s": global_total_mean,
+                        "global_samples_per_sec": (
+                            (1.0 / global_total_mean) * cfg.batch_size * accelerator.num_processes
+                            if global_total_mean > 0
+                            else 0.0
+                        ),
+                        "per_rank_step_time_s": per_rank_total_mean,
+                        "peak_alloc_gb_worst": worst_peak_alloc_gb,
+                        "peak_reserved_gb_worst": worst_peak_reserved_gb,
+                        "per_rank_peak_alloc_gb": per_rank_peak_alloc_gb,
+                        "per_rank_peak_reserved_gb": per_rank_peak_reserved_gb,
                     },
                     f,
                     indent=2,
