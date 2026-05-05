@@ -1953,3 +1953,39 @@ class TestDisableActionExpert:
 
         cfg = PI07LowLevelConfig()
         assert cfg.vlm_config.disable_action_expert is False
+
+
+class TestDisableInternalBf16Cast:
+    """Locks in that ``disable_internal_bf16_cast=True`` actually skips the
+    in-``__init__`` ``to_bfloat16_like_physical_intelligence`` call. The flag
+    exists because FSDP needs fp32 outer params for ``MixedPrecision`` to
+    own the bf16-compute / fp32-master split — if the model casts itself to
+    bf16 before FSDP wraps, FSDP can't upcast and the optimizer ends up
+    stepping on bf16 sharded params with bf16 Adam state."""
+
+    def test_default_keeps_bf16_cast_active(self):
+        """Default (False) preserves pre-flag behaviour: per-layer params
+        are bf16 after init (matches the on-device dtype DeepSpeed/DDP
+        expect when they layer fp32 master back on top)."""
+        cfg = _make_tiny_g3we_cfg()
+        assert cfg.disable_internal_bf16_cast is False
+        model = Gemma3WithExpertModel(cfg)  # do NOT post-cast — read the in-init dtype
+        # Sample a per-layer param that ``to_bfloat16_like_physical_intelligence``
+        # always touches (interleaved_layers selector).
+        sample = model.interleaved_layers[0].backbone_layer.input_layernorm.weight
+        assert sample.dtype == torch.bfloat16, f"expected bf16 after default in-init cast, got {sample.dtype}"
+
+    def test_flag_skips_bf16_cast(self):
+        """With the flag, the same per-layer param stays in its constructed
+        dtype (fp32 from the HF backbone defaults)."""
+        cfg = _make_tiny_g3we_cfg()
+        cfg.disable_internal_bf16_cast = True
+        model = Gemma3WithExpertModel(cfg)
+        sample = model.interleaved_layers[0].backbone_layer.input_layernorm.weight
+        assert sample.dtype == torch.float32, f"expected fp32 (cast skipped), got {sample.dtype}"
+        # Also covers the SigLIP vision tower and the MM projector — all of
+        # the selectors ``to_bfloat16_like_physical_intelligence`` walks.
+        for name, param in model.named_parameters():
+            assert param.dtype == torch.float32, (
+                f"param {name} unexpectedly {param.dtype} (expected fp32 with cast skipped)"
+            )

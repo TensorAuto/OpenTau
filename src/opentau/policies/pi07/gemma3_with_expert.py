@@ -117,6 +117,7 @@ class Gemma3WithExpertConfig(PretrainedConfig):
         dropout: float = 0.1,
         gradient_checkpointing: bool = False,
         disable_action_expert: bool = False,
+        disable_internal_bf16_cast: bool = False,
         **kwargs,
     ):
         """Initializes the configuration.
@@ -155,6 +156,18 @@ class Gemma3WithExpertConfig(PretrainedConfig):
                 if a non-None expert input is provided when the expert is
                 disabled. Incompatible with ``train_expert_only=True``.
                 Defaults to False.
+            disable_internal_bf16_cast: When True, skip the in-``__init__``
+                call to ``to_bfloat16_like_physical_intelligence`` so the
+                model's params remain in their constructed dtype (fp32 on
+                a fresh instance). The intended consumer is the FSDP path,
+                which needs fp32 outer params so ``MixedPrecision(
+                param_dtype=bf16, reduce_dtype=bf16)`` can downcast on the
+                fly while keeping the fp32 outer copy for AdamW to step on
+                (mirrors DeepSpeed's bf16-live / fp32-master regime). Other
+                backends (DDP, single, DeepSpeed ZeRO-1/2) still want the
+                cast applied here, then layer fp32 master back on top via
+                ``MasterWeightOptimizer`` / ``BF16_Optimizer``. Defaults to
+                False.
             **kwargs: Passed to `PretrainedConfig`.
         """
         self.freeze_vision_encoder = freeze_vision_encoder
@@ -165,6 +178,7 @@ class Gemma3WithExpertConfig(PretrainedConfig):
         self.dropout = dropout
         self.gradient_checkpointing = gradient_checkpointing
         self.disable_action_expert = disable_action_expert
+        self.disable_internal_bf16_cast = disable_internal_bf16_cast
 
         # Gemma 3 backbone defaults (match google/gemma-3-4b-pt).
         if gemma3_config is None:
@@ -593,7 +607,11 @@ class Gemma3WithExpertModel(PreTrainedModel):
         # FSDP / ZeRO-3 see one coherent forward unit per interleaved step.
         self._build_interleaved_layers()
 
-        if not torch.compiler.is_compiling():
+        # FSDP needs fp32 outer params so ``MixedPrecision(param_dtype=bf16,
+        # reduce_dtype=bf16)`` can manage the bf16-compute / fp32-master
+        # split itself — see the ``disable_internal_bf16_cast`` docstring on
+        # ``Gemma3WithExpertConfig``. Other backends still want the cast.
+        if not torch.compiler.is_compiling() and not config.disable_internal_bf16_cast:
             self.to_bfloat16_like_physical_intelligence()
         self.set_requires_grad()
 

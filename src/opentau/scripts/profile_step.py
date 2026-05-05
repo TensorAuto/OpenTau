@@ -178,9 +178,23 @@ def profile(cfg: TrainPipelineConfig):
     # initializers like SigLIP's lecun_normal_). No-op for any non-ZeRO-3 backend.
     from opentau.scripts.train import _zero3_disabled_init_context
 
+    # Mirror train.py: under FSDP, gate the model's internal bf16 cast so the
+    # policy stays fp32 for FSDP's MixedPrecision to manage the bf16 compute /
+    # fp32 master split. Without this, AdamW would silently allocate Adam state
+    # in bf16 (matches the bf16-cast params) and the throughput numbers would
+    # not represent the production fp32-Adam regime.
+    if accelerator.distributed_type == accelerate.DistributedType.FSDP:
+        vlm_config = getattr(cfg.policy, "vlm_config", None)
+        if vlm_config is not None and hasattr(vlm_config, "disable_internal_bf16_cast"):
+            vlm_config.disable_internal_bf16_cast = True
+
     with _zero3_disabled_init_context(accelerator):
         policy = make_policy(cfg=cfg.policy, ds_meta=train_dataset.meta)
-    policy.to(torch.bfloat16)
+    # Same per-backend cast logic as train.py: skip the outer bf16 cast under
+    # FSDP (the policy must stay fp32 going into accelerate.prepare; FSDP
+    # MixedPrecision provides bf16 compute on the fly).
+    if accelerator.distributed_type != accelerate.DistributedType.FSDP:
+        policy.to(torch.bfloat16)
 
     skip_optim = os.environ.get("PROFILE_NO_OPTIM", "0") == "1"
     if skip_optim:

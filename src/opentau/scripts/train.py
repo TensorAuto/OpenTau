@@ -375,6 +375,22 @@ def train(cfg: TrainPipelineConfig):
         )
 
     logging.info("Creating policy")
+    # FSDP needs the policy built in fp32 so its ``MixedPrecision(
+    # param_dtype=bf16, reduce_dtype=bf16, buffer_dtype=bf16)`` policy can
+    # downcast on the fly while keeping the fp32 outer (master) params for
+    # AdamW to step on. Without this gate, ``Gemma3WithExpertModel.__init__``
+    # would call ``to_bfloat16_like_physical_intelligence`` and the params
+    # would already be bf16 by the time FSDP wraps them — MixedPrecision
+    # becomes a storage no-op and the optimizer ends up stepping on bf16
+    # sharded params with bf16 Adam state, which underflows on small late-
+    # training updates. Set the flag where it exists (currently only on
+    # ``Gemma3WithExpertConfig``); other policies that don't yet support
+    # FSDP simply lack the attribute.
+    if accelerator.distributed_type == accelerate.DistributedType.FSDP:
+        vlm_config = getattr(cfg.policy, "vlm_config", None)
+        if vlm_config is not None and hasattr(vlm_config, "disable_internal_bf16_cast"):
+            vlm_config.disable_internal_bf16_cast = True
+
     # DeepSpeed ZeRO-3 installs a `partition_parameters` wrapper that shards
     # parameters at construction time (`zero3_init_flag` only controls the
     # transformers `from_pretrained` integration, not this wrapper). Some
@@ -384,45 +400,33 @@ def train(cfg: TrainPipelineConfig):
     # `accelerator.prepare` wraps it. No-op for any non-ZeRO-3 backend.
     with _zero3_disabled_init_context(accelerator):
         policy = make_policy(cfg=cfg.policy, ds_meta=train_dataset.meta)
-    # Keep the policy in bf16 for forward/backward (activation memory + bf16
-    # compute). The fp32-master / bf16-compute story differs by backend:
+    # Per-backend precision regime:
+    #   * DDP / single-process: outer ``policy.to(bfloat16)`` cast here makes
+    #     live params bf16, then ``MasterWeightOptimizer.from_existing``
+    #     (issue #181) layers fp32 master + fp32 Adam state on top.
     #   * DeepSpeed ZeRO-1/2: outer ``policy.to(bfloat16)`` cast here, then
-    #     ``BF16_Optimizer`` keeps an fp32 master copy + fp32 Adam state.
-    #   * DDP / single-process: outer ``policy.to(bfloat16)`` cast here, then
-    #     ``MasterWeightOptimizer.from_existing`` (issue #181) wraps the
-    #     optimizer with an fp32 master + fp32 Adam state.
-    #   * FSDP: **pure bf16, no fp32 master.** The model's own
-    #     ``Gemma3WithExpertModel.__init__`` already calls
-    #     ``to_bfloat16_like_physical_intelligence`` (gemma3_with_expert.py)
-    #     which casts every param under ``interleaved_layers`` /
-    #     ``vision_tower`` / ``multi_modal_projector`` plus ``self.gemma3`` to
-    #     bf16 unconditionally. By the time accelerate.prepare wraps the
-    #     policy, params are already bf16 — FSDP's ``MixedPrecision`` cannot
-    #     upcast a stored bf16 shard, the optimizer steps on bf16 sharded
-    #     params, and the only fp32-touching collective is the gradient
-    #     reduce-scatter (``reduce_dtype=fp32`` in the FSDP yaml). This is a
-    #     deliberate trade-off: pure bf16 keeps params + states small enough
-    #     to fit on 8×A100 without offload, accepting the convergence-quality
-    #     risk. To get genuine fp32-master under FSDP we'd need to also skip
-    #     the inner ``to_bfloat16_like_physical_intelligence`` call here, and
-    #     re-validate convergence — out of scope for this PR.
-    # The outer ``policy.to(bfloat16)`` below is therefore a no-op under FSDP
-    # (the inner cast already covered the same params); we still skip it so
-    # any future reader doesn't read it as evidence that an FSDP fp32-master
-    # path exists.
+    #     ``BF16_Optimizer`` keeps fp32 master + fp32 Adam state, reduces
+    #     gradients in bf16.
+    #   * FSDP-FULL_SHARD: skip the outer cast (and the model's inner
+    #     ``to_bfloat16_like_physical_intelligence`` was already gated above)
+    #     so the policy stays fp32 going into ``accelerator.prepare``. FSDP's
+    #     ``MixedPrecision`` then provides bf16 compute (forward/backward),
+    #     bf16 reduce-scatter (matches DeepSpeed), and the optimizer steps
+    #     on the fp32 outer (master) params with fp32 Adam state. Live
+    #     params consume HBM in fp32 (sharded across 8 ranks); compute
+    #     params materialize in bf16 transiently during the all-gather.
     if accelerator.distributed_type != accelerate.DistributedType.FSDP:
         policy.to(torch.bfloat16)
     logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
     # Outside DeepSpeed *and* FSDP, wrap the optimizer so it carries fp32
-    # master weights and fp32 Adam state. DeepSpeed provides fp32 master via
-    # ``BF16_Optimizer`` (see ``ds_config['bf16']['enabled']``). FSDP gets
-    # NO fp32 master in this PR — see the comment block above on the inner
-    # ``to_bfloat16_like_physical_intelligence`` cast — but wrapping with
-    # ``MasterWeightOptimizer`` here would also be wrong: it would clone the
-    # already-bf16 sharded params into a redundant in-rank fp32 copy, doubling
-    # memory without restoring the cross-rank fp32 master that FSDP would have
-    # owned in a fp32-built model. So skip the wrap under FSDP too.
+    # master weights and fp32 Adam state. DeepSpeed provides this via
+    # ``BF16_Optimizer``. FSDP provides it via ``MixedPrecision`` over the
+    # fp32-built policy — the optimizer was constructed over fp32 outer
+    # params and AdamW's exp_avg / exp_avg_sq are allocated to match → fp32.
+    # Wrapping with ``MasterWeightOptimizer`` on top of FSDP's flat-param
+    # handles also misaligns and triggers a NCCL desync during the first
+    # backward (observed empirically), so skip there too.
     if accelerator.distributed_type not in (
         accelerate.DistributedType.DEEPSPEED,
         accelerate.DistributedType.FSDP,
