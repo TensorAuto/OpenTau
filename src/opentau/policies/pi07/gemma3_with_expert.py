@@ -116,6 +116,7 @@ class Gemma3WithExpertConfig(PretrainedConfig):
         discrete_action_vocab_size: int | None = None,
         dropout: float = 0.1,
         gradient_checkpointing: bool = False,
+        disable_action_expert: bool = False,
         **kwargs,
     ):
         """Initializes the configuration.
@@ -145,6 +146,15 @@ class Gemma3WithExpertConfig(PretrainedConfig):
                 per-rank batch sizes. Only safe under plain DDP (MULTI_GPU),
                 single-process (NO), or DeepSpeed ZeRO-1/2 — see the train.py
                 guard. Defaults to False.
+            disable_action_expert: When True, skip instantiating the Gemma-v1
+                action expert entirely (``self.gemma_expert is None``). Use
+                this for callers that never feed the expert stream (e.g. the
+                high-level planner, which always passes
+                ``inputs_embeds=[prefix_embs, None]``) — saves ~860M parameters
+                of dead weight on disk and in memory. ``forward`` will raise
+                if a non-None expert input is provided when the expert is
+                disabled. Incompatible with ``train_expert_only=True``.
+                Defaults to False.
             **kwargs: Passed to `PretrainedConfig`.
         """
         self.freeze_vision_encoder = freeze_vision_encoder
@@ -154,6 +164,7 @@ class Gemma3WithExpertConfig(PretrainedConfig):
         self.discrete_action_vocab_size = discrete_action_vocab_size
         self.dropout = dropout
         self.gradient_checkpointing = gradient_checkpointing
+        self.disable_action_expert = disable_action_expert
 
         # Gemma 3 backbone defaults (match google/gemma-3-4b-pt).
         if gemma3_config is None:
@@ -252,6 +263,13 @@ class Gemma3WithExpertConfig(PretrainedConfig):
             raise ValueError(
                 "You set `freeze_vision_encoder=False` and `train_expert_only=True` which are not compatible."
             )
+        if self.train_expert_only and self.disable_action_expert:
+            raise ValueError(
+                "`disable_action_expert=True` removes the action-expert stream entirely; "
+                "`train_expert_only=True` would then have nothing to train. Set "
+                "`train_expert_only=False` (the high-level-planner default) when "
+                "`disable_action_expert=True`."
+            )
         if self.attention_implementation not in ["eager", "sdpa", "fa2"]:
             raise ValueError(
                 f"Wrong value provided for `attention_implementation` ({self.attention_implementation}). "
@@ -284,9 +302,18 @@ class Gemma3WithExpertModel(PreTrainedModel):
         else:
             self.gemma3 = Gemma3ForConditionalGeneration(config=config.gemma3_config)
 
-        self.gemma_expert = GemmaForCausalLM(config=config.gemma_expert_config)
-        # The expert shares embeddings nowhere — drop the unused token table.
-        self.gemma_expert.model.embed_tokens = None
+        # The action expert is only consulted when callers feed
+        # ``inputs_embeds=[..., expert_embs]``. Single-stream callers (the π0.7
+        # high-level planner is the canonical example — it always passes
+        # ``inputs_embeds=[prefix_embs, None]``) opt out via
+        # ``config.disable_action_expert`` to avoid carrying ~860M parameters
+        # of dead weight on disk and in memory.
+        if config.disable_action_expert:
+            self.gemma_expert = None
+        else:
+            self.gemma_expert = GemmaForCausalLM(config=config.gemma_expert_config)
+            # The expert shares embeddings nowhere — drop the unused token table.
+            self.gemma_expert.model.embed_tokens = None
 
         text_hidden = config.gemma3_config.text_config.hidden_size
 
@@ -651,8 +678,17 @@ class Gemma3WithExpertModel(PreTrainedModel):
         if adarms_cond is None:
             adarms_cond = [None, None]
 
+        if self.gemma_expert is None and inputs_embeds[1] is not None:
+            raise ValueError(
+                "Action expert is disabled (`config.disable_action_expert=True`) but the "
+                "expert stream `inputs_embeds[1]` is not None. Pass "
+                "`inputs_embeds=[backbone_embs, None]` for single-stream callers."
+            )
+
         backbone_norm = self._backbone_final_norm()
-        expert_norm = self.gemma_expert.model.norm
+        # `expert_norm` is only consulted when the expert stream is present;
+        # leave it None when the expert was not instantiated.
+        expert_norm = self.gemma_expert.model.norm if self.gemma_expert is not None else None
 
         # Infer batch size from whichever stream is present.
         batch_size = None
@@ -749,13 +785,19 @@ class Gemma3WithExpertModel(PreTrainedModel):
         key with the same K/V tensors.
         """
         backbone_layers = self._backbone_layers()
-        expert_layers = self.gemma_expert.model.layers
+        # When the expert is disabled the inner loop never indexes into
+        # ``layers_this_step[1]`` — it short-circuits at ``hidden_states is
+        # None`` for stream_idx == 1 — so a None placeholder here is safe.
+        expert_layers = self.gemma_expert.model.layers if self.gemma_expert is not None else None
 
         layer_type = self._layer_types[layer_idx]
         is_sliding = layer_type == "sliding_attention"
         layer_rope_theta = self._rope_local if is_sliding else self._rope_global
 
-        layers_this_step = [backbone_layers[layer_idx], expert_layers[layer_idx]]
+        layers_this_step = [
+            backbone_layers[layer_idx],
+            expert_layers[layer_idx] if expert_layers is not None else None,
+        ]
         # Both streams MUST use the same RoPE base at this layer. Shared
         # attention concatenates Q/K along the sequence axis; the dot-product
         # invariant `R(q,p)·R(k,q) = q·R(q-p)k` only holds when the same θ
