@@ -59,7 +59,7 @@ def _build_encoder(*, num_frames: int, freeze_encoder: bool, dtype=torch.bfloat1
     """Build a SpaceTimeSiglipVideoEncoder wrapping a fresh PaliGemma's
     vision_tower + projector. Returns (encoder, full_paligemma, vision_tower,
     projector) so the caller can keep references alive and assert on params."""
-    from opentau.policies.pi05_mem.video_encoder import SpaceTimeSiglipVideoEncoder
+    from opentau.policies.pi07.video_encoder import SpaceTimeSiglipVideoEncoder
 
     full, vision_tower, projector = _load_paligemma(dtype=dtype)
     if freeze_encoder:
@@ -68,7 +68,7 @@ def _build_encoder(*, num_frames: int, freeze_encoder: bool, dtype=torch.bfloat1
     encoder = SpaceTimeSiglipVideoEncoder(
         vision_tower=vision_tower,
         multi_modal_projector=projector,
-        num_frames=num_frames,
+        max_num_frames=num_frames,
         spacetime_layer_stride=4,
     ).to("cuda")
     return encoder, full, vision_tower, projector

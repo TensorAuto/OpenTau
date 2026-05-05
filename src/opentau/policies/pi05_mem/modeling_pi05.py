@@ -53,7 +53,7 @@ from opentau.policies.pi05.paligemma_with_expert import (
     PaliGemmaWithExpertModel,
 )
 from opentau.policies.pi05_mem.configuration_pi05 import PI05MemConfig
-from opentau.policies.pi05_mem.video_encoder import SpaceTimeSiglipVideoEncoder
+from opentau.policies.pi07.video_encoder import SpaceTimeSiglipVideoEncoder
 from opentau.policies.pretrained import PreTrainedPolicy, T
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
@@ -829,7 +829,7 @@ class PI05MemFlowMatching(nn.Module):
         self.video_encoder = SpaceTimeSiglipVideoEncoder(
             vision_tower=self.paligemma_with_expert.paligemma.vision_tower,
             multi_modal_projector=self.paligemma_with_expert.paligemma.multi_modal_projector,
-            num_frames=config.n_obs_steps,
+            max_num_frames=config.n_obs_steps,
             spacetime_layer_stride=config.spacetime_layer_stride,
             gradient_checkpointing=config.gradient_checkpointing,
         )

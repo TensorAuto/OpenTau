@@ -58,7 +58,7 @@ from opentau.policies.pi07.gemma3_with_expert import (
 from opentau.policies.pi07.low_level.configuration_pi07_low_level import (
     PI07LowLevelConfig,
 )
-from opentau.policies.pi07.low_level.video_encoder import SpaceTimeSiglipVideoEncoder
+from opentau.policies.pi07.video_encoder import SpaceTimeSiglipVideoEncoder
 from opentau.policies.pretrained import PreTrainedPolicy, T
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
@@ -1117,7 +1117,7 @@ class PI07LowLevelFlowMatching(nn.Module):
         self.video_encoder = SpaceTimeSiglipVideoEncoder(
             vision_tower=self.gemma3_with_expert._vision_tower(),
             multi_modal_projector=self.gemma3_with_expert._multi_modal_projector(),
-            num_frames=config.n_obs_steps,
+            max_num_frames=config.n_obs_steps,
             spacetime_layer_stride=config.spacetime_layer_stride,
             gradient_checkpointing=config.gradient_checkpointing,
         )

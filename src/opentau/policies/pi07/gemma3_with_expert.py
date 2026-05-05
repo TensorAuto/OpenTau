@@ -440,7 +440,7 @@ class Gemma3WithExpertModel(PreTrainedModel):
         # Local import keeps ``gemma3_with_expert`` importable from the
         # high-level planner (which never constructs a video encoder) without
         # forcing a transitive import of einops/F at module load time.
-        from opentau.policies.pi07.low_level.video_encoder import (
+        from opentau.policies.pi07.video_encoder import (
             suppress_spacetime_temporal,
         )
 

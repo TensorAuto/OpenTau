@@ -40,10 +40,10 @@ from opentau.policies.pi05.paligemma_with_expert import (
     PaliGemmaWithExpertConfig,
     PaliGemmaWithExpertModel,
 )
+from opentau.policies.pi07.video_encoder import SpaceTimeSiglipVideoEncoder
 from opentau.policies.pi07_paligemma.low_level_planner.configuration_pi07_low_level import (
     PI07lowlevelPlannerConfig,
 )
-from opentau.policies.pi07_paligemma.low_level_planner.video_encoder import SpaceTimeSiglipVideoEncoder
 from opentau.policies.pretrained import PreTrainedPolicy, T
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
@@ -1290,7 +1290,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         self.video_encoder = SpaceTimeSiglipVideoEncoder(
             vision_tower=self.paligemma_with_expert.paligemma.vision_tower,
             multi_modal_projector=self.paligemma_with_expert.paligemma.multi_modal_projector,
-            num_frames=n_obs_steps,
+            max_num_frames=n_obs_steps,
             spacetime_layer_stride=self.config.spacetime_layer_stride,
             gradient_checkpointing=self.config.gradient_checkpointing,
         )

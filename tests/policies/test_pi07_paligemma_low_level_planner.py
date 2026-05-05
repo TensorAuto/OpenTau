@@ -505,26 +505,22 @@ class TestPI07LowLevelPlannerIntegration:
 
 
 class TestPI07LowLevelPlannerObsHistoryRegression:
-    """Regression tests for observation-history handling in the SpaceTime SigLIP pipeline.
-
-    Four scenarios:
-      1. ``n_obs_steps=1``: single-frame, ``obs_history_is_pad`` is irrelevant.
-      2. ``n_obs_steps>1``, ``obs_history_is_pad`` all-True (except current): padded
-         history masked away, output matches current-only encoding.
-      3. ``n_obs_steps>1``, ``obs_history_is_pad`` all-False: full causal attention.
-      4. ``n_obs_steps>1``, ``obs_history_is_pad`` is None: fallback to case 2.
+    """GPU integration test for the SpaceTime SigLIP pipeline driven through a
+    real PaliGemma backbone. The standalone (CPU-only) tests for the encoder's
+    temporal-attention mask construction and PE behavior live in
+    ``tests/policies/test_pi07_video_encoder_cpu.py`` — that file is the
+    canonical home for ``SpaceTimeSiglipVideoEncoder`` unit tests, parametrized
+    over both Gemma 3 and PaliGemma backbone projectors.
     """
 
     @staticmethod
-    def _make_encoder(*, num_frames: int, spacetime_layer_stride: int = 4):
+    def _make_encoder(*, max_num_frames: int, spacetime_layer_stride: int = 4):
         """Build a SpaceTimeSiglipVideoEncoder without loading the full policy."""
         from opentau.policies.pi05.paligemma_with_expert import (
             PaliGemmaWithExpertConfig,
             PaliGemmaWithExpertModel,
         )
-        from opentau.policies.pi07_paligemma.low_level_planner.video_encoder import (
-            SpaceTimeSiglipVideoEncoder,
-        )
+        from opentau.policies.pi07.video_encoder import SpaceTimeSiglipVideoEncoder
 
         paligemma_cfg = PaliGemmaWithExpertConfig(
             load_pretrained_paligemma=False,
@@ -536,14 +532,11 @@ class TestPI07LowLevelPlannerObsHistoryRegression:
         encoder = SpaceTimeSiglipVideoEncoder(
             vision_tower=paligemma.paligemma.vision_tower,
             multi_modal_projector=paligemma.paligemma.multi_modal_projector,
-            num_frames=num_frames,
+            max_num_frames=max_num_frames,
             spacetime_layer_stride=spacetime_layer_stride,
         )
         return encoder
 
-    # ------------------------------------------------------------------ #
-    # Case 1: n_obs_steps = 1
-    # ------------------------------------------------------------------ #
     @pytest.mark.gpu
     @pytest.mark.slow
     def test_single_frame_shape_and_mask_true(self):
@@ -553,7 +546,7 @@ class TestPI07LowLevelPlannerObsHistoryRegression:
         identical outputs (temporal attention is short-circuited).
         """
         bsz, t, c, h, w = 2, 1, 3, 224, 224
-        encoder = self._make_encoder(num_frames=1)
+        encoder = self._make_encoder(max_num_frames=1)
         video = torch.rand(bsz, t, c, h, w, device="cuda", dtype=torch.bfloat16)
 
         out_none = encoder(video, obs_history_is_pad=None)
@@ -565,196 +558,6 @@ class TestPI07LowLevelPlannerObsHistoryRegression:
 
         torch.testing.assert_close(out_none, out_true, msg="T=1: obs_history_is_pad=True should match None")
         torch.testing.assert_close(out_none, out_false, msg="T=1: obs_history_is_pad=False should match None")
-
-    # ------------------------------------------------------------------ #
-    # Case 2: n_obs_steps > 1, history padded (only current frame valid)
-    # ------------------------------------------------------------------ #
-    def test_temporal_mask_is_history_padded(self):
-        """Verify _build_temporal_attn_mask with all-padded history produces the
-        correct structure: past frames blocked everywhere, current frame can only
-        self-attend, and the isolation guard zeros out temporal attention.
-
-        This directly validates the mask tensor rather than requiring a full
-        GPU forward pass, covering:
-          - mask shape is (B*N, 1, T, T)
-          - all past-frame columns are -inf (blocked as keys)
-          - current-frame row can only attend to itself (column T-1)
-          - every timestep is "isolated" (num_attendable <= 1), so the
-            SpaceTimeEncoderLayerWrapper would zero the temporal residual
-        """
-        from opentau.policies.pi07_paligemma.low_level_planner.video_encoder import (
-            SpaceTimeSiglipVideoEncoder,
-        )
-
-        bsz, t = 2, 4
-        num_patches = 16
-        dtype = torch.float32
-
-        pad_mask = torch.ones(bsz, t, dtype=torch.bool)
-        pad_mask[:, -1] = False
-
-        mask = SpaceTimeSiglipVideoEncoder._build_temporal_attn_mask(pad_mask, num_patches, dtype)
-
-        assert mask.shape == (bsz * num_patches, 1, t, t)
-
-        neginf = float("-inf")
-        for bi in range(bsz):
-            sample_mask = mask[bi * num_patches, 0]  # (T, T)
-
-            for col in range(t - 1):
-                assert torch.all(sample_mask[:, col] == neginf), (
-                    f"column {col} (padded frame) should be fully blocked"
-                )
-
-            assert sample_mask[t - 1, t - 1] == 0.0, "current frame attending to itself should be unblocked"
-
-            for row in range(t - 1):
-                assert sample_mask[row, t - 1] == neginf, (
-                    f"row {row} should not attend to current frame (causal violation)"
-                )
-
-        attn_2d = mask[:, 0, :, :]  # (B*N, T, T)
-        num_attendable = (attn_2d > neginf).sum(dim=-1)  # (B*N, T)
-        assert torch.all(num_attendable <= 1), "every timestep should be isolated (attend to at most itself)"
-
-        all_patches_identical = torch.all(mask[:num_patches] == mask[0:1].expand(num_patches, -1, -1, -1))
-        assert all_patches_identical, "mask should be identical across spatial patches within a sample"
-
-    # ------------------------------------------------------------------ #
-    # Case 3: n_obs_steps > 1, all frames valid (full causal attention)
-    # ------------------------------------------------------------------ #
-    def test_temporal_mask_all_valid_is_causal(self):
-        """All frames valid (no padding): mask must be a standard lower-triangular
-        causal mask where row i attends to columns j <= i.
-        """
-        from opentau.policies.pi07_paligemma.low_level_planner.video_encoder import (
-            SpaceTimeSiglipVideoEncoder,
-        )
-
-        bsz, t = 2, 4
-        num_patches = 4
-        dtype = torch.float32
-        neginf = float("-inf")
-
-        no_pad = torch.zeros(bsz, t, dtype=torch.bool)
-        mask = SpaceTimeSiglipVideoEncoder._build_temporal_attn_mask(no_pad, num_patches, dtype)
-
-        assert mask.shape == (bsz * num_patches, 1, t, t)
-
-        # Expected: standard causal lower-triangular (0 = attend, -inf = block)
-        expected_bool = torch.tril(torch.ones(t, t, dtype=torch.bool))
-        expected = torch.zeros(t, t, dtype=dtype)
-        expected.masked_fill_(~expected_bool, neginf)
-
-        for bi in range(bsz):
-            sample_mask = mask[bi * num_patches, 0]
-            torch.testing.assert_close(
-                sample_mask,
-                expected,
-                msg=f"sample {bi}: all-valid mask should be standard causal",
-            )
-
-        # Every row except row 0 has num_attendable > 1 (history contributes)
-        attn_2d = mask[:, 0, :, :]
-        num_attendable = (attn_2d > neginf).sum(dim=-1)  # (B*N, T)
-        for row_i in range(1, t):
-            assert torch.all(num_attendable[:, row_i] == row_i + 1), (
-                f"row {row_i} should attend to {row_i + 1} positions"
-            )
-
-    # ------------------------------------------------------------------ #
-    # Case 4: n_obs_steps > 1, obs_history_is_pad is None → fallback
-    # ------------------------------------------------------------------ #
-    def test_temporal_mask_none_fallback_matches_all_padded(self):
-        """obs_history_is_pad=None in the forward path falls back to an
-        all-history-padded mask. Verify the fallback mask is identical
-        to explicitly passing [True, ..., True, False].
-        """
-        from opentau.policies.pi07_paligemma.low_level_planner.video_encoder import (
-            SpaceTimeSiglipVideoEncoder,
-        )
-
-        bsz, t = 2, 4
-        num_patches = 4
-        dtype = torch.float32
-
-        explicit_pad = torch.ones(bsz, t, dtype=torch.bool)
-        explicit_pad[:, -1] = False
-        mask_explicit = SpaceTimeSiglipVideoEncoder._build_temporal_attn_mask(
-            explicit_pad, num_patches, dtype
-        )
-
-        # The forward() fallback constructs exactly this mask when
-        # obs_history_is_pad is None and T > 1.
-        fallback_pad = torch.ones(bsz, t, dtype=torch.bool)
-        fallback_pad[:, -1] = False
-        mask_fallback = SpaceTimeSiglipVideoEncoder._build_temporal_attn_mask(
-            fallback_pad, num_patches, dtype
-        )
-
-        torch.testing.assert_close(
-            mask_fallback,
-            mask_explicit,
-            msg="None-fallback mask should be identical to explicit all-padded mask",
-        )
-
-    # ------------------------------------------------------------------ #
-    # Case 5: mixed batch — per-sample pad patterns are independent
-    # ------------------------------------------------------------------ #
-    def test_temporal_mask_mixed_batch_per_sample_independence(self):
-        """Heterogeneous pad masks in a batch: each sample's (T, T) slice must
-        match the mask built from that sample alone — no cross-sample leakage.
-
-        Sample 0: all history padded  → [True, True, True, False]
-        Sample 1: all history valid   → [False, False, False, False]
-        Sample 2: partial history     → [True, False, False, False]
-        """
-        from opentau.policies.pi07_paligemma.low_level_planner.video_encoder import (
-            SpaceTimeSiglipVideoEncoder,
-        )
-
-        t = 4
-        num_patches = 4
-        dtype = torch.float32
-        neginf = float("-inf")
-
-        pad_mask = torch.tensor(
-            [
-                [True, True, True, False],
-                [False, False, False, False],
-                [True, False, False, False],
-            ],
-            dtype=torch.bool,
-        )
-        bsz = pad_mask.shape[0]
-
-        mask_batched = SpaceTimeSiglipVideoEncoder._build_temporal_attn_mask(pad_mask, num_patches, dtype)
-        assert mask_batched.shape == (bsz * num_patches, 1, t, t)
-
-        # Each sample's mask slice must match a standalone single-sample call.
-        for bi in range(bsz):
-            mask_solo = SpaceTimeSiglipVideoEncoder._build_temporal_attn_mask(
-                pad_mask[bi : bi + 1], num_patches, dtype
-            )
-            batched_slice = mask_batched[bi * num_patches : (bi + 1) * num_patches]
-            torch.testing.assert_close(
-                batched_slice,
-                mask_solo,
-                msg=f"sample {bi}: batched mask slice differs from solo build",
-            )
-
-        # Sample 0 (all-padded) and sample 1 (all-valid) must differ.
-        s0 = mask_batched[0, 0]
-        s1 = mask_batched[1 * num_patches, 0]
-        assert not torch.equal(s0, s1), "all-padded and all-valid samples should produce different masks"
-
-        # Sample 2 (partial): frame 0 padded, frames 1-3 valid.
-        # Row 2 should attend to columns 1, 2 (causal + valid) but not 0.
-        s2 = mask_batched[2 * num_patches, 0]  # (T, T)
-        assert s2[2, 0] == neginf, "row 2 should not attend to padded column 0"
-        assert s2[2, 1] == 0.0, "row 2 should attend to valid column 1"
-        assert s2[2, 2] == 0.0, "row 2 should attend to itself (column 2)"
-        assert s2[2, 3] == neginf, "row 2 should not attend to future column 3 (causal)"
 
 
 class TestPI07LowLevelPlannerStateEmbedding:
