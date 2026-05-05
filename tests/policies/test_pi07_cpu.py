@@ -1660,3 +1660,163 @@ class TestBuildHistoryBatchEmitsObsHistoryIsPad:
             else:
                 assert torch.all(state[t] == 7.0), f"state[{t}] zero-filled but mask says real"
                 assert torch.all(cam[t] == 5.0), f"camera[{t}] zero-filled but mask says real"
+
+
+# Tests pinning the architectural invariants of the InterleavedDecoderLayer
+# refactor (commit aaefa6e). These are the things that, if broken, would
+# silently re-introduce the FSDP / ZeRO-3 NCCL desync that the refactor fixes
+# but CPU runs would still produce plausible-looking forward outputs from.
+class TestInterleavedDecoderLayer:
+    def test_module_list_built_with_correct_count(self):
+        """One InterleavedDecoderLayer per text-config layer."""
+        cfg = _make_tiny_g3we_cfg()
+        model = Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+        assert hasattr(model, "interleaved_layers")
+        assert isinstance(model.interleaved_layers, torch.nn.ModuleList)
+        assert len(model.interleaved_layers) == cfg.gemma3_config.text_config.num_hidden_layers
+        assert all(isinstance(layer, g3we.InterleavedDecoderLayer) for layer in model.interleaved_layers)
+
+    def test_source_module_lists_are_emptied(self):
+        """The original ``language_model.layers`` and ``gemma_expert.model.layers``
+        must be empty after init — otherwise FSDP / ZeRO-3 walks the module
+        tree and tries to wrap each layer twice."""
+        cfg = _make_tiny_g3we_cfg()
+        model = Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+        backbone_text = model._backbone_text_model()
+        assert len(backbone_text.layers) == 0
+        assert len(model.gemma_expert.model.layers) == 0
+
+    def test_each_parameter_registered_exactly_once(self):
+        """No Parameter object should appear under multiple module paths.
+        Double-registration breaks FSDP's flat-param construction."""
+        cfg = _make_tiny_g3we_cfg()
+        model = Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+        seen: dict[int, str] = {}
+        for name, param in model.named_parameters():
+            pid = id(param)
+            if pid in seen:
+                pytest.fail(f"parameter object {pid} registered at both {seen[pid]} and {name}")
+            seen[pid] = name
+
+    def test_state_dict_layer_keys_under_interleaved_prefix(self):
+        """All per-layer params must serialise under the ``interleaved_layers``
+        prefix (NOT under ``gemma3.language_model.model.layers`` or
+        ``gemma_expert.model.layers``). This is the documented post-refactor
+        key namespace."""
+        cfg = _make_tiny_g3we_cfg()
+        model = Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+        state_keys = list(model.state_dict().keys())
+        # Per-layer attention / mlp / norm weights must exist under the new path.
+        backbone_layer_keys = [k for k in state_keys if k.startswith("interleaved_layers.0.backbone_layer.")]
+        expert_layer_keys = [k for k in state_keys if k.startswith("interleaved_layers.0.expert_layer.")]
+        assert backbone_layer_keys, "no backbone layer keys under interleaved_layers"
+        assert expert_layer_keys, "no expert layer keys under interleaved_layers"
+        # And NOT under the old paths.
+        for key in state_keys:
+            assert ".language_model.model.layers." not in key, f"stale key path: {key}"
+            assert ".language_model.layers." not in key, f"stale key path: {key}"
+            assert "gemma_expert.model.layers." not in key, f"stale key path: {key}"
+
+    def test_train_expert_only_freezes_backbone_layers(self):
+        """When ``train_expert_only=True`` the backbone layers (now living
+        under ``interleaved_layers[i].backbone_layer``) must be frozen.
+        Pre-refactor this was achieved by freezing ``self.gemma3.parameters()``;
+        after the refactor those layers are no longer reachable from
+        ``self.gemma3``."""
+        cfg = _make_tiny_g3we_cfg()
+        cfg.train_expert_only = True
+        model = Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+        for layer in model.interleaved_layers:
+            for name, param in layer.backbone_layer.named_parameters():
+                assert not param.requires_grad, (
+                    f"backbone param interleaved_layers.*.backbone_layer.{name} should be frozen"
+                )
+            # Expert layer params must remain trainable.
+            for name, param in layer.expert_layer.named_parameters():
+                assert param.requires_grad, (
+                    f"expert param interleaved_layers.*.expert_layer.{name} should be trainable"
+                )
+
+    def test_train_expert_only_eval_propagates_to_backbone_layers(self):
+        """``train(mode=True)`` with ``train_expert_only=True`` must also
+        flip the backbone layers under interleaved_layers to ``.training=False``
+        — they used to live under ``self.gemma3`` which the original ``train``
+        method walks."""
+        cfg = _make_tiny_g3we_cfg()
+        cfg.train_expert_only = True
+        model = Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+        model.train(True)
+        for layer in model.interleaved_layers:
+            assert not layer.backbone_layer.training, "backbone layer not in eval mode"
+            # Expert layer should be in training mode.
+            assert layer.expert_layer.training, "expert layer should be training"
+
+    def test_attention_dispatch_is_resolved_at_call_time(self, monkeypatch):
+        """The InterleavedDecoderLayer must look up the attention dispatch
+        via ``parent.get_attention_interface()`` per forward, NOT capture it
+        at init. Otherwise tests / runtime adapters that monkey-patch
+        ``self.eager_attention_forward`` (existing pattern, see
+        TestNoSlidingWindowEnforcement above) silently bypass the patch."""
+        monkeypatch.setattr(g3we, "_preferred_dtype", lambda: torch.float32)
+        cfg = _make_tiny_g3we_cfg()
+        model = Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+        real_eager = model.eager_attention_forward
+        calls: list[int] = []
+
+        def spy_eager(*args, **kwargs):
+            calls.append(1)
+            return real_eager(*args, **kwargs)
+
+        monkeypatch.setattr(model, "eager_attention_forward", spy_eager)
+
+        batch, seq_len = 1, 4
+        hidden = torch.randn(batch, seq_len, cfg.gemma3_config.text_config.hidden_size)
+        position_ids = torch.arange(seq_len)[None, :]
+        attention_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool))[None]
+        with torch.no_grad():
+            model.forward(
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                inputs_embeds=[hidden, None],
+            )
+        # One call per layer.
+        assert len(calls) == cfg.gemma3_config.text_config.num_hidden_layers
+
+    def test_forward_seeded_determinism(self, monkeypatch):
+        """Two seeded forwards through the refactored stack must produce
+        bit-identical outputs (no rank-dependent ordering, no captured-once
+        objects breaking re-entrancy)."""
+        # Same convention as TestNoSlidingWindowEnforcement above — pin
+        # ``_preferred_dtype`` to fp32 so the layer's intra-forward casts
+        # don't mix bf16 weights with fp32 inputs.
+        monkeypatch.setattr(g3we, "_preferred_dtype", lambda: torch.float32)
+        cfg = _make_tiny_g3we_cfg()
+
+        def _one_run() -> torch.Tensor:
+            torch.manual_seed(0)
+            model = Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+            model.eval()
+            torch.manual_seed(1)
+            batch, seq_len = 1, 4
+            hidden = torch.randn(batch, seq_len, cfg.gemma3_config.text_config.hidden_size)
+            position_ids = torch.arange(seq_len)[None, :]
+            attention_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool))[None]
+            with torch.no_grad():
+                outs, _ = model.forward(
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    inputs_embeds=[hidden, None],
+                )
+            return outs[0].detach().clone()
+
+        out_a = _one_run()
+        out_b = _one_run()
+        assert torch.equal(out_a, out_b), "non-deterministic forward (refactor regression?)"
+
+    def test_attention_provider_not_in_state_dict(self):
+        """The cached attention dispatch provider must not leak into
+        ``state_dict`` (it's a callable, not a Parameter / Buffer / Module)."""
+        cfg = _make_tiny_g3we_cfg()
+        model = Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+        for key in model.state_dict():
+            assert "attention_interface" not in key, f"unexpected key: {key}"

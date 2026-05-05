@@ -302,10 +302,13 @@ class InterleavedDecoderLayer(nn.Module):
             ``head_dim ** -0.5``).
         head_dim: Per-head dimension shared by both streams.
         dropout: Dropout module applied to attention output and MLP output.
-        attention_interface_fn: Bound attention method from the parent
-            ``Gemma3WithExpertModel`` (selected by ``attention_implementation``).
-            Stored as a plain callable attribute — not a submodule — so it
-            doesn't appear in ``state_dict``.
+        attention_interface_provider: Zero-arg callable that returns the
+            current attention dispatch function (``parent.get_attention_interface()``).
+            Resolved at every ``forward`` rather than captured at init so
+            tests / runtime code that monkey-patches the parent's
+            ``eager_attention_forward`` / ``sdpa_attention_forward`` see
+            their patches honoured. Stored as a plain callable attribute —
+            not a submodule — so it doesn't appear in ``state_dict``.
     """
 
     def __init__(
@@ -318,7 +321,7 @@ class InterleavedDecoderLayer(nn.Module):
         query_pre_attn_scaling: float,
         head_dim: int,
         dropout: nn.Module,
-        attention_interface_fn,
+        attention_interface_provider,
     ):
         super().__init__()
         self.backbone_layer = backbone_layer
@@ -331,7 +334,7 @@ class InterleavedDecoderLayer(nn.Module):
         self._rope_global = rope_global
         self._query_pre_attn_scaling = query_pre_attn_scaling
         self._head_dim = head_dim
-        self._attention_interface_fn = attention_interface_fn
+        self._attention_interface_provider = attention_interface_provider
 
     def forward(
         self,
@@ -445,7 +448,8 @@ class InterleavedDecoderLayer(nn.Module):
         # (see the note next to `apply_rope`).
         layer_attention_mask = attention_mask
 
-        att_output = self._attention_interface_fn(
+        attention_interface = self._attention_interface_provider()
+        att_output = attention_interface(
             layer_attention_mask,
             batch_size,
             head_dim,
@@ -580,7 +584,12 @@ class Gemma3WithExpertModel(PreTrainedModel):
                 f"Expected backbone and expert to have {self._num_layers} layers each; "
                 f"got backbone={len(backbone_layers)}, expert={len(expert_layers)}."
             )
-        attention_interface_fn = self.get_attention_interface()
+        # Resolve the attention dispatch lazily on every call so that runtime
+        # patches to ``self.eager_attention_forward`` / ``sdpa_attention_forward``
+        # — used in tests and adapters — are honoured. Capturing the bound
+        # method at init would freeze the dispatch and silently bypass the
+        # patch.
+        attention_interface_provider = self.get_attention_interface
         layers = nn.ModuleList(
             [
                 InterleavedDecoderLayer(
@@ -592,7 +601,7 @@ class Gemma3WithExpertModel(PreTrainedModel):
                     query_pre_attn_scaling=self._query_pre_attn_scaling,
                     head_dim=self._head_dim,
                     dropout=self.dropout,
-                    attention_interface_fn=attention_interface_fn,
+                    attention_interface_provider=attention_interface_provider,
                 )
                 for i in range(self._num_layers)
             ]
