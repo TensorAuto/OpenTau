@@ -244,27 +244,26 @@ def train(cfg: TrainPipelineConfig):
     _sync_deepspeed_gradient_accumulation_steps(accelerator, cfg)
 
     # Strict guard for gradient_checkpointing: the pi05 custom forward loop
-    # wraps layer bodies in torch.utils.checkpoint.checkpoint, which is only
-    # semantically safe under distributed backends that do NOT re-shard
-    # parameters during forward. DDP (MULTI_GPU), single-process (NO), and
-    # DeepSpeed ZeRO-1/2 all replicate full params on every rank during
-    # forward — safe. ZeRO-3 and FSDP re-shard and rely on forward-time
-    # all-gather hooks that plain torch.utils.checkpoint does not trigger
-    # during backward recompute, which can silently produce wrong gradients
-    # or hang. Fail loudly at startup instead of corrupting training.
+    # wraps layer bodies in torch.utils.checkpoint.checkpoint. With
+    # use_reentrant=False this uses saved_tensors_hooks, which co-exist
+    # with FSDP's all-gather hooks in PyTorch ≥2.4 — so FSDP is supported.
+    # DeepSpeed ZeRO-3, however, prefetches/re-shards through DeepSpeed-specific
+    # hooks that torch.utils.checkpoint does not fire, so it can silently
+    # produce wrong gradients; keep that case rejected.
     if getattr(cfg.policy, "gradient_checkpointing", False):
         grad_ckpt_allowed = {
             accelerate.DistributedType.MULTI_GPU,
             accelerate.DistributedType.NO,
             accelerate.DistributedType.DEEPSPEED,
+            accelerate.DistributedType.FSDP,
         }
         if accelerator.distributed_type not in grad_ckpt_allowed:
             raise ValueError(
                 f"gradient_checkpointing=True is not supported under "
                 f"distributed_type={accelerator.distributed_type}. Supported: "
-                "MULTI_GPU (DDP), NO (single process), DEEPSPEED (ZeRO-1/2 only). "
-                "ZeRO-3 and FSDP need backend-specific activation-checkpointing "
-                "hooks which pi05's custom per-layer forward does not wire up. "
+                "MULTI_GPU (DDP), NO (single process), FSDP, DEEPSPEED (ZeRO-1/2 only). "
+                "DeepSpeed ZeRO-3 needs deepspeed.checkpointing.checkpoint hooks "
+                "which pi05's custom per-layer forward does not wire up. "
                 "Either set gradient_checkpointing=False or switch to a "
                 "supported backend."
             )
@@ -278,7 +277,9 @@ def train(cfg: TrainPipelineConfig):
                     f"DeepSpeed ZeRO stage {zero_stage}. ZeRO-3 re-shards parameters "
                     "during forward and needs deepspeed.checkpointing.checkpoint "
                     "rather than torch.utils.checkpoint. Either set "
-                    "gradient_checkpointing=False or use zero_stage: 1 or 2."
+                    "gradient_checkpointing=False, use zero_stage: 1 or 2, or "
+                    "switch to FSDP (which has equivalent param sharding and "
+                    "is compatible with torch.utils.checkpoint)."
                 )
 
     logging.info(pformat(cfg.to_dict()))
@@ -329,15 +330,27 @@ def train(cfg: TrainPipelineConfig):
     policy = make_policy(cfg=cfg.policy, ds_meta=train_dataset.meta)
     # Keep the policy in bf16 for forward/backward (activation memory + bf16
     # compute). The optimizer state is kept in fp32 separately: DeepSpeed
-    # ZeRO does this through ``BF16_Optimizer``; under DDP/FSDP/single we
-    # mirror that with ``MasterWeightOptimizer`` (see issue #181).
-    policy.to(torch.bfloat16)
+    # ZeRO does this through ``BF16_Optimizer``; under DDP/single we mirror
+    # that with ``MasterWeightOptimizer`` (see issue #181). Under FSDP,
+    # the policy must stay in fp32 here so FSDP's ``MixedPrecision`` (set
+    # by accelerate from ``mixed_precision: bf16`` in the FSDP yaml) can
+    # downcast on the fly while keeping the fp32 outer params for the
+    # optimizer to step — same fp32-master / bf16-compute split, but owned
+    # by FSDP rather than our wrapper.
+    if accelerator.distributed_type != accelerate.DistributedType.FSDP:
+        policy.to(torch.bfloat16)
     logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
-    # Outside DeepSpeed, wrap the optimizer so it carries fp32 master weights
-    # and fp32 Adam state. DeepSpeed already provides this via BF16_Optimizer
-    # (see ``ds_config['bf16']['enabled']``), so we don't double-wrap there.
-    if accelerator.distributed_type != accelerate.DistributedType.DEEPSPEED:
+    # Outside DeepSpeed *and* FSDP, wrap the optimizer so it carries fp32
+    # master weights and fp32 Adam state. DeepSpeed provides this via
+    # BF16_Optimizer (see ``ds_config['bf16']['enabled']``); FSDP provides
+    # it via MixedPrecision (param_dtype=bf16, reduce_dtype=fp32, with the
+    # outer fp32 params owned by FSDP). Wrapping under either of those would
+    # double-allocate fp32 masters.
+    if accelerator.distributed_type not in (
+        accelerate.DistributedType.DEEPSPEED,
+        accelerate.DistributedType.FSDP,
+    ):
         optimizer = MasterWeightOptimizer.from_existing(optimizer)
         # ``make_optimizer_and_scheduler`` bound the LR scheduler to the
         # ORIGINAL ``torch.optim.AdamW`` (now discarded in favour of the
