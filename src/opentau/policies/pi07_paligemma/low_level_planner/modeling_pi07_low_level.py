@@ -937,8 +937,11 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
                 (0, 0, 0, self.config.chunk_size - action_prefix.shape[1]),
             )
 
-        prepared_state = self.prepare_state(batch)
-        t_dim = prepared_state.shape[1]
+        # `prepare_state` already ran inside `_build_prefix_items`; replicate
+        # its T inference here without a second call (a 2-D state is
+        # unsqueezed to T=1, otherwise T = state.shape[-2]).
+        raw_state = batch["state"]
+        t_dim = 1 if raw_state.ndim == 2 else raw_state.shape[-2]
         if self.config.n_obs_history is not None and self.config.n_obs_history > 1 and t_dim == 1:
             logging.warning(
                 "n_obs_history=%d but state has T=%d (single timestep). "
@@ -1621,14 +1624,20 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         - ``text`` / ``discrete_action``: token-ID embedding via PaliGemma
           (text gets the ``sqrt(hidden)`` normalization).
         - ``state``: continuous-state projection.
-        - ``video``: SpaceTime SigLIP. When the input has only one frame
-          but the encoder expects ``num_frames > 1`` (e.g. subgoal images),
-          this routine zero-prepends to ``num_frames`` and synthesizes the
-          temporal pad mask so attention sees only the real (last) frame.
-          When no sample needs this video (``pad_mask.any()`` is ``False``),
-          the SigLIP backbone is skipped and zeros are emitted instead —
-          a strict efficiency win since the per-token pad mask zeros the
-          slot regardless.
+        - ``video``: SpaceTime SigLIP. The unified video encoder accepts
+          variable ``T`` (short-circuiting the temporal sublayer at
+          ``T=1``), so single-frame subgoal videos are forwarded as-is —
+          no zero-prepend to ``num_frames`` is required. When no sample
+          needs this video (``pad_mask.any()`` is ``False``), the SigLIP
+          backbone is skipped and zeros are emitted instead — a strict
+          efficiency win since the per-token pad mask zeros the slot
+          regardless. **DDP invariant:** the skip is data-dependent, so
+          all ranks must agree on whether SigLIP runs. ``pad_mask`` for
+          a ``video`` item must therefore be derivable from config
+          (e.g. ``empty_cameras`` is config-determined; real cameras get
+          all-True per-rank), never per-sample data that can diverge
+          across ranks — otherwise DDP with
+          ``find_unused_parameters=False`` will deadlock.
         - ``action``: noisy-action projection (suffix only).
 
         The pad mask is broadcast/expanded so the returned mask matches

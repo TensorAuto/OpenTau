@@ -21,7 +21,6 @@ from opentau.policies.pi07_paligemma.low_level_planner.configuration_pi07_low_le
     PI07lowlevelPlannerConfig,
 )
 from opentau.policies.pi07_paligemma.low_level_planner.modeling_pi07_low_level import (
-    ContextItem,
     PI07LowLevelPlannerFlowMatching,
     PI07LowLevelPlannerPolicy,
     make_att_2d_masks,
@@ -46,154 +45,45 @@ def _legacy_embed_prefix(
     discrete_action_masks=None,
     obs_history_is_pad=None,
 ):
-    """Construct the canonical ``ContextItem`` list from legacy kwargs and
-    call ``model.embed_prefix``.
+    """Drive ``PI07LowLevelPlannerPolicy._build_prefix_items`` from the
+    raw tensors these tests already construct, then run the resulting
+    items through ``model.embed_prefix``.
 
-    Mirrors :meth:`PI07LowLevelPlannerPolicy._build_prefix_items` but
-    operates on raw tensors instead of a batch dict, so the existing
-    embedding tests can keep their lightweight stub setup.
+    Going through the production layout method keeps the tests on a
+    single source of truth: any change to ``_build_prefix_items``
+    (the whole point of this refactor — adding/reordering blocks should
+    only require editing one place) is exercised here automatically,
+    rather than silently testing a parallel re-implementation.
+
+    The wiring: a bare ``PI07LowLevelPlannerPolicy`` instance is
+    fabricated with ``object.__new__`` and its ``prepare_*`` methods
+    are stubbed to return the supplied tensors. The fake policy
+    borrows the model's ``language_tokenizer`` so ``_embed_text``
+    can resolve the layout strings.
     """
-    bsize = lang_tokens.shape[0]
-    device = lang_tokens.device
-    tokenizer = model.language_tokenizer
-
-    def _toks(s: str):
-        ids = tokenizer.encode(s, add_special_tokens=False)
-        t = torch.tensor([ids] * bsize, device=device)
-        return t, len(ids)
-
-    items: list[ContextItem] = []
-    for vid, vid_mask in zip(videos, vid_masks, strict=True):
-        items.append(
-            ContextItem(
-                data=vid,
-                item_type="video",
-                pad_mask=vid_mask,
-                attention="continue",
-                obs_history_is_pad=obs_history_is_pad,
-            )
-        )
-    items.append(ContextItem(data=lang_tokens, item_type="text", pad_mask=lang_masks, attention="continue"))
-    state_ind, state_ind_len = _toks("State: ")
-    items.append(
-        ContextItem(
-            data=state_ind,
-            item_type="text",
-            pad_mask=torch.ones(bsize, state_ind_len, dtype=torch.bool, device=device),
-            attention="continue",
-        )
+    fake_policy = object.__new__(PI07LowLevelPlannerPolicy)
+    fake_policy.language_tokenizer = model.language_tokenizer
+    fake_policy.prepare_videos = lambda batch: (list(videos), list(vid_masks))
+    fake_policy.prepare_language = lambda batch: (lang_tokens, lang_masks)
+    fake_policy.prepare_response = lambda batch: (response_tokens, response_masks)
+    fake_policy.prepare_metadata = lambda batch: (metadata_tokens, metadata_masks)
+    fake_policy.prepare_subgoal_images = lambda batch: (
+        list(subgoal_videos),
+        list(subgoal_vid_masks),
     )
-    t_steps = state.shape[1]
+    fake_policy.prepare_state = lambda batch: state
+
+    batch: dict = {}
     if obs_history_is_pad is not None:
-        state_mask = ~obs_history_is_pad
-    else:
-        state_mask = torch.zeros(bsize, t_steps, dtype=torch.bool, device=device)
-    state_mask = state_mask.clone()
-    state_mask[:, -1] = True
-    items.append(ContextItem(data=state, item_type="state", pad_mask=state_mask, attention="continue"))
+        batch["obs_history_is_pad"] = obs_history_is_pad
 
-    sample_has_response = response_masks.any(dim=1)
-    rc, rc_len = _toks(", ")
-    items.append(
-        ContextItem(
-            data=rc,
-            item_type="text",
-            pad_mask=sample_has_response[:, None].expand(bsize, rc_len),
-            attention="continue",
-        )
+    items = PI07LowLevelPlannerPolicy._build_prefix_items(
+        fake_policy,
+        batch,
+        include_discrete_actions=discrete_actions is not None,
+        discrete_actions=discrete_actions,
+        discrete_action_masks=discrete_action_masks,
     )
-    items.append(
-        ContextItem(
-            data=response_tokens,
-            item_type="text",
-            pad_mask=response_masks,
-            attention="bidirectional",
-        )
-    )
-
-    if subgoal_vid_masks:
-        sample_has_subgoal = torch.stack(list(subgoal_vid_masks), dim=0).any(dim=0)
-    else:
-        sample_has_subgoal = torch.zeros(bsize, dtype=torch.bool, device=device)
-    sgc, sgc_len = _toks(", ")
-    items.append(
-        ContextItem(
-            data=sgc,
-            item_type="text",
-            pad_mask=sample_has_subgoal[:, None].expand(bsize, sgc_len),
-            attention="continue",
-        )
-    )
-    sgs, sgs_len = _toks("Subgoal: ")
-    items.append(
-        ContextItem(
-            data=sgs,
-            item_type="text",
-            pad_mask=sample_has_subgoal[:, None].expand(bsize, sgs_len),
-            attention="bidirectional",
-        )
-    )
-    for sg_vid, sg_vid_mask in zip(subgoal_videos, subgoal_vid_masks, strict=True):
-        items.append(
-            ContextItem(
-                data=sg_vid,
-                item_type="video",
-                pad_mask=sg_vid_mask,
-                attention="continue",
-            )
-        )
-
-    sample_has_metadata = metadata_masks.any(dim=1)
-    mdc, mdc_len = _toks(", ")
-    items.append(
-        ContextItem(
-            data=mdc,
-            item_type="text",
-            pad_mask=sample_has_metadata[:, None].expand(bsize, mdc_len),
-            attention="continue",
-        )
-    )
-    items.append(
-        ContextItem(
-            data=metadata_tokens,
-            item_type="text",
-            pad_mask=metadata_masks,
-            attention="bidirectional",
-        )
-    )
-
-    se, _ = _toks(":\n")
-    items.append(
-        ContextItem(
-            data=se,
-            item_type="text",
-            pad_mask=torch.ones(bsize, se.shape[1], dtype=torch.bool, device=device),
-            attention="continue",
-        )
-    )
-
-    if discrete_actions is not None:
-        assert discrete_action_masks is not None
-        di, di_len = _toks("Action: ")
-        items.append(
-            ContextItem(
-                data=di,
-                item_type="text",
-                pad_mask=torch.ones(bsize, di_len, dtype=torch.bool, device=device),
-                attention="causal",
-                exclude_from_cross_attention=True,
-            )
-        )
-        items.append(
-            ContextItem(
-                data=discrete_actions,
-                item_type="discrete_action",
-                pad_mask=discrete_action_masks,
-                attention="causal",
-                exclude_from_cross_attention=True,
-            )
-        )
-
     embs, pad_masks, att_masks, _num_cross = PI07LowLevelPlannerFlowMatching.embed_prefix(model, items)
     return embs, pad_masks, att_masks
 
