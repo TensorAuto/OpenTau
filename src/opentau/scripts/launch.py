@@ -13,14 +13,26 @@
 # limitations under the License.
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
 
+# CUDA allocator default. The 5B+ pi07 model on A100-80GB sits at the
+# allocator's edge — issue #264 reproduces an OOM at 79.21/79.25 GiB used
+# with 3.4 GiB reserved-but-unallocated, exactly the fragmentation pattern
+# expandable_segments resolves. Default it on; users can still override by
+# exporting their own value before invoking the launcher.
+_DEFAULT_ALLOC_CONF = "expandable_segments:True"
+
 
 def launch(script_module: ModuleType, description: str, use_accelerate: bool = True):
     """Generic launcher for OpenTau scripts using Accelerate or Python."""
+    if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ and "PYTORCH_ALLOC_CONF" not in os.environ:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = _DEFAULT_ALLOC_CONF
+        print(f"[opentau-launch] Defaulting PYTORCH_CUDA_ALLOC_CONF={_DEFAULT_ALLOC_CONF}")
+
     parser = argparse.ArgumentParser(
         description=description,
         usage=f"{Path(sys.argv[0]).name} {'[--accelerate-config CONFIG] ' if use_accelerate else ''}[ARGS]",
