@@ -167,6 +167,13 @@ class PI07HighLevelPlannerConfig(PreTrainedConfig):
             attention_implementation="eager",
             load_pretrained_gemma3=False,
             dropout=0.1,
+            # The high-level planner predicts text autoregressively and never
+            # feeds the expert stream (``inputs_embeds=[prefix_embs, None]``
+            # at modeling_pi07_high_level.py). Skipping the expert removes
+            # ~860M parameters of dead weight from the saved checkpoint and
+            # from memory. Override to ``False`` only if you intend to wire
+            # the expert into a downstream forward path.
+            disable_action_expert=True,
         )
     )
 

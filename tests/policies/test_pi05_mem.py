@@ -574,3 +574,391 @@ class TestSpaceTimeSiglipVideoEncoder:
             out_st = enc_st(video)
 
         torch.testing.assert_close(out_st, out_no_st, rtol=1e-5, atol=1e-5)
+
+
+# Padded-history attention masking. Pixel-zeroing of padded frames is not
+# enough — the SigLIP patch embedding has a learned bias and the temporal
+# positional embedding e(t) is non-zero for t < T-1, so padded "zero" frames
+# still produce non-zero hidden states the current frame would otherwise
+# attend to. The encoder must build an attention mask blocking padded keys.
+
+
+class TestTemporalAttentionMaskBlocksPaddedHistory:
+    @staticmethod
+    def _make_encoder(num_frames: int = 4, spacetime_stride: int = 4):
+        helper = TestSpaceTimeSiglipVideoEncoder()
+        return helper._make_encoder(num_frames=num_frames, spacetime_stride=spacetime_stride)
+
+    def test_current_frame_invariant_to_padded_history(self):
+        """Gold-standard: with the first three frames marked padded and an
+        identical current frame at ``[:, -1]``, the encoder output must NOT
+        depend on the pixel values of those padded frames. Pre-fix code
+        reads contaminated hidden states from padded frames through the
+        temporal attention path and the two outputs diverge.
+        """
+        torch.manual_seed(0)
+        encoder = self._make_encoder(num_frames=4, spacetime_stride=4).eval()
+
+        current = torch.rand(1, 1, 3, 224, 224)
+        vid_a = torch.cat([torch.rand(1, 3, 3, 224, 224), current], dim=1)
+        vid_b = torch.cat([torch.zeros(1, 3, 3, 224, 224), current], dim=1)
+
+        obs_history_is_pad = torch.tensor([[True, True, True, False]])
+        with torch.no_grad():
+            out_a = encoder(vid_a, obs_history_is_pad=obs_history_is_pad)
+            out_b = encoder(vid_b, obs_history_is_pad=obs_history_is_pad)
+
+        torch.testing.assert_close(out_a, out_b, rtol=1e-5, atol=1e-5)
+
+    def test_inference_fallback_blocks_all_history(self):
+        """``obs_history_is_pad=None`` triggers the inference fallback that
+        treats every history slot as padded; pins the property that
+        ``select_action`` (which never emitted ``obs_history_is_pad`` before
+        this fix) does not let zero-pixel placeholders contaminate the
+        current frame.
+        """
+        torch.manual_seed(1)
+        encoder = self._make_encoder(num_frames=4, spacetime_stride=4).eval()
+
+        current = torch.rand(1, 1, 3, 224, 224)
+        vid_a = torch.cat([torch.rand(1, 3, 3, 224, 224), current], dim=1)
+        vid_b = torch.cat([torch.zeros(1, 3, 3, 224, 224), current], dim=1)
+
+        with torch.no_grad():
+            out_a = encoder(vid_a)  # obs_history_is_pad defaults to None
+            out_b = encoder(vid_b)
+
+        torch.testing.assert_close(out_a, out_b, rtol=1e-5, atol=1e-5)
+
+    def test_temporal_mask_shape_and_values(self):
+        """Exercise ``_build_temporal_attn_mask`` directly. Documents the
+        contract: causal lower-triangular AND key-side ``~obs_history_is_pad``
+        with current-frame override; (B*N, 1, T, T) shape; additive 0/-inf.
+        """
+        from opentau.policies.pi05_mem.video_encoder import SpaceTimeSiglipVideoEncoder
+
+        obs_history_is_pad = torch.tensor([[True, False, False]])
+        mask = SpaceTimeSiglipVideoEncoder._build_temporal_attn_mask(
+            obs_history_is_pad, num_patches=4, dtype=torch.float32
+        )
+
+        # Shape: B=1, N=4, T=3 -> (B*N, 1, T, T) = (4, 1, 3, 3).
+        assert mask.shape == (4, 1, 3, 3)
+        assert mask.dtype == torch.float32
+
+        # All N rows for batch 0 share the same (T, T) submatrix.
+        m = mask[0, 0]  # (3, 3)
+
+        # Row 0: query=frame0 (padded query, but causal allows j=0 only;
+        # since frame 0 is padded its key is blocked -> -inf). The
+        # current-frame override only forces key j=T-1 real, not j=0.
+        assert m[0, 0] == float("-inf"), "padded frame 0 key should be blocked"
+        # Row 1: query=frame1 attends to {0 (padded -> -inf), 1 (real -> 0)}.
+        assert m[1, 0] == float("-inf")
+        assert m[1, 1] == 0.0
+        # Row 2: query=current attends to {0 (padded -> -inf), 1 (real -> 0),
+        # 2 (current, always real -> 0)}.
+        assert m[2, 0] == float("-inf")
+        assert m[2, 1] == 0.0
+        assert m[2, 2] == 0.0
+
+        # Upper triangular off-diagonals are blocked (causal).
+        assert m[0, 1] == float("-inf")
+        assert m[0, 2] == float("-inf")
+        assert m[1, 2] == float("-inf")
+
+        # Patch rows for the same batch are identical.
+        for n in range(1, 4):
+            torch.testing.assert_close(mask[n, 0], mask[0, 0])
+
+    def test_current_frame_override_when_pad_includes_current(self):
+        """Defensive: even if a caller passes ``obs_history_is_pad`` with the
+        current step (T-1) marked padded — as the dataset's
+        ``history_state_drop_prob`` augmentation does — the mask must keep
+        the current frame attendable, otherwise the current query has no
+        valid key and softmax produces NaNs.
+        """
+        from opentau.policies.pi05_mem.video_encoder import SpaceTimeSiglipVideoEncoder
+
+        all_padded = torch.tensor([[True, True, True, True]])
+        mask = SpaceTimeSiglipVideoEncoder._build_temporal_attn_mask(
+            all_padded, num_patches=1, dtype=torch.float32
+        )
+        m = mask[0, 0]
+        assert m[3, 3] == 0.0, "current frame must remain self-attendable"
+
+    def test_pad_tensor_not_mutated(self):
+        """The mask helper must not mutate the caller's ``obs_history_is_pad``
+        tensor (it is also consumed downstream as the state mask in
+        ``embed_prefix``).
+        """
+        from opentau.policies.pi05_mem.video_encoder import SpaceTimeSiglipVideoEncoder
+
+        all_padded = torch.tensor([[True, True, True, True]])
+        snapshot = all_padded.clone()
+        SpaceTimeSiglipVideoEncoder._build_temporal_attn_mask(all_padded, num_patches=1, dtype=torch.float32)
+        torch.testing.assert_close(all_padded, snapshot)
+
+
+# State mask: current step (t = T-1) must always be marked real, even when
+# obs_history_is_pad sets it to True (e.g. dataset's history_state_drop_prob
+# augmentation flips the entire tensor to all-True). Without the override the
+# policy is conditioned on no state at all when that augmentation fires.
+
+
+def _make_embed_prefix_stub():
+    """Construct a partial PI05MemFlowMatching that exposes only the attrs
+    ``embed_prefix`` reads — no PaliGemma init, just enough for the layout
+    paths exercised by the state-mask tests.
+    """
+    import types
+
+    from opentau.policies.pi05_mem.modeling_pi05 import PI05MemFlowMatching
+
+    hidden = 4
+    n_video_tokens = 3
+    fm = PI05MemFlowMatching.__new__(PI05MemFlowMatching)
+
+    class _FakePaligemma:
+        def embed_language_tokens(self, tokens):
+            return torch.zeros((*tokens.shape, hidden), dtype=torch.float32)
+
+        def embed_discrete_actions(self, da):
+            return torch.zeros((*da.shape, hidden), dtype=torch.float32)
+
+    fm.paligemma_with_expert = _FakePaligemma()
+    fm.state_proj = lambda state: torch.zeros(state.shape[0], state.shape[1], hidden, dtype=torch.float32)
+    fm.embed_video = lambda video, obs_history_is_pad=None: torch.zeros(
+        video.shape[0], n_video_tokens, hidden, dtype=torch.float32
+    )
+    fm.config = types.SimpleNamespace(discrete_action_max_length=2)
+    return fm
+
+
+def _embed_prefix_default_inputs(*, batch_size: int = 2, prompt_len: int = 3, t_state: int = 1):
+    return {
+        "videos": [torch.zeros(batch_size, t_state, 3, 4, 4)],
+        "vid_masks": [torch.ones(batch_size, dtype=torch.bool)],
+        "lang_tokens": torch.zeros(batch_size, prompt_len, dtype=torch.long),
+        "lang_masks": torch.ones(batch_size, prompt_len, dtype=torch.bool),
+        "state": torch.zeros(batch_size, t_state, 7),
+    }
+
+
+def _state_slice_indices(prompt_len: int, n_video_tokens: int, t_state: int) -> slice:
+    """Layout: videos(n_video_tokens) + lang(prompt_len) + state(t_state)."""
+    state_lo = n_video_tokens + prompt_len
+    return slice(state_lo, state_lo + t_state)
+
+
+class TestStateMaskCurrentStepAlwaysReal:
+    """Pin the post-fix invariant: state_mask[:, -1] is True regardless of
+    obs_history_is_pad. (Bug B from the audit; ported from pi07 / PR #205.)
+    """
+
+    def test_state_mask_current_step_real_when_all_history_padded(self):
+        """``obs_history_is_pad = ones(B, T)`` (the
+        ``history_state_drop_prob=1.0`` case) MUST still leave the current
+        state token (index T-1) marked real, otherwise attention to it is
+        masked out and the policy conditions on no state at all.
+        """
+        from opentau.policies.pi05_mem.modeling_pi05 import PI05MemFlowMatching
+
+        fake = _make_embed_prefix_stub()
+        bsize = 2
+        t_state = 4
+        kwargs = _embed_prefix_default_inputs(batch_size=bsize, t_state=t_state)
+        kwargs["obs_history_is_pad"] = torch.ones(bsize, t_state, dtype=torch.bool)
+
+        _, pad_masks, _ = PI05MemFlowMatching.embed_prefix(fake, **kwargs)
+
+        state_slice = _state_slice_indices(prompt_len=3, n_video_tokens=3, t_state=t_state)
+        state_mask = pad_masks[:, state_slice]
+        assert state_mask.shape == (bsize, t_state)
+
+        for i in range(bsize):
+            assert state_mask[i, -1].item() is True, (
+                f"sample {i}: current state token (T-1) is masked out — the "
+                f"history_state_drop_prob augmentation would condition on no "
+                f"state at all. state_mask = {state_mask[i].tolist()}"
+            )
+        assert (~state_mask[:, :-1]).all().item() is True
+
+    def test_state_mask_none_branch_assumes_history_padded_keeps_current_real(self):
+        """``obs_history_is_pad = None`` means the caller didn't tell us
+        which slots are real. Post-fix: assume all history is padded so the
+        encoder cannot attend to garbage history slots — but the current
+        step is still real.
+        """
+        from opentau.policies.pi05_mem.modeling_pi05 import PI05MemFlowMatching
+
+        fake = _make_embed_prefix_stub()
+        bsize = 2
+        t_state = 4
+        kwargs = _embed_prefix_default_inputs(batch_size=bsize, t_state=t_state)
+        kwargs["obs_history_is_pad"] = None
+
+        _, pad_masks, _ = PI05MemFlowMatching.embed_prefix(fake, **kwargs)
+
+        state_slice = _state_slice_indices(prompt_len=3, n_video_tokens=3, t_state=t_state)
+        state_mask = pad_masks[:, state_slice]
+        assert state_mask.shape == (bsize, t_state)
+
+        for i in range(bsize):
+            assert state_mask[i, -1].item() is True
+            assert (~state_mask[i, :-1]).all().item() is True
+
+    def test_state_mask_partial_history_pad_preserves_current(self):
+        """Mixed pad pattern (typical of natural episode-boundary padding):
+        some history slots padded, current step real -> state_mask matches
+        ``~obs_history_is_pad`` exactly, with the override a no-op since the
+        current bit was already True.
+        """
+        from opentau.policies.pi05_mem.modeling_pi05 import PI05MemFlowMatching
+
+        fake = _make_embed_prefix_stub()
+        bsize = 2
+        t_state = 4
+        kwargs = _embed_prefix_default_inputs(batch_size=bsize, t_state=t_state)
+        kwargs["obs_history_is_pad"] = torch.tensor([[True, True, False, False], [True, False, False, False]])
+
+        _, pad_masks, _ = PI05MemFlowMatching.embed_prefix(fake, **kwargs)
+
+        state_slice = _state_slice_indices(prompt_len=3, n_video_tokens=3, t_state=t_state)
+        state_mask = pad_masks[:, state_slice]
+        torch.testing.assert_close(
+            state_mask,
+            torch.tensor([[False, False, True, True], [False, True, True, True]]),
+        )
+
+    def test_state_mask_does_not_mutate_obs_history_is_pad(self):
+        """The override path must not mutate the caller's
+        ``obs_history_is_pad`` (it is also threaded into ``embed_video``
+        for the temporal attention mask — mutating it there would cause
+        cross-call corruption).
+        """
+        from opentau.policies.pi05_mem.modeling_pi05 import PI05MemFlowMatching
+
+        fake = _make_embed_prefix_stub()
+        bsize = 1
+        t_state = 4
+        kwargs = _embed_prefix_default_inputs(batch_size=bsize, t_state=t_state)
+        original_pad = torch.ones(bsize, t_state, dtype=torch.bool)
+        kwargs["obs_history_is_pad"] = original_pad
+        snapshot = original_pad.clone()
+
+        PI05MemFlowMatching.embed_prefix(fake, **kwargs)
+
+        torch.testing.assert_close(original_pad, snapshot)
+
+
+# `_build_history_batch` emits ``obs_history_is_pad`` so the encoder can use
+# real mid-episode history while still masking start-of-episode zero-fill.
+# Without this emit, the encoder's None-fallback masks ALL history at
+# inference (mid-episode regression flagged in pi07's PR #253 review and
+# inherited from pi05_mem's original design).
+
+
+class TestBuildHistoryBatchEmitsObsHistoryIsPad:
+    @staticmethod
+    def _make_policy_stub(*, n_obs_steps: int, history_interval: int, image_keys: list[str]):
+        """Construct a partial PI05MemPolicy that exposes only the attrs
+        ``_build_history_batch`` reads.
+        """
+        import types
+
+        from opentau.policies.pi05_mem.modeling_pi05 import PI05MemPolicy
+
+        policy = PI05MemPolicy.__new__(PI05MemPolicy)
+        buf_size = (n_obs_steps - 1) * history_interval + 1
+        policy.config = types.SimpleNamespace(
+            n_obs_steps=n_obs_steps,
+            history_interval=history_interval,
+            obs_buffer_size=buf_size,
+            image_features=dict.fromkeys(image_keys),
+        )
+        policy._state_buffer = None
+        policy._obs_buffers = None
+        return policy
+
+    def _make_batch(self, image_keys: list[str], state_dim: int = 4) -> dict:
+        return {
+            "state": torch.zeros(1, state_dim),
+            **{k: torch.zeros(1, 3, 8, 8) for k in image_keys},
+        }
+
+    def test_first_step_marks_all_but_current_padded(self):
+        """At episode start, only the very first observation is in the
+        buffer; every other slot in the requested history was zero-filled.
+        Mask should be ``[True, ..., True, False]`` — the canonical case
+        the Bug A fix protects against contamination from.
+        """
+        policy = self._make_policy_stub(n_obs_steps=4, history_interval=1, image_keys=["camera0"])
+        out = policy._build_history_batch(self._make_batch(["camera0"]))
+
+        assert "obs_history_is_pad" in out
+        assert out["obs_history_is_pad"].shape == (1, 4)
+        assert out["obs_history_is_pad"].dtype == torch.bool
+        assert out["obs_history_is_pad"].tolist() == [[True, True, True, False]]
+
+    def test_buffer_full_emits_all_false(self):
+        """Once the buffer is full (after ``obs_buffer_size`` calls), every
+        slot maps to a real observation — mask is all-False. This is the
+        mid-episode case the previous behavior regressed: with no emit, the
+        encoder masked these real frames out via the None-fallback.
+        """
+        policy = self._make_policy_stub(n_obs_steps=4, history_interval=2, image_keys=["camera0"])
+        # obs_buffer_size = (4-1)*2 + 1 = 7. Need 7 calls to fill.
+        batch = self._make_batch(["camera0"])
+        for _ in range(7):
+            out = policy._build_history_batch(batch)
+        assert out["obs_history_is_pad"].tolist() == [[False, False, False, False]]
+
+    def test_partial_fill_marks_only_unfilled_slots(self):
+        """After ``k < obs_buffer_size`` calls, the leading slots are still
+        virtual past-steps. With ``n_obs_steps=4, history_interval=2``
+        (buffer_size=7), after 4 calls the deque has 4 entries -> ``missing
+        = 3`` -> slots with ``i*interval - 3 < 0`` are padded: i=0 -> -3 (T),
+        i=1 -> -1 (T), i=2 -> 1 (F), i=3 -> 3 (F). Mask = [T, T, F, F].
+        """
+        policy = self._make_policy_stub(n_obs_steps=4, history_interval=2, image_keys=["camera0"])
+        batch = self._make_batch(["camera0"])
+        for _ in range(4):
+            out = policy._build_history_batch(batch)
+        assert out["obs_history_is_pad"].tolist() == [[True, True, False, False]]
+
+    def test_mask_is_broadcast_over_batch(self):
+        """The buffer is shared across batch elements, so the (B, T) mask is
+        the same across the batch dim. Verify by emitting from a B=3 batch.
+        """
+        policy = self._make_policy_stub(n_obs_steps=4, history_interval=1, image_keys=["camera0"])
+        batch = {
+            "state": torch.zeros(3, 4),
+            "camera0": torch.zeros(3, 3, 8, 8),
+        }
+        out = policy._build_history_batch(batch)
+
+        assert out["obs_history_is_pad"].shape == (3, 4)
+        assert torch.all(out["obs_history_is_pad"] == out["obs_history_is_pad"][0:1])
+
+    def test_state_and_camera_padding_match_emitted_mask(self):
+        """The emitted mask must agree slot-for-slot with the actual
+        zero-padding pattern of state and camera tensors.
+        """
+        policy = self._make_policy_stub(n_obs_steps=3, history_interval=1, image_keys=["camera0"])
+        batch = {
+            "state": torch.full((1, 4), 7.0),
+            "camera0": torch.full((1, 3, 8, 8), 5.0),
+        }
+        out = policy._build_history_batch(batch)
+        # After one call: missing = 2; mask = [True, True, False].
+        is_pad = out["obs_history_is_pad"][0]  # (T,)
+        state = out["state"][0]  # (T, D)
+        cam = out["camera0"][0]  # (T, C, H, W)
+        for t, padded in enumerate(is_pad.tolist()):
+            if padded:
+                assert torch.all(state[t] == 0.0), f"state[{t}] not zero-filled"
+                assert torch.all(cam[t] == 0.0), f"camera[{t}] not zero-filled"
+            else:
+                assert torch.all(state[t] == 7.0), f"state[{t}] zero-filled but mask says real"
+                assert torch.all(cam[t] == 5.0), f"camera[{t}] zero-filled but mask says real"
