@@ -9,7 +9,9 @@
         "weights": [1.0],
         "action_freq": 10.0,
         "image_resample_strategy": "nearest",
-        "vector_resample_strategy": "nearest"
+        "vector_resample_strategy": "nearest",
+        "n_obs_history": 8,
+        "history_interval": 1
     },
     "policy": {
         "type": "pi07_low_level",
