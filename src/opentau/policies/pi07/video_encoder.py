@@ -322,7 +322,6 @@ class SpaceTimeEncoderLayerWrapper(nn.Module):
 
         attn = self.self_attn
         num_heads = attn.num_heads
-        head_dim = attn.head_dim
 
         # Reshape (B*T, N, D) -> (B, T, N, D) and add temporal PE.
         # Slice the precomputed PE: take the LAST t rows so the current-frame
@@ -341,16 +340,16 @@ class SpaceTimeEncoderLayerWrapper(nn.Module):
         # ONE QKV projection. Q/K/V come from a single application of the
         # layer's W_Q/W_K/W_V to LN1(h_pe). They are reshaped (not
         # re-projected) into the temporal and spatial layouts below.
-        q = attn.q_proj(z).view(b, t, n, num_heads, head_dim)
-        k = attn.k_proj(z).view(b, t, n, num_heads, head_dim)
-        v = attn.v_proj(z).view(b, t, n, num_heads, head_dim)
+        q = rearrange(attn.q_proj(z), "b t n (h d) -> b t n h d", h=num_heads)
+        k = rearrange(attn.k_proj(z), "b t n (h d) -> b t n h d", h=num_heads)
+        v = rearrange(attn.v_proj(z), "b t n (h d) -> b t n h d", h=num_heads)
 
         # ===== Temporal SDPA: per-patch causal attention over T =====
         # Layout (B*N, H, T, Dh): each spatial patch is its own length-T
         # causal sequence; flatten (B, N) into the SDPA batch axis.
-        q_t = q.permute(0, 2, 3, 1, 4).reshape(b * n, num_heads, t, head_dim)
-        k_t = k.permute(0, 2, 3, 1, 4).reshape(b * n, num_heads, t, head_dim)
-        v_t = v.permute(0, 2, 3, 1, 4).reshape(b * n, num_heads, t, head_dim)
+        q_t = rearrange(q, "b t n h d -> (b n) h t d")
+        k_t = rearrange(k, "b t n h d -> (b n) h t d")
+        v_t = rearrange(v, "b t n h d -> (b n) h t d")
 
         if temporal_attn_mask is not None:
             # Caller-supplied mask already encodes both the causal pattern AND
@@ -378,17 +377,19 @@ class SpaceTimeEncoderLayerWrapper(nn.Module):
                 dropout_p=0.0,
                 scale=attn.scale,
             )
-        # v_temp: (B*N, H, T, Dh). Permute back into (B, T, N, H, Dh) layout
-        # so it can feed the spatial pass as the V input. The .reshape at
-        # the end materializes the new strides into a contiguous tensor.
-        v_temp = v_temp.view(b, n, num_heads, t, head_dim).permute(0, 3, 1, 2, 4)
+        # v_temp: (B*N, H, T, Dh). Rearrange back into (B, T, N, H, Dh) layout
+        # so it can feed the spatial pass as the V input. ``rearrange`` is
+        # defensive against non-contiguous SDPA outputs (some flash-attn
+        # backends return non-standard strides) — it is a no-op when the
+        # tensor is already contiguous and a copy when it is not.
+        v_temp = rearrange(v_temp, "(b n) h t d -> b t n h d", b=b)
 
         # ===== Spatial SDPA: per-timestep bidirectional attention over N =====
         # Q, K REUSE the same projections from z (NOT recomputed from v_temp).
         # V is v_temp (the temporally-mixed values). Layout (B*T, H, N, Dh).
-        q_s = q.permute(0, 1, 3, 2, 4).reshape(b * t, num_heads, n, head_dim)
-        k_s = k.permute(0, 1, 3, 2, 4).reshape(b * t, num_heads, n, head_dim)
-        v_s = v_temp.permute(0, 1, 3, 2, 4).reshape(b * t, num_heads, n, head_dim)
+        q_s = rearrange(q, "b t n h d -> (b t) h n d")
+        k_s = rearrange(k, "b t n h d -> (b t) h n d")
+        v_s = rearrange(v_temp, "b t n h d -> (b t) h n d")
 
         out = F.scaled_dot_product_attention(
             q_s,
@@ -400,7 +401,7 @@ class SpaceTimeEncoderLayerWrapper(nn.Module):
             scale=attn.scale,
         )
         # (B*T, H, N, Dh) -> (B*T, N, D)
-        out = out.transpose(1, 2).reshape(b * t, n, d)
+        out = rearrange(out, "bt h n d -> bt n (h d)")
 
         # ONE output projection.
         out = attn.out_proj(out)
