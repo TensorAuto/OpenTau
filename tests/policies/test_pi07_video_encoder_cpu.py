@@ -175,6 +175,31 @@ class TestTemporalSinusoidalPE:
         # collapses to the unmodified SigLIP forward.
         assert torch.all(pe[-1] == 0)
 
+    @pytest.mark.parametrize("num_frames", [1, 2, 3, 4, 8, 16, 32])
+    @pytest.mark.parametrize("embed_dim", [16, 64, 1152])
+    def test_pe_is_zero_at_t_eq_0(self, num_frames: int, embed_dim: int):
+        """MEM Appendix C boundary condition: ``e(t=0) = 0``.
+
+        The codebase convention places the current frame at array index
+        ``T-1`` (so ``time[T-1] = 0``); this test asserts the boundary holds
+        across every ``T`` the wrapper might encounter at runtime and across
+        ``embed_dim`` values spanning small fixtures up to the real SigLIP
+        hidden size (1152). Required for: (a) the K=1 natural identity in
+        Reading B (the temporal SDPA over a single key returns V unchanged
+        only if ``e(t=0)=0`` keeps ``h_pe = h``), and (b) the variable-T
+        slicing trick — ``pe[max_num_frames - T:]`` is byte-identical to a
+        fresh PE only because each PE's last row is zero by construction.
+        """
+        pe = _build_temporal_sinusoidal_pe(num_frames=num_frames, embed_dim=embed_dim)
+        assert pe.shape == (num_frames, embed_dim)
+        # The "t=0" row: array index T-1 (current frame).
+        torch.testing.assert_close(
+            pe[num_frames - 1],
+            torch.zeros(embed_dim, dtype=pe.dtype),
+            rtol=0,
+            atol=0,
+        )
+
     def test_earlier_rows_are_nonzero(self):
         pe = _build_temporal_sinusoidal_pe(num_frames=8, embed_dim=64)
         assert torch.any(pe[0] != 0)
@@ -191,6 +216,38 @@ class TestTemporalSinusoidalPE:
     def test_zero_num_frames_raises(self):
         with pytest.raises(ValueError, match="num_frames"):
             _build_temporal_sinusoidal_pe(num_frames=0, embed_dim=64)
+
+    def test_pe_supports_20_frames_without_aliasing(self):
+        """The default ``max_period`` must comfortably cover ``T = 20``: every
+        pair of distinct timesteps in ``{-19, ..., 0}`` should have visibly
+        different sinusoidal rows. Pre-fix code (``max_period = 4.0``) failed
+        this — the lowest-frequency component completed ~5 full cycles over
+        the time range, so e.g. rows ``t = -16`` and ``t = -12`` collapsed
+        to nearly-identical encodings in the long-period dims.
+        """
+        pe = _build_temporal_sinusoidal_pe(num_frames=20, embed_dim=64)
+        assert pe.shape == (20, 64)
+        # Current frame still zero (boundary preserved across max_period change).
+        torch.testing.assert_close(pe[-1], torch.zeros(64, dtype=pe.dtype), rtol=0, atol=0)
+        # Any two distinct rows must differ by at least a measurable margin.
+        for i in range(20):
+            for j in range(i + 1, 20):
+                gap = (pe[i] - pe[j]).abs().max().item()
+                assert gap > 1e-2, (
+                    f"rows t={i - 19} and t={j - 19} differ by only {gap:.2e}; "
+                    "max_period likely too small for T=20 (temporal aliasing)"
+                )
+
+    def test_max_period_too_small_raises(self):
+        """Asking for more frames than ``max_period`` can encode without
+        aliasing must raise a clear error rather than silently producing a
+        degenerate PE.
+        """
+        with pytest.raises(ValueError, match="aliasing"):
+            _build_temporal_sinusoidal_pe(num_frames=42, embed_dim=64)
+        # Passing a larger max_period explicitly clears the guard.
+        pe = _build_temporal_sinusoidal_pe(num_frames=42, embed_dim=64, max_period=128.0)
+        assert pe.shape == (42, 64)
 
     def test_pe_slice_matches_fresh_build(self):
         """The MEM-paper PE values depend only on the relative offset from the
@@ -749,6 +806,213 @@ class TestTemporalAttentionMaskBlocksPaddedHistory:
         snapshot = all_padded.clone()
         SpaceTimeSiglipVideoEncoder._build_temporal_attn_mask(all_padded, num_patches=1, dtype=torch.float32)
         torch.testing.assert_close(all_padded, snapshot)
+
+    def test_t_above_1_with_full_pad_matches_t1(self):
+        """T>1 with every history frame masked must produce the same encoder
+        output as a T=1 forward on the current frame alone.
+
+        Reading B at the current-frame slot, when the temporal mask blocks
+        every past key, the temporal SDPA reduces to ``V_temp[current] =
+        V[current]`` (only the current key is attendable, attention weight is
+        1.0). The spatial pass then sees the same Q, K, V the T=1 path would,
+        so the current-frame output is mathematically identical to the T=1
+        forward — modulo low-precision accumulation noise from the no-op
+        temporal SDPA. This pins the "fully-masked-history is exactly T=1"
+        identity that downstream callers rely on at inference time when
+        ``_build_history_batch`` zero-pads missing history slots.
+        """
+        torch.manual_seed(7)
+        encoder = _make_gemma3_encoder(max_num_frames=4, spacetime_stride=4).eval()
+
+        current = torch.rand(1, 1, 3, 224, 224)
+        # Arbitrary past frames; their pixels must not influence the output
+        # because every history slot is marked padded.
+        history = torch.rand(1, 3, 3, 224, 224)
+        video_t4 = torch.cat([history, current], dim=1)
+        pad_full = torch.tensor([[True, True, True, False]])
+
+        with torch.no_grad():
+            out_t1 = encoder(current)
+            out_t4 = encoder(video_t4, obs_history_is_pad=pad_full)
+
+        torch.testing.assert_close(out_t1, out_t4, rtol=1e-5, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Mask-structure invariants: Reading B's temporal pass uses a causal mask;
+# the spatial pass is bidirectional (no mask). These tests intercept the
+# SDPA calls inside a single wrapper forward and verify the call shape +
+# mask kwargs match the paper's factorization.
+# ---------------------------------------------------------------------------
+
+
+class TestReadingBMaskStructure:
+    """Verify the two SDPAs inside ``SpaceTimeEncoderLayerWrapper.forward``
+    use the right mask types: temporal = causal, spatial = bidirectional.
+    """
+
+    @staticmethod
+    def _grab_wrapper() -> SpaceTimeEncoderLayerWrapper:
+        encoder = _make_gemma3_encoder(max_num_frames=2, spacetime_stride=4)
+        wrappers = [
+            layer
+            for layer in encoder.vision_tower.vision_model.encoder.layers
+            if isinstance(layer, SpaceTimeEncoderLayerWrapper)
+        ]
+        assert wrappers, "expected at least one SpaceTimeEncoderLayerWrapper"
+        return wrappers[0]
+
+    @staticmethod
+    def _record_sdpa_calls():
+        """Returns ``(install, restore, calls)`` — install the recorder around
+        ``torch.nn.functional.scaled_dot_product_attention`` then restore
+        the original. Records ``q_shape``, ``is_causal``, and the attn_mask
+        identity / shape for each call.
+        """
+        import torch.nn.functional as F  # noqa: N812
+
+        original = F.scaled_dot_product_attention
+        calls: list[dict] = []
+
+        def recorder(q, k, v, attn_mask=None, is_causal=False, **kwargs):
+            calls.append(
+                {
+                    "q_shape": tuple(q.shape),
+                    "is_causal": bool(is_causal),
+                    "attn_mask_is_none": attn_mask is None,
+                    "attn_mask_shape": tuple(attn_mask.shape) if attn_mask is not None else None,
+                }
+            )
+            return original(q, k, v, attn_mask=attn_mask, is_causal=is_causal, **kwargs)
+
+        def install():
+            F.scaled_dot_product_attention = recorder
+
+        def restore():
+            F.scaled_dot_product_attention = original
+
+        return install, restore, calls
+
+    def test_temporal_is_causal_spatial_is_bidirectional_no_mask(self):
+        """Without ``temporal_attn_mask``: the temporal SDPA must use
+        ``is_causal=True`` (lower-triangular causal mask) and the spatial
+        SDPA must use ``is_causal=False`` with ``attn_mask=None``
+        (bidirectional, every patch attends to every other patch within
+        the same timestep).
+        """
+        wrapper = self._grab_wrapper()
+        t = 2
+        n = wrapper.num_tokens_per_frame
+        d = wrapper.embed_dim
+        hidden = torch.randn(t, n, d)
+
+        install, restore, calls = self._record_sdpa_calls()
+        install()
+        try:
+            with torch.no_grad():
+                wrapper(hidden, attention_mask=None, output_attentions=False, num_frames=t)
+        finally:
+            restore()
+
+        # Reading B fires exactly two SDPAs per wrapper forward at T>1.
+        assert len(calls) == 2, f"expected 2 SDPA calls (temporal + spatial), got {len(calls)}"
+
+        temporal, spatial = calls
+        # Temporal: layout (B*N, H, T, Dh); seq axis (dim 2) must equal T.
+        assert temporal["q_shape"][2] == t, f"temporal seq axis expected T={t}, got {temporal['q_shape']}"
+        assert temporal["is_causal"] is True, "temporal SDPA must be causal"
+        assert temporal["attn_mask_is_none"], (
+            "with no caller-supplied temporal_attn_mask, the temporal pass must rely on "
+            "is_causal=True (SDPA disallows combining is_causal with attn_mask)"
+        )
+
+        # Spatial: layout (B*T, H, N, Dh); seq axis (dim 2) must equal N.
+        assert spatial["q_shape"][2] == n, f"spatial seq axis expected N={n}, got {spatial['q_shape']}"
+        assert spatial["is_causal"] is False, "spatial SDPA must be bidirectional (not causal)"
+        assert spatial["attn_mask_is_none"], (
+            "with no caller-supplied attention_mask, the spatial pass must use no mask "
+            "(bidirectional attention over patches at the same timestep)"
+        )
+
+    def test_temporal_uses_provided_mask_spatial_still_bidirectional(self):
+        """When ``temporal_attn_mask`` is supplied: the temporal SDPA must
+        receive that mask (and ``is_causal=False`` so SDPA does not reject
+        the combination), while the spatial SDPA must still be bidirectional
+        with no mask.
+        """
+        wrapper = self._grab_wrapper()
+        t = 2
+        n = wrapper.num_tokens_per_frame
+        d = wrapper.embed_dim
+        hidden = torch.randn(t, n, d)
+
+        # Build a real temporal mask via the encoder helper. Shape (B*N, 1, T, T).
+        pad = torch.tensor([[True, False]])
+        temporal_attn_mask = SpaceTimeSiglipVideoEncoder._build_temporal_attn_mask(
+            pad, num_patches=n, dtype=hidden.dtype
+        )
+
+        install, restore, calls = self._record_sdpa_calls()
+        install()
+        try:
+            with torch.no_grad():
+                wrapper(
+                    hidden,
+                    attention_mask=None,
+                    output_attentions=False,
+                    temporal_attn_mask=temporal_attn_mask,
+                    num_frames=t,
+                )
+        finally:
+            restore()
+
+        assert len(calls) == 2
+        temporal, spatial = calls
+
+        # Temporal: receives the explicit mask; is_causal must be False
+        # (SDPA disallows is_causal=True together with attn_mask=...).
+        assert temporal["is_causal"] is False, (
+            "with caller-supplied temporal_attn_mask, the temporal SDPA must NOT also "
+            "set is_causal=True (SDPA rejects the combination)"
+        )
+        assert not temporal["attn_mask_is_none"], "temporal SDPA must receive the supplied mask"
+        assert temporal["attn_mask_shape"] == tuple(temporal_attn_mask.shape)
+
+        # Spatial: still bidirectional, no mask.
+        assert spatial["is_causal"] is False
+        assert spatial["attn_mask_is_none"], "spatial pass remains bidirectional regardless of temporal mask"
+
+    def test_temporal_default_mask_is_lower_triangular(self):
+        """Direct check that the wrapper's no-temporal-mask path is causal:
+        the temporal pass at the past-frame slot (t=0) must NOT depend on
+        the current-frame slot (t=T-1).
+
+        Modify only the current frame's input and verify the wrapper's
+        output at the past-frame slot is unchanged. This pins the causal
+        mask invariant from the outside, without monkey-patching SDPA.
+        """
+        torch.manual_seed(11)
+        wrapper = self._grab_wrapper()
+        t = 2
+        n = wrapper.num_tokens_per_frame
+        d = wrapper.embed_dim
+
+        past = torch.randn(1, n, d)
+        current_a = torch.randn(1, n, d)
+        current_b = torch.randn(1, n, d)
+        hidden_a = torch.cat([past, current_a], dim=0)  # (T=2, N, D)
+        hidden_b = torch.cat([past, current_b], dim=0)
+
+        with torch.no_grad():
+            out_a = wrapper(hidden_a, num_frames=t)[0]
+            out_b = wrapper(hidden_b, num_frames=t)[0]
+
+        # Past frame at index 0: causal mask must prevent it from seeing
+        # the current frame's data, so out_a[0] must equal out_b[0].
+        torch.testing.assert_close(out_a[0], out_b[0], rtol=1e-5, atol=1e-5)
+        # Sanity: the current-frame output WAS allowed to differ between
+        # the two runs (otherwise the test is vacuous).
+        assert not torch.allclose(out_a[1], out_b[1], rtol=1e-5, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------

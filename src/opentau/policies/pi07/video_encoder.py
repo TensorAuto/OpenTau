@@ -65,7 +65,6 @@ import torch.nn.functional as F  # noqa: N812
 from einops import rearrange
 from torch import Tensor, nn
 from transformers.models.siglip.modeling_siglip import (
-    SiglipAttention,
     SiglipEncoderLayer,
     SiglipVisionModel,
 )
@@ -83,7 +82,7 @@ def _build_temporal_sinusoidal_pe(
     embed_dim: int,
     *,
     min_period: float = 4e-3,
-    max_period: float = 4.0,
+    max_period: float = 40.0,
     dtype: torch.dtype = torch.float32,
     device: torch.device | str = "cpu",
 ) -> Tensor:
@@ -96,11 +95,27 @@ def _build_temporal_sinusoidal_pe(
     The zero-current-row condition lets a ``T=1`` forward pass match an
     un-modified SigLIP ViT exactly, which is required for single-frame
     invariance against ``PaliGemmaModel.get_image_features``.
+
+    The ``max_period`` floor governs the LONGEST sinusoidal period. To avoid
+    temporal aliasing (different timesteps mapping to nearly-identical
+    low-frequency rows), ``max_period`` should comfortably exceed the time
+    range ``T-1``. The default ``40.0`` covers up to ``T=20`` with the
+    longest sinusoid completing at most ``19 / 40 ≈ 0.48`` of a cycle —
+    every timestep in ``{-19, ..., 0}`` therefore gets a unique
+    low-frequency encoding. Callers needing ``T > 20`` should pass a larger
+    ``max_period`` explicitly (rule of thumb: ``2 * (T - 1)``).
     """
     if embed_dim % 2 != 0:
         raise ValueError(f"embed_dim ({embed_dim}) must be divisible by 2")
     if num_frames < 1:
         raise ValueError(f"num_frames ({num_frames}) must be >= 1")
+    if num_frames - 1 > max_period:
+        raise ValueError(
+            f"num_frames ({num_frames}) exceeds the no-alias range of max_period "
+            f"({max_period}); the lowest-frequency sinusoid would complete more than "
+            f"a full cycle over the time range, causing temporal aliasing. Pass "
+            f"max_period >= {2 * (num_frames - 1)} explicitly."
+        )
 
     # time[i] = i - (T-1) in {-(T-1), ..., -1, 0}; row T-1 has time = 0.
     time = torch.arange(num_frames, dtype=torch.float64, device=device) - (num_frames - 1)
@@ -115,99 +130,43 @@ def _build_temporal_sinusoidal_pe(
     return pe.to(dtype=dtype)
 
 
-class _TemporalSelfAttention(nn.Module):
-    """Parameter-free causal temporal self-attention.
-
-    Re-uses an existing ``SiglipAttention`` instance's
-    ``q_proj``/``k_proj``/``v_proj``/``out_proj`` linear layers, but applies
-    them over the ``T`` axis (for each fixed patch position) with a
-    standard lower-triangular causal mask (position ``i`` attends to
-    positions ``j <= i``; since ``t = T-1`` is the current frame, the current
-    frame attends to all past frames).
-
-    The referenced ``SiglipAttention`` is held in a list to keep ``nn.Module``
-    from re-registering its parameters under this module's path (which would
-    duplicate them in ``state_dict`` under both
-    ``base_layer.self_attn.*`` and ``_temporal_attn.attn.*``).
-    """
-
-    def __init__(self, attn: SiglipAttention):
-        super().__init__()
-        # Wrap in a list so nn.Module.__setattr__ does not treat ``attn``
-        # as a child submodule; the base layer already owns these params.
-        self._attn_ref: list[SiglipAttention] = [attn]
-
-    @property
-    def attn(self) -> SiglipAttention:
-        return self._attn_ref[0]
-
-    def forward(self, hidden_states: Tensor, temporal_attn_mask: Tensor | None = None) -> Tensor:
-        """hidden_states: (B*N, T, D) -> (B*N, T, D).
-
-        Args:
-            hidden_states: ``(B*N, T, D)`` hidden states reshaped for temporal
-                attention (one sequence per spatial patch position).
-            temporal_attn_mask: Optional ``(B*N, 1, T, T)`` additive float mask.
-                ``0.0`` = attend, ``-inf`` = block. When ``None``, falls back to
-                the standard causal lower-triangular mask via ``is_causal=True``.
-        """
-        attn = self.attn
-        bn, t, d = hidden_states.shape
-        num_heads = attn.num_heads
-        head_dim = attn.head_dim
-
-        q = attn.q_proj(hidden_states).view(bn, t, num_heads, head_dim).transpose(1, 2)
-        k = attn.k_proj(hidden_states).view(bn, t, num_heads, head_dim).transpose(1, 2)
-        v = attn.v_proj(hidden_states).view(bn, t, num_heads, head_dim).transpose(1, 2)
-
-        if temporal_attn_mask is not None:
-            # Caller-supplied mask already encodes both causal AND padded-history
-            # blocking; do NOT also set is_causal=True (SDPA disallows combining
-            # the two).
-            out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=temporal_attn_mask, is_causal=False, dropout_p=0.0, scale=attn.scale
-            )
-        else:
-            # is_causal=True -> lower-triangular mask, each position attends to
-            # itself and earlier positions (our convention: t=T-1 is current).
-            out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=None, is_causal=True, dropout_p=0.0, scale=attn.scale
-            )
-        out = out.transpose(1, 2).reshape(bn, t, d)
-        return attn.out_proj(out)
-
-
 class SpaceTimeEncoderLayerWrapper(nn.Module):
-    """Replaces a ``SiglipEncoderLayer`` in-place; adds a temporal sublayer.
+    """Replaces a ``SiglipEncoderLayer`` in-place; adds factorized space-time
+    attention via a single composed attention sublayer (Reading B of MEM
+    Eq. 3).
 
     The wrapper **adopts** the original layer's submodules by reference —
     ``self_attn``, ``layer_norm1``, ``layer_norm2``, ``mlp`` — so its
     ``state_dict`` keys are **identical** to a vanilla ``SiglipEncoderLayer``.
     That means any pi05 / pi05_continuous_state checkpoint can load directly
     into the wrapped layer without any key remapping. The only new state is
-    a non-persistent ``_temporal_pe`` buffer (excluded from state_dict) and
-    an internal ``_temporal_attn`` wrapper that holds a by-reference pointer
-    to ``self_attn`` (also excluded because it's kept in a list).
+    a non-persistent ``_temporal_pe`` buffer (excluded from state_dict).
 
-    The forward computes:
+    The forward computes (single QKV projection per block; two SDPAs share
+    those projections; one residual; one out_proj):
 
-        h_pe  = h + e(t)                                   # broadcast over (B, N)
-        h     = h + temporal_attn( LN1(h_pe) )             # new; causal over T
-        # then the standard SigLIP block:
-        h     = h + spatial_attn( LN1(h) )
-        h     = h + MLP( LN2(h) )
+        h_pe  = h + e(t)                              # broadcast over (B, N)
+        z     = LN1(h_pe)                             # ONE LN
+        Q,K,V = W_Q·z, W_K·z, W_V·z                   # ONE projection
+        V'    = SDPA(Q, K, V; causal mask over T)     # temporal pass per patch
+        out   = SDPA(Q, K, V'; no mask, over N)       # spatial pass per timestep
+        h     = h + W_O(out)                          # ONE residual on h (not h_pe)
+        h     = h + MLP( LN2(h) )                     # standard MLP block
 
-    At ``T=1`` the temporal sublayer is skipped entirely so that the block
-    degenerates to the unmodified SigLIP forward, satisfying the MEM paper's
-    single-frame invariance claim. (With ``T=1`` causal attention over a
-    single timestep is not an identity — it returns ``out_proj(v_proj(
-    LN1(x)))`` — so ``e(0)=0`` alone is insufficient; the block itself must
-    also be bypassed.)
+    Q and K are reused across both passes (same tensor, just permuted into
+    each layout); only V is replaced by ``V'`` for the spatial pass. ``W_O``
+    fires once at the end. This matches the paper's "no new learnable
+    parameters" claim at the projection level: ``W_Q``, ``W_K``, ``W_V``,
+    ``W_O`` are each applied exactly once per block, not twice.
 
-    Reusing ``layer_norm1`` for both the temporal and spatial sublayers keeps
-    the paper's "no new learnable parameters" guarantee. It is an intentional
-    design choice: the two attentions operate on different axes and the
-    LayerNorm is applied to different input tensors each time.
+    At ``T=1`` the temporal SDPA collapses to the identity (a single key,
+    so the attention weight is 1 and ``V`` passes through unchanged) and
+    ``e(t=0)=0`` makes ``h_pe = h``. The block is therefore mathematically
+    identical to a vanilla ``SiglipEncoderLayer`` forward at ``T=1`` — no
+    short-circuit is required for correctness. The wrapper still routes
+    ``T=1`` inputs through ``_spatial_block_forward`` for compute savings
+    and bit-exact match in low-precision dtypes (where the no-op temporal
+    SDPA can drift by ~1 ULP).
 
     Variable ``T`` per forward: the cached PE is built once for
     ``max_num_frames`` rows and sliced as ``pe[max_num_frames - num_frames:]``
@@ -239,10 +198,6 @@ class SpaceTimeEncoderLayerWrapper(nn.Module):
 
         self.max_num_frames = max_num_frames
         self.num_tokens_per_frame = num_tokens_per_frame
-        # The temporal attention re-uses self_attn's Q/K/V/O projections; it
-        # holds its reference in a list (see _TemporalSelfAttention) so the
-        # params don't show up twice in state_dict.
-        self._temporal_attn = _TemporalSelfAttention(self.self_attn)
 
         # Caller-driven flag: when False, ``forward`` short-circuits to the
         # vanilla spatial-only block (`_spatial_block_forward`) regardless of
@@ -342,11 +297,11 @@ class SpaceTimeEncoderLayerWrapper(nn.Module):
         if not self._temporal_active:
             return self._spatial_block_forward(hidden_states, attention_mask, output_attentions)
 
-        # Short-circuit at T=1: temporal self-attention over a single timestep
-        # collapses to ``out_proj(v_proj(LN1(x)))``, which is NOT an identity
-        # and would break single-frame invariance (the MEM paper's guarantee
-        # that a T=1 pass matches the unmodified SigLIP ViT). e(t=0)=0 alone
-        # is insufficient; the block must also be skipped.
+        # Short-circuit at T=1. Under Reading B the block IS naturally
+        # identity at T=1 (the temporal SDPA over a single key returns V
+        # unchanged, and ``e(t=0)=0`` makes ``h_pe = h``), so this is purely
+        # an optimization: it avoids the no-op temporal SDPA and guarantees
+        # bit-exact match with vanilla SigLIP in low-precision dtypes.
         if num_frames is None or num_frames == 1:
             return self._spatial_block_forward(hidden_states, attention_mask, output_attentions)
 
@@ -365,31 +320,111 @@ class SpaceTimeEncoderLayerWrapper(nn.Module):
             )
         b = bt // t
 
-        # Temporal sublayer.
-        x = rearrange(hidden_states, "(b t) n d -> b t n d", b=b, t=t)
+        attn = self.self_attn
+        num_heads = attn.num_heads
+        head_dim = attn.head_dim
+
+        # Reshape (B*T, N, D) -> (B, T, N, D) and add temporal PE.
         # Slice the precomputed PE: take the LAST t rows so the current-frame
-        # row remains zero (PE entries depend only on relative offset from the
-        # current frame, so pe[M-t:M] is byte-identical to a fresh PE built
-        # for t frames).
-        # Cast PE to match tensor device/dtype each call. Both are no-ops if
-        # already aligned (the common case — the buffer is constructed on
-        # the base layer's device). The cast only allocates when something
-        # external has moved the inputs onto a different device without
-        # propagating ``.to()`` through to this wrapper.
+        # row (t = T-1) remains exactly zero (PE entries depend only on the
+        # relative offset from the current frame, so ``pe[M-t:M]`` is
+        # byte-identical to a fresh PE built for t frames). Cast PE to match
+        # the tensor's device/dtype each call; no-op if already aligned.
+        x = rearrange(hidden_states, "(b t) n d -> b t n d", b=b, t=t)
         pe_full = self._temporal_pe.to(device=x.device, dtype=x.dtype)
         pe = pe_full[self.max_num_frames - t :].view(1, t, 1, d)
         x_pe = x + pe
 
-        t_in = rearrange(x_pe, "b t n d -> (b n) t d")
-        t_norm = self.layer_norm1(t_in)
-        t_out = self._temporal_attn(t_norm, temporal_attn_mask=temporal_attn_mask)
-        # Residual on the pre-PE hidden (not on x_pe): PE is a transient
-        # positional signal, not a feature perturbation to carry forward.
-        t_res = rearrange(x, "b t n d -> (b n) t d") + t_out
-        h_after_t = rearrange(t_res, "(b n) t d -> (b t) n d", n=n)
+        # ONE LayerNorm. Its output feeds BOTH attention passes.
+        z = self.layer_norm1(x_pe)
 
-        # Spatial + MLP sublayers.
-        return self._spatial_block_forward(h_after_t, attention_mask, output_attentions)
+        # ONE QKV projection. Q/K/V come from a single application of the
+        # layer's W_Q/W_K/W_V to LN1(h_pe). They are reshaped (not
+        # re-projected) into the temporal and spatial layouts below.
+        q = attn.q_proj(z).view(b, t, n, num_heads, head_dim)
+        k = attn.k_proj(z).view(b, t, n, num_heads, head_dim)
+        v = attn.v_proj(z).view(b, t, n, num_heads, head_dim)
+
+        # ===== Temporal SDPA: per-patch causal attention over T =====
+        # Layout (B*N, H, T, Dh): each spatial patch is its own length-T
+        # causal sequence; flatten (B, N) into the SDPA batch axis.
+        q_t = q.permute(0, 2, 3, 1, 4).reshape(b * n, num_heads, t, head_dim)
+        k_t = k.permute(0, 2, 3, 1, 4).reshape(b * n, num_heads, t, head_dim)
+        v_t = v.permute(0, 2, 3, 1, 4).reshape(b * n, num_heads, t, head_dim)
+
+        if temporal_attn_mask is not None:
+            # Caller-supplied mask already encodes both the causal pattern AND
+            # padded-history blocking; do NOT also set is_causal=True (SDPA
+            # disallows combining the two).
+            v_temp = F.scaled_dot_product_attention(
+                q_t,
+                k_t,
+                v_t,
+                attn_mask=temporal_attn_mask,
+                is_causal=False,
+                dropout_p=0.0,
+                scale=attn.scale,
+            )
+        else:
+            # is_causal=True -> lower-triangular mask. Position i attends to
+            # j <= i; since t = T-1 is the current frame, the current frame
+            # attends to all past frames.
+            v_temp = F.scaled_dot_product_attention(
+                q_t,
+                k_t,
+                v_t,
+                attn_mask=None,
+                is_causal=True,
+                dropout_p=0.0,
+                scale=attn.scale,
+            )
+        # v_temp: (B*N, H, T, Dh). Permute back into (B, T, N, H, Dh) layout
+        # so it can feed the spatial pass as the V input. The .reshape at
+        # the end materializes the new strides into a contiguous tensor.
+        v_temp = v_temp.view(b, n, num_heads, t, head_dim).permute(0, 3, 1, 2, 4)
+
+        # ===== Spatial SDPA: per-timestep bidirectional attention over N =====
+        # Q, K REUSE the same projections from z (NOT recomputed from v_temp).
+        # V is v_temp (the temporally-mixed values). Layout (B*T, H, N, Dh).
+        q_s = q.permute(0, 1, 3, 2, 4).reshape(b * t, num_heads, n, head_dim)
+        k_s = k.permute(0, 1, 3, 2, 4).reshape(b * t, num_heads, n, head_dim)
+        v_s = v_temp.permute(0, 1, 3, 2, 4).reshape(b * t, num_heads, n, head_dim)
+
+        out = F.scaled_dot_product_attention(
+            q_s,
+            k_s,
+            v_s,
+            attn_mask=attention_mask,
+            is_causal=False,
+            dropout_p=0.0,
+            scale=attn.scale,
+        )
+        # (B*T, H, N, Dh) -> (B*T, N, D)
+        out = out.transpose(1, 2).reshape(b * t, n, d)
+
+        # ONE output projection.
+        out = attn.out_proj(out)
+
+        # ONE residual on the original hidden_states (NOT on x_pe). PE is a
+        # transient positional signal that informs the attention computation;
+        # it is not a feature perturbation to carry forward in the residual.
+        h_after_attn = hidden_states + out
+
+        # Standard SigLIP MLP block on the post-attention residual.
+        residual = h_after_attn
+        h_norm = self.layer_norm2(h_after_attn)
+        h_mlp = self.mlp(h_norm)
+        h_out = residual + h_mlp
+
+        outputs: tuple[Tensor, ...] = (h_out,)
+        if output_attentions:
+            # SDPA does not return attention weights, and Reading B never
+            # materializes either α_temporal or α_spatial. Return None to
+            # keep the tuple shape; callers requesting weights at T>1 should
+            # switch to an explicit-attention build of SigLIP if they need
+            # per-layer weights.
+            outputs = outputs + (None,)
+        return outputs
 
 
 @contextmanager
