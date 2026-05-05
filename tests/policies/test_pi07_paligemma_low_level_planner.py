@@ -21,6 +21,7 @@ from opentau.policies.pi07_paligemma.low_level_planner.configuration_pi07_low_le
     PI07lowlevelPlannerConfig,
 )
 from opentau.policies.pi07_paligemma.low_level_planner.modeling_pi07_low_level import (
+    ContextItem,
     PI07LowLevelPlannerFlowMatching,
     PI07LowLevelPlannerPolicy,
     make_att_2d_masks,
@@ -60,8 +61,36 @@ def _legacy_embed_prefix(
     are stubbed to return the supplied tensors. The fake policy
     borrows the model's ``language_tokenizer`` so ``_embed_text``
     can resolve the layout strings.
+
+    Contract: ``_build_prefix_items`` is expected to read only the
+    ``language_tokenizer`` and ``prepare_*`` attributes wired below.
+    To keep silent regressions visible — if a future change to
+    ``_build_prefix_items`` reaches for some other attribute (e.g.
+    ``self.config``) — we install a strict ``__class__`` whose
+    ``__getattr__`` raises with a clear message naming the missing
+    attribute, rather than letting Python fall back to a default
+    ``AttributeError`` that points at an unrelated test failure.
     """
-    fake_policy = object.__new__(PI07LowLevelPlannerPolicy)
+
+    class _StrictFakePolicy(PI07LowLevelPlannerPolicy):
+        """Subclass that errors loudly on any unstubbed attribute access.
+
+        Bypasses ``PI07LowLevelPlannerPolicy.__init__`` via
+        ``object.__new__``; only the attributes assigned below are
+        valid. Any other attribute read raises a clear error that
+        names the missing attribute and the helper that owns it,
+        rather than the bare ``AttributeError`` that would otherwise
+        bubble up from deep inside ``_build_prefix_items``.
+        """
+
+        def __getattr__(self, name):  # noqa: D401 - clarity-first error
+            raise AttributeError(
+                f"_legacy_embed_prefix fake policy is missing attribute "
+                f"{name!r}; if _build_prefix_items now reads this, extend "
+                f"the helper in tests/policies/test_pi07_paligemma_low_level_planner.py."
+            )
+
+    fake_policy = object.__new__(_StrictFakePolicy)
     fake_policy.language_tokenizer = model.language_tokenizer
     fake_policy.prepare_videos = lambda batch: (list(videos), list(vid_masks))
     fake_policy.prepare_language = lambda batch: (lang_tokens, lang_masks)
@@ -1039,6 +1068,66 @@ class TestPI07LowLevelPlannerStateEmbedding:
         assert state_proj_calls[0] == (bsize, 1, state_dim), (
             f"state_proj input shape should be (B, 1, D), got {state_proj_calls[0]}"
         )
+
+
+class TestPI07EmbedPrefixInvariants:
+    """CPU-only tests for layout invariants enforced by ``embed_prefix``.
+
+    The dispatcher in ``embed_prefix`` requires that any items flagged
+    ``exclude_from_cross_attention=True`` form a contiguous trailing
+    run, since ``num_cross_att_tokens`` is the prefix length up to (but
+    not including) the first excluded item. If a non-excluded item ever
+    appeared after an excluded one, the count would silently undercount
+    the cross-attention scope. The guard raises ``ValueError`` so this
+    test pins the behavior — without it, the invariant is one
+    accidental refactor away from being silently bypassed.
+    """
+
+    def _make_mock_model(self, hidden_size: int = 8):
+        """Reuse the lightweight CPU stub from
+        :class:`TestPI07LowLevelPlannerStateEmbedding` so this test
+        class has no PaliGemma / GPU dependency.
+        """
+        return TestPI07LowLevelPlannerStateEmbedding._make_mock_model(hidden_size=hidden_size)
+
+    @staticmethod
+    def _text_item(bsize: int, length: int, *, exclude: bool) -> ContextItem:
+        """Minimal ``text`` ``ContextItem`` for invariant testing — the
+        mock ``embed_language_tokens`` returns zeros, so token IDs and
+        masks just need to have the right shape.
+        """
+        return ContextItem(
+            data=torch.zeros(bsize, length, dtype=torch.long),
+            item_type="text",
+            pad_mask=torch.ones(bsize, length, dtype=torch.bool),
+            attention="continue",
+            exclude_from_cross_attention=exclude,
+        )
+
+    def test_excluded_followed_by_included_raises(self):
+        """A non-excluded item after an excluded one is illegal."""
+        model = self._make_mock_model()
+        items = [
+            self._text_item(1, 3, exclude=False),
+            self._text_item(1, 2, exclude=True),
+            self._text_item(1, 1, exclude=False),
+        ]
+        with pytest.raises(ValueError, match="contiguous trailing run"):
+            PI07LowLevelPlannerFlowMatching.embed_prefix(model, items)
+
+    def test_all_included_then_all_excluded_ok(self):
+        """The legal layout (excluded items as a trailing run) returns
+        a ``num_cross_att_tokens`` equal to the summed lengths of the
+        non-excluded prefix."""
+        model = self._make_mock_model()
+        items = [
+            self._text_item(1, 3, exclude=False),
+            self._text_item(1, 2, exclude=False),
+            self._text_item(1, 4, exclude=True),
+            self._text_item(1, 1, exclude=True),
+        ]
+        _embs, _pad, _att, num_cross = PI07LowLevelPlannerFlowMatching.embed_prefix(model, items)
+        assert num_cross == 5  # 3 + 2; the trailing 4 + 1 are excluded.
 
 
 class TestPI07LowLevelPlannerResponseEmbedding:

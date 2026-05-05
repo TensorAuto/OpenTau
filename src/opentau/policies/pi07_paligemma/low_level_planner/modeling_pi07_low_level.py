@@ -753,12 +753,13 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
         # State pad mask: real for every non-padded history step; the current
         # (last) step is always real even if obs_history_is_pad isn't given.
+        # Both branches return fresh tensors, so no clone is needed before
+        # the indexed write.
         t_steps = state.shape[1]
         if obs_history_is_pad is not None:
             state_mask = ~obs_history_is_pad
         else:
             state_mask = torch.zeros(bsize, t_steps, dtype=torch.bool, device=device)
-        state_mask = state_mask.clone()
         state_mask[:, -1] = True
         items.append(ContextItem(data=state, item_type="state", pad_mask=state_mask, attention="continue"))
 
@@ -1795,7 +1796,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         embs_cat = torch.cat(embs, dim=1)
         pad_masks_cat = torch.cat(pad_masks, dim=1)
         bsize = embs_cat.shape[0]
-        att_masks = torch.tensor(att_masks_flat, dtype=embs_cat.dtype, device=embs_cat.device)
+        att_masks = torch.tensor(att_masks_flat, dtype=torch.bool, device=embs_cat.device)
         att_masks = att_masks[None, :].expand(bsize, len(att_masks_flat))
 
         return embs_cat, pad_masks_cat, att_masks, adarms_cond
