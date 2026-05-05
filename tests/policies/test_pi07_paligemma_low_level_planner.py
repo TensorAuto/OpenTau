@@ -301,7 +301,7 @@ class TestPI07LowLevelPlannerIntegration:
     # Main integration test
     # ------------------------------------------------------------------
 
-    @pytest.mark.skip(reason="run on local machine")
+    @pytest.mark.skip(reason="Requires too much memory, does not fit on RTX 3090 24GB")
     @pytest.mark.gpu
     @pytest.mark.slow
     def test_complete_pi07_low_level_pipeline(self, lerobot_dataset_metadata):

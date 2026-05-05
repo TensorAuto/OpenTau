@@ -725,6 +725,7 @@ class TestPi06GradCkptEquivalence:
 # End-to-end integration — guarded because Gemma 3 4B is huge.
 
 
+@pytest.mark.skip(reason="Requires too much memory, does not fit on RTX 3090 24GB")
 @pytest.mark.gpu
 @pytest.mark.slow
 def test_complete_pi06_pipeline_integration_smoke(lerobot_dataset_metadata):
@@ -796,6 +797,7 @@ def test_complete_pi06_pipeline_integration_smoke(lerobot_dataset_metadata):
     assert all(v.isfinite() for v in loss.values())
 
 
+@pytest.mark.skip(reason="Requires too much memory, does not fit on RTX 3090 24GB")
 @pytest.mark.gpu
 @pytest.mark.slow
 def test_pi06_loc_tokens_extend_vocab_and_resize_embeddings(lerobot_dataset_metadata):
@@ -1042,6 +1044,7 @@ def test_pi06_untrained_loads_with_no_missing_or_unexpected_keys(pi06_untrained_
     )
 
 
+@pytest.mark.skip(reason="Requires too much memory, does not fit on RTX 3090 24GB")
 @pytest.mark.gpu
 @pytest.mark.slow
 def test_pi06_untrained_vlm_matches_gemma3_4b_pt(pi06_untrained_policy, gemma3_4b_pt_aligned_state_dict):

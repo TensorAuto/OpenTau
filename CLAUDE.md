@@ -20,6 +20,14 @@ These override defaults — read them before running anything.
 
 3. **Verify determinism on any change to the training loop or model.** ML bugs hide in stochasticity: a bad change can still produce loss curves that *look* plausible. After touching anything in `scripts/train.py`, `policies/*/modeling_*.py`, `optim/`, or `datasets/sampler.py`, run a smoke config twice with the same `seed` and confirm the per-step loss series is bit-identical (not just "close"). Seeding utilities live in `src/opentau/utils/random_utils.py` (`set_seed`, `serialize_python_rng_state`, etc.). If two seeded runs diverge, that's a bug — investigate before claiming the change works.
 
+4. **Prefer `einops` for tensor reshape / permutation / reduction.** `einops` (`>=0.8.0`, already a hard dependency in `pyproject.toml`) makes tensor shape transformations self-documenting; opaque `view` / `reshape` / `permute` / `transpose` / `squeeze` / `unsqueeze` chains are a frequent source of subtle bugs in VLA model code. When writing or modifying tensor manipulation code:
+   - Use `einops.rearrange` instead of `.view(...)` / `.reshape(...)` / `.permute(...)` / `.transpose(...)` / `.squeeze(...)` / `.unsqueeze(...)` whenever the operation can be expressed as a named-axis pattern (e.g. `rearrange(x, "b t (h w) c -> b t h w c", h=H)` instead of `x.view(B, T, H, W, C)`).
+   - Use `einops.reduce` instead of `.mean(dim=...)` / `.sum(dim=...)` / `.max(dim=...)` when the reduction axes are clearer as named patterns.
+   - Use `einops.repeat` instead of `.expand(...)` / `.repeat(...)` / broadcasting tricks with `unsqueeze`.
+   - Use `einops.einsum` for non-trivial contractions instead of `torch.einsum` with single-letter indices, since named axes survive copy-paste better.
+   - Exceptions where plain torch ops are fine: simple `.flatten()` of a contiguous suffix, single-axis `.sum()` over the last dim, contiguity calls (`.contiguous()`), and shape-preserving ops (`.to(...)`, `.float()`). Don't rewrite these just for the sake of einops.
+   - When matching a reference (HuggingFace `transformers`, upstream LeRobot, the original π model code), preserve the existing op style verbatim inside that block — readability gains are not worth diff churn against an upstream reference.
+
 ## Project overview
 
 OpenTau is Tensor's open-source PyTorch training toolchain for vision-language-action (VLA) models — a fork of LeRobot with extra capabilities (heterogeneous-dataset co-training, discrete actions for π₀.₅, knowledge insulation, dropout in PaliGemma, π*₀.₆-style RL, validation splits, profilers). Any LeRobot-compliant policy and dataset works directly. Pinned to **Python 3.10**.

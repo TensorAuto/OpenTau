@@ -352,6 +352,7 @@ class TestPI07LowLevelIntegration:
     # Main integration test
     # ------------------------------------------------------------------
 
+    @pytest.mark.skip(reason="Requires too much memory, does not fit on RTX 3090 24GB")
     @pytest.mark.gpu
     @pytest.mark.slow
     def test_complete_pi07_low_level_pipeline(self, lerobot_dataset_metadata):
@@ -611,6 +612,7 @@ class TestPI07LowLevelIntegration:
 
         assert action.shape == (1, MAX_ACTION_DIM)
 
+    @pytest.mark.skip(reason="Requires too much memory, does not fit on RTX 3090 24GB")
     @pytest.mark.gpu
     @pytest.mark.slow
     def test_no_optionals_path_on_real_gemma3(self, lerobot_dataset_metadata):
@@ -758,6 +760,7 @@ class TestPI07LowLevelRegression:
             "mistake_is_pad": torch.tensor([False] * batch_size, device="cuda"),
         }
 
+    @pytest.mark.skip(reason="Requires too much memory, does not fit on RTX 3090 24GB")
     @pytest.mark.gpu
     @pytest.mark.slow
     def test_prepare_metadata_always_returns_tensors(self, lerobot_dataset_metadata):
