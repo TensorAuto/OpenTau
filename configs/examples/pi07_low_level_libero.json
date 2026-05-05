@@ -11,12 +11,7 @@
         "image_resample_strategy": "nearest",
         "vector_resample_strategy": "nearest",
         "n_obs_history": 8,
-        "history_interval": 1,
-        "history_state_drop_prob": 1.0,
-        "subgoal_drop_prob": 1.0,
-        "response_drop_prob": 1.0,
-        "metadata_drop_all_prob": 1.0,
-        "metadata_drop_each_prob": 1.0
+        "history_interval": 1
     },
     "policy": {
         "type": "pi07_low_level",
