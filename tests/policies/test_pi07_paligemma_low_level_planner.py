@@ -21,10 +21,182 @@ from opentau.policies.pi07_paligemma.low_level_planner.configuration_pi07_low_le
     PI07lowlevelPlannerConfig,
 )
 from opentau.policies.pi07_paligemma.low_level_planner.modeling_pi07_low_level import (
+    ContextItem,
     PI07LowLevelPlannerFlowMatching,
     PI07LowLevelPlannerPolicy,
     make_att_2d_masks,
 )
+
+
+def _legacy_embed_prefix(
+    model,
+    *,
+    videos,
+    vid_masks,
+    lang_tokens,
+    lang_masks,
+    state,
+    response_tokens,
+    response_masks,
+    metadata_tokens,
+    metadata_masks,
+    subgoal_videos=(),
+    subgoal_vid_masks=(),
+    discrete_actions=None,
+    discrete_action_masks=None,
+    obs_history_is_pad=None,
+):
+    """Construct the canonical ``ContextItem`` list from legacy kwargs and
+    call ``model.embed_prefix``.
+
+    Mirrors :meth:`PI07LowLevelPlannerPolicy._build_prefix_items` but
+    operates on raw tensors instead of a batch dict, so the existing
+    embedding tests can keep their lightweight stub setup.
+    """
+    bsize = lang_tokens.shape[0]
+    device = lang_tokens.device
+    tokenizer = model.language_tokenizer
+
+    def _toks(s: str):
+        ids = tokenizer.encode(s, add_special_tokens=False)
+        t = torch.tensor([ids] * bsize, device=device)
+        return t, len(ids)
+
+    items: list[ContextItem] = []
+    for vid, vid_mask in zip(videos, vid_masks, strict=True):
+        items.append(
+            ContextItem(
+                data=vid,
+                item_type="video",
+                pad_mask=vid_mask,
+                attention="continue",
+                obs_history_is_pad=obs_history_is_pad,
+            )
+        )
+    items.append(ContextItem(data=lang_tokens, item_type="text", pad_mask=lang_masks, attention="continue"))
+    state_ind, state_ind_len = _toks("State: ")
+    items.append(
+        ContextItem(
+            data=state_ind,
+            item_type="text",
+            pad_mask=torch.ones(bsize, state_ind_len, dtype=torch.bool, device=device),
+            attention="continue",
+        )
+    )
+    t_steps = state.shape[1]
+    if obs_history_is_pad is not None:
+        state_mask = ~obs_history_is_pad
+    else:
+        state_mask = torch.zeros(bsize, t_steps, dtype=torch.bool, device=device)
+    state_mask = state_mask.clone()
+    state_mask[:, -1] = True
+    items.append(ContextItem(data=state, item_type="state", pad_mask=state_mask, attention="continue"))
+
+    sample_has_response = response_masks.any(dim=1)
+    rc, rc_len = _toks(", ")
+    items.append(
+        ContextItem(
+            data=rc,
+            item_type="text",
+            pad_mask=sample_has_response[:, None].expand(bsize, rc_len),
+            attention="continue",
+        )
+    )
+    items.append(
+        ContextItem(
+            data=response_tokens,
+            item_type="text",
+            pad_mask=response_masks,
+            attention="bidirectional",
+        )
+    )
+
+    if subgoal_vid_masks:
+        sample_has_subgoal = torch.stack(list(subgoal_vid_masks), dim=0).any(dim=0)
+    else:
+        sample_has_subgoal = torch.zeros(bsize, dtype=torch.bool, device=device)
+    sgc, sgc_len = _toks(", ")
+    items.append(
+        ContextItem(
+            data=sgc,
+            item_type="text",
+            pad_mask=sample_has_subgoal[:, None].expand(bsize, sgc_len),
+            attention="continue",
+        )
+    )
+    sgs, sgs_len = _toks("Subgoal: ")
+    items.append(
+        ContextItem(
+            data=sgs,
+            item_type="text",
+            pad_mask=sample_has_subgoal[:, None].expand(bsize, sgs_len),
+            attention="bidirectional",
+        )
+    )
+    for sg_vid, sg_vid_mask in zip(subgoal_videos, subgoal_vid_masks, strict=True):
+        items.append(
+            ContextItem(
+                data=sg_vid,
+                item_type="video",
+                pad_mask=sg_vid_mask,
+                attention="continue",
+            )
+        )
+
+    sample_has_metadata = metadata_masks.any(dim=1)
+    mdc, mdc_len = _toks(", ")
+    items.append(
+        ContextItem(
+            data=mdc,
+            item_type="text",
+            pad_mask=sample_has_metadata[:, None].expand(bsize, mdc_len),
+            attention="continue",
+        )
+    )
+    items.append(
+        ContextItem(
+            data=metadata_tokens,
+            item_type="text",
+            pad_mask=metadata_masks,
+            attention="bidirectional",
+        )
+    )
+
+    se, _ = _toks(":\n")
+    items.append(
+        ContextItem(
+            data=se,
+            item_type="text",
+            pad_mask=torch.ones(bsize, se.shape[1], dtype=torch.bool, device=device),
+            attention="continue",
+        )
+    )
+
+    if discrete_actions is not None:
+        assert discrete_action_masks is not None
+        di, di_len = _toks("Action: ")
+        items.append(
+            ContextItem(
+                data=di,
+                item_type="text",
+                pad_mask=torch.ones(bsize, di_len, dtype=torch.bool, device=device),
+                attention="causal",
+                exclude_from_cross_attention=True,
+            )
+        )
+        items.append(
+            ContextItem(
+                data=discrete_actions,
+                item_type="discrete_action",
+                pad_mask=discrete_action_masks,
+                attention="causal",
+                exclude_from_cross_attention=True,
+            )
+        )
+
+    embs, pad_masks, att_masks, _num_cross = PI07LowLevelPlannerFlowMatching.embed_prefix(model, items)
+    return embs, pad_masks, att_masks
+
 
 # Config defaults used across the test.
 NUM_CAMERAS = 2
@@ -300,31 +472,26 @@ class TestPI07LowLevelPlannerIntegration:
                 captured["action_expert_position_ids"] = kwargs["position_ids"].clone()
             return original_paligemma_forward(*args, **kwargs)
 
-        def capture_embed_prefix(*args, **kwargs):
-            # Truncate discrete actions to inject padding (same workaround as PI05 test).
-            # Replacing ``model.embed_prefix`` with a plain function drops ``self`` from *args,
-            # so positions are: 0 videos, 1 vid_masks, 2 lang_tokens, 3 lang_masks,
-            # 4 discrete_actions, 5 discrete_action_masks (state is keyword-only).
+        def capture_embed_prefix(items, *args, **kwargs):
+            # Truncate the discrete-action item to inject padding (same workaround as PI05 test).
+            # ``items`` is the ``ContextItem`` list; the discrete-action block is the
+            # trailing item with item_type == "discrete_action".
             half = DISCRETE_ACTION_MAX_LENGTH // 2
-            args = list(args)
-            da = args[4]
-            dm = args[5]
-            bsz = da.shape[0]
-            args[4] = torch.cat(
-                (
-                    da[:, :half],
-                    torch.zeros((bsz, half), dtype=da.dtype, device=da.device),
-                ),
-                dim=-1,
-            )
-            args[5] = torch.cat(
-                (
-                    dm[:, :half],
-                    torch.zeros((bsz, half), dtype=torch.bool, device=dm.device),
-                ),
-                dim=-1,
-            )
-            result = original_embed_prefix(*args, **kwargs)
+            for item in items:
+                if item.item_type == "discrete_action":
+                    da = item.data
+                    dm = item.pad_mask
+                    bsz = da.shape[0]
+                    item.data = torch.cat(
+                        (da[:, :half], torch.zeros((bsz, half), dtype=da.dtype, device=da.device)),
+                        dim=-1,
+                    )
+                    item.pad_mask = torch.cat(
+                        (dm[:, :half], torch.zeros((bsz, half), dtype=torch.bool, device=dm.device)),
+                        dim=-1,
+                    )
+                    break
+            result = original_embed_prefix(items, *args, **kwargs)
             captured["prefix_pad_masks"] = result[1].clone()
             captured["prefix_att_masks"] = result[2].clone()
             return result
@@ -676,7 +843,7 @@ class TestPI07LowLevelPlannerStateEmbedding:
         metadata_tokens = torch.zeros(bsize, metadata_len, dtype=torch.long)
         metadata_masks = torch.zeros(bsize, metadata_len, dtype=torch.bool)
 
-        (embs, pad_masks, att_masks) = PI07LowLevelPlannerFlowMatching.embed_prefix(
+        (embs, pad_masks, att_masks) = _legacy_embed_prefix(
             model,
             videos=videos,
             vid_masks=vid_masks,
@@ -789,14 +956,14 @@ class TestPI07LowLevelPlannerStateEmbedding:
 
         pad_with_current = torch.ones(bsize, t, dtype=torch.bool)
         pad_with_current[:, -1] = False
-        (embs_partial, pm_partial, _) = PI07LowLevelPlannerFlowMatching.embed_prefix(
+        (embs_partial, pm_partial, _) = _legacy_embed_prefix(
             model,
             **common_kwargs,
             obs_history_is_pad=pad_with_current,
         )
 
         pad_all_true = torch.ones(bsize, t, dtype=torch.bool)
-        (embs_all, pm_all, _) = PI07LowLevelPlannerFlowMatching.embed_prefix(
+        (embs_all, pm_all, _) = _legacy_embed_prefix(
             model,
             **common_kwargs,
             obs_history_is_pad=pad_all_true,
@@ -929,7 +1096,7 @@ class TestPI07LowLevelPlannerStateEmbedding:
         pad = torch.ones(bsize, t, dtype=torch.bool)
         pad[:, -1] = False
 
-        PI07LowLevelPlannerFlowMatching.embed_prefix(
+        _legacy_embed_prefix(
             model,
             videos=[torch.zeros(bsize, t, 3, 8, 8)],
             vid_masks=[torch.ones(bsize, dtype=torch.bool)],
@@ -964,7 +1131,7 @@ class TestPI07LowLevelPlannerStateEmbedding:
         bsize, state_dim = 1, 8
         prompt_len = 5
 
-        PI07LowLevelPlannerFlowMatching.embed_prefix(
+        _legacy_embed_prefix(
             model,
             videos=[torch.zeros(bsize, 1, 3, 8, 8)],
             vid_masks=[torch.ones(bsize, dtype=torch.bool)],
@@ -1107,7 +1274,7 @@ class TestPI07LowLevelPlannerResponseEmbedding:
         model = cls._make_mock_model(hidden_size=hidden_size)
         model.video_encoder.num_frames = n_obs_steps
 
-        (embs, pad_masks, att_masks) = PI07LowLevelPlannerFlowMatching.embed_prefix(
+        (embs, pad_masks, att_masks) = _legacy_embed_prefix(
             model,
             videos=[torch.zeros(bsize, n_obs_steps, 3, 8, 8)],
             vid_masks=[torch.ones(bsize, dtype=torch.bool)],
@@ -1351,7 +1518,7 @@ class TestPI07LowLevelPlannerMetadataEmbedding:
         model = TestPI07LowLevelPlannerResponseEmbedding._make_mock_model(hidden_size=hidden_size)
         assert metadata_tokens.shape[1] == METADATA_MAX_LENGTH
 
-        (_, pad_masks, _) = PI07LowLevelPlannerFlowMatching.embed_prefix(
+        (_, pad_masks, _) = _legacy_embed_prefix(
             model,
             videos=[torch.zeros(bsize, n_obs_steps, 3, 8, 8)],
             vid_masks=[torch.ones(bsize, dtype=torch.bool)],
@@ -1648,7 +1815,7 @@ class TestPI07LowLevelPlannerSubgoalEmbedding:
         model.video_encoder.num_frames = n_obs_steps
         assert len(subgoal_videos) == len(subgoal_vid_masks)
 
-        (_, pad_masks, _) = PI07LowLevelPlannerFlowMatching.embed_prefix(
+        (_, pad_masks, _) = _legacy_embed_prefix(
             model,
             videos=[torch.zeros(bsize, n_obs_steps, 3, 8, 8)],
             vid_masks=[torch.ones(bsize, dtype=torch.bool)],
@@ -1953,7 +2120,7 @@ class TestPI07LowLevelPlannerSubgoalEmbedding:
         model.embed_video = _capturing_embed_video
 
         # Call embed_prefix directly so we can install the capturing mock.
-        PI07LowLevelPlannerFlowMatching.embed_prefix(
+        _legacy_embed_prefix(
             model,
             videos=[torch.zeros(bsz, n_obs_steps, 3, 8, 8)],
             vid_masks=[torch.ones(bsz, dtype=torch.bool)],
