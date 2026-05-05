@@ -1660,3 +1660,136 @@ class TestBuildHistoryBatchEmitsObsHistoryIsPad:
             else:
                 assert torch.all(state[t] == 7.0), f"state[{t}] zero-filled but mask says real"
                 assert torch.all(cam[t] == 5.0), f"camera[{t}] zero-filled but mask says real"
+
+
+# disable_action_expert — the high-level planner never feeds the expert stream,
+# so it opts out of instantiating the ~860M-parameter Gemma-v1 action expert
+# (modeling_pi07_high_level.py:1157 always passes inputs_embeds=[prefix, None]).
+
+
+class TestDisableActionExpert:
+    """Locks in the ``disable_action_expert`` invariant: with the flag set,
+    ``Gemma3WithExpertModel.gemma_expert is None``, the saved state_dict
+    contains zero ``gemma_expert.*`` keys, and a single-stream forward call
+    matches a baseline run that allocated the (unused) expert."""
+
+    def _disabled_cfg(self) -> Gemma3WithExpertConfig:
+        cfg = _make_tiny_g3we_cfg()
+        cfg.disable_action_expert = True
+        return cfg
+
+    def test_gemma_expert_is_none_when_disabled(self):
+        """``self.gemma_expert`` is ``None`` and absent from the named module
+        list (so it carries zero parameters)."""
+        cfg = self._disabled_cfg()
+        model = Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+
+        assert model.gemma_expert is None
+        named = {name for name, _ in model.named_modules()}
+        assert not any(n.startswith("gemma_expert") for n in named), (
+            "gemma_expert.* must not appear in the module hierarchy when disabled"
+        )
+        assert all("gemma_expert" not in n for n, _ in model.named_parameters()), (
+            "gemma_expert.* parameters leaked through despite disable_action_expert=True"
+        )
+
+    def test_state_dict_has_no_gemma_expert_keys(self):
+        """The saved state_dict (i.e. what ``save_model_as_safetensor`` would
+        write to disk) contains zero ``gemma_expert.*`` entries — that's the
+        disk-byte savings the flag is meant to deliver."""
+        cfg = self._disabled_cfg()
+        model = Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+
+        keys = set(model.state_dict().keys())
+        leaked = {k for k in keys if k.startswith("gemma_expert.")}
+        assert not leaked, f"unexpected gemma_expert.* keys in state_dict: {sorted(leaked)[:5]}"
+
+    def test_forward_runs_with_single_stream_input(self, monkeypatch):
+        """A backbone-only forward (``inputs_embeds=[backbone, None]``) returns
+        a finite backbone output and ``None`` for the expert stream — no crash
+        on missing ``self.gemma_expert.model.{norm,layers}``.
+
+        Pin ``_preferred_dtype`` to float32 to match the convention of the
+        other forward tests in this file (``Gemma3WithExpertModel.__init__``
+        otherwise auto-casts a subset of submodules to bf16, which mismatches
+        a fresh ``model.to(torch.float32)`` cast inside the per-layer
+        attention math)."""
+        monkeypatch.setattr(g3we, "_preferred_dtype", lambda: torch.float32)
+
+        cfg = self._disabled_cfg()
+        model = Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+        model.eval()
+
+        batch_size, seq_len = 1, 4
+        hidden = cfg.gemma3_config.text_config.hidden_size
+        backbone_embs = torch.randn(batch_size, seq_len, hidden, dtype=torch.float32)
+        attn_mask = torch.ones(batch_size, seq_len, seq_len, dtype=torch.bool)
+        position_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
+
+        with torch.no_grad():
+            (backbone_out, expert_out), _ = model.forward(
+                attention_mask=attn_mask,
+                position_ids=position_ids,
+                inputs_embeds=[backbone_embs, None],
+                use_cache=False,
+                fill_kv_cache=False,
+            )
+
+        assert expert_out is None, "expert stream output must mirror the None input"
+        assert backbone_out is not None
+        assert backbone_out.shape == (batch_size, seq_len, hidden)
+        assert torch.isfinite(backbone_out).all()
+
+    def test_forward_rejects_expert_input_when_disabled(self):
+        """Feeding a non-None expert stream when the expert was not
+        instantiated must surface a clear error rather than crashing on
+        ``NoneType.model.norm``."""
+        cfg = self._disabled_cfg()
+        model = Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+
+        backbone = torch.zeros(1, 2, cfg.gemma3_config.text_config.hidden_size)
+        expert = torch.zeros(1, 2, cfg.gemma_expert_config.hidden_size)
+        attn_mask = torch.ones(1, 4, 4, dtype=torch.bool)
+        position_ids = torch.arange(4, dtype=torch.long).unsqueeze(0)
+
+        with pytest.raises(ValueError, match="disable_action_expert"):
+            model.forward(
+                attention_mask=attn_mask,
+                position_ids=position_ids,
+                inputs_embeds=[backbone, expert],
+                use_cache=False,
+                fill_kv_cache=False,
+            )
+
+    def test_config_rejects_train_expert_only_when_disabled(self):
+        """Validation: training only the expert is incompatible with not
+        having one."""
+        with pytest.raises(ValueError, match="train_expert_only"):
+            Gemma3WithExpertConfig(
+                discrete_action_vocab_size=2048,
+                disable_action_expert=True,
+                train_expert_only=True,
+                freeze_vision_encoder=True,
+            )
+
+    def test_high_level_planner_default_disables_expert(self):
+        """The π0.7 high-level planner config defaults to
+        ``disable_action_expert=True`` because the planner forward pass
+        always feeds ``inputs_embeds=[prefix_embs, None]`` (see
+        modeling_pi07_high_level.py:1157)."""
+        from opentau.policies.pi07.high_level_planner.configuration_pi07_high_level import (
+            PI07HighLevelPlannerConfig,
+        )
+
+        cfg = PI07HighLevelPlannerConfig()
+        assert cfg.vlm_config.disable_action_expert is True
+
+    def test_low_level_default_keeps_expert(self):
+        """The π0.7 low-level component must keep the expert (it's the action
+        head). Sanity: refactor didn't accidentally flip the low-level default."""
+        from opentau.policies.pi07.low_level.configuration_pi07_low_level import (
+            PI07LowLevelConfig,
+        )
+
+        cfg = PI07LowLevelConfig()
+        assert cfg.vlm_config.disable_action_expert is False

@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import warnings
+from pathlib import Path
 
+import draccus
 import pytest
 
 from opentau.configs.default import DatasetConfig, DatasetMixtureConfig
@@ -187,3 +190,83 @@ class TestDatasetConfigDataMapping:
         # Restore original state of global mappings
         DATA_FEATURES_NAME_MAPPING.clear()
         DATA_FEATURES_NAME_MAPPING.update(self.original_data_mapping)
+
+
+# transformers.PretrainedConfig codec round-trip — pinned because pi07's
+# policy configs declare `vlm_config: Gemma3WithExpertConfig` (a PretrainedConfig
+# subclass) as a draccus field, and save_pretrained/from_pretrained walk it.
+
+
+class TestPretrainedConfigCodec:
+    """Verify the encode/decode handlers registered in
+    ``opentau.configs.policies`` round-trip ``transformers.PretrainedConfig``
+    subclasses through draccus.
+
+    Without these handlers, ``PI07HighLevelPlannerConfig._save_pretrained``
+    raises ``Exception("No parser for object ...")`` when draccus tries to
+    serialise the nested ``vlm_config: Gemma3WithExpertConfig`` field —
+    which is the bug surfaced when bootstrapping the
+    ``TensorAuto/pi07-{high,low}-untrained`` checkpoints.
+    """
+
+    def test_encode_dispatches_via_to_dict_for_subclass(self):
+        """``draccus.encode`` resolves to ``obj.to_dict()`` even for a subclass
+        of ``PretrainedConfig`` (registered with ``include_subclasses=True``)."""
+        from opentau.policies.pi07.gemma3_with_expert import Gemma3WithExpertConfig
+
+        cfg = Gemma3WithExpertConfig(dropout=0.42)
+        encoded = draccus.encode(cfg)
+
+        assert isinstance(encoded, dict)
+        assert encoded["dropout"] == 0.42
+        # Nested transformers configs serialize as dicts too.
+        assert isinstance(encoded["gemma3_config"], dict)
+        assert encoded["gemma3_config"]["text_config"]["hidden_size"] == 2560
+
+    def test_decode_reconstructs_correct_subclass(self):
+        """``draccus.decode(SubCls, data)`` returns an instance of ``SubCls``,
+        not the parent ``PretrainedConfig``."""
+        from opentau.policies.pi07.gemma3_with_expert import Gemma3WithExpertConfig
+
+        original = Gemma3WithExpertConfig(dropout=0.3)
+        encoded = draccus.encode(original)
+        decoded = draccus.decode(Gemma3WithExpertConfig, encoded)
+
+        assert type(decoded) is Gemma3WithExpertConfig
+        assert decoded.dropout == 0.3
+        # Nested config also reconstructs to a real PretrainedConfig (not a dict).
+        assert decoded.gemma3_config.text_config.hidden_size == 2560
+
+    def test_pi07_high_level_config_save_load_round_trip(self, tmp_path: Path):
+        """End-to-end: ``PI07HighLevelPlannerConfig`` round-trips through
+        ``_save_pretrained`` -> ``PreTrainedConfig.from_pretrained``, with the
+        ``vlm_config`` subtree preserved.
+
+        This is the actual failure mode that broke the
+        ``TensorAuto/pi07-high-untrained`` build before the codec was
+        registered.
+        """
+        from opentau.configs.policies import PreTrainedConfig
+        from opentau.policies.pi07.high_level_planner.configuration_pi07_high_level import (
+            PI07HighLevelPlannerConfig,
+        )
+
+        cfg = PI07HighLevelPlannerConfig(dropout=0.25)
+        cfg._save_pretrained(tmp_path)
+
+        # The serialised vlm_config must round-trip as a dict (not crash) and
+        # must contain the nested Gemma 3 text + vision config blobs.
+        with open(tmp_path / "config.json") as f:
+            data = json.load(f)
+        assert isinstance(data["vlm_config"], dict)
+        assert "gemma3_config" in data["vlm_config"]
+        assert "gemma_expert_config" in data["vlm_config"]
+
+        loaded = PreTrainedConfig.from_pretrained(tmp_path)
+        assert isinstance(loaded, PI07HighLevelPlannerConfig)
+        assert loaded.dropout == 0.25
+        # vlm_config came back as a real Gemma3WithExpertConfig, not a dict.
+        from opentau.policies.pi07.gemma3_with_expert import Gemma3WithExpertConfig
+
+        assert isinstance(loaded.vlm_config, Gemma3WithExpertConfig)
+        assert loaded.vlm_config.gemma3_config.text_config.hidden_size == 2560
