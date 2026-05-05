@@ -1542,33 +1542,13 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         vlm_h = self.paligemma_with_expert.config.paligemma_config.text_config.hidden_size
         n_sg_tokens = self.video_encoder.num_video_tokens
         sg_dtype = _preferred_dtype()
-        # SpaceTime SigLIP is constructed with num_frames=n_obs_history; subgoal
-        # videos arrive single-frame (B, 1, C, H, W). Pad to (B, num_frames, ...)
-        # with the real subgoal as the last frame and zeros for prior frames,
-        # then mask out the padded history via obs_history_is_pad so temporal
-        # attention sees only the current (subgoal) frame.
-        sg_num_frames = self.video_encoder.num_frames
+        # Subgoals are single-frame (B, 1, C, H, W); the encoder accepts any
+        # T in [1, max_num_frames] and short-circuits the temporal sublayer at
+        # T=1, so we forward the subgoal as-is — no pad-to-history needed.
 
         for sg_vid, sg_vid_mask in zip(subgoal_videos, subgoal_vid_masks, strict=True):
             if any_subgoal_in_batch:
-                sg_vid_padded = sg_vid
-                sg_obs_pad: Tensor | None = None
-                t_in = sg_vid.shape[1]
-                if t_in != sg_num_frames:
-                    if t_in != 1:
-                        raise ValueError(f"Expected subgoal video T=1 or T={sg_num_frames}; got T={t_in}.")
-                    b_sg = sg_vid.shape[0]
-                    pad_frames = torch.zeros(
-                        b_sg,
-                        sg_num_frames - 1,
-                        *sg_vid.shape[2:],
-                        device=sg_vid.device,
-                        dtype=sg_vid.dtype,
-                    )
-                    sg_vid_padded = torch.cat([pad_frames, sg_vid], dim=1)
-                    sg_obs_pad = torch.ones(b_sg, sg_num_frames, dtype=torch.bool, device=sg_vid.device)
-                    sg_obs_pad[:, -1] = False
-                sg_vid_emb = self.embed_video(sg_vid_padded, obs_history_is_pad=sg_obs_pad)
+                sg_vid_emb = self.embed_video(sg_vid)
                 sg_vid_emb = sg_vid_emb.to(dtype=sg_dtype)
             else:
                 sg_vid_emb = torch.zeros(bsize, n_sg_tokens, vlm_h, device=lang_tokens.device, dtype=sg_dtype)

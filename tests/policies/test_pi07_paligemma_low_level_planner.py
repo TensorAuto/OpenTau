@@ -640,8 +640,9 @@ class TestPI07LowLevelPlannerStateEmbedding:
 
         def _embed_video(video, obs_history_is_pad=None):
             t = video.shape[1]
-            if t != model.video_encoder.num_frames:
-                raise ValueError(f"Expected T={model.video_encoder.num_frames} frames; got {t}.")
+            max_t = model.video_encoder.num_frames
+            if not 1 <= t <= max_t:
+                raise ValueError(f"Expected 1 <= T <= {max_t}; got {t}.")
             return torch.zeros(video.shape[0], 6, h, dtype=torch.bfloat16)
 
         model.embed_video = _embed_video
@@ -1081,8 +1082,9 @@ class TestPI07LowLevelPlannerResponseEmbedding:
 
         def _embed_video(video, obs_history_is_pad=None):
             t = video.shape[1]
-            if t != model.video_encoder.num_frames:
-                raise ValueError(f"Expected T={model.video_encoder.num_frames} frames; got {t}.")
+            max_t = model.video_encoder.num_frames
+            if not 1 <= t <= max_t:
+                raise ValueError(f"Expected 1 <= T <= {max_t}; got {t}.")
             return torch.zeros(video.shape[0], 6, h, dtype=torch.bfloat16)
 
         model.embed_video = _embed_video
@@ -1921,13 +1923,11 @@ class TestPI07LowLevelPlannerSubgoalEmbedding:
         assert torch.equal(pm_a, pm_b)
 
     # ------------------------------------------------------------------ #
-    # n_obs_history > 1: subgoal videos must be padded to (B, num_frames, …)
-    # before reaching the SpaceTime SigLIP encoder, with obs_history_is_pad
-    # blocking all but the current frame. Regression test for the crash
-    # at video_encoder.py:485 (T != num_frames) when any sample has a real
-    # subgoal and the encoder was constructed with num_frames > 1.
+    # n_obs_history > 1: subgoals are single-frame (B, 1, C, H, W) and the
+    # encoder accepts variable T in [1, max_num_frames], so they pass through
+    # unpadded — the wrapper's T=1 short-circuit handles the temporal axis.
     # ------------------------------------------------------------------ #
-    def test_subgoal_padded_to_num_frames_when_n_obs_history_gt_one(self):
+    def test_subgoal_passed_through_at_t1_when_n_obs_history_gt_one(self):
         bsz = 2
         n_obs_steps = 4
         batch = self._subgoal_batch(
@@ -1944,8 +1944,9 @@ class TestPI07LowLevelPlannerSubgoalEmbedding:
 
         def _capturing_embed_video(video, obs_history_is_pad=None):
             t = video.shape[1]
-            if t != model.video_encoder.num_frames:
-                raise ValueError(f"Expected T={model.video_encoder.num_frames} frames; got {t}.")
+            max_t = model.video_encoder.num_frames
+            if not 1 <= t <= max_t:
+                raise ValueError(f"Expected 1 <= T <= {max_t}; got {t}.")
             captured.append((tuple(video.shape), obs_history_is_pad))
             return torch.zeros(video.shape[0], 6, 8, dtype=torch.bfloat16)
 
@@ -1968,12 +1969,10 @@ class TestPI07LowLevelPlannerSubgoalEmbedding:
         )
 
         # Expect one embed_video call per main-video camera (T=n_obs_steps,
-        # obs_history_is_pad=None), then one per subgoal camera with the same
-        # T and obs_history_is_pad marking only the last frame as not-padded.
+        # obs_history_is_pad=None), then one per subgoal camera at T=1 with
+        # obs_history_is_pad=None — the encoder's T=1 short-circuit handles
+        # the temporal axis without padding.
         assert len(captured) == 1 + len(sg_videos)
         for shape, pad in captured[1:]:
-            assert shape == (bsz, n_obs_steps, 3, 224, 224), shape
-            assert pad is not None
-            assert pad.shape == (bsz, n_obs_steps)
-            assert torch.all(pad[:, :-1])
-            assert torch.all(~pad[:, -1])
+            assert shape == (bsz, 1, 3, 224, 224), shape
+            assert pad is None

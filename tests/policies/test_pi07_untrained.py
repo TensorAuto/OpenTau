@@ -33,7 +33,7 @@ Notes:
   fixture does not call ``ensure_loc_tokens``.
 - For the low-level checkpoint, the SigLIP encoder layers at indices
   [3, 7, 11, 15, 19, 23] are wrapped in place by
-  :class:`~opentau.policies.pi07.low_level.video_encoder.SpaceTimeEncoderLayerWrapper`.
+  :class:`~opentau.policies.pi07.video_encoder.SpaceTimeEncoderLayerWrapper`.
   The wrapper adopts the wrapped ``SiglipEncoderLayer``'s submodules under the
   same attribute names (``self_attn`` / ``layer_norm1`` / ``layer_norm2`` /
   ``mlp``); the temporal extras are a non-persistent buffer + a by-list
