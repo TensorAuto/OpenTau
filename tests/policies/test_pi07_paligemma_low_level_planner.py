@@ -21,10 +21,101 @@ from opentau.policies.pi07_paligemma.low_level_planner.configuration_pi07_low_le
     PI07lowlevelPlannerConfig,
 )
 from opentau.policies.pi07_paligemma.low_level_planner.modeling_pi07_low_level import (
+    ContextItem,
     PI07LowLevelPlannerFlowMatching,
     PI07LowLevelPlannerPolicy,
     make_att_2d_masks,
 )
+
+
+def _legacy_embed_prefix(
+    model,
+    *,
+    videos,
+    vid_masks,
+    lang_tokens,
+    lang_masks,
+    state,
+    response_tokens,
+    response_masks,
+    metadata_tokens,
+    metadata_masks,
+    subgoal_videos=(),
+    subgoal_vid_masks=(),
+    discrete_actions=None,
+    discrete_action_masks=None,
+    obs_history_is_pad=None,
+):
+    """Drive ``PI07LowLevelPlannerPolicy._build_prefix_items`` from the
+    raw tensors these tests already construct, then run the resulting
+    items through ``model.embed_prefix``.
+
+    Going through the production layout method keeps the tests on a
+    single source of truth: any change to ``_build_prefix_items``
+    (the whole point of this refactor — adding/reordering blocks should
+    only require editing one place) is exercised here automatically,
+    rather than silently testing a parallel re-implementation.
+
+    The wiring: a bare ``PI07LowLevelPlannerPolicy`` instance is
+    fabricated with ``object.__new__`` and its ``prepare_*`` methods
+    are stubbed to return the supplied tensors. The fake policy
+    borrows the model's ``language_tokenizer`` so ``_embed_text``
+    can resolve the layout strings.
+
+    Contract: ``_build_prefix_items`` is expected to read only the
+    ``language_tokenizer`` and ``prepare_*`` attributes wired below.
+    To keep silent regressions visible — if a future change to
+    ``_build_prefix_items`` reaches for some other attribute (e.g.
+    ``self.config``) — we install a strict ``__class__`` whose
+    ``__getattr__`` raises with a clear message naming the missing
+    attribute, rather than letting Python fall back to a default
+    ``AttributeError`` that points at an unrelated test failure.
+    """
+
+    class _StrictFakePolicy(PI07LowLevelPlannerPolicy):
+        """Subclass that errors loudly on any unstubbed attribute access.
+
+        Bypasses ``PI07LowLevelPlannerPolicy.__init__`` via
+        ``object.__new__``; only the attributes assigned below are
+        valid. Any other attribute read raises a clear error that
+        names the missing attribute and the helper that owns it,
+        rather than the bare ``AttributeError`` that would otherwise
+        bubble up from deep inside ``_build_prefix_items``.
+        """
+
+        def __getattr__(self, name):  # noqa: D401 - clarity-first error
+            raise AttributeError(
+                f"_legacy_embed_prefix fake policy is missing attribute "
+                f"{name!r}; if _build_prefix_items now reads this, extend "
+                f"the helper in tests/policies/test_pi07_paligemma_low_level_planner.py."
+            )
+
+    fake_policy = object.__new__(_StrictFakePolicy)
+    fake_policy.language_tokenizer = model.language_tokenizer
+    fake_policy.prepare_videos = lambda batch: (list(videos), list(vid_masks))
+    fake_policy.prepare_language = lambda batch: (lang_tokens, lang_masks)
+    fake_policy.prepare_response = lambda batch: (response_tokens, response_masks)
+    fake_policy.prepare_metadata = lambda batch: (metadata_tokens, metadata_masks)
+    fake_policy.prepare_subgoal_images = lambda batch: (
+        list(subgoal_videos),
+        list(subgoal_vid_masks),
+    )
+    fake_policy.prepare_state = lambda batch: state
+
+    batch: dict = {}
+    if obs_history_is_pad is not None:
+        batch["obs_history_is_pad"] = obs_history_is_pad
+
+    items = PI07LowLevelPlannerPolicy._build_prefix_items(
+        fake_policy,
+        batch,
+        include_discrete_actions=discrete_actions is not None,
+        discrete_actions=discrete_actions,
+        discrete_action_masks=discrete_action_masks,
+    )
+    embs, pad_masks, att_masks, _num_cross = PI07LowLevelPlannerFlowMatching.embed_prefix(model, items)
+    return embs, pad_masks, att_masks
+
 
 # Config defaults used across the test.
 NUM_CAMERAS = 2
@@ -239,7 +330,7 @@ class TestPI07LowLevelPlannerIntegration:
     # Main integration test
     # ------------------------------------------------------------------
 
-    @pytest.mark.skip(reason="run on local machine")
+    @pytest.mark.skip(reason="Requires too much memory, does not fit on RTX 3090 24GB")
     @pytest.mark.gpu
     @pytest.mark.slow
     def test_complete_pi07_low_level_pipeline(self, lerobot_dataset_metadata):
@@ -300,31 +391,26 @@ class TestPI07LowLevelPlannerIntegration:
                 captured["action_expert_position_ids"] = kwargs["position_ids"].clone()
             return original_paligemma_forward(*args, **kwargs)
 
-        def capture_embed_prefix(*args, **kwargs):
-            # Truncate discrete actions to inject padding (same workaround as PI05 test).
-            # Replacing ``model.embed_prefix`` with a plain function drops ``self`` from *args,
-            # so positions are: 0 videos, 1 vid_masks, 2 lang_tokens, 3 lang_masks,
-            # 4 discrete_actions, 5 discrete_action_masks (state is keyword-only).
+        def capture_embed_prefix(items, *args, **kwargs):
+            # Truncate the discrete-action item to inject padding (same workaround as PI05 test).
+            # ``items`` is the ``ContextItem`` list; the discrete-action block is the
+            # trailing item with item_type == "discrete_action".
             half = DISCRETE_ACTION_MAX_LENGTH // 2
-            args = list(args)
-            da = args[4]
-            dm = args[5]
-            bsz = da.shape[0]
-            args[4] = torch.cat(
-                (
-                    da[:, :half],
-                    torch.zeros((bsz, half), dtype=da.dtype, device=da.device),
-                ),
-                dim=-1,
-            )
-            args[5] = torch.cat(
-                (
-                    dm[:, :half],
-                    torch.zeros((bsz, half), dtype=torch.bool, device=dm.device),
-                ),
-                dim=-1,
-            )
-            result = original_embed_prefix(*args, **kwargs)
+            for item in items:
+                if item.item_type == "discrete_action":
+                    da = item.data
+                    dm = item.pad_mask
+                    bsz = da.shape[0]
+                    item.data = torch.cat(
+                        (da[:, :half], torch.zeros((bsz, half), dtype=da.dtype, device=da.device)),
+                        dim=-1,
+                    )
+                    item.pad_mask = torch.cat(
+                        (dm[:, :half], torch.zeros((bsz, half), dtype=torch.bool, device=dm.device)),
+                        dim=-1,
+                    )
+                    break
+            result = original_embed_prefix(items, *args, **kwargs)
             captured["prefix_pad_masks"] = result[1].clone()
             captured["prefix_att_masks"] = result[2].clone()
             return result
@@ -676,7 +762,7 @@ class TestPI07LowLevelPlannerStateEmbedding:
         metadata_tokens = torch.zeros(bsize, metadata_len, dtype=torch.long)
         metadata_masks = torch.zeros(bsize, metadata_len, dtype=torch.bool)
 
-        (embs, pad_masks, att_masks) = PI07LowLevelPlannerFlowMatching.embed_prefix(
+        (embs, pad_masks, att_masks) = _legacy_embed_prefix(
             model,
             videos=videos,
             vid_masks=vid_masks,
@@ -789,14 +875,14 @@ class TestPI07LowLevelPlannerStateEmbedding:
 
         pad_with_current = torch.ones(bsize, t, dtype=torch.bool)
         pad_with_current[:, -1] = False
-        (embs_partial, pm_partial, _) = PI07LowLevelPlannerFlowMatching.embed_prefix(
+        (embs_partial, pm_partial, _) = _legacy_embed_prefix(
             model,
             **common_kwargs,
             obs_history_is_pad=pad_with_current,
         )
 
         pad_all_true = torch.ones(bsize, t, dtype=torch.bool)
-        (embs_all, pm_all, _) = PI07LowLevelPlannerFlowMatching.embed_prefix(
+        (embs_all, pm_all, _) = _legacy_embed_prefix(
             model,
             **common_kwargs,
             obs_history_is_pad=pad_all_true,
@@ -929,7 +1015,7 @@ class TestPI07LowLevelPlannerStateEmbedding:
         pad = torch.ones(bsize, t, dtype=torch.bool)
         pad[:, -1] = False
 
-        PI07LowLevelPlannerFlowMatching.embed_prefix(
+        _legacy_embed_prefix(
             model,
             videos=[torch.zeros(bsize, t, 3, 8, 8)],
             vid_masks=[torch.ones(bsize, dtype=torch.bool)],
@@ -964,7 +1050,7 @@ class TestPI07LowLevelPlannerStateEmbedding:
         bsize, state_dim = 1, 8
         prompt_len = 5
 
-        PI07LowLevelPlannerFlowMatching.embed_prefix(
+        _legacy_embed_prefix(
             model,
             videos=[torch.zeros(bsize, 1, 3, 8, 8)],
             vid_masks=[torch.ones(bsize, dtype=torch.bool)],
@@ -982,6 +1068,66 @@ class TestPI07LowLevelPlannerStateEmbedding:
         assert state_proj_calls[0] == (bsize, 1, state_dim), (
             f"state_proj input shape should be (B, 1, D), got {state_proj_calls[0]}"
         )
+
+
+class TestPI07EmbedPrefixInvariants:
+    """CPU-only tests for layout invariants enforced by ``embed_prefix``.
+
+    The dispatcher in ``embed_prefix`` requires that any items flagged
+    ``exclude_from_cross_attention=True`` form a contiguous trailing
+    run, since ``num_cross_att_tokens`` is the prefix length up to (but
+    not including) the first excluded item. If a non-excluded item ever
+    appeared after an excluded one, the count would silently undercount
+    the cross-attention scope. The guard raises ``ValueError`` so this
+    test pins the behavior — without it, the invariant is one
+    accidental refactor away from being silently bypassed.
+    """
+
+    def _make_mock_model(self, hidden_size: int = 8):
+        """Reuse the lightweight CPU stub from
+        :class:`TestPI07LowLevelPlannerStateEmbedding` so this test
+        class has no PaliGemma / GPU dependency.
+        """
+        return TestPI07LowLevelPlannerStateEmbedding._make_mock_model(hidden_size=hidden_size)
+
+    @staticmethod
+    def _text_item(bsize: int, length: int, *, exclude: bool) -> ContextItem:
+        """Minimal ``text`` ``ContextItem`` for invariant testing — the
+        mock ``embed_language_tokens`` returns zeros, so token IDs and
+        masks just need to have the right shape.
+        """
+        return ContextItem(
+            data=torch.zeros(bsize, length, dtype=torch.long),
+            item_type="text",
+            pad_mask=torch.ones(bsize, length, dtype=torch.bool),
+            attention="continue",
+            exclude_from_cross_attention=exclude,
+        )
+
+    def test_excluded_followed_by_included_raises(self):
+        """A non-excluded item after an excluded one is illegal."""
+        model = self._make_mock_model()
+        items = [
+            self._text_item(1, 3, exclude=False),
+            self._text_item(1, 2, exclude=True),
+            self._text_item(1, 1, exclude=False),
+        ]
+        with pytest.raises(ValueError, match="contiguous trailing run"):
+            PI07LowLevelPlannerFlowMatching.embed_prefix(model, items)
+
+    def test_all_included_then_all_excluded_ok(self):
+        """The legal layout (excluded items as a trailing run) returns
+        a ``num_cross_att_tokens`` equal to the summed lengths of the
+        non-excluded prefix."""
+        model = self._make_mock_model()
+        items = [
+            self._text_item(1, 3, exclude=False),
+            self._text_item(1, 2, exclude=False),
+            self._text_item(1, 4, exclude=True),
+            self._text_item(1, 1, exclude=True),
+        ]
+        _embs, _pad, _att, num_cross = PI07LowLevelPlannerFlowMatching.embed_prefix(model, items)
+        assert num_cross == 5  # 3 + 2; the trailing 4 + 1 are excluded.
 
 
 class TestPI07LowLevelPlannerResponseEmbedding:
@@ -1107,7 +1253,7 @@ class TestPI07LowLevelPlannerResponseEmbedding:
         model = cls._make_mock_model(hidden_size=hidden_size)
         model.video_encoder.num_frames = n_obs_steps
 
-        (embs, pad_masks, att_masks) = PI07LowLevelPlannerFlowMatching.embed_prefix(
+        (embs, pad_masks, att_masks) = _legacy_embed_prefix(
             model,
             videos=[torch.zeros(bsize, n_obs_steps, 3, 8, 8)],
             vid_masks=[torch.ones(bsize, dtype=torch.bool)],
@@ -1351,7 +1497,7 @@ class TestPI07LowLevelPlannerMetadataEmbedding:
         model = TestPI07LowLevelPlannerResponseEmbedding._make_mock_model(hidden_size=hidden_size)
         assert metadata_tokens.shape[1] == METADATA_MAX_LENGTH
 
-        (_, pad_masks, _) = PI07LowLevelPlannerFlowMatching.embed_prefix(
+        (_, pad_masks, _) = _legacy_embed_prefix(
             model,
             videos=[torch.zeros(bsize, n_obs_steps, 3, 8, 8)],
             vid_masks=[torch.ones(bsize, dtype=torch.bool)],
@@ -1648,7 +1794,7 @@ class TestPI07LowLevelPlannerSubgoalEmbedding:
         model.video_encoder.num_frames = n_obs_steps
         assert len(subgoal_videos) == len(subgoal_vid_masks)
 
-        (_, pad_masks, _) = PI07LowLevelPlannerFlowMatching.embed_prefix(
+        (_, pad_masks, _) = _legacy_embed_prefix(
             model,
             videos=[torch.zeros(bsize, n_obs_steps, 3, 8, 8)],
             vid_masks=[torch.ones(bsize, dtype=torch.bool)],
@@ -1953,7 +2099,7 @@ class TestPI07LowLevelPlannerSubgoalEmbedding:
         model.embed_video = _capturing_embed_video
 
         # Call embed_prefix directly so we can install the capturing mock.
-        PI07LowLevelPlannerFlowMatching.embed_prefix(
+        _legacy_embed_prefix(
             model,
             videos=[torch.zeros(bsz, n_obs_steps, 3, 8, 8)],
             vid_masks=[torch.ones(bsz, dtype=torch.bool)],

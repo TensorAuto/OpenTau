@@ -24,7 +24,9 @@ import builtins
 import logging
 import math
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import torch
@@ -47,6 +49,55 @@ from opentau.policies.pi07_paligemma.low_level_planner.configuration_pi07_low_le
 from opentau.policies.pretrained import PreTrainedPolicy, T
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
+
+ItemType = Literal["text", "video", "state", "discrete_action", "action"]
+AttentionMode = Literal["continue", "bidirectional", "causal"]
+
+
+@dataclass
+class ContextItem:
+    """One token-block contributed to the prefix or suffix sequence.
+
+    The ``PI07LowLevelPlannerPolicy`` builds a list of ``ContextItem``s and
+    hands it to the ``PI07LowLevelPlannerFlowMatching`` model. The model
+    embeds each item by ``item_type`` (text, video, state, discrete_action,
+    action), concatenates the embeddings, and derives the 1-D attention
+    mask from each item's ``attention`` setting. To add or rearrange
+    blocks in the prefix/suffix, edit the policy's list construction —
+    the model is layout-agnostic.
+
+    Fields:
+        data: Per-type input. ``text``/``discrete_action``: token IDs
+            ``(B, L)``. ``video``: pixel video ``(B, T, C, H, W)`` in
+            ``[0, 1]``. ``state``: continuous state ``(B, T, max_state_dim)``.
+            ``action``: noisy actions ``(B, chunk_size, max_action_dim)``.
+        item_type: Dispatch key for which embedding path to take.
+        pad_mask: Padding mask. ``(B,)`` per-sample is allowed for
+            ``video`` (the model expands it to ``(B, num_video_tokens)``).
+            All other types must pass ``(B, L)`` matching the embedded
+            sequence length. ``True`` = real, ``False`` = padded.
+        attention: 1-D attention pattern for this block:
+            - ``"continue"``: ``[0]*L`` — token continues the previous
+              block's attention scope (bidirectional with everything before).
+            - ``"bidirectional"``: ``[1] + [0]*(L-1)`` — opens a new block
+              boundary, then bidirectional within the block.
+            - ``"causal"``: ``[1]*L`` — every token starts its own scope
+              (fully causal within this block).
+        exclude_from_cross_attention: When ``True``, this item's tokens are
+            not cross-attended to by the suffix (action expert). Used for
+            the trailing ``"Action: "`` indicator + discrete-action block,
+            which the action expert must not condition on.
+        obs_history_is_pad: Optional ``(B, T)`` mask threaded into the
+            video encoder's temporal attention (only used by ``video``
+            items). ``True`` marks padded history frames.
+    """
+
+    data: Tensor
+    item_type: ItemType
+    pad_mask: Tensor
+    attention: AttentionMode = "continue"
+    exclude_from_cross_attention: bool = False
+    obs_history_is_pad: Tensor | None = None
 
 
 def _preferred_dtype():
@@ -615,6 +666,216 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         action = self._action_queue.popleft()
         return action
 
+    def _embed_text(self, text: str, bsize: int, device: torch.device) -> tuple[Tensor, int]:
+        """Tokenize a fixed string and replicate across the batch.
+
+        Returns ``(token_ids, length)`` where ``token_ids`` has shape
+        ``(bsize, length)``. Used by :meth:`_build_prefix_items` to insert
+        layout strings (``"State: "``, ``"Subgoal: "``, separators, etc.)
+        without each call site having to think about device/batching.
+        """
+        ids = self.language_tokenizer.encode(text, add_special_tokens=False)
+        tokens = torch.tensor([ids] * bsize, device=device)
+        return tokens, len(ids)
+
+    def _build_prefix_items(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        include_discrete_actions: bool,
+        discrete_actions: Tensor | None = None,
+        discrete_action_masks: Tensor | None = None,
+    ) -> list[ContextItem]:
+        """Construct the ordered ``ContextItem`` list defining the prefix.
+
+        This is the **single place** to edit when adding a new conditioning
+        block, removing one, or rearranging the order. The downstream
+        ``PI07LowLevelPlannerFlowMatching`` is layout-agnostic.
+
+        Layout (top-to-bottom = sequence order):
+
+            videos
+            language ("Task: …")
+            "State: "
+            state (per-timestep stream)
+            ", " — gated by sample_has_response
+            response ("Subtask: …") — gated per-token by response_masks
+            ", " — gated by sample_has_subgoal
+            "Subgoal: "
+            subgoal videos (one per camera, per-sample masked)
+            ", " — gated by sample_has_metadata
+            metadata ("Metadata: Speed: …") — gated per-token by metadata_masks
+            ":\n"
+            (training only)
+            "Action: " — excluded from cross-attention
+            discrete_actions (FAST tokens) — excluded from cross-attention
+        """
+        obs_history_is_pad = batch.get("obs_history_is_pad")
+
+        videos, vid_masks = self.prepare_videos(batch)
+        lang_tokens, lang_masks = self.prepare_language(batch)
+        response_tokens, response_masks = self.prepare_response(batch)
+        metadata_tokens, metadata_masks = self.prepare_metadata(batch)
+        subgoal_videos, subgoal_vid_masks = self.prepare_subgoal_images(batch)
+        state = self.prepare_state(batch)
+
+        bsize = state.shape[0]
+        device = state.device
+        items: list[ContextItem] = []
+
+        for vid, vid_mask in zip(videos, vid_masks, strict=True):
+            items.append(
+                ContextItem(
+                    data=vid,
+                    item_type="video",
+                    pad_mask=vid_mask,
+                    attention="continue",
+                    obs_history_is_pad=obs_history_is_pad,
+                )
+            )
+
+        items.append(
+            ContextItem(data=lang_tokens, item_type="text", pad_mask=lang_masks, attention="continue")
+        )
+
+        state_indicator_tokens, _ = self._embed_text("State: ", bsize, device)
+        state_indicator_mask = torch.ones(
+            bsize, state_indicator_tokens.shape[1], dtype=torch.bool, device=device
+        )
+        items.append(
+            ContextItem(
+                data=state_indicator_tokens,
+                item_type="text",
+                pad_mask=state_indicator_mask,
+                attention="continue",
+            )
+        )
+
+        # State pad mask: real for every non-padded history step; the current
+        # (last) step is always real even if obs_history_is_pad isn't given.
+        # Both branches return fresh tensors, so no clone is needed before
+        # the indexed write.
+        t_steps = state.shape[1]
+        if obs_history_is_pad is not None:
+            state_mask = ~obs_history_is_pad
+        else:
+            state_mask = torch.zeros(bsize, t_steps, dtype=torch.bool, device=device)
+        state_mask[:, -1] = True
+        items.append(ContextItem(data=state, item_type="state", pad_mask=state_mask, attention="continue"))
+
+        # Response block: gated by sample_has_response.
+        sample_has_response = response_masks.any(dim=1)
+        resp_comma_tokens, resp_comma_len = self._embed_text(", ", bsize, device)
+        items.append(
+            ContextItem(
+                data=resp_comma_tokens,
+                item_type="text",
+                pad_mask=sample_has_response[:, None].expand(bsize, resp_comma_len),
+                attention="continue",
+            )
+        )
+        items.append(
+            ContextItem(
+                data=response_tokens,
+                item_type="text",
+                pad_mask=response_masks,
+                attention="bidirectional",
+            )
+        )
+
+        # Subgoal block: gated by sample_has_subgoal (OR across cameras).
+        if subgoal_vid_masks:
+            sample_has_subgoal = torch.stack(subgoal_vid_masks, dim=0).any(dim=0)
+        else:
+            sample_has_subgoal = torch.zeros(bsize, dtype=torch.bool, device=device)
+
+        sg_comma_tokens, sg_comma_len = self._embed_text(", ", bsize, device)
+        items.append(
+            ContextItem(
+                data=sg_comma_tokens,
+                item_type="text",
+                pad_mask=sample_has_subgoal[:, None].expand(bsize, sg_comma_len),
+                attention="continue",
+            )
+        )
+        sg_start_tokens, sg_start_len = self._embed_text("Subgoal: ", bsize, device)
+        items.append(
+            ContextItem(
+                data=sg_start_tokens,
+                item_type="text",
+                pad_mask=sample_has_subgoal[:, None].expand(bsize, sg_start_len),
+                attention="bidirectional",
+            )
+        )
+        for sg_vid, sg_vid_mask in zip(subgoal_videos, subgoal_vid_masks, strict=True):
+            items.append(
+                ContextItem(
+                    data=sg_vid,
+                    item_type="video",
+                    pad_mask=sg_vid_mask,
+                    attention="continue",
+                )
+            )
+
+        # Metadata block: gated by sample_has_metadata.
+        sample_has_metadata = metadata_masks.any(dim=1)
+        md_comma_tokens, md_comma_len = self._embed_text(", ", bsize, device)
+        items.append(
+            ContextItem(
+                data=md_comma_tokens,
+                item_type="text",
+                pad_mask=sample_has_metadata[:, None].expand(bsize, md_comma_len),
+                attention="continue",
+            )
+        )
+        items.append(
+            ContextItem(
+                data=metadata_tokens,
+                item_type="text",
+                pad_mask=metadata_masks,
+                attention="bidirectional",
+            )
+        )
+
+        # Always-real state-end terminator.
+        state_end_tokens, _ = self._embed_text(":\n", bsize, device)
+        state_end_mask = torch.ones(bsize, state_end_tokens.shape[1], dtype=torch.bool, device=device)
+        items.append(
+            ContextItem(
+                data=state_end_tokens,
+                item_type="text",
+                pad_mask=state_end_mask,
+                attention="continue",
+            )
+        )
+
+        if include_discrete_actions:
+            assert discrete_actions is not None and discrete_action_masks is not None, (
+                "discrete_actions / discrete_action_masks required when include_discrete_actions=True"
+            )
+            da_indicator_tokens, da_indicator_len = self._embed_text("Action: ", bsize, device)
+            da_indicator_mask = torch.ones(bsize, da_indicator_len, dtype=torch.bool, device=device)
+            items.append(
+                ContextItem(
+                    data=da_indicator_tokens,
+                    item_type="text",
+                    pad_mask=da_indicator_mask,
+                    attention="causal",
+                    exclude_from_cross_attention=True,
+                )
+            )
+            items.append(
+                ContextItem(
+                    data=discrete_actions,
+                    item_type="discrete_action",
+                    pad_mask=discrete_action_masks,
+                    attention="causal",
+                    exclude_from_cross_attention=True,
+                )
+            )
+
+        return items
+
     @torch.no_grad()
     def sample_actions(
         self,
@@ -660,21 +921,16 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
         self._hydrate_optional_conditioning_batch(batch)
 
-        obs_history_is_pad = batch.get("obs_history_is_pad")
-
-        videos, vid_masks = self.prepare_videos(batch)
-        lang_tokens, lang_masks = self.prepare_language(batch)
-        response_tokens, response_masks = self.prepare_response(batch)
-        metadata_tokens, metadata_masks = self.prepare_metadata(batch)
-        subgoal_videos, subgoal_vid_masks = self.prepare_subgoal_images(batch)
+        prefix_items = self._build_prefix_items(batch, include_discrete_actions=False)
+        bsize = batch["state"].shape[0]
+        device = batch["state"].device
 
         if delay is None:
-            delay = torch.tensor(0, dtype=torch.long, device=lang_tokens.device)
+            delay = torch.tensor(0, dtype=torch.long, device=device)
 
         if action_prefix is None:
-            bsize = lang_tokens.shape[0]
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
-            action_prefix = torch.zeros(actions_shape, dtype=lang_tokens.dtype, device=lang_tokens.device)
+            action_prefix = torch.zeros(actions_shape, dtype=torch.float32, device=device)
         else:
             action_prefix = self.normalize_targets({"actions": action_prefix})["actions"]
             action_prefix = F.pad(
@@ -682,11 +938,11 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
                 (0, 0, 0, self.config.chunk_size - action_prefix.shape[1]),
             )
 
-        state = self.prepare_state(batch)
-
-        assert state.ndim == 3, f"Expected state (B, T, D) but got {state.shape}"
-
-        t_dim = state.shape[1]
+        # `prepare_state` already ran inside `_build_prefix_items`; replicate
+        # its T inference here without a second call (a 2-D state is
+        # unsqueezed to T=1, otherwise T = state.shape[-2]).
+        raw_state = batch["state"]
+        t_dim = 1 if raw_state.ndim == 2 else raw_state.shape[-2]
         if self.config.n_obs_history is not None and self.config.n_obs_history > 1 and t_dim == 1:
             logging.warning(
                 "n_obs_history=%d but state has T=%d (single timestep). "
@@ -696,21 +952,10 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             )
 
         actions = self.model.sample_actions(
-            videos,
-            vid_masks,
-            lang_tokens,
-            lang_masks,
-            action_prefix,
-            delay,
-            state,
+            prefix_items,
+            action_prefix=action_prefix,
+            delay=delay,
             noise=noise,
-            response_tokens=response_tokens,
-            response_masks=response_masks,
-            subgoal_videos=subgoal_videos,
-            subgoal_vid_masks=subgoal_vid_masks,
-            metadata_tokens=metadata_tokens,
-            metadata_masks=metadata_masks,
-            obs_history_is_pad=obs_history_is_pad,
         )
 
         # Unpad actions
@@ -740,37 +985,24 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
         self._hydrate_optional_conditioning_batch(batch)
 
-        obs_history_is_pad = batch.get("obs_history_is_pad")
-
-        videos, vid_masks = self.prepare_videos(batch)
-        lang_tokens, lang_masks = self.prepare_language(batch)
-        response_tokens, response_masks = self.prepare_response(batch)
-        metadata_tokens, metadata_masks = self.prepare_metadata(batch)
-        subgoal_videos, subgoal_vid_masks = self.prepare_subgoal_images(batch)
         discrete_actions, discrete_action_masks = self.prepare_discrete_actions(batch)
         actions = batch["actions"]
         actions_is_pad = batch.get("action_is_pad")
 
-        state = self.prepare_state(batch)
+        prefix_items = self._build_prefix_items(
+            batch,
+            include_discrete_actions=True,
+            discrete_actions=discrete_actions,
+            discrete_action_masks=discrete_action_masks,
+        )
         losses = self.model.forward(
-            videos,
-            vid_masks,
-            lang_tokens,
-            lang_masks,
-            actions,
-            actions_is_pad,
-            noise,
-            time,
-            discrete_actions,
-            discrete_action_masks,
-            state=state,
-            response_tokens=response_tokens,
-            response_masks=response_masks,
-            subgoal_videos=subgoal_videos,
-            subgoal_vid_masks=subgoal_vid_masks,
-            metadata_tokens=metadata_tokens,
-            metadata_masks=metadata_masks,
-            obs_history_is_pad=obs_history_is_pad,
+            prefix_items,
+            actions=actions,
+            discrete_actions=discrete_actions,
+            discrete_action_masks=discrete_action_masks,
+            actions_is_pad=actions_is_pad,
+            noise=noise,
+            time=time,
         )
 
         mse_loss = losses["MSE"]
@@ -1386,374 +1618,224 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         """
         return self.video_encoder(video, obs_history_is_pad=obs_history_is_pad)
 
-    def embed_prefix(
-        self,
-        videos: list[Tensor],
-        vid_masks: list[Tensor],
-        lang_tokens: Tensor,
-        lang_masks: Tensor,
-        discrete_actions: Tensor | None = None,
-        discrete_action_masks: Tensor | None = None,
-        state: Tensor | None = None,
-        *,
-        response_tokens: Tensor,
-        response_masks: Tensor,
-        metadata_tokens: Tensor,
-        metadata_masks: Tensor,
-        subgoal_videos: list[Tensor] = (),
-        subgoal_vid_masks: list[Tensor] = (),
-        obs_history_is_pad: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """Embed video/images with SpaceTime SigLIP and language tokens to prepare
-        for PaliGemma transformer processing.
+    def _embed_item(self, item: ContextItem) -> tuple[Tensor, Tensor]:
+        """Embed a single ``ContextItem`` and return ``(emb, expanded_pad_mask)``.
 
-        Args:
-            videos: List of video tensors, each (B, T, C, H, W) in [0, 1].
-            vid_masks: List of boolean masks, each (B,).
-            lang_tokens: Language token tensor.
-            lang_masks: Language mask tensor.
-            discrete_actions: Optional discrete action tensor.
-            discrete_action_masks: Optional discrete action mask tensor.
-            state: Optional continuous state tensor of shape ``(B, T, max_state_dim)``.
-            response_tokens: Subtask response token IDs ``(B, response_max_length)``.
-            response_masks: Boolean mask for response tokens (never ``None``).
-            metadata_tokens: Metadata token IDs ``(B, metadata_max_length)`` (never ``None``).
-            metadata_masks: Boolean mask for metadata tokens (never ``None``).
-            subgoal_videos: List of subgoal video tensors, each (B, 1, C, H, W) in [0, 1].
-            subgoal_vid_masks: List of boolean masks, each (B,).
-            obs_history_is_pad: Optional ``(B, T)`` boolean mask where ``True``
-                marks padded (missing) history timesteps.
+        Dispatches on ``item.item_type``:
+        - ``text`` / ``discrete_action``: token-ID embedding via PaliGemma
+          (text gets the ``sqrt(hidden)`` normalization).
+        - ``state``: continuous-state projection.
+        - ``video``: SpaceTime SigLIP. The unified video encoder accepts
+          variable ``T`` (short-circuiting the temporal sublayer at
+          ``T=1``), so single-frame subgoal videos are forwarded as-is —
+          no zero-prepend to ``num_frames`` is required. When no sample
+          needs this video (``pad_mask.any()`` is ``False``), the SigLIP
+          backbone is skipped and zeros are emitted instead — a strict
+          efficiency win since the per-token pad mask zeros the slot
+          regardless. **DDP invariant:** the skip is data-dependent, so
+          all ranks must agree on whether SigLIP runs. ``pad_mask`` for
+          a ``video`` item must therefore be derivable from config
+          (e.g. ``empty_cameras`` is config-determined; real cameras get
+          all-True per-rank), never per-sample data that can diverge
+          across ranks — otherwise DDP with
+          ``find_unused_parameters=False`` will deadlock.
+        - ``action``: noisy-action projection (suffix only).
 
-        Returns:
-            A tuple (embs, pad_masks, att_masks).
+        The pad mask is broadcast/expanded so the returned mask matches
+        the embedded sequence length: per-sample ``(B,)`` is allowed for
+        ``video`` and is expanded to ``(B, num_video_tokens)``; all other
+        types pass through ``(B, L)`` unchanged.
         """
-        embs = []
-        pad_masks = []
-        att_masks = []
-
-        for vid, vid_mask in zip(videos, vid_masks, strict=False):
-            vid_emb = self.embed_video(vid, obs_history_is_pad=obs_history_is_pad)
-            vid_emb = vid_emb.to(dtype=_preferred_dtype())
-
-            bsize, num_vid_embs = vid_emb.shape[:2]
-            vid_mask = vid_mask[:, None].expand(bsize, num_vid_embs)
-
-            embs.append(vid_emb)
-            pad_masks.append(vid_mask)
-
-            att_masks += [0] * num_vid_embs
-
-        lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
-
-        # Normalize language embeddings
-        lang_emb_dim = lang_emb.shape[-1]
-        lang_emb = lang_emb * math.sqrt(lang_emb_dim)
-
-        embs.append(lang_emb)
-        pad_masks.append(lang_masks)
-
-        # full attention between image and language inputs
-        num_lang_embs = lang_emb.shape[1]
-        att_masks += [0] * num_lang_embs
-
-        state_indicator_ids = self.language_tokenizer.encode("State: ", add_special_tokens=False)
-        state_indicator_tokens = torch.tensor([state_indicator_ids] * bsize, device=lang_tokens.device)
-        state_indicator_emb = self.paligemma_with_expert.embed_language_tokens(state_indicator_tokens)
-        state_indicator_emb = state_indicator_emb * math.sqrt(state_indicator_emb.shape[-1])
-        state_indicator_mask = torch.ones(
-            bsize, state_indicator_emb.shape[1], dtype=torch.bool, device=lang_tokens.device
-        )
-        embs.append(state_indicator_emb)
-        pad_masks.append(state_indicator_mask)
-        att_masks += [0] * state_indicator_emb.shape[1]
-
-        # state: (B, T, max_state_dim) — one VLM token per timestep
-        state_emb = self.state_proj(state.to(dtype=_preferred_dtype()))  # (B, T, vlm_hidden)
-        t_steps = state_emb.shape[1]
-
-        if obs_history_is_pad is not None:
-            state_mask = ~obs_history_is_pad  # (B, T)
-        else:
-            # Absent → assume all history is padded; only current step is real.
-            state_mask = torch.zeros(bsize, t_steps, dtype=torch.bool, device=state.device)
-        state_mask[:, -1] = True
-
-        embs.append(state_emb)
-        pad_masks.append(state_mask)
-        att_masks += [0] * t_steps
-
-        # Per-sample flag: True for samples that have at least one real
-        # response token, False for samples whose response was dropped.
-        sample_has_response = response_masks.any(dim=1)  # (B,)
-
-        # ", " separator — only unmasked for samples with response
-        comma_ids = self.language_tokenizer.encode(", ", add_special_tokens=False)
-        comma_tokens = torch.tensor([comma_ids] * bsize, device=lang_tokens.device)
-        comma_emb = self.paligemma_with_expert.embed_language_tokens(comma_tokens)
-        comma_emb = comma_emb * math.sqrt(comma_emb.shape[-1])
-        num_comma_tokens = comma_emb.shape[1]
-        comma_mask = sample_has_response[:, None].expand(bsize, num_comma_tokens)
-        embs.append(comma_emb)
-        pad_masks.append(comma_mask)
-        att_masks += [0] * num_comma_tokens
-
-        # Response tokens — already per-sample masked via response_masks
-        response_emb = self.paligemma_with_expert.embed_language_tokens(response_tokens)
-        response_emb_dim = response_emb.shape[-1]
-        response_emb = response_emb * math.sqrt(response_emb_dim)
-        embs.append(response_emb)
-        pad_masks.append(response_masks)
-        num_response_embs = response_emb.shape[1]
-        att_masks += [1] + [0] * (num_response_embs - 1)
-
-        # --- Subgoal block (per-sample masked) ---
-        if subgoal_vid_masks:
-            sample_has_subgoal = torch.stack(subgoal_vid_masks, dim=0).any(dim=0)  # (B,)
-        else:
-            sample_has_subgoal = torch.zeros(bsize, dtype=torch.bool, device=lang_tokens.device)
-
-        # ", " separator between response/state and subgoal header
-        sg_comma_ids = self.language_tokenizer.encode(", ", add_special_tokens=False)
-        sg_comma_tokens = torch.tensor([sg_comma_ids] * bsize, device=lang_tokens.device)
-        sg_comma_emb = self.paligemma_with_expert.embed_language_tokens(sg_comma_tokens)
-        sg_comma_emb = sg_comma_emb * math.sqrt(sg_comma_emb.shape[-1])
-        num_sg_comma = sg_comma_emb.shape[1]
-        sg_comma_mask = sample_has_subgoal[:, None].expand(bsize, num_sg_comma)
-        embs.append(sg_comma_emb)
-        pad_masks.append(sg_comma_mask)
-        att_masks += [0] * num_sg_comma
-
-        # "Subgoal: " header
-        sg_start_ids = self.language_tokenizer.encode("Subgoal: ", add_special_tokens=False)
-        sg_start_tokens = torch.tensor([sg_start_ids] * bsize, device=lang_tokens.device)
-        sg_start_emb = self.paligemma_with_expert.embed_language_tokens(sg_start_tokens)
-        sg_start_emb = sg_start_emb * math.sqrt(sg_start_emb.shape[-1])
-        num_sg_start = sg_start_emb.shape[1]
-        sg_start_mask = sample_has_subgoal[:, None].expand(bsize, num_sg_start)
-        embs.append(sg_start_emb)
-        pad_masks.append(sg_start_mask)
-        att_masks += [1] + [0] * (num_sg_start - 1)
-
-        # Subgoal image embeddings via SpaceTime SigLIP. When every sample
-        # masks subgoal (common with ``subgoal_drop_prob≈1`` or eval without
-        # subgoal tensors), skip the vision backbone — zeros match padded slots
-        # and avoid ~2× redundant SigLIP forwards per step (OOM on tight VRAM).
-        any_subgoal_in_batch = bool(sample_has_subgoal.any().item())
-        vlm_h = self.paligemma_with_expert.config.paligemma_config.text_config.hidden_size
-        n_sg_tokens = self.video_encoder.num_video_tokens
-        sg_dtype = _preferred_dtype()
-        # Subgoals are single-frame (B, 1, C, H, W); the encoder accepts any
-        # T in [1, max_num_frames] and short-circuits the temporal sublayer at
-        # T=1, so we forward the subgoal as-is — no pad-to-history needed.
-
-        for sg_vid, sg_vid_mask in zip(subgoal_videos, subgoal_vid_masks, strict=True):
-            if any_subgoal_in_batch:
-                sg_vid_emb = self.embed_video(sg_vid)
-                sg_vid_emb = sg_vid_emb.to(dtype=sg_dtype)
+        t = item.item_type
+        if t == "text":
+            emb = self.paligemma_with_expert.embed_language_tokens(item.data)
+            emb = emb * math.sqrt(emb.shape[-1])
+            return emb, item.pad_mask
+        if t == "state":
+            emb = self.state_proj(item.data.to(dtype=_preferred_dtype()))
+            return emb, item.pad_mask
+        if t == "discrete_action":
+            emb = self.paligemma_with_expert.embed_discrete_actions(item.data)
+            return emb.to(dtype=_preferred_dtype()), item.pad_mask
+        if t == "action":
+            emb = self.action_in_proj(item.data.to(dtype=_preferred_dtype()))
+            return emb, item.pad_mask
+        if t == "video":
+            # The unified SigLIP video encoder accepts variable T
+            # (short-circuiting the temporal sublayer at T=1), so single-frame
+            # subgoal videos are forwarded as-is without padding to num_frames.
+            video = item.data
+            obs_pad = item.obs_history_is_pad
+            per_sample_mask = item.pad_mask
+            if per_sample_mask.ndim != 1:
+                raise ValueError(
+                    f"video pad_mask must be (B,) per-sample; got shape {tuple(per_sample_mask.shape)}."
+                )
+            n_tokens = self.video_encoder.num_video_tokens
+            vlm_h = self.paligemma_with_expert.config.paligemma_config.text_config.hidden_size
+            dtype = _preferred_dtype()
+            if bool(per_sample_mask.any()):
+                emb = self.embed_video(video, obs_history_is_pad=obs_pad).to(dtype=dtype)
             else:
-                sg_vid_emb = torch.zeros(bsize, n_sg_tokens, vlm_h, device=lang_tokens.device, dtype=sg_dtype)
+                emb = torch.zeros(video.shape[0], n_tokens, vlm_h, device=video.device, dtype=dtype)
+            expanded = per_sample_mask[:, None].expand(emb.shape[0], emb.shape[1])
+            return emb, expanded
+        raise ValueError(f"Unknown ContextItem type: {t!r}")
 
-            bsize_sg, num_sg_embs = sg_vid_emb.shape[:2]
-            sg_mask_expanded = sg_vid_mask[:, None].expand(bsize_sg, num_sg_embs)
+    @staticmethod
+    def _attention_pattern(mode: AttentionMode, length: int) -> list[int]:
+        """1-D attention pattern for a block of ``length`` tokens.
 
-            embs.append(sg_vid_emb)
-            pad_masks.append(sg_mask_expanded)
-            att_masks += [0] * num_sg_embs
+        See ``ContextItem.attention``. The cumulative ``sum`` of these
+        ints, fed to :func:`make_att_2d_masks`, defines a token's
+        attention scope: tokens with the same cumulative value share
+        bidirectional attention.
+        """
+        if mode == "continue":
+            return [0] * length
+        if mode == "bidirectional":
+            return [1] + [0] * (length - 1)
+        if mode == "causal":
+            return [1] * length
+        raise ValueError(f"Unknown attention mode: {mode!r}")
 
-        # Metadata (speed / quality / mistake), same layout as pi07_paligemma
-        sample_has_metadata = metadata_masks.any(dim=1)  # (B,)
+    def embed_prefix(self, items: list[ContextItem]) -> tuple[Tensor, Tensor, Tensor, int]:
+        """Embed a layout-agnostic list of ``ContextItem``s into the prefix.
 
-        md_comma_ids = self.language_tokenizer.encode(", ", add_special_tokens=False)
-        md_comma_tokens = torch.tensor([md_comma_ids] * bsize, device=lang_tokens.device)
-        md_comma_emb = self.paligemma_with_expert.embed_language_tokens(md_comma_tokens)
-        md_comma_emb = md_comma_emb * math.sqrt(md_comma_emb.shape[-1])
-        num_md_comma = md_comma_emb.shape[1]
-        md_comma_mask = sample_has_metadata[:, None].expand(bsize, num_md_comma)
-        embs.append(md_comma_emb)
-        pad_masks.append(md_comma_mask)
-        att_masks += [0] * num_md_comma
-
-        metadata_emb = self.paligemma_with_expert.embed_language_tokens(metadata_tokens)
-        metadata_emb = metadata_emb * math.sqrt(metadata_emb.shape[-1])
-        embs.append(metadata_emb)
-        pad_masks.append(metadata_masks)
-        num_md_embs = metadata_emb.shape[1]
-        att_masks += [1] + [0] * (num_md_embs - 1)
-
-        # ":\n" always terminates the state(+response+subgoal+metadata) block
-        state_end_ids = self.language_tokenizer.encode(":\n", add_special_tokens=False)
-        state_end_tokens = torch.tensor([state_end_ids] * bsize, device=lang_tokens.device)
-        state_end_emb = self.paligemma_with_expert.embed_language_tokens(state_end_tokens)
-        state_end_emb = state_end_emb * math.sqrt(state_end_emb.shape[-1])
-        state_end_mask = torch.ones(
-            bsize, state_end_emb.shape[1], dtype=torch.bool, device=lang_tokens.device
-        )
-        embs.append(state_end_emb)
-        pad_masks.append(state_end_mask)
-        att_masks += [0] * state_end_emb.shape[1]
-
-        if discrete_actions is not None:
-            discrete_action_indicator_ids = self.language_tokenizer.encode(
-                "Action: ", add_special_tokens=False
-            )
-            discrete_action_indicator_tokens = torch.tensor(
-                [discrete_action_indicator_ids] * bsize, device=lang_tokens.device
-            )
-            discrete_action_indicator_emb = self.paligemma_with_expert.embed_language_tokens(
-                discrete_action_indicator_tokens
-            )
-            discrete_action_indicator_emb = discrete_action_indicator_emb * math.sqrt(
-                discrete_action_indicator_emb.shape[-1]
-            )
-            discrete_action_indicator_mask = torch.ones(
-                bsize, discrete_action_indicator_emb.shape[1], dtype=torch.bool, device=lang_tokens.device
-            )
-            embs.append(discrete_action_indicator_emb)
-            pad_masks.append(discrete_action_indicator_mask)
-            att_masks += [1] * discrete_action_indicator_emb.shape[1]
-
-            discrete_action_emb = self.paligemma_with_expert.embed_discrete_actions(discrete_actions)
-            embs.append(discrete_action_emb.to(dtype=_preferred_dtype()))
-            pad_masks.append(discrete_action_masks)
-            att_masks += [1] * discrete_action_emb.shape[1]
-
-        embs = torch.cat(embs, dim=1)
-        pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
-        att_masks = att_masks[None, :].expand(bsize, len(att_masks))
-
-        return embs, pad_masks, att_masks
-
-    def embed_suffix(self, noisy_actions: Tensor, timestep: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Embed noisy_actions, timestep to prepare for Expert Gemma processing.
+        The policy decides what blocks go into the prefix and in what
+        order; this method only embeds them by type, concatenates, and
+        derives the 1-D attention mask. Items flagged
+        ``exclude_from_cross_attention`` are dropped from the
+        ``num_cross_att_tokens`` count returned alongside the embeddings,
+        so the action expert never cross-attends to them (e.g. trailing
+        ``"Action: "`` indicator + discrete-action tokens).
 
         Args:
-            noisy_actions: Tensor containing noisy actions.
-            timestep: Tensor containing timesteps of shape (batch_size, action_chunk_length).
+            items: Ordered list of ``ContextItem`` blocks. Per the
+                current architecture, items flagged
+                ``exclude_from_cross_attention`` must be a contiguous
+                trailing run.
 
         Returns:
-            A tuple containing:
-                - embs: Concatenated embeddings tensor.
-                - pad_masks: Concatenated padding masks tensor.
-                - att_masks: Attention masks tensor.
-                - adarms_cond: AdaRMS conditioning tensor.
+            ``(embs, pad_masks, att_masks, num_cross_att_tokens)``.
         """
-        embs = []
-        pad_masks = []
-        att_masks = []
+        embs: list[Tensor] = []
+        pad_masks: list[Tensor] = []
+        att_masks_flat: list[int] = []
 
-        bsize = noisy_actions.shape[0]
+        cross_att_running = 0
+        cross_att_locked = False
+        for item in items:
+            emb, mask = self._embed_item(item)
+            length = emb.shape[1]
+            embs.append(emb)
+            pad_masks.append(mask)
+            att_masks_flat += self._attention_pattern(item.attention, length)
+
+            if item.exclude_from_cross_attention:
+                cross_att_locked = True
+            else:
+                if cross_att_locked:
+                    raise ValueError("exclude_from_cross_attention items must be a contiguous trailing run.")
+                cross_att_running += length
+
+        embs_cat = torch.cat(embs, dim=1)
+        pad_masks_cat = torch.cat(pad_masks, dim=1)
+        bsize = embs_cat.shape[0]
+        att_masks = torch.tensor(att_masks_flat, dtype=torch.bool, device=pad_masks_cat.device)
+        att_masks = att_masks[None, :].expand(bsize, len(att_masks_flat))
+        return embs_cat, pad_masks_cat, att_masks, cross_att_running
+
+    def embed_suffix(
+        self, items: list[ContextItem], timestep: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Embed the action expert's suffix from a list of ``ContextItem``s.
+
+        Mirrors :meth:`embed_prefix`. The timestep stays a separate
+        argument (not a ``ContextItem``) because it conditions the
+        action expert via adaRMS rather than appearing as a sequence
+        token.
+
+        Args:
+            items: Ordered ``ContextItem`` blocks (today: just a single
+                ``"action"`` item containing the noisy actions; the policy
+                may add more in the future).
+            timestep: ``(B, chunk_size)`` flow-matching time, fed through
+                a sine-cosine positional encoding and a 2-layer MLP to
+                produce the adaRMS conditioning vector.
+
+        Returns:
+            ``(embs, pad_masks, att_masks, adarms_cond)``.
+        """
+        device = timestep.device
         dtype = _preferred_dtype()
-        device = noisy_actions.device
 
-        # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = create_sinusoidal_pos_embedding(
             timestep, self.config.proj_width, min_period=4e-3, max_period=4.0, device=device
-        )
+        ).to(dtype=dtype)
 
-        # Fuse timestep + action information using an MLP
-        noisy_actions = noisy_actions.to(dtype=dtype)
-        action_emb = self.action_in_proj(noisy_actions)
-
-        def time_mlp_func(time_emb):
-            x = self.time_mlp_in(time_emb)
+        def time_mlp_func(x: Tensor) -> Tensor:
+            x = self.time_mlp_in(x)
             x = F.silu(x)
             x = self.time_mlp_out(x)
             return F.silu(x)
 
-        time_emb = time_emb.to(dtype=dtype)
         adarms_cond = time_mlp_func(time_emb)
 
-        # Add to input tokens
-        embs.append(action_emb)
+        embs: list[Tensor] = []
+        pad_masks: list[Tensor] = []
+        att_masks_flat: list[int] = []
 
-        bsize, action_dim = action_emb.shape[:2]
-        action_mask = torch.ones(bsize, action_dim, dtype=torch.bool, device=device)
-        pad_masks.append(action_mask)
+        for item in items:
+            emb, mask = self._embed_item(item)
+            length = emb.shape[1]
+            embs.append(emb)
+            pad_masks.append(mask)
+            att_masks_flat += self._attention_pattern(item.attention, length)
 
-        # Set attention masks so that image, language and state inputs do not attend to action tokens
-        att_masks += [1] + ([0] * (self.config.n_action_steps - 1))
+        embs_cat = torch.cat(embs, dim=1)
+        pad_masks_cat = torch.cat(pad_masks, dim=1)
+        bsize = embs_cat.shape[0]
+        att_masks = torch.tensor(att_masks_flat, dtype=torch.bool, device=embs_cat.device)
+        att_masks = att_masks[None, :].expand(bsize, len(att_masks_flat))
 
-        embs = torch.cat(embs, dim=1)
-        pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
-        att_masks = att_masks[None, :].expand(bsize, len(att_masks))
-
-        return embs, pad_masks, att_masks, adarms_cond
+        return embs_cat, pad_masks_cat, att_masks, adarms_cond
 
     def forward(
         self,
-        videos: list[Tensor],
-        vid_masks: list[Tensor],
-        lang_tokens: Tensor,
-        lang_masks: Tensor,
+        prefix_items: list[ContextItem],
         actions: Tensor,
+        discrete_actions: Tensor,
+        discrete_action_masks: Tensor,
         actions_is_pad: Tensor | None = None,
         noise: Tensor | None = None,
         time: Tensor | None = None,
-        discrete_actions: Tensor | None = None,
-        discrete_action_masks: Tensor | None = None,
-        state: Tensor | None = None,
-        *,
-        response_tokens: Tensor,
-        response_masks: Tensor,
-        metadata_tokens: Tensor,
-        metadata_masks: Tensor,
-        subgoal_videos: list[Tensor] = (),
-        subgoal_vid_masks: list[Tensor] = (),
-        obs_history_is_pad: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """Do a full training forward pass and compute the loss.
 
         Args:
-            videos: List of video tensors, each (B, T, C, H, W) in [0, 1].
-            vid_masks: List of boolean masks, each (B,).
-            lang_tokens: Language token tensor.
-            lang_masks: Language mask tensor.
-            actions: Action tensor.
-            actions_is_pad: Optional action is padded mask tensor.
-            noise: Optional noise tensor.
-            time: Optional time tensor.
-            discrete_actions: Optional discrete action tensor.
-            discrete_action_masks: Optional discrete action mask tensor.
-            state: Optional continuous state tensor of shape ``(B, T, max_state_dim)``.
-            response_tokens: Subtask response token IDs ``(B, response_max_length)``.
-            response_masks: Boolean mask for response tokens.
-            metadata_tokens: Metadata token IDs ``(B, metadata_max_length)``.
-            metadata_masks: Boolean mask for metadata tokens.
-            subgoal_videos: List of subgoal video tensors, each (B, 1, C, H, W) in [0, 1].
-            subgoal_vid_masks: List of boolean masks, each (B,).
-            obs_history_is_pad: Optional ``(B, T)`` bool mask for padded history steps.
+            prefix_items: Ordered ``ContextItem`` list defining the entire
+                VLM prefix layout. The ``"Action: "`` indicator and the
+                discrete-action item must be flagged
+                ``exclude_from_cross_attention=True`` so the continuous
+                action expert does not condition on them.
+            actions: Continuous action targets ``(B, chunk_size, max_action_dim)``.
+            discrete_actions: FAST discrete-action token IDs
+                ``(B, discrete_action_max_length)``, used for the CE loss.
+            discrete_action_masks: Mask for ``discrete_actions``.
+            actions_is_pad: Optional ``(B, chunk_size)`` mask for padded actions.
+            noise: Optional pre-sampled noise tensor.
+            time: Optional pre-sampled flow-matching time tensor.
 
         Returns:
             A dictionary containing the loss components ("MSE" and "CE").
         """
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            videos,
-            vid_masks,
-            lang_tokens,
-            lang_masks,
-            discrete_actions,
-            discrete_action_masks,
-            state=state,
-            response_tokens=response_tokens,
-            response_masks=response_masks,
-            metadata_tokens=metadata_tokens,
-            metadata_masks=metadata_masks,
-            subgoal_videos=subgoal_videos,
-            subgoal_vid_masks=subgoal_vid_masks,
-            obs_history_is_pad=obs_history_is_pad,
+        prefix_embs, prefix_pad_masks, prefix_att_masks, num_cross_att_tokens = self.embed_prefix(
+            prefix_items
         )
 
         vlm_2d_attention_mask = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         vlm_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-
-        # avoids using discrete action for predicting continuous flow matching action
-        num_cross_att_tokens = (
-            prefix_embs.shape[1]
-            - self.config.discrete_action_indicator_max_length
-            - self.config.discrete_action_max_length
-        )
 
         (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
             attention_mask=vlm_2d_attention_mask,
@@ -1787,7 +1869,8 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
+        suffix_items = self._build_suffix_items(x_t)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(suffix_items, time)
 
         action_expert_2d_attention_mask = make_att_2d_masks(
             suffix_pad_masks,
@@ -1795,14 +1878,10 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
             n_cross_att_tokens=num_cross_att_tokens,
             cross_att_pad_masks=prefix_pad_masks[:, :num_cross_att_tokens],
         )
-        # We should skip the discrete action tokens as well as the discrete action indicator tokens when numbering the position ids for the action expert
-        prefix_offsets = torch.sum(
-            prefix_pad_masks[
-                :,
-                : -self.config.discrete_action_indicator_max_length - self.config.discrete_action_max_length,
-            ],
-            dim=-1,
-        )[:, None]  # action expert position ids start after prefix
+        # Action expert position ids continue past the cross-attended prefix
+        # (skipping the trailing discrete-action block, which is excluded
+        # from cross-attention via num_cross_att_tokens).
+        prefix_offsets = torch.sum(prefix_pad_masks[:, :num_cross_att_tokens], dim=-1)[:, None]
         action_expert_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
         # stop gradient to avoid backpropagating from action expert to VLM
@@ -1874,74 +1953,58 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
 
         return {"MSE": mse_loss, "CE": discrete_action_ce_loss}
 
+    def _build_suffix_items(self, x_t: Tensor) -> list[ContextItem]:
+        """Default suffix layout: a single ``"action"`` block for ``x_t``.
+
+        Factored out so that :meth:`forward`, :meth:`sample_actions`, and
+        :meth:`denoise_step` share one definition of what's in the suffix.
+        """
+        bsize = x_t.shape[0]
+        action_mask = torch.ones(bsize, x_t.shape[1], dtype=torch.bool, device=x_t.device)
+        return [
+            ContextItem(
+                data=x_t,
+                item_type="action",
+                pad_mask=action_mask,
+                attention="bidirectional",
+            )
+        ]
+
     def sample_actions(
         self,
-        videos: list[Tensor],
-        vid_masks: list[Tensor],
-        lang_tokens: Tensor,
-        lang_masks: Tensor,
+        prefix_items: list[ContextItem],
         action_prefix: Tensor,
         delay: Tensor,
-        state: Tensor | None = None,
         noise: Tensor | None = None,
-        *,
-        response_tokens: Tensor,
-        response_masks: Tensor,
-        metadata_tokens: Tensor,
-        metadata_masks: Tensor,
-        subgoal_videos: list[Tensor] = (),
-        subgoal_vid_masks: list[Tensor] = (),
-        obs_history_is_pad: Tensor | None = None,
     ) -> Tensor:
         """Do a full inference forward and compute the action.
 
         Args:
-            videos: List of video tensors, each (B, T, C, H, W) in [0, 1].
-            vid_masks: List of boolean masks, each (B,).
-            lang_tokens: Language token tensor.
-            lang_masks: Language mask tensor.
-            action_prefix: Action prefix tensor.
-            delay: Number of delay actions.
-            state: Optional continuous state tensor of shape ``(B, T, max_state_dim)``.
-            noise: Optional noise tensor.
-            response_tokens: Subtask response token IDs ``(B, response_max_length)``.
-            response_masks: Boolean mask for response tokens.
-            metadata_tokens: Metadata token IDs ``(B, metadata_max_length)``.
-            metadata_masks: Boolean mask for metadata tokens.
-            subgoal_videos: List of subgoal video tensors, each (B, 1, C, H, W) in [0, 1].
-            subgoal_vid_masks: List of boolean masks, each (B,).
+            prefix_items: Ordered ``ContextItem`` list defining the entire
+                VLM prefix layout. Inference omits the discrete-action
+                block, so no items need to be excluded from cross-attention.
+            action_prefix: Frozen action prefix ``(B, chunk_size, max_action_dim)``.
+            delay: Number of frozen delay actions at the start of the chunk.
+            noise: Optional pre-sampled noise.
 
         Returns:
             The sampled action tensor.
         """
-        bsize = lang_tokens.shape[0]
-        device = lang_tokens.device
+        prefix_embs, prefix_pad_masks, prefix_att_masks, num_cross_att_tokens = self.embed_prefix(
+            prefix_items
+        )
+        bsize = prefix_embs.shape[0]
+        device = prefix_embs.device
 
         if noise is None:
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            videos,
-            vid_masks,
-            lang_tokens,
-            lang_masks,
-            state=state,
-            response_tokens=response_tokens,
-            response_masks=response_masks,
-            metadata_tokens=metadata_tokens,
-            metadata_masks=metadata_masks,
-            subgoal_videos=subgoal_videos,
-            subgoal_vid_masks=subgoal_vid_masks,
-            obs_history_is_pad=obs_history_is_pad,
-        )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
-        num_cross_att_tokens = prefix_embs.shape[1]
-
         # Compute image and language key value cache
-        (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
+        (_prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
             position_ids=prefix_position_ids,
             past_key_values=None,
@@ -1994,7 +2057,8 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         Returns:
             The predicted velocity tensor (v_t).
         """
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
+        suffix_items = self._build_suffix_items(x_t)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(suffix_items, time)
 
         num_cross_att_tokens = prefix_pad_masks.shape[1]
         action_expert_2d_attention_mask = make_att_2d_masks(

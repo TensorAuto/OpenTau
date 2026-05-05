@@ -149,6 +149,7 @@ class TestPI07HighLevelPlannerIntegration:
     # Main integration test
     # ------------------------------------------------------------------
 
+    @pytest.mark.skip(reason="Requires too much memory, does not fit on RTX 3090 24GB")
     @pytest.mark.gpu
     @pytest.mark.slow
     def test_complete_pi07_high_level_planner_pipeline(self, lerobot_dataset_metadata):
