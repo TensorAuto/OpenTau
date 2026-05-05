@@ -538,6 +538,53 @@ class TestSingleFrameInvariance:
 
         torch.testing.assert_close(out_st, out_no_st, rtol=1e-5, atol=1e-5)
 
+    def test_t1_matches_vanilla_siglip_vision_model(self, backbone):
+        """At T=1 the SpaceTime SigLIP video encoder must match the output of
+        an unmodified ``SiglipVisionModel`` (the upstream HuggingFace vision
+        encoder, never wrapped) on the same image, modulo the shared
+        ``multi_modal_projector``.
+
+        This is the direct restatement of the wrapper's "no new params, no
+        behavior change at T=1" claim against the upstream SigLIP class —
+        it does NOT rely on ``suppress_spacetime_temporal`` (the bypass flag)
+        or on a sibling encoder built with stride=999. The wrapper's
+        natural T=1 short-circuit (and equivalently, Reading B's natural
+        identity at T=1: e(t=0)=0 and a single-key temporal SDPA) must
+        produce the same hidden states as the un-instrumented SigLIP
+        forward, so a deepcopy of the same vision_tower (built BEFORE
+        wrapping) gives byte-identical output.
+        """
+        torch.manual_seed(0)
+        vision_tower, projector, _ = backbone
+
+        # Snapshot the un-instrumented SigLIP weights BEFORE constructing the
+        # encoder (which mutates ``vision_tower`` in-place by replacing every
+        # stride-th layer with a SpaceTimeEncoderLayerWrapper). The deepcopy
+        # is a true vanilla SiglipVisionModel — no wrapper, no PE buffer.
+        vt_vanilla = copy.deepcopy(vision_tower)
+        proj_vanilla = copy.deepcopy(projector)
+        vt_vanilla.eval()
+        proj_vanilla.eval()
+
+        encoder = SpaceTimeSiglipVideoEncoder(
+            vision_tower=vision_tower,
+            multi_modal_projector=projector,
+            max_num_frames=4,
+            spacetime_layer_stride=4,  # 6 layers wrapped
+        ).eval()
+
+        image_unit = torch.rand(2, 3, 224, 224)
+        # Encoder rescales [0, 1] → [-1, 1] internally; the vanilla SigLIP
+        # forward expects pre-rescaled pixels.
+        image_siglip = image_unit * 2.0 - 1.0
+
+        with torch.no_grad():
+            out_video = encoder(image_unit.unsqueeze(1))  # (B, 1, C, H, W)
+            last_hidden = vt_vanilla(pixel_values=image_siglip).last_hidden_state
+            out_vanilla = proj_vanilla(last_hidden)
+
+        torch.testing.assert_close(out_video, out_vanilla, rtol=1e-5, atol=1e-5)
+
 
 # ---------------------------------------------------------------------------
 # `suppress_spacetime_temporal` context manager
