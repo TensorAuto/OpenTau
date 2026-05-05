@@ -173,7 +173,13 @@ def profile(cfg: TrainPipelineConfig):
             )
         cfg.policy.gradient_checkpointing = want_ckpt
 
-    policy = make_policy(cfg=cfg.policy, ds_meta=train_dataset.meta)
+    # Mirror train.py: under DeepSpeed ZeRO-3 we must disable the per-construction
+    # parameter partitioning (it shards before init, breaking shape-dependent
+    # initializers like SigLIP's lecun_normal_). No-op for any non-ZeRO-3 backend.
+    from opentau.scripts.train import _zero3_disabled_init_context
+
+    with _zero3_disabled_init_context(accelerator):
+        policy = make_policy(cfg=cfg.policy, ds_meta=train_dataset.meta)
     policy.to(torch.bfloat16)
 
     skip_optim = os.environ.get("PROFILE_NO_OPTIM", "0") == "1"

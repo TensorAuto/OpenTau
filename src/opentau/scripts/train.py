@@ -190,6 +190,32 @@ def _find_unused_params_from_env() -> bool:
     return os.environ.get("FIND_UNUSED_PARAMS", "true").lower() == "true"
 
 
+def _zero3_disabled_init_context(accelerator: accelerate.Accelerator):
+    """Return a context manager that disables ZeRO-3's per-construction param partitioning.
+
+    DeepSpeed ZeRO-3 installs a `partition_parameters` wrapper that shards
+    each parameter as it's created. Some HuggingFace init paths (e.g.
+    SigLIP's `lecun_normal_` → `_calculate_fan_in_and_fan_out`) need the
+    full tensor shape and crash on the per-rank shard. This returns a
+    `deepspeed.zero.Init(enabled=False)` context for ZeRO-3 and a
+    no-op `nullcontext()` everywhere else.
+
+    Args:
+        accelerator: The active accelerate ``Accelerator``.
+
+    Returns:
+        A context manager (no-op for non-ZeRO-3 backends).
+    """
+    if accelerator.distributed_type != accelerate.DistributedType.DEEPSPEED:
+        return nullcontext()
+    zero_stage = accelerator.deepspeed_plugin.hf_ds_config.config.get("zero_optimization", {}).get("stage", 0)
+    if zero_stage < 3:
+        return nullcontext()
+    import deepspeed
+
+    return deepspeed.zero.Init(enabled=False)
+
+
 def _sync_deepspeed_gradient_accumulation_steps(
     accelerator: accelerate.Accelerator, cfg: TrainPipelineConfig
 ) -> None:
@@ -327,7 +353,16 @@ def train(cfg: TrainPipelineConfig):
         )
 
     logging.info("Creating policy")
-    policy = make_policy(cfg=cfg.policy, ds_meta=train_dataset.meta)
+    # DeepSpeed ZeRO-3 installs a `partition_parameters` wrapper that shards
+    # parameters at construction time (`zero3_init_flag` only controls the
+    # transformers `from_pretrained` integration, not this wrapper). Some
+    # init paths — e.g. SigLIP's `lecun_normal_` → `_calculate_fan_in_and_fan_out`
+    # — need the full tensor shape and crash on a per-rank shard. Build the
+    # model with partitioning disabled; ZeRO will re-shard properly when
+    # `accelerator.prepare` wraps it. No-op for any non-ZeRO-3 backend.
+    init_ctx = _zero3_disabled_init_context(accelerator)
+    with init_ctx:
+        policy = make_policy(cfg=cfg.policy, ds_meta=train_dataset.meta)
     # Keep the policy in bf16 for forward/backward (activation memory + bf16
     # compute). The optimizer state is kept in fp32 separately: DeepSpeed
     # ZeRO does this through ``BF16_Optimizer``; under DDP/single we mirror
