@@ -199,7 +199,7 @@ class TestDatasetConfigDataMapping:
 
 class TestPretrainedConfigCodec:
     """Verify the encode/decode handlers registered in
-    ``opentau.configs.default`` round-trip ``transformers.PretrainedConfig``
+    ``opentau.configs.policies`` round-trip ``transformers.PretrainedConfig``
     subclasses through draccus.
 
     Without these handlers, ``PI07HighLevelPlannerConfig._save_pretrained``

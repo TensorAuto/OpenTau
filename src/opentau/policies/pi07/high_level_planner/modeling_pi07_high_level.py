@@ -378,6 +378,17 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
 
             new_key = key
 
+            # When the action expert is disabled (`disable_action_expert=True`),
+            # there is no `gemma_expert` submodule to receive these weights —
+            # drop any expert-prefixed keys with a warning rather than
+            # dereferencing the None submodule below.
+            if (
+                key.startswith("gemma3_with_expert.gemma_expert.")
+                and self.model.gemma3_with_expert.gemma_expert is None
+            ):
+                logging.warning(f"Skipping gemma_expert key (action expert disabled): {key}")
+                continue
+
             # Handle layer norm structure changes: .weight -> .dense.weight + .dense.bias
             # For gemma expert layers
             if re.match(
