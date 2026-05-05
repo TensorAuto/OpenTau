@@ -33,6 +33,7 @@ import draccus
 from huggingface_hub import hf_hub_download
 from huggingface_hub.constants import CONFIG_NAME
 from huggingface_hub.errors import HfHubHTTPError
+from transformers import PretrainedConfig as _HFPretrainedConfig
 
 from opentau.configs.refs import resolve_refs
 from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
@@ -42,6 +43,43 @@ from opentau.utils.hub import HubMixin
 
 # Generic variable that is either PreTrainedConfig or a subclass thereof
 T = TypeVar("T", bound="PreTrainedConfig")
+
+
+# --- transformers.PretrainedConfig <-> draccus codec ---
+# pi07's policy configs declare dataclass fields of type
+# `Gemma3WithExpertConfig` (a `transformers.PretrainedConfig` subclass) so the
+# VLM topology travels with the policy config and is serialised in
+# `config.json` via `_save_pretrained`. draccus's choice-type encode/decode
+# path traverses dataclass fields and looks up an encoder by field type —
+# without a registered handler for `PretrainedConfig`, encoding raises
+# `Exception("No parser for object ...")` because `PretrainedConfig` is not
+# itself a dataclass. Registered with `include_subclasses=True` so any
+# subclass dispatches here automatically; the decoder receives the declared
+# subclass as its first argument, which is what lets `cls.from_dict`
+# reconstruct the right concrete type. Lives in this module (rather than
+# `configs/default.py` next to the np.ndarray codec) so it's loaded as a
+# side-effect of any policy-config import path that hits `_save_pretrained`,
+# including standalone scripts that don't go through `configs/default.py`.
+def _decode_hf_pretrained_config(cls, raw_value, path=()):
+    """Decode a dict back into the declared ``PretrainedConfig`` subclass.
+
+    Args:
+        cls: The declared subclass of ``transformers.PretrainedConfig`` (e.g.
+            ``Gemma3WithExpertConfig``). Provided by draccus because this
+            decoder was registered with ``include_subclasses=True``.
+        raw_value: The serialised dict produced by the matching encoder
+            (``obj.to_dict()``).
+        path: Ignored; kept for compatibility with draccus's decoder
+            signature.
+
+    Returns:
+        An instance of ``cls`` reconstructed from ``raw_value``.
+    """
+    return cls.from_dict(raw_value)
+
+
+draccus.encode.register(_HFPretrainedConfig, lambda obj: obj.to_dict(), include_subclasses=True)
+draccus.decode.register(_HFPretrainedConfig, _decode_hf_pretrained_config, include_subclasses=True)
 
 _DEPRECATED_LATENCY_FIELDS = (
     "cloud_vlm_latency_mean",
