@@ -32,6 +32,32 @@ from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
 EPS = 1e-8  # Small epsilon value for numerical stability in normalization
 
 
+def _materialize(tensor: Tensor) -> Tensor:
+    """Return the full local Tensor for ``tensor``, materializing if it is a DTensor.
+
+    Under FSDP2 (``fully_shard``), parameters and buffers attached to a
+    ``fully_shard``-wrapped module are exposed as ``DTensor`` instances.
+    Mixing a ``DTensor`` with a regular ``Tensor`` in arithmetic raises:
+
+        RuntimeError: aten.sub.Tensor got mixed torch.Tensor and DTensor,
+        need to convert all torch.Tensor to DTensor before calling
+        distributed operators!
+
+    Normalize / Unnormalize stats (``mean``/``std``/``min``/``max``) are tiny
+    and replicated across ranks, so the cost of redistributing to a full
+    Tensor for the per-feature arithmetic is negligible. Under FSDP1, DDP,
+    or single-process this helper is a fast no-op (the Parameter is already
+    a regular Tensor).
+    """
+    if hasattr(tensor, "full_tensor"):
+        # ``DTensor.full_tensor()`` materializes the (replicated or sharded)
+        # tensor into a single full Tensor on each rank. For replicated
+        # placements this is just a pointer-copy; for sharded ones it does
+        # an all-gather.
+        return tensor.full_tensor()
+    return tensor
+
+
 def warn_missing_keys(features: dict[str, PolicyFeature], batch: dict[str, Tensor], mode: str) -> None:
     """Warns if expected features are missing from the batch.
 
@@ -219,14 +245,14 @@ class Normalize(nn.Module):
             buffer = getattr(self, "buffer_" + key.replace(".", "_"))
 
             if norm_mode is NormalizationMode.MEAN_STD:
-                mean = buffer["mean"]
-                std = buffer["std"]
+                mean = _materialize(buffer["mean"])
+                std = _materialize(buffer["std"])
                 assert not torch.isinf(mean).any(), _no_stats_error_str("mean")
                 assert not torch.isinf(std).any(), _no_stats_error_str("std")
                 batch[key] = (batch[key] - mean) / (std + EPS)
             elif norm_mode is NormalizationMode.MIN_MAX:
-                min = buffer["min"]
-                max = buffer["max"]
+                min = _materialize(buffer["min"])
+                max = _materialize(buffer["max"])
                 assert not torch.isinf(min).any(), _no_stats_error_str("min")
                 assert not torch.isinf(max).any(), _no_stats_error_str("max")
                 batch[key] = (batch[key] - min) / (max - min + EPS)
@@ -298,15 +324,15 @@ class Unnormalize(nn.Module):
             buffer = getattr(self, "buffer_" + key.replace(".", "_"))
 
             if norm_mode is NormalizationMode.MEAN_STD:
-                mean = buffer["mean"]
-                std = buffer["std"]
+                mean = _materialize(buffer["mean"])
+                std = _materialize(buffer["std"])
                 if not (torch.compiler.is_compiling() or torch.onnx.is_in_onnx_export()):
                     assert not torch.isinf(mean).any(), _no_stats_error_str("mean")
                     assert not torch.isinf(std).any(), _no_stats_error_str("std")
                 batch[key] = batch[key] * (std + EPS) + mean
             elif norm_mode is NormalizationMode.MIN_MAX:
-                min = buffer["min"]
-                max = buffer["max"]
+                min = _materialize(buffer["min"])
+                max = _materialize(buffer["max"])
                 if not (torch.compiler.is_compiling() or torch.onnx.is_in_onnx_export()):
                     assert not torch.isinf(min).any(), _no_stats_error_str("min")
                     assert not torch.isinf(max).any(), _no_stats_error_str("max")
