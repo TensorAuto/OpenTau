@@ -35,7 +35,7 @@ class TestPI05MemConfig:
         assert config.n_obs_steps == 8
         assert config.chunk_size == 50
         assert config.n_action_steps == 50
-        assert config.history_interval == 1  # auto-set when n_obs_steps > 1
+        assert config.history_interval == 1
         assert config.max_state_dim == 32
         assert config.max_action_dim == 32
         assert config.spacetime_layer_stride == 4

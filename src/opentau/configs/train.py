@@ -273,7 +273,6 @@ class TrainPipelineConfig(HubMixin):
             self.policy.max_action_state = self.max_action_dim
             self.policy.chunk_size = self.action_chunk
 
-            # Sync observation-history settings from dataset_mixture to policy.
             # The policy's ``n_obs_steps`` determines the T dimension its
             # encoder expects; the dataset_mixture's ``n_obs_history`` is
             # what the dataloader actually produces. They must agree.
@@ -287,16 +286,6 @@ class TrainPipelineConfig(HubMixin):
                         "treated as 1 when unset). Set dataset_mixture.n_obs_history "
                         "to match policy.n_obs_steps."
                     )
-                # Only some policies (currently pi05_mem) carry a
-                # ``history_interval`` field for inference-buffer sampling.
-                if hasattr(self.policy, "history_interval"):
-                    if self.policy.history_interval is None:
-                        self.policy.history_interval = dm.history_interval
-                    elif (self.policy.history_interval or 1) != (dm.history_interval or 1):
-                        raise ValueError(
-                            f"policy.history_interval ({self.policy.history_interval}) != "
-                            f"dataset_mixture.history_interval ({dm.history_interval})"
-                        )
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:

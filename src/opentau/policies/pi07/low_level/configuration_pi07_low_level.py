@@ -48,8 +48,10 @@ class PI07LowLevelConfig(PreTrainedConfig):
 
     Args:
         n_obs_steps: Number of temporal video frames passed to the
-            SpaceTimeSiglip encoder per forward call. Must equal
-            ``n_obs_history`` when the latter is set.
+            SpaceTimeSiglip encoder per forward call. Also the count of
+            evenly-spaced historical frames the inference buffer keeps
+            (the encoder sees the same number of frames at training and
+            inference time). Must equal ``dataset_mixture.n_obs_history``.
         chunk_size: Size of the action chunk (upper bound for
             ``n_action_steps``). Defaults to 50.
         n_action_steps: Number of action steps to predict. Defaults to 50.
@@ -76,7 +78,7 @@ class PI07LowLevelConfig(PreTrainedConfig):
             are compatible with the expert's transformer layers.  Defaults to
             1280 (the expert hidden size in ``Gemma3WithExpertConfig``).
         dropout: Dropout rate. Defaults to 0.1.
-        num_steps: Number of flow-matching denoising steps. Defaults to 10.
+        num_steps: Number of flow-matching denoising steps. Defaults to 5.
         max_delay: Maximum number of prefix action steps for real-time
             inference. Defaults to 0.
         attention_implementation: Attention backend — ``"eager"``, ``"sdpa"``,
@@ -113,20 +115,14 @@ class PI07LowLevelConfig(PreTrainedConfig):
     """
 
     # Input / output structure.
-    n_obs_steps: int = 8
+    n_obs_steps: int = 6
     chunk_size: int = 50
     n_action_steps: int = 50
 
-    # Observation history for inference buffering.
-    # ``n_obs_history`` controls how many evenly-spaced historical frames the
-    # inference buffer keeps.  ``history_interval`` is the stride between those
-    # frames.  Together they determine ``obs_buffer_size = (n_obs_history-1) *
-    # history_interval + 1``.  Typically ``n_obs_history`` should equal
-    # ``n_obs_steps`` so the SpaceTimeSiglip encoder sees the same number of
-    # frames at training and inference time.
-    # Populated from DatasetMixtureConfig during training if unset.
-    n_obs_history: int | None = None
-    history_interval: int | None = None
+    # ``history_interval`` is the stride between the ``n_obs_steps`` evenly-
+    # spaced historical frames in the inference buffer.  Together they
+    # determine ``obs_buffer_size = (n_obs_steps - 1) * history_interval + 1``.
+    history_interval: int = 1
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -164,7 +160,7 @@ class PI07LowLevelConfig(PreTrainedConfig):
     dropout: float = 0.1
 
     # Decoding
-    num_steps: int = 10
+    num_steps: int = 5
 
     # Real Time Inference
     max_delay: int = 0
@@ -206,13 +202,13 @@ class PI07LowLevelConfig(PreTrainedConfig):
     def obs_buffer_size(self) -> int:
         """Total raw frames the observation buffer must keep.
 
-        With ``n_obs_history=T`` and ``history_interval=k``, the buffer stores
+        With ``n_obs_steps=T`` and ``history_interval=k``, the buffer stores
         the most recent ``(T-1)*k + 1`` frames so that ``T`` evenly-spaced
         frames can be selected.
         """
-        if self.n_obs_history is None or self.n_obs_history <= 1:
+        if self.n_obs_steps <= 1:
             return 1
-        return (self.n_obs_history - 1) * (self.history_interval or 1) + 1
+        return (self.n_obs_steps - 1) * self.history_interval + 1
 
     def __post_init__(self):
         """Post-initialization validation and policy → vlm_config plumbing.
@@ -233,19 +229,10 @@ class PI07LowLevelConfig(PreTrainedConfig):
         if self.gradient_checkpointing:
             self.vlm_config.gradient_checkpointing = self.gradient_checkpointing
 
-        if self.n_obs_history is not None:
-            if not isinstance(self.n_obs_history, int) or self.n_obs_history < 1:
-                raise ValueError(
-                    f"`n_obs_history` must be None or a positive integer, got {self.n_obs_history}."
-                )
-            if self.history_interval is None:
-                self.history_interval = 1
-        if self.history_interval is not None and (
-            not isinstance(self.history_interval, int) or self.history_interval < 1
-        ):
-            raise ValueError(
-                f"`history_interval` must be None or a positive integer, got {self.history_interval}."
-            )
+        if not isinstance(self.n_obs_steps, int) or self.n_obs_steps < 1:
+            raise ValueError(f"`n_obs_steps` must be a positive integer, got {self.n_obs_steps}.")
+        if not isinstance(self.history_interval, int) or self.history_interval < 1:
+            raise ValueError(f"`history_interval` must be a positive integer, got {self.history_interval}.")
 
         if self.n_action_steps > self.chunk_size:
             raise ValueError(

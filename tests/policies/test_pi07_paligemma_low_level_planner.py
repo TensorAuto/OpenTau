@@ -148,7 +148,6 @@ class TestPI07LowLevelPlannerIntegration:
     def _make_config() -> PI07lowlevelPlannerConfig:
         config = PI07lowlevelPlannerConfig(
             n_obs_steps=N_OBS_STEPS,
-            n_obs_history=N_OBS_STEPS,
             chunk_size=CHUNK_SIZE,
             n_action_steps=CHUNK_SIZE,
             max_state_dim=MAX_STATE_DIM,
@@ -2069,11 +2068,11 @@ class TestPI07LowLevelPlannerSubgoalEmbedding:
         assert torch.equal(pm_a, pm_b)
 
     # ------------------------------------------------------------------ #
-    # n_obs_history > 1: subgoals are single-frame (B, 1, C, H, W) and the
+    # n_obs_steps > 1: subgoals are single-frame (B, 1, C, H, W) and the
     # encoder accepts variable T in [1, max_num_frames], so they pass through
     # unpadded — the wrapper's T=1 short-circuit handles the temporal axis.
     # ------------------------------------------------------------------ #
-    def test_subgoal_passed_through_at_t1_when_n_obs_history_gt_one(self):
+    def test_subgoal_passed_through_at_t1_when_n_obs_steps_gt_one(self):
         bsz = 2
         n_obs_steps = 4
         batch = self._subgoal_batch(

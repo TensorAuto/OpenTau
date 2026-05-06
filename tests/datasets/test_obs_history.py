@@ -34,6 +34,7 @@ from tests.fixtures.constants import DUMMY_REPO_ID
 @dataclass
 class DummyPolicyConfig(PreTrainedConfig):
     chunk_size: int = 50
+    history_interval: int = 1
 
     @property
     def observation_delta_indices(self):
@@ -66,7 +67,6 @@ class TestDatasetMixtureConfigValidation:
     def test_n_obs_history_none_is_default(self):
         cfg = DatasetMixtureConfig()
         assert cfg.n_obs_history is None
-        assert cfg.history_interval == 1
 
     def test_n_obs_history_positive_int_accepted(self):
         cfg = DatasetMixtureConfig(n_obs_history=3)
@@ -88,18 +88,6 @@ class TestDatasetMixtureConfigValidation:
         with pytest.raises(ValueError, match="n_obs_history"):
             DatasetMixtureConfig(n_obs_history=2.5)
 
-    def test_history_interval_positive_int_accepted(self):
-        cfg = DatasetMixtureConfig(n_obs_history=3, history_interval=2)
-        assert cfg.history_interval == 2
-
-    def test_history_interval_zero_rejected(self):
-        with pytest.raises(ValueError, match="history_interval"):
-            DatasetMixtureConfig(history_interval=0)
-
-    def test_history_interval_negative_rejected(self):
-        with pytest.raises(ValueError, match="history_interval"):
-            DatasetMixtureConfig(history_interval=-1)
-
 
 # ---------------------------------------------------------------------------
 # resolve_delta_timestamps tests
@@ -120,9 +108,8 @@ def _make_train_cfg(n_obs_history=None, history_interval=1, action_freq=30.0):
         weights=[1.0],
         action_freq=action_freq,
         n_obs_history=n_obs_history,
-        history_interval=history_interval,
     )
-    policy_cfg = DummyPolicyConfig()
+    policy_cfg = DummyPolicyConfig(history_interval=history_interval)
     return TrainPipelineConfig(
         dataset_mixture=mixture_cfg,
         policy=policy_cfg,
@@ -235,9 +222,10 @@ def _make_dataset_with_history(
 
     # Patch config with desired history settings and a policy with action_delta_indices
     dataset.cfg.dataset_mixture.n_obs_history = n_obs_history
-    dataset.cfg.dataset_mixture.history_interval = history_interval
     dataset.n_obs_history = n_obs_history
-    dataset.cfg.policy = DummyPolicyConfig(chunk_size=dataset.cfg.action_chunk)
+    dataset.cfg.policy = DummyPolicyConfig(
+        chunk_size=dataset.cfg.action_chunk, history_interval=history_interval
+    )
 
     dt_info = resolve_delta_timestamps(dataset.cfg, dataset.cfg.dataset_mixture.datasets[0], dataset.meta)
     dataset.delta_timestamps_params = LeRobotDataset.compute_delta_params(*dt_info)

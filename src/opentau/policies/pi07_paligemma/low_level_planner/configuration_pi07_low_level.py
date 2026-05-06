@@ -83,8 +83,7 @@ class PI07lowlevelPlannerConfig(PreTrainedConfig):
     # Inference observation-history buffer: ``history_interval`` is the
     # temporal stride between the ``n_obs_steps`` stacked frames. Together they
     # determine ``obs_buffer_size = (n_obs_steps - 1) * history_interval + 1``.
-    # Populated from DatasetMixtureConfig during training if unset.
-    history_interval: int | None = None
+    history_interval: int = 1
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -105,14 +104,9 @@ class PI07lowlevelPlannerConfig(PreTrainedConfig):
     # left and right wrist cameras in addition to the top camera.
     empty_cameras: int = 0
 
-    # Observation history for SpaceTime SigLIP video encoder.
-    # None means single-frame (no temporal attention, byte-identical to plain SigLIP).
-    # When set to an int > 1, the dataloader must supply (B, T, C, H, W) video tensors
-    # and (B, T, D) state tensors.
-    n_obs_history: int | None = None
-
     # Every spacetime_layer_stride-th SigLIP encoder layer gets a temporal
-    # attention sub-layer when n_obs_history is not None.
+    # attention sub-layer when n_obs_steps > 1.  When n_obs_steps == 1 the
+    # encoder is byte-identical to plain SigLIP (no temporal attention).
     spacetime_layer_stride: int = 4
 
     # Language Tokenizer
@@ -179,13 +173,13 @@ class PI07lowlevelPlannerConfig(PreTrainedConfig):
     def obs_buffer_size(self) -> int:
         """Total raw frames the state history buffer must keep.
 
-        With ``n_obs_history=T`` and ``history_interval=k``, the buffer stores
+        With ``n_obs_steps=T`` and ``history_interval=k``, the buffer stores
         the most recent ``(T-1)*k + 1`` frames so that ``T`` evenly-spaced
         frames can be selected.
         """
-        if self.n_obs_history is None or self.n_obs_history <= 1:
+        if self.n_obs_steps <= 1:
             return 1
-        return (self.n_obs_history - 1) * (self.history_interval or 1) + 1
+        return (self.n_obs_steps - 1) * self.history_interval + 1
 
     def __post_init__(self):
         """Post-initialization validation."""
@@ -193,6 +187,10 @@ class PI07lowlevelPlannerConfig(PreTrainedConfig):
 
         # TODO(Steven): Validate device and amp? in all policy configs?
         """Input validation (not exhaustive)."""
+        if not isinstance(self.n_obs_steps, int) or self.n_obs_steps < 1:
+            raise ValueError(f"`n_obs_steps` must be a positive integer, got {self.n_obs_steps}.")
+        if not isinstance(self.history_interval, int) or self.history_interval < 1:
+            raise ValueError(f"`history_interval` must be a positive integer, got {self.history_interval}.")
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "

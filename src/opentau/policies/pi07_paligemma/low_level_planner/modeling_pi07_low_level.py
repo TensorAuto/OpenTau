@@ -560,7 +560,7 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
         Appends single-step state ``(B, D)`` and single-frame images
         ``(B, C, H, W)`` from ``batch`` into internal deques, then
-        assembles a batch with ``n_obs_history`` evenly-spaced frames
+        assembles a batch with ``n_obs_steps`` evenly-spaced frames
         (interval = ``history_interval``).  Early in an episode, missing
         history slots are zero-padded and marked in ``obs_history_is_pad``.
 
@@ -569,9 +569,8 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         - each image key expanded to ``(B, T, C, H, W)``
         - ``"obs_history_is_pad"`` as ``(B, T)`` bool
         """
-        assert self.config.n_obs_history is not None
-        n_hist: int = self.config.n_obs_history
-        interval = self.config.history_interval or 1
+        n_hist: int = self.config.n_obs_steps
+        interval = self.config.history_interval
         buf_maxlen = self.config.obs_buffer_size
 
         # --- buffer state ---
@@ -642,7 +641,7 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         """
         self.eval()
 
-        if self.config.n_obs_history is not None and self.config.n_obs_history > 1:
+        if self.config.n_obs_steps > 1:
             batch = self._build_history_batch(batch)
 
         if len(self._action_queue) == 0 or len(self._action_queue) <= self.config.max_delay:
@@ -943,11 +942,11 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         # unsqueezed to T=1, otherwise T = state.shape[-2]).
         raw_state = batch["state"]
         t_dim = 1 if raw_state.ndim == 2 else raw_state.shape[-2]
-        if self.config.n_obs_history is not None and self.config.n_obs_history > 1 and t_dim == 1:
+        if self.config.n_obs_steps > 1 and t_dim == 1:
             logging.warning(
-                "n_obs_history=%d but state has T=%d (single timestep). "
+                "n_obs_steps=%d but state has T=%d (single timestep). "
                 "History buffering may not have been called.",
-                self.config.n_obs_history,
+                self.config.n_obs_steps,
                 t_dim,
             )
 
@@ -1025,14 +1024,14 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
         Raises:
             ValueError: If the state dimension exceeds ``max_state_dim``
-                or if ``n_obs_history > 1`` but a 2-D state is provided.
+                or if ``n_obs_steps > 1`` but a 2-D state is provided.
         """
         state = batch["state"]
 
         if state.ndim == 2:
-            if self.config.n_obs_history is not None and self.config.n_obs_history > 1:
+            if self.config.n_obs_steps > 1:
                 raise ValueError(
-                    f"n_obs_history={self.config.n_obs_history} requires a "
+                    f"n_obs_steps={self.config.n_obs_steps} requires a "
                     f"(B, T, D) state tensor, but got shape {tuple(state.shape)}. "
                     f"Ensure _build_state_history_batch was called before prepare_state."
                 )
@@ -1449,7 +1448,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
     state, discrete actions) tokens:
 
     * **Image history** — encoded by :class:`SpaceTimeSiglipVideoEncoder`.
-      ``n_obs_history`` frames per camera; T=1 is byte-identical to plain SigLIP,
+      ``n_obs_steps`` frames per camera; T=1 is byte-identical to plain SigLIP,
       T>1 inserts space-time separable temporal attention every
       ``spacetime_layer_stride`` SigLIP layers (MEM-paper recipe).
     * **Per-timestep robot state stream** ``(B, T, max_state_dim)`` — one VLM
@@ -1518,11 +1517,10 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         )
         self.paligemma_with_expert = PaliGemmaWithExpertModel(paligemma_with_expert_config)
 
-        n_obs_steps = self.config.n_obs_history if self.config.n_obs_history is not None else 1
         self.video_encoder = SpaceTimeSiglipVideoEncoder(
             vision_tower=self.paligemma_with_expert.paligemma.vision_tower,
             multi_modal_projector=self.paligemma_with_expert.paligemma.multi_modal_projector,
-            max_num_frames=n_obs_steps,
+            max_num_frames=self.config.n_obs_steps,
             spacetime_layer_stride=self.config.spacetime_layer_stride,
             gradient_checkpointing=self.config.gradient_checkpointing,
         )

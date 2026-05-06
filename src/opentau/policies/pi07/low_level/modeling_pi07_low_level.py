@@ -429,7 +429,7 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
         """Buffer the current observation and construct a temporal batch.
 
         Appends the single-frame observation from ``batch`` to internal deque
-        buffers, then assembles a batch with ``n_obs_history`` evenly-spaced
+        buffers, then assembles a batch with ``n_obs_steps`` evenly-spaced
         frames (interval = ``history_interval``). Early in an episode the
         buffer is partially filled, so some slots are zero-padded; the
         returned ``"obs_history_is_pad"`` (B, T) bool tensor flags those
@@ -445,11 +445,10 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
 
         Returns a new dict with ``"state"`` expanded to (B, T, D), image keys
         expanded to (B, T, C, H, W), and a new ``"obs_history_is_pad"`` (B, T)
-        bool tensor (``True`` = padded). T = ``n_obs_history``.
+        bool tensor (``True`` = padded). T = ``n_obs_steps``.
         """
-        assert self.config.n_obs_history is not None
-        n_hist: int = self.config.n_obs_history
-        interval = self.config.history_interval or 1
+        n_hist: int = self.config.n_obs_steps
+        interval = self.config.history_interval
         buf_maxlen = self.config.obs_buffer_size
 
         # initialise buffers on first call after reset()
@@ -532,7 +531,7 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
         self.eval()
 
         # Build temporal observation history if configured.
-        if self.config.n_obs_history is not None and self.config.n_obs_history > 1:
+        if self.config.n_obs_steps > 1:
             batch = self._build_history_batch(batch)
 
         if len(self._action_queue) == 0 or len(self._action_queue) <= self.config.max_delay:
@@ -587,8 +586,8 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
         batch = self.normalize_inputs(batch)
 
         # `_build_history_batch` (called from `select_action` upstream) emits
-        # this; it's None when the caller skipped that step (e.g. n_obs_history
-        # is None/1, or sample_actions is invoked directly without the buffer).
+        # this; it's None when the caller skipped that step (e.g. n_obs_steps
+        # is 1, or sample_actions is invoked directly without the buffer).
         obs_history_is_pad = batch.get("obs_history_is_pad")
 
         videos, vid_masks = self.prepare_videos(batch, obs_history_is_pad=obs_history_is_pad)
@@ -605,13 +604,13 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
             assert vid.ndim == 5, f"Expected 5D video tensor (B, T, C, H, W), got {vid.shape}"
         assert state.ndim == 3, f"Expected 3D state tensor (B, T, D), got {state.shape}"
 
-        if self.config.n_obs_history is not None and self.config.n_obs_history > 1:
+        if self.config.n_obs_steps > 1:
             t_dim = state.shape[1]
             if t_dim == 1:
                 logging.warning(
                     "Temporal dimension T=1: no historical frames included. "
                     "This should only happen at most %d time(s) at the start of an episode.",
-                    self.config.history_interval or 1,
+                    self.config.history_interval,
                 )
 
         if delay is None:
@@ -728,9 +727,9 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
         """
         state = batch["state"]  # (B, T, D) or (B, D) during inference
         if state.ndim == 2:
-            if self.config.n_obs_history is not None and self.config.n_obs_history > 1:
+            if self.config.n_obs_steps > 1:
                 raise ValueError(
-                    f"Expected 3D state tensor (B, T, D) when n_obs_history > 1, "
+                    f"Expected 3D state tensor (B, T, D) when n_obs_steps > 1, "
                     f"got shape {state.shape}. Ensure select_action() is being used."
                 )
             state = state.unsqueeze(1)  # (B, D) -> (B, 1, D)
@@ -803,9 +802,9 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
         for key in present_img_keys:
             vid = batch[key]  # (B, T, C, H, W) or (B, C, H, W) during inference
             if vid.ndim == 4:
-                if self.config.n_obs_history is not None and self.config.n_obs_history > 1:
+                if self.config.n_obs_steps > 1:
                     raise ValueError(
-                        f"Expected 5D video tensor (B, T, C, H, W) when n_obs_history > 1, "
+                        f"Expected 5D video tensor (B, T, C, H, W) when n_obs_steps > 1, "
                         f"got shape {vid.shape}. Ensure select_action() is being used."
                     )
                 vid = vid.unsqueeze(1)  # (B, C, H, W) -> (B, 1, C, H, W)
