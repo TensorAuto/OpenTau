@@ -68,8 +68,13 @@ def _preferred_dtype():
     return torch.float32 if torch.onnx.is_in_onnx_export() else torch.bfloat16
 
 
-def _global_any(local: bool, device: torch.device) -> bool:
-    """Return ``local`` OR-reduced across all ranks of the current process group.
+def _global_or_branch_decisions(
+    presence_locals: tuple[bool, ...],
+    any_locals: tuple[bool, ...],
+    field_names: tuple[str, ...],
+    device: torch.device,
+) -> tuple[bool, ...]:
+    """Synchronize ``embed_prefix`` branch decisions across distributed ranks.
 
     pi07's ``embed_prefix`` chooses Python-level branches based on whether the
     local rank's micro-batch contains any subgoal images / response tokens /
@@ -80,21 +85,76 @@ def _global_any(local: bool, device: torch.device) -> bool:
     take different branches and deadlock at NCCL with mismatched all-gather
     sequence numbers.
 
-    This helper turns a per-rank ``bool`` into a globally-OR'd ``bool`` via a
-    single 1-element ``MAX`` all-reduce. We use it once per branch decision
-    in ``embed_prefix`` so every rank executes the same code path even when
-    its local data slice has different drop rolls.
+    This helper bundles two synchronizations into a *single* SUM all-reduce
+    (vs N independent 1-element MAX all-reduces before):
 
-    The all-reduce cost is negligible (~tens of microseconds per call,
-    handful of calls per step). Outside ``torch.distributed`` (single-process
-    runs, CPU smoke tests) the helper is a fast no-op that just returns the
-    local value.
+    1. ``any_locals`` are OR-reduced across ranks. The returned ``has_*``
+       booleans drive the Python branches that fire collectives, so all
+       ranks must end up taking the same branch.
+    2. ``presence_locals`` are checked for cross-rank agreement. If any rank
+       has a field as None while another has it as a Tensor (a future
+       heterogeneous-mixture regression), this raises immediately rather
+       than letting the inner ``if has_response and response_tokens is not
+       None`` gates silently re-introduce the desync. Today every rank
+       instantiates the same ``embed_prefix`` contract, so divergence is a
+       loud bug, not normal operation.
+
+    Outside ``torch.distributed`` (single-process runs, CPU smoke tests)
+    the helper is a no-op that just returns the local ``any_locals``.
+
+    Args:
+        presence_locals: Per-field bools — ``True`` iff the local rank has a
+            non-None Tensor for that field. Checked for agreement only;
+            never returned.
+        any_locals: Per-field bools — ``True`` iff the local rank's mask has
+            any non-False entry. OR-reduced and returned. Each entry implies
+            the field is present locally (``any_locals[i] => presence_locals[i]``).
+        field_names: Human-readable field names parallel to the lists above
+            (used in the divergence error message).
+        device: Device to allocate the all-reduce buffer on; must match the
+            distributed backend (typically the policy's CUDA device).
+
+    Returns:
+        A tuple of OR-reduced ``has_*`` booleans, one per ``any_locals`` entry,
+        in the same order.
+
+    Raises:
+        RuntimeError: If any field's ``presence_locals`` value differs across
+            ranks. Error names the divergent field(s).
     """
+    n = len(any_locals)
+    if not (len(presence_locals) == n and len(field_names) == n):
+        raise ValueError(
+            f"_global_or_branch_decisions: presence_locals/any_locals/field_names "
+            f"must have the same length, got "
+            f"{len(presence_locals)}/{n}/{len(field_names)}."
+        )
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
-        return bool(local)
-    flag = torch.tensor([1 if local else 0], device=device, dtype=torch.int32)
-    torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
-    return bool(flag.item())
+        return tuple(bool(a) for a in any_locals)
+    # One SUM all-reduce over [presence | any]: SUM lets us derive both the
+    # OR (sum > 0) for the any flags and the cross-rank-agreement check
+    # (sum == 0 or sum == world_size) for the presence flags.
+    flag = torch.tensor(
+        [int(bool(p)) for p in presence_locals] + [int(bool(a)) for a in any_locals],
+        device=device,
+        dtype=torch.int32,
+    )
+    torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.SUM)
+    world_size = torch.distributed.get_world_size()
+    counts = flag.tolist()
+    presence_counts = counts[:n]
+    any_counts = counts[n:]
+    diverged = [(name, c) for name, c in zip(field_names, presence_counts, strict=True) if 0 < c < world_size]
+    if diverged:
+        raise RuntimeError(
+            "_global_or_branch_decisions: ranks disagree on field presence "
+            "(None vs Tensor). embed_prefix assumes per-field presence is a "
+            "global property of the dataset config; if a heterogeneous-mixture "
+            "change makes this no longer true, the None-vs-Tensor inner gates "
+            "would re-introduce the FSDP / ZeRO-3 desync. Divergent fields "
+            f"(name, ranks_with_non_None / world_size={world_size}): {diverged}."
+        )
+    return tuple(c > 0 for c in any_counts)
 
 
 def create_sinusoidal_pos_embedding(
@@ -1294,40 +1354,39 @@ class PI07LowLevelFlowMatching(nn.Module):
         # omitted, eliminating spurious dangling tokens that would otherwise break
         # the cumsum at the indicator -> first-discrete boundary.
         #
-        # Each ``has_*`` flag is OR-reduced across all ranks via ``_global_any``.
-        # Different ranks process different micro-batches, so under stochastic
-        # ``*_drop_prob`` settings their local ``.any()`` values can diverge.
-        # If we let each rank take its local branch, FSDP / ZeRO-3 would launch
-        # different numbers of param all-gathers per rank and deadlock at NCCL
-        # (observed empirically: rank 0,1,3,4,5,7 stuck at SeqNum=274 ALLREDUCE,
-        # rank 2,6 at SeqNum=279 ALLGATHER_BASE). Synchronizing the *branch
-        # decision* — not the data — keeps every rank running the same set of
-        # collectives. Ranks whose local data is all-dropped still embed real
-        # tokens with all-False masks; downstream attention / loss respect the
-        # mask, so accuracy is preserved.
+        # Each ``has_*`` flag is OR-reduced across all ranks via
+        # ``_global_or_branch_decisions``. Different ranks process different
+        # micro-batches, so under stochastic ``*_drop_prob`` settings their
+        # local ``.any()`` values can diverge. If we let each rank take its
+        # local branch, FSDP / ZeRO-3 would launch different numbers of param
+        # all-gathers per rank and deadlock at NCCL (observed empirically:
+        # rank 0,1,3,4,5,7 stuck at SeqNum=274 ALLREDUCE, rank 2,6 at
+        # SeqNum=279 ALLGATHER_BASE). Synchronizing the *branch decision* —
+        # not the data — keeps every rank running the same set of collectives.
+        # Ranks whose local data is all-dropped still embed real tokens with
+        # all-False masks; downstream attention / loss respect the mask, so
+        # accuracy is preserved.
         #
-        # Scope of the sync: this only protects against per-rank divergence of
-        # the ``.any()`` outcome on a field that *is* present everywhere. The
-        # inner branch (``if has_response and response_tokens is not None
-        # and response_masks is not None``) still gates on per-rank Nones,
-        # which assumes field presence is a global property of the dataset
-        # config (true today — every rank instantiates the same ``embed_prefix``
-        # contract). If a future heterogeneous-mixture change makes some ranks
-        # carry e.g. ``response_tokens=None`` while others carry a Tensor, the
-        # branches would re-desync and need their own None-vs-Tensor sync.
+        # The same call also asserts cross-rank agreement on field *presence*
+        # (None vs Tensor), bundled into the same all-reduce. The inner gates
+        # (``if has_response and response_tokens is not None``) assume field
+        # presence is a global property of the dataset config. If a future
+        # heterogeneous-mixture change ever makes that not true, the helper
+        # raises a loud ``RuntimeError`` here rather than letting the branches
+        # silently re-desync and hang at NCCL hours into a run.
         device = lang_tokens.device
-        has_response_local = (
-            response_tokens is not None and response_masks is not None and bool(response_masks.any())
+        response_present_local = response_tokens is not None and response_masks is not None
+        subgoal_present_local = bool(subgoal_images) and bool(subgoal_img_masks)
+        metadata_present_local = metadata_tokens is not None and metadata_masks is not None
+        has_response_local = response_present_local and bool(response_masks.any())
+        has_subgoal_local = subgoal_present_local and any(bool(m.any()) for m in subgoal_img_masks)
+        has_metadata_local = metadata_present_local and bool(metadata_masks.any())
+        has_response, has_subgoal, has_metadata = _global_or_branch_decisions(
+            presence_locals=(response_present_local, subgoal_present_local, metadata_present_local),
+            any_locals=(has_response_local, has_subgoal_local, has_metadata_local),
+            field_names=("response", "subgoal", "metadata"),
+            device=device,
         )
-        has_subgoal_local = (
-            bool(subgoal_images) and bool(subgoal_img_masks) and any(bool(m.any()) for m in subgoal_img_masks)
-        )
-        has_metadata_local = (
-            metadata_tokens is not None and metadata_masks is not None and bool(metadata_masks.any())
-        )
-        has_response = _global_any(has_response_local, device)
-        has_subgoal = _global_any(has_subgoal_local, device)
-        has_metadata = _global_any(has_metadata_local, device)
         has_any_optional = bool(has_response or has_subgoal or has_metadata)
 
         for vid, vid_mask in zip(videos, vid_masks, strict=True):

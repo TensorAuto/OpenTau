@@ -811,3 +811,103 @@ class TestPI07LowLevelRegression:
             assert params[name].default is inspect.Parameter.empty, (
                 f"{name} should be a required parameter (no default), got default={params[name].default}"
             )
+
+
+class TestGemma3WithExpertFSDPWrap:
+    """Smoke-level GPU coverage that the InterleavedDecoderLayer-based model
+    can be wrapped under FSDP and run one forward+backward without raising.
+
+    The CPU invariants in ``test_pi07_cpu.py::TestInterleavedDecoderLayer``
+    pin param uniqueness / state_dict prefix / dispatch lookup, but a wrap-
+    target regression (e.g. someone re-introduces the language_model.layers
+    nesting or shares a Parameter between two modules) would only fail at
+    actual FSDP construction. Until commit aaefa6e + this PR that failure
+    was only caught by the 8×A100 throughput matrix; this test makes it
+    catchable on any single-GPU box.
+    """
+
+    @pytest.mark.gpu
+    @pytest.mark.slow
+    def test_fsdp_wrap_forward_backward(self):
+        """Wrap the model with FSDP (single-rank process group on the local
+        GPU) and exercise one forward + backward. Catches param double-
+        registration, shared-parameter handles, and unwrappable submodules."""
+        import functools
+        import os
+
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP  # noqa: N817
+        from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+
+        from opentau.policies.pi07.gemma3_with_expert import (
+            Gemma3WithExpertModel,
+            InterleavedDecoderLayer,
+        )
+
+        if not torch.cuda.is_available():
+            pytest.skip("FSDP wrap test requires CUDA")
+
+        # Single-rank process group on the local GPU; the test owns init /
+        # teardown so it doesn't pollute other GPU tests in the same pytest
+        # session. world_size=1 keeps the all-gather / reduce-scatter hooks
+        # active (their no-op fast paths still walk the FlatParameter
+        # machinery) while not requiring multi-GPU infrastructure.
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "29501")
+        os.environ.setdefault("WORLD_SIZE", "1")
+        os.environ.setdefault("RANK", "0")
+        already_initialized = torch.distributed.is_initialized()
+        if not already_initialized:
+            torch.distributed.init_process_group(backend="nccl", world_size=1, rank=0)
+        try:
+            torch.cuda.set_device(0)
+            cfg = Gemma3WithExpertConfig(
+                gemma3_config=_TINY_VLM_CONFIG.gemma3_config.to_dict(),
+                gemma_expert_config=_TINY_VLM_CONFIG.gemma_expert_config.to_dict(),
+                # Skip the in-init bf16 cast so FSDP MixedPrecision can manage
+                # the fp32-master / bf16-compute split itself (the production
+                # FSDP regime — see profile_step.py:215-218 and train.py).
+                disable_internal_bf16_cast=True,
+                freeze_vision_encoder=True,
+                train_expert_only=False,
+                attention_implementation="eager",
+            )
+
+            model = Gemma3WithExpertModel(cfg).to(device="cuda", dtype=torch.float32)
+
+            auto_wrap_policy = functools.partial(
+                transformer_auto_wrap_policy,
+                transformer_layer_cls={InterleavedDecoderLayer},
+            )
+            wrapped = FSDP(
+                model,
+                auto_wrap_policy=auto_wrap_policy,
+                use_orig_params=True,
+                device_id=torch.cuda.current_device(),
+            )
+
+            batch, seq_len = 1, 4
+            hidden_size = cfg.gemma3_config.text_config.hidden_size
+            inputs = torch.randn(batch, seq_len, hidden_size, device="cuda", dtype=torch.float32)
+            position_ids = torch.arange(seq_len, device="cuda")[None, :]
+            attn_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device="cuda"))[None]
+
+            outs, _ = wrapped(
+                attention_mask=attn_mask,
+                position_ids=position_ids,
+                inputs_embeds=[inputs, None],
+            )
+            assert outs[0] is not None
+            # One backward to exercise the FSDP all-gather / reduce-scatter
+            # hooks on every interleaved layer — the path that would deadlock
+            # if the wrap target was misaligned.
+            outs[0].sum().backward()
+
+            # Confirm the wrap actually saw the InterleavedDecoderLayer (vs.
+            # falling back to a single root-level wrap that hides regressions).
+            wrapped_modules = [m for m in wrapped.modules() if isinstance(m, FSDP)]
+            assert any(isinstance(m.module, InterleavedDecoderLayer) for m in wrapped_modules), (
+                "transformer_auto_wrap_policy did not pick up InterleavedDecoderLayer"
+            )
+        finally:
+            if not already_initialized and torch.distributed.is_initialized():
+                torch.distributed.destroy_process_group()

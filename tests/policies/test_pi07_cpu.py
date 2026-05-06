@@ -1989,3 +1989,66 @@ class TestDisableInternalBf16Cast:
             assert param.dtype == torch.float32, (
                 f"param {name} unexpectedly {param.dtype} (expected fp32 with cast skipped)"
             )
+
+
+class TestGlobalOrBranchDecisions:
+    """Single-process / no-distributed coverage of ``_global_or_branch_decisions``.
+
+    The helper has two responsibilities: OR-reduce per-rank ``has_*`` flags
+    so all ranks branch identically, and assert cross-rank agreement on
+    field presence (None vs Tensor). Without ``torch.distributed`` initialised
+    it must short-circuit to identity on the local ``any_locals``. Multi-rank
+    NCCL behaviour is exercised by the FSDP integration matrix on 8×A100;
+    this class pins the no-distributed path and the input-validation contract.
+    """
+
+    def test_no_distributed_returns_local_any_flags(self):
+        """When ``torch.distributed`` is uninitialised, the helper must return
+        the local ``any_locals`` unchanged (no all-reduce, no presence check)."""
+        from opentau.policies.pi07.low_level.modeling_pi07_low_level import (
+            _global_or_branch_decisions,
+        )
+
+        # Sanity: in a CPU pytest run there is no process group.
+        assert not torch.distributed.is_initialized()
+
+        out = _global_or_branch_decisions(
+            presence_locals=(True, False, True),
+            any_locals=(True, False, False),
+            field_names=("response", "subgoal", "metadata"),
+            device=torch.device("cpu"),
+        )
+        assert out == (True, False, False)
+
+    def test_no_distributed_coerces_truthy_inputs_to_bool(self):
+        """``presence_locals`` and ``any_locals`` are ``bool`` per the type
+        annotation, but the helper guards against numpy/scalar leaks by
+        coercing to Python ``bool``. The no-distributed path returns ``bool``
+        outputs even when fed truthy non-bool values."""
+        from opentau.policies.pi07.low_level.modeling_pi07_low_level import (
+            _global_or_branch_decisions,
+        )
+
+        out = _global_or_branch_decisions(
+            presence_locals=(1, 0, 1),  # type: ignore[arg-type]
+            any_locals=(1, 0, 0),  # type: ignore[arg-type]
+            field_names=("a", "b", "c"),
+            device=torch.device("cpu"),
+        )
+        assert all(isinstance(x, bool) for x in out)
+        assert out == (True, False, False)
+
+    def test_length_mismatch_raises(self):
+        """Mismatched lengths between presence/any/names must fail loudly at
+        the call site rather than silently zip-truncate."""
+        from opentau.policies.pi07.low_level.modeling_pi07_low_level import (
+            _global_or_branch_decisions,
+        )
+
+        with pytest.raises(ValueError, match="same length"):
+            _global_or_branch_decisions(
+                presence_locals=(True, False),
+                any_locals=(True, False, False),
+                field_names=("a", "b", "c"),
+                device=torch.device("cpu"),
+            )

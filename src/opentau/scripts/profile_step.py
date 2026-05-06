@@ -327,18 +327,22 @@ def profile(cfg: TrainPipelineConfig):
         # memory and over-report the largest batch that fits. See issue #181.
         # DeepSpeed ZeRO provides equivalent fp32-master semantics via
         # BF16_Optimizer.
-        # FSDP in this PR runs in **pure bf16** (no fp32 master): the model's
-        # ``Gemma3WithExpertModel.__init__`` calls
-        # ``to_bfloat16_like_physical_intelligence`` unconditionally, so by
-        # the time accelerate.prepare wraps the policy under FSDP, params
-        # are already bf16 — FSDP's ``MixedPrecision(param_dtype=bf16, ...)``
-        # is a no-op for storage and the optimizer steps on bf16 sharded
-        # params. Wrapping with ``MasterWeightOptimizer`` on top would clone
-        # the bf16 sharded params into a redundant in-rank fp32 copy without
-        # restoring the cross-rank fp32 master that a fp32-built model would
-        # have, so we skip the wrap (also: would misalign with FSDP's
-        # flat-param parameter handles — observed empirically as a NCCL
-        # desync during the first backward).
+        # FSDP runs with fp32 master + fp32 Adam state in this PR: the
+        # ``disable_internal_bf16_cast`` flag set above (lines 215-218) gates
+        # the model's internal ``to_bfloat16_like_physical_intelligence``
+        # cast, so by the time ``accelerator.prepare`` wraps the policy under
+        # FSDP, parameters are still fp32. The optimizer is therefore built
+        # over fp32 outer params, and FSDP's ``MixedPrecision(param_dtype=bf16,
+        # reduce_dtype=fp32, buffer_dtype=fp32)`` provides bf16 compute on the
+        # fly while keeping the fp32 master copy on each rank. Adam state is
+        # fp32 (matches the production regime). Wrapping with
+        # ``MasterWeightOptimizer`` *on top* of FSDP would still misalign with
+        # FSDP's flat-param parameter handles — every wrap clone breaks the
+        # 1:1 handle ↔ stored-param identity that FSDP relies on for its
+        # all-gather hooks, observed empirically as a NCCL desync during the
+        # first backward. Since FSDP already gives us fp32 master semantics
+        # via MixedPrecision when the policy enters fp32, the wrap is also
+        # redundant. Skip it.
         if accelerator.distributed_type not in (
             accelerate.DistributedType.DEEPSPEED,
             accelerate.DistributedType.FSDP,
