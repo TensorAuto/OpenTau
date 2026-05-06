@@ -205,8 +205,8 @@ class TestPretrainedConfigCodec:
     Without these handlers, ``PI07HighLevelPlannerConfig._save_pretrained``
     raises ``Exception("No parser for object ...")`` when draccus tries to
     serialise the nested ``vlm_config: Gemma3WithExpertConfig`` field —
-    which is the bug surfaced when bootstrapping the
-    ``TensorAuto/pi07-{high,low}-untrained`` checkpoints.
+    which is the bug originally surfaced when bootstrapping a π0.7
+    high-level / low-level planner checkpoint from public Gemma 3 weights.
     """
 
     def test_encode_dispatches_via_to_dict_for_subclass(self):
@@ -242,9 +242,8 @@ class TestPretrainedConfigCodec:
         ``_save_pretrained`` -> ``PreTrainedConfig.from_pretrained``, with the
         ``vlm_config`` subtree preserved.
 
-        This is the actual failure mode that broke the
-        ``TensorAuto/pi07-high-untrained`` build before the codec was
-        registered.
+        This is the actual failure mode that broke a π0.7 high-level
+        planner checkpoint bootstrap before the codec was registered.
         """
         from opentau.configs.policies import PreTrainedConfig
         from opentau.policies.pi07.high_level_planner.configuration_pi07_high_level import (

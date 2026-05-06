@@ -50,8 +50,10 @@ class TestBilinearResamplePosEmbed:
 
     def test_deterministic(self):
         # Two calls with the same input must return bit-identical output.
-        # Required for byte-equality tests against an independently-resampled
-        # reference (see test_pi06_untrained_siglip_matches_gemma3_4b_pt).
+        # Required so that bootstrapping scripts which resample the published
+        # Gemma 3 SigLIP position-embedding table produce a checkpoint whose
+        # weights compare byte-for-byte against an independently-resampled
+        # reference (see ``bilinear_resample_pos_embed`` docstring).
         pos = torch.arange(64 * 8, dtype=torch.float32).reshape(64, 8)
         out1 = bilinear_resample_pos_embed(pos, target_num_patches=16)
         out2 = bilinear_resample_pos_embed(pos, target_num_patches=16)
