@@ -436,7 +436,7 @@ class PI05MemPolicy(PreTrainedPolicy):
         bool tensor (``True`` = padded). T = ``n_obs_steps``.
         """
         n_hist: int = self.config.n_obs_steps
-        interval = self.config.history_interval or 1
+        interval = self.config.history_interval
         buf_maxlen = self.config.obs_buffer_size
 
         # initialise buffers on first call after reset()
@@ -566,7 +566,7 @@ class PI05MemPolicy(PreTrainedPolicy):
                 logging.warning(
                     "Temporal dimension T=1: no historical frames included. "
                     "This should only happen at most %d time(s) at the start of an episode.",
-                    self.config.history_interval or 1,
+                    self.config.history_interval,
                 )
 
         if delay is None:

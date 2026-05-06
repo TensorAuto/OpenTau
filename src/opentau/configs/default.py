@@ -187,11 +187,11 @@ class DatasetMixtureConfig:
             ``(C, H, W)`` and rank-1 state tensors ``(max_state_dim,)``.
             Note that ``n_obs_history=1`` produces rank-4/rank-2 tensors with
             a leading singleton dimension, so downstream consumers must handle
-            both rank conventions. Defaults to ``None``.
-        history_interval: Step interval between historical observation steps.
-            Must be a positive integer. When ``n_obs_history=T`` and
-            ``history_interval=k``, observations are sampled at timesteps
-            :math:`t - (T-1)k,\; t - (T-2)k,\; \ldots,\; t`. Defaults to 1.
+            both rank conventions. Defaults to ``None``. The temporal stride
+            between sampled observations is read from the policy config's
+            ``history_interval`` attribute (defaults to 1 when the policy
+            doesn't define one), so observations are sampled at timesteps
+            :math:`t - (T-1)k,\; t - (T-2)k,\; \ldots,\; t`.
         history_state_drop_prob: Probability of dropping historical frames and
             ``observation.state`` together during a single ``__getitem__`` call
             (zeros out ``state`` and historical camera frames; sets
@@ -277,8 +277,6 @@ class DatasetMixtureConfig:
     val_split_ratio: float = 0.05
     # Number of historical observation steps. None preserves default single-step behavior.
     n_obs_history: int | None = None
-    # Step interval between historical observation steps. Must be a positive integer.
-    history_interval: int = 1
 
     # Training-time dropout probabilities for optional sample keys.
     history_state_drop_prob: float = 0.3
@@ -328,8 +326,6 @@ class DatasetMixtureConfig:
             not isinstance(self.n_obs_history, int) or self.n_obs_history < 1
         ):
             raise ValueError(f"`n_obs_history` must be None or a positive integer, got {self.n_obs_history}.")
-        if not isinstance(self.history_interval, int) or self.history_interval < 1:
-            raise ValueError(f"`history_interval` must be a positive integer, got {self.history_interval}.")
         for name in (
             "history_state_drop_prob",
             "subgoal_drop_prob",

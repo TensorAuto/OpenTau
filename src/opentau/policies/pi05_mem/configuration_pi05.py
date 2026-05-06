@@ -53,8 +53,7 @@ class PI05MemConfig(PreTrainedConfig):
             produce exactly ``n_obs_steps`` frames (sampled at
             ``history_interval``).
         history_interval: Temporal stride between stacked frames, in
-            environment steps. Defaults to None (= 1). Must match
-            ``dataset_mixture.history_interval``.
+            environment steps. Defaults to 1.
         chunk_size: Size of the action chunk. The upper bound for n_action_steps. Defaults to 50.
         n_action_steps: Number of action steps to predict. Defaults to 50.
         normalization_mapping: Mapping of feature names to normalization modes.
@@ -90,8 +89,7 @@ class PI05MemConfig(PreTrainedConfig):
     # Inference observation-history buffer: ``history_interval`` is the
     # temporal stride between the ``n_obs_steps`` stacked frames. Together they
     # determine ``obs_buffer_size = (n_obs_steps - 1) * history_interval + 1``.
-    # Populated from DatasetMixtureConfig during training if unset.
-    history_interval: int | None = None
+    history_interval: int = 1
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -171,7 +169,7 @@ class PI05MemConfig(PreTrainedConfig):
         """
         if self.n_obs_steps <= 1:
             return 1
-        return (self.n_obs_steps - 1) * (self.history_interval or 1) + 1
+        return (self.n_obs_steps - 1) * self.history_interval + 1
 
     def __post_init__(self):
         """Post-initialization validation."""
@@ -179,14 +177,8 @@ class PI05MemConfig(PreTrainedConfig):
 
         if not isinstance(self.n_obs_steps, int) or self.n_obs_steps < 1:
             raise ValueError(f"`n_obs_steps` must be a positive integer, got {self.n_obs_steps}.")
-        if self.n_obs_steps > 1 and self.history_interval is None:
-            self.history_interval = 1
-        if self.history_interval is not None and (
-            not isinstance(self.history_interval, int) or self.history_interval < 1
-        ):
-            raise ValueError(
-                f"`history_interval` must be None or a positive integer, got {self.history_interval}."
-            )
+        if not isinstance(self.history_interval, int) or self.history_interval < 1:
+            raise ValueError(f"`history_interval` must be a positive integer, got {self.history_interval}.")
 
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
