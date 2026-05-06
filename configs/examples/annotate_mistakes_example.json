@@ -1,0 +1,12 @@
+{
+  "dataset_mixture": {
+    "datasets": [
+      {
+        "repo_id": "RoboCOIN/leju_robot_moving_parts_a",
+        "data_features_name_mapping": {
+          "camera0": "observation.images.camera_head_rgb"
+        }
+      }
+    ]
+  }
+}
