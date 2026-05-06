@@ -333,16 +333,18 @@ def profile(cfg: TrainPipelineConfig):
         # cast, so by the time ``accelerator.prepare`` wraps the policy under
         # FSDP, parameters are still fp32. The optimizer is therefore built
         # over fp32 outer params, and FSDP's ``MixedPrecision(param_dtype=bf16,
-        # reduce_dtype=fp32, buffer_dtype=fp32)`` provides bf16 compute on the
-        # fly while keeping the fp32 master copy on each rank. Adam state is
-        # fp32 (matches the production regime). Wrapping with
-        # ``MasterWeightOptimizer`` *on top* of FSDP would still misalign with
-        # FSDP's flat-param parameter handles — every wrap clone breaks the
-        # 1:1 handle ↔ stored-param identity that FSDP relies on for its
-        # all-gather hooks, observed empirically as a NCCL desync during the
-        # first backward. Since FSDP already gives us fp32 master semantics
-        # via MixedPrecision when the policy enters fp32, the wrap is also
-        # redundant. Skip it.
+        # reduce_dtype=bf16, buffer_dtype=bf16)`` (what accelerate translates
+        # ``mixed_precision: bf16`` into when no ``fsdp_reduce_dtype`` /
+        # ``fsdp_buffer_dtype`` overrides are set) does only the compute-time
+        # downcast — the fp32 outer master shards are preserved across forward
+        # and backward, and AdamW steps on them. Adam state is fp32 (matches
+        # the production regime). Wrapping with ``MasterWeightOptimizer`` *on
+        # top* of FSDP would still misalign with FSDP's flat-param parameter
+        # handles — every wrap clone breaks the 1:1 handle ↔ stored-param
+        # identity that FSDP relies on for its all-gather hooks, observed
+        # empirically as a NCCL desync during the first backward. Since FSDP
+        # already gives us fp32 master semantics via the fp32-built outer
+        # params, the wrap is also redundant. Skip it.
         if accelerator.distributed_type not in (
             accelerate.DistributedType.DEEPSPEED,
             accelerate.DistributedType.FSDP,
