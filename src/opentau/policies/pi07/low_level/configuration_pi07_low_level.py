@@ -52,6 +52,9 @@ class PI07LowLevelConfig(PreTrainedConfig):
             evenly-spaced historical frames the inference buffer keeps
             (the encoder sees the same number of frames at training and
             inference time). Must equal ``dataset_mixture.n_obs_history``.
+        history_interval: Temporal stride between the ``n_obs_steps``
+            stacked frames in the inference buffer, in environment steps.
+            Defaults to 1.
         chunk_size: Size of the action chunk (upper bound for
             ``n_action_steps``). Defaults to 50.
         n_action_steps: Number of action steps to predict. Defaults to 50.

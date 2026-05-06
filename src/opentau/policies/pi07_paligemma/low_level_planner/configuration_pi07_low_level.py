@@ -43,6 +43,8 @@ class PI07lowlevelPlannerConfig(PreTrainedConfig):
 
     Args:
         n_obs_steps: Number of observation steps to use. Defaults to 1.
+        history_interval: Temporal stride between the ``n_obs_steps`` stacked
+            frames in the inference buffer, in environment steps. Defaults to 1.
         chunk_size: Size of the action chunk. The upper bound for n_action_steps. Defaults to 50.
         n_action_steps: Number of action steps to predict. Defaults to 50.
         normalization_mapping: Mapping of feature names to normalization modes.
