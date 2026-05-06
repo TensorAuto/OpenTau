@@ -148,9 +148,12 @@ def _call_claude_single(
     subtask: str,
     frame: Image.Image,
 ) -> str:
+    # max_tokens is required by the Anthropic Messages API; set to the
+    # claude-opus-4-7 per-request output ceiling so the response is never
+    # truncated for budget reasons.
     response = client.messages.create(
         model=model,
-        max_tokens=256,
+        max_tokens=32000,
         system=_SYSTEM_PROMPT,
         messages=[
             {
@@ -183,10 +186,10 @@ def _call_gemini_single(
     frame: Image.Image,
 ) -> str:
     # Gemini Robotics-ER is a thinking model: with default settings it spends
-    # most of `max_output_tokens` on internal reasoning and truncates before
-    # emitting any JSON. For a simple per-frame success/failure judgment we
-    # disable thinking entirely (`thinking_budget=0`) and ask only for the
-    # final JSON.
+    # output tokens on internal reasoning and may truncate the JSON. We
+    # disable thinking entirely (`thinking_budget=0`) for these short
+    # success/failure judgments and leave the output budget unset so the
+    # model uses its own default ceiling.
     response = client.models.generate_content(
         model=model,
         contents=[
@@ -195,7 +198,6 @@ def _call_gemini_single(
         ],
         config=genai_types.GenerateContentConfig(
             system_instruction=_SYSTEM_PROMPT,
-            max_output_tokens=512,
             response_mime_type="application/json",
             thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
         ),
