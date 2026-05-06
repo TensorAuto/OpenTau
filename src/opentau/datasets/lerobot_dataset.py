@@ -1346,12 +1346,20 @@ class LeRobotDataset(BaseDataset):
         # Check timestamps
         # If transform is set, with_transform will decode all columns of a row before returning the desired column(s).
         if self.skip_timestamp_check:
-            logging.warning(
-                "Skipping timestamp sync check for %s (skip_timestamp_check=True). "
-                "Frame-to-frame spacing is NOT verified against 1/fps; downstream "
-                "delta_timestamps lookups may sample unintended frames.",
-                self.repo_id,
-            )
+            # LeRobotDataset is constructed once per rank, so a naive
+            # ``logging.warning`` floods the run log with ``num_processes`` ×
+            # ``num_datasets`` copies of the same message (392 × 8 ≈ 3K lines
+            # for a wide pretraining mixture). Gate to rank 0 — fall through
+            # to logging when no Accelerator is set (single-process dev /
+            # tests).
+            acc = get_proc_accelerator()
+            if acc is None or acc.is_main_process:
+                logging.warning(
+                    "Skipping timestamp sync check for %s (skip_timestamp_check=True). "
+                    "Frame-to-frame spacing is NOT verified against 1/fps; downstream "
+                    "delta_timestamps lookups may sample unintended frames.",
+                    self.repo_id,
+                )
         else:
             no_transform_ds = self.hf_dataset.with_transform(None).with_format("numpy")
             logging.info("Checking timestamps synchronization...")
