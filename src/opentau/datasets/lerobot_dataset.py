@@ -216,6 +216,14 @@ CODEBASE_VERSION = "v2.1"
 # instances within a single process (e.g., train + val constructed for the same repo).
 _CONTROL_MODE_WARNED: set[str] = set()
 
+# ``skip_timestamp_check`` is a mixture-wide decision (with optional per-dataset
+# override) that produces an identical warning for every dataset in the mixture.
+# For a 392-dataset pretraining run on 8 ranks, the naive per-dataset emission
+# floods the run log with ~3K identical lines. This flag makes the warning fire
+# once per process; combined with the rank-0 gate at the call site, that's once
+# per run rather than 8 × num_datasets.
+_SKIP_TIMESTAMP_WARNED: bool = False
+
 
 def suppress_control_mode_warning(repo_id: str) -> None:
     """Mark ``repo_id`` as already-warned so the missing-``control_mode`` warning
@@ -1346,12 +1354,24 @@ class LeRobotDataset(BaseDataset):
         # Check timestamps
         # If transform is set, with_transform will decode all columns of a row before returning the desired column(s).
         if self.skip_timestamp_check:
-            logging.warning(
-                "Skipping timestamp sync check for %s (skip_timestamp_check=True). "
-                "Frame-to-frame spacing is NOT verified against 1/fps; downstream "
-                "delta_timestamps lookups may sample unintended frames.",
-                self.repo_id,
-            )
+            # ``skip_timestamp_check`` is a mixture-wide decision and the
+            # message is identical for every dataset, so emit it once per
+            # process and only on the main rank. Naive per-dataset / per-rank
+            # logging floods the run log with ``num_processes`` ×
+            # ``num_datasets`` copies of the same line (392 × 8 ≈ 3K for a
+            # wide pretraining mixture). Falls through to logging when no
+            # Accelerator is set (single-process dev / tests).
+            global _SKIP_TIMESTAMP_WARNED
+            acc = get_proc_accelerator()
+            if not _SKIP_TIMESTAMP_WARNED and (acc is None or acc.is_main_process):
+                _SKIP_TIMESTAMP_WARNED = True
+                logging.warning(
+                    "skip_timestamp_check=True is in effect for one or more "
+                    "datasets in this mixture (e.g. %s). Frame-to-frame "
+                    "spacing is NOT verified against 1/fps; downstream "
+                    "delta_timestamps lookups may sample unintended frames.",
+                    self.repo_id,
+                )
         else:
             no_transform_ds = self.hf_dataset.with_transform(None).with_format("numpy")
             logging.info("Checking timestamps synchronization...")
