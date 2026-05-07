@@ -839,6 +839,7 @@ class TestGemma3WithExpertFSDPWrap:
         import os
 
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP  # noqa: N817
+        from torch.distributed.fsdp import MixedPrecision
         from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
         from opentau.policies.pi07.gemma3_with_expert import (
@@ -873,6 +874,10 @@ class TestGemma3WithExpertFSDPWrap:
                 freeze_vision_encoder=True,
                 train_expert_only=False,
                 attention_implementation="eager",
+                # Production wrappers (PI07LowLevelPolicy) inject this from the
+                # FAST tokenizer; here we set it explicitly so the bare
+                # Gemma3WithExpertModel can build its discrete-action head.
+                discrete_action_vocab_size=32,
             )
 
             model = Gemma3WithExpertModel(cfg).to(device="cuda", dtype=torch.float32)
@@ -881,9 +886,19 @@ class TestGemma3WithExpertFSDPWrap:
                 transformer_auto_wrap_policy,
                 transformer_layer_cls={InterleavedDecoderLayer},
             )
+            # Match the production FSDP regime (accelerate's `mixed_precision: bf16`
+            # with no `fsdp_reduce_dtype` override translates to this triple). Without
+            # it, the model's fp32 weights collide with `_preferred_dtype()` casting
+            # activations to bf16 inside `gemma3_with_expert.py:forward`.
+            mixed_precision = MixedPrecision(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.bfloat16,
+                buffer_dtype=torch.bfloat16,
+            )
             wrapped = FSDP(
                 model,
                 auto_wrap_policy=auto_wrap_policy,
+                mixed_precision=mixed_precision,
                 use_orig_params=True,
                 device_id=torch.cuda.current_device(),
             )
