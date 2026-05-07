@@ -50,12 +50,16 @@ config format (``{"dataset_mixture": {"datasets": [...]}}``) and the simpler
 Example::
 
     python src/opentau/scripts/annotate_mistakes.py \\
-        --config-path configs/examples/train_mixture_config.json
+        --config-path configs/examples/annotate_mistakes_example.json
 
     # Dry run: 1 episode per dataset
     python src/opentau/scripts/annotate_mistakes.py \\
-        --config-path configs/examples/train_mixture_config.json \\
+        --config-path configs/examples/annotate_mistakes_example.json \\
         --max-episodes-per-dataset 1
+
+A minimal mixture config is checked in at
+``configs/examples/annotate_mistakes_example.json`` (Hub ``revision`` pinned
+to ``v2.1`` since this script has only been tested against v2.1 datasets).
 """
 
 from __future__ import annotations
@@ -125,7 +129,10 @@ def _parse_success_response(text: str) -> bool:
     """Parse a ``{"success": bool, ...}`` JSON object from the model response.
 
     Tolerates ``` ... ``` fences. Raises ``ValueError`` / ``json.JSONDecodeError``
-    on any malformed payload — the caller treats those as a mistake=0 default.
+    on any malformed payload — including a non-bool ``success`` value (e.g. the
+    string ``"false"``, which would otherwise coerce to ``True``). The caller
+    treats those as a mistake=0 default, so failing closed here is safer than
+    flipping the verdict.
     """
     text = text.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text)
@@ -133,7 +140,10 @@ def _parse_success_response(text: str) -> bool:
     parsed = json.loads(text.strip())
     if not isinstance(parsed, dict) or "success" not in parsed:
         raise ValueError(f"Expected JSON object with 'success' key, got: {parsed!r}")
-    return bool(parsed["success"])
+    success = parsed["success"]
+    if not isinstance(success, bool):
+        raise ValueError(f"Expected boolean 'success' value, got {type(success).__name__}: {success!r}")
+    return success
 
 
 # ---------------------------------------------------------------------------
@@ -148,12 +158,14 @@ def _call_claude_single(
     subtask: str,
     frame: Image.Image,
 ) -> str:
-    # max_tokens is required by the Anthropic Messages API; set to the
-    # claude-opus-4-7 per-request output ceiling so the response is never
-    # truncated for budget reasons.
+    # max_tokens is required by the Anthropic Messages API; the response is a
+    # one-line ``{"success": bool, "reason": str}`` JSON object, so 1024 is a
+    # comfortable model-agnostic cap that fits inside the smallest Anthropic
+    # output ceiling (claude-3.5 family, 8192) without underutilizing larger
+    # models.
     response = client.messages.create(
         model=model,
-        max_tokens=32000,
+        max_tokens=1024,
         system=_SYSTEM_PROMPT,
         messages=[
             {
@@ -185,6 +197,11 @@ def _call_gemini_single(
     subtask: str,
     frame: Image.Image,
 ) -> str:
+    # Gemini ER thinking is left at the model default. The earlier
+    # ``thinking_budget=0`` workaround (introduced as a fix for output
+    # truncation) was retired once we confirmed empirically that the default
+    # output budget comfortably fits both internal reasoning and the
+    # one-line JSON verdict for the success/failure prompt.
     response = client.models.generate_content(
         model=model,
         contents=[
@@ -209,8 +226,15 @@ def _query_subtask_success(
     task: str,
     subtask: str,
     frame: Image.Image,
-) -> bool:
-    """Ask the VLM whether the subtask was completed; default to ``True`` (mistake=0) on any failure."""
+) -> tuple[bool, bool]:
+    """Ask the VLM whether the subtask was completed.
+
+    Returns ``(success, ok)`` where ``success`` is the verdict (``True`` →
+    ``mistake=0``, ``False`` → ``mistake=1``) and ``ok`` is ``False`` if the
+    API call or response parse failed. Failures default to ``success=True``
+    (no mistake) but the caller is expected to count ``not ok`` separately so
+    a quiet API outage doesn't masquerade as "no mistakes found".
+    """
     try:
         if _is_gemini_model(model):
             assert isinstance(client, genai.Client)
@@ -218,14 +242,14 @@ def _query_subtask_success(
         else:
             assert isinstance(client, anthropic.Anthropic)
             raw = _call_claude_single(client, model, task, subtask, frame)
-        return _parse_success_response(raw)
+        return _parse_success_response(raw), True
     except Exception as exc:
         logger.warning(
             "VLM query failed for subtask %r (%s); defaulting to success (mistake=0).",
             subtask,
             exc,
         )
-        return True
+        return True, False
 
 
 # ---------------------------------------------------------------------------
@@ -292,26 +316,33 @@ def _annotate_episode(
     ep_index: int,
     ep_info: dict,
     target_size: int,
-) -> bool:
-    """Annotate one episode. Returns ``True`` if the parquet was rewritten."""
+) -> tuple[bool, int, int]:
+    """Annotate one episode.
+
+    Returns ``(processed, n_api_failures, n_missing_frames)``. ``processed`` is
+    ``True`` iff the parquet was rewritten. ``n_api_failures`` counts segments
+    where the VLM call/parse failed (defaulted to ``mistake=0``).
+    ``n_missing_frames`` counts segments whose last frame could not be decoded
+    from the video (also defaulted to ``mistake=0``).
+    """
     data_tmpl: str = info["data_path"]
     chunks_size: int = info.get("chunks_size", DEFAULT_CHUNK_SIZE)
     parquet_path = _get_parquet_path(root, data_tmpl, ep_index, chunks_size)
 
     if not parquet_path.is_file():
         logger.warning("Episode %d: parquet not found at %s; skipping.", ep_index, parquet_path)
-        return False
+        return False, 0, 0
 
     schema_names = pq.read_metadata(parquet_path).schema.names
     if "mistake" in schema_names:
         logger.debug("Episode %d: 'mistake' column already present, skipping.", ep_index)
-        return False
+        return False, 0, 0
     if "response" not in schema_names:
         logger.warning(
             "Episode %d: parquet has no 'response' column (run annotate_subtasks.py first); skipping.",
             ep_index,
         )
-        return False
+        return False, 0, 0
 
     table = pq.read_table(parquet_path)
     responses = table.column("response").to_pylist()
@@ -321,18 +352,19 @@ def _annotate_episode(
             "Episode %d: 'response' column has no non-empty subtask labels; skipping.",
             ep_index,
         )
-        return False
+        return False, 0, 0
 
     video_tmpl: str = info["video_path"]
     ep_chunk = ep_index // chunks_size
     video_path = root / video_tmpl.format(episode_chunk=ep_chunk, video_key=video_key, episode_index=ep_index)
     if not video_path.is_file():
         logger.warning("Episode %d: video file not found at %s; skipping.", ep_index, video_path)
-        return False
+        return False, 0, 0
 
     last_indices = [last_idx for _, last_idx, _ in runs]
     frames = _extract_frames_at_indices(video_path, last_indices, target_size)
     missing = [i for i in last_indices if i not in frames]
+    n_missing_frames = len(missing)
     if missing:
         logger.warning(
             "Episode %d: could not extract frames at indices %s; those segments default to mistake=0.",
@@ -345,11 +377,14 @@ def _annotate_episode(
 
     mistakes = [0] * len(responses)
     n_failures = 0
+    n_api_failures = 0
     for start_idx, last_idx, subtask in runs:
         frame = frames.get(last_idx)
         if frame is None:
             continue
-        success = _query_subtask_success(client, model, task_description, subtask, frame)
+        success, ok = _query_subtask_success(client, model, task_description, subtask, frame)
+        if not ok:
+            n_api_failures += 1
         if not success:
             n_failures += 1
             for j in range(start_idx, last_idx + 1):
@@ -375,7 +410,7 @@ def _annotate_episode(
         sum(mistakes),
         len(mistakes),
     )
-    return True
+    return True, n_api_failures, n_missing_frames
 
 
 # ---------------------------------------------------------------------------
@@ -415,14 +450,7 @@ def _process_dataset(
         logger.warning("Dataset %s: no usable camera0 video feature; skipping.", root.name)
         return
 
-    if "mistake" not in info.get("features", {}):
-        info.setdefault("features", {})["mistake"] = {
-            "dtype": "int64",
-            "shape": (1,),
-            "names": None,
-        }
-        write_info(info, root)
-        logger.info("Added 'mistake' feature to %s/meta/info.json", root.name)
+    mistake_feature_registered = "mistake" in info.get("features", {})
 
     ep_indices = sorted(episodes.keys())
     if max_episodes is not None:
@@ -430,10 +458,12 @@ def _process_dataset(
 
     n_annotated = 0
     n_skipped = 0
+    n_api_failures_total = 0
+    n_missing_frames_total = 0
     for ep_index in tqdm(ep_indices, desc=root.name, unit="ep"):
         ep_info = episodes[ep_index]
         try:
-            processed = _annotate_episode(
+            processed, n_api_failures, n_missing_frames = _annotate_episode(
                 client=client,
                 model=model,
                 root=root,
@@ -450,10 +480,33 @@ def _process_dataset(
 
         if processed:
             n_annotated += 1
+            n_api_failures_total += n_api_failures
+            n_missing_frames_total += n_missing_frames
+            # Defer registering the 'mistake' feature in info.json until after
+            # the first parquet has actually been rewritten — otherwise a
+            # mid-dataset crash leaves info.json advertising a column that
+            # exists in only some parquets.
+            if not mistake_feature_registered:
+                info.setdefault("features", {})["mistake"] = {
+                    "dtype": "int64",
+                    "shape": (1,),
+                    "names": None,
+                }
+                write_info(info, root)
+                logger.info("Added 'mistake' feature to %s/meta/info.json", root.name)
+                mistake_feature_registered = True
         else:
             n_skipped += 1
 
-    logger.info("%s: annotated %d episodes, skipped %d.", root.name, n_annotated, n_skipped)
+    logger.info(
+        "%s: annotated %d episodes, skipped %d, %d VLM call failures, %d missing frames "
+        "(both default to mistake=0).",
+        root.name,
+        n_annotated,
+        n_skipped,
+        n_api_failures_total,
+        n_missing_frames_total,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -520,7 +573,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=Path.home() / ".cache" / "huggingface" / "opentau_subtasks",
         help=(
-            "Directory for caching Hub dataset downloads (default: ~/.cache/huggingface/opentau_subtasks)."
+            "Directory for caching Hub dataset downloads (default: "
+            "~/.cache/huggingface/opentau_subtasks). The default deliberately "
+            "matches annotate_subtasks.py so this script reuses datasets "
+            "already downloaded by the prior step rather than re-downloading "
+            "them — pass the same value here as you used there if you "
+            "overrode it."
         ),
     )
     return p.parse_args(argv)

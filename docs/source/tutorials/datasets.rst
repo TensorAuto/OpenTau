@@ -315,19 +315,22 @@ episode parquet has a non-empty ``response`` column.
 Running the script
 ^^^^^^^^^^^^^^^^^^
 
-Reuse the same dataset mixture config you passed to ``annotate_subtasks.py``:
+Reuse the same dataset mixture config you passed to ``annotate_subtasks.py``.
+A minimal one-dataset example (with the Hub revision pinned to ``v2.1``, since
+this script has only been tested against v2.1 datasets) is checked in at
+``configs/examples/annotate_mistakes_example.json``:
 
 .. code-block:: bash
 
     python src/opentau/scripts/annotate_mistakes.py \
-        --config-path configs/examples/train_mixture_config.json
+        --config-path configs/examples/annotate_mistakes_example.json
 
 For a dry run that processes only 1 episode per dataset:
 
 .. code-block:: bash
 
     python src/opentau/scripts/annotate_mistakes.py \
-        --config-path configs/examples/train_mixture_config.json \
+        --config-path configs/examples/annotate_mistakes_example.json \
         --max-episodes-per-dataset 1
 
 To annotate with Claude instead of Gemini:
@@ -335,7 +338,7 @@ To annotate with Claude instead of Gemini:
 .. code-block:: bash
 
     ANTHROPIC_API_KEY=... python src/opentau/scripts/annotate_mistakes.py \
-        --config-path configs/examples/train_mixture_config.json \
+        --config-path configs/examples/annotate_mistakes_example.json \
         --model claude-opus-4-7
 
 Full list of flags:
@@ -367,7 +370,9 @@ Full list of flags:
      - Anthropic SDK retry count for 429/5xx responses (ignored for Gemini).
    * - ``--hub-cache-dir``
      - ``~/.cache/huggingface/opentau_subtasks``
-     - Directory for caching Hub dataset downloads.
+     - Directory for caching Hub dataset downloads. The default deliberately matches
+       ``annotate_subtasks.py`` so this script reuses datasets already downloaded by
+       the prior step — pass the same value here if you overrode it there.
 
 Output
 ^^^^^^

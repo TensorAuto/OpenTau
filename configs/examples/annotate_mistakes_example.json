@@ -3,6 +3,7 @@
     "datasets": [
       {
         "repo_id": "RoboCOIN/leju_robot_moving_parts_a",
+        "revision": "v2.1",
         "data_features_name_mapping": {
           "camera0": "observation.images.camera_head_rgb"
         }
