@@ -185,11 +185,6 @@ def _call_gemini_single(
     subtask: str,
     frame: Image.Image,
 ) -> str:
-    # Gemini Robotics-ER is a thinking model: with default settings it spends
-    # output tokens on internal reasoning and may truncate the JSON. We
-    # disable thinking entirely (`thinking_budget=0`) for these short
-    # success/failure judgments and leave the output budget unset so the
-    # model uses its own default ceiling.
     response = client.models.generate_content(
         model=model,
         contents=[
@@ -199,7 +194,6 @@ def _call_gemini_single(
         config=genai_types.GenerateContentConfig(
             system_instruction=_SYSTEM_PROMPT,
             response_mime_type="application/json",
-            thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
         ),
     )
     raw_text = (response.text or "").strip()
