@@ -1033,24 +1033,27 @@ def test_skip_timestamp_warning_emitted_once_per_process(tmp_path, lerobot_datas
     heterogeneous mixture of N datasets emits 1 line, not N."""
     from opentau.datasets import lerobot_dataset as ld_mod
 
+    original = ld_mod._SKIP_TIMESTAMP_WARNED
     ld_mod._SKIP_TIMESTAMP_WARNED = False
+    try:
+        with caplog.at_level(logging.WARNING):
+            ds_a = lerobot_dataset_factory(
+                root=tmp_path / "skip_warn_a",
+                repo_id="warn-once/skip-ts-a",
+                skip_timestamp_check=True,
+            )
+            ds_b = lerobot_dataset_factory(
+                root=tmp_path / "skip_warn_b",
+                repo_id="warn-once/skip-ts-b",
+                skip_timestamp_check=True,
+            )
 
-    with caplog.at_level(logging.WARNING):
-        ds_a = lerobot_dataset_factory(
-            root=tmp_path / "skip_warn_a",
-            repo_id="warn-once/skip-ts-a",
-            skip_timestamp_check=True,
-        )
-        ds_b = lerobot_dataset_factory(
-            root=tmp_path / "skip_warn_b",
-            repo_id="warn-once/skip-ts-b",
-            skip_timestamp_check=True,
-        )
-
-    assert ds_a.skip_timestamp_check is True
-    assert ds_b.skip_timestamp_check is True
-    matching = [r for r in caplog.records if "skip_timestamp_check=True" in r.getMessage()]
-    assert len(matching) == 1
+        assert ds_a.skip_timestamp_check is True
+        assert ds_b.skip_timestamp_check is True
+        matching = [r for r in caplog.records if "skip_timestamp_check=True" in r.getMessage()]
+        assert len(matching) == 1
+    finally:
+        ld_mod._SKIP_TIMESTAMP_WARNED = original
 
 
 def test_robot_type_and_control_mode_in_meta_info(tmp_path, lerobot_dataset_factory, info_factory):
