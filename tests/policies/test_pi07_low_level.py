@@ -859,15 +859,18 @@ class TestGemma3WithExpertFSDPWrap:
         os.environ.setdefault("MASTER_PORT", "29501")
         os.environ.setdefault("WORLD_SIZE", "1")
         os.environ.setdefault("RANK", "0")
-        # Set the CUDA device and drain stale state from earlier GPU tests
-        # in the same pytest session before init_process_group, since NCCL
-        # binds its communicator to whatever device is current at init time
-        # (issue #283 hint about stale GPU context).
-        torch.cuda.set_device(0)
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
         already_initialized = torch.distributed.is_initialized()
         if not already_initialized:
+            # Set the CUDA device and drain stale state from earlier GPU tests
+            # in the same pytest session before init_process_group, since NCCL
+            # binds its communicator to whatever device is current at init time
+            # (issue #283 hint about stale GPU context). When a prior test has
+            # already initialized the PG, NCCL is bound to whichever device that
+            # test picked and re-pinning here can't unbind it — so this drain is
+            # only meaningful on the path where we own the init.
+            torch.cuda.set_device(0)
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
             # device_id pins the new PG to the local GPU explicitly, so NCCL
             # forms its communicator eagerly on the correct device instead of
             # the lazy default-device guess (PyTorch ≥ 2.0).
