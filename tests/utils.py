@@ -16,6 +16,7 @@
 # limitations under the License.
 import os
 import platform
+import time
 from functools import wraps
 
 import numpy as np
@@ -147,6 +148,43 @@ def require_package(package_name):
             if not is_package_available(package_name):
                 pytest.skip(f"{package_name} not installed")
             return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def retry_on_hf_flakiness(reruns: int = 2, delay: float = 10.0):
+    """Retry a test on transient HF Hub server-side failures.
+
+    Catches `HfHubHTTPError` with 5xx status codes (Hub outage) and
+    `FileNotFoundError` whose path lives under the HF cache (downstream effect of
+    `snapshot_download` falling back to an incomplete local_dir on Hub 5xx).
+    Other exceptions propagate immediately so real test bugs still fail fast.
+    """
+    from huggingface_hub.errors import HfHubHTTPError
+
+    def _is_hf_flaky(exc: BaseException) -> bool:
+        if isinstance(exc, HfHubHTTPError):
+            response = getattr(exc, "response", None)
+            status = getattr(response, "status_code", None)
+            return status is not None and 500 <= status < 600
+        if isinstance(exc, FileNotFoundError):
+            path = str(exc.filename or exc)
+            return "/.cache/huggingface/" in path or "/huggingface/" in path
+        return False
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(reruns + 1):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as exc:
+                    if attempt < reruns and _is_hf_flaky(exc):
+                        time.sleep(delay)
+                        continue
+                    raise
 
         return wrapper
 
