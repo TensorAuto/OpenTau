@@ -222,6 +222,75 @@ def test_aggregate_feature_stats():
     np.testing.assert_allclose(result["count"], np.array([2]))
 
 
+def test_aggregate_feature_stats_nan_tolerant_per_dim():
+    """A NaN at one contributor's dim must not poison clean dims for other contributors.
+
+    Regression: a single dataset's NaN min/max would poison every sample's
+    normalize buffer because np.min/np.max propagate NaN. The fix uses
+    np.nanmin/np.nanmax + per-dim NaN-aware weighted mean/variance.
+    """
+    nan = float("nan")
+    stats_ft_list = [
+        {  # contributor A: dim 0 is NaN, dim 1 is clean
+            "min": np.array([nan, 2.0]),
+            "max": np.array([nan, 12.0]),
+            "mean": np.array([nan, 6.0]),
+            "std": np.array([nan, 2.5]),
+            "count": np.array([10]),
+        },
+        {  # contributor B: both dims clean
+            "min": np.array([1.0, 1.5]),
+            "max": np.array([10.0, 11.0]),
+            "mean": np.array([5.0, 5.5]),
+            "std": np.array([2.0, 2.0]),
+            "count": np.array([10]),
+        },
+    ]
+    result = aggregate_feature_stats(stats_ft_list)
+    # dim 0: only B contributes (A is NaN at this dim)
+    np.testing.assert_allclose(result["min"][0], 1.0)
+    np.testing.assert_allclose(result["max"][0], 10.0)
+    np.testing.assert_allclose(result["mean"][0], 5.0)
+    np.testing.assert_allclose(result["std"][0], 2.0)
+    # dim 1: weighted average of A and B (equal counts)
+    np.testing.assert_allclose(result["min"][1], 1.5)
+    np.testing.assert_allclose(result["max"][1], 12.0)
+    np.testing.assert_allclose(result["mean"][1], 5.75)
+    # count is unaffected by per-dim NaN masking
+    np.testing.assert_allclose(result["count"], np.array([20]))
+
+
+def test_aggregate_feature_stats_all_nan_dim_stays_nan():
+    """If every contributor is NaN at a dim, the result is NaN there (not silently clean).
+
+    Lets downstream loaders surface the case rather than masking it.
+    """
+    nan = float("nan")
+    stats_ft_list = [
+        {
+            "min": np.array([nan, 2.0]),
+            "max": np.array([nan, 12.0]),
+            "mean": np.array([nan, 6.0]),
+            "std": np.array([nan, 2.5]),
+            "count": np.array([10]),
+        },
+        {
+            "min": np.array([nan, 1.5]),
+            "max": np.array([nan, 11.0]),
+            "mean": np.array([nan, 5.5]),
+            "std": np.array([nan, 2.0]),
+            "count": np.array([10]),
+        },
+    ]
+    result = aggregate_feature_stats(stats_ft_list)
+    assert np.isnan(result["min"][0])
+    assert np.isnan(result["max"][0])
+    assert np.isnan(result["mean"][0])
+    assert np.isnan(result["std"][0])
+    np.testing.assert_allclose(result["min"][1], 1.5)
+    np.testing.assert_allclose(result["max"][1], 12.0)
+
+
 def test_aggregate_stats():
     all_stats = [
         {
