@@ -859,11 +859,25 @@ class TestGemma3WithExpertFSDPWrap:
         os.environ.setdefault("MASTER_PORT", "29501")
         os.environ.setdefault("WORLD_SIZE", "1")
         os.environ.setdefault("RANK", "0")
+        # Set the CUDA device and drain stale state from earlier GPU tests
+        # in the same pytest session before init_process_group, since NCCL
+        # binds its communicator to whatever device is current at init time
+        # (issue #283 hint about stale GPU context).
+        torch.cuda.set_device(0)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
         already_initialized = torch.distributed.is_initialized()
         if not already_initialized:
-            torch.distributed.init_process_group(backend="nccl", world_size=1, rank=0)
+            # device_id pins the new PG to the local GPU explicitly, so NCCL
+            # forms its communicator eagerly on the correct device instead of
+            # the lazy default-device guess (PyTorch ≥ 2.0).
+            torch.distributed.init_process_group(
+                backend="nccl",
+                world_size=1,
+                rank=0,
+                device_id=torch.device("cuda", 0),
+            )
         try:
-            torch.cuda.set_device(0)
             cfg = Gemma3WithExpertConfig(
                 gemma3_config=_TINY_VLM_CONFIG.gemma3_config.to_dict(),
                 gemma_expert_config=_TINY_VLM_CONFIG.gemma_expert_config.to_dict(),
@@ -886,13 +900,20 @@ class TestGemma3WithExpertFSDPWrap:
                 transformer_auto_wrap_policy,
                 transformer_layer_cls={InterleavedDecoderLayer},
             )
-            # Match the production FSDP regime (accelerate's `mixed_precision: bf16`
-            # with no `fsdp_reduce_dtype` override translates to this triple). Without
-            # it, the model's fp32 weights collide with `_preferred_dtype()` casting
-            # activations to bf16 inside `gemma3_with_expert.py:forward`.
+            # Match the production FSDP regime (accelerate's `mixed_precision: bf16`)
+            # — without it, the model's fp32 weights collide with `_preferred_dtype()`
+            # casting activations to bf16 inside `gemma3_with_expert.py:forward`.
+            #
+            # ``reduce_dtype=fp32`` (rather than bf16) for the single-rank smoke test:
+            # NCCL 2.27.5 hits an ``ncclUnhandledCudaError`` on bf16 ``all_reduce`` over
+            # a single-rank PG inside FSDP's ``_reduce_grad_no_shard`` fast path
+            # (issue #283). fp32 reduce is also a valid production setting (accelerate
+            # ``fsdp_reduce_dtype: fp32``) and the test's purpose is FSDP-wrap topology,
+            # not the bf16 reduce path itself — multi-rank bf16-reduce coverage lives
+            # in the regression matrix.
             mixed_precision = MixedPrecision(
                 param_dtype=torch.bfloat16,
-                reduce_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
                 buffer_dtype=torch.bfloat16,
             )
             wrapped = FSDP(
