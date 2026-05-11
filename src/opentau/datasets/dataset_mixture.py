@@ -202,9 +202,10 @@ class DatasetMixtureMetadata:
                 )
 
         # Surface non-finite stats with the offending repo + dim, so that the
-        # NaN-tolerant aggregator in `aggregate_feature_stats` doesn't silently
-        # drop a dataset's contribution. Cameras get min=0/max=1/mean=0/std=0
-        # placeholders for missing slots, so we only check non-camera features.
+        # non-finite-tolerant aggregator in `aggregate_feature_stats` doesn't
+        # silently drop a dataset's contribution. Cameras get
+        # min=0/max=1/mean=0/std=0 placeholders for missing slots, so we only
+        # check non-camera features.
         for data in standard_stats:
             if data.startswith("camera"):
                 continue
@@ -214,13 +215,12 @@ class DatasetMixtureMetadata:
                 if bad.size > 0:
                     logging.warning(
                         "Dataset %r: non-finite values in %r.%r at flat indices %s "
-                        "(shape=%s); excluded from aggregated %r stats at those dims.",
+                        "(shape=%s); these dims are excluded from aggregation.",
                         repo_id,
                         data,
                         stat_name,
                         bad.tolist(),
                         tuple(arr.shape),
-                        data,
                     )
 
         return standard_stats

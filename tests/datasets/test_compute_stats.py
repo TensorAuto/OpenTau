@@ -260,6 +260,49 @@ def test_aggregate_feature_stats_nan_tolerant_per_dim():
     np.testing.assert_allclose(result["count"], np.array([20]))
 
 
+def test_aggregate_feature_stats_inf_masked_per_dim():
+    """+/-Inf in a contributor's stats must be masked per-dim the same way NaN is.
+
+    Naive ``np.nanmin`` / ``np.nanmax`` skip NaN but *not* Inf -- +Inf would still
+    poison the aggregated max, -Inf the aggregated min, and ``np.where(np.isnan(...))``
+    would leave them in the weighted-mean numerator. This regression locks in the
+    ``~np.isfinite`` predicate so a contributor with +/-Inf is excluded per dim
+    just like a NaN contributor.
+    """
+    inf = float("inf")
+    stats_ft_list = [
+        {  # contributor A: dim 0 fully Inf-poisoned, dim 1 clean
+            "min": np.array([-inf, 2.0]),
+            "max": np.array([inf, 12.0]),
+            "mean": np.array([inf, 6.0]),
+            "std": np.array([inf, 2.5]),
+            "count": np.array([10]),
+        },
+        {  # contributor B: clean everywhere
+            "min": np.array([1.0, 1.5]),
+            "max": np.array([10.0, 11.0]),
+            "mean": np.array([5.0, 5.5]),
+            "std": np.array([2.0, 2.0]),
+            "count": np.array([10]),
+        },
+    ]
+    result = aggregate_feature_stats(stats_ft_list)
+    # dim 0: only B contributes (A is Inf at every stat); naive nanmin/nanmax
+    # would return -inf / +inf here without the ~np.isfinite mask.
+    np.testing.assert_allclose(result["min"][0], 1.0)
+    np.testing.assert_allclose(result["max"][0], 10.0)
+    np.testing.assert_allclose(result["mean"][0], 5.0)
+    np.testing.assert_allclose(result["std"][0], 2.0)
+    # dim 1: both contribute (A's stats are finite at this dim).
+    np.testing.assert_allclose(result["min"][1], 1.5)
+    np.testing.assert_allclose(result["max"][1], 12.0)
+    np.testing.assert_allclose(result["mean"][1], 5.75)
+    assert np.isfinite(result["min"]).all()
+    assert np.isfinite(result["max"]).all()
+    assert np.isfinite(result["mean"]).all()
+    assert np.isfinite(result["std"]).all()
+
+
 def test_aggregate_feature_stats_all_nan_dim_stays_nan():
     """If every contributor is NaN at a dim, the result is NaN there (not silently clean).
 
