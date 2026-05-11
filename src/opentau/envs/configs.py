@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-r"""This module contains configuration files for different environments. Only LIBERO is supported for now."""
+r"""This module contains configuration files for different environments. Supports LIBERO and RoboCasa."""
 
 import abc
 import logging
@@ -25,6 +25,12 @@ import draccus
 from opentau.configs.types import FeatureType, PolicyFeature
 from opentau.constants import ACTION, OBS_IMAGES, OBS_STATE
 from opentau.utils.accelerate_utils import get_proc_accelerator
+
+ROBOCASA_DEFAULT_CAMERA_NAMES: tuple[str, ...] = (
+    "robot0_eye_in_hand",
+    "robot0_agentview_left",
+    "robot0_agentview_right",
+)
 
 
 @dataclass
@@ -175,4 +181,124 @@ class LiberoEnv(EnvConfig):
             "obs_type": self.obs_type,
             "render_mode": self.render_mode,
             "task_ids": task_ids,
+        }
+
+
+@EnvConfig.register_subclass("robocasa")
+@dataclass
+class RoboCasaEnv(EnvConfig):
+    r"""Configuration for the RoboCasa kitchen environment.
+
+    RoboCasa envs are constructed via ``robocasa.utils.env_utils.create_env`` rather than
+    ``gym.make``. The env name is the registered RoboCasa task class name (e.g.
+    ``PnPCounterToCab``), and ``task`` is a comma-separated list of such names — one
+    indexed vec env is built per task name, matching how LIBERO is fanned out across
+    accelerator ranks.
+
+    Args:
+        task: Optional comma-separated RoboCasa task class names (e.g. ``"PnPCounterToCab"``).
+            May be empty when ``task_ids`` is provided.
+        task_ids: Optional list of integer indices into
+            :data:`opentau.envs.robocasa_tasks.ROBOCASA_TASKS` — atomic skills in
+            ``0 .. 24`` (e.g. ``[0, 1, 14]`` picks ``PnPCounterToCab``,
+            ``PnPCabToCounter``, ``TurnOnStove``) and composite multi-stage tasks in
+            ``25 .. 325`` (e.g. ``[267]`` picks ``MakeFruitBowl``). Names from ``task``
+            and ``task_ids`` are concatenated, preserving order.
+        fps: Target frames-per-second for stepping/rendering.
+        episode_length: Maximum number of policy steps per episode.
+        camera_names: Tuple of RoboCasa camera names to record (order maps to
+            ``camera0``, ``camera1``, ...).
+        camera_height: Off-screen camera height (pixels).
+        camera_width: Off-screen camera width (pixels).
+        num_steps_wait: Number of no-op steps after reset to settle the simulator.
+        render_cam: Camera name to use for ``render()``; defaults to the first camera.
+        split: Dataset split passed to ``robocasa.utils.env_utils.create_env``.
+            One of ``None``, ``"all"``, ``"pretrain"``, ``"target"``.
+        seed_base: Per-task seed offset; episode ``i`` uses ``seed_base + i``.
+    """
+
+    task: str = ""
+    task_ids: list[int] | None = None
+    fps: int = 20
+    episode_length: int = 1500
+    camera_names: tuple[str, ...] = ROBOCASA_DEFAULT_CAMERA_NAMES
+    camera_height: int = 256
+    camera_width: int = 256
+    num_steps_wait: int = 10
+    render_cam: str | None = None
+    split: str | None = "all"
+    seed_base: int = 0
+    features: dict[str, PolicyFeature] = field(
+        default_factory=lambda: {
+            "action": PolicyFeature(type=FeatureType.ACTION, shape=(16,)),
+        }
+    )
+    features_map: dict[str, str] = field(
+        default_factory=lambda: {
+            "action": ACTION,
+            "agent_pos": OBS_STATE,
+            "pixels/robot0_eye_in_hand": f"{OBS_IMAGES}.image",
+            "pixels/robot0_agentview_left": f"{OBS_IMAGES}.image2",
+            "pixels/robot0_agentview_right": f"{OBS_IMAGES}.image3",
+        }
+    )
+
+    def __post_init__(self):
+        # Defer import so that simply loading this module does not require robocasa_tasks
+        # (kept light because it only depends on stdlib).
+        from opentau.envs.robocasa_tasks import resolve_tasks
+
+        # Resolve `task` + `task_ids` into a canonical list of task class names. The
+        # resolved list is stashed for `gym_kwargs` to fan out across accelerator ranks.
+        self._resolved_task_names: list[str] = resolve_tasks(self.task, self.task_ids)
+
+        if not self.camera_names:
+            raise ValueError("camera_names must contain at least one RoboCasa camera name.")
+        cams = tuple(c.strip() for c in self.camera_names if str(c).strip())
+        if not cams:
+            raise ValueError("camera_names resolved to an empty tuple.")
+        self.camera_names = cams
+
+        shape = (self.camera_height, self.camera_width, 3)
+        for cam in self.camera_names:
+            self.features[f"pixels/{cam}"] = PolicyFeature(type=FeatureType.VISUAL, shape=shape)
+        # agent_pos shape is fixed by build_proprio_vector (proprio vector returned by RoboCasa).
+        # Leave the actual shape inference to the wrapper; declare a flexible default here.
+        self.features["agent_pos"] = PolicyFeature(type=FeatureType.STATE, shape=(32,))
+
+    @property
+    def gym_kwargs(self) -> dict:
+        r"""Return the keyword arguments used to construct the RoboCasa environment."""
+        task_names = list(self._resolved_task_names)
+        if not task_names:
+            raise ValueError(
+                "RoboCasa env has no tasks selected — provide `task` (class names) "
+                "and/or `task_ids` (indices)."
+            )
+
+        accelerator = get_proc_accelerator()
+        if accelerator is None:
+            assigned = list(task_names)
+            logging.info(f"[RoboCasa environment] No accelerator found, using tasks={assigned}.")
+        else:
+            assigned = [
+                t
+                for idx, t in enumerate(task_names)
+                if idx % accelerator.num_processes == accelerator.process_index
+            ]
+            logging.info(
+                f"[RoboCasa environment] After distributing, using tasks={assigned} "
+                f"on process_index={accelerator.process_index}."
+            )
+
+        return {
+            "tasks": assigned,
+            "camera_names": list(self.camera_names),
+            "camera_height": self.camera_height,
+            "camera_width": self.camera_width,
+            "num_steps_wait": self.num_steps_wait,
+            "episode_length": self.episode_length,
+            "render_cam": self.render_cam,
+            "split": self.split,
+            "seed_base": self.seed_base,
         }

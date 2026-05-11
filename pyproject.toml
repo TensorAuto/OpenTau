@@ -140,12 +140,37 @@ libero = [
 urdf = [
     "rerun-sdk>=0.28.2",
 ]
+robocasa = [
+    # RoboCasa kitchen sim. Most runtime deps (numpy, mujoco, lerobot, gymnasium,
+    # opencv-python, imageio, termcolor, lxml, hidapi, numba, pygame) come from
+    # robocasa's own setup.py — listed below only when robocasa needs them but does
+    # not declare them, or when we need a tighter version floor than robocasa does.
+    # Mutually exclusive with the `libero` extra (numpy 2.x vs <2).
+    "robocasa",
+    "robosuite>=1.5.0",         # robocasa imports robosuite at top-level but does not declare it
+    "glfw>=2.0",                # required by mujoco's viewer; not pulled by robocasa
+    "msgpack>=1.0",             # used by scripts/robocasa/server.py
+    "websockets>=11.0",         # used by scripts/robocasa/server.py
+]
 trt = [
     "tensorrt>=10.15.1.29 ; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and (platform_machine == 'AMD64' or platform_machine == 'x86_64'))",
 ]
 
 [tool.uv.sources]
 libero = { git = "https://github.com/shuheng-liu/LIBERO" , branch = "master" }  # the official libero repo is misconfigured for pip install with git
+# RoboCasa is shipped as a separate sim package; track upstream main. Replace with a
+# fork (e.g. `{ git = "https://github.com/<your-fork>/robocasa", branch = "..." }`) or a
+# local checkout (`{ path = "../robocasa", editable = true }`) if you carry local
+# patches. The OpenTau wrapper only depends on `robocasa.utils.env_utils.create_env`,
+# so an unmodified upstream install is sufficient.
+robocasa = { git = "https://github.com/robocasa/robocasa", branch = "main" }
+# RoboCasa uses upstream robosuite **master** APIs (`get_elements`,
+# `xml_path_completion`-variants) that aren't in PyPI's `robosuite==1.5.x`. Scope this
+# source to the robocasa extra via `extra = "robocasa"` so libero — which pins
+# `robosuite==1.4.0` from PyPI — falls back to the index resolution.
+robosuite = [
+    { git = "https://github.com/ARISE-Initiative/robosuite", branch = "master", extra = "robocasa" },
+]
 
 # libero depends on gym, which depends on numpy 1.x, while rerun only supports urdf in v0.28 which requires numpy 2.x
 [tool.uv]
@@ -154,10 +179,42 @@ libero = { git = "https://github.com/shuheng-liu/LIBERO" , branch = "master" }  
 # and the build regresses to the original CMake 4 failure with a confusing
 # message. Bumping this floor errors loudly with a clear pointer instead.
 required-version = ">=0.8.4"
+# RoboCasa's setup.py declares hard equality pins (numpy==2.2.5, numba==0.61.2,
+# scipy==1.15.3) that collide with opentau's own floors (numba>=0.62.0) and with
+# whatever other extras pull in. Force compatible versions across the whole resolve so
+# `uv sync --extra robocasa` succeeds without forking robocasa's setup.py. The override
+# applies regardless of the active extra — it's a no-op for libero/urdf because they
+# don't repin numba and the numpy bound here is satisfied by libero's numpy<2 too.
+override-dependencies = [
+    "numba>=0.62.0",
+    "scipy>=1.13",
+    # Both opentau and lerobot want draccus>=0.10, but the robocasa-extras resolve
+    # currently picks 0.8.0 (an old shared transitive constraint). Force the modern
+    # version explicitly so `singledispatch(include_subclasses=...)` is available.
+    "draccus>=0.10.0",
+    # robocasa's setup.py pins tianshou==0.4.10, which transitively requires
+    # protobuf<3.20 — clashing with opentau's protobuf>=4.25. Tianshou 1.x requires
+    # Python>=3.11 (we're on 3.10), so we can't bump it. Force protobuf to opentau's
+    # range instead; opentau never actually exercises tianshou code paths, and
+    # tianshou's protobuf usage is limited to a tensorboard pb shim that still imports
+    # on protobuf 4.x at runtime even if its declared pin says otherwise.
+    "protobuf>=4.25",
+]
 conflicts = [
   [
     { extra = "libero" },
     { extra = "urdf" },
+  ],
+  # robocasa pins numpy 2.x; libero pulls numpy<2. Force users to pick one sim at a time.
+  [
+    { extra = "libero" },
+    { extra = "robocasa" },
+  ],
+  # robocasa transitively pulls rerun-sdk<0.23 (via lerobot 0.3.3), while urdf needs
+  # rerun-sdk>=0.28.2. Declare them mutually exclusive so the resolver bails fast.
+  [
+    { extra = "urdf" },
+    { extra = "robocasa" },
   ],
 ]
 # egl-probe (transitive via robomimic in the libero extra) ships an sdist whose
@@ -201,6 +258,8 @@ default.extend-ignore-identifiers-re = [
     # Add individual words here to ignore them
     "2nd",
     "pn",
+    "Pn",  # RoboCasa task names use "Pn" prefix (e.g. PnPCounterToCab)
+    "Metalic",  # upstream RoboCasa class name (OrganizeMetalicUtensils)
     "ser",
     "ein",
 ]
