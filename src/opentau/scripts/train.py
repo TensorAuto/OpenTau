@@ -134,17 +134,49 @@ def update_policy(
         train_metrics.loss = loss
         train_metrics.mse_loss = mse_loss
         train_metrics.ce_loss = ce_loss
-        if l1_loss is not None:
-            if "l1_loss" not in train_metrics.metrics:
-                train_metrics.metrics["l1_loss"] = AverageMeter("l1_loss", ":.6f")
-            train_metrics.l1_loss = l1_loss
-        if accuracy is not None:
-            if "accuracy" not in train_metrics.metrics:
-                train_metrics.metrics["accuracy"] = AverageMeter("accuracy", ":.3f")
-            train_metrics.accuracy = accuracy
+        _observe_optional(train_metrics, "l1_loss", "l1_loss", ":.6f", l1_loss)
+        _observe_optional(train_metrics, "accuracy", "accuracy", ":.3f", accuracy)
         train_metrics.lr = optimizer.param_groups[0]["lr"]
 
     return train_metrics
+
+
+def _observe_optional(
+    tracker: MetricsTracker,
+    key: str,
+    display_name: str,
+    fmt: str,
+    value: float | None,
+) -> None:
+    """Lazily allocate-and-update an optional ``AverageMeter`` on ``tracker``.
+
+    Centralizes the lazy-allocation pattern used for optional loss metrics
+    (currently ``l1_loss`` and ``accuracy``) that only some policies — e.g.
+    the value head — emit. Allocating the meter on first observation rather
+    than at tracker construction keeps the Python log line and the wandb
+    dashboard clean for policies that never produce the metric.
+
+    Callers must already be on the main process: this function mutates
+    ``tracker.metrics`` and that mutation should not be performed on
+    non-main ranks (mirroring the surrounding ``if accelerator.is_main_process:``
+    guards on regular metric assignments).
+
+    Args:
+        tracker: The ``MetricsTracker`` to update.
+        key: The metric attribute name (used both as the ``metrics`` dict key
+            and as the attribute on ``tracker``).
+        display_name: Display name passed to the ``AverageMeter`` constructor
+            when first allocating it (e.g. ``"l1_loss"`` for train,
+            ``"val_l1_loss"`` for validation).
+        fmt: Format string passed to the ``AverageMeter`` constructor.
+        value: Value to record; if ``None`` (the metric was absent from this
+            batch's ``losses``) the function is a no-op.
+    """
+    if value is None:
+        return
+    if key not in tracker.metrics:
+        tracker.metrics[key] = AverageMeter(display_name, fmt)
+    setattr(tracker, key, value)
 
 
 def _mixture_weighted_aggregate(
@@ -688,14 +720,8 @@ def train(cfg: TrainPipelineConfig):
                             ds_tracker.loss = loss
                             ds_tracker.mse_loss = mse_loss
                             ds_tracker.ce_loss = ce_loss
-                            if l1_loss is not None:
-                                if "l1_loss" not in ds_tracker.metrics:
-                                    ds_tracker.metrics["l1_loss"] = AverageMeter("val_l1_loss", ":.6f")
-                                ds_tracker.l1_loss = l1_loss
-                            if accuracy is not None:
-                                if "accuracy" not in ds_tracker.metrics:
-                                    ds_tracker.metrics["accuracy"] = AverageMeter("val_accuracy", ":.3f")
-                                ds_tracker.accuracy = accuracy
+                            _observe_optional(ds_tracker, "l1_loss", "val_l1_loss", ":.6f", l1_loss)
+                            _observe_optional(ds_tracker, "accuracy", "val_accuracy", ":.3f", accuracy)
 
             if accelerator.is_main_process:
                 for ds_name, ds_tracker in per_dataset_trackers.items():
