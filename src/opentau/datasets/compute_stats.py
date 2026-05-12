@@ -71,6 +71,7 @@ Example:
         >>> aggregated = aggregate_stats(stats_list, weights=weights)
 """
 
+import warnings
 from typing import Optional
 
 import numpy as np
@@ -286,6 +287,20 @@ def aggregate_feature_stats(
     Computes weighted mean and variance using the parallel algorithm for variance
     computation. Min and max are taken as the global min/max across all stats.
 
+    Non-finite-tolerant per-dim: a contributor whose ``mean``/``std``/``min``/``max``
+    is non-finite (NaN or +/-Inf) at some dim is excluded from the aggregation at
+    that dim only. Clean dims aggregate normally. A dim that is non-finite across
+    every contributor stays NaN, so the downstream loader (or ``Normalize`` buffer)
+    can surface it -- but a single bad dataset no longer poisons the global buffer
+    for every other sample.
+
+    The mean and variance use *different* per-dim masks: a contributor is dropped
+    from the mean at a dim iff its ``mean`` is non-finite there, but dropped from
+    the variance at a dim iff *either* its ``mean`` or its ``std`` is non-finite
+    there (you can't form a Chan-style variance contribution without a finite
+    ``std``). ``count`` is unconditional: the sum of contributors' counts, not a
+    per-dim effective contributor count.
+
     Args:
         stats_ft_list: List of statistics dictionaries for the same feature.
         weights: Optional weights for each statistics entry. If None, uses
@@ -296,32 +311,52 @@ def aggregate_feature_stats(
     """
     means = np.stack([s["mean"] for s in stats_ft_list])
     variances = np.stack([s["std"] ** 2 for s in stats_ft_list])
+    mins = np.stack([s["min"] for s in stats_ft_list])
+    maxs = np.stack([s["max"] for s in stats_ft_list])
 
-    # if weights are provided, use them to compute the weighted mean and variance
-    # otherwise, use episode counts as weights
-    if weights is not None:
-        counts = np.stack(weights)
-        total_count = counts.sum(axis=0)
-    else:
-        counts = np.stack([s["count"] for s in stats_ft_list])
-        total_count = counts.sum(axis=0)
+    counts = np.stack(weights) if weights is not None else np.stack([s["count"] for s in stats_ft_list])
+    total_count = counts.sum(axis=0)
 
-    # Prepare weighted mean by matching number of dimensions
     while counts.ndim < means.ndim:
         counts = np.expand_dims(counts, axis=-1)
 
-    # Compute the weighted mean
-    weighted_means = means * counts
-    total_mean = weighted_means.sum(axis=0) / total_count
+    means_bad = ~np.isfinite(means)
+    variances_bad = ~np.isfinite(variances)
 
-    # Compute the variance using the parallel algorithm
-    delta_means = means - total_mean
-    weighted_variances = (variances + delta_means**2) * counts
-    total_variance = weighted_variances.sum(axis=0) / total_count
+    mean_weights = np.where(means_bad, 0.0, counts).astype(np.float64)
+    mean_weight_sum = mean_weights.sum(axis=0)
+    safe_means = np.where(means_bad, 0.0, means)
+    total_mean = np.divide(
+        (safe_means * mean_weights).sum(axis=0),
+        mean_weight_sum,
+        out=np.full(mean_weight_sum.shape, np.nan, dtype=np.float64),
+        where=mean_weight_sum > 0,
+    )
+
+    # Chan-style parallel weighted variance, non-finite-masked per dim.
+    var_weights = np.where(variances_bad | means_bad, 0.0, counts).astype(np.float64)
+    var_weight_sum = var_weights.sum(axis=0)
+    safe_variances = np.where(variances_bad, 0.0, variances)
+    delta_means = np.where(means_bad, 0.0, means - total_mean)
+    total_variance = np.divide(
+        ((safe_variances + delta_means**2) * var_weights).sum(axis=0),
+        var_weight_sum,
+        out=np.full(var_weight_sum.shape, np.nan, dtype=np.float64),
+        where=var_weight_sum > 0,
+    )
+
+    # Mask +/-Inf to NaN so nanmin/nanmax exclude them too. (nanmin/nanmax skip NaN
+    # but not Inf: +Inf would still poison max, -Inf would still poison min.)
+    mins_safe = np.where(np.isfinite(mins), mins, np.nan)
+    maxs_safe = np.where(np.isfinite(maxs), maxs, np.nan)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        agg_min = np.nanmin(mins_safe, axis=0)
+        agg_max = np.nanmax(maxs_safe, axis=0)
 
     return {
-        "min": np.min(np.stack([s["min"] for s in stats_ft_list]), axis=0),
-        "max": np.max(np.stack([s["max"] for s in stats_ft_list]), axis=0),
+        "min": agg_min,
+        "max": agg_max,
         "mean": total_mean,
         "std": np.sqrt(total_variance),
         "count": total_count,

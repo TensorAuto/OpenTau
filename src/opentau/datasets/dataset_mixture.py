@@ -201,6 +201,28 @@ class DatasetMixtureMetadata:
                     f"The dataset {repo_id} is missing required statistics: {', '.join(sorted(missing_keys))}"
                 )
 
+        # Surface non-finite stats with the offending repo + dim, so that the
+        # non-finite-tolerant aggregator in `aggregate_feature_stats` doesn't
+        # silently drop a dataset's contribution. Cameras get
+        # min=0/max=1/mean=0/std=0 placeholders for missing slots, so we only
+        # check non-camera features.
+        for data in standard_stats:
+            if data.startswith("camera"):
+                continue
+            for stat_name in ("mean", "std", "min", "max"):
+                arr = np.asarray(standard_stats[data][stat_name])
+                bad = np.flatnonzero(~np.isfinite(arr.ravel()))
+                if bad.size > 0:
+                    logging.warning(
+                        "Dataset %r: non-finite values in %r.%r at flat indices %s "
+                        "(shape=%s); these dims are excluded from aggregation.",
+                        repo_id,
+                        data,
+                        stat_name,
+                        bad.tolist(),
+                        tuple(arr.shape),
+                    )
+
         return standard_stats
 
     @property
