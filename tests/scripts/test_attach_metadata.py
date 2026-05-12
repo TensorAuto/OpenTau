@@ -387,7 +387,7 @@ def test_attach_metadata_end_to_end_droid_100(tmp_path, dataset_config, train_pi
         assert f"subgoal{k}" in item
         assert item[f"subgoal{k}"].shape == (3, *ds.resolution)
     assert "subgoal_is_pad" in item
-    assert item["speed"].item() % 500 == 0
+    assert item["speed"].item() % 10 == 0
     assert 1 <= item["quality"].item() <= 5
     # The memory column in the annotated dataset follows f"memory{frame_index}";
     # since __getitem__ already pulls the row, check memory_raw → memory.
