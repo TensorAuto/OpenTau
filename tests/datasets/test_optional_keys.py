@@ -24,9 +24,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
-from opentau.datasets.lerobot_dataset import BaseDataset
+from opentau.datasets.lerobot_dataset import BaseDataset, speed_duration_bucket_s
 from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
 
 _TEST_MAPPING_KEY = "_tests/optional_keys_dummy"
@@ -682,3 +683,32 @@ class TestRobotTypeControlMode:
         out = ds._to_standard_data_format(_full_raw_item(ds))
         assert type(out["robot_type"]) is str
         assert type(out["control_mode"]) is str
+
+
+# `speed_duration_bucket_s` is called by `LeRobotDataset.__getitem__` to set
+# `speed_raw`. Lock in the FPS-normalization + 10-second granularity so future
+# edits to the formula can't silently change the bucket distribution. Banker's
+# rounding (Python's built-in `round`) means a 25 s episode buckets to 20.
+class TestSpeedDurationBucket:
+    @pytest.mark.parametrize(
+        "num_frames, fps, expected",
+        [
+            (1500, 30, 50),  # 50 s at 30 fps
+            (1500, 60, 20),  # 25 s at 60 fps → banker's rounding to 20
+            (1500, 50, 30),  # 30 s at 50 fps — same physical duration as 900 frames @ 30 fps
+            (900, 30, 30),  # 30 s — pairs with the row above to show FPS invariance
+            (3000, 30, 100),  # 100 s
+            (100, 30, 0),  # 3.33 s → 0
+            (149, 30, 0),  # 4.97 s → 0
+            (450, 30, 20),  # 15 s → banker's rounding to 20
+            (0, 30, 0),  # empty episode degenerate case
+        ],
+    )
+    def test_bucket_math(self, num_frames, fps, expected):
+        assert speed_duration_bucket_s(num_frames, fps) == expected
+
+    def test_returns_python_int(self):
+        # `speed_raw` is consumed downstream by `int(raw)` in _emit_optional_keys,
+        # which would silently coerce a float; better to fail loud here.
+        out = speed_duration_bucket_s(1500, 30)
+        assert type(out) is int

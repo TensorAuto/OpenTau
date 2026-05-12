@@ -237,6 +237,24 @@ def suppress_control_mode_warning(repo_id: str) -> None:
     _CONTROL_MODE_WARNED.add(repo_id)
 
 
+_SPEED_BUCKET_SECONDS = 10
+
+
+def speed_duration_bucket_s(num_frames: int, fps: float) -> int:
+    """Bucket an episode's physical duration to the nearest 10 seconds.
+
+    Used to compute the ``speed`` optional key emitted by
+    ``LeRobotDataset.__getitem__``. Working in seconds (rather than native
+    frames) makes the bucket invariant to the dataset's native FPS and to the
+    mixture's ``cfg.dataset_mixture.action_freq`` resampling — see
+    :ref:`standard-data-format-optional-keys` in ``docs/source/concepts.rst``.
+
+    Uses Python's built-in ``round()`` (banker's rounding), e.g. a 25 s
+    episode buckets to 20, not 30.
+    """
+    return int(round((num_frames / fps) / _SPEED_BUCKET_SECONDS) * _SPEED_BUCKET_SECONDS)
+
+
 class DatasetMetadata:
     """Base class for dataset metadata containing info and statistics.
 
@@ -1980,8 +1998,7 @@ class LeRobotDataset(BaseDataset):
             quality = self.meta.episodes[ep_idx].get("quality")
             if quality is not None:
                 item["quality_raw"] = int(quality)
-            duration_s = self.episode_lengths[ep_idx] / self.fps
-            item["speed_raw"] = int(round(duration_s / 10) * 10)
+            item["speed_raw"] = speed_duration_bucket_s(self.episode_lengths[ep_idx], self.fps)
             item.update(self._load_subgoal_frames(ep_idx, frame_in_ep))
 
             item = self._to_standard_data_format(item)
