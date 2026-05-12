@@ -522,10 +522,10 @@ def train(cfg: TrainPipelineConfig):
 
     # setup metrics tracker to average metrics over the logging interval
     train_metrics = {
-        "loss": AverageMeter("total_loss", ":.3f"),
-        "mse_loss": AverageMeter("mse_loss", ":.3f"),
-        "ce_loss": AverageMeter("ce_loss", ":.3f"),
-        "l1_loss": AverageMeter("l1_loss", ":.3f"),
+        "loss": AverageMeter("total_loss", ":.6f"),
+        "mse_loss": AverageMeter("mse_loss", ":.6f"),
+        "ce_loss": AverageMeter("ce_loss", ":.6f"),
+        "l1_loss": AverageMeter("l1_loss", ":.6f"),
         "accuracy": AverageMeter("accuracy", ":.3f"),
         "lr": AverageMeter("lr", ":0.1e"),
         "grad_norm": AverageMeter("grad_norm", ":.3f"),
@@ -606,10 +606,10 @@ def train(cfg: TrainPipelineConfig):
                 return MetricsTracker(
                     cfg.batch_size * accelerator.num_processes,
                     {
-                        "loss": AverageMeter("val_total_loss", ":.3f"),
-                        "mse_loss": AverageMeter("val_mse_loss", ":.3f"),
-                        "ce_loss": AverageMeter("val_ce_loss", ":.3f"),
-                        "l1_loss": AverageMeter("val_l1_loss", ":.3f"),
+                        "loss": AverageMeter("val_total_loss", ":.6f"),
+                        "mse_loss": AverageMeter("val_mse_loss", ":.6f"),
+                        "ce_loss": AverageMeter("val_ce_loss", ":.6f"),
+                        "l1_loss": AverageMeter("val_l1_loss", ":.6f"),
                         "accuracy": AverageMeter("val_accuracy", ":.3f"),
                     },
                     initial_step=current_step,

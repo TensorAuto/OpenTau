@@ -95,6 +95,25 @@ def test_metrics_tracker_str(mock_metrics):
     assert "accuracy:0.88" in output
 
 
+def test_metrics_tracker_str_step_and_samples_exact_value(mock_metrics):
+    # Once steps cross a 1K/1M boundary, ``format_big_number`` truncates to a
+    # suffix (e.g. "15K"), which collapses 14903 and 15127 into the same token.
+    # The exact integer is appended in parens so the line is unambiguous.
+    tracker = MetricsTracker(batch_size=64, metrics=mock_metrics, initial_step=15123)
+    output = str(tracker)
+    assert "step:15K(15123)" in output
+    assert f"smpl:968K({15123 * 64})" in output
+
+
+def test_metrics_tracker_str_step_and_samples_small_value(mock_metrics):
+    # For early-training values that already format without a suffix, the
+    # parenthesized exact value is still present for grep/format consistency.
+    tracker = MetricsTracker(batch_size=8, metrics=mock_metrics, initial_step=42)
+    output = str(tracker)
+    assert "step:42(42)" in output
+    assert "smpl:336(336)" in output
+
+
 def test_metrics_tracker_to_dict(mock_metrics):
     tracker = MetricsTracker(batch_size=32, metrics=mock_metrics)
     tracker.loss.update(5, 2)

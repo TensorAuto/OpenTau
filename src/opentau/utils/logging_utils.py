@@ -150,10 +150,12 @@ class MetricsTracker:
         self.samples += self._batch_size
 
     def __str__(self) -> str:
+        # Show the exact integer in parentheses after the rounded suffix so a
+        # log line like ``step:15K`` can be disambiguated as e.g. 14903 vs 15127.
         display_list = [
-            f"step:{format_big_number(self.steps)}",
+            f"step:{format_big_number(self.steps)}({self.steps})",
             # number of samples seen during training
-            f"smpl:{format_big_number(self.samples)}",
+            f"smpl:{format_big_number(self.samples)}({self.samples})",
             *[str(m) for m in self.metrics.values()],
         ]
         return " ".join(display_list)
