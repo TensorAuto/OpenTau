@@ -150,12 +150,18 @@ see :ref:`Training-time dropout <standard-data-format-optional-keys-dropout>`.
                                    # segment, differs at segment boundaries). Clipped at episode
                                    # end. Empty string when unavailable.
 
-        "speed": torch.LongTensor,     # Scalar; episode length in frames rounded to the nearest multiple of
-                                       # 500 (so short <250-frame episodes bucket to 0). Populated
-                                       # unconditionally from ``info.json`` — available on every
-                                       # LeRobotDataset regardless of whether the dataset went through
+        "speed": torch.LongTensor,     # Scalar; episode **duration in seconds** rounded to the nearest
+                                       # multiple of 10 (so short <5 s episodes bucket to 0). Computed as
+                                       # ``round(episode_length_frames / fps / 10) * 10`` from
+                                       # ``meta/episodes.jsonl["length"]`` and ``meta/info.json["fps"]``.
+                                       # Using seconds (rather than raw frames) makes the bucket
+                                       # comparable across datasets in a mixture: it is invariant to both
+                                       # the dataset's native FPS and to ``cfg.dataset_mixture.action_freq``
+                                       # (which resamples each dataset to a common rate at sample time).
+                                       # Populated unconditionally — available on every LeRobotDataset
+                                       # regardless of whether the dataset went through
                                        # ``attach_metadata``. Name is historical; think
-                                       # "episode-length bucket".
+                                       # "episode-duration bucket".
         "speed_is_pad": torch.BoolTensor,  # True only when the dataset has no episode-length metadata
                                            # (pure VQA / legacy fake datasets) or when the metadata drop
                                            # rolls in _emit_optional_keys fire at training time.

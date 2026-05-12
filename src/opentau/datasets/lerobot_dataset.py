@@ -1980,7 +1980,8 @@ class LeRobotDataset(BaseDataset):
             quality = self.meta.episodes[ep_idx].get("quality")
             if quality is not None:
                 item["quality_raw"] = int(quality)
-            item["speed_raw"] = int(round(self.episode_lengths[ep_idx] / 500) * 500)
+            duration_s = self.episode_lengths[ep_idx] / self.fps
+            item["speed_raw"] = int(round(duration_s / 10) * 10)
             item.update(self._load_subgoal_frames(ep_idx, frame_in_ep))
 
             item = self._to_standard_data_format(item)
