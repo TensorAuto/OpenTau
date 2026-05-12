@@ -161,6 +161,53 @@ def add_envs_task(env: gym.vector.VectorEnv, observation: dict[str, Any]) -> dic
     return observation
 
 
+def add_eval_metadata(observation: dict[str, Any], cfg: TrainPipelineConfig) -> dict[str, Any]:
+    r"""Inject pi07 inference-time metadata from ``cfg.env.metadata``.
+
+    Numeric fields (``speed`` / ``quality`` / ``mistake``) are broadcast as
+    ``(num_envs,)`` tensors with a parallel ``{key}_is_pad=False`` flag,
+    using the same dtypes the dataset emits at training time
+    (``torch.long`` for ``speed`` / ``quality``, ``torch.bool`` for
+    ``mistake``). String fields (``robot_type`` / ``control_mode``) are
+    broadcast as ``list[str]`` of length ``num_envs``. Fields set to
+    ``None`` on the config — or a missing ``cfg.env`` entirely — are
+    skipped, so the corresponding batch key stays absent and the policy's
+    ``prepare_metadata`` pad default kicks in.
+
+    Args:
+        observation: Observation dict produced by ``preprocess_observation``
+            (must contain ``state`` to source the batch size and device).
+        cfg: Training/eval pipeline config; reads ``cfg.env.metadata``.
+
+    Returns:
+        The observation dict, mutated in place.
+    """
+    if cfg.env is None:
+        return observation
+
+    meta = cfg.env.metadata
+    state = observation["state"]
+    batch_size = state.shape[0]
+    device = state.device
+
+    for key, dtype in (
+        ("speed", torch.long),
+        ("quality", torch.long),
+        ("mistake", torch.bool),
+    ):
+        val = getattr(meta, key)
+        if val is not None:
+            observation[key] = torch.tensor([val] * batch_size, dtype=dtype, device=device)
+            observation[f"{key}_is_pad"] = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+    for key in ("robot_type", "control_mode"):
+        val = getattr(meta, key)
+        if val is not None:
+            observation[key] = [val] * batch_size
+
+    return observation
+
+
 def _close_single_env(env: Any) -> None:
     try:
         env.close()
