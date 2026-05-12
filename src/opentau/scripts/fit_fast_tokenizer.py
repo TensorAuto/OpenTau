@@ -740,9 +740,12 @@ def _normalize_chunks(chunks: np.ndarray, action_min: np.ndarray, action_max: np
     Reproduces ``Normalize({"ACTION": NormalizationMode.MIN_MAX})`` in
     ``opentau.policies.normalize`` byte-for-byte:
     ``out = (x - min) / (max - min + EPS) * 2 - 1`` (no clip).
-    The post-Normalize ``torch.nan_to_num`` in pi0.7's
-    ``prepare_discrete_actions`` is applied here too, so the BPE sees the
-    same numerical distribution training will see.
+    The final ``nan_to_num`` is defensive only -- production neither sanitizes
+    NaN in ``Normalize`` nor in ``prepare_discrete_actions``, so a NaN input
+    would actually crash the upstream DCT. We sanitize so a single bad chunk
+    (e.g. a recording with a corrupted action sample) doesn't tank an hour-long
+    fit; for non-NaN inputs this is a no-op and the script is byte-identical to
+    training.
     """
     span_with_eps = (action_max - action_min) + _NORMALIZE_EPS
     norm = (chunks.astype(np.float64) - action_min) / span_with_eps * 2.0 - 1.0
@@ -759,6 +762,14 @@ def _drain_mixture(
     """Iterate the WeightedDatasetMixture dataloader, normalize, collect chunks.
 
     Returns ``(stacked_chunks_array (N, T, D), n_batches_consumed)``.
+
+    Note: unlike the manual path's ``_sample_via_manual``, this branch does
+    NOT log a warning when datasets have native_action_dim > action_dim --
+    the mixture's standardization pipeline already pads to
+    ``cfg.max_action_dim`` (and would raise on truncation, since
+    ``DatasetMixtureMetadata.pad_vector`` doesn't truncate). So an
+    over-dim mismatch surfaces as a build-time failure, not silent
+    truncation as in the manual path.
     """
     import torch
 
