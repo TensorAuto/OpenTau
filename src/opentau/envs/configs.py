@@ -19,12 +19,98 @@ import abc
 import logging
 from copy import copy
 from dataclasses import dataclass, field
+from typing import Literal, get_args
 
 import draccus
 
 from opentau.configs.types import FeatureType, PolicyFeature
 from opentau.constants import ACTION, OBS_IMAGES, OBS_STATE
 from opentau.utils.accelerate_utils import get_proc_accelerator
+
+# Single source of truth for the ``control_mode`` enum: the type alias is
+# used in the dataclass annotation, the runtime tuple is derived from it
+# via ``get_args`` so the two can't drift if a new mode is ever added.
+ControlMode = Literal["joint", "ee"]
+CONTROL_MODE_CHOICES: tuple[str, ...] = get_args(ControlMode)
+# Training-side bucket size for ``speed_raw`` in seconds. Must stay in
+# lockstep with the divisor used by ``BaseDataset._emit_optional_keys``
+# (currently a literal ``10`` inside the ``round(duration_s / N) * N``
+# expression in ``src/opentau/datasets/lerobot_dataset.py``). Update both
+# call sites together if the bucket size ever changes.
+SPEED_BUCKET_SECONDS = 10
+
+
+@dataclass
+class EnvMetadataConfig:
+    """Optional pi07 metadata fields, broadcast across the rollout batch.
+
+    These describe properties of the environment / robot / demonstration
+    style that the pi07 prefix tokenizes as a ``"Metadata: ..."`` segment.
+    They live on the env config (not the eval config) because they're
+    properties of *what is being run*, not *how many episodes to run*.
+
+    Each field defaults to ``None`` — the corresponding batch key is omitted
+    and the policy's ``prepare_metadata`` pad path produces no segment in
+    the prefix. Set a value to inject it for every env in the rollout.
+    Allowed values mirror the training-time distribution emitted by
+    :meth:`BaseDataset._emit_optional_keys`.
+
+    Only the pi07 family of policies consumes these keys today; setting
+    them when evaluating another policy (e.g. pi0, pi05) will pass
+    validation but the values will be ignored downstream.
+
+    Args:
+        speed: Positive integer multiple of ``SPEED_BUCKET_SECONDS`` (= 10
+            seconds; matches the rounded episode-duration bucket used at
+            training time), or ``None``.
+        quality: Integer in ``[1, 5]``, or ``None``.
+        mistake: ``True`` / ``False``, or ``None``. Note that ``False`` is
+            semantically distinct from ``None``: ``False`` emits a
+            ``"Mistake: False"`` segment into the prefix, ``None`` omits
+            the segment entirely.
+        robot_type: Non-empty robot identifier string (e.g. ``"UR5"``), or
+            ``None``.
+        control_mode: ``"joint"`` (joint-position control) or ``"ee"``
+            (end-effector control), or ``None``.
+    """
+
+    speed: int | None = None
+    quality: int | None = None
+    mistake: bool | None = None
+    robot_type: str | None = None
+    control_mode: ControlMode | None = None
+
+    def __post_init__(self) -> None:
+        # `isinstance(x, bool)` guards exclude Python bools — `bool` is a
+        # subclass of `int`, so without them `speed=True` would silently
+        # pass the type check and fail later with a confusing value error.
+        if self.speed is not None:
+            if not isinstance(self.speed, int) or isinstance(self.speed, bool):
+                raise TypeError(f"env.metadata.speed must be int, got {type(self.speed).__name__}")
+            if self.speed <= 0 or self.speed % SPEED_BUCKET_SECONDS != 0:
+                raise ValueError(
+                    f"env.metadata.speed must be a positive multiple of "
+                    f"{SPEED_BUCKET_SECONDS}, got {self.speed}"
+                )
+        if self.quality is not None:
+            if not isinstance(self.quality, int) or isinstance(self.quality, bool):
+                raise TypeError(f"env.metadata.quality must be int, got {type(self.quality).__name__}")
+            if not 1 <= self.quality <= 5:
+                raise ValueError(f"env.metadata.quality must be in [1, 5], got {self.quality}")
+        if self.mistake is not None and not isinstance(self.mistake, bool):
+            raise TypeError(f"env.metadata.mistake must be bool, got {type(self.mistake).__name__}")
+        if self.robot_type is not None:
+            if not isinstance(self.robot_type, str):
+                raise TypeError(f"env.metadata.robot_type must be str, got {type(self.robot_type).__name__}")
+            if self.robot_type == "":
+                raise ValueError(
+                    "env.metadata.robot_type must be a non-empty string; use ``None`` to leave it missing."
+                )
+        if self.control_mode is not None and self.control_mode not in CONTROL_MODE_CHOICES:
+            raise ValueError(
+                f"env.metadata.control_mode must be one of {CONTROL_MODE_CHOICES} or None, "
+                f"got {self.control_mode!r}"
+            )
 
 
 @dataclass
@@ -43,6 +129,9 @@ class EnvConfig(draccus.ChoiceRegistry, abc.ABC):
             (e.g., mapping env observations into ``OBS_IMAGES`` / ``OBS_STATE``).
         max_parallel_tasks: Maximum number of tasks to run in parallel within the env.
         disable_env_checker: Whether to disable Gymnasium environment checking.
+        metadata: Optional pi07 metadata fields (speed/quality/mistake/
+            robot_type/control_mode) broadcast across the eval batch.
+            Defaults to all-``None`` (no metadata injected).
 
     """
 
@@ -54,6 +143,7 @@ class EnvConfig(draccus.ChoiceRegistry, abc.ABC):
     features_map: dict[str, str] = field(default_factory=dict)
     max_parallel_tasks: int = 1
     disable_env_checker: bool = True
+    metadata: EnvMetadataConfig = field(default_factory=EnvMetadataConfig)
 
     @property
     def type(self) -> str:

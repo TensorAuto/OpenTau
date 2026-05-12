@@ -20,7 +20,7 @@ from dataclasses import dataclass
 import pytest
 
 from opentau.configs.types import FeatureType, PolicyFeature
-from opentau.envs.configs import EnvConfig
+from opentau.envs.configs import EnvConfig, EnvMetadataConfig
 
 
 class TestEnvConfig:
@@ -172,3 +172,89 @@ class TestEnvConfigRegistry:
         # Should be able to get all registered choices
         for choice in choices:
             assert choice in EnvConfig._choice_registry
+
+
+class TestEnvMetadataConfig:
+    """Pin the validation contract for the optional pi07 metadata fields
+    attached to ``EnvConfig.metadata``. The defaults (all ``None``) must
+    stay frozen because eval rollouts that don't set them rely on the
+    policy's ``prepare_metadata`` pad path for backwards compatibility.
+    """
+
+    def test_all_none_default_passes(self):
+        cfg = EnvMetadataConfig()
+        assert cfg.speed is None
+        assert cfg.quality is None
+        assert cfg.mistake is None
+        assert cfg.robot_type is None
+        assert cfg.control_mode is None
+
+    @pytest.mark.parametrize("mode", ["joint", "ee"])
+    @pytest.mark.parametrize("speed", [10, 50, 100, 1000])
+    def test_valid_values_pass(self, mode, speed):
+        EnvMetadataConfig(
+            speed=speed,
+            quality=3,
+            mistake=False,
+            robot_type="UR5",
+            control_mode=mode,
+        )
+
+    @pytest.mark.parametrize("bad_speed", [-10, 0, 1, 5, 9, 11, 15, 1001])
+    def test_speed_must_be_positive_multiple_of_10(self, bad_speed):
+        with pytest.raises(ValueError, match=r"speed must be a positive multiple of 10"):
+            EnvMetadataConfig(speed=bad_speed)
+
+    def test_speed_rejects_bool(self):
+        with pytest.raises(TypeError, match=r"speed must be int"):
+            EnvMetadataConfig(speed=True)
+
+    def test_speed_rejects_float(self):
+        with pytest.raises(TypeError, match=r"speed must be int"):
+            EnvMetadataConfig(speed=500.0)
+
+    @pytest.mark.parametrize("bad_quality", [0, 6, -1, 100])
+    def test_quality_out_of_range(self, bad_quality):
+        with pytest.raises(ValueError, match=r"quality must be in \[1, 5\]"):
+            EnvMetadataConfig(quality=bad_quality)
+
+    def test_quality_rejects_bool(self):
+        with pytest.raises(TypeError, match=r"quality must be int"):
+            EnvMetadataConfig(quality=True)
+
+    def test_mistake_rejects_non_bool(self):
+        with pytest.raises(TypeError, match=r"mistake must be bool"):
+            EnvMetadataConfig(mistake=1)
+
+    def test_robot_type_rejects_empty(self):
+        with pytest.raises(ValueError, match=r"robot_type must be a non-empty string"):
+            EnvMetadataConfig(robot_type="")
+
+    def test_robot_type_rejects_non_str(self):
+        with pytest.raises(TypeError, match=r"robot_type must be str"):
+            EnvMetadataConfig(robot_type=42)
+
+    @pytest.mark.parametrize("bad_mode", ["joint_position", "EE", "Joint", "cartesian", ""])
+    def test_control_mode_must_be_joint_or_ee(self, bad_mode):
+        with pytest.raises(ValueError, match=r"control_mode must be one of"):
+            EnvMetadataConfig(control_mode=bad_mode)
+
+
+class TestEnvConfigMetadataField:
+    """Verify the ``metadata`` field is wired onto every concrete
+    ``EnvConfig`` subclass via the abstract base, with the all-``None``
+    default that preserves prior eval behavior.
+    """
+
+    def test_concrete_subclass_has_metadata_default(self):
+        @EnvConfig.register_subclass("test_env_metadata_default")
+        @dataclass
+        class TestEnvConfigWithMetadata(EnvConfig):
+            @property
+            def gym_kwargs(self) -> dict:
+                return {}
+
+        config = TestEnvConfigWithMetadata()
+        assert isinstance(config.metadata, EnvMetadataConfig)
+        assert config.metadata.speed is None
+        assert config.metadata.control_mode is None

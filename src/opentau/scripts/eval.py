@@ -52,6 +52,7 @@ from opentau.configs.train import TrainPipelineConfig
 from opentau.envs.factory import make_envs
 from opentau.envs.utils import (
     add_envs_task,
+    add_eval_metadata,
     check_env_attributes_and_types,
     close_envs,
     preprocess_observation,
@@ -144,6 +145,7 @@ def rollout(
         # Infer "task" from attributes of environments.
         # TODO: works with SyncVectorEnv but not AsyncVectorEnv
         observation = add_envs_task(env, observation)
+        observation = add_eval_metadata(observation, cfg=cfg)
 
         if return_observations:
             all_observations.append(deepcopy(observation))
@@ -188,6 +190,7 @@ def rollout(
     if return_observations:
         observation = preprocess_observation(observation, cfg=cfg)
         observation = add_envs_task(env, observation)
+        observation = add_eval_metadata(observation, cfg=cfg)
         all_observations.append(deepcopy(observation))
 
     # Stack the sequence along the first dimension so that we have (batch, sequence, *) tensors.
