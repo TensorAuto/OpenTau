@@ -126,8 +126,9 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Time horizon per action chunk. MUST match the downstream policy's "
             "n_action_steps -- the BPE merges depend on chunk length. "
-            "pi0.5 / pi0.6 default to 10; pi0.7 low-level defaults to 50 "
-            "(see configuration_pi07_low_level.py)."
+            "Every policy config in this repo (pi0, pi0.5, pi0.5-mem, pi0.6, "
+            "pi0.7 low-level, pi0.7-paligemma low-level) defaults n_action_steps "
+            "to 50; configs/examples/pi07_libero.json overrides to 10."
         ),
     )
     p.add_argument(
@@ -531,12 +532,19 @@ def _sample_via_manual(
     work = [
         (i, cfg, budgets[i], chunk_size, action_freq, seed + i) for i, cfg in enumerate(mixture_cfg.datasets)
     ]
-    chunks: list[np.ndarray] = []
-    per_ds_counts = [0] * len(mixture_cfg.datasets)
+    # Collect per-dataset chunks into a fixed-index slot so the corpus we feed
+    # into the BPE trainer is in mixture-config order regardless of which
+    # workers finish first. BPE tie-breaks on equal pair frequencies depend on
+    # first-encounter order in the corpus, so completion-order extends would
+    # make two seeded runs diverge (cf. CLAUDE.md rule 3).
+    n_datasets = len(mixture_cfg.datasets)
+    per_ds_chunks: list[list[np.ndarray]] = [[] for _ in range(n_datasets)]
+    per_ds_counts = [0] * n_datasets
     errors: dict[int, str] = {}
     t0 = time.perf_counter()
     last_log = t0
     n_done = 0
+    total_so_far = 0
     with ProcessPoolExecutor(max_workers=num_workers) as ex:
         futs = {ex.submit(_sample_chunks_for_dataset_manual, w): w[0] for w in work}
         for fut in as_completed(futs):
@@ -544,18 +552,20 @@ def _sample_via_manual(
             if err:
                 errors[idx] = err
                 logger.warning("Dataset %d: %s", idx, err)
+            per_ds_chunks[idx] = ds_chunks
             per_ds_counts[idx] = len(ds_chunks)
-            chunks.extend(ds_chunks)
             n_done += 1
+            total_so_far += len(ds_chunks)
             now = time.perf_counter()
             if now - last_log > 10.0 or n_done == len(work):
                 logger.info(
                     "Manual sample: %d/%d datasets done, %d chunks so far",
                     n_done,
                     len(work),
-                    len(chunks),
+                    total_so_far,
                 )
                 last_log = now
+    chunks: list[np.ndarray] = [c for bucket in per_ds_chunks for c in bucket]
     logger.info(
         "Manual sampling done in %.1fs: %d chunks, %d ok, %d errors",
         time.perf_counter() - t0,
@@ -604,6 +614,11 @@ def _build_train_cfg(
         response_drop_prob=1.0,  # drop all responses
         metadata_drop_all_prob=1.0,  # drop all metadata
         metadata_drop_each_prob=0.0,
+        # DatasetMixtureConfig.val_split_ratio defaults to 0.05 -- if we let it
+        # through, make_dataset would return a (train, val) tuple per dataset
+        # and the assert below would (correctly) reject it. Force 0 here so the
+        # parallel mixture build always returns single train datasets.
+        val_split_ratio=0.0,
     )
     fake_policy = SimpleNamespace(
         action_delta_indices=list(range(chunk_size)),
@@ -645,9 +660,10 @@ def _build_mixture_parallel(train_cfg: Any, num_workers: int) -> Any:
     from opentau.datasets.dataset_mixture import WeightedDatasetMixture
     from opentau.datasets.factory import _resolve_weights, _validate_metadata_requirements, make_dataset
 
-    # _build_train_cfg forces ``val_split_ratio=0`` (the default), so
-    # ``make_dataset`` only ever returns a single train dataset. Asserting that
-    # explicitly keeps the parallel-build path simpler than the upstream
+    # ``_build_train_cfg`` explicitly overrides ``val_split_ratio`` to 0 (the
+    # field defaults to 0.05, so we cannot rely on the default). With it forced
+    # to 0, ``make_dataset`` only ever returns a single train dataset.
+    # Asserting that keeps the parallel-build path simpler than the upstream
     # train/val branching factory.
     assert getattr(train_cfg.dataset_mixture, "val_split_ratio", 0.0) == 0.0, (
         "fit_fast_tokenizer doesn't support val splits"
@@ -731,21 +747,25 @@ def _extract_action_stats(mixture_meta: Any, action_dim: int) -> tuple[np.ndarra
     return action_min, action_max
 
 
-_NORMALIZE_EPS = 1e-8  # matches ``opentau.policies.normalize.EPS`` for bit-identical math.
+_NORMALIZE_EPS = 1e-8  # matches ``opentau.policies.normalize.EPS``.
 
 
 def _normalize_chunks(chunks: np.ndarray, action_min: np.ndarray, action_max: np.ndarray) -> np.ndarray:
     """Min-max-normalize a stacked chunk tensor ``(N, T, D)`` to ``[-1, 1]``.
 
-    Reproduces ``Normalize({"ACTION": NormalizationMode.MIN_MAX})`` in
-    ``opentau.policies.normalize`` byte-for-byte:
+    Mirrors the formula in ``Normalize({"ACTION": NormalizationMode.MIN_MAX})``
+    from ``opentau.policies.normalize``:
     ``out = (x - min) / (max - min + EPS) * 2 - 1`` (no clip).
+    NOTE: production ``Normalize`` runs the whole expression in float32, while
+    we compute in float64 here and cast back at the end -- low float32 bits
+    will differ from training. The values agree to ~1e-7 absolute error, which
+    is well below the DCT scale used downstream, so the BPE corpus is
+    indistinguishable in practice; just don't claim bit-equality.
     The final ``nan_to_num`` is defensive only -- production neither sanitizes
     NaN in ``Normalize`` nor in ``prepare_discrete_actions``, so a NaN input
     would actually crash the upstream DCT. We sanitize so a single bad chunk
     (e.g. a recording with a corrupted action sample) doesn't tank an hour-long
-    fit; for non-NaN inputs this is a no-op and the script is byte-identical to
-    training.
+    fit; for non-NaN inputs this is a no-op.
     """
     span_with_eps = (action_max - action_min) + _NORMALIZE_EPS
     norm = (chunks.astype(np.float64) - action_min) / span_with_eps * 2.0 - 1.0
@@ -925,10 +945,21 @@ def _fit_tokenizer(
 
 
 def _find_upstream_source() -> Path:
-    """Snapshot-download just the remote-code source file so we can copy it."""
+    """Snapshot-download the remote-code source file at the pinned revision.
+
+    Passing ``revision=UPSTREAM_PINNED_SHA`` makes the constant load-bearing:
+    ``AutoProcessor.from_pretrained(out_dir, trust_remote_code=True)`` later
+    executes the copied file, so it must match the body that ``_fit_tokenizer``
+    was ported from. Without the pin, ``snapshot_download`` defaults to ``main``
+    and the copied source can silently diverge from the ported fit logic.
+    """
     from huggingface_hub import snapshot_download
 
-    cache_root = snapshot_download(repo_id=UPSTREAM_REPO_ID, allow_patterns=UPSTREAM_SOURCE_FILE)
+    cache_root = snapshot_download(
+        repo_id=UPSTREAM_REPO_ID,
+        revision=UPSTREAM_PINNED_SHA,
+        allow_patterns=UPSTREAM_SOURCE_FILE,
+    )
     src = Path(cache_root) / UPSTREAM_SOURCE_FILE
     if not src.exists():
         raise FileNotFoundError(f"{UPSTREAM_SOURCE_FILE} not in {cache_root}")
