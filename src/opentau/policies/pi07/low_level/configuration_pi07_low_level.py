@@ -82,10 +82,7 @@ class PI07LowLevelConfig(PreTrainedConfig):
             to the policy's auxiliary cross-entropy target at training time
             but is unused at inference (the flow-matching head produces
             continuous actions). Defaults to
-            ``"TensorAuto/fast-pi07-pretrain"`` -- the pi0.7 pretrain
-            mixture's specialized fit (vocab=2048, max_token_length=64,
-            mean 68 tokens/chunk, P99 93). Pass
-            ``"physical-intelligence/fast"`` to use the upstream tokenizer.
+            ``"physical-intelligence/fast"``.
         metadata_max_length: Maximum token length for metadata strings.
             Defaults to 52.
         response_max_length: Maximum token length for high-level planner
@@ -168,7 +165,7 @@ class PI07LowLevelConfig(PreTrainedConfig):
 
     # HF repo id or local path for the FAST action tokenizer
     # (``AutoProcessor.from_pretrained(..., trust_remote_code=True)``).
-    discrete_action_tokenizer_path: str = "TensorAuto/fast-pi07-pretrain"
+    discrete_action_tokenizer_path: str = "physical-intelligence/fast"
 
     metadata_max_length: int = 52
 

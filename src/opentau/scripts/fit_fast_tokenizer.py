@@ -89,6 +89,16 @@ logger = logging.getLogger(__name__)
 
 UPSTREAM_REPO_ID = "physical-intelligence/fast"
 UPSTREAM_SOURCE_FILE = "processing_action_tokenizer.py"
+# Commit SHA of physical-intelligence/fast that ``_fit_tokenizer`` was ported
+# from. When upstream changes (new preprocessing, different defaults), bump
+# this and re-port the body of ``UniversalActionProcessor.fit`` in
+# ``_fit_tokenizer`` accordingly.
+UPSTREAM_PINNED_SHA = "ec4d7aa71691cac0b8bed6942be45684db2110f4"
+
+# How much merge headroom (in tokens) we want above the initial-alphabet floor
+# before warning the user. Lower -> the BPE has very few real merges; raise
+# ``--vocab-size`` to fix.
+_MIN_MERGE_HEADROOM = 100
 
 
 def parse_args() -> argparse.Namespace:
@@ -221,19 +231,37 @@ def _parse_mixture(mixture_json: Path) -> tuple[DatasetMixtureConfig, str]:
     return mixture_cfg, content_hash
 
 
-def _resolve_native_action_key(repo_id: str | None, override_mapping: dict | None) -> str:
+def _resolve_native_action_key(
+    repo_id: str | None, override_mapping: dict | None, available_keys: set[str] | None = None
+) -> str:
     """Return the native parquet / stats column name for actions.
 
-    OpenTau's standard name is ``"actions"`` (plural); some upstream datasets use
-    ``"action"``. ``DATA_FEATURES_NAME_MAPPING`` maps standard -> native;
-    per-DatasetConfig overrides are upserted into that global at parse time.
+    OpenTau's standard name is ``"actions"`` (plural); most upstream LeRobot
+    datasets use ``"action"`` (singular). ``DATA_FEATURES_NAME_MAPPING`` maps
+    standard -> native; per-DatasetConfig overrides are upserted into that
+    global at parse time.
+
+    When the caller knows the dataset's actual stats / column keys, pass
+    ``available_keys`` so we can return whichever of ``"action"`` /
+    ``"actions"`` is actually present instead of guessing -- handles datasets
+    that aren't registered in ``DATA_FEATURES_NAME_MAPPING`` and use either
+    convention. Without ``available_keys`` we still fall back to ``"action"``
+    (the more common upstream convention).
     """
     from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
 
     if override_mapping is not None and "actions" in override_mapping:
         return override_mapping["actions"]
     mapping = DATA_FEATURES_NAME_MAPPING.get(repo_id, {}) if repo_id else {}
-    return mapping.get("actions", "action")
+    if "actions" in mapping:
+        return mapping["actions"]
+    # No registered mapping. If we know the available keys, prefer whichever
+    # exists; otherwise default to "action".
+    if available_keys is not None:
+        for candidate in ("action", "actions"):
+            if candidate in available_keys:
+                return candidate
+    return "action"
 
 
 def _load_dataset_stats(
@@ -245,7 +273,11 @@ def _load_dataset_stats(
         from opentau.datasets.lerobot_dataset import LeRobotDatasetMetadata
 
         meta = LeRobotDatasetMetadata(cfg.repo_id, root=cfg.root, revision=cfg.revision)
-        key = _resolve_native_action_key(cfg.repo_id, cfg.data_features_name_mapping)
+        key = _resolve_native_action_key(
+            cfg.repo_id,
+            cfg.data_features_name_mapping,
+            available_keys=set(meta.stats or []),
+        )
         if not meta.stats or key not in meta.stats:
             return (
                 idx,
@@ -312,6 +344,28 @@ def _aggregate_stats_manual(
             maxs_padded.append(mx)
     if not mins_padded:
         raise RuntimeError("No dataset stats loaded successfully.")
+    # Surface --action-dim / mixture-native dim mismatches loudly: any dataset
+    # whose native action dim exceeds ``action_dim`` will have its high dims
+    # silently dropped from the BPE corpus *and* normalized with truncated
+    # stats. That's only correct if production's ``max_action_dim`` matches.
+    over_dim = [
+        (i, info.get("native_action_dim", 0), info["repo_id"])
+        for i, info in per_dataset.items()
+        if info.get("native_action_dim", 0) > action_dim
+    ]
+    if over_dim:
+        max_over = max(d for _, d, _ in over_dim)
+        logger.warning(
+            "%d/%d datasets have native action_dim > --action-dim=%d (max %d). "
+            "Their extra dims will be silently dropped. Confirm this matches "
+            "the production policy's max_action_dim (mismatch => the fitted "
+            "BPE doesn't cover those dims at inference). Sample: %s",
+            len(over_dim),
+            n_ok,
+            action_dim,
+            max_over,
+            [r for _, _, r in over_dim[:5]],
+        )
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
         action_min = np.nanmin(np.stack(mins_padded), axis=0)
@@ -404,7 +458,18 @@ def _sample_chunks_for_dataset_manual(
             start = int(rng.integers(0, valid_by_ep[ep_int]))
             ep_to_starts[ep_int].append(start)
 
-        action_col = _resolve_native_action_key(cfg.repo_id, cfg.data_features_name_mapping)
+        # Peek at the first episode's parquet schema so we can pass real column
+        # names to the resolver -- handles datasets with no registered mapping
+        # that use either ``"action"`` or ``"actions"``.
+        first_ep = next(iter(ep_to_starts))
+        first_rel = meta.get_data_file_path(ep_index=first_ep)
+        first_full = meta.root / first_rel
+        if not first_full.exists():
+            meta.pull_from_repo(allow_patterns=str(first_rel))
+        available_cols = set(pq.read_schema(first_full).names)
+        action_col = _resolve_native_action_key(
+            cfg.repo_id, cfg.data_features_name_mapping, available_keys=available_cols
+        )
         chunks: list[np.ndarray] = []
         for ep, starts in ep_to_starts.items():
             rel = meta.get_data_file_path(ep_index=ep)
@@ -521,26 +586,32 @@ def _build_train_cfg(
     in ``LeRobotDataset._standardize_images`` (verified at
     ``lerobot_dataset.py:1868``), which is what makes this script CPU-cheap.
     """
+    import dataclasses
+
     from opentau.configs.train import TrainPipelineConfig
 
     # We only need action chunks for the tokenizer fit. Override mixture-side
     # knobs that would otherwise force per-sample state-history loads and
-    # augmentation rolls (none of which affect the action column).
-    mixture_cfg.n_obs_history = None
-    mixture_cfg.history_state_drop_prob = 0.0
-    mixture_cfg.subgoal_drop_prob = 1.0  # drop all subgoals -- we don't read them
-    mixture_cfg.subgoal_end_of_segment_prob = 0.0
-    mixture_cfg.response_drop_prob = 1.0  # drop all responses
-    mixture_cfg.metadata_drop_all_prob = 1.0  # drop all metadata
-    mixture_cfg.metadata_drop_each_prob = 0.0
-    n_obs = 1  # forced above
+    # augmentation rolls (none of which affect the action column). Use
+    # ``dataclasses.replace`` so the caller's parsed config is unaffected and
+    # this function can be called more than once on the same input.
+    mixture_cfg_for_fit = dataclasses.replace(
+        mixture_cfg,
+        n_obs_history=None,
+        history_state_drop_prob=0.0,
+        subgoal_drop_prob=1.0,  # drop all subgoals -- we don't read them
+        subgoal_end_of_segment_prob=0.0,
+        response_drop_prob=1.0,  # drop all responses
+        metadata_drop_all_prob=1.0,  # drop all metadata
+        metadata_drop_each_prob=0.0,
+    )
     fake_policy = SimpleNamespace(
         action_delta_indices=list(range(chunk_size)),
         history_interval=1,
-        n_obs_steps=n_obs,
+        n_obs_steps=1,  # matches n_obs_history=None
     )
     cfg = TrainPipelineConfig(
-        dataset_mixture=mixture_cfg,
+        dataset_mixture=mixture_cfg_for_fit,
         policy=fake_policy,
         batch_size=dataloader_batch_size,
         dataloader_batch_size=dataloader_batch_size,
@@ -574,28 +645,34 @@ def _build_mixture_parallel(train_cfg: Any, num_workers: int) -> Any:
     from opentau.datasets.dataset_mixture import WeightedDatasetMixture
     from opentau.datasets.factory import _resolve_weights, _validate_metadata_requirements, make_dataset
 
+    # _build_train_cfg forces ``val_split_ratio=0`` (the default), so
+    # ``make_dataset`` only ever returns a single train dataset. Asserting that
+    # explicitly keeps the parallel-build path simpler than the upstream
+    # train/val branching factory.
+    assert getattr(train_cfg.dataset_mixture, "val_split_ratio", 0.0) == 0.0, (
+        "fit_fast_tokenizer doesn't support val splits"
+    )
+
     dataset_cfgs = train_cfg.dataset_mixture.datasets
     n = len(dataset_cfgs)
     train_datasets: list[Any] = [None] * n
-    val_datasets: list[Any] = [None] * n
-    has_val = False
     n_done = 0
     last_log = time.perf_counter()
 
     def _build_one(idx: int) -> tuple[int, Any]:
-        res = make_dataset(dataset_cfgs[idx], train_cfg, return_advantage_input=False)
-        return idx, res
+        return idx, make_dataset(dataset_cfgs[idx], train_cfg, return_advantage_input=False)
 
     with ThreadPoolExecutor(max_workers=num_workers) as ex:
         futs = {ex.submit(_build_one, i): i for i in range(n)}
         for fut in as_completed(futs):
             idx, res = fut.result()
             if isinstance(res, tuple):
-                train_datasets[idx] = res[0]
-                val_datasets[idx] = res[1]
-                has_val = True
-            else:
-                train_datasets[idx] = res
+                raise RuntimeError(
+                    f"Dataset {idx} ({getattr(dataset_cfgs[idx], 'repo_id', '?')}): "
+                    "make_dataset returned a (train, val) tuple but val_split_ratio "
+                    "should be 0. Did the train_cfg get mutated?"
+                )
+            train_datasets[idx] = res
             n_done += 1
             now = time.perf_counter()
             if now - last_log > 10.0 or n_done == n:
@@ -604,18 +681,12 @@ def _build_mixture_parallel(train_cfg: Any, num_workers: int) -> Any:
 
     _validate_metadata_requirements(train_cfg, train_datasets, label="train")
     train_weights = _resolve_weights(train_cfg.dataset_mixture.weights, train_datasets, label="train")
-    mixture = WeightedDatasetMixture(
+    return WeightedDatasetMixture(
         train_cfg,
         train_datasets,
         train_weights,
         train_cfg.dataset_mixture.action_freq,
     )
-    if has_val:
-        # We don't use val in this script, but maintain shape parity with
-        # make_dataset_mixture. val_split_ratio defaults to 0 in our cfg path
-        # so this branch is essentially dead.
-        _validate_metadata_requirements(train_cfg, val_datasets, label="val")
-    return mixture
 
 
 def _extract_action_stats(mixture_meta: Any, action_dim: int) -> tuple[np.ndarray, np.ndarray]:
@@ -660,22 +731,23 @@ def _extract_action_stats(mixture_meta: Any, action_dim: int) -> tuple[np.ndarra
     return action_min, action_max
 
 
+_NORMALIZE_EPS = 1e-8  # matches ``opentau.policies.normalize.EPS`` for bit-identical math.
+
+
 def _normalize_chunks(chunks: np.ndarray, action_min: np.ndarray, action_max: np.ndarray) -> np.ndarray:
     """Min-max-normalize a stacked chunk tensor ``(N, T, D)`` to ``[-1, 1]``.
 
-    Mirrors ``Normalize({"ACTION": NormalizationMode.MIN_MAX})`` in pi0.7's
-    ``modeling_pi07_low_level.py``. Constant dims (``min == max``) map to 0;
-    non-finite inputs map to 0 (the policy's ``prepare_discrete_actions``
-    applies the equivalent ``torch.nan_to_num``).
+    Reproduces ``Normalize({"ACTION": NormalizationMode.MIN_MAX})`` in
+    ``opentau.policies.normalize`` byte-for-byte:
+    ``out = (x - min) / (max - min + EPS) * 2 - 1`` (no clip).
+    The post-Normalize ``torch.nan_to_num`` in pi0.7's
+    ``prepare_discrete_actions`` is applied here too, so the BPE sees the
+    same numerical distribution training will see.
     """
-    span = action_max - action_min
-    safe_span = np.where(span > 0, span, 1.0)
-    x = np.nan_to_num(chunks.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0)
-    norm = 2.0 * (x - action_min) / safe_span - 1.0
-    zero_dims = np.where(span <= 0)[0]
-    if zero_dims.size > 0:
-        norm[..., zero_dims] = 0.0
-    return np.clip(norm, -1.0, 1.0).astype(np.float32)
+    span_with_eps = (action_max - action_min) + _NORMALIZE_EPS
+    norm = (chunks.astype(np.float64) - action_min) / span_with_eps * 2.0 - 1.0
+    norm = np.nan_to_num(norm, nan=0.0, posinf=0.0, neginf=0.0)
+    return norm.astype(np.float32)
 
 
 def _drain_mixture(
@@ -753,12 +825,14 @@ def _fit_tokenizer(
     """Fit a fresh ``UniversalActionProcessor``, exposing the BpeTrainer's
     ``max_token_length`` knob so we can cap runaway zero-run merges.
 
-    Mirrors ``UniversalActionProcessor.fit`` (cached at
-    ``physical-intelligence/fast/processing_action_tokenizer.py``) exactly,
-    except for the ``max_token_length`` value -- the upstream uses 10000,
-    which on heavily zero-padded action data wastes the BPE's entire merge
-    budget on one runaway zero-run token (verified empirically:
-    1855 merges, one each at lengths 2..1320, all zero-pad).
+    Mirrors ``UniversalActionProcessor.fit`` from
+    ``physical-intelligence/fast/processing_action_tokenizer.py`` pinned at
+    commit ``UPSTREAM_PINNED_SHA`` (see module-level constant), except for the
+    ``max_token_length`` value -- the upstream hard-codes 10000, which on
+    heavily zero-padded action data wastes the BPE's entire merge budget on
+    one runaway zero-run token (empirically: 1855 merges, one each at lengths
+    2..1320, all zero-pad). When the upstream HF model is updated, bump the
+    pinned SHA and re-port the body below.
     """
     from scipy.fft import dct
     from tokenizers import ByteLevelBPETokenizer
@@ -793,7 +867,7 @@ def _fit_tokenizer(
             f"Vocab size {vocab_size} is too small for the range of tokens "
             f"{min_vocab_size}; bump --vocab-size."
         )
-    if min_vocab_size + 100 > vocab_size:
+    if min_vocab_size + _MIN_MERGE_HEADROOM > vocab_size:
         logger.warning(
             "Initial alphabet size %d is close to vocab size %d -- "
             "consider increasing --vocab-size for more merge headroom.",
@@ -1042,7 +1116,6 @@ def main() -> int:
         "roundtrip": roundtrip,
         "pilot": args.pilot,
     }
-    _ = warnings  # silence unused import; kept for future hooks.
     report_path = out_dir / "fit_report.json"
     report_path.write_text(json.dumps(report, indent=2, default=str))
     logger.info("Wrote fit report to %s", report_path)

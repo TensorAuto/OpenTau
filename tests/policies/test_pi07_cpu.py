@@ -1276,12 +1276,12 @@ class TestPi07ConfigPlumbing:
         )
 
         cfg = PI07LowLevelConfig()
-        # pi07 low-level is the one policy that defaults to our specialized
-        # tokenizer; all others default to the upstream "physical-intelligence/fast".
-        assert cfg.discrete_action_tokenizer_path == "TensorAuto/fast-pi07-pretrain"
+        # All seven policies default to the upstream tokenizer; users opt into
+        # a mixture-specialized fit via the CLI override exercised below.
+        assert cfg.discrete_action_tokenizer_path == "physical-intelligence/fast"
 
-        overridden = PI07LowLevelConfig(discrete_action_tokenizer_path="physical-intelligence/fast")
-        assert overridden.discrete_action_tokenizer_path == "physical-intelligence/fast"
+        overridden = PI07LowLevelConfig(discrete_action_tokenizer_path="TensorAuto/fast-pi07-pretrain")
+        assert overridden.discrete_action_tokenizer_path == "TensorAuto/fast-pi07-pretrain"
 
         # The modeling code must read the field rather than the hard-coded
         # upstream string. Patch AutoProcessor.from_pretrained to capture the
@@ -1313,7 +1313,7 @@ class TestPi07ConfigPlumbing:
         ):
             PI07LowLevelPolicy(overridden)
 
-        assert captured["path"] == "physical-intelligence/fast"
+        assert captured["path"] == "TensorAuto/fast-pi07-pretrain"
         assert captured["kwargs"].get("trust_remote_code") is True
 
     def test_post_init_preserves_explicit_vlm_config_when_policy_default(self):
