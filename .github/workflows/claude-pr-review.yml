@@ -47,7 +47,6 @@ jobs:
       || github.event.pull_request.user.login == 'claude[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
         with:
@@ -55,6 +54,7 @@ jobs:
           persist-credentials: false
 
       - uses: anthropics/claude-code-action@v1
+        continue-on-error: true
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           # Match the bot allowlist in the job-level `if:` above. Never `*` on
