@@ -698,6 +698,12 @@ def train(cfg: TrainPipelineConfig):
             accelerator.wait_for_everyone()
 
         if is_eval_step and eval_envs:
+            if torch.cuda.is_available():
+                pre_eval_alloc_gib = torch.cuda.memory_allocated() / 1024**3
+                pre_eval_resv_gib = torch.cuda.memory_reserved() / 1024**3
+                torch.cuda.reset_peak_memory_stats()
+            else:
+                pre_eval_alloc_gib = pre_eval_resv_gib = 0.0
             step_id = get_step_identifier(step, cfg.steps)
             logging.info(f"Eval policy at step {step}")
             with (
@@ -754,6 +760,32 @@ def train(cfg: TrainPipelineConfig):
             # This barrier is to ensure all processes finishes evaluation before the next training step
             # Some processes might be slower than others
             accelerator.wait_for_everyone()
+
+            if torch.cuda.is_available():
+                eval_hbm_probe = {
+                    "rank": accelerator.process_index,
+                    "pre_alloc": pre_eval_alloc_gib,
+                    "pre_resv": pre_eval_resv_gib,
+                    "peak_alloc": torch.cuda.max_memory_allocated() / 1024**3,
+                    "peak_resv": torch.cuda.max_memory_reserved() / 1024**3,
+                    "post_alloc": torch.cuda.memory_allocated() / 1024**3,
+                    "post_resv": torch.cuda.memory_reserved() / 1024**3,
+                }
+                gathered_eval_hbm = gather_object([eval_hbm_probe])
+                if accelerator.is_main_process:
+                    for s in sorted(gathered_eval_hbm, key=lambda x: x["rank"]):
+                        logging.info(
+                            "Eval HBM probe step=%d rank=%d pre=%.2f/%.2f peak=%.2f/%.2f post=%.2f/%.2f retained_alloc=%+.2f GiB",
+                            step,
+                            s["rank"],
+                            s["pre_alloc"],
+                            s["pre_resv"],
+                            s["peak_alloc"],
+                            s["peak_resv"],
+                            s["post_alloc"],
+                            s["post_resv"],
+                            s["post_alloc"] - s["pre_alloc"],
+                        )
 
     if cfg.eval_freq > 0 and eval_envs:
         close_envs(eval_envs)
