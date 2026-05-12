@@ -272,7 +272,7 @@ class PI05Policy(PreTrainedPolicy):
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
 
         self.discrete_action_processor = AutoProcessor.from_pretrained(
-            "physical-intelligence/fast", trust_remote_code=True
+            config.discrete_action_tokenizer_path, trust_remote_code=True
         )
         # Get vocab size from processor
         discrete_action_vocab_size = getattr(self.discrete_action_processor, "vocab_size", None)

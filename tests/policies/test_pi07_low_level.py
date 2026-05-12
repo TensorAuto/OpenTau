@@ -161,6 +161,11 @@ class TestPI07LowLevelIntegration:
             response_max_length=RESPONSE_MAX_LENGTH,
             metadata_max_length=METADATA_MAX_LENGTH,
             discrete_action_max_length=DISCRETE_ACTION_MAX_LENGTH,
+            # Use the public upstream tokenizer rather than the default
+            # ``TensorAuto/fast-pi07-pretrain`` so the GPU CI doesn't depend on
+            # private-repo credentials. Either tokenizer satisfies the test's
+            # contract (just needs a vocab_size attribute).
+            discrete_action_tokenizer_path="physical-intelligence/fast",
             proj_width=_TINY_EXPERT_HIDDEN,
             vlm_config=_TINY_VLM_CONFIG,
             normalization_mapping={

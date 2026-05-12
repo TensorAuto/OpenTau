@@ -116,6 +116,12 @@ class PI05Config(PreTrainedConfig):
     # Maximum length of the action tokens
     discrete_action_max_length: int = 32
 
+    # HF repo id or local path for the FAST action tokenizer
+    # (``AutoProcessor.from_pretrained(..., trust_remote_code=True)``).
+    # Override to use a tokenizer specialized to your mixture (see
+    # ``opentau.scripts.fit_fast_tokenizer``).
+    discrete_action_tokenizer_path: str = "physical-intelligence/fast"
+
     # Projector
     proj_width: int = 1024
 

@@ -1262,10 +1262,9 @@ class TestPi07ConfigPlumbing:
 
     def test_discrete_action_tokenizer_path_default_and_override(self):
         """``PI07LowLevelConfig.discrete_action_tokenizer_path`` defaults to the
-        upstream HF repo and is plumbed verbatim into
-        ``AutoProcessor.from_pretrained`` at policy construction. Override
-        path is the contract exercised by ``opentau.scripts.fit_fast_tokenizer``
-        outputs.
+        specialized pi07-pretrain tokenizer and is plumbed verbatim into
+        ``AutoProcessor.from_pretrained`` at policy construction. The override
+        contract is what ``opentau.scripts.fit_fast_tokenizer`` outputs target.
         """
         from unittest import mock
 
@@ -1277,10 +1276,12 @@ class TestPi07ConfigPlumbing:
         )
 
         cfg = PI07LowLevelConfig()
-        assert cfg.discrete_action_tokenizer_path == "physical-intelligence/fast"
+        # pi07 low-level is the one policy that defaults to our specialized
+        # tokenizer; all others default to the upstream "physical-intelligence/fast".
+        assert cfg.discrete_action_tokenizer_path == "TensorAuto/fast-pi07-pretrain"
 
-        overridden = PI07LowLevelConfig(discrete_action_tokenizer_path="TensorAuto/fast-pi07-pretrain")
-        assert overridden.discrete_action_tokenizer_path == "TensorAuto/fast-pi07-pretrain"
+        overridden = PI07LowLevelConfig(discrete_action_tokenizer_path="physical-intelligence/fast")
+        assert overridden.discrete_action_tokenizer_path == "physical-intelligence/fast"
 
         # The modeling code must read the field rather than the hard-coded
         # upstream string. Patch AutoProcessor.from_pretrained to capture the
@@ -1312,7 +1313,7 @@ class TestPi07ConfigPlumbing:
         ):
             PI07LowLevelPolicy(overridden)
 
-        assert captured["path"] == "TensorAuto/fast-pi07-pretrain"
+        assert captured["path"] == "physical-intelligence/fast"
         assert captured["kwargs"].get("trust_remote_code") is True
 
     def test_post_init_preserves_explicit_vlm_config_when_policy_default(self):

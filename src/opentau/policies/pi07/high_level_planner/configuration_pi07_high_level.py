@@ -147,6 +147,12 @@ class PI07HighLevelPlannerConfig(PreTrainedConfig):
 
     memory_indicator_max_length: int = 4
 
+    # HF repo id or local path for the FAST action tokenizer
+    # (``AutoProcessor.from_pretrained(..., trust_remote_code=True)``).
+    # Override to use a tokenizer specialized to your mixture (see
+    # ``opentau.scripts.fit_fast_tokenizer``).
+    discrete_action_tokenizer_path: str = "physical-intelligence/fast"
+
     # Dropout
     dropout: float = 0.1
 
