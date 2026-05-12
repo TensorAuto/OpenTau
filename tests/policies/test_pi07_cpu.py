@@ -1260,6 +1260,61 @@ class TestPi07ConfigPlumbing:
         ll = PI07LowLevelConfig(attention_implementation="sdpa")
         assert ll.vlm_config.attention_implementation == "sdpa"
 
+    def test_discrete_action_tokenizer_path_default_and_override(self):
+        """``PI07LowLevelConfig.discrete_action_tokenizer_path`` defaults to the
+        upstream HF repo and is plumbed verbatim into
+        ``AutoProcessor.from_pretrained`` at policy construction. Override
+        path is the contract exercised by ``opentau.scripts.fit_fast_tokenizer``
+        outputs.
+        """
+        from unittest import mock
+
+        from opentau.policies.pi07.low_level.configuration_pi07_low_level import (
+            PI07LowLevelConfig,
+        )
+        from opentau.policies.pi07.low_level.modeling_pi07_low_level import (
+            PI07LowLevelPolicy,
+        )
+
+        cfg = PI07LowLevelConfig()
+        assert cfg.discrete_action_tokenizer_path == "physical-intelligence/fast"
+
+        overridden = PI07LowLevelConfig(discrete_action_tokenizer_path="TensorAuto/fast-pi07-pretrain")
+        assert overridden.discrete_action_tokenizer_path == "TensorAuto/fast-pi07-pretrain"
+
+        # The modeling code must read the field rather than the hard-coded
+        # upstream string. Patch AutoProcessor.from_pretrained to capture the
+        # repo id without actually downloading.
+        captured: dict[str, object] = {}
+
+        def _fake_from_pretrained(path, *args, **kwargs):
+            captured["path"] = path
+            captured["kwargs"] = kwargs
+            stub = mock.MagicMock()
+            stub.vocab_size = 2048
+            return stub
+
+        # Patch AutoProcessor at its import site inside the modeling module so
+        # the real HF resolver never runs (this is a CPU test; no network).
+        with (
+            mock.patch(
+                "opentau.policies.pi07.low_level.modeling_pi07_low_level.AutoProcessor.from_pretrained",
+                side_effect=_fake_from_pretrained,
+            ),
+            mock.patch(
+                "opentau.policies.pi07.low_level.modeling_pi07_low_level.AutoTokenizer.from_pretrained",
+                return_value=mock.MagicMock(),
+            ),
+            mock.patch(
+                "opentau.policies.pi07.low_level.modeling_pi07_low_level.PI07LowLevelFlowMatching",
+                return_value=mock.MagicMock(),
+            ),
+        ):
+            PI07LowLevelPolicy(overridden)
+
+        assert captured["path"] == "TensorAuto/fast-pi07-pretrain"
+        assert captured["kwargs"].get("trust_remote_code") is True
+
     def test_post_init_preserves_explicit_vlm_config_when_policy_default(self):
         """Direct overrides via --policy.vlm_config.* must survive when the
         policy-level field is at its default ('eager' / False)."""

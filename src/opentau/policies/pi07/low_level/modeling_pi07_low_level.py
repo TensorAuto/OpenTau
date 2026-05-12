@@ -336,7 +336,7 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-4b-pt")
 
         self.discrete_action_processor = AutoProcessor.from_pretrained(
-            "physical-intelligence/fast", trust_remote_code=True
+            config.discrete_action_tokenizer_path, trust_remote_code=True
         )
         discrete_action_vocab_size = getattr(self.discrete_action_processor, "vocab_size", None)
         self.model = PI07LowLevelFlowMatching(config, discrete_action_vocab_size=discrete_action_vocab_size)
