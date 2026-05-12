@@ -170,9 +170,10 @@ def add_eval_metadata(observation: dict[str, Any], cfg: TrainPipelineConfig) -> 
     (``torch.long`` for ``speed`` / ``quality``, ``torch.bool`` for
     ``mistake``). String fields (``robot_type`` / ``control_mode``) are
     broadcast as ``list[str]`` of length ``num_envs``. Fields set to
-    ``None`` on the config — or a missing ``cfg.env`` entirely — are
-    skipped, so the corresponding batch key stays absent and the policy's
-    ``prepare_metadata`` pad default kicks in.
+    ``None`` on the config are skipped, so the corresponding batch key
+    stays absent and the policy's ``prepare_metadata`` pad default kicks
+    in. ``cfg.env`` is guaranteed non-``None`` here — ``eval_policy``
+    dereferences ``cfg.env.type`` before the rollout loop starts.
 
     Args:
         observation: Observation dict produced by ``preprocess_observation``
@@ -182,9 +183,6 @@ def add_eval_metadata(observation: dict[str, Any], cfg: TrainPipelineConfig) -> 
     Returns:
         The observation dict, mutated in place.
     """
-    if cfg.env is None:
-        return observation
-
     meta = cfg.env.metadata
     state = observation["state"]
     batch_size = state.shape[0]

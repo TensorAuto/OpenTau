@@ -15,11 +15,18 @@
 # limitations under the License.
 
 import warnings
+from types import SimpleNamespace
 
 import gymnasium as gym
 import pytest
+import torch
 
-from opentau.envs.utils import are_all_envs_same_type, check_env_attributes_and_types
+from opentau.envs.configs import EnvMetadataConfig
+from opentau.envs.utils import (
+    add_eval_metadata,
+    are_all_envs_same_type,
+    check_env_attributes_and_types,
+)
 
 
 def make_type1_env():
@@ -190,3 +197,119 @@ class TestCheckEnvAttributesAndTypes:
 
             # Should not issue warning about missing attributes
             assert len(w) == 0
+
+
+def _make_obs(batch_size: int = 2, device: str = "cpu") -> dict:
+    """Minimal observation dict mirroring what ``preprocess_observation`` emits.
+
+    ``add_eval_metadata`` only reads ``observation["state"]`` (for batch size
+    and device), so anything richer would be dead weight.
+    """
+    return {"state": torch.zeros(batch_size, 8, device=device, dtype=torch.float32)}
+
+
+def _make_cfg(**metadata_kwargs) -> SimpleNamespace:
+    """Build a duck-typed ``cfg`` exposing only ``cfg.env.metadata``.
+
+    Avoids constructing a full ``TrainPipelineConfig`` (which pulls in
+    optimizer/dataset/policy validation) just to read five attributes.
+    """
+    return SimpleNamespace(env=SimpleNamespace(metadata=EnvMetadataConfig(**metadata_kwargs)))
+
+
+class TestAddEvalMetadata:
+    """Pin the contract between the rollout-time helper and the policy's
+    ``prepare_metadata`` reader. The dtypes, shapes, and missing-key skip
+    behaviour below are what ``prepare_metadata`` relies on — drift here
+    silently changes the prefix the model sees at eval.
+    """
+
+    def test_all_none_default_skips_every_key(self):
+        obs = _make_obs()
+        original_keys = set(obs.keys())
+        out = add_eval_metadata(obs, cfg=_make_cfg())
+        assert out is obs  # mutated-in-place contract
+        assert set(out.keys()) == original_keys, (
+            "no metadata keys should be injected when every field is None"
+        )
+
+    @pytest.mark.parametrize("batch_size", [1, 4])
+    def test_speed_injects_long_tensor_with_pad_flag(self, batch_size):
+        obs = _make_obs(batch_size=batch_size)
+        add_eval_metadata(obs, cfg=_make_cfg(speed=20))
+
+        assert obs["speed"].dtype == torch.long
+        assert obs["speed"].shape == (batch_size,)
+        assert torch.equal(obs["speed"], torch.full((batch_size,), 20, dtype=torch.long))
+
+        assert obs["speed_is_pad"].dtype == torch.bool
+        assert obs["speed_is_pad"].shape == (batch_size,)
+        assert not obs["speed_is_pad"].any()
+
+    def test_quality_injects_long_tensor_with_pad_flag(self):
+        obs = _make_obs(batch_size=3)
+        add_eval_metadata(obs, cfg=_make_cfg(quality=4))
+
+        assert obs["quality"].dtype == torch.long
+        assert torch.equal(obs["quality"], torch.full((3,), 4, dtype=torch.long))
+        assert obs["quality_is_pad"].dtype == torch.bool
+        assert not obs["quality_is_pad"].any()
+
+    @pytest.mark.parametrize("value", [True, False])
+    def test_mistake_injects_bool_tensor_with_pad_flag(self, value):
+        obs = _make_obs(batch_size=2)
+        add_eval_metadata(obs, cfg=_make_cfg(mistake=value))
+
+        assert obs["mistake"].dtype == torch.bool
+        assert obs["mistake"].shape == (2,)
+        assert torch.equal(obs["mistake"], torch.full((2,), value, dtype=torch.bool))
+        assert obs["mistake_is_pad"].dtype == torch.bool
+        assert not obs["mistake_is_pad"].any()
+
+    def test_mistake_false_vs_none_differ(self):
+        """``mistake=False`` injects a key; ``mistake=None`` (default) does not.
+
+        This is the foot-gun called out in code review: ``False`` is *not*
+        "no mistake info available" — that's ``None``.
+        """
+        obs_false = _make_obs()
+        add_eval_metadata(obs_false, cfg=_make_cfg(mistake=False))
+        assert "mistake" in obs_false
+        assert "mistake_is_pad" in obs_false
+
+        obs_none = _make_obs()
+        add_eval_metadata(obs_none, cfg=_make_cfg(mistake=None))
+        assert "mistake" not in obs_none
+        assert "mistake_is_pad" not in obs_none
+
+    @pytest.mark.parametrize("key,value", [("robot_type", "UR5"), ("control_mode", "ee")])
+    def test_string_fields_broadcast_as_list(self, key, value):
+        obs = _make_obs(batch_size=3)
+        add_eval_metadata(obs, cfg=_make_cfg(**{key: value}))
+
+        assert obs[key] == [value, value, value]
+        assert f"{key}_is_pad" not in obs, "string fields use empty-string as pad signal, not a flag"
+
+    def test_partial_fields_only_inject_specified_keys(self):
+        obs = _make_obs()
+        add_eval_metadata(obs, cfg=_make_cfg(speed=30, robot_type="UR5"))
+
+        assert "speed" in obs and "speed_is_pad" in obs
+        assert "robot_type" in obs
+        for absent in ("quality", "quality_is_pad", "mistake", "mistake_is_pad", "control_mode"):
+            assert absent not in obs, f"unset field {absent} should not be injected"
+
+    def test_device_propagation(self):
+        """Newly-injected tensors must live on the same device as ``state``.
+
+        Using "meta" device makes this CPU-host portable (no real CUDA
+        required) while still exercising the device-routing branch in the
+        helper.
+        """
+        obs = _make_obs(batch_size=2, device="meta")
+        add_eval_metadata(obs, cfg=_make_cfg(speed=20, mistake=True))
+
+        assert obs["speed"].device.type == "meta"
+        assert obs["speed_is_pad"].device.type == "meta"
+        assert obs["mistake"].device.type == "meta"
+        assert obs["mistake_is_pad"].device.type == "meta"

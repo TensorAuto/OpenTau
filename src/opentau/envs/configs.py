@@ -28,6 +28,12 @@ from opentau.constants import ACTION, OBS_IMAGES, OBS_STATE
 from opentau.utils.accelerate_utils import get_proc_accelerator
 
 CONTROL_MODE_CHOICES = ("joint", "ee")
+# Training-side bucket size for ``speed_raw`` in seconds. Must stay in
+# lockstep with the divisor used by ``BaseDataset._emit_optional_keys``
+# (currently a literal ``10`` inside the ``round(duration_s / N) * N``
+# expression in ``src/opentau/datasets/lerobot_dataset.py``). Update both
+# call sites together if the bucket size ever changes.
+SPEED_BUCKET_SECONDS = 10
 
 
 @dataclass
@@ -45,11 +51,19 @@ class EnvMetadataConfig:
     Allowed values mirror the training-time distribution emitted by
     :meth:`BaseDataset._emit_optional_keys`.
 
+    Only the pi07 family of policies consumes these keys today; setting
+    them when evaluating another policy (e.g. pi0, pi05) will pass
+    validation but the values will be ignored downstream.
+
     Args:
-        speed: Positive integer multiple of 10 (matches the rounded
-            episode-length bucket used at training time), or ``None``.
+        speed: Positive integer multiple of ``SPEED_BUCKET_SECONDS`` (= 10
+            seconds; matches the rounded episode-duration bucket used at
+            training time), or ``None``.
         quality: Integer in ``[1, 5]``, or ``None``.
-        mistake: ``True`` / ``False``, or ``None``.
+        mistake: ``True`` / ``False``, or ``None``. Note that ``False`` is
+            semantically distinct from ``None``: ``False`` emits a
+            ``"Mistake: False"`` segment into the prefix, ``None`` omits
+            the segment entirely.
         robot_type: Non-empty robot identifier string (e.g. ``"UR5"``), or
             ``None``.
         control_mode: ``"joint"`` (joint-position control) or ``"ee"``
@@ -69,8 +83,11 @@ class EnvMetadataConfig:
         if self.speed is not None:
             if not isinstance(self.speed, int) or isinstance(self.speed, bool):
                 raise TypeError(f"env.metadata.speed must be int, got {type(self.speed).__name__}")
-            if self.speed <= 0 or self.speed % 10 != 0:
-                raise ValueError(f"env.metadata.speed must be a positive multiple of 10, got {self.speed}")
+            if self.speed <= 0 or self.speed % SPEED_BUCKET_SECONDS != 0:
+                raise ValueError(
+                    f"env.metadata.speed must be a positive multiple of "
+                    f"{SPEED_BUCKET_SECONDS}, got {self.speed}"
+                )
         if self.quality is not None:
             if not isinstance(self.quality, int) or isinstance(self.quality, bool):
                 raise TypeError(f"env.metadata.quality must be int, got {type(self.quality).__name__}")
