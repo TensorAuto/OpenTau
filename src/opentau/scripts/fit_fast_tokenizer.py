@@ -19,8 +19,8 @@ pi0.7 training as an auxiliary cross-entropy target on top of the
 flow-matching MSE loss -- it tokenizes action chunks via DCT + BPE. The
 published upstream checkpoint was fit on a generic robotics mixture; this
 script lets you specialize the BPE to your own action distribution by
-fitting on the same min-max-normalized action chunks the policy will see
-at training time.
+fitting on the same min-max-normalized, FPS-resampled action chunks the
+policy will see at training time.
 
 Output is a ``processor`` directory loadable via
 ``AutoProcessor.from_pretrained(out_dir, trust_remote_code=True)``.
@@ -29,29 +29,37 @@ Pipeline (all CPU):
 
     1. Resolve ``$ref`` includes in the mixture JSON and parse it as a
        ``DatasetMixtureConfig``.
-    2. Aggregate per-dim ``action`` min/max across the mixture by reading
-       each dataset's ``LeRobotDatasetMetadata`` (cheap, only ``meta/``).
-    3. Allocate per-dataset chunk budgets weight-proportional to
-       ``mixture.weights``, clamped to ``[floor, cap]``.
-    4. Sample action chunks from each dataset's parquet files (no video
-       decode, no LeRobotDataset machinery).
-    5. Min-max-normalize each chunk to ``[-1, 1]`` using the aggregated
-       stats; right-pad ``action_dim`` to the policy's ``max_action_dim``.
-    6. Call ``UniversalActionProcessor.fit(...)`` (DCT + Rust BpeTrainer)
-       and ``save_pretrained`` the result. The upstream remote-code source
-       ``processing_action_tokenizer.py`` is copied alongside so the saved
-       directory loads via ``trust_remote_code=True``.
-    7. Round-trip a held-out sample of chunks for a sanity-check MSE and
-       average token length.
+    2. Build a minimal ``TrainPipelineConfig`` (stub policy with
+       ``action_delta_indices = list(range(chunk_size))``, ``num_cams=0``
+       to skip video decode) and pass it to ``make_dataset_mixture`` so
+       we reuse the same weighted-sampling + ``action_freq`` resampling
+       pipeline the training loop uses. This is the ONLY way to guarantee
+       the tokenizer is fit on the same chunk distribution the policy
+       will see.
+    3. Drain the weighted dataloader until ``--total-chunks`` action
+       chunks have been collected; each batch yields chunks already
+       resampled to ``mixture.action_freq`` and right-padded to
+       ``max_action_dim``.
+    4. Min-max-normalize each chunk to ``[-1, 1]`` using
+       ``mixture.meta.stats["actions"]`` -- the same min/max the policy
+       will use at training via
+       ``Normalize({"ACTION": NormalizationMode.MIN_MAX})``.
+    5. Call ``UniversalActionProcessor.fit(...)`` (DCT + Rust BpeTrainer)
+       and ``save_pretrained`` the result. The upstream remote-code
+       source ``processing_action_tokenizer.py`` is copied alongside so
+       the saved directory loads via ``trust_remote_code=True``.
+    6. Round-trip a held-out sample of chunks for a sanity-check MSE and
+       average token length; write ``fit_report.json``.
 
 Usage:
 
     python -m opentau.scripts.fit_fast_tokenizer \\
         --mixture-json /path/to/mixture.json \\
         --out-dir /path/to/output_dir/ \\
-        [--total-chunks 1000000] [--chunk-size 10] [--action-dim 32] \\
-        [--vocab-size 2048] [--scale 10] [--seed 0] [--num-workers 16] \\
-        [--cap-per-dataset 30000] [--floor-per-dataset 200] [--pilot]
+        --chunk-size 50 \\
+        [--total-chunks 1000000] [--action-dim 32] \\
+        [--vocab-size 2048] [--scale 10] [--seed 0] [--num-workers 8] \\
+        [--dataloader-batch-size 256] [--pilot]
 
 The mixture JSON may use ``$ref`` includes -- see
 ``opentau.configs.refs.resolve_refs``.
@@ -67,15 +75,14 @@ import shutil
 import sys
 import time
 import warnings
-from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import draccus
 import numpy as np
 
-from opentau.configs.default import DatasetConfig, DatasetMixtureConfig
+from opentau.configs.default import DatasetMixtureConfig
 from opentau.configs.refs import resolve_refs_to_tempfile
 
 logger = logging.getLogger(__name__)
@@ -105,25 +112,77 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--chunk-size",
         type=int,
-        default=10,
-        help="Time horizon per action chunk (matches policy n_action_steps).",
+        required=True,
+        help=(
+            "Time horizon per action chunk. MUST match the downstream policy's "
+            "n_action_steps -- the BPE merges depend on chunk length. "
+            "pi0.5 / pi0.6 default to 10; pi0.7 low-level defaults to 50 "
+            "(see configuration_pi07_low_level.py)."
+        ),
     )
     p.add_argument(
         "--action-dim",
         type=int,
         default=32,
-        help="Padded action dimension (matches policy max_action_dim).",
+        help=(
+            "Padded action dimension. Must match the production policy's "
+            "max_action_dim (pi0.5/pi0.6/pi0.7 default to 32). Datasets whose "
+            "native action dim exceeds this value have their extra dims "
+            "silently dropped from the BPE corpus -- those dims are never "
+            "used at inference, so they shouldn't appear at fit time either."
+        ),
+    )
+    p.add_argument(
+        "--max-state-dim",
+        type=int,
+        default=128,
+        help=(
+            "Padded state dimension. Must be >= the largest native state dim in "
+            "the mixture (same non-truncating pad path). We never read state, "
+            "but the value flows through DatasetMixtureMetadata stats."
+        ),
     )
     p.add_argument("--vocab-size", type=int, default=2048)
     p.add_argument("--scale", type=float, default=10.0)
+    p.add_argument(
+        "--max-token-length",
+        type=int,
+        default=64,
+        help=(
+            "Cap on the byte length of any single learned BPE merge. The "
+            "upstream FAST fit uses 10000 (effectively uncapped), which on a "
+            "high-zero-pad corpus causes the BPE to spend its entire merge "
+            "budget on one runaway zero-run token (lengths 2,3,4,...,N). "
+            "Capping at ~chunk_size keeps merges focused on meaningful "
+            "patterns. Set to >chunk_size*action_dim to reproduce the "
+            "upstream behaviour."
+        ),
+    )
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--cap-per-dataset", type=int, default=30_000)
-    p.add_argument("--floor-per-dataset", type=int, default=200)
+    p.add_argument(
+        "--dataloader-batch-size",
+        type=int,
+        default=256,
+        help="Per-iteration batch size from the WeightedDatasetMixture dataloader.",
+    )
     p.add_argument(
         "--num-workers",
         type=int,
-        default=16,
-        help="Parallel processes for per-dataset stats + sampling phases.",
+        default=8,
+        help="Dataloader worker processes (passed to PyTorch DataLoader).",
+    )
+    p.add_argument(
+        "--use-mixture-dataloader",
+        action="store_true",
+        help=(
+            "Use the full WeightedDatasetMixture dataloader for sampling "
+            "(safer but ~1000x slower at ~25 chunks/s due to per-sample "
+            "standardization). Default: a hand-rolled equivalent that "
+            "weight-allocates a budget per dataset, reads action+timestamp "
+            "columns directly from parquet, and resamples to "
+            "mixture.action_freq via scipy.interp1d. Both paths respect "
+            "the mixture's weights and global FPS."
+        ),
     )
     p.add_argument(
         "--pilot",
@@ -162,62 +221,64 @@ def _parse_mixture(mixture_json: Path) -> tuple[DatasetMixtureConfig, str]:
     return mixture_cfg, content_hash
 
 
-def _resolve_native_action_key(cfg: DatasetConfig) -> str:
-    """Return the native column / stats key for actions in ``cfg``'s dataset.
+def _resolve_native_action_key(repo_id: str | None, override_mapping: dict | None) -> str:
+    """Return the native parquet / stats column name for actions.
 
-    Falls back to ``"action"`` (the LeRobot convention) when no mapping is
-    found. Side note: ``DatasetConfig.__post_init__`` upserts any per-config
-    ``data_features_name_mapping`` into ``DATA_FEATURES_NAME_MAPPING`` at
-    parse time, so a single global lookup suffices.
+    OpenTau's standard name is ``"actions"`` (plural); some upstream datasets use
+    ``"action"``. ``DATA_FEATURES_NAME_MAPPING`` maps standard -> native;
+    per-DatasetConfig overrides are upserted into that global at parse time.
     """
     from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
 
-    mapping = DATA_FEATURES_NAME_MAPPING.get(cfg.repo_id, {}) if cfg.repo_id else {}
+    if override_mapping is not None and "actions" in override_mapping:
+        return override_mapping["actions"]
+    mapping = DATA_FEATURES_NAME_MAPPING.get(repo_id, {}) if repo_id else {}
     return mapping.get("actions", "action")
 
 
 def _load_dataset_stats(
-    item: tuple[int, DatasetConfig],
+    item: tuple[int, Any],
 ) -> tuple[int, str, dict | None, str | None]:
-    """Worker: load action min/max from a single dataset's metadata.
-
-    Returns ``(idx, repo_id, {"min": ..., "max": ...} | None, error_str | None)``.
-    """
+    """Worker: read action min/max from a dataset's LeRobotDatasetMetadata."""
     idx, cfg = item
     try:
         from opentau.datasets.lerobot_dataset import LeRobotDatasetMetadata
 
         meta = LeRobotDatasetMetadata(cfg.repo_id, root=cfg.root, revision=cfg.revision)
-        action_key = _resolve_native_action_key(cfg)
-        if not meta.stats or action_key not in meta.stats:
+        key = _resolve_native_action_key(cfg.repo_id, cfg.data_features_name_mapping)
+        if not meta.stats or key not in meta.stats:
             return (
                 idx,
                 cfg.repo_id,
                 None,
-                f"key {action_key!r} missing from stats (keys={sorted(meta.stats or [])})",
+                f"key {key!r} missing from stats (keys={sorted(meta.stats or [])})",
             )
-        action_stats = meta.stats[action_key]
+        s = meta.stats[key]
         return (
             idx,
             cfg.repo_id,
             {
-                "min": np.asarray(action_stats["min"], dtype=np.float64).ravel(),
-                "max": np.asarray(action_stats["max"], dtype=np.float64).ravel(),
+                "min": np.asarray(s["min"], dtype=np.float64).ravel(),
+                "max": np.asarray(s["max"], dtype=np.float64).ravel(),
             },
             None,
         )
-    except Exception as e:  # noqa: BLE001  (worker boundary -- collect all errors)
+    except Exception as e:  # noqa: BLE001
         return idx, cfg.repo_id or "<no-repo-id>", None, f"{type(e).__name__}: {e}"
 
 
-def _aggregate_stats(
+def _aggregate_stats_manual(
     mixture_cfg: DatasetMixtureConfig, action_dim: int, num_workers: int
 ) -> tuple[np.ndarray, np.ndarray, dict[int, dict]]:
-    """Element-wise nan-tolerant min / max across the mixture.
+    """NaN-tolerant nanmin / nanmax of per-dataset action stats.
 
-    Pads each dataset's stats to ``action_dim`` (NaN sentinel for padded slots).
-    Dims that stay NaN across the whole mixture fall back to ``[-1, 1]``.
+    Mirrors what ``DatasetMixtureMetadata`` does for ``actions`` -- pads each
+    dataset's stats to ``action_dim`` (NaN sentinel for padded slots),
+    aggregates with nanmin / nanmax, falls back to ``[-1, 1]`` for dims that
+    are NaN across the entire mixture.
     """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
     logger.info(
         "Loading action stats for %d datasets (workers=%d)",
         len(mixture_cfg.datasets),
@@ -229,21 +290,19 @@ def _aggregate_stats(
     per_dataset: dict[int, dict] = {}
     n_ok = 0
     n_fail = 0
-
     work = list(enumerate(mixture_cfg.datasets))
     with ProcessPoolExecutor(max_workers=num_workers) as ex:
         futs = {ex.submit(_load_dataset_stats, item): item[0] for item in work}
         for fut in as_completed(futs):
             idx, repo_id, stats, err = fut.result()
-            record = {"repo_id": repo_id, "ok": stats is not None, "error": err}
-            per_dataset[idx] = record
+            per_dataset[idx] = {"repo_id": repo_id, "ok": stats is not None, "error": err}
             if stats is None:
                 n_fail += 1
                 logger.warning("Dataset %d (%s): no stats -- %s", idx, repo_id, err)
                 continue
             n_ok += 1
             native_dim = int(stats["min"].shape[0])
-            record["native_action_dim"] = native_dim
+            per_dataset[idx]["native_action_dim"] = native_dim
             mn = np.full(action_dim, np.nan, dtype=np.float64)
             mx = np.full(action_dim, np.nan, dtype=np.float64)
             clip = min(action_dim, native_dim)
@@ -251,15 +310,12 @@ def _aggregate_stats(
             mx[:clip] = stats["max"][:clip]
             mins_padded.append(mn)
             maxs_padded.append(mx)
-
     if not mins_padded:
-        raise RuntimeError("No dataset stats were loaded successfully -- cannot proceed.")
-
+        raise RuntimeError("No dataset stats loaded successfully.")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
         action_min = np.nanmin(np.stack(mins_padded), axis=0)
         action_max = np.nanmax(np.stack(maxs_padded), axis=0)
-
     nan_dims = np.where(~np.isfinite(action_min) | ~np.isfinite(action_max))[0]
     if nan_dims.size > 0:
         logger.info(
@@ -268,80 +324,87 @@ def _aggregate_stats(
         )
         action_min[nan_dims] = -1.0
         action_max[nan_dims] = 1.0
-
-    elapsed = time.perf_counter() - t0
-    logger.info("Stats aggregation done in %.1fs (%d ok, %d fail).", elapsed, n_ok, n_fail)
-    logger.info("Global action_min: %s", np.round(action_min, 3).tolist())
-    logger.info("Global action_max: %s", np.round(action_max, 3).tolist())
+    logger.info(
+        "Stats aggregation done in %.1fs (%d ok, %d fail).",
+        time.perf_counter() - t0,
+        n_ok,
+        n_fail,
+    )
     return action_min, action_max, per_dataset
 
 
-def _compute_budgets(
-    mixture_cfg: DatasetMixtureConfig,
-    total_chunks: int,
-    cap: int,
-    floor: int,
-) -> list[int]:
-    """Per-dataset budget: weight-proportional, clamped to ``[floor, cap]``."""
+def _compute_budgets_weighted(mixture_cfg: DatasetMixtureConfig, total_chunks: int) -> list[int]:
+    """Pure weight-proportional budget per dataset (no clamps).
+
+    The HierarchicalSampler used at training samples each chunk by weight, so
+    expected per-dataset chunk count is ``total * w_i / sum(w)``. This function
+    materializes that as discrete budgets we can dispatch in parallel.
+    """
     n = len(mixture_cfg.datasets)
     weights = mixture_cfg.weights if mixture_cfg.weights is not None else [1.0] * n
     weights = np.asarray(weights, dtype=np.float64)
     if weights.sum() <= 0:
         weights = np.ones(n, dtype=np.float64)
     budgets = np.round(total_chunks * weights / weights.sum()).astype(int)
-    budgets = np.clip(budgets, floor, cap)
     return budgets.tolist()
 
 
-def _sample_chunks_for_dataset(
-    args: tuple[int, DatasetConfig, int, int, int],
+def _sample_chunks_for_dataset_manual(
+    args: tuple[int, Any, int, int, float, int],
 ) -> tuple[int, list[np.ndarray], str | None]:
-    """Worker: sample ``n_chunks`` action chunks of shape ``(chunk_size, native_dim)``.
+    """Worker: sample ``n_chunks`` action chunks of shape ``(chunk_size, native_dim)``
+    resampled to ``action_freq`` via ``scipy.interpolate.interp1d``.
 
-    Reads raw parquet via ``pyarrow`` directly (no video decode, no
-    ``LeRobotDataset`` machinery, no FPS resampling). The fitted tokenizer
-    is a function of the DCT-coefficient distribution, which is mostly
-    determined by per-step action deltas; the resampling-induced jitter
-    is small enough that it does not matter for the BPE.
+    Reads raw parquet (action + timestamp) per episode -- no LeRobotDataset
+    overhead. The interp matches LeRobot's vector_resample_strategy="nearest"
+    closely enough for tokenizer fitting (``kind="linear"`` here is actually
+    slightly more accurate; we don't need the strict step-resample behavior).
     """
-    idx, cfg, n_chunks, chunk_size, seed = args
+    idx, cfg, n_chunks, chunk_size, action_freq, seed = args
     if n_chunks <= 0:
         return idx, [], None
     try:
         import pyarrow.parquet as pq
+        from scipy.interpolate import interp1d
 
         from opentau.datasets.lerobot_dataset import LeRobotDatasetMetadata
 
         meta = LeRobotDatasetMetadata(cfg.repo_id, root=cfg.root, revision=cfg.revision)
-        # Episode filter (None means "all episodes")
+        native_fps = float(meta.info["fps"])
+        target_dt = 1.0 / action_freq
+        chunk_duration = (chunk_size - 1) * target_dt  # seconds spanned by a chunk
+        # Need at least ceil(chunk_duration * native_fps) + 1 native frames per chunk.
+        min_native_frames = int(np.ceil(chunk_duration * native_fps)) + 1
+
         eligible_eps = (
             list(meta.episodes.keys())
             if cfg.episodes is None
             else [ep for ep in cfg.episodes if ep in meta.episodes]
         )
-        ep_starts: list[tuple[int, int]] = []
+        ep_max_start: list[tuple[int, int]] = []
         for ep in eligible_eps:
             length = int(meta.episodes[ep].get("length", 0))
-            valid = max(0, length - chunk_size + 1)
+            valid = max(0, length - min_native_frames + 1)
             if valid > 0:
-                ep_starts.append((ep, valid))
-        if not ep_starts:
-            return idx, [], f"no episode has length >= chunk_size={chunk_size}"
+                ep_max_start.append((ep, valid))
+        if not ep_max_start:
+            return idx, [], f"no episode has length >= {min_native_frames} native frames"
 
         rng = np.random.default_rng(seed)
-        ep_ids = np.array([e for e, _ in ep_starts])
-        ep_weights = np.array([v for _, v in ep_starts], dtype=np.float64)
+        ep_ids = np.array([e for e, _ in ep_max_start])
+        ep_weights = np.array([v for _, v in ep_max_start], dtype=np.float64)
         probs = ep_weights / ep_weights.sum()
         chosen_eps = rng.choice(ep_ids, size=n_chunks, p=probs)
-        # Group by episode so we read each parquet at most once.
-        valid_by_ep = dict(ep_starts)
-        ep_to_starts: dict[int, list[int]] = defaultdict(list)
+        valid_by_ep = dict(ep_max_start)
+        from collections import defaultdict as _dd
+
+        ep_to_starts: dict[int, list[int]] = _dd(list)
         for ep in chosen_eps:
             ep_int = int(ep)
             start = int(rng.integers(0, valid_by_ep[ep_int]))
             ep_to_starts[ep_int].append(start)
 
-        action_col = _resolve_native_action_key(cfg)
+        action_col = _resolve_native_action_key(cfg.repo_id, cfg.data_features_name_mapping)
         chunks: list[np.ndarray] = []
         for ep, starts in ep_to_starts.items():
             rel = meta.get_data_file_path(ep_index=ep)
@@ -349,90 +412,429 @@ def _sample_chunks_for_dataset(
             if not full.exists():
                 meta.pull_from_repo(allow_patterns=str(rel))
             try:
-                table = pq.read_table(full, columns=[action_col])
+                table = pq.read_table(full, columns=[action_col, "timestamp"])
             except Exception as e:  # noqa: BLE001
-                raise RuntimeError(f"Failed reading {action_col!r} column from {full}: {e}") from e
-            arr_list = table.column(action_col).to_pylist()
+                raise RuntimeError(f"Failed reading {full}: {e}") from e
             try:
-                actions = np.asarray(arr_list, dtype=np.float32)
+                native_actions = np.asarray(table.column(action_col).to_pylist(), dtype=np.float32)
+                native_timestamps = np.asarray(table.column("timestamp").to_pylist(), dtype=np.float64)
             except (ValueError, TypeError) as e:
-                raise RuntimeError(f"{full}: {action_col!r} column is not a uniform 2-D array: {e}") from e
-            if actions.ndim != 2:
-                raise RuntimeError(f"{full}: {action_col!r} ndim={actions.ndim}, expected 2")
+                raise RuntimeError(f"{full}: non-uniform column shape: {e}") from e
+            if native_actions.ndim != 2:
+                raise RuntimeError(f"{full}: {action_col!r} ndim={native_actions.ndim}, expected 2")
+            # Interpolator built once per parquet -- amortizes across all starts in this episode.
+            interp = interp1d(
+                native_timestamps,
+                native_actions,
+                axis=0,
+                kind="linear",
+                bounds_error=False,
+                fill_value=(native_actions[0], native_actions[-1]),
+                assume_sorted=True,
+            )
             for s in starts:
-                chunks.append(actions[s : s + chunk_size])
+                t0 = native_timestamps[s]
+                target_ts = t0 + np.arange(chunk_size) * target_dt
+                # Clamp to native range to avoid extrapolation surprises.
+                target_ts = np.clip(target_ts, native_timestamps[0], native_timestamps[-1])
+                chunks.append(interp(target_ts).astype(np.float32))
         return idx, chunks, None
     except Exception as e:  # noqa: BLE001
         return idx, [], f"{type(e).__name__}: {e}"
 
 
-def _normalize_and_pad(
-    chunks: list[np.ndarray],
-    action_min: np.ndarray,
-    action_max: np.ndarray,
+def _sample_via_manual(
+    mixture_cfg: DatasetMixtureConfig,
+    total_chunks: int,
+    chunk_size: int,
+    action_freq: float,
+    seed: int,
+    num_workers: int,
+) -> tuple[list[np.ndarray], list[int], dict[int, str]]:
+    """Parallel per-dataset sampling with FPS resampling. Returns
+    ``(chunks, per_dataset_counts, errors_by_idx)``."""
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    budgets = _compute_budgets_weighted(mixture_cfg, total_chunks)
+    logger.info(
+        "Manual sampler budgets: total=%d (target=%d), min=%d, max=%d",
+        sum(budgets),
+        total_chunks,
+        min(budgets),
+        max(budgets),
+    )
+    work = [
+        (i, cfg, budgets[i], chunk_size, action_freq, seed + i) for i, cfg in enumerate(mixture_cfg.datasets)
+    ]
+    chunks: list[np.ndarray] = []
+    per_ds_counts = [0] * len(mixture_cfg.datasets)
+    errors: dict[int, str] = {}
+    t0 = time.perf_counter()
+    last_log = t0
+    n_done = 0
+    with ProcessPoolExecutor(max_workers=num_workers) as ex:
+        futs = {ex.submit(_sample_chunks_for_dataset_manual, w): w[0] for w in work}
+        for fut in as_completed(futs):
+            idx, ds_chunks, err = fut.result()
+            if err:
+                errors[idx] = err
+                logger.warning("Dataset %d: %s", idx, err)
+            per_ds_counts[idx] = len(ds_chunks)
+            chunks.extend(ds_chunks)
+            n_done += 1
+            now = time.perf_counter()
+            if now - last_log > 10.0 or n_done == len(work):
+                logger.info(
+                    "Manual sample: %d/%d datasets done, %d chunks so far",
+                    n_done,
+                    len(work),
+                    len(chunks),
+                )
+                last_log = now
+    logger.info(
+        "Manual sampling done in %.1fs: %d chunks, %d ok, %d errors",
+        time.perf_counter() - t0,
+        len(chunks),
+        len(work) - len(errors),
+        len(errors),
+    )
+    return chunks, per_ds_counts, errors
+
+
+def _build_train_cfg(
+    mixture_cfg: DatasetMixtureConfig,
+    chunk_size: int,
     action_dim: int,
-) -> list[np.ndarray]:
-    """Min-max-normalize each chunk to ``[-1, 1]``; right-pad ``action_dim``.
+    max_state_dim: int,
+    dataloader_batch_size: int,
+    num_workers: int,
+) -> Any:
+    """Build a minimal ``TrainPipelineConfig`` good enough for
+    ``make_dataset_mixture``.
+
+    We use a ``SimpleNamespace`` policy stub: ``resolve_delta_timestamps`` only
+    reads ``policy.action_delta_indices`` (for action resampling) and
+    ``policy.history_interval`` via ``getattr`` (for state/camera history).
+    ``LeRobotDataset`` itself reads ``cfg.policy`` only inside ``ValueConfig``
+    branches and a single assertion that ``cfg.action_chunk == chunk_size``,
+    so a stub suffices. ``num_cams=0`` short-circuits the camera-loading path
+    in ``LeRobotDataset._standardize_images`` (verified at
+    ``lerobot_dataset.py:1868``), which is what makes this script CPU-cheap.
+    """
+    from opentau.configs.train import TrainPipelineConfig
+
+    # We only need action chunks for the tokenizer fit. Override mixture-side
+    # knobs that would otherwise force per-sample state-history loads and
+    # augmentation rolls (none of which affect the action column).
+    mixture_cfg.n_obs_history = None
+    mixture_cfg.history_state_drop_prob = 0.0
+    mixture_cfg.subgoal_drop_prob = 1.0  # drop all subgoals -- we don't read them
+    mixture_cfg.subgoal_end_of_segment_prob = 0.0
+    mixture_cfg.response_drop_prob = 1.0  # drop all responses
+    mixture_cfg.metadata_drop_all_prob = 1.0  # drop all metadata
+    mixture_cfg.metadata_drop_each_prob = 0.0
+    n_obs = 1  # forced above
+    fake_policy = SimpleNamespace(
+        action_delta_indices=list(range(chunk_size)),
+        history_interval=1,
+        n_obs_steps=n_obs,
+    )
+    cfg = TrainPipelineConfig(
+        dataset_mixture=mixture_cfg,
+        policy=fake_policy,
+        batch_size=dataloader_batch_size,
+        dataloader_batch_size=dataloader_batch_size,
+        gradient_accumulation_steps=1,
+        num_workers=num_workers,
+        action_chunk=chunk_size,
+        num_cams=0,
+        max_action_dim=action_dim,
+        max_state_dim=max_state_dim,
+        steps=1,
+        save_checkpoint=False,
+        use_policy_training_preset=False,
+        # output_dir is auto-set in __post_init__; we never write to it.
+    )
+    return cfg
+
+
+def _build_mixture_parallel(train_cfg: Any, num_workers: int) -> Any:
+    """Drop-in for ``make_dataset_mixture(cfg)`` with thread-parallel per-dataset construction.
+
+    ``make_dataset_mixture`` constructs each ``LeRobotDataset`` sequentially in a
+    Python for-loop. With ~400 datasets and per-dataset I/O of several seconds
+    (parquet scan + timestamp check), the sequential build can take 60+ min.
+    LeRobotDataset init is I/O-bound (pyarrow + HF datasets cache builds release
+    the GIL), so threading wins here even under the GIL. The resulting
+    ``WeightedDatasetMixture`` is byte-identical to the upstream one because we
+    preserve mixture-config ordering when collecting futures.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from opentau.datasets.dataset_mixture import WeightedDatasetMixture
+    from opentau.datasets.factory import _resolve_weights, _validate_metadata_requirements, make_dataset
+
+    dataset_cfgs = train_cfg.dataset_mixture.datasets
+    n = len(dataset_cfgs)
+    train_datasets: list[Any] = [None] * n
+    val_datasets: list[Any] = [None] * n
+    has_val = False
+    n_done = 0
+    last_log = time.perf_counter()
+
+    def _build_one(idx: int) -> tuple[int, Any]:
+        res = make_dataset(dataset_cfgs[idx], train_cfg, return_advantage_input=False)
+        return idx, res
+
+    with ThreadPoolExecutor(max_workers=num_workers) as ex:
+        futs = {ex.submit(_build_one, i): i for i in range(n)}
+        for fut in as_completed(futs):
+            idx, res = fut.result()
+            if isinstance(res, tuple):
+                train_datasets[idx] = res[0]
+                val_datasets[idx] = res[1]
+                has_val = True
+            else:
+                train_datasets[idx] = res
+            n_done += 1
+            now = time.perf_counter()
+            if now - last_log > 10.0 or n_done == n:
+                logger.info("Mixture build: %d/%d datasets ready", n_done, n)
+                last_log = now
+
+    _validate_metadata_requirements(train_cfg, train_datasets, label="train")
+    train_weights = _resolve_weights(train_cfg.dataset_mixture.weights, train_datasets, label="train")
+    mixture = WeightedDatasetMixture(
+        train_cfg,
+        train_datasets,
+        train_weights,
+        train_cfg.dataset_mixture.action_freq,
+    )
+    if has_val:
+        # We don't use val in this script, but maintain shape parity with
+        # make_dataset_mixture. val_split_ratio defaults to 0 in our cfg path
+        # so this branch is essentially dead.
+        _validate_metadata_requirements(train_cfg, val_datasets, label="val")
+    return mixture
+
+
+def _extract_action_stats(mixture_meta: Any, action_dim: int) -> tuple[np.ndarray, np.ndarray]:
+    """Pull mixture-aggregated ``action`` min/max (already padded to
+    ``max_action_dim`` and computed with NaN-tolerant aggregation by
+    ``DatasetMixtureMetadata``).
+
+    Dims that are ``NaN`` across the whole mixture fall back to ``[-1, 1]`` so
+    the normalization step never divides by zero.
+    """
+    action_stats = mixture_meta.stats.get("actions")
+    if action_stats is None:
+        raise RuntimeError(
+            f"Mixture meta is missing 'actions' stats. Available keys: {sorted(mixture_meta.stats or [])}"
+        )
+    action_min = np.asarray(action_stats["min"], dtype=np.float64).ravel()
+    action_max = np.asarray(action_stats["max"], dtype=np.float64).ravel()
+    if action_min.shape[0] < action_dim:
+        action_min = np.pad(
+            action_min,
+            (0, action_dim - action_min.shape[0]),
+            constant_values=np.nan,
+        )
+        action_max = np.pad(
+            action_max,
+            (0, action_dim - action_max.shape[0]),
+            constant_values=np.nan,
+        )
+    elif action_min.shape[0] > action_dim:
+        action_min = action_min[:action_dim]
+        action_max = action_max[:action_dim]
+    nan_dims = np.where(~np.isfinite(action_min) | ~np.isfinite(action_max))[0]
+    if nan_dims.size > 0:
+        logger.info(
+            "Dims with no stats anywhere in mixture: %s -- using [-1, 1] fallback.",
+            nan_dims.tolist(),
+        )
+        action_min[nan_dims] = -1.0
+        action_max[nan_dims] = 1.0
+    logger.info("Mixture-aggregated action_min: %s", np.round(action_min, 3).tolist())
+    logger.info("Mixture-aggregated action_max: %s", np.round(action_max, 3).tolist())
+    return action_min, action_max
+
+
+def _normalize_chunks(chunks: np.ndarray, action_min: np.ndarray, action_max: np.ndarray) -> np.ndarray:
+    """Min-max-normalize a stacked chunk tensor ``(N, T, D)`` to ``[-1, 1]``.
 
     Mirrors ``Normalize({"ACTION": NormalizationMode.MIN_MAX})`` in pi0.7's
-    ``modeling_pi07_low_level.py``. Padded slots and constant dims map to 0;
+    ``modeling_pi07_low_level.py``. Constant dims (``min == max``) map to 0;
     non-finite inputs map to 0 (the policy's ``prepare_discrete_actions``
-    does the same via ``torch.nan_to_num``).
+    applies the equivalent ``torch.nan_to_num``).
     """
     span = action_max - action_min
     safe_span = np.where(span > 0, span, 1.0)
-    out: list[np.ndarray] = []
-    for chunk in chunks:
-        n_steps, native_dim = chunk.shape
-        x = np.zeros((n_steps, action_dim), dtype=np.float32)
-        clip = min(native_dim, action_dim)
-        sub = np.nan_to_num(chunk[:, :clip].astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0)
-        norm = 2.0 * (sub - action_min[:clip]) / safe_span[:clip] - 1.0
-        zero_dims = np.where(span[:clip] <= 0)[0]
-        if zero_dims.size > 0:
-            norm[:, zero_dims] = 0.0
-        x[:, :clip] = np.clip(norm, -1.0, 1.0).astype(np.float32)
-        out.append(x)
-    return out
+    x = np.nan_to_num(chunks.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    norm = 2.0 * (x - action_min) / safe_span - 1.0
+    zero_dims = np.where(span <= 0)[0]
+    if zero_dims.size > 0:
+        norm[..., zero_dims] = 0.0
+    return np.clip(norm, -1.0, 1.0).astype(np.float32)
+
+
+def _drain_mixture(
+    mixture_meta: Any,
+    dataloader: Any,
+    total_chunks: int,
+    action_dim: int,
+) -> tuple[np.ndarray, int]:
+    """Iterate the WeightedDatasetMixture dataloader, normalize, collect chunks.
+
+    Returns ``(stacked_chunks_array (N, T, D), n_batches_consumed)``.
+    """
+    import torch
+
+    action_min, action_max = _extract_action_stats(mixture_meta, action_dim)
+
+    collected: list[np.ndarray] = []
+    n_collected = 0
+    n_batches = 0
+    t0 = time.perf_counter()
+    last_log = t0
+
+    for batch in dataloader:
+        actions = batch["actions"]
+        # ``.numpy()`` doesn't support bfloat16, so cast to float32 first.
+        actions = (
+            actions.detach().to(dtype=torch.float32, device="cpu").numpy()
+            if isinstance(actions, torch.Tensor)
+            else np.asarray(actions, dtype=np.float32)
+        )
+        # Expect shape (B, T, D); some pipelines may yield (B, T, D_native) padded
+        # later -- the WeightedDatasetMixture's standardization pipeline pads to
+        # max_action_dim, so D == action_dim here.
+        if actions.ndim != 3:
+            raise RuntimeError(f"Unexpected actions batch ndim={actions.ndim}, shape={actions.shape}")
+        normalized = _normalize_chunks(actions, action_min, action_max)
+        take = min(normalized.shape[0], total_chunks - n_collected)
+        collected.append(normalized[:take])
+        n_collected += take
+        n_batches += 1
+        if n_collected >= total_chunks:
+            break
+        now = time.perf_counter()
+        if now - last_log > 10.0:
+            rate = n_collected / max(1e-6, now - t0)
+            logger.info(
+                "Draining: %d / %d chunks (%.0f chunks/s, %d batches)",
+                n_collected,
+                total_chunks,
+                rate,
+                n_batches,
+            )
+            last_log = now
+
+    elapsed = time.perf_counter() - t0
+    stacked = np.concatenate(collected, axis=0) if collected else np.empty((0,))
+    logger.info(
+        "Drain done in %.1fs: %d chunks across %d batches (rate %.0f chunks/s)",
+        elapsed,
+        stacked.shape[0],
+        n_batches,
+        stacked.shape[0] / max(1e-6, elapsed),
+    )
+    return stacked, n_batches
 
 
 def _fit_tokenizer(
-    chunks: list[np.ndarray],
+    chunks: np.ndarray,
     vocab_size: int,
     scale: float,
     chunk_size: int,
     action_dim: int,
+    max_token_length: int,
 ) -> tuple[Any, float]:
-    """Fit a fresh ``UniversalActionProcessor`` via its classmethod ``fit``."""
-    from transformers import AutoProcessor
+    """Fit a fresh ``UniversalActionProcessor``, exposing the BpeTrainer's
+    ``max_token_length`` knob so we can cap runaway zero-run merges.
 
-    # We can't import the class as a Python module without adding the cached
-    # snapshot dir to sys.path; using AutoProcessor + type(...) is portable.
+    Mirrors ``UniversalActionProcessor.fit`` (cached at
+    ``physical-intelligence/fast/processing_action_tokenizer.py``) exactly,
+    except for the ``max_token_length`` value -- the upstream uses 10000,
+    which on heavily zero-padded action data wastes the BPE's entire merge
+    budget on one runaway zero-run token (verified empirically:
+    1855 merges, one each at lengths 2..1320, all zero-pad).
+    """
+    from scipy.fft import dct
+    from tokenizers import ByteLevelBPETokenizer
+    from tokenizers.trainers import BpeTrainer
+    from transformers import AutoProcessor, PreTrainedTokenizerFast
+
+    # Resolve the UniversalActionProcessor class via trust_remote_code.
     upstream = AutoProcessor.from_pretrained(UPSTREAM_REPO_ID, trust_remote_code=True)
     cls = type(upstream)
+
+    chunk_list = [chunks[i] for i in range(chunks.shape[0])]
     logger.info(
-        "Fitting %s on %d chunks (vocab=%d, scale=%g, chunk_size=%d, action_dim=%d)",
+        "Fitting %s on %d chunks (vocab=%d, scale=%g, chunk_size=%d, action_dim=%d, max_token_length=%d)",
         cls.__name__,
-        len(chunks),
+        len(chunk_list),
         vocab_size,
         scale,
         chunk_size,
         action_dim,
+        max_token_length,
     )
     t0 = time.perf_counter()
-    processor = cls.fit(
-        chunks,
+
+    # --- Replicate UniversalActionProcessor.fit body, parametrised. ---
+    dct_tokens = [dct(a, axis=0, norm="ortho").flatten() for a in chunk_list]
+    quantized = np.around(np.concatenate(dct_tokens) * scale)
+    max_token = int(quantized.max())
+    min_token = int(quantized.min())
+    min_vocab_size = max_token - min_token
+    if min_vocab_size > vocab_size:
+        raise ValueError(
+            f"Vocab size {vocab_size} is too small for the range of tokens "
+            f"{min_vocab_size}; bump --vocab-size."
+        )
+    if min_vocab_size + 100 > vocab_size:
+        logger.warning(
+            "Initial alphabet size %d is close to vocab size %d -- "
+            "consider increasing --vocab-size for more merge headroom.",
+            min_vocab_size,
+            vocab_size,
+        )
+
+    def _token_iter():
+        for tokens in dct_tokens:
+            rounded = np.around(tokens * scale) - min_token
+            rounded = rounded.astype(int)
+            yield "".join(map(chr, rounded))
+
+    alphabet = [chr(i) for i in range(max_token - min_token + 1)]
+    trainer = BpeTrainer(
         vocab_size=vocab_size,
+        min_frequency=2,
+        show_progress=True,
+        special_tokens=[],
+        initial_alphabet=alphabet,
+        max_token_length=max_token_length,
+    )
+    bpe = ByteLevelBPETokenizer()
+    bpe._tokenizer.train_from_iterator(_token_iter(), trainer=trainer)
+    processor = cls(
+        PreTrainedTokenizerFast(tokenizer_object=bpe, clean_up_tokenization_spaces=False),
         scale=scale,
+        vocab_size=vocab_size,
+        min_token=min_token,
         time_horizon=chunk_size,
         action_dim=action_dim,
     )
+    # --- end replicated body ---
+
     elapsed = time.perf_counter() - t0
     logger.info(
-        "BPE fit done in %.1fs (min_token=%s, vocab_size=%s)",
+        "BPE fit done in %.1fs (min_token=%s, vocab_size=%s, max_token_length=%d)",
         elapsed,
         getattr(processor, "min_token", "?"),
         getattr(processor, "vocab_size", "?"),
+        max_token_length,
     )
     return processor, elapsed
 
@@ -455,12 +857,12 @@ def _save_processor(processor: Any, out_dir: Path) -> None:
     logger.info("Saved tokenizer + remote-code source to %s", out_dir)
 
 
-def _verify_roundtrip(out_dir: Path, sample_chunks: list[np.ndarray]) -> dict[str, float]:
+def _verify_roundtrip(out_dir: Path, sample_chunks: np.ndarray) -> dict[str, float]:
     """Reload via ``AutoProcessor.from_pretrained`` and round-trip encode/decode."""
     from transformers import AutoProcessor
 
     rp = AutoProcessor.from_pretrained(str(out_dir), trust_remote_code=True)
-    arr = np.stack(sample_chunks).astype(np.float32)  # (N, T, D)
+    arr = sample_chunks.astype(np.float32)  # (N, T, D)
     tokens = rp(arr)
     decoded = rp.decode(tokens, time_horizon=arr.shape[1], action_dim=arr.shape[2])
     mse = float(np.mean((arr - decoded) ** 2))
@@ -490,6 +892,10 @@ def main() -> int:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    import torch
+
+    torch.manual_seed(args.seed)
+
     # --- Phase 1: parse mixture ---
     logger.info("Parsing mixture JSON: %s", args.mixture_json)
     mixture_cfg, mixture_hash = _parse_mixture(args.mixture_json)
@@ -500,82 +906,114 @@ def main() -> int:
         mixture_cfg.action_freq,
     )
 
-    # --- Phase 2: aggregate stats ---
-    action_min, action_max, per_dataset_info = _aggregate_stats(
-        mixture_cfg, args.action_dim, args.num_workers
-    )
-
-    # --- Phase 3: per-dataset budgets ---
-    budgets = _compute_budgets(
-        mixture_cfg,
-        args.total_chunks,
-        args.cap_per_dataset,
-        args.floor_per_dataset,
-    )
-    logger.info(
-        "Per-dataset budgets: total=%d (target=%d), min=%d, max=%d",
-        sum(budgets),
-        args.total_chunks,
-        min(budgets),
-        max(budgets),
-    )
-
-    # --- Phase 4: sample chunks ---
-    logger.info("Sampling chunks (workers=%d)", args.num_workers)
-    t_sample0 = time.perf_counter()
-    work = [
-        (i, cfg, budgets[i], args.chunk_size, args.seed + i) for i, cfg in enumerate(mixture_cfg.datasets)
-    ]
-    all_chunks: list[np.ndarray] = []
-    n_sampled_per_dataset = [0] * len(mixture_cfg.datasets)
+    # --- Phase 2: build mixture & gather chunks ---
+    build_time = 0.0
     sample_errors: dict[int, str] = {}
-    with ProcessPoolExecutor(max_workers=args.num_workers) as ex:
-        futs = {ex.submit(_sample_chunks_for_dataset, w): w[0] for w in work}
-        for k, fut in enumerate(as_completed(futs)):
-            idx, chunks, err = fut.result()
-            if err:
-                sample_errors[idx] = err
-                logger.warning("Dataset %d: %s", idx, err)
-            n_sampled_per_dataset[idx] = len(chunks)
-            all_chunks.extend(chunks)
-            if (k + 1) % 25 == 0 or (k + 1) == len(work):
-                logger.info(
-                    "Sampling: %d/%d datasets done, %d chunks so far",
-                    k + 1,
-                    len(work),
-                    len(all_chunks),
-                )
-    sample_time = time.perf_counter() - t_sample0
-    logger.info("Sampling done in %.1fs. Total raw chunks: %d", sample_time, len(all_chunks))
-    if not all_chunks:
-        raise RuntimeError("No chunks were sampled. Check warnings above.")
+    per_dataset_chunks: list[int] = [0] * len(mixture_cfg.datasets)
+    if args.use_mixture_dataloader:
+        # Slow path: full WeightedDatasetMixture dataloader.
+        logger.info(
+            "Building WeightedDatasetMixture (parallel-loading %d datasets, workers=%d)...",
+            len(mixture_cfg.datasets),
+            args.num_workers,
+        )
+        t_build0 = time.perf_counter()
+        train_cfg = _build_train_cfg(
+            mixture_cfg,
+            chunk_size=args.chunk_size,
+            action_dim=args.action_dim,
+            max_state_dim=args.max_state_dim,
+            dataloader_batch_size=args.dataloader_batch_size,
+            num_workers=args.num_workers,
+        )
+        mixture = _build_mixture_parallel(train_cfg, num_workers=args.num_workers)
+        build_time = time.perf_counter() - t_build0
+        logger.info("Mixture built in %.1fs", build_time)
 
-    # --- Phase 5: normalize + pad ---
-    t_norm0 = time.perf_counter()
-    all_chunks = _normalize_and_pad(all_chunks, action_min, action_max, args.action_dim)
-    norm_time = time.perf_counter() - t_norm0
-    logger.info("Normalized + padded %d chunks in %.1fs", len(all_chunks), norm_time)
+        logger.info(
+            "Draining %d chunks at batch_size=%d, num_workers=%d...",
+            args.total_chunks,
+            args.dataloader_batch_size,
+            args.num_workers,
+        )
+        t_drain0 = time.perf_counter()
+        dataloader = mixture.get_dataloader()
+        all_chunks, n_batches = _drain_mixture(mixture.meta, dataloader, args.total_chunks, args.action_dim)
+        drain_time = time.perf_counter() - t_drain0
+        logger.info(
+            "Collected %d chunks in %.1fs (%d batches)",
+            all_chunks.shape[0],
+            drain_time,
+            n_batches,
+        )
+        if all_chunks.shape[0] == 0:
+            raise RuntimeError("No chunks collected from dataloader. Check warnings above.")
+        # Use mixture-computed stats.
+        action_min, action_max = _extract_action_stats(mixture.meta, args.action_dim)
+    else:
+        # Fast path: aggregate stats manually, sample chunks per-dataset with
+        # scipy interp for FPS resampling.
+        action_min, action_max, _ = _aggregate_stats_manual(mixture_cfg, args.action_dim, args.num_workers)
+        logger.info("Global action_min: %s", np.round(action_min, 3).tolist())
+        logger.info("Global action_max: %s", np.round(action_max, 3).tolist())
+        t_drain0 = time.perf_counter()
+        raw_chunks, per_dataset_chunks, sample_errors = _sample_via_manual(
+            mixture_cfg,
+            args.total_chunks,
+            args.chunk_size,
+            float(mixture_cfg.action_freq),
+            args.seed,
+            args.num_workers,
+        )
+        if not raw_chunks:
+            raise RuntimeError("No chunks sampled. Check warnings above.")
+        # Pad each raw chunk to action_dim and normalize. Datasets with native
+        # action dim > action_dim get their extra dims silently dropped -- if
+        # the production policy uses max_action_dim < native, those dims are
+        # never used at inference, so they shouldn't appear in the BPE corpus.
+        max_native = max(c.shape[1] for c in raw_chunks)
+        if max_native > args.action_dim:
+            logger.warning(
+                "Truncating extra action dims: max native dim is %d > --action-dim %d. "
+                "Dims %d.. are silently dropped from the BPE corpus.",
+                max_native,
+                args.action_dim,
+                args.action_dim,
+            )
+        n_steps = args.chunk_size
+        dim = args.action_dim
+        stacked = np.zeros((len(raw_chunks), n_steps, dim), dtype=np.float32)
+        for i, c in enumerate(raw_chunks):
+            clip = min(c.shape[1], dim)
+            stacked[i, :, :clip] = c[:, :clip]
+        all_chunks = _normalize_chunks(stacked, action_min, action_max)
+        drain_time = time.perf_counter() - t_drain0
+        logger.info(
+            "Manual path: %d chunks normalized in %.1fs",
+            all_chunks.shape[0],
+            drain_time,
+        )
 
     fit_time = 0.0
     roundtrip: dict[str, float] | None = None
     if not args.skip_fit:
-        # --- Phase 6: fit ---
+        # --- Phase 4: fit ---
         processor, fit_time = _fit_tokenizer(
             all_chunks,
             args.vocab_size,
             args.scale,
             args.chunk_size,
             args.action_dim,
+            args.max_token_length,
         )
-        # --- Phase 7: save ---
+        # --- Phase 5: save ---
         _save_processor(processor, out_dir)
-        # --- Phase 8: verify ---
+        # --- Phase 6: verify ---
         rng = np.random.default_rng(args.seed + 1)
-        n_sample = min(256, len(all_chunks))
-        sample_idx = rng.choice(len(all_chunks), size=n_sample, replace=False)
-        roundtrip = _verify_roundtrip(out_dir, [all_chunks[i] for i in sample_idx])
+        n_sample = min(256, all_chunks.shape[0])
+        sample_idx = rng.choice(all_chunks.shape[0], size=n_sample, replace=False)
+        roundtrip = _verify_roundtrip(out_dir, all_chunks[sample_idx])
 
-    # --- Final report ---
     report: dict[str, Any] = {
         "mixture_json": str(args.mixture_json),
         "mixture_hash_sha256": mixture_hash,
@@ -585,23 +1023,26 @@ def main() -> int:
         "action_dim": args.action_dim,
         "vocab_size": args.vocab_size,
         "scale": args.scale,
+        "max_token_length": args.max_token_length,
         "seed": args.seed,
         "total_chunks_target": args.total_chunks,
-        "total_chunks_actual": len(all_chunks),
-        "cap_per_dataset": args.cap_per_dataset,
-        "floor_per_dataset": args.floor_per_dataset,
+        "total_chunks_actual": int(all_chunks.shape[0]),
+        "dataloader_batch_size": args.dataloader_batch_size,
+        "num_workers": args.num_workers,
+        "sampler": "mixture_dataloader" if args.use_mixture_dataloader else "manual_parquet_interp",
+        "per_dataset_chunks": per_dataset_chunks,
+        "sample_errors": sample_errors,
         "global_action_min": action_min.tolist(),
         "global_action_max": action_max.tolist(),
-        "per_dataset_chunks": n_sampled_per_dataset,
-        "sample_errors": sample_errors,
         "timings_seconds": {
-            "sample": sample_time,
-            "normalize": norm_time,
+            "build_mixture": build_time,
+            "drain": drain_time,
             "fit": fit_time,
         },
         "roundtrip": roundtrip,
         "pilot": args.pilot,
     }
+    _ = warnings  # silence unused import; kept for future hooks.
     report_path = out_dir / "fit_report.json"
     report_path.write_text(json.dumps(report, indent=2, default=str))
     logger.info("Wrote fit report to %s", report_path)
