@@ -214,9 +214,13 @@ class TestMixtureWeightedAggregate:
         assert agg["l1_loss"] == pytest.approx(0.25 * 4.0 + 0.75 * 8.0)
         assert agg["accuracy"] == pytest.approx(0.25 * 0.1 + 0.75 * 0.5)
 
-    def test_empty_trackers_returns_zeros(self):
-        agg = _mixture_weighted_aggregate({}, {})
-        assert agg == {"loss": 0.0, "mse_loss": 0.0, "ce_loss": 0.0, "l1_loss": 0.0, "accuracy": 0.0}
+    def test_empty_trackers_returns_empty_dict(self):
+        # Without any trackers the function has no way to know which metric
+        # keys the policy emits, so it returns an empty dict rather than a
+        # zeroed-out hardcoded key set. Caller (``train.py``) never invokes
+        # this with empty trackers in practice; the empty-input path is here
+        # only as a documented degenerate case.
+        assert _mixture_weighted_aggregate({}, {}) == {}
 
     def test_all_zero_weights_returns_zeros(self):
         trackers = {"a": _make_tracker(loss=1.0), "b": _make_tracker(loss=2.0)}
@@ -224,6 +228,36 @@ class TestMixtureWeightedAggregate:
         agg = _mixture_weighted_aggregate(trackers, weights)
         # Avoids div-by-zero; behaviour matches "no signal to average".
         assert agg["loss"] == 0.0
+
+    def test_aggregates_only_keys_present_on_trackers(self):
+        # Mirrors the production case where the policy returns only MSE+CE
+        # (every VLA policy except the value head). ``l1_loss``/``accuracy``
+        # meters are absent from the tracker, so the aggregate must not
+        # invent them.
+        def _make_partial_tracker(loss: float, mse: float, ce: float) -> MetricsTracker:
+            tracker = MetricsTracker(
+                batch_size=8,
+                metrics={
+                    "loss": AverageMeter("val_total_loss", ":.3f"),
+                    "mse_loss": AverageMeter("val_mse_loss", ":.3f"),
+                    "ce_loss": AverageMeter("val_ce_loss", ":.3f"),
+                },
+            )
+            tracker.loss = loss
+            tracker.mse_loss = mse
+            tracker.ce_loss = ce
+            return tracker
+
+        trackers = {
+            "a": _make_partial_tracker(loss=1.0, mse=2.0, ce=3.0),
+            "b": _make_partial_tracker(loss=5.0, mse=6.0, ce=7.0),
+        }
+        weights = {"a": 1.0, "b": 3.0}
+        agg = _mixture_weighted_aggregate(trackers, weights)
+        assert set(agg.keys()) == {"loss", "mse_loss", "ce_loss"}
+        assert agg["loss"] == pytest.approx(0.25 * 1.0 + 0.75 * 5.0)
+        assert agg["mse_loss"] == pytest.approx(0.25 * 2.0 + 0.75 * 6.0)
+        assert agg["ce_loss"] == pytest.approx(0.25 * 3.0 + 0.75 * 7.0)
 
 
 if __name__ == "__main__":

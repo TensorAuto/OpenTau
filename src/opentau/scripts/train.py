@@ -108,14 +108,23 @@ def update_policy(
     # This calls `torch.distributed.all_gather_into_tensor` under the hood, which is not so efficient.
     # We don't actually want to broadcast the gathered tensors to all processes, but only to the main process.
     # Nonetheless, we still do this for correctness, safety, and simplicity.
-    _first_loss_tensor = next(lt for lt in losses.values() if isinstance(lt, torch.Tensor))
-    zero = torch.tensor(0.0, device=_first_loss_tensor.device, dtype=_first_loss_tensor.dtype)
+    # ``L1`` and ``Accuracy`` are optional — only the value head currently returns
+    # them; the VLA policies (pi0/pi05/pi06/pi07) return only ``MSE`` and ``CE``.
+    # Gating the gather on ``key in losses`` keeps the collective count aligned
+    # across ranks because the keys returned by ``forward`` are determined by
+    # the policy class, which is identical on every rank.
     loss = accelerator.gather_for_metrics(loss).mean().item()
     mse_loss = accelerator.gather_for_metrics(losses["MSE"]).to(dtype=torch.float32).mean().item()
     ce_loss = accelerator.gather_for_metrics(losses["CE"]).to(dtype=torch.float32).mean().item()
-    l1_loss = accelerator.gather_for_metrics(losses.get("L1", zero)).to(dtype=torch.float32).mean().item()
+    l1_loss = (
+        accelerator.gather_for_metrics(losses["L1"]).to(dtype=torch.float32).mean().item()
+        if "L1" in losses
+        else None
+    )
     accuracy = (
-        accelerator.gather_for_metrics(losses.get("Accuracy", zero)).to(dtype=torch.float32).mean().item()
+        accelerator.gather_for_metrics(losses["Accuracy"]).to(dtype=torch.float32).mean().item()
+        if "Accuracy" in losses
+        else None
     )
     # This actually calls `.update` method of the `AverageMeter` class. This operation is not idempotent.
     # See MetricsTracker.__setattr__ for more details.
@@ -125,20 +134,22 @@ def update_policy(
         train_metrics.loss = loss
         train_metrics.mse_loss = mse_loss
         train_metrics.ce_loss = ce_loss
-        train_metrics.l1_loss = l1_loss
-        train_metrics.accuracy = accuracy
+        if l1_loss is not None:
+            if "l1_loss" not in train_metrics.metrics:
+                train_metrics.metrics["l1_loss"] = AverageMeter("l1_loss", ":.6f")
+            train_metrics.l1_loss = l1_loss
+        if accuracy is not None:
+            if "accuracy" not in train_metrics.metrics:
+                train_metrics.metrics["accuracy"] = AverageMeter("accuracy", ":.3f")
+            train_metrics.accuracy = accuracy
         train_metrics.lr = optimizer.param_groups[0]["lr"]
 
     return train_metrics
 
 
-_VAL_METRIC_KEYS: tuple[str, ...] = ("loss", "mse_loss", "ce_loss", "l1_loss", "accuracy")
-
-
 def _mixture_weighted_aggregate(
     per_dataset_trackers: dict[str, MetricsTracker],
     name_to_weight: dict[str, float],
-    metric_keys: tuple[str, ...] = _VAL_METRIC_KEYS,
 ) -> dict[str, float]:
     """Mixture-weighted average of per-dataset validation metrics.
 
@@ -149,17 +160,27 @@ def _mixture_weighted_aggregate(
     -- empty trackers, or all selected datasets have weight 0 -- every metric
     is returned as ``0.0``.
 
+    The aggregated metric keys are derived from the first tracker's meters.
+    All per-dataset trackers share the same meter set because they're all
+    populated by the same policy's ``forward`` (which deterministically
+    returns the same loss keys for every batch and every rank), so any
+    tracker's keys are representative.
+
     Args:
         per_dataset_trackers: One ``MetricsTracker`` per non-empty validation
             dataset, keyed by dataset name.
         name_to_weight: Mapping from dataset name to its mixture weight (need
             not be normalized; need not be a strict subset/superset of the
             tracker keys, but must contain every tracker key).
-        metric_keys: The metric attribute names to aggregate.
 
     Returns:
-        Dict mapping each ``metric_keys`` entry to its weighted average.
+        Dict mapping each metric name found on the trackers to its weighted
+        average. Empty when ``per_dataset_trackers`` is empty.
     """
+    if not per_dataset_trackers:
+        return {}
+    metric_keys = tuple(next(iter(per_dataset_trackers.values())).metrics.keys())
+
     weights = {name: name_to_weight[name] for name in per_dataset_trackers}
     total = sum(weights.values())
     if total <= 0:
@@ -520,13 +541,15 @@ def train(cfg: TrainPipelineConfig):
 
     policy.train()
 
-    # setup metrics tracker to average metrics over the logging interval
+    # setup metrics tracker to average metrics over the logging interval.
+    # ``l1_loss`` and ``accuracy`` are populated lazily in ``update_policy``
+    # iff the policy's ``forward`` returns ``"L1"`` / ``"Accuracy"`` (only the
+    # value head currently does); omitting them here keeps logs clean for VLA
+    # policies that don't emit those losses.
     train_metrics = {
         "loss": AverageMeter("total_loss", ":.6f"),
         "mse_loss": AverageMeter("mse_loss", ":.6f"),
         "ce_loss": AverageMeter("ce_loss", ":.6f"),
-        "l1_loss": AverageMeter("l1_loss", ":.6f"),
-        "accuracy": AverageMeter("accuracy", ":.3f"),
         "lr": AverageMeter("lr", ":0.1e"),
         "grad_norm": AverageMeter("grad_norm", ":.3f"),
     }
@@ -573,8 +596,10 @@ def train(cfg: TrainPipelineConfig):
             accelerator.log({"Training/Loss": log_dict["loss"]}, step=step)
             accelerator.log({"Training/MSE Loss": log_dict["mse_loss"]}, step=step)
             accelerator.log({"Training/CE Loss": log_dict["ce_loss"]}, step=step)
-            accelerator.log({"Training/L1 Loss": log_dict["l1_loss"]}, step=step)
-            accelerator.log({"Training/Accuracy": log_dict["accuracy"]}, step=step)
+            if "l1_loss" in train_tracker.metrics:
+                accelerator.log({"Training/L1 Loss": log_dict["l1_loss"]}, step=step)
+            if "accuracy" in train_tracker.metrics:
+                accelerator.log({"Training/Accuracy": log_dict["accuracy"]}, step=step)
             accelerator.log({"Training/Learning Rate": log_dict["lr"]}, step=step)
             accelerator.log({"Training/Grad Norm": log_dict["grad_norm"]}, step=step)
             accelerator.log({"Training/Num Samples": log_dict["samples"]}, step=step)
@@ -603,14 +628,15 @@ def train(cfg: TrainPipelineConfig):
             policy.eval()
 
             def _make_val_tracker(current_step: int = step) -> MetricsTracker:
+                # ``l1_loss`` and ``accuracy`` are populated lazily below iff the
+                # policy's ``forward`` returns ``"L1"`` / ``"Accuracy"``. See
+                # ``update_policy`` for the symmetric training-side pattern.
                 return MetricsTracker(
                     cfg.batch_size * accelerator.num_processes,
                     {
                         "loss": AverageMeter("val_total_loss", ":.6f"),
                         "mse_loss": AverageMeter("val_mse_loss", ":.6f"),
                         "ce_loss": AverageMeter("val_ce_loss", ":.6f"),
-                        "l1_loss": AverageMeter("val_l1_loss", ":.6f"),
-                        "accuracy": AverageMeter("val_accuracy", ":.3f"),
                     },
                     initial_step=current_step,
                 )
@@ -631,14 +657,9 @@ def train(cfg: TrainPipelineConfig):
                             + cfg.loss_weighting["CE"] * losses["CE"]
                         )
 
-                        # Gather and average metrics across processes
-                        _first_loss_tensor = next(
-                            lt for lt in losses.values() if isinstance(lt, torch.Tensor)
-                        )
-                        zero = torch.tensor(
-                            0.0, device=_first_loss_tensor.device, dtype=_first_loss_tensor.dtype
-                        )
-
+                        # Gather and average metrics across processes. ``L1`` /
+                        # ``Accuracy`` are optional — see ``update_policy`` for
+                        # the symmetric training-side gating rationale.
                         loss = accelerator.gather_for_metrics(loss).mean().item()
                         mse_loss = (
                             accelerator.gather_for_metrics(losses["MSE"])
@@ -650,24 +671,31 @@ def train(cfg: TrainPipelineConfig):
                             accelerator.gather_for_metrics(losses["CE"]).to(dtype=torch.float32).mean().item()
                         )
                         l1_loss = (
-                            accelerator.gather_for_metrics(losses.get("L1", zero))
-                            .to(dtype=torch.float32)
-                            .mean()
-                            .item()
+                            accelerator.gather_for_metrics(losses["L1"]).to(dtype=torch.float32).mean().item()
+                            if "L1" in losses
+                            else None
                         )
                         accuracy = (
-                            accelerator.gather_for_metrics(losses.get("Accuracy", zero))
+                            accelerator.gather_for_metrics(losses["Accuracy"])
                             .to(dtype=torch.float32)
                             .mean()
                             .item()
+                            if "Accuracy" in losses
+                            else None
                         )
 
                         if accelerator.is_main_process:
                             ds_tracker.loss = loss
                             ds_tracker.mse_loss = mse_loss
                             ds_tracker.ce_loss = ce_loss
-                            ds_tracker.l1_loss = l1_loss
-                            ds_tracker.accuracy = accuracy
+                            if l1_loss is not None:
+                                if "l1_loss" not in ds_tracker.metrics:
+                                    ds_tracker.metrics["l1_loss"] = AverageMeter("val_l1_loss", ":.6f")
+                                ds_tracker.l1_loss = l1_loss
+                            if accuracy is not None:
+                                if "accuracy" not in ds_tracker.metrics:
+                                    ds_tracker.metrics["accuracy"] = AverageMeter("val_accuracy", ":.3f")
+                                ds_tracker.accuracy = accuracy
 
             if accelerator.is_main_process:
                 for ds_name, ds_tracker in per_dataset_trackers.items():
@@ -676,8 +704,10 @@ def train(cfg: TrainPipelineConfig):
                     accelerator.log({f"Validation/{ds_name}/Loss": ds_dict["loss"]}, step=step)
                     accelerator.log({f"Validation/{ds_name}/MSE Loss": ds_dict["mse_loss"]}, step=step)
                     accelerator.log({f"Validation/{ds_name}/CE Loss": ds_dict["ce_loss"]}, step=step)
-                    accelerator.log({f"Validation/{ds_name}/L1 Loss": ds_dict["l1_loss"]}, step=step)
-                    accelerator.log({f"Validation/{ds_name}/Accuracy": ds_dict["accuracy"]}, step=step)
+                    if "l1_loss" in ds_tracker.metrics:
+                        accelerator.log({f"Validation/{ds_name}/L1 Loss": ds_dict["l1_loss"]}, step=step)
+                    if "accuracy" in ds_tracker.metrics:
+                        accelerator.log({f"Validation/{ds_name}/Accuracy": ds_dict["accuracy"]}, step=step)
 
                 # Mixture-weighted aggregate across the per-dataset trackers, so the
                 # overall scalar reflects the training mixture rather than being
@@ -690,8 +720,10 @@ def train(cfg: TrainPipelineConfig):
                 accelerator.log({"Validation/Loss": agg["loss"]}, step=step)
                 accelerator.log({"Validation/MSE Loss": agg["mse_loss"]}, step=step)
                 accelerator.log({"Validation/CE Loss": agg["ce_loss"]}, step=step)
-                accelerator.log({"Validation/L1 Loss": agg["l1_loss"]}, step=step)
-                accelerator.log({"Validation/Accuracy": agg["accuracy"]}, step=step)
+                if "l1_loss" in agg:
+                    accelerator.log({"Validation/L1 Loss": agg["l1_loss"]}, step=step)
+                if "accuracy" in agg:
+                    accelerator.log({"Validation/Accuracy": agg["accuracy"]}, step=step)
 
             # This barrier is probably necessary to ensure
             # other processes wait for the main process to finish saving
