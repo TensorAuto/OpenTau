@@ -47,6 +47,12 @@ from transformers import (
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
 
+from opentau.policies.pi07.ring_attention import (
+    gather_seq,
+    ring_attention_forward,
+    ring_world_size,
+)
+
 # Ensure the Gemma-v1 AdaRMS / gated-residual patches are live before we
 # construct an action expert. Import for side effects only.
 from opentau.utils import transformers_patch  # noqa: F401
@@ -129,13 +135,24 @@ class Gemma3WithExpertConfig(PretrainedConfig):
                 Defaults to a ~860M-parameter Gemma with AdaRMS enabled.
             freeze_vision_encoder: Freeze the SigLIP tower during training.
             train_expert_only: Only update the expert and its heads.
-            attention_implementation: "eager", "sdpa", or "fa2". "fa2" is not
-                implemented and falls back to eager with a warning. "sdpa"
-                dispatches to ``torch.nn.functional.scaled_dot_product_attention``;
-                see the per-layer note about Gemma 3's interleaved local/global
+            attention_implementation: "eager", "sdpa", "ring", or "fa2".
+                "fa2" is not implemented and falls back to eager with a
+                warning. "sdpa" dispatches to
+                ``torch.nn.functional.scaled_dot_product_attention``; see
+                the per-layer note about Gemma 3's interleaved local/global
                 pattern in ``forward()`` — π0.7 deliberately keeps the same
                 block-causal mask at every layer, so the SDPA call sees a
-                regular bool mask and takes the standard fused path.
+                regular bool mask and takes the standard fused path. "ring"
+                shards the sequence axis across the active distributed
+                process group and computes attention with paper-style ring
+                rotation + online softmax (see
+                ``opentau.policies.pi07.ring_attention``). The ring path
+                also subsumes per-layer activation rematerialisation — full
+                ``(S, S)`` attention scores are never stored, so the legacy
+                ``gradient_checkpointing`` flag is ignored under "ring". Use
+                "ring" only on the prefix forward pass (single-stream,
+                backbone-only); the action-expert suffix is short enough
+                that the path always falls back to SDPA there.
             load_pretrained_gemma3: Whether to pull pretrained Gemma 3 weights
                 from the Hub (only recommended when He-initializing the expert).
             discrete_action_vocab_size: FAST tokenizer vocab size.
@@ -284,10 +301,10 @@ class Gemma3WithExpertConfig(PretrainedConfig):
                 "`train_expert_only=False` (the high-level-planner default) when "
                 "`disable_action_expert=True`."
             )
-        if self.attention_implementation not in ["eager", "sdpa", "fa2"]:
+        if self.attention_implementation not in ["eager", "sdpa", "fa2", "ring"]:
             raise ValueError(
                 f"Wrong value provided for `attention_implementation` ({self.attention_implementation}). "
-                "Expected 'eager', 'sdpa', or 'fa2'."
+                "Expected 'eager', 'sdpa', 'ring', or 'fa2'."
             )
         if self.attention_implementation == "fa2":
             # fa2 has been considered but never implemented for pi07 because of
@@ -474,9 +491,18 @@ class InterleavedDecoderLayer(nn.Module):
         if fill_kv_cache:
             if n_cross_att_tokens is None:
                 raise ValueError("n_cross_att_tokens must be provided when fill_kv_cache is True")
+            # Under ring attention, k_concat / v_concat hold this rank's shard
+            # along the sequence axis. The cache feeds the (unsharded) suffix
+            # forward, so gather full K/V before storing. ``gather_seq`` is a
+            # no-op when the ring group has world size 1.
+            if ring_world_size() > 1:
+                k_full = gather_seq(k_concat, seq_dim=1)
+                v_full = gather_seq(v_concat, seq_dim=1)
+            else:
+                k_full, v_full = k_concat, v_concat
             past_key_values[layer_idx] = {
-                "key_states": k_concat[:, :n_cross_att_tokens, :, :],
-                "value_states": v_concat[:, :n_cross_att_tokens, :, :],
+                "key_states": k_full[:, :n_cross_att_tokens, :, :],
+                "value_states": v_full[:, :n_cross_att_tokens, :, :],
             }
 
         # π0.7 keeps the prefix block-causal mask at every layer — the
@@ -843,15 +869,71 @@ class Gemma3WithExpertModel(PreTrainedModel):
             layer (sliding window deliberately not enforced — see the comment
             near ``apply_rope``), so SDPA sees a regular bool mask and does
             not need a per-layer mask shape branch.
+          - ``"ring"``: paper-style ring attention — see
+            ``opentau.policies.pi07.ring_attention``. Each rank holds 1/W
+            of the sequence; K/V rotate around the ring while an online
+            softmax accumulates the output per rank. Falls back to SDPA
+            transparently when world size is 1.
           - ``"fa2"``: accepted for backward compatibility; falls back to
             eager with a warning emitted at config validation time.
         """
         impl = self.config.attention_implementation
         if impl == "sdpa":
             return self.sdpa_attention_forward
+        if impl == "ring":
+            # The model only enters the ring code path during the prefix
+            # forward (single-stream, fill_kv_cache=True). The suffix
+            # forward — short action-expert stream that cross-attends to
+            # the cached prefix K/V — still benefits from SDPA on full
+            # unsharded data. ``_ring_active`` is True only inside the
+            # sharded prefix forward (see Gemma3WithExpertModel.forward).
+            if getattr(self, "_ring_active", False):
+                return self.ring_attention_forward
+            return self.sdpa_attention_forward
         # "eager" and legacy "fa2" both land here; "fa2" already warned during
         # config construction.
         return self.eager_attention_forward
+
+    def ring_attention_forward(
+        self,
+        attention_mask: torch.Tensor,
+        batch_size: int,
+        head_dim: int,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        scaling: float | None = None,
+    ) -> torch.Tensor:
+        """Ring-attention interface adapter.
+
+        Bridges the existing ``(attention_mask, batch_size, head_dim, q, k, v,
+        scaling)`` per-layer call signature to the standalone
+        :func:`ring_attention_forward` in
+        ``opentau.policies.pi07.ring_attention``. The standalone function
+        needs to know the GQA head counts, which live on the text config
+        but aren't passed through the per-layer signature; this method
+        supplies them.
+
+        Q / K / V tensors are this rank's local shards when the top-level
+        :meth:`Gemma3WithExpertModel.forward` has sharded the inputs along
+        the sequence axis (the only configuration in which ``"ring"`` does
+        anything useful). When the ring group has world size 1 (single GPU
+        / eager tests) the underlying function transparently falls back to
+        SDPA on the full sequence.
+        """
+        num_attention_heads = self._text_config.num_attention_heads
+        num_key_value_heads = self._text_config.num_key_value_heads
+        return ring_attention_forward(
+            attention_mask,
+            batch_size,
+            head_dim,
+            query_states,
+            key_states,
+            value_states,
+            num_query_heads=num_attention_heads,
+            num_kv_heads=num_key_value_heads,
+            scaling=scaling,
+        )
 
     def eager_attention_forward(
         self,
@@ -1060,7 +1142,58 @@ class Gemma3WithExpertModel(PreTrainedModel):
         if fill_kv_cache and past_key_values is None:
             past_key_values = {}
 
-        use_ckpt = self.config.gradient_checkpointing and self.training
+        # Ring attention sharding. Active when the user opted in via the config
+        # and we are running in a multi-rank group AND the call is a
+        # single-stream prefix forward — the expert-suffix forward is short
+        # enough that ring's per-rank fixed costs outweigh its memory savings,
+        # so it transparently routes through SDPA via the get_attention_interface
+        # branch on ``self._ring_active`` below.
+        ring_active = (
+            self.config.attention_implementation == "ring"
+            and ring_world_size() > 1
+            and inputs_embeds[1] is None
+        )
+        # The single-stream prefix forward holds the (long) backbone shard
+        # only; ``inputs_embeds[0]`` is therefore the tensor to shard.
+        ring_pad_len = 0
+        ring_original_seq_len = 0
+        if ring_active:
+            ws = ring_world_size()
+            backbone_embs = inputs_embeds[0]
+            ring_original_seq_len = backbone_embs.shape[1]
+            ring_pad_len = (-ring_original_seq_len) % ws
+            if ring_pad_len > 0:
+                # Pad inputs_embeds, attention_mask, position_ids to a multiple
+                # of world_size. attention_mask: False entries along both
+                # padded Q and K rows so padding contributes nothing to the
+                # softmax. position_ids: replicate the last valid id so RoPE
+                # on padded slots produces a finite (ignored) rotation.
+                pad_emb = nn.functional.pad(backbone_embs, (0, 0, 0, ring_pad_len))
+                inputs_embeds = [pad_emb, None]
+                attention_mask = nn.functional.pad(
+                    attention_mask, (0, ring_pad_len, 0, ring_pad_len), value=False
+                )
+                last_pos = position_ids[:, -1:].expand(-1, ring_pad_len)
+                position_ids = torch.cat([position_ids, last_pos], dim=1)
+            # Shard inputs along the sequence axis. The attention mask stays
+            # replicated on every rank (it's small relative to activations)
+            # and ring_attention_forward slices it internally per ring step.
+            from opentau.policies.pi07.ring_attention import split_seq
+
+            shard = split_seq(inputs_embeds[0], seq_dim=1)
+            inputs_embeds = [shard, None]
+            position_ids = split_seq(position_ids, seq_dim=1)
+
+        # Tell the per-layer attention dispatch which branch to take. Layers
+        # capture ``get_attention_interface`` lazily on every call, so this
+        # flag is honoured by every layer in the loop below.
+        self._ring_active = ring_active
+
+        # Per-layer ``torch.utils.checkpoint`` is redundant under ring: the
+        # ring attention kernel already does blockwise rematerialisation
+        # (Section 3.2.2 of the paper) — full (Q, K) score matrices are
+        # never stored across the forward → backward boundary on any rank.
+        use_ckpt = self.config.gradient_checkpointing and self.training and not ring_active
         for layer_idx, layer in enumerate(self.interleaved_layers):
             if use_ckpt:
                 # use_reentrant=False is the modern, DDP-safe path; it
@@ -1098,7 +1231,9 @@ class Gemma3WithExpertModel(PreTrainedModel):
                     layer_idx,
                 )
 
-        # Final norms.
+        # Final norms. RMSNorm is per-token so it commutes with sequence
+        # sharding — we apply it on the per-rank shards and gather *after*
+        # to minimise communicated bytes.
         final_outputs: list[torch.Tensor | None] = []
         for stream_idx, hidden_states in enumerate(inputs_embeds):
             if hidden_states is None:
@@ -1109,6 +1244,21 @@ class Gemma3WithExpertModel(PreTrainedModel):
             else:
                 out, _ = expert_norm(hidden_states, cond=adarms_cond[stream_idx])
                 final_outputs.append(out)
+
+        # Gather the backbone stream back to the full sequence length when
+        # we sharded at the top, and strip any padding we added to make the
+        # length divisible by world size. Callers see the same shape /
+        # semantics as the non-ring path.
+        if ring_active:
+            assert final_outputs[0] is not None
+            gathered = gather_seq(final_outputs[0], seq_dim=1)
+            if ring_pad_len > 0:
+                gathered = gathered[:, :ring_original_seq_len]
+            final_outputs[0] = gathered
+        # Clear the flag so subsequent (unsharded) forwards — e.g. the suffix
+        # forward in low-level training — see ``_ring_active=False`` and
+        # take the SDPA branch in ``get_attention_interface``.
+        self._ring_active = False
 
         return final_outputs, past_key_values
 
