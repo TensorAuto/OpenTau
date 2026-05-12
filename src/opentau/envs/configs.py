@@ -19,7 +19,7 @@ import abc
 import logging
 from copy import copy
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, get_args
 
 import draccus
 
@@ -27,7 +27,11 @@ from opentau.configs.types import FeatureType, PolicyFeature
 from opentau.constants import ACTION, OBS_IMAGES, OBS_STATE
 from opentau.utils.accelerate_utils import get_proc_accelerator
 
-CONTROL_MODE_CHOICES = ("joint", "ee")
+# Single source of truth for the ``control_mode`` enum: the type alias is
+# used in the dataclass annotation, the runtime tuple is derived from it
+# via ``get_args`` so the two can't drift if a new mode is ever added.
+ControlMode = Literal["joint", "ee"]
+CONTROL_MODE_CHOICES: tuple[str, ...] = get_args(ControlMode)
 # Training-side bucket size for ``speed_raw`` in seconds. Must stay in
 # lockstep with the divisor used by ``BaseDataset._emit_optional_keys``
 # (currently a literal ``10`` inside the ``round(duration_s / N) * N``
@@ -74,7 +78,7 @@ class EnvMetadataConfig:
     quality: int | None = None
     mistake: bool | None = None
     robot_type: str | None = None
-    control_mode: Literal["joint", "ee"] | None = None
+    control_mode: ControlMode | None = None
 
     def __post_init__(self) -> None:
         # `isinstance(x, bool)` guards exclude Python bools — `bool` is a
