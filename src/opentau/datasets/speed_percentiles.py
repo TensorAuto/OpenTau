@@ -20,9 +20,11 @@ lower bucket labels (= "faster"); longer episodes get higher labels.
 
 The 10 percentile boundaries (p5, p15, ..., p95) per task are persisted
 to ``meta/speed_percentiles.jsonl`` so the compute happens at most once
-per dataset on disk. Existence of the file is the sole gate — staleness
-(after ``meta/episodes.jsonl`` is appended to) is accepted; delete the
-file to force a recompute.
+per dataset on disk. Existence of the file is the sole gate; staleness
+(after ``meta/episodes.jsonl`` is appended to) is detected by comparing
+the on-disk per-task ``n_episodes`` total against the current load — a
+mismatch logs a WARNING but the file is still trusted (delete it to
+force recompute).
 
 Tasks with fewer than ``MIN_EPISODES_FOR_PERCENTILES`` *distinct*
 episode lengths are written with ``"percentiles": null`` and bucket
@@ -34,12 +36,14 @@ distributions in one rule.
 from __future__ import annotations
 
 import logging
+import os
 from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 
 from opentau.datasets.utils import load_jsonlines, write_jsonlines
+from opentau.utils.accelerate_utils import get_proc_accelerator
 
 # Boundary percentiles, ascending. Length 10 by design: 11 buckets.
 SPEED_PERCENTILES: tuple[int, ...] = (5, 15, 25, 35, 45, 55, 65, 75, 85, 95)
@@ -58,7 +62,8 @@ SPARSE_TASK_BUCKET = 50
 
 # Module-level set of dataset roots for which we've already warned about a
 # read-only meta/ directory. Suppresses log spam when many datasets in a
-# mixture share the same read-only HF snapshot.
+# mixture share the same read-only HF snapshot. Mirrors the
+# ``_CONTROL_MODE_WARNED`` pattern in ``lerobot_dataset.py``.
 _READONLY_WARNED: set[str] = set()
 
 
@@ -115,37 +120,94 @@ def bucket_episode_length(length: int, percentiles: list[float] | None) -> int:
     return SPEED_BUCKET_LABELS[idx]
 
 
-def _episode_lengths_per_task(
+def _group_lengths_by_task(
+    episode_lengths: dict[int, int],
+    episode_to_task_index: dict[int, int],
+) -> dict[int, list[int]]:
+    """Group ``episode_lengths`` values by their ``episode_to_task_index`` key."""
+    by_task: dict[int, list[int]] = defaultdict(list)
+    for ep_idx, task_idx in episode_to_task_index.items():
+        by_task[task_idx].append(episode_lengths[ep_idx])
+    return dict(by_task)
+
+
+def episode_to_task_index_from_episodes(
     episodes: dict[int, dict],
     task_to_task_index: dict[str, int],
-) -> dict[int, list[int]]:
-    """Group episode lengths by task_index.
+) -> dict[int, int]:
+    """Build ``{ep_idx: task_idx}`` from ``meta/episodes.jsonl`` entries.
 
     Episodes whose ``tasks`` field is a multi-element list silently use
     ``tasks[0]`` — the codebase assumes an N-to-1 episode-to-task
-    relationship even though the field is structurally a list.
+    relationship even though the field is structurally a list. Episodes
+    with an empty / missing ``tasks`` list are skipped.
     """
-    by_task: dict[int, list[int]] = defaultdict(list)
-    for ep_info in episodes.values():
+    out: dict[int, int] = {}
+    for ep_idx, ep_info in episodes.items():
         tasks = ep_info.get("tasks") or []
         if not tasks:
             continue
-        task_idx = task_to_task_index[tasks[0]]
-        by_task[task_idx].append(int(ep_info["length"]))
-    return dict(by_task)
+        out[ep_idx] = task_to_task_index[tasks[0]]
+    return out
+
+
+def _atomic_write_jsonlines(rows: list[dict], path: Path) -> None:
+    """Write ``rows`` to ``path`` atomically via tmp file + ``os.replace``.
+
+    Defends against partial-write corruption when two processes (e.g.
+    parallel training jobs sharing one dataset, or a stale ``__init__``
+    overlapping a fresh one) race on the same file. Within a single
+    distributed run we additionally rank-gate the write (see
+    :func:`load_or_compute_speed_percentiles`); the atomic rename is the
+    fallback for cases where rank-gating doesn't apply.
+    """
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    write_jsonlines(rows, tmp_path)
+    os.replace(tmp_path, path)
+
+
+def _read_persisted(path: Path, current_total: int) -> dict[int, list[float] | None]:
+    """Load the percentile file and warn if its episode total is stale.
+
+    A mismatch between the sum of on-disk ``n_episodes`` and the current
+    load's episode total means episodes were added (or filtered) since
+    the file was first written. Per spec the file is still trusted —
+    the warning is just to cut debugging time when a small-N first run
+    accidentally freezes the percentile distribution.
+    """
+    rows = load_jsonlines(path)
+    on_disk_total = sum(int(row.get("n_episodes", 0)) for row in rows)
+    if on_disk_total != current_total:
+        logging.warning(
+            "Stale %s: on-disk per-task n_episodes sums to %d, current load has %d. "
+            "Using on-disk percentiles as-is; delete the file to force recompute.",
+            path,
+            on_disk_total,
+            current_total,
+        )
+    return {int(row["task_index"]): row["percentiles"] for row in rows}
 
 
 def load_or_compute_speed_percentiles(
     root: Path,
-    episodes: dict[int, dict],
+    episode_lengths: dict[int, int],
+    episode_to_task_index: dict[int, int],
     task_to_task_index: dict[str, int],
 ) -> dict[int, list[float] | None]:
     """Return per-task percentile lookup for the dataset rooted at ``root``.
 
     If ``root / meta/speed_percentiles.jsonl`` already exists, load it
-    verbatim — staleness is accepted by design (delete the file to force
-    a recompute). Otherwise compute the percentiles from ``episodes`` and
+    verbatim — staleness is accepted by design (a WARNING is logged when
+    the on-disk per-task ``n_episodes`` total disagrees with the current
+    load, but the file is still trusted; delete it to force a recompute).
+    Otherwise compute the percentiles from ``episode_lengths`` and
     persist the file.
+
+    Distributed-safe: only the main process writes; other ranks block on
+    ``Accelerator.wait_for_everyone()`` until the file appears, then read
+    it. The write itself is atomic (tmp file + ``os.replace``) so two
+    independent processes (e.g. concurrent training jobs sharing a
+    dataset root) can't corrupt each other's output.
 
     Persistence schema (one line per task)::
 
@@ -155,14 +217,19 @@ def load_or_compute_speed_percentiles(
          "n_episodes": 2, "percentiles": null}
 
     On read-only roots (write raises ``OSError`` / ``PermissionError``)
-    the dict is still returned in-memory and a warning is logged once
+    the in-memory dict is still returned and a warning is logged once
     per root.
 
     Args:
         root: Dataset root directory (the parent of ``meta/``).
-        episodes: ``LeRobotDatasetMetadata.episodes``: ``{ep_idx: ep_info}``.
-        task_to_task_index: ``LeRobotDatasetMetadata.task_to_task_index``:
-            ``{task_string: task_index}``.
+        episode_lengths: ``{ep_idx: length_in_frames}`` — typically
+            ``LeRobotDataset.episode_lengths`` so the percentile compute
+            and the per-episode bucket pre-fill share one source.
+        episode_to_task_index: ``{ep_idx: task_idx}`` — typically built
+            via :func:`episode_to_task_index_from_episodes`.
+        task_to_task_index: ``{task_string: task_index}`` — used only to
+            denormalize the task string into each row for human
+            inspection.
 
     Returns:
         Dict mapping ``task_index`` to its 10 percentile boundaries (or
@@ -170,13 +237,13 @@ def load_or_compute_speed_percentiles(
         :func:`bucket_episode_length`.
     """
     path = Path(root) / SPEED_PERCENTILES_PATH
-    by_task = _episode_lengths_per_task(episodes, task_to_task_index)
-    index_to_task = {idx: task for task, idx in task_to_task_index.items()}
+    by_task = _group_lengths_by_task(episode_lengths, episode_to_task_index)
+    current_total = sum(len(v) for v in by_task.values())
 
     if path.is_file():
-        rows = load_jsonlines(path)
-        return {int(row["task_index"]): row["percentiles"] for row in rows}
+        return _read_persisted(path, current_total)
 
+    index_to_task = {idx: task for task, idx in task_to_task_index.items()}
     percentiles = compute_task_percentiles(by_task)
     rows = [
         {
@@ -187,17 +254,24 @@ def load_or_compute_speed_percentiles(
         }
         for task_idx in sorted(percentiles)
     ]
-    try:
-        write_jsonlines(rows, path)
-    except (OSError, PermissionError) as e:
-        root_key = str(root)
-        if root_key not in _READONLY_WARNED:
-            _READONLY_WARNED.add(root_key)
-            logging.warning(
-                "Could not write speed percentiles to %s (%s); using in-memory "
-                "values for this run. The compute will repeat on every load until "
-                "the file can be written.",
-                path,
-                e,
-            )
+
+    acc = get_proc_accelerator()
+    distributed = acc is not None and acc.num_processes > 1
+    should_write = (not distributed) or acc.is_main_process
+    if should_write:
+        try:
+            _atomic_write_jsonlines(rows, path)
+        except (OSError, PermissionError) as e:
+            root_key = str(root)
+            if root_key not in _READONLY_WARNED:
+                _READONLY_WARNED.add(root_key)
+                logging.warning(
+                    "Could not write speed percentiles to %s (%s); using in-memory "
+                    "values for this run. The compute will repeat on every load until "
+                    "the file can be written.",
+                    path,
+                    e,
+                )
+    if distributed:
+        acc.wait_for_everyone()
     return percentiles

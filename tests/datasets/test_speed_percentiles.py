@@ -13,9 +13,10 @@
 # limitations under the License.
 """Tests for the per-task percentile bucketing in :mod:`opentau.datasets.speed_percentiles`.
 
-Pin the ranking semantics, the sparse-task fallback, and the on-disk
-persistence contract so future edits to the formula or the JSONL schema
-can't silently change `speed_raw` distributions.
+Pin the ranking semantics, the sparse-task fallback, the on-disk
+persistence contract, and the distributed-write safety so future edits
+to the formula or the JSONL schema can't silently change `speed_raw`
+distributions.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from __future__ import annotations
 import contextlib
 import os
 import stat
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -34,24 +36,29 @@ from opentau.datasets.speed_percentiles import (
     SPEED_PERCENTILES_PATH,
     bucket_episode_length,
     compute_task_percentiles,
+    episode_to_task_index_from_episodes,
     load_or_compute_speed_percentiles,
 )
-from opentau.datasets.utils import load_jsonlines
+from opentau.datasets.utils import load_jsonlines, write_jsonlines
 
 
-def _episodes(task_to_lengths: dict[str, list[int]]) -> dict[int, dict]:
-    """Build a `meta.episodes`-shaped dict from a `{task: [lengths]}` map."""
-    out: dict[int, dict] = {}
+def _fake_meta(task_to_lengths: dict[str, list[int]]):
+    """Build the inputs the loader expects from a `{task: [lengths]}` map.
+
+    Returns ``(episode_lengths, episode_to_task_index, task_to_task_index)``
+    — the same triple a real ``LeRobotDataset.__init__`` would assemble.
+    """
+    episode_lengths: dict[int, int] = {}
+    episodes: dict[int, dict] = {}
+    task_to_task_index = {task: i for i, task in enumerate(task_to_lengths)}
     next_ep = 0
     for task, lengths in task_to_lengths.items():
         for length in lengths:
-            out[next_ep] = {"episode_index": next_ep, "tasks": [task], "length": length}
+            episode_lengths[next_ep] = length
+            episodes[next_ep] = {"episode_index": next_ep, "tasks": [task], "length": length}
             next_ep += 1
-    return out
-
-
-def _task_index(task_to_lengths: dict[str, list[int]]) -> dict[str, int]:
-    return {task: i for i, task in enumerate(task_to_lengths)}
+    e2t = episode_to_task_index_from_episodes(episodes, task_to_task_index)
+    return episode_lengths, e2t, task_to_task_index
 
 
 class TestComputeTaskPercentiles:
@@ -94,6 +101,30 @@ class TestComputeTaskPercentiles:
         assert out[0] is not None
         assert out[1] is None
         assert out[2] is None
+
+
+class TestEpisodeToTaskIndex:
+    def test_single_task_episodes(self):
+        episodes = {
+            0: {"tasks": ["taskA"], "length": 100},
+            1: {"tasks": ["taskB"], "length": 200},
+        }
+        t2i = {"taskA": 0, "taskB": 1}
+        assert episode_to_task_index_from_episodes(episodes, t2i) == {0: 0, 1: 1}
+
+    def test_multi_task_uses_first(self):
+        episodes = {0: {"tasks": ["taskA", "taskB"], "length": 100}}
+        t2i = {"taskA": 0, "taskB": 1}
+        assert episode_to_task_index_from_episodes(episodes, t2i) == {0: 0}
+
+    def test_empty_tasks_skipped(self):
+        episodes = {
+            0: {"tasks": [], "length": 100},
+            1: {"length": 200},
+            2: {"tasks": ["taskA"], "length": 300},
+        }
+        t2i = {"taskA": 0}
+        assert episode_to_task_index_from_episodes(episodes, t2i) == {2: 0}
 
 
 class TestBucketEpisodeLength:
@@ -154,11 +185,8 @@ class TestBucketEpisodeLength:
 
 class TestLoadOrComputeSpeedPercentiles:
     def test_writes_file_when_absent(self, tmp_path):
-        task_to_lengths = {"taskA": list(range(100, 200))}
-        episodes = _episodes(task_to_lengths)
-        t2i = _task_index(task_to_lengths)
-
-        out = load_or_compute_speed_percentiles(tmp_path, episodes, t2i)
+        el, e2t, t2i = _fake_meta({"taskA": list(range(100, 200))})
+        out = load_or_compute_speed_percentiles(tmp_path, el, e2t, t2i)
         path = tmp_path / SPEED_PERCENTILES_PATH
         assert path.is_file()
         assert out[0] is not None and len(out[0]) == 10
@@ -175,46 +203,38 @@ class TestLoadOrComputeSpeedPercentiles:
         # never produce — proves we read it without re-computing.
         path = tmp_path / SPEED_PERCENTILES_PATH
         path.parent.mkdir(parents=True, exist_ok=True)
-        from opentau.datasets.utils import write_jsonlines
-
         write_jsonlines(
             [
                 {
                     "task_index": 0,
                     "task": "taskA",
-                    "n_episodes": 999,
+                    "n_episodes": 1000,
                     "percentiles": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
                 }
             ],
             path,
         )
 
-        # Episodes that would naturally yield very different percentiles.
-        task_to_lengths = {"taskA": list(range(1000, 2000))}
-        out = load_or_compute_speed_percentiles(
-            tmp_path, _episodes(task_to_lengths), _task_index(task_to_lengths)
-        )
+        # Episodes that match n_episodes exactly so no stale-warning fires.
+        el, e2t, t2i = _fake_meta({"taskA": list(range(1000, 2000))})
+        out = load_or_compute_speed_percentiles(tmp_path, el, e2t, t2i)
         # The hand-written percentiles are returned, not what compute
         # would have produced from the episodes.
         assert out[0] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
 
     def test_round_trip_preserves_buckets(self, tmp_path):
-        task_to_lengths = {"taskA": list(range(100, 200))}
-        episodes = _episodes(task_to_lengths)
-        t2i = _task_index(task_to_lengths)
+        el, e2t, t2i = _fake_meta({"taskA": list(range(100, 200))})
 
-        first = load_or_compute_speed_percentiles(tmp_path, episodes, t2i)
+        first = load_or_compute_speed_percentiles(tmp_path, el, e2t, t2i)
         # Second call hits the file path.
-        second = load_or_compute_speed_percentiles(tmp_path, episodes, t2i)
+        second = load_or_compute_speed_percentiles(tmp_path, el, e2t, t2i)
 
         for length in (50, 100, 150, 175, 200, 250):
             assert bucket_episode_length(length, first[0]) == bucket_episode_length(length, second[0])
 
     def test_sparse_task_persisted_with_null_percentiles(self, tmp_path):
-        task_to_lengths = {"taskA": [42]}
-        out = load_or_compute_speed_percentiles(
-            tmp_path, _episodes(task_to_lengths), _task_index(task_to_lengths)
-        )
+        el, e2t, t2i = _fake_meta({"taskA": [42]})
+        out = load_or_compute_speed_percentiles(tmp_path, el, e2t, t2i)
         assert out[0] is None
 
         rows = load_jsonlines(tmp_path / SPEED_PERCENTILES_PATH)
@@ -223,26 +243,59 @@ class TestLoadOrComputeSpeedPercentiles:
         assert rows[0]["percentiles"] is None
 
         # Reload reproduces the None.
-        out2 = load_or_compute_speed_percentiles(
-            tmp_path, _episodes(task_to_lengths), _task_index(task_to_lengths)
-        )
+        out2 = load_or_compute_speed_percentiles(tmp_path, el, e2t, t2i)
         assert out2[0] is None
         # And the bucket lookup falls back to SPARSE_TASK_BUCKET.
         assert bucket_episode_length(42, out2[0]) == SPARSE_TASK_BUCKET
 
-    def test_multi_task_episode_uses_first_task(self, tmp_path):
-        # Episodes whose `tasks` list has >1 entry silently use tasks[0].
-        episodes = {
-            0: {"episode_index": 0, "tasks": ["taskA", "taskB"], "length": 100},
-            1: {"episode_index": 1, "tasks": ["taskA"], "length": 200},
-        }
-        t2i = {"taskA": 0, "taskB": 1}
-        # No raise.
-        out = load_or_compute_speed_percentiles(tmp_path, episodes, t2i)
-        # taskA got both episodes (sparse, n=2 distinct → None).
-        # taskB got none and is therefore absent from the result.
-        assert 0 in out and out[0] is None
-        assert 1 not in out
+    def test_stale_file_logs_warning_but_still_used(self, tmp_path, caplog):
+        # First write: 100 episodes for taskA.
+        el, e2t, t2i = _fake_meta({"taskA": list(range(100, 200))})
+        load_or_compute_speed_percentiles(tmp_path, el, e2t, t2i)
+
+        # Second load with a different episode count — file should still
+        # be used, but a WARNING fires.
+        el2, e2t2, t2i2 = _fake_meta({"taskA": list(range(100, 250))})  # 150 episodes
+        with caplog.at_level("WARNING"):
+            out = load_or_compute_speed_percentiles(tmp_path, el2, e2t2, t2i2)
+        assert out[0] is not None
+        assert any("Stale" in rec.message and "speed_percentiles" in rec.message for rec in caplog.records), [
+            rec.message for rec in caplog.records
+        ]
+
+    def test_no_stale_warning_when_totals_match(self, tmp_path, caplog):
+        el, e2t, t2i = _fake_meta({"taskA": list(range(100, 200))})
+        load_or_compute_speed_percentiles(tmp_path, el, e2t, t2i)
+        with caplog.at_level("WARNING"):
+            load_or_compute_speed_percentiles(tmp_path, el, e2t, t2i)
+        assert not any("Stale" in rec.message for rec in caplog.records)
+
+    def test_concurrent_writes_produce_valid_file(self, tmp_path):
+        # Two threads racing on the same root must not corrupt the file.
+        # Atomic write (tmp + os.replace) is what makes this safe outside
+        # of the rank-gated path.
+        el, e2t, t2i = _fake_meta({"taskA": list(range(100, 200))})
+
+        def worker():
+            return load_or_compute_speed_percentiles(tmp_path, el, e2t, t2i)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(lambda _: worker(), range(8)))
+
+        # All workers must agree on the percentiles.
+        first = results[0][0]
+        for r in results[1:]:
+            assert r[0] == first
+
+        # The on-disk file must be parseable and complete.
+        rows = load_jsonlines(tmp_path / SPEED_PERCENTILES_PATH)
+        assert len(rows) == 1
+        assert rows[0]["task_index"] == 0
+        assert rows[0]["n_episodes"] == 100
+        assert rows[0]["percentiles"] == first
+
+        # And no leftover .tmp file.
+        assert not (tmp_path / "meta" / "speed_percentiles.jsonl.tmp").exists()
 
     def test_falls_back_to_in_memory_on_readonly_root(self, tmp_path, caplog, monkeypatch):
         # Make the meta/ dir read-only so write_jsonlines raises.
@@ -250,22 +303,20 @@ class TestLoadOrComputeSpeedPercentiles:
         meta_dir.mkdir()
         meta_dir.chmod(stat.S_IRUSR | stat.S_IXUSR)
         # Force the write attempt to fail even if permissions don't (CI
-        # often runs as root and ignores chmod). We patch write_jsonlines
-        # in the speed_percentiles module to always raise.
+        # often runs as root and ignores chmod). We patch the atomic
+        # writer in the speed_percentiles module to always raise.
         from opentau.datasets import speed_percentiles as sp
 
         def _raise(*a, **kw):
             raise PermissionError("read-only test")
 
-        monkeypatch.setattr(sp, "write_jsonlines", _raise)
+        monkeypatch.setattr(sp, "_atomic_write_jsonlines", _raise)
         # Reset the per-root warn-once cache so caplog sees the message.
         monkeypatch.setattr(sp, "_READONLY_WARNED", set())
 
-        task_to_lengths = {"taskA": list(range(100, 200))}
+        el, e2t, t2i = _fake_meta({"taskA": list(range(100, 200))})
         with caplog.at_level("WARNING"):
-            out = load_or_compute_speed_percentiles(
-                tmp_path, _episodes(task_to_lengths), _task_index(task_to_lengths)
-            )
+            out = load_or_compute_speed_percentiles(tmp_path, el, e2t, t2i)
 
         assert out[0] is not None and len(out[0]) == 10
         assert any("speed percentiles" in rec.message for rec in caplog.records)
@@ -279,11 +330,9 @@ class TestLoadOrComputeSpeedPercentiles:
         # `.get(task_idx)` to fall back to the sparse bucket.
         path = tmp_path / SPEED_PERCENTILES_PATH
         path.parent.mkdir(parents=True, exist_ok=True)
-        from opentau.datasets.utils import write_jsonlines
-
         write_jsonlines([], path)
 
-        out = load_or_compute_speed_percentiles(tmp_path, {}, {})
+        out = load_or_compute_speed_percentiles(tmp_path, {}, {}, {})
         assert out == {}
         # `.get(missing_idx)` returns None → bucket 50.
         assert bucket_episode_length(123, out.get(99)) == SPARSE_TASK_BUCKET

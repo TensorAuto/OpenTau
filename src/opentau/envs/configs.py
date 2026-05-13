@@ -36,8 +36,10 @@ CONTROL_MODE_CHOICES: tuple[str, ...] = get_args(ControlMode)
 # spacing of
 # :data:`opentau.datasets.speed_percentiles.SPEED_BUCKET_LABELS`
 # (``0, 10, 20, ..., 100``); update both call sites together if the
-# label set ever changes.
-SPEED_BUCKET_SECONDS = 10
+# label set ever changes. Named ``_STEP`` (not ``_SECONDS``) because
+# the bucket label is no longer a duration in seconds — it is a
+# percentile-rank index.
+SPEED_BUCKET_STEP = 10
 
 
 @dataclass
@@ -61,7 +63,7 @@ class EnvMetadataConfig:
 
     Args:
         speed: Integer in ``[0, 100]`` and a multiple of
-            ``SPEED_BUCKET_SECONDS`` (= 10), or ``None``. Matches the
+            ``SPEED_BUCKET_STEP`` (= 10), or ``None``. Matches the
             per-task percentile-rank bucket used at training time
             (``0`` = fastest decile, ``100`` = slowest); see
             :mod:`opentau.datasets.speed_percentiles`.
@@ -89,10 +91,10 @@ class EnvMetadataConfig:
         if self.speed is not None:
             if not isinstance(self.speed, int) or isinstance(self.speed, bool):
                 raise TypeError(f"env.metadata.speed must be int, got {type(self.speed).__name__}")
-            if self.speed < 0 or self.speed > 100 or self.speed % SPEED_BUCKET_SECONDS != 0:
+            if self.speed < 0 or self.speed > 100 or self.speed % SPEED_BUCKET_STEP != 0:
                 raise ValueError(
                     f"env.metadata.speed must be a non-negative multiple of "
-                    f"{SPEED_BUCKET_SECONDS} in [0, 100], got {self.speed}"
+                    f"{SPEED_BUCKET_STEP} in [0, 100], got {self.speed}"
                 )
         if self.quality is not None:
             if not isinstance(self.quality, int) or isinstance(self.quality, bool):

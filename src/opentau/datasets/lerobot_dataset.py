@@ -113,7 +113,9 @@ from opentau.constants import HF_OPENTAU_HOME
 from opentau.datasets.compute_stats import aggregate_stats, compute_episode_stats
 from opentau.datasets.image_writer import AsyncImageWriter, write_image
 from opentau.datasets.speed_percentiles import (
+    SPARSE_TASK_BUCKET,
     bucket_episode_length,
+    episode_to_task_index_from_episodes,
     load_or_compute_speed_percentiles,
 )
 from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
@@ -1405,25 +1407,31 @@ class LeRobotDataset(BaseDataset):
             self.segment_starts_by_episode[ep] = np.asarray(starts, dtype=np.int64)
 
         # Per-task percentile lookup for `speed_raw`. Computed once per
-        # dataset on first load and persisted to meta/speed_percentiles.jsonl;
-        # subsequent loads just read the file. See
-        # opentau.datasets.speed_percentiles for the bucketing scheme.
+        # dataset on first load and persisted to meta/speed_percentiles.jsonl
+        # (rank-gated + atomic-write); subsequent loads just read the file.
+        # See opentau.datasets.speed_percentiles for the bucketing scheme.
+        # Both the percentile compute and the per-episode pre-fill below
+        # consume `self.episode_lengths` so the two paths can't drift on
+        # what counts as an "episode length".
+        self.episode_to_task_index: dict[int, int] = episode_to_task_index_from_episodes(
+            self.meta.episodes, self.meta.task_to_task_index
+        )
         self.speed_percentiles_by_task: dict[int, list[float] | None] = load_or_compute_speed_percentiles(
             root=self.root,
-            episodes=self.meta.episodes,
+            episode_lengths=self.episode_lengths,
+            episode_to_task_index=self.episode_to_task_index,
             task_to_task_index=self.meta.task_to_task_index,
         )
         # Pre-compute the bucket per episode so __getitem__ stays a dict
-        # lookup. .get() defends against the impossible "task with 0
-        # episodes in the on-disk file" case (e.g. a hand-edited percentile
-        # file): a missing entry falls back to the sparse-task bucket.
+        # lookup. Episodes with no task entry (impossible in well-formed
+        # datasets) and tasks missing from the on-disk percentile file
+        # (possible after hand-editing) both land at SPARSE_TASK_BUCKET.
         self.speed_raw_by_episode: dict[int, int] = {}
-        for ep, info in self.meta.episodes.items():
-            tasks = info.get("tasks") or []
-            if not tasks:
-                self.speed_raw_by_episode[ep] = bucket_episode_length(self.episode_lengths[ep], None)
+        for ep in self.meta.episodes:
+            task_idx = self.episode_to_task_index.get(ep)
+            if task_idx is None:
+                self.speed_raw_by_episode[ep] = SPARSE_TASK_BUCKET
                 continue
-            task_idx = self.meta.task_to_task_index[tasks[0]]
             self.speed_raw_by_episode[ep] = bucket_episode_length(
                 self.episode_lengths[ep],
                 self.speed_percentiles_by_task.get(task_idx),
