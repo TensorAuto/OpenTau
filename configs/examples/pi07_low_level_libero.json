@@ -10,14 +10,12 @@
         "action_freq": 10.0,
         "image_resample_strategy": "nearest",
         "vector_resample_strategy": "nearest",
-        "n_obs_history": 6,
-        "history_interval": 1
+        "n_obs_history": 6
     },
     "policy": {
         "type": "pi07_low_level",
         "pretrained_path": null,
         "n_obs_steps": 6,
-        "n_obs_history": 6,
         "history_interval": 1,
         "normalization_mapping": {
             "VISUAL": "IDENTITY",
