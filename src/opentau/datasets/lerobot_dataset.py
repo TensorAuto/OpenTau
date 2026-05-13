@@ -102,7 +102,7 @@ import pyarrow.dataset as pa_ds
 import torch
 import torch.nn.functional as F  # noqa: N812
 import torch.utils
-from datasets import Dataset, concatenate_datasets
+from datasets import Dataset, DatasetInfo, concatenate_datasets
 from einops import rearrange
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from huggingface_hub.constants import REPOCARD_NAME
@@ -1568,8 +1568,20 @@ class LeRobotDataset(BaseDataset):
         if not paths:
             raise FileNotFoundError(f"No parquet files matching {glob_pattern!r} under {self.root}")
         features = get_hf_features_from_features(self.meta.features)
-        filters = pa_ds.field("episode_index").isin(self.episodes) if self.episodes is not None else None
-        hf_dataset = Dataset.from_parquet(list(map(str, paths)), filters=filters, features=features)
+        # Read parquet directly via pyarrow.dataset and wrap the resulting
+        # pa.Table in a HF Dataset. Going through `load_dataset("parquet", ...)`
+        # or `Dataset.from_parquet(...)` both route through ParquetDatasetBuilder,
+        # which rewrites the parquet bytes into an uncompressed Arrow cache at
+        # $HF_HOME/datasets/parquet/ — 1-5x the source size (compression-dependent)
+        # and one cache entry per distinct (paths, filter) combo. Issue #277 has
+        # the empirical numbers; verified on physical-intelligence/libero.
+        # Trade-off: `to_table(filter=...)` materializes the filtered rows into
+        # RAM. Typical training subsets are fine; full-corpus loads on multi-GB
+        # repos will be RAM-bound (vs. mmapped Arrow cache before).
+        pa_dataset = pa_ds.dataset(list(map(str, paths)), format="parquet")
+        filter_expr = pa_ds.field("episode_index").isin(self.episodes) if self.episodes is not None else None
+        table = pa_dataset.to_table(filter=filter_expr)
+        hf_dataset = Dataset(table, info=DatasetInfo(features=features))
         hf_dataset.set_transform(hf_transform_to_torch)
         return hf_dataset
 
