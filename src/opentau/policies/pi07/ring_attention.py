@@ -41,17 +41,53 @@ useful for unit tests and single-GPU debugging.
 
 from __future__ import annotations
 
+import os
 from typing import Sequence
 
 import torch
 import torch.distributed as dist
 from einops import rearrange, repeat
 
+
+def _ring_debug_probes() -> bool:
+    """Whether to run NaN / Inf assertions inside the ring forward + backward.
+
+    Off by default; flip on at training-time via ``RING_DEBUG_PROBES=1`` if a
+    real-data run is producing NaNs and you need to localise which layer /
+    iteration first emits one. Each probe is a single per-rank reduce on a
+    fp32 buffer, so leaving it on is cheap but not free."""
+    return os.environ.get("RING_DEBUG_PROBES", "").strip() in {"1", "true", "True", "TRUE"}
+
+
+def _assert_finite(name: str, t: torch.Tensor) -> None:
+    """No-op unless RING_DEBUG_PROBES is set; otherwise raises on NaN / Inf."""
+    if not _ring_debug_probes():
+        return
+    # ``isfinite`` returns False for NaN and ±Inf alike; one ``all`` reduce
+    # per tensor is cheap and short-circuit-friendly.
+    if not torch.isfinite(t).all():
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        raise RuntimeError(
+            f"[ring rank {rank}] non-finite tensor '{name}' shape={tuple(t.shape)} "
+            f"dtype={t.dtype}; min={t.min().item()}, max={t.max().item()}"
+        )
+
+
 # A finite stand-in for -inf so masked attention scores still survive a
 # ``torch.maximum`` / ``torch.exp`` chain without producing NaNs when an
-# entire row is masked out (e.g. padding rows). Same constant as the
-# eager attention forward in ``gemma3_with_expert.py``.
-_NEG_INF = -2.3819763e38
+# entire row is masked out (e.g. padding rows). We deliberately use a much
+# smaller magnitude than the ``-2.38e38`` constant the eager path uses —
+# the online softmax in the ring kernel does several extra fp32 additions /
+# subtractions on ``S - m_new`` and ``S - LSE``, and a magnitude that close
+# to fp32's representable limit can cancel into NaN under those compositions
+# (observed empirically under bf16 mixed-precision training on real pi07
+# data). ``-1e9`` is still ``< -log(fp32_eps)`` so ``exp(S - max)`` for masked
+# positions reliably underflows to 0 in fp32 once any unmasked score is in
+# the score block — i.e. masking is still numerically lossless wherever the
+# row has at least one unmasked position. Fully-masked rows still survive
+# the chain (``m_new == _NEG_INF`` cancels with ``S == _NEG_INF`` to give
+# ``exp(0) == 1``), so padding doesn't corrupt the output either.
+_NEG_INF = -1.0e9
 
 
 # ---------------------------------------------------------------------------
@@ -576,8 +612,13 @@ class _RingAttention(torch.autograd.Function):
                 owner = (owner - 1) % ws
 
         # Finalize: divide by accumulator l. LSE saved for backward.
+        _assert_finite("forward.l_pre_norm", l)
+        _assert_finite("forward.m_pre_norm", m)
+        _assert_finite("forward.O_pre_norm", O)
         O = O / l.permute(0, 2, 1).unsqueeze(-1)
         LSE = m + torch.log(l)  # (B, Hq, Sq_local) — fp32
+        _assert_finite("forward.O", O)
+        _assert_finite("forward.LSE", LSE)
 
         # Save for backward.
         ctx.save_for_backward(q_local, k_local, v_local, O, LSE, attn_mask)
@@ -685,6 +726,9 @@ class _RingAttention(torch.autograd.Function):
         if ws > 1:
             dk_cur, dv_cur = _ring_rotate(dk_cur, dv_cur, group=group, forward_dir=True)
 
+        _assert_finite("backward.dq_local", dq_local)
+        _assert_finite("backward.dk_cur", dk_cur)
+        _assert_finite("backward.dv_cur", dv_cur)
         return (
             dq_local.to(q_local.dtype),
             dk_cur.to(k_local.dtype),
