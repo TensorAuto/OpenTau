@@ -355,25 +355,34 @@ def _ring_rotate(
     sends to rank-1 and receives from rank+1; used in the backward to walk
     dK/dV and (recomputed) K/V the opposite way so each rank ends up with
     gradients for the K/V it originally owned.
+
+    The ``peer`` argument to :class:`torch.distributed.P2POp` is a *global*
+    rank, even when ``group`` is a sub-group — torch will reject within-
+    sub-group rank indices that don't correspond to any rank in WORLD. We
+    translate the within-sub-group rotation step into global ranks by
+    looking up each peer's global rank via ``get_global_rank``.
     """
     ws = dist.get_world_size(group)
     if ws == 1:
         return tuple(tensors)
-    rank = dist.get_rank(group)
+    local_rank = dist.get_rank(group)
     if forward_dir:
-        send_to = (rank + 1) % ws
-        recv_from = (rank - 1) % ws
+        send_to_local = (local_rank + 1) % ws
+        recv_from_local = (local_rank - 1) % ws
     else:
-        send_to = (rank - 1) % ws
-        recv_from = (rank + 1) % ws
+        send_to_local = (local_rank - 1) % ws
+        recv_from_local = (local_rank + 1) % ws
+
+    send_to_global = dist.get_global_rank(group, send_to_local)
+    recv_from_global = dist.get_global_rank(group, recv_from_local)
 
     ops: list[dist.P2POp] = []
     recv_buffers: list[torch.Tensor] = []
     for t in tensors:
         t_c = t.contiguous()
         recv = torch.empty_like(t_c)
-        ops.append(dist.P2POp(dist.isend, t_c, send_to, group=group))
-        ops.append(dist.P2POp(dist.irecv, recv, recv_from, group=group))
+        ops.append(dist.P2POp(dist.isend, t_c, send_to_global, group=group))
+        ops.append(dist.P2POp(dist.irecv, recv, recv_from_global, group=group))
         recv_buffers.append(recv)
     reqs = dist.batch_isend_irecv(ops)
     for req in reqs:
