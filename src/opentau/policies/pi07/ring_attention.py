@@ -634,6 +634,12 @@ class _RingAttention(torch.autograd.Function):
     def backward(ctx, grad_O: torch.Tensor):
         # Recover saved state.
         q_local, k_local, v_local, O, LSE, attn_mask = ctx.saved_tensors
+        _assert_finite("backward.grad_O", grad_O)
+        _assert_finite("backward.saved_O", O)
+        _assert_finite("backward.saved_LSE", LSE)
+        _assert_finite("backward.saved_q_local", q_local)
+        _assert_finite("backward.saved_k_local", k_local)
+        _assert_finite("backward.saved_v_local", v_local)
         scaling = ctx.scaling
         num_query_heads = ctx.num_query_heads
         num_kv_heads = ctx.num_kv_heads
@@ -685,8 +691,11 @@ class _RingAttention(torch.autograd.Function):
                 S, v32, k32 = _compute_block(
                     q_tile_local, k_cur, v_cur, mask_tile, scaling, num_query_heads, num_kv_heads
                 )
+                _assert_finite("backward.S_recompute", S)
                 LSE_tile = LSE[:, :, q_start:q_end]
+                _assert_finite("backward.LSE_tile", LSE_tile)
                 P = torch.exp(S - LSE_tile.unsqueeze(-1))
+                _assert_finite("backward.P", P)
 
                 grad_O_tile = grad_O32[:, q_start:q_end]
                 D_tile = D_bhq[:, :, q_start:q_end]
@@ -697,7 +706,10 @@ class _RingAttention(torch.autograd.Function):
 
                 # dP, dS.
                 dP = torch.einsum("bqhd,bkhd->bhqk", grad_O_tile, v32)
+                _assert_finite("backward.dP", dP)
+                _assert_finite("backward.D_tile", D_tile)
                 dS = P * (dP - D_tile.unsqueeze(-1))
+                _assert_finite("backward.dS", dS)
 
                 dq_local[:, q_start:q_end] = (
                     dq_local[:, q_start:q_end] + torch.einsum("bhqk,bkhd->bqhd", dS, k32) * scaling
