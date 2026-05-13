@@ -1562,7 +1562,9 @@ class LeRobotDataset(BaseDataset):
         # datasets with a non-default `info["data_path"]` (deeper nesting,
         # flat layout, etc.) keep working. Default template is
         # "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"
-        # which yields the glob "data/chunk-*/episode_*.parquet".
+        # which yields the glob "data/chunk-*/episode_*.parquet". Assumes the
+        # template uses simple `{name}` / `{name:fmt}` placeholders and no
+        # literal `{{`/`}}` escapes — true for every in-repo writer.
         glob_pattern = re.sub(r"\{[^}]+\}", "*", self.meta.data_path)
         paths = sorted(self.root.glob(glob_pattern))
         if not paths:
@@ -1575,9 +1577,20 @@ class LeRobotDataset(BaseDataset):
         # $HF_HOME/datasets/parquet/ — 1-5x the source size (compression-dependent)
         # and one cache entry per distinct (paths, filter) combo. Issue #277 has
         # the empirical numbers; verified on physical-intelligence/libero.
+        #
         # Trade-off: `to_table(filter=...)` materializes the filtered rows into
-        # RAM. Typical training subsets are fine; full-corpus loads on multi-GB
-        # repos will be RAM-bound (vs. mmapped Arrow cache before).
+        # RAM rather than mmapping a disk-backed Arrow cache. RAM cost scales
+        # with `len(filtered rows) × avg-row-size`; concretely:
+        # ~350 MB for physical-intelligence/libero with episodes=[0..9],
+        # ~46 GB for humanoid-everyday-A-overlay with episodes=None (full corpus).
+        # Narrow `episodes=` picks are fine; an episodes=None load on a multi-GB
+        # image-heavy repo will OOM on a small dev box — pass a manageable
+        # subset, or restore a mmap'd Arrow cache via tmp pa.ipc files if RAM
+        # ever becomes the binding constraint.
+        #
+        # The `Dataset(table, info=DatasetInfo(features=features))` constructor
+        # signature has been stable since datasets 2.x; the project pin is
+        # `datasets>=2.19.0`, so we're well inside the supported window.
         pa_dataset = pa_ds.dataset(list(map(str, paths)), format="parquet")
         filter_expr = pa_ds.field("episode_index").isin(self.episodes) if self.episodes is not None else None
         table = pa_dataset.to_table(filter=filter_expr)

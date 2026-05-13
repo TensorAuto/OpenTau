@@ -79,6 +79,10 @@ def _assert_episode_row_alignment(dataset) -> None:
     used to build episode_data_index/epi2idx (e.g. unsorted self.episodes vs.
     sorted-by-filename row layout from Dataset.from_parquet).
     """
+    # Reach into the underlying pa.Table to bypass the set_transform=hf_transform_to_torch
+    # set in load_hf_dataset — calling `hf_dataset["episode_index"]` here would
+    # route the column through the torch transform, which is wrong for a raw
+    # episode_index check. Don't "simplify" this without removing the transform.
     ep_idx_col = dataset.hf_dataset.data.table.column("episode_index").to_pylist()
     for ep in dataset.episodes:
         pos = dataset.epi2idx[ep]
