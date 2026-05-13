@@ -72,6 +72,74 @@ def test_dataset_initialization(tmp_path, lerobot_dataset_factory):
     assert dataset.num_frames == len(dataset)
 
 
+def _assert_episode_row_alignment(dataset) -> None:
+    """For each episode, verify hf_dataset rows in [from:to] all carry that episode_index.
+
+    This catches the case where hf_dataset row order disagrees with the order
+    used to build episode_data_index/epi2idx (e.g. unsorted self.episodes vs.
+    sorted-by-filename row layout from Dataset.from_parquet).
+    """
+    ep_idx_col = dataset.hf_dataset.data.table.column("episode_index").to_pylist()
+    for ep in dataset.episodes:
+        pos = dataset.epi2idx[ep]
+        start = int(dataset.episode_data_index["from"][pos])
+        end = int(dataset.episode_data_index["to"][pos])
+        assert end > start, f"Episode {ep} has empty row span [{start}:{end}]"
+        rows = ep_idx_col[start:end]
+        assert all(e == ep for e in rows), (
+            f"Episode {ep} at hf_dataset[{start}:{end}] has mismatched episode_index values "
+            f"(saw {sorted(set(rows))})"
+        )
+
+
+def test_dataset_unsorted_episodes_row_alignment(tmp_path, lerobot_dataset_factory):
+    """Regression: passing an unsorted episodes list must still yield correct row indexing.
+
+    Before the parquet-loader switch to Dataset.from_parquet, `data_files=[...]` produced
+    rows in self.episodes order, so unsorted picks happened to work. With the
+    glob-based loader, rows come back sorted by filename — so __init__ must sort
+    self.episodes for episode_data_index/epi2idx to line up.
+    """
+    dataset = lerobot_dataset_factory(
+        root=tmp_path / "test",
+        repo_id=DUMMY_REPO_ID,
+        total_episodes=10,
+        total_frames=400,
+        episodes=[6, 2, 5],
+    )
+    assert dataset.episodes == [2, 5, 6], "self.episodes should be sorted at the boundary"
+    _assert_episode_row_alignment(dataset)
+
+
+def test_dataset_sparse_episodes_row_alignment(tmp_path, lerobot_dataset_factory):
+    """Sparse non-contiguous episodes filtered out of a larger corpus stay aligned."""
+    dataset = lerobot_dataset_factory(
+        root=tmp_path / "test",
+        repo_id=DUMMY_REPO_ID,
+        total_episodes=10,
+        total_frames=400,
+        episodes=[3, 7],
+    )
+    assert dataset.episodes == [3, 7]
+    _assert_episode_row_alignment(dataset)
+    # Confirm the filter actually dropped the unselected episodes.
+    ep_idx_col = dataset.hf_dataset.data.table.column("episode_index").to_pylist()
+    assert set(ep_idx_col) == {3, 7}
+
+
+def test_dataset_no_episodes_loads_all(tmp_path, lerobot_dataset_factory):
+    """episodes=None loads every episode and stays aligned with episode_data_index."""
+    dataset = lerobot_dataset_factory(
+        root=tmp_path / "test",
+        repo_id=DUMMY_REPO_ID,
+        total_episodes=4,
+        total_frames=200,
+        episodes=None,
+    )
+    assert dataset.episodes == [0, 1, 2, 3]
+    _assert_episode_row_alignment(dataset)
+
+
 def test_add_frame_missing_task(tmp_path, empty_lerobot_dataset_factory):
     features = {"state": {"dtype": "float32", "shape": (1,), "names": None}}
     dataset = empty_lerobot_dataset_factory(root=tmp_path / "test", features=features)

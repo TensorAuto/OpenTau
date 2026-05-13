@@ -87,6 +87,7 @@ import functools
 import json
 import logging
 import math
+import re
 import shutil
 import traceback
 from abc import abstractmethod
@@ -1261,7 +1262,12 @@ class LeRobotDataset(BaseDataset):
             delta_timestamps_lower,
             delta_timestamps_upper,
         )
-        self.episodes = episodes
+        # Sort episodes here so that hf_dataset row layout (sorted by
+        # episode_index after the glob in load_hf_dataset) stays aligned with
+        # episode_data_index["from"/"to"] (built in self.episodes order in
+        # get_episode_data_index). Mismatched order would silently return
+        # rows from the wrong episode for callers that pass an unsorted list.
+        self.episodes = sorted(episodes) if episodes is not None else None
         self.tolerance_s = tolerance_s
         self.skip_timestamp_check = skip_timestamp_check
         self.revision = revision if revision else CODEBASE_VERSION
@@ -1552,13 +1558,18 @@ class LeRobotDataset(BaseDataset):
 
     def load_hf_dataset(self) -> datasets.Dataset:
         """hf_dataset contains all the observations, states, actions, rewards, etc."""
-        data_dir = self.root / "data"
-        paths = sorted(data_dir.glob("*/*.parquet"))
+        # Derive the parquet glob from the meta data_path template so that
+        # datasets with a non-default `info["data_path"]` (deeper nesting,
+        # flat layout, etc.) keep working. Default template is
+        # "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"
+        # which yields the glob "data/chunk-*/episode_*.parquet".
+        glob_pattern = re.sub(r"\{[^}]+\}", "*", self.meta.data_path)
+        paths = sorted(self.root.glob(glob_pattern))
         if not paths:
-            raise FileNotFoundError(f"No parquet files under {data_dir}")
+            raise FileNotFoundError(f"No parquet files matching {glob_pattern!r} under {self.root}")
         features = get_hf_features_from_features(self.meta.features)
         filters = pa_ds.field("episode_index").isin(self.episodes) if self.episodes is not None else None
-        hf_dataset = Dataset.from_parquet([str(p) for p in paths], filters=filters, features=features)
+        hf_dataset = Dataset.from_parquet(list(map(str, paths)), filters=filters, features=features)
         hf_dataset.set_transform(hf_transform_to_torch)
         return hf_dataset
 
