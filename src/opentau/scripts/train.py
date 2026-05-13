@@ -589,18 +589,15 @@ def train(cfg: TrainPipelineConfig):
             with accelerator.accumulate(policy) if cfg.gradient_accumulation_steps > 1 else nullcontext():
                 logging.debug(f"{step=}, {accelerator.sync_gradients=}")
                 batch = next(train_dl_iter)
-                if cfg.ring_group_size is not None and torch.distributed.is_initialized():
-                    # Within each ring sub-group, every rank already loads the
-                    # same indices (same sampler seed; see sampler_seed setup
-                    # above). Broadcasting the batch from the sub-group leader
-                    # to its followers makes that equality robust to any
-                    # source of stochasticity the dataloader workers might
-                    # introduce (random augmentations, RNG-using transforms,
-                    # collator non-determinism) — and is cheap over NVLink
-                    # next to the model forward.
-                    from opentau.policies.pi07.ring_attention import _broadcast_batch_in_ring
-
-                    _broadcast_batch_in_ring(batch)
+                # Within each ring sub-group, every rank already loads the same
+                # indices via the seeded HierarchicalSampler (see sampler_seed
+                # setup above), so a per-step batch broadcast is redundant for
+                # correctness. The defensive broadcast helper in
+                # ``ring_attention._broadcast_batch_in_ring`` exists for
+                # callers whose dataloader has unkeyed stochasticity (random
+                # augmentations etc.); pi07's current loader is deterministic
+                # under a seeded sampler, so we skip it to avoid one extra
+                # collective per step on every ring sub-group.
 
                 train_tracker = update_policy(
                     cfg,
