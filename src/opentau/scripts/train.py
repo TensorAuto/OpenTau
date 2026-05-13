@@ -78,6 +78,18 @@ def update_policy(
         train_config.loss_weighting["MSE"] * losses["MSE"] + train_config.loss_weighting["CE"] * losses["CE"]
     )
 
+    # Ring sequence-parallelism correction: under a ring sub-group of size R,
+    # every rank in the sub-group computes its sequence slice of the SAME
+    # batch, so the per-rank local loss is 1/R of the batch's loss. ZeRO/DDP
+    # then MEAN-reduces gradients across WORLD, which averages over both
+    # the ring axis (where contributions should sum) and the DP axis (where
+    # they should average). Multiplying the loss by R before backward
+    # rescales the world-MEAN to the desired (ring-SUM, DP-MEAN). When ring
+    # spans the world (no DP axis) the same scaling cancels the spurious
+    # 1/R the world MEAN would otherwise introduce.
+    if train_config.ring_group_size is not None:
+        loss = loss * train_config.ring_group_size
+
     accelerator.backward(loss)
     accelerator.unscale_gradients(optimizer=optimizer)
 
@@ -287,6 +299,24 @@ def train(cfg: TrainPipelineConfig):
     # Register accelerator globally for use in other modules, (e.g., detect current rank, etc.)
     set_proc_accelerator(accelerator)
 
+    # 2D parallelism for ring attention. After accelerate has bootstrapped
+    # ``torch.distributed``, carve WORLD into ring sub-groups of size
+    # ``cfg.ring_group_size`` along the fast intra-node axis, with DP
+    # sub-groups orthogonal to them. Ring attention's ``_RING_GROUP`` is
+    # repointed to the sub-group; the trainer keeps a handle to the DP
+    # group for sampler seeding and (later) gradient sanity checks. When
+    # ``ring_group_size`` is unset or equals world size, this is a single
+    # ring spanning every rank — the legacy behaviour of the PR.
+    if cfg.ring_group_size is not None and torch.distributed.is_initialized():
+        from opentau.policies.pi07.ring_attention import build_ring_and_dp_groups
+
+        ring_pg, dp_pg = build_ring_and_dp_groups(cfg.ring_group_size)
+        logging.info(
+            f"Ring 2D parallelism: ring_group_size={cfg.ring_group_size}, "
+            f"world_size={torch.distributed.get_world_size()}, "
+            f"num_rings={torch.distributed.get_world_size() // cfg.ring_group_size}."
+        )
+
     # Must run before `encode_accelerator_state_dict` + `init_trackers` below so the
     # wandb-logged accelerator config and the value DeepSpeed consumes at prepare()
     # time both reflect TrainPipelineConfig.
@@ -452,8 +482,23 @@ def train(cfg: TrainPipelineConfig):
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
+    # Ring-aware sampler seeding: ranks in the same ring sub-group must
+    # produce the same sample stream so that sequence parallelism inside the
+    # sub-group is computing one coherent batch, while different DP groups
+    # see different batches. The seed is keyed on the DP rank (which equals
+    # 0 for every rank when ring_group_size is None — preserves legacy
+    # behaviour). The 1000003 prime spreads adjacent dp_ranks across the
+    # generator's state space so the two streams are decorrelated.
+    if cfg.ring_group_size is not None and torch.distributed.is_initialized():
+        from opentau.policies.pi07.ring_attention import get_dp_rank
+
+        base = cfg.seed if cfg.seed is not None else 0
+        sampler_seed = int(base) + get_dp_rank() * 1_000_003
+    else:
+        sampler_seed = None
+
     if cfg.val_freq > 0:
-        train_dataloader = train_dataset.get_dataloader()
+        train_dataloader = train_dataset.get_dataloader(sampler_seed=sampler_seed)
         # One DataLoader per underlying val dataset so we can report per-dataset
         # validation losses. The aggregate is computed by averaging across all.
         per_dataset_val_dataloaders = val_dataset.get_per_dataset_dataloaders()
@@ -468,7 +513,7 @@ def train(cfg: TrainPipelineConfig):
         policy, optimizer, train_dataloader, lr_scheduler = prepared[:4]
         per_dataset_val_dataloaders = dict(zip(val_names, prepared[4:], strict=True))
     else:
-        train_dataloader = train_dataset.get_dataloader()
+        train_dataloader = train_dataset.get_dataloader(sampler_seed=sampler_seed)
         policy, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             policy, optimizer, train_dataloader, lr_scheduler
         )
@@ -544,6 +589,18 @@ def train(cfg: TrainPipelineConfig):
             with accelerator.accumulate(policy) if cfg.gradient_accumulation_steps > 1 else nullcontext():
                 logging.debug(f"{step=}, {accelerator.sync_gradients=}")
                 batch = next(train_dl_iter)
+                if cfg.ring_group_size is not None and torch.distributed.is_initialized():
+                    # Within each ring sub-group, every rank already loads the
+                    # same indices (same sampler seed; see sampler_seed setup
+                    # above). Broadcasting the batch from the sub-group leader
+                    # to its followers makes that equality robust to any
+                    # source of stochasticity the dataloader workers might
+                    # introduce (random augmentations, RNG-using transforms,
+                    # collator non-determinism) — and is cheap over NVLink
+                    # next to the model forward.
+                    from opentau.policies.pi07.ring_attention import _broadcast_batch_in_ring
+
+                    _broadcast_batch_in_ring(batch)
 
                 train_tracker = update_policy(
                     cfg,

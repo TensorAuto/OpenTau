@@ -488,11 +488,22 @@ class WeightedDatasetMixture:
                 overrides[dataset_cfg.repo_id] = dataset_cfg.data_features_name_mapping
         return overrides
 
-    def get_dataloader(self) -> DataLoader:
+    def get_dataloader(self, sampler_seed: int | None = None) -> DataLoader:
         """Create and return a PyTorch DataLoader with weighted sampling.
 
         Uses HierarchicalSampler to first sample a dataset according to weights,
         then uniformly sample within that dataset.
+
+        Args:
+            sampler_seed: Optional seed for the HierarchicalSampler's RNG.
+                Identical seeds across ranks produce identical sample streams,
+                which is what 2D ring + DP parallelism needs: ranks in the same
+                ring sub-group should see the same batch (so sequence
+                parallelism is computing one consistent batch), while ranks in
+                different DP sub-groups should see different batches. Callers
+                that want this should pass ``base_seed + dp_rank * large_prime``.
+                None leaves the sampler unseeded (every rank's independent
+                ``torch.Generator()`` state), preserving the pre-ring behaviour.
 
         Returns:
             DataLoader configured for weighted hierarchical sampling.
@@ -535,6 +546,7 @@ class WeightedDatasetMixture:
             dataset_lengths=ds_lengths,
             dataset_probs=self.dataset_weights,
             num_samples=num_samples_per_epoch,
+            seed=sampler_seed,
         )
 
         dataloader = DataLoader(

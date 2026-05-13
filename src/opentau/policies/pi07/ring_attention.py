@@ -100,6 +100,165 @@ def ring_rank(group: dist.ProcessGroup | None = None) -> int:
     return 0 if group is None else dist.get_rank(group)
 
 
+# Module-global DP sub-group, populated alongside the ring sub-group by
+# :func:`build_ring_and_dp_groups`. Kept here (not in the trainer) so any
+# code path can look it up without importing trainer internals.
+_DP_GROUP: dist.ProcessGroup | None = None
+
+
+def get_dp_group() -> dist.ProcessGroup | None:
+    """Return the DP-replication process group, or None when ring is inactive.
+
+    The DP group contains one rank from each ring sub-group at the same
+    intra-ring offset (i.e. ranks ``r``, ``r + ring_group_size``,
+    ``r + 2 * ring_group_size`` ... for offset ``r``). When ring spans the
+    full world (``ring_group_size == world_size`` or unset), there is no
+    DP axis — this returns None.
+
+    Returns None when distributed is not initialised so single-GPU callers
+    can use the same code path.
+    """
+    return _DP_GROUP
+
+
+def build_ring_and_dp_groups(ring_group_size: int) -> tuple[dist.ProcessGroup, dist.ProcessGroup | None]:
+    """Construct contiguous ring + orthogonal DP sub-groups.
+
+    Ranks ``[0, R), [R, 2R), ...`` form ring sub-groups of size ``R =
+    ring_group_size``. The DP group at intra-ring offset ``r`` contains
+    ``r, r + R, r + 2R, ...`` — one rank from each ring sub-group at the
+    same intra-ring offset. This is the standard "ring along the fast axis,
+    DP along the slow axis" topology used in Megatron-style sequence
+    parallelism + ZeRO.
+
+    All ranks must call this function in the same order (it issues
+    ``dist.new_group`` collectives that every rank participates in, even
+    for sub-groups they don't belong to). Calls :func:`set_ring_group` so
+    subsequent ``get_ring_group()`` returns the correct sub-group.
+
+    Args:
+        ring_group_size: Number of ranks per ring sub-group. Must divide
+            world size. Set ``ring_group_size == world_size`` for a single
+            ring (no DP axis); set ``ring_group_size == 1`` to disable ring
+            entirely (every rank is its own group of one).
+
+    Returns:
+        ``(ring_group, dp_group)``. ``dp_group`` is None when
+        ``ring_group_size == world_size`` (no DP replication).
+    """
+    if not dist.is_available() or not dist.is_initialized():
+        raise RuntimeError("build_ring_and_dp_groups requires torch.distributed to be initialised.")
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    if world_size % ring_group_size != 0:
+        raise ValueError(
+            f"world_size ({world_size}) must be divisible by ring_group_size ({ring_group_size})."
+        )
+    num_rings = world_size // ring_group_size
+
+    # Create ring sub-groups. Every rank must participate in the
+    # ``new_group`` collective for every sub-group, even ones it doesn't
+    # belong to — that's NCCL's contract for sub-group creation.
+    my_ring_group: dist.ProcessGroup | None = None
+    for ring_id in range(num_rings):
+        ranks = list(range(ring_id * ring_group_size, (ring_id + 1) * ring_group_size))
+        g = dist.new_group(ranks=ranks)
+        if rank in ranks:
+            my_ring_group = g
+    assert my_ring_group is not None, "rank not assigned to any ring sub-group"
+
+    # Create DP sub-groups (only when there's actually a DP axis).
+    my_dp_group: dist.ProcessGroup | None = None
+    if num_rings > 1:
+        for offset in range(ring_group_size):
+            ranks = list(range(offset, world_size, ring_group_size))
+            g = dist.new_group(ranks=ranks)
+            if rank in ranks:
+                my_dp_group = g
+        assert my_dp_group is not None, "rank not assigned to any DP sub-group"
+
+    # Wire the module-global pointers so ``get_ring_group`` /
+    # ``get_dp_group`` find the new groups.
+    set_ring_group(my_ring_group)
+    global _DP_GROUP
+    _DP_GROUP = my_dp_group
+
+    return my_ring_group, my_dp_group
+
+
+def get_dp_rank(group: dist.ProcessGroup | None = None) -> int:
+    """Return this rank's position within the DP sub-group, or 0 if absent.
+
+    Used by the trainer to seed the dataloader sampler — ranks in the same
+    ring sub-group share a DP rank, ranks in different ring sub-groups have
+    different DP ranks. With no DP axis (``ring_group_size == world_size``)
+    all ranks return 0, so every rank sees the same sampler stream — which
+    is exactly what single-ring sequence parallelism needs.
+    """
+    group = group if group is not None else _DP_GROUP
+    if group is None:
+        return 0
+    return dist.get_rank(group)
+
+
+def get_dp_world_size(group: dist.ProcessGroup | None = None) -> int:
+    """Number of DP-replicas across the world, or 1 when there's no DP axis."""
+    group = group if group is not None else _DP_GROUP
+    if group is None:
+        return 1
+    return dist.get_world_size(group)
+
+
+def _broadcast_batch_in_ring(batch, src_offset: int = 0) -> None:
+    """Broadcast every tensor in ``batch`` from the ring leader to its followers.
+
+    The trainer calls this on every step under 2D parallelism so the
+    sequence-parallel ranks within a ring sub-group provably agree on the
+    batch they are jointly attending over. The seeded sampler already
+    arranges that — this broadcast is a cheap belt-and-braces guard
+    against any worker-side stochasticity (random augmentations, etc.)
+    that could otherwise let the per-rank batches diverge.
+
+    Args:
+        batch: A nested container (dict / list / tuple) of ``torch.Tensor``
+            and arbitrary scalar metadata. Tensors are broadcast in place;
+            non-tensor leaves are left untouched (every rank in the
+            sub-group already has them deterministically by virtue of the
+            shared sampler stream).
+        src_offset: Intra-ring offset of the broadcast source. Defaults to
+            ``0`` (the rank with the lowest global rank in the sub-group).
+
+    No-op when the ring sub-group has size 1 (or no ring is active).
+    """
+    group = get_ring_group()
+    if group is None or dist.get_world_size(group) <= 1:
+        return
+    # Translate intra-ring offset to global rank: ring sub-groups are
+    # contiguous, so the source is ``my_global_rank - my_local_rank +
+    # src_offset``.
+    my_local = dist.get_rank(group)
+    my_global = dist.get_rank()
+    src_global = my_global - my_local + src_offset
+
+    def _walk(obj):
+        if isinstance(obj, torch.Tensor):
+            # ``broadcast`` requires the tensor to be on a CUDA device for
+            # NCCL; CPU tensors would need GLOO. We assume training has
+            # already moved inputs to GPU by this point (pin_memory + the
+            # implicit device move accelerate does); guard otherwise.
+            if obj.is_cuda:
+                dist.broadcast(obj, src=src_global, group=group)
+            return
+        if isinstance(obj, dict):
+            for v in obj.values():
+                _walk(v)
+        elif isinstance(obj, (list, tuple)):
+            for v in obj:
+                _walk(v)
+
+    _walk(batch)
+
+
 # ---------------------------------------------------------------------------
 # Sharding helpers (used by the surrounding model to feed per-rank shards
 # into the attention forward).

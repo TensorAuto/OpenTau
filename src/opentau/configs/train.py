@@ -155,6 +155,14 @@ class TrainPipelineConfig(HubMixin):
     dataloader_batch_size: int | None = None
     # Prefetch factor for the dataloader.
     prefetch_factor: int | None = None
+    # Ring-attention sub-group size. When set (and the policy enables
+    # ``attention_implementation="ring"``), splits the WORLD process group
+    # into ``world_size / ring_group_size`` ring sub-groups of this size.
+    # Sequence parallelism happens within each ring; DP-replication happens
+    # across rings (ZeRO over WORLD scales the gradient correctly via a
+    # ``loss *= ring_group_size`` pre-backward, see train.py). None keeps the
+    # legacy single-ring behaviour (ring spans WORLD). Must divide world_size.
+    ring_group_size: int | None = None
     steps: int = 100_000
     log_freq: int = 200
     save_checkpoint: bool = True
@@ -285,6 +293,39 @@ class TrainPipelineConfig(HubMixin):
                         f"dataset_mixture.n_obs_history ({dm.n_obs_history}; "
                         "treated as 1 when unset). Set dataset_mixture.n_obs_history "
                         "to match policy.n_obs_steps."
+                    )
+
+        # Ring sub-group validation. ``validate()`` runs before the Accelerator
+        # initialises distributed, so probe ``WORLD_SIZE`` from the env (set
+        # by torchrun / accelerate) rather than ``dist.get_world_size()``.
+        if self.ring_group_size is not None:
+            import os as _os
+
+            if self.ring_group_size < 1:
+                raise ValueError(f"ring_group_size must be >= 1; got {self.ring_group_size}.")
+            world_size_env = _os.environ.get("WORLD_SIZE")
+            if world_size_env is not None:
+                world_size = int(world_size_env)
+                if world_size % self.ring_group_size != 0:
+                    raise ValueError(
+                        f"world_size ({world_size}) must be divisible by "
+                        f"ring_group_size ({self.ring_group_size})."
+                    )
+            # Ring sub-grouping is only meaningful when the policy actually
+            # consumes ring attention. pi07 exposes the flag directly on the
+            # policy config (it's plumbed into ``vlm_config`` in
+            # ``__post_init__``); other policies (pi05, etc.) don't have the
+            # field at all — for those we treat ring_group_size as a no-op
+            # rather than erroring, so a shared launcher script can leave
+            # the flag set without breaking non-pi07 runs.
+            if self.policy is not None:
+                impl = getattr(self.policy, "attention_implementation", None)
+                if impl is not None and impl != "ring":
+                    raise ValueError(
+                        "ring_group_size is set but "
+                        f"policy.attention_implementation = {impl!r}. "
+                        "Set attention_implementation='ring' or unset "
+                        "ring_group_size."
                     )
 
     @classmethod
