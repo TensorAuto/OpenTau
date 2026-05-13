@@ -122,14 +122,24 @@ def get_dp_group() -> dist.ProcessGroup | None:
 
 
 def build_ring_and_dp_groups(ring_group_size: int) -> tuple[dist.ProcessGroup, dist.ProcessGroup | None]:
-    """Construct contiguous ring + orthogonal DP sub-groups.
+    """Construct the ring sub-group; expose DP topology arithmetically.
 
     Ranks ``[0, R), [R, 2R), ...`` form ring sub-groups of size ``R =
-    ring_group_size``. The DP group at intra-ring offset ``r`` contains
-    ``r, r + R, r + 2R, ...`` — one rank from each ring sub-group at the
-    same intra-ring offset. This is the standard "ring along the fast axis,
-    DP along the slow axis" topology used in Megatron-style sequence
-    parallelism + ZeRO.
+    ring_group_size``. The DP axis (one rank from each ring sub-group at
+    the same intra-ring offset) is conceptual: pi07's only ZeRO + ring
+    integration uses ZeRO over the WORLD group with a ``loss *= R``
+    pre-backward to correct the MEAN-reduction, so no actual DP-axis
+    collective is issued. Skipping the DP ``new_group`` calls keeps the
+    NCCL communicator count minimal — that matters because every extra
+    sub-group communicator competes with ZeRO's world-group collectives
+    on the same CUDA streams, and NCCL is documented as unsafe under
+    concurrent multi-communicator use on shared streams. Empirically, on
+    A100 + DeepSpeed ZeRO-2, creating the orthogonal DP groups was enough
+    to hang the first training step.
+
+    When ``ring_group_size == world_size`` we reuse the WORLD group as
+    the ring group instead of creating a duplicate communicator — same
+    rationale.
 
     All ranks must call this function in the same order (it issues
     ``dist.new_group`` collectives that every rank participates in, even
@@ -138,13 +148,14 @@ def build_ring_and_dp_groups(ring_group_size: int) -> tuple[dist.ProcessGroup, d
 
     Args:
         ring_group_size: Number of ranks per ring sub-group. Must divide
-            world size. Set ``ring_group_size == world_size`` for a single
-            ring (no DP axis); set ``ring_group_size == 1`` to disable ring
-            entirely (every rank is its own group of one).
+            world size. ``ring_group_size == world_size`` is the
+            single-ring case (no DP replication).
 
     Returns:
-        ``(ring_group, dp_group)``. ``dp_group`` is None when
-        ``ring_group_size == world_size`` (no DP replication).
+        ``(ring_group, dp_group)``. ``dp_group`` is always None today —
+        the DP axis is handled implicitly by ZeRO over WORLD. The tuple
+        shape is kept for forward-compatibility with future call sites
+        that may want an explicit DP communicator.
     """
     if not dist.is_available() or not dist.is_initialized():
         raise RuntimeError("build_ring_and_dp_groups requires torch.distributed to be initialised.")
@@ -156,57 +167,60 @@ def build_ring_and_dp_groups(ring_group_size: int) -> tuple[dist.ProcessGroup, d
         )
     num_rings = world_size // ring_group_size
 
-    # Create ring sub-groups. Every rank must participate in the
-    # ``new_group`` collective for every sub-group, even ones it doesn't
-    # belong to — that's NCCL's contract for sub-group creation.
-    my_ring_group: dist.ProcessGroup | None = None
-    for ring_id in range(num_rings):
-        ranks = list(range(ring_id * ring_group_size, (ring_id + 1) * ring_group_size))
-        g = dist.new_group(ranks=ranks)
-        if rank in ranks:
-            my_ring_group = g
-    assert my_ring_group is not None, "rank not assigned to any ring sub-group"
-
-    # Create DP sub-groups (only when there's actually a DP axis).
-    my_dp_group: dist.ProcessGroup | None = None
-    if num_rings > 1:
-        for offset in range(ring_group_size):
-            ranks = list(range(offset, world_size, ring_group_size))
+    if num_rings == 1:
+        # Single ring spanning WORLD — no need for a duplicate communicator.
+        my_ring_group: dist.ProcessGroup = dist.group.WORLD  # type: ignore[assignment]
+    else:
+        # Multiple ring sub-groups. Every rank must call ``new_group`` for
+        # every sub-group (NCCL contract for sub-group creation).
+        my_ring_group = None  # type: ignore[assignment]
+        for ring_id in range(num_rings):
+            ranks = list(range(ring_id * ring_group_size, (ring_id + 1) * ring_group_size))
             g = dist.new_group(ranks=ranks)
             if rank in ranks:
-                my_dp_group = g
-        assert my_dp_group is not None, "rank not assigned to any DP sub-group"
+                my_ring_group = g
+        assert my_ring_group is not None, "rank not assigned to any ring sub-group"
 
-    # Wire the module-global pointers so ``get_ring_group`` /
-    # ``get_dp_group`` find the new groups.
     set_ring_group(my_ring_group)
     global _DP_GROUP
-    _DP_GROUP = my_dp_group
+    _DP_GROUP = None
+    return my_ring_group, None
 
-    return my_ring_group, my_dp_group
 
+def get_dp_rank(ring_group_size: int | None = None) -> int:
+    """Return this rank's DP index, computed arithmetically.
 
-def get_dp_rank(group: dist.ProcessGroup | None = None) -> int:
-    """Return this rank's position within the DP sub-group, or 0 if absent.
+    The DP index identifies which ring sub-group a rank belongs to. With
+    contiguous ring sub-groups (rank ``[0, R)``, ``[R, 2R)``, ...) the
+    DP index is just ``world_rank // R``. When ``ring_group_size`` is
+    None we infer it from :func:`ring_world_size`, which returns the
+    pinned ring sub-group's size after :func:`build_ring_and_dp_groups`
+    has run.
 
-    Used by the trainer to seed the dataloader sampler — ranks in the same
-    ring sub-group share a DP rank, ranks in different ring sub-groups have
-    different DP ranks. With no DP axis (``ring_group_size == world_size``)
-    all ranks return 0, so every rank sees the same sampler stream — which
-    is exactly what single-ring sequence parallelism needs.
+    Used by the trainer to seed the dataloader sampler so ranks in the
+    same ring sub-group draw an identical sample stream; this is the only
+    consumer of the DP-axis identity in the current implementation, so
+    expressing it as an integer keeps us out of NCCL sub-group territory.
     """
-    group = group if group is not None else _DP_GROUP
-    if group is None:
+    if not dist.is_available() or not dist.is_initialized():
         return 0
-    return dist.get_rank(group)
+    world_rank = dist.get_rank()
+    if ring_group_size is None:
+        ring_group_size = ring_world_size()
+    if ring_group_size <= 0:
+        return 0
+    return world_rank // ring_group_size
 
 
-def get_dp_world_size(group: dist.ProcessGroup | None = None) -> int:
-    """Number of DP-replicas across the world, or 1 when there's no DP axis."""
-    group = group if group is not None else _DP_GROUP
-    if group is None:
+def get_dp_world_size(ring_group_size: int | None = None) -> int:
+    """Number of DP-replicas across the world (``world_size / ring_group_size``)."""
+    if not dist.is_available() or not dist.is_initialized():
         return 1
-    return dist.get_world_size(group)
+    if ring_group_size is None:
+        ring_group_size = ring_world_size()
+    if ring_group_size <= 0:
+        return 1
+    return dist.get_world_size() // ring_group_size
 
 
 def _broadcast_batch_in_ring(batch, src_offset: int = 0) -> None:

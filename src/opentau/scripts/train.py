@@ -493,7 +493,7 @@ def train(cfg: TrainPipelineConfig):
         from opentau.policies.pi07.ring_attention import get_dp_rank
 
         base = cfg.seed if cfg.seed is not None else 0
-        sampler_seed = int(base) + get_dp_rank() * 1_000_003
+        sampler_seed = int(base) + get_dp_rank(cfg.ring_group_size) * 1_000_003
     else:
         sampler_seed = None
 
