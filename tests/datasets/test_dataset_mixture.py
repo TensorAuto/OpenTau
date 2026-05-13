@@ -30,6 +30,7 @@ from opentau.datasets.dataset_mixture import (
     pad_vector,
 )
 from opentau.datasets.factory import make_dataset
+from tests.utils import retry_on_hf_flakiness
 
 
 class TestPadVector:
@@ -349,6 +350,7 @@ class TestWeightedDatasetMixtureIntegration:
         assert dataloader.num_workers == train_pipeline_config.num_workers
 
     @pytest.mark.slow  # ~3.5 min
+    @retry_on_hf_flakiness()
     def test_integration_basic_functionality_with_same_fps_as_dataset(self, train_pipeline_config):
         """Test that the mixture with same fps as datasets actually uses the samples from the datasets."""
         # Create dataset

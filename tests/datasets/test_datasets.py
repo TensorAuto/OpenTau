@@ -37,6 +37,7 @@ from opentau.datasets.utils import (
     unflatten_dict,
 )
 from tests.fixtures.constants import DUMMY_CHW, DUMMY_HWC, DUMMY_REPO_ID
+from tests.utils import retry_on_hf_flakiness
 
 
 @pytest.fixture
@@ -368,6 +369,7 @@ def check_standard_data_format(item, delta_timestamps_params, dataset, train_pip
         "danaaubakirova/koch_test",
     ],
 )
+@retry_on_hf_flakiness()
 def test_lerobot_dataset_factory(dataset_config, train_pipeline_config, repo_id):
     """
     Tests that:
@@ -395,6 +397,7 @@ def test_lerobot_dataset_factory(dataset_config, train_pipeline_config, repo_id)
         "lerobot/aloha_mobile_cabinet",
     ],
 )
+@retry_on_hf_flakiness()
 def test_do_not_use_imagenet_stats(dataset_config, train_pipeline_config, repo_id):
     """
     Tests that:

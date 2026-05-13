@@ -29,6 +29,7 @@ from opentau.scripts.attach_metadata import (
     _update_episodes_jsonl,
     _update_info_json_features,
 )
+from tests.utils import retry_on_hf_flakiness
 
 # Fixtures
 
@@ -283,6 +284,7 @@ def _synthesize_annotations(episodes: dict[int, dict]) -> list[dict]:
 
 
 @pytest.mark.slow
+@retry_on_hf_flakiness()
 def test_attach_metadata_end_to_end_droid_100(tmp_path, dataset_config, train_pipeline_config):
     """Real-network integration test against lerobot/droid_100@v2.1.
 
