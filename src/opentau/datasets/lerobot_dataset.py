@@ -97,10 +97,11 @@ import datasets
 import numpy as np
 import packaging.version
 import PIL.Image
+import pyarrow.dataset as pa_ds
 import torch
 import torch.nn.functional as F  # noqa: N812
 import torch.utils
-from datasets import concatenate_datasets, load_dataset
+from datasets import Dataset, concatenate_datasets
 from einops import rearrange
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from huggingface_hub.constants import REPOCARD_NAME
@@ -1551,14 +1552,13 @@ class LeRobotDataset(BaseDataset):
 
     def load_hf_dataset(self) -> datasets.Dataset:
         """hf_dataset contains all the observations, states, actions, rewards, etc."""
-        if self.episodes is None:
-            path = str(self.root / "data")
-            hf_dataset = load_dataset("parquet", data_dir=path, split="train")
-        else:
-            files = [str(self.root / self.meta.get_data_file_path(ep_idx)) for ep_idx in self.episodes]
-            hf_dataset = load_dataset("parquet", data_files=files, split="train")
-
-        # TODO(aliberts): hf_dataset.set_format("torch")
+        data_dir = self.root / "data"
+        paths = sorted(data_dir.glob("*/*.parquet"))
+        if not paths:
+            raise FileNotFoundError(f"No parquet files under {data_dir}")
+        features = get_hf_features_from_features(self.meta.features)
+        filters = pa_ds.field("episode_index").isin(self.episodes) if self.episodes is not None else None
+        hf_dataset = Dataset.from_parquet([str(p) for p in paths], filters=filters, features=features)
         hf_dataset.set_transform(hf_transform_to_torch)
         return hf_dataset
 
