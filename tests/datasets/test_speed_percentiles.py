@@ -1,0 +1,322 @@
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Tests for the per-task percentile bucketing in :mod:`opentau.datasets.speed_percentiles`.
+
+Pin the ranking semantics, the sparse-task fallback, and the on-disk
+persistence contract so future edits to the formula or the JSONL schema
+can't silently change `speed_raw` distributions.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import os
+import stat
+
+import pytest
+
+from opentau.datasets.speed_percentiles import (
+    MIN_EPISODES_FOR_PERCENTILES,
+    SPARSE_TASK_BUCKET,
+    SPEED_BUCKET_LABELS,
+    SPEED_PERCENTILES,
+    SPEED_PERCENTILES_PATH,
+    bucket_episode_length,
+    compute_task_percentiles,
+    load_or_compute_speed_percentiles,
+)
+from opentau.datasets.utils import load_jsonlines
+
+
+def _episodes(task_to_lengths: dict[str, list[int]]) -> dict[int, dict]:
+    """Build a `meta.episodes`-shaped dict from a `{task: [lengths]}` map."""
+    out: dict[int, dict] = {}
+    next_ep = 0
+    for task, lengths in task_to_lengths.items():
+        for length in lengths:
+            out[next_ep] = {"episode_index": next_ep, "tasks": [task], "length": length}
+            next_ep += 1
+    return out
+
+
+def _task_index(task_to_lengths: dict[str, list[int]]) -> dict[str, int]:
+    return {task: i for i, task in enumerate(task_to_lengths)}
+
+
+class TestComputeTaskPercentiles:
+    def test_well_populated_returns_ten_ascending_floats(self):
+        # 100 distinct lengths well above the threshold.
+        lengths = list(range(100, 200))
+        out = compute_task_percentiles({0: lengths})
+        assert out[0] is not None
+        assert len(out[0]) == len(SPEED_PERCENTILES) == 10
+        assert all(isinstance(p, float) for p in out[0])
+        assert out[0] == sorted(out[0])
+
+    def test_single_episode_task_returns_none(self):
+        out = compute_task_percentiles({0: [123]})
+        assert out[0] is None
+
+    def test_two_episode_task_returns_none(self):
+        out = compute_task_percentiles({0: [100, 200]})
+        assert out[0] is None
+
+    def test_below_threshold_distinct_returns_none(self):
+        # 100 episodes but only 9 distinct lengths → still sparse.
+        lengths = ([10, 20, 30, 40, 50, 60, 70, 80, 90] * 12)[:100]
+        assert len(set(lengths)) < MIN_EPISODES_FOR_PERCENTILES
+        out = compute_task_percentiles({0: lengths})
+        assert out[0] is None
+
+    def test_all_equal_lengths_returns_none(self):
+        out = compute_task_percentiles({0: [200] * 100})
+        assert out[0] is None
+
+    def test_per_task_independence(self):
+        out = compute_task_percentiles(
+            {
+                0: list(range(100, 200)),  # well populated
+                1: [42],  # single-episode sparse
+                2: [10] * 50,  # all-equal sparse
+            }
+        )
+        assert out[0] is not None
+        assert out[1] is None
+        assert out[2] is None
+
+
+class TestBucketEpisodeLength:
+    @pytest.fixture
+    def percentiles(self) -> list[float]:
+        # Hand-picked round numbers so boundary tests are unambiguous.
+        return [50.0, 100.0, 150.0, 200.0, 250.0, 300.0, 350.0, 400.0, 450.0, 500.0]
+
+    def test_below_p5_returns_zero(self, percentiles):
+        assert bucket_episode_length(0, percentiles) == 0
+        assert bucket_episode_length(49, percentiles) == 0
+
+    def test_at_p5_exactly_returns_ten(self, percentiles):
+        # Tie at p5 lands in the upper bucket per searchsorted(side='right').
+        assert bucket_episode_length(50, percentiles) == 10
+
+    def test_at_p95_exactly_returns_one_hundred(self, percentiles):
+        assert bucket_episode_length(500, percentiles) == 100
+
+    def test_above_p95_returns_one_hundred(self, percentiles):
+        assert bucket_episode_length(99999, percentiles) == 100
+
+    @pytest.mark.parametrize(
+        "length, expected",
+        [
+            (49, 0),
+            (50, 10),
+            (75, 10),
+            (100, 20),
+            (150, 30),
+            (200, 40),
+            (250, 50),
+            (300, 60),
+            (350, 70),
+            (400, 80),
+            (450, 90),
+            (500, 100),
+            (501, 100),
+        ],
+    )
+    def test_boundary_walk(self, percentiles, length, expected):
+        assert bucket_episode_length(length, percentiles) == expected
+
+    def test_sparse_fallback_returns_median_bucket(self):
+        assert bucket_episode_length(123, None) == SPARSE_TASK_BUCKET == 50
+
+    def test_returns_python_int(self, percentiles):
+        # `_emit_optional_keys` later wraps with `int(raw)`; numpy ints
+        # would slip through but a plain Python int is the contract.
+        out = bucket_episode_length(75, percentiles)
+        assert type(out) is int
+
+    def test_label_set_invariant(self, percentiles):
+        # Every possible length must map to one of the 11 declared labels.
+        for length in (0, 49, 50, 100, 250, 500, 9999):
+            assert bucket_episode_length(length, percentiles) in SPEED_BUCKET_LABELS
+
+
+class TestLoadOrComputeSpeedPercentiles:
+    def test_writes_file_when_absent(self, tmp_path):
+        task_to_lengths = {"taskA": list(range(100, 200))}
+        episodes = _episodes(task_to_lengths)
+        t2i = _task_index(task_to_lengths)
+
+        out = load_or_compute_speed_percentiles(tmp_path, episodes, t2i)
+        path = tmp_path / SPEED_PERCENTILES_PATH
+        assert path.is_file()
+        assert out[0] is not None and len(out[0]) == 10
+
+        # Round-trip: bucket using both the in-memory dict and what was
+        # written to disk yields the same answer.
+        rows = load_jsonlines(path)
+        on_disk = {row["task_index"]: row["percentiles"] for row in rows}
+        for length in (50, 150, 250, 350, 500):
+            assert bucket_episode_length(length, out[0]) == bucket_episode_length(length, on_disk[0])
+
+    def test_existing_file_is_loaded_verbatim(self, tmp_path):
+        # Pre-write a hand-crafted file with values that compute would
+        # never produce — proves we read it without re-computing.
+        path = tmp_path / SPEED_PERCENTILES_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        from opentau.datasets.utils import write_jsonlines
+
+        write_jsonlines(
+            [
+                {
+                    "task_index": 0,
+                    "task": "taskA",
+                    "n_episodes": 999,
+                    "percentiles": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
+                }
+            ],
+            path,
+        )
+
+        # Episodes that would naturally yield very different percentiles.
+        task_to_lengths = {"taskA": list(range(1000, 2000))}
+        out = load_or_compute_speed_percentiles(
+            tmp_path, _episodes(task_to_lengths), _task_index(task_to_lengths)
+        )
+        # The hand-written percentiles are returned, not what compute
+        # would have produced from the episodes.
+        assert out[0] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+
+    def test_round_trip_preserves_buckets(self, tmp_path):
+        task_to_lengths = {"taskA": list(range(100, 200))}
+        episodes = _episodes(task_to_lengths)
+        t2i = _task_index(task_to_lengths)
+
+        first = load_or_compute_speed_percentiles(tmp_path, episodes, t2i)
+        # Second call hits the file path.
+        second = load_or_compute_speed_percentiles(tmp_path, episodes, t2i)
+
+        for length in (50, 100, 150, 175, 200, 250):
+            assert bucket_episode_length(length, first[0]) == bucket_episode_length(length, second[0])
+
+    def test_sparse_task_persisted_with_null_percentiles(self, tmp_path):
+        task_to_lengths = {"taskA": [42]}
+        out = load_or_compute_speed_percentiles(
+            tmp_path, _episodes(task_to_lengths), _task_index(task_to_lengths)
+        )
+        assert out[0] is None
+
+        rows = load_jsonlines(tmp_path / SPEED_PERCENTILES_PATH)
+        assert rows[0]["task_index"] == 0
+        assert rows[0]["n_episodes"] == 1
+        assert rows[0]["percentiles"] is None
+
+        # Reload reproduces the None.
+        out2 = load_or_compute_speed_percentiles(
+            tmp_path, _episodes(task_to_lengths), _task_index(task_to_lengths)
+        )
+        assert out2[0] is None
+        # And the bucket lookup falls back to SPARSE_TASK_BUCKET.
+        assert bucket_episode_length(42, out2[0]) == SPARSE_TASK_BUCKET
+
+    def test_multi_task_episode_uses_first_task(self, tmp_path):
+        # Episodes whose `tasks` list has >1 entry silently use tasks[0].
+        episodes = {
+            0: {"episode_index": 0, "tasks": ["taskA", "taskB"], "length": 100},
+            1: {"episode_index": 1, "tasks": ["taskA"], "length": 200},
+        }
+        t2i = {"taskA": 0, "taskB": 1}
+        # No raise.
+        out = load_or_compute_speed_percentiles(tmp_path, episodes, t2i)
+        # taskA got both episodes (sparse, n=2 distinct → None).
+        # taskB got none and is therefore absent from the result.
+        assert 0 in out and out[0] is None
+        assert 1 not in out
+
+    def test_falls_back_to_in_memory_on_readonly_root(self, tmp_path, caplog, monkeypatch):
+        # Make the meta/ dir read-only so write_jsonlines raises.
+        meta_dir = tmp_path / "meta"
+        meta_dir.mkdir()
+        meta_dir.chmod(stat.S_IRUSR | stat.S_IXUSR)
+        # Force the write attempt to fail even if permissions don't (CI
+        # often runs as root and ignores chmod). We patch write_jsonlines
+        # in the speed_percentiles module to always raise.
+        from opentau.datasets import speed_percentiles as sp
+
+        def _raise(*a, **kw):
+            raise PermissionError("read-only test")
+
+        monkeypatch.setattr(sp, "write_jsonlines", _raise)
+        # Reset the per-root warn-once cache so caplog sees the message.
+        monkeypatch.setattr(sp, "_READONLY_WARNED", set())
+
+        task_to_lengths = {"taskA": list(range(100, 200))}
+        with caplog.at_level("WARNING"):
+            out = load_or_compute_speed_percentiles(
+                tmp_path, _episodes(task_to_lengths), _task_index(task_to_lengths)
+            )
+
+        assert out[0] is not None and len(out[0]) == 10
+        assert any("speed percentiles" in rec.message for rec in caplog.records)
+        # Restore so tmp_path cleanup can remove the dir.
+        with contextlib.suppress(OSError):
+            meta_dir.chmod(stat.S_IRWXU)
+
+    def test_handles_missing_task_in_lookup_defensively(self, tmp_path):
+        # A hand-edited percentile file might omit a task that exists in
+        # episodes; the consumer (lerobot_dataset's pre-bucket pass) uses
+        # `.get(task_idx)` to fall back to the sparse bucket.
+        path = tmp_path / SPEED_PERCENTILES_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        from opentau.datasets.utils import write_jsonlines
+
+        write_jsonlines([], path)
+
+        out = load_or_compute_speed_percentiles(tmp_path, {}, {})
+        assert out == {}
+        # `.get(missing_idx)` returns None → bucket 50.
+        assert bucket_episode_length(123, out.get(99)) == SPARSE_TASK_BUCKET
+
+
+class TestLiberoSnapshot:
+    """Sanity check against the well-formed `physical-intelligence/libero`
+    distribution: every task should be well populated (>= 10 distinct
+    lengths) and each yields 10 ascending percentiles spanning a sensible
+    frame range. Skips when the dataset isn't cached locally.
+    """
+
+    def test_compute_smoke(self):
+        lerobot_root = os.environ.get("LEROBOT_HOME") or os.path.expanduser("~/.cache/huggingface/lerobot")
+        ep_path = os.path.join(lerobot_root, "physical-intelligence/libero/meta/episodes.jsonl")
+        if not os.path.isfile(ep_path):
+            pytest.skip(f"no local copy of physical-intelligence/libero at {ep_path}")
+        import json
+        from collections import defaultdict
+
+        by_task: dict[str, list[int]] = defaultdict(list)
+        with open(ep_path) as f:
+            for line in f:
+                d = json.loads(line)
+                assert len(d["tasks"]) == 1
+                by_task[d["tasks"][0]].append(d["length"])
+        # Re-key by integer task_index for compute_task_percentiles.
+        as_idx = {i: by_task[t] for i, t in enumerate(by_task)}
+        out = compute_task_percentiles(as_idx)
+        for idx, pcts in out.items():
+            assert pcts is not None, f"task {idx} should be well populated"
+            assert pcts == sorted(pcts)
+            assert all(p > 0 for p in pcts)
+            # Every observed length lands in a valid bucket label.
+            for length in as_idx[idx]:
+                assert bucket_episode_length(length, pcts) in SPEED_BUCKET_LABELS

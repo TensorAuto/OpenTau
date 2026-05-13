@@ -190,7 +190,7 @@ class TestEnvMetadataConfig:
         assert cfg.control_mode is None
 
     @pytest.mark.parametrize("mode", ["joint", "ee"])
-    @pytest.mark.parametrize("speed", [10, 50, 100, 1000])
+    @pytest.mark.parametrize("speed", [0, 10, 50, 90, 100])
     def test_valid_values_pass(self, mode, speed):
         EnvMetadataConfig(
             speed=speed,
@@ -200,9 +200,12 @@ class TestEnvMetadataConfig:
             control_mode=mode,
         )
 
-    @pytest.mark.parametrize("bad_speed", [-10, 0, 1, 5, 9, 11, 15, 1001])
-    def test_speed_must_be_positive_multiple_of_10(self, bad_speed):
-        with pytest.raises(ValueError, match=r"speed must be a positive multiple of 10"):
+    @pytest.mark.parametrize("bad_speed", [-10, -1, 1, 5, 9, 11, 15, 105, 110, 1000, 1001])
+    def test_speed_must_be_in_zero_to_100_step_10(self, bad_speed):
+        with pytest.raises(
+            ValueError,
+            match=r"speed must be a non-negative multiple of 10 in \[0, 100\]",
+        ):
             EnvMetadataConfig(speed=bad_speed)
 
     def test_speed_rejects_bool(self):
@@ -211,7 +214,7 @@ class TestEnvMetadataConfig:
 
     def test_speed_rejects_float(self):
         with pytest.raises(TypeError, match=r"speed must be int"):
-            EnvMetadataConfig(speed=500.0)
+            EnvMetadataConfig(speed=50.0)
 
     @pytest.mark.parametrize("bad_quality", [0, 6, -1, 100])
     def test_quality_out_of_range(self, bad_quality):

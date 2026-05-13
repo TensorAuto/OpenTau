@@ -112,6 +112,10 @@ from opentau.configs.train import TrainPipelineConfig
 from opentau.constants import HF_OPENTAU_HOME
 from opentau.datasets.compute_stats import aggregate_stats, compute_episode_stats
 from opentau.datasets.image_writer import AsyncImageWriter, write_image
+from opentau.datasets.speed_percentiles import (
+    bucket_episode_length,
+    load_or_compute_speed_percentiles,
+)
 from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
 from opentau.datasets.utils import (
     DEFAULT_FEATURES,
@@ -237,24 +241,6 @@ def suppress_control_mode_warning(repo_id: str) -> None:
     once ``__init__`` has emitted the warning, further calls are a no-op.
     """
     _CONTROL_MODE_WARNED.add(repo_id)
-
-
-_SPEED_BUCKET_SECONDS = 10
-
-
-def speed_duration_bucket_s(num_frames: int, fps: float) -> int:
-    """Bucket an episode's physical duration to the nearest 10 seconds.
-
-    Used to compute the ``speed`` optional key emitted by
-    ``LeRobotDataset.__getitem__``. Working in seconds (rather than native
-    frames) makes the bucket invariant to the dataset's native FPS and to the
-    mixture's ``cfg.dataset_mixture.action_freq`` resampling — see
-    :ref:`standard-data-format-optional-keys` in ``docs/source/concepts.rst``.
-
-    Uses Python's built-in ``round()`` (banker's rounding), e.g. a 25 s
-    episode buckets to 20, not 30.
-    """
-    return int(round((num_frames / fps) / _SPEED_BUCKET_SECONDS) * _SPEED_BUCKET_SECONDS)
 
 
 class DatasetMetadata:
@@ -1418,6 +1404,31 @@ class LeRobotDataset(BaseDataset):
                 starts = [0]
             self.segment_starts_by_episode[ep] = np.asarray(starts, dtype=np.int64)
 
+        # Per-task percentile lookup for `speed_raw`. Computed once per
+        # dataset on first load and persisted to meta/speed_percentiles.jsonl;
+        # subsequent loads just read the file. See
+        # opentau.datasets.speed_percentiles for the bucketing scheme.
+        self.speed_percentiles_by_task: dict[int, list[float] | None] = load_or_compute_speed_percentiles(
+            root=self.root,
+            episodes=self.meta.episodes,
+            task_to_task_index=self.meta.task_to_task_index,
+        )
+        # Pre-compute the bucket per episode so __getitem__ stays a dict
+        # lookup. .get() defends against the impossible "task with 0
+        # episodes in the on-disk file" case (e.g. a hand-edited percentile
+        # file): a missing entry falls back to the sparse-task bucket.
+        self.speed_raw_by_episode: dict[int, int] = {}
+        for ep, info in self.meta.episodes.items():
+            tasks = info.get("tasks") or []
+            if not tasks:
+                self.speed_raw_by_episode[ep] = bucket_episode_length(self.episode_lengths[ep], None)
+                continue
+            task_idx = self.meta.task_to_task_index[tasks[0]]
+            self.speed_raw_by_episode[ep] = bucket_episode_length(
+                self.episode_lengths[ep],
+                self.speed_percentiles_by_task.get(task_idx),
+            )
+
         # One memory string per segment. Read once from the parquet's "memory"
         # column at segment-start indices so __getitem__ can resolve
         # ``next_memory`` without a secondary parquet query per sample. When the
@@ -2034,7 +2045,7 @@ class LeRobotDataset(BaseDataset):
             quality = self.meta.episodes[ep_idx].get("quality")
             if quality is not None:
                 item["quality_raw"] = int(quality)
-            item["speed_raw"] = speed_duration_bucket_s(self.episode_lengths[ep_idx], self.fps)
+            item["speed_raw"] = self.speed_raw_by_episode[ep_idx]
             item.update(self._load_subgoal_frames(ep_idx, frame_in_ep))
 
             item = self._to_standard_data_format(item)

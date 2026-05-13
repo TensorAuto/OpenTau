@@ -371,7 +371,7 @@ class TestPI07LowLevelIntegration:
             "actions": torch.randn(batch_size, CHUNK_SIZE, MAX_ACTION_DIM),
             "prompt": ["Pick up the red block"],
             "response": ["Grasp the red block"],
-            "speed": torch.tensor([500]),
+            "speed": torch.tensor([50]),
             "quality": torch.tensor([3]),
             "mistake": torch.tensor([0]),
             "speed_is_pad": torch.tensor([False]),
@@ -549,7 +549,7 @@ class TestPI07LowLevelIntegration:
             "state": batch_cuda["state"],  # (B, T, D)
             "prompt": ["Pick up the red block"],
             "response": ["Grasp the red block"],
-            "speed": torch.tensor([500], device="cuda"),
+            "speed": torch.tensor([50], device="cuda"),
             "quality": torch.tensor([3], device="cuda"),
             "mistake": torch.tensor([0], device="cuda"),
             "speed_is_pad": torch.tensor([False], device="cuda"),
@@ -752,7 +752,7 @@ class TestPI07LowLevelRegression:
     def _make_metadata_batch(batch_size: int) -> dict[str, torch.Tensor]:
         return {
             "state": torch.randn(batch_size, N_OBS_STEPS, MAX_STATE_DIM, device="cuda", dtype=torch.bfloat16),
-            "speed": torch.tensor([500] * batch_size, device="cuda"),
+            "speed": torch.tensor([50] * batch_size, device="cuda"),
             "quality": torch.tensor([3] * batch_size, device="cuda"),
             "mistake": torch.tensor([0] * batch_size, device="cuda"),
             "speed_is_pad": torch.tensor([False] * batch_size, device="cuda"),

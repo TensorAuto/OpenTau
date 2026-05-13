@@ -150,21 +150,31 @@ see :ref:`Training-time dropout <standard-data-format-optional-keys-dropout>`.
                                    # segment, differs at segment boundaries). Clipped at episode
                                    # end. Empty string when unavailable.
 
-        "speed": torch.LongTensor,     # Scalar; episode **duration in seconds** rounded to the nearest
-                                       # multiple of 10 (so short <5 s episodes bucket to 0). Computed as
-                                       # ``round(episode_length_frames / fps / 10) * 10`` from
-                                       # ``meta/episodes.jsonl["length"]`` and ``meta/info.json["fps"]``.
-                                       # Using seconds (rather than raw frames) makes the bucket
-                                       # comparable across datasets in a mixture: it is invariant to both
-                                       # the dataset's native FPS and to ``cfg.dataset_mixture.action_freq``
-                                       # (which resamples each dataset to a common rate at sample time).
+        "speed": torch.LongTensor,     # Scalar in {0, 10, 20, ..., 100}; **per-task decile rank** of this
+                                       # episode's length-in-frames. Lower = faster, higher = slower.
+                                       # Computed by grouping episodes from ``meta/episodes.jsonl`` by
+                                       # task (``tasks[0]`` — the codebase assumes the list is length-1)
+                                       # and bucketing each episode's length against the
+                                       # ``[p5, p15, ..., p95]`` boundaries of *its own task's*
+                                       # length distribution. Episodes shorter than p5 bucket to 0;
+                                       # episodes at or above p95 bucket to 100; ties at a boundary
+                                       # land in the upper bucket (``p_X <= length < p_Y``). Per-task
+                                       # boundaries are persisted to ``meta/speed_percentiles.jsonl``;
+                                       # delete that file to recompute (e.g. after appending episodes).
+                                       # Tasks with fewer than 10 distinct episode lengths are treated
+                                       # as sparse and bucket every episode to 50 (the median-equivalent
+                                       # neutral default). The per-task framing makes the bucket carry
+                                       # task-relative information: "this is a fast example of *this*
+                                       # task" rather than "this episode lasted N seconds". See
+                                       # :mod:`opentau.datasets.speed_percentiles` for the helpers.
                                        # Populated unconditionally — available on every LeRobotDataset
                                        # regardless of whether the dataset went through
-                                       # ``attach_metadata``. Name is historical; think
-                                       # "episode-duration bucket".
-        "speed_is_pad": torch.BoolTensor,  # True only when the dataset has no episode-length metadata
-                                           # (pure VQA / legacy fake datasets) or when the metadata drop
-                                           # rolls in _emit_optional_keys fire at training time.
+                                       # ``attach_metadata``.
+        "speed_is_pad": torch.BoolTensor,  # True only when the metadata drop rolls in
+                                           # _emit_optional_keys fire at training time. The percentile
+                                           # compute itself never produces a pad signal: sparse-task
+                                           # episodes still get a (neutral) bucket value rather than
+                                           # being padded.
 
         "mistake": torch.BoolTensor,   # Scalar; True iff the current segment's success flag is False.
         "mistake_is_pad": torch.BoolTensor,

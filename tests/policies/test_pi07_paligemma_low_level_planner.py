@@ -348,7 +348,7 @@ class TestPI07LowLevelPlannerIntegration:
             "actions": torch.randn(batch_size, CHUNK_SIZE, MAX_ACTION_DIM),
             "prompt": ["Pick up the red block"],
             "response": ["Grasp the red block"],
-            "speed": torch.tensor([500]),
+            "speed": torch.tensor([50]),
             "quality": torch.tensor([3]),
             "mistake": torch.tensor([0]),
             "speed_is_pad": torch.tensor([False]),
@@ -526,7 +526,7 @@ class TestPI07LowLevelPlannerIntegration:
             "state": batch_cuda["state"][:, 0],  # (B, D)
             "prompt": ["Pick up the red block"],
             "response": ["Grasp the red block"],
-            "speed": torch.tensor([500], device="cuda"),
+            "speed": torch.tensor([50], device="cuda"),
             "quality": torch.tensor([3], device="cuda"),
             "mistake": torch.tensor([0], device="cuda"),
             "speed_is_pad": torch.tensor([False], device="cuda"),
@@ -1456,7 +1456,7 @@ class TestPI07LowLevelPlannerMetadataEmbedding:
         speed_pad: torch.Tensor | bool,
         quality_pad: torch.Tensor | bool,
         mistake_pad: torch.Tensor | bool,
-        speed_val: float = 500.0,
+        speed_val: float = 50.0,
         quality_val: float = 3.0,
         mistake_val: bool = False,
     ) -> dict:
@@ -1648,7 +1648,7 @@ class TestPI07LowLevelPlannerMetadataEmbedding:
         bsz = 3
         batch = {
             "state": torch.zeros(bsz, 1, MAX_STATE_DIM),
-            "speed": torch.tensor([100.0, 200.0, 300.0]),
+            "speed": torch.tensor([10.0, 50.0, 90.0]),
             "quality": torch.tensor([1.0, 2.0, 3.0]),
             "mistake": torch.tensor([False, True, False]),
             # Sample 0: all pad. Sample 1: all real. Sample 2: only speed real.

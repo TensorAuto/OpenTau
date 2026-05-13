@@ -32,11 +32,11 @@ from opentau.utils.accelerate_utils import get_proc_accelerator
 # via ``get_args`` so the two can't drift if a new mode is ever added.
 ControlMode = Literal["joint", "ee"]
 CONTROL_MODE_CHOICES: tuple[str, ...] = get_args(ControlMode)
-# Training-side bucket size for ``speed_raw`` in seconds. Must stay in
-# lockstep with the divisor used by ``BaseDataset._emit_optional_keys``
-# (currently a literal ``10`` inside the ``round(duration_s / N) * N``
-# expression in ``src/opentau/datasets/lerobot_dataset.py``). Update both
-# call sites together if the bucket size ever changes.
+# Step size between consecutive ``speed`` bucket labels. Must match the
+# spacing of
+# :data:`opentau.datasets.speed_percentiles.SPEED_BUCKET_LABELS`
+# (``0, 10, 20, ..., 100``); update both call sites together if the
+# label set ever changes.
 SPEED_BUCKET_SECONDS = 10
 
 
@@ -60,9 +60,11 @@ class EnvMetadataConfig:
     validation but the values will be ignored downstream.
 
     Args:
-        speed: Positive integer multiple of ``SPEED_BUCKET_SECONDS`` (= 10
-            seconds; matches the rounded episode-duration bucket used at
-            training time), or ``None``.
+        speed: Integer in ``[0, 100]`` and a multiple of
+            ``SPEED_BUCKET_SECONDS`` (= 10), or ``None``. Matches the
+            per-task percentile-rank bucket used at training time
+            (``0`` = fastest decile, ``100`` = slowest); see
+            :mod:`opentau.datasets.speed_percentiles`.
         quality: Integer in ``[1, 5]``, or ``None``.
         mistake: ``True`` / ``False``, or ``None``. Note that ``False`` is
             semantically distinct from ``None``: ``False`` emits a
@@ -87,10 +89,10 @@ class EnvMetadataConfig:
         if self.speed is not None:
             if not isinstance(self.speed, int) or isinstance(self.speed, bool):
                 raise TypeError(f"env.metadata.speed must be int, got {type(self.speed).__name__}")
-            if self.speed <= 0 or self.speed % SPEED_BUCKET_SECONDS != 0:
+            if self.speed < 0 or self.speed > 100 or self.speed % SPEED_BUCKET_SECONDS != 0:
                 raise ValueError(
-                    f"env.metadata.speed must be a positive multiple of "
-                    f"{SPEED_BUCKET_SECONDS}, got {self.speed}"
+                    f"env.metadata.speed must be a non-negative multiple of "
+                    f"{SPEED_BUCKET_SECONDS} in [0, 100], got {self.speed}"
                 )
         if self.quality is not None:
             if not isinstance(self.quality, int) or isinstance(self.quality, bool):
