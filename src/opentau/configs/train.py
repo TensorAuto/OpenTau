@@ -177,6 +177,18 @@ class TrainPipelineConfig(HubMixin):
     # gRPC inference server configuration
     server: ServerConfig = field(default_factory=ServerConfig)
 
+    # Ring attention (sequence parallelism) group size.
+    #
+    # When set together with a ring-aware policy (pi07 with
+    # ``policy.attention_implementation="ring"``), splits the WORLD process
+    # group into ``world_size / ring_group_size`` ring sub-groups of this
+    # size. Sequence parallelism happens within each ring; DP replication
+    # is implicit via ZeRO over WORLD with a ``loss *= ring_group_size``
+    # pre-backward correction (see ``scripts/train.py``). Must divide
+    # world size. ``None`` (default) keeps single-device / pure-DP
+    # behaviour.
+    ring_group_size: int | None = None
+
     def __post_init__(self):
         """Initialize post-creation attributes and validate batch size configuration."""
         self.checkpoint_path = None

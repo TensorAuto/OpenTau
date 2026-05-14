@@ -284,10 +284,10 @@ class Gemma3WithExpertConfig(PretrainedConfig):
                 "`train_expert_only=False` (the high-level-planner default) when "
                 "`disable_action_expert=True`."
             )
-        if self.attention_implementation not in ["eager", "sdpa", "fa2"]:
+        if self.attention_implementation not in ["eager", "sdpa", "fa2", "ring"]:
             raise ValueError(
                 f"Wrong value provided for `attention_implementation` ({self.attention_implementation}). "
-                "Expected 'eager', 'sdpa', or 'fa2'."
+                "Expected 'eager', 'sdpa', 'fa2', or 'ring'."
             )
         if self.attention_implementation == "fa2":
             # fa2 has been considered but never implemented for pi07 because of
@@ -849,9 +849,41 @@ class Gemma3WithExpertModel(PreTrainedModel):
         impl = self.config.attention_implementation
         if impl == "sdpa":
             return self.sdpa_attention_forward
+        if impl == "ring":
+            return self.ring_attention_forward
         # "eager" and legacy "fa2" both land here; "fa2" already warned during
         # config construction.
         return self.eager_attention_forward
+
+    def ring_attention_forward(
+        self,
+        attention_mask: torch.Tensor,
+        batch_size: int,
+        head_dim: int,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        scaling: float | None = None,
+    ) -> torch.Tensor:
+        """Ring attention dispatch matching the eager/sdpa signature.
+
+        When no ring group is active (single device / world_size 1) the
+        underlying call collapses to SDPA so single-GPU tests don't depend on
+        torch.distributed init.
+        """
+        from opentau.policies.pi07.ring_attention import ring_attention_forward as _ring_fwd
+
+        return _ring_fwd(
+            attention_mask,
+            batch_size,
+            head_dim,
+            query_states,
+            key_states,
+            value_states,
+            num_query_heads=self._text_config.num_attention_heads,
+            num_kv_heads=self._text_config.num_key_value_heads,
+            scaling=scaling,
+        )
 
     def eager_attention_forward(
         self,
@@ -1060,43 +1092,113 @@ class Gemma3WithExpertModel(PreTrainedModel):
         if fill_kv_cache and past_key_values is None:
             past_key_values = {}
 
-        use_ckpt = self.config.gradient_checkpointing and self.training
+        # Ring attention sharding: under attention_implementation="ring"
+        # and a no-cache forward, split inputs_embeds + position_ids along
+        # the sequence axis so every decoder layer sees only this rank's
+        # contiguous slice. The replicated attention_mask is sliced inside
+        # the ring kernel using rank offsets. After the decoder stack we
+        # all-gather along the seq axis before the final norms, so the
+        # rest of the policy sees the full sequence as usual. Padding to a
+        # multiple of ring world size is done here too; the mask masks the
+        # pad inert. ZeRO-2 grad checkpointing is intentionally replaced by
+        # the blockwise rematerialization performed inside _RingAttention.
+        from opentau.policies.pi07.ring_attention import (
+            gather_seq,
+            get_ring_group,
+            ring_world_size,
+            split_seq,
+        )
+
+        ring_active = (
+            self.config.attention_implementation == "ring"
+            and not use_cache
+            and not fill_kv_cache
+            and get_ring_group() is not None
+            and ring_world_size() > 1
+        )
+        ring_pad_amount = 0
+        original_seq_lens: list[int] = []
+        if ring_active:
+            ring_ws = ring_world_size()
+            for hs in inputs_embeds:
+                original_seq_lens.append(0 if hs is None else hs.shape[1])
+            # Pi07 training calls forward one stream at a time; pick the
+            # active stream and pad / slice it. Multi-stream + ring is not
+            # supported and would have a non-contiguous global-seq layout.
+            active_streams = [i for i, hs in enumerate(inputs_embeds) if hs is not None]
+            if len(active_streams) != 1:
+                raise ValueError(
+                    "attention_implementation='ring' currently supports single-stream "
+                    f"forwards only; got {len(active_streams)} active stream(s). "
+                    "Pi07 training already issues single-stream forwards for VLM and "
+                    "action-expert separately — check the caller."
+                )
+            active = active_streams[0]
+            hs = inputs_embeds[active]
+            assert hs is not None
+            bsz, seq, hid = hs.shape
+            rem = seq % ring_ws
+            if rem != 0:
+                ring_pad_amount = ring_ws - rem
+                pad_embed = torch.zeros((bsz, ring_pad_amount, hid), dtype=hs.dtype, device=hs.device)
+                hs = torch.cat([hs, pad_embed], dim=1)
+                if position_ids is not None:
+                    pad_pos = torch.zeros(
+                        (bsz, ring_pad_amount), dtype=position_ids.dtype, device=position_ids.device
+                    )
+                    position_ids = torch.cat([position_ids, pad_pos], dim=1)
+                # Pad mask: add ring_pad_amount along both Q and K axes
+                # with False so padded queries attend to nothing and
+                # padded keys are not attended to by anything.
+                if attention_mask is not None:
+                    am = attention_mask
+                    pad_q = torch.zeros(
+                        (am.shape[0], ring_pad_amount, am.shape[2]),
+                        dtype=am.dtype,
+                        device=am.device,
+                    )
+                    am = torch.cat([am, pad_q], dim=1)
+                    pad_k = torch.zeros(
+                        (am.shape[0], am.shape[1], ring_pad_amount),
+                        dtype=am.dtype,
+                        device=am.device,
+                    )
+                    am = torch.cat([am, pad_k], dim=2)
+                    attention_mask = am
+            # Shard along seq dim.
+            new_embeds = list(inputs_embeds)
+            new_embeds[active] = split_seq(hs, seq_dim=1)
+            inputs_embeds = new_embeds
+            if position_ids is not None:
+                position_ids = split_seq(position_ids, seq_dim=1)
+
         for layer_idx, layer in enumerate(self.interleaved_layers):
-            if use_ckpt:
-                # use_reentrant=False is the modern, DDP-safe path; it
-                # preserves RNG state across recompute so dropout is
-                # deterministic, participates cleanly in autograd's
-                # saved_tensors_hooks, and is compatible with FSDP's
-                # all-gather hooks (the wrap target is the
-                # InterleavedDecoderLayer, so its sub-component params are
-                # all gathered before this checkpoint runs).
-                inputs_embeds = torch.utils.checkpoint.checkpoint(
-                    layer,
-                    inputs_embeds,
-                    attention_mask,
-                    position_ids,
-                    past_key_values,
-                    n_cross_att_tokens,
-                    use_cache,
-                    fill_kv_cache,
-                    adarms_cond,
-                    batch_size,
-                    layer_idx,
-                    use_reentrant=False,
-                )
-            else:
-                inputs_embeds = layer(
-                    inputs_embeds,
-                    attention_mask,
-                    position_ids,
-                    past_key_values,
-                    n_cross_att_tokens,
-                    use_cache,
-                    fill_kv_cache,
-                    adarms_cond,
-                    batch_size,
-                    layer_idx,
-                )
+            inputs_embeds = layer(
+                inputs_embeds,
+                attention_mask,
+                position_ids,
+                past_key_values,
+                n_cross_att_tokens,
+                use_cache,
+                fill_kv_cache,
+                adarms_cond,
+                batch_size,
+                layer_idx,
+            )
+
+        if ring_active:
+            # Gather along seq dim before the final norms so downstream
+            # heads / loss see the full sequence layout they expect.
+            gathered: list[torch.FloatTensor | None] = []
+            for stream_idx, hs in enumerate(inputs_embeds):
+                if hs is None:
+                    gathered.append(None)
+                    continue
+                full = gather_seq(hs, seq_dim=1)
+                if ring_pad_amount > 0:
+                    full = full[:, : original_seq_lens[stream_idx]]
+                gathered.append(full)
+            inputs_embeds = gathered
 
         # Final norms.
         final_outputs: list[torch.Tensor | None] = []

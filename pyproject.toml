@@ -183,6 +183,9 @@ select = ["E4", "E7", "E9", "F", "I", "N", "B", "C4", "SIM"]
 "src/opentau/scripts/grpc/server.py" = ["N802"]
 # Uppercase names for rotation matrices follow standard math convention
 "src/opentau/scripts/recordhuman_to_lerobot.py" = ["N803", "N806"]
+# Attention math uses uppercase identifiers per the FlashAttention paper:
+# S=scores, P=softmax probs, O=output, LSE=log-sum-exp, D=row grad correction.
+"src/opentau/policies/pi07/ring_attention.py" = ["N803", "N806", "E741"]
 
 [tool.bandit]
 exclude_dirs = [

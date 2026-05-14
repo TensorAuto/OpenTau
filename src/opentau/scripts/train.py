@@ -73,10 +73,23 @@ def update_policy(
     lr_scheduler: AcceleratedScheduler | None = None,
 ) -> tuple[MetricsTracker, dict]:
     policy.train()
+    if train_config.ring_group_size is not None and train_config.ring_group_size > 1:
+        from opentau.policies.pi07.ring_attention import broadcast_batch_within_ring
+
+        broadcast_batch_within_ring(batch)
     losses = policy.forward(batch)
     loss = (
         train_config.loss_weighting["MSE"] * losses["MSE"] + train_config.loss_weighting["CE"] * losses["CE"]
     )
+
+    # 2D parallelism correction: ZeRO runs MEAN-over-WORLD on the gradient,
+    # but ring members share a single logical sample (each rank computes a
+    # partial gradient on its sequence slice; the sum across the ring is
+    # the true sample gradient). Pre-multiplying the loss by ring_group_size
+    # turns MEAN-over-WORLD into SUM-over-ring × MEAN-over-DP, which is
+    # what we want. No-op when ring is inactive.
+    if train_config.ring_group_size is not None and train_config.ring_group_size > 1:
+        loss = loss * train_config.ring_group_size
 
     accelerator.backward(loss)
     accelerator.unscale_gradients(optimizer=optimizer)
@@ -340,6 +353,30 @@ def train(cfg: TrainPipelineConfig):
     # Register accelerator globally for use in other modules, (e.g., detect current rank, etc.)
     set_proc_accelerator(accelerator)
 
+    # Build ring-attention sub-groups if requested. Sequence parallelism
+    # happens within each ring; DP-replication is implicit via ZeRO over
+    # WORLD with a loss-scale correction (see `train_step` below). Must
+    # come BEFORE `accelerator.prepare`: that call wraps the optimizer
+    # under DeepSpeed and reads the WORLD process group; we keep WORLD as
+    # ZeRO's group and only carve out a sub-group for the ring kernel.
+    if cfg.ring_group_size is not None and cfg.ring_group_size > 1:
+        import torch.distributed as _dist
+
+        from opentau.policies.pi07.ring_attention import build_ring_groups
+
+        if not _dist.is_available() or not _dist.is_initialized():
+            raise RuntimeError(
+                "ring_group_size requires torch.distributed to be initialised "
+                "before training starts. Launch via `accelerate launch` (or "
+                "torchrun) so the world is set up by the time `train()` is called."
+            )
+        ws = _dist.get_world_size()
+        if ws % cfg.ring_group_size != 0:
+            raise ValueError(
+                f"world_size ({ws}) must be divisible by ring_group_size ({cfg.ring_group_size})."
+            )
+        build_ring_groups(cfg.ring_group_size)
+
     # Must run before `encode_accelerator_state_dict` + `init_trackers` below so the
     # wandb-logged accelerator config and the value DeepSpeed consumes at prepare()
     # time both reflect TrainPipelineConfig.
@@ -403,7 +440,31 @@ def train(cfg: TrainPipelineConfig):
             logging.info(f"tracker initialized with wandb job id: {tracker.id}")
 
     if cfg.seed is not None:
-        set_seed(cfg.seed, accelerator=accelerator)
+        if cfg.ring_group_size is not None and cfg.ring_group_size > 1:
+            # Under ring attention, every rank in the same ring sub-group
+            # must see the same sample stream — they jointly attend over
+            # one logical sequence per step. Seeding by DP index instead
+            # of global process index achieves that without needing a
+            # per-step broadcast: ranks 0..R-1 share dp_rank=0, ranks
+            # R..2R-1 share dp_rank=1, etc.
+            from opentau.policies.pi07.ring_attention import dp_rank
+
+            magic_number = 12345
+            effective_seed = cfg.seed + dp_rank(cfg.ring_group_size) * magic_number
+            import random as _random
+
+            import numpy as _np
+
+            _random.seed(effective_seed)
+            _np.random.seed(effective_seed)
+            torch.manual_seed(effective_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(effective_seed)
+            from accelerate.utils import set_seed as _accel_set_seed
+
+            _accel_set_seed(effective_seed)
+        else:
+            set_seed(cfg.seed, accelerator=accelerator)
 
     # Enable anomaly detection for debugging NaN/Inf values
     # (warning: large computational overhead)
