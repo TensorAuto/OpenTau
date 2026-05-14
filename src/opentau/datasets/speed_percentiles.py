@@ -35,8 +35,10 @@ distributions in one rule.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
+import uuid
 from collections import defaultdict
 from pathlib import Path
 
@@ -160,13 +162,32 @@ def _atomic_write_jsonlines(rows: list[dict], path: Path) -> None:
     distributed run we additionally rank-gate the write (see
     :func:`load_or_compute_speed_percentiles`); the atomic rename is the
     fallback for cases where rank-gating doesn't apply.
+
+    Uses a per-writer UUID-suffixed tmp path so two concurrent writers
+    don't truncate each other's tmp file before the rename. ``os.replace``
+    is atomic on POSIX and on Windows for same-filesystem renames, so
+    once the tmp file is fully written the swap into ``path`` is the
+    point-of-commit; readers see either the previous file or the new
+    one, never a half-written one.
     """
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    write_jsonlines(rows, tmp_path)
-    os.replace(tmp_path, path)
+    tmp_path = path.with_suffix(f"{path.suffix}.{uuid.uuid4().hex}.tmp")
+    try:
+        write_jsonlines(rows, tmp_path)
+        os.replace(tmp_path, path)
+    finally:
+        # If write_jsonlines raised after creating the file, or os.replace
+        # failed, leave no orphan behind.
+        if tmp_path.exists():
+            with contextlib.suppress(OSError):
+                tmp_path.unlink()
 
 
-def _read_persisted(path: Path, current_total: int) -> dict[int, list[float] | None]:
+def _read_persisted(
+    path: Path,
+    current_total: int,
+    *,
+    warn: bool,
+) -> dict[int, list[float] | None]:
     """Load the percentile file and warn if its episode total is stale.
 
     A mismatch between the sum of on-disk ``n_episodes`` and the current
@@ -174,17 +195,21 @@ def _read_persisted(path: Path, current_total: int) -> dict[int, list[float] | N
     the file was first written. Per spec the file is still trusted —
     the warning is just to cut debugging time when a small-N first run
     accidentally freezes the percentile distribution.
+
+    ``warn`` is gated by the caller (typically ``acc.is_main_process``)
+    so an 8-rank run produces a single warning line, not eight.
     """
     rows = load_jsonlines(path)
-    on_disk_total = sum(int(row.get("n_episodes", 0)) for row in rows)
-    if on_disk_total != current_total:
-        logging.warning(
-            "Stale %s: on-disk per-task n_episodes sums to %d, current load has %d. "
-            "Using on-disk percentiles as-is; delete the file to force recompute.",
-            path,
-            on_disk_total,
-            current_total,
-        )
+    if warn:
+        on_disk_total = sum(int(row.get("n_episodes", 0)) for row in rows)
+        if on_disk_total != current_total:
+            logging.warning(
+                "Stale %s: on-disk per-task n_episodes sums to %d, current load has %d. "
+                "Using on-disk percentiles as-is; delete the file to force recompute.",
+                path,
+                on_disk_total,
+                current_total,
+            )
     return {int(row["task_index"]): row["percentiles"] for row in rows}
 
 
@@ -203,11 +228,16 @@ def load_or_compute_speed_percentiles(
     Otherwise compute the percentiles from ``episode_lengths`` and
     persist the file.
 
-    Distributed-safe: only the main process writes; other ranks block on
-    ``Accelerator.wait_for_everyone()`` until the file appears, then read
-    it. The write itself is atomic (tmp file + ``os.replace``) so two
-    independent processes (e.g. concurrent training jobs sharing a
-    dataset root) can't corrupt each other's output.
+    Distributed-safe: every rank computes the percentiles in-memory
+    (the result is deterministic from the inputs), but only the main
+    process writes the file; the ``Accelerator.wait_for_everyone()``
+    barrier afterwards ensures non-main ranks don't sail past the
+    function while the file is still mid-rename. Each rank returns its
+    own in-memory copy rather than re-reading the just-written file.
+    The write itself is atomic (per-writer UUID-suffixed tmp file +
+    ``os.replace``) so two independent processes (e.g. concurrent
+    training jobs sharing a dataset root) can't corrupt each other's
+    output even outside the rank-gated case.
 
     Persistence schema (one line per task)::
 
@@ -237,12 +267,17 @@ def load_or_compute_speed_percentiles(
         :func:`bucket_episode_length`.
     """
     path = Path(root) / SPEED_PERCENTILES_PATH
-    by_task = _group_lengths_by_task(episode_lengths, episode_to_task_index)
-    current_total = sum(len(v) for v in by_task.values())
+    acc = get_proc_accelerator()
+    distributed = acc is not None and acc.num_processes > 1
+    is_main_or_solo = (not distributed) or acc.is_main_process
 
     if path.is_file():
-        return _read_persisted(path, current_total)
+        # `episode_to_task_index` already drops episodes with empty tasks,
+        # so its length is the per-task episode count we want to compare
+        # against the on-disk sum.
+        return _read_persisted(path, len(episode_to_task_index), warn=is_main_or_solo)
 
+    by_task = _group_lengths_by_task(episode_lengths, episode_to_task_index)
     index_to_task = {idx: task for task, idx in task_to_task_index.items()}
     percentiles = compute_task_percentiles(by_task)
     rows = [
@@ -255,10 +290,7 @@ def load_or_compute_speed_percentiles(
         for task_idx in sorted(percentiles)
     ]
 
-    acc = get_proc_accelerator()
-    distributed = acc is not None and acc.num_processes > 1
-    should_write = (not distributed) or acc.is_main_process
-    if should_write:
+    if is_main_or_solo:
         try:
             _atomic_write_jsonlines(rows, path)
         except (OSError, PermissionError) as e:

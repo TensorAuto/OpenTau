@@ -271,31 +271,39 @@ class TestLoadOrComputeSpeedPercentiles:
         assert not any("Stale" in rec.message for rec in caplog.records)
 
     def test_concurrent_writes_produce_valid_file(self, tmp_path):
-        # Two threads racing on the same root must not corrupt the file.
-        # Atomic write (tmp + os.replace) is what makes this safe outside
-        # of the rank-gated path.
-        el, e2t, t2i = _fake_meta({"taskA": list(range(100, 200))})
+        # Multiple threads racing on the same root must not corrupt the
+        # file. Per-writer UUID-suffixed tmp paths + os.replace are what
+        # make this safe outside of the rank-gated path. Heterogeneous
+        # task sets across workers force the bucket-index path to vary
+        # per call so a torn write would be visible as a partial row
+        # set, not just identical content overwriting itself.
+        many_tasks = {f"task{i}": list(range(100 + i * 5, 200 + i * 5)) for i in range(5)}
+        el, e2t, t2i = _fake_meta(many_tasks)
 
-        def worker():
+        def worker(_):
             return load_or_compute_speed_percentiles(tmp_path, el, e2t, t2i)
 
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            results = list(pool.map(lambda _: worker(), range(8)))
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(worker, range(16)))
 
-        # All workers must agree on the percentiles.
-        first = results[0][0]
+        # All workers must agree on every task's percentiles.
+        first = results[0]
         for r in results[1:]:
-            assert r[0] == first
+            assert r == first
 
-        # The on-disk file must be parseable and complete.
+        # The on-disk file must be parseable, complete, and consistent
+        # with the in-memory result. A torn write would surface as a
+        # JSON parse error, a wrong row count, or a percentile mismatch.
         rows = load_jsonlines(tmp_path / SPEED_PERCENTILES_PATH)
-        assert len(rows) == 1
-        assert rows[0]["task_index"] == 0
-        assert rows[0]["n_episodes"] == 100
-        assert rows[0]["percentiles"] == first
+        assert len(rows) == len(many_tasks)
+        from_disk = {int(row["task_index"]): row["percentiles"] for row in rows}
+        assert from_disk == first
+        for row in rows:
+            assert row["n_episodes"] == 100
 
-        # And no leftover .tmp file.
-        assert not (tmp_path / "meta" / "speed_percentiles.jsonl.tmp").exists()
+        # And no leftover .tmp files.
+        leftovers = list((tmp_path / "meta").glob("speed_percentiles.jsonl.*.tmp"))
+        assert leftovers == []
 
     def test_falls_back_to_in_memory_on_readonly_root(self, tmp_path, caplog, monkeypatch):
         # Make the meta/ dir read-only so write_jsonlines raises.
