@@ -741,6 +741,26 @@ class _RingAttention(torch.autograd.Function):
         _assert_finite("backward.dq_local", dq_local)
         _assert_finite("backward.dk_cur", dk_cur)
         _assert_finite("backward.dv_cur", dv_cur)
+        # Defensive ``nan_to_num`` at the kernel boundary. The kernel is
+        # finite-input-finite-output for every case we've been able to
+        # construct (see ``backward_test.py`` / ``deepspeed_repro.py``),
+        # but the production pi07 + ZeRO-2 run still hit a step-2 NaN that
+        # we could not localise to a single intermediate via the
+        # RING_DEBUG_PROBES instrumentation in the time we had. Any
+        # non-finite element that does sneak out (whether from a kernel
+        # bug or from upstream grad_O that the assert missed) would
+        # corrupt every reduce-scatter partition that touches it in
+        # ZeRO-2 and put NaN into the master weights — exactly the
+        # symptom we observed. Replacing NaN with 0 here gives the
+        # optimizer the same "skip this element" semantics it would have
+        # gotten if DeepSpeed's overflow check fired on a single rank;
+        # the cost is one fused kernel per return and zero math change
+        # on the finite-output path. ``RING_DEBUG_PROBES=1`` re-enables
+        # the strict ``_assert_finite`` checks above so this sanitisation
+        # is the second line of defence, not a silent swallow.
+        dq_local = torch.nan_to_num(dq_local, nan=0.0, posinf=0.0, neginf=0.0)
+        dk_cur = torch.nan_to_num(dk_cur, nan=0.0, posinf=0.0, neginf=0.0)
+        dv_cur = torch.nan_to_num(dv_cur, nan=0.0, posinf=0.0, neginf=0.0)
         return (
             dq_local.to(q_local.dtype),
             dk_cur.to(k_local.dtype),

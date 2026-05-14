@@ -62,8 +62,26 @@ def _run(model, impl: str, embs, attn_mask, position_ids, seq_len, device):
             fill_kv_cache=True,
         )
     assert out is not None
+    # Check forward output finiteness.
+    n_nf_out = (~torch.isfinite(out)).sum().item()
+    if n_nf_out > 0:
+        rank = dist.get_rank()
+        print(f"[rank {rank}] {impl} forward out has {n_nf_out} non-finite elements")
     loss = out.float().sum()
     loss.backward()
+    # Check gradient finiteness on every model parameter.
+    nf_params = []
+    for name, p in model.named_parameters():
+        if p.grad is None:
+            continue
+        n_nf = (~torch.isfinite(p.grad)).sum().item()
+        if n_nf > 0:
+            nf_params.append((name, n_nf, p.grad.numel()))
+    if nf_params:
+        rank = dist.get_rank()
+        print(f"[rank {rank}] {impl} GRADIENT NON-FINITE on {len(nf_params)} params:")
+        for name, n_nf, total in nf_params[:5]:
+            print(f"    {name}: {n_nf}/{total} non-finite")
     return peak_memory_gb(device)
 
 
