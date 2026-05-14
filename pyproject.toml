@@ -107,6 +107,7 @@ opentau-dataset-viz = "opentau.scripts.launch:visualize"
 [project.optional-dependencies]
 dev = ["pre-commit>=3.7.0",
     "debugpy>=1.8.1",
+    "py-spy>=0.3.14",
     "pytest>=8.1.0",
     "pytest-cov>=5.0.0",
     "pyserial>=3.5",
