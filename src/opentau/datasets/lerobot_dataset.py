@@ -1617,26 +1617,30 @@ class LeRobotDataset(BaseDataset):
         try:
             hf_dataset = Dataset(table, info=DatasetInfo(features=features))
         except (TypeError, ValueError) as cast_err:
-            # info.json's declared features can drift from what was actually
-            # written to parquet, in two ways:
-            #   * type drift — e.g. shape=[1] gets serialized as Value(...) by
-            #     get_hf_features_from_features but the parquet column was
-            #     emitted as list<...>; HF's Dataset constructor then raises
-            #     TypeError("Couldn't cast ...").
-            #   * column-set drift — parquet has a column info.json never
-            #     declared (e.g. gripper_activity_action); HF raises
-            #     ValueError("Keys mismatch ...").
-            # Both mean the same thing — stale metadata — and both want the
-            # same fallback: use parquet-inferred features so the dataset
-            # still loads. The underlying metadata still needs a curator fix.
-            msg = str(cast_err)
-            if "Couldn't cast" not in msg and "Keys mismatch" not in msg:
-                raise
+            # info.json's declared features routinely drift from what was
+            # actually written to parquet. HF's typed Dataset constructor
+            # surfaces this as several different exceptions depending on the
+            # kind of drift — observed in this dataset corpus:
+            #   * TypeError("Couldn't cast ...")            — type drift
+            #   * ValueError("Keys mismatch ...")           — column-set drift
+            #   * ValueError("External features info don't match ...")
+            #                                               — fixed vs variable
+            #                                                 length list drift
+            # They all mean the same thing (stale metadata) and all want the
+            # same fallback: drop the declared features and infer them from the
+            # parquet so the dataset still loads. `features` is built by our
+            # own get_hf_features_from_features from a valid pa.Table, so a
+            # TypeError/ValueError from this constructor is always a metadata/
+            # parquet reconciliation failure, never a programming error — hence
+            # catching the exception types rather than grepping their messages
+            # (the message text varies and embeds huge schema dumps). The
+            # underlying metadata still needs a curator-side fix.
+            reason = str(cast_err).splitlines()[0][:200]
             logging.warning(
                 "Feature reconciliation from meta/info.json failed for %s (%s); "
                 "falling back to parquet-inferred features.",
                 self.repo_id,
-                cast_err,
+                reason,
             )
             hf_dataset = Dataset(table)
         hf_dataset.set_transform(hf_transform_to_torch)
