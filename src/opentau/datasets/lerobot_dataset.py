@@ -91,6 +91,7 @@ import re
 import shutil
 import traceback
 from abc import abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable
 
@@ -1537,20 +1538,56 @@ class LeRobotDataset(BaseDataset):
             ignore_patterns=ignore_patterns,
         )
 
+    @on_accelerate_main_proc(local=True, _sync=True)
+    def download_files(self, files: list[str]) -> None:
+        """Fetch an explicit list of repo files, one `hf_hub_download` per file.
+
+        `snapshot_download(allow_patterns=<thousands of explicit paths>)` spends
+        many minutes GIL-held and I/O-idle inside `filter_repo_objects`, whose
+        fnmatch loop is O(repo_files x patterns) — long enough to trip the NCCL
+        watchdog while sibling ranks wait at the `_sync` broadcast.
+        `hf_hub_download` targets each file by exact path, skipping the filter
+        entirely; a thread pool overlaps the network round-trips (the GIL is
+        released during I/O). Files already present in `local_dir` are not
+        re-downloaded.
+        """
+        if not files:
+            return
+
+        def _fetch(fpath: str) -> None:
+            hf_hub_download(
+                repo_id=self.repo_id,
+                filename=fpath,
+                repo_type="dataset",
+                revision=self.revision,
+                local_dir=self.root,
+            )
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            # list() forces the lazy map so any per-file failure propagates.
+            list(pool.map(_fetch, files))
+
     def download_episodes(self, download_videos: bool = True) -> None:
         """Downloads the dataset from the given 'repo_id' at the provided version. If 'episodes' is given, this
         will only download those episodes (selected by their episode_index). If 'episodes' is None, the whole
-        dataset will be downloaded. Thanks to the behavior of snapshot_download, if the files are already present
-        in 'local_dir', they won't be downloaded again.
+        dataset will be downloaded. Already-present files in 'local_dir' are not re-downloaded.
         """
         # TODO(rcadene, aliberts): implement faster transfer
         # https://huggingface.co/docs/huggingface_hub/en/guides/download#faster-downloads
-        files = None
-        ignore_patterns = None if download_videos else "videos/"
-        if self.episodes is not None:
-            files = self.get_episodes_file_paths()
-
-        self.pull_from_repo(allow_patterns=files, ignore_patterns=ignore_patterns)
+        if self.episodes is None:
+            # Whole-dataset download: snapshot_download with no allow_patterns
+            # has nothing to filter, so there is no filter_repo_objects blowup.
+            ignore_patterns = None if download_videos else "videos/"
+            self.pull_from_repo(ignore_patterns=ignore_patterns)
+            return
+        # Episode subset: download exactly the needed files directly. Passing
+        # the explicit per-episode path list to snapshot_download as
+        # allow_patterns triggers a pathologically slow filter_repo_objects
+        # scan (see download_files).
+        files = self.get_episodes_file_paths()
+        if not download_videos:
+            files = [f for f in files if not f.startswith("videos/")]
+        self.download_files(files)
 
     def get_episodes_file_paths(self) -> list[str]:
         """Get file paths for all selected episodes.
