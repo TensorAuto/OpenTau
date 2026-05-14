@@ -68,6 +68,11 @@ SPARSE_TASK_BUCKET = 50
 # ``_CONTROL_MODE_WARNED`` pattern in ``lerobot_dataset.py``.
 _READONLY_WARNED: set[str] = set()
 
+# Module-level set of unresolved episode task labels we've already warned
+# about, so episodes.jsonl / tasks.jsonl drift in a dataset only logs once
+# per distinct bad label per process instead of once per episode per rank.
+_UNRESOLVED_TASK_WARNED: set[str] = set()
+
 
 def compute_task_percentiles(
     episode_lengths_per_task: dict[int, list[int]],
@@ -143,13 +148,34 @@ def episode_to_task_index_from_episodes(
     ``tasks[0]`` — the codebase assumes an N-to-1 episode-to-task
     relationship even though the field is structurally a list. Episodes
     with an empty / missing ``tasks`` list are skipped.
+
+    Episodes whose ``tasks[0]`` is absent from ``task_to_task_index`` are
+    also skipped (with a deduped warning) rather than raising. This guards
+    against ``episodes.jsonl`` / ``tasks.jsonl`` drift in dataset metadata
+    — a `tasks.jsonl` with stale/incomplete entries, or an
+    ``episodes.jsonl`` that stores integer task indices instead of task
+    strings. Skipped episodes are still trained on; they just fall back to
+    ``SPARSE_TASK_BUCKET`` in the downstream speed-bucket lookup, which
+    already tolerates a missing ``episode_to_task_index`` entry.
     """
     out: dict[int, int] = {}
     for ep_idx, ep_info in episodes.items():
         tasks = ep_info.get("tasks") or []
         if not tasks:
             continue
-        out[ep_idx] = task_to_task_index[tasks[0]]
+        task_idx = task_to_task_index.get(tasks[0])
+        if task_idx is None:
+            key = str(tasks[0])
+            if key not in _UNRESOLVED_TASK_WARNED:
+                _UNRESOLVED_TASK_WARNED.add(key)
+                logging.warning(
+                    "Episode task label %r is not present in tasks.jsonl; episode(s) "
+                    "using it fall back to the sparse speed bucket. This indicates "
+                    "episodes.jsonl / tasks.jsonl drift in the dataset metadata.",
+                    tasks[0],
+                )
+            continue
+        out[ep_idx] = task_idx
     return out
 
 
@@ -271,39 +297,47 @@ def load_or_compute_speed_percentiles(
     distributed = acc is not None and acc.num_processes > 1
     is_main_or_solo = (not distributed) or acc.is_main_process
 
-    if path.is_file():
-        # `episode_to_task_index` already drops episodes with empty tasks,
-        # so its length is the per-task episode count we want to compare
-        # against the on-disk sum.
-        return _read_persisted(path, len(episode_to_task_index), warn=is_main_or_solo)
+    # NB: the barrier at the end of this function must run on every code path,
+    # not just the compute path. Otherwise a rank that arrives *after* rank 0
+    # has finished writing the file takes the early-return branch (file now
+    # exists), skips the barrier, and silently desyncs the collective counter
+    # for every subsequent collective in the mixture-load loop — manifesting
+    # as a NCCL hang at a much later (and entirely unrelated) sync point.
+    try:
+        if path.is_file():
+            # `episode_to_task_index` already drops episodes with empty tasks,
+            # so its length is the per-task episode count we want to compare
+            # against the on-disk sum.
+            return _read_persisted(path, len(episode_to_task_index), warn=is_main_or_solo)
 
-    by_task = _group_lengths_by_task(episode_lengths, episode_to_task_index)
-    index_to_task = {idx: task for task, idx in task_to_task_index.items()}
-    percentiles = compute_task_percentiles(by_task)
-    rows = [
-        {
-            "task_index": task_idx,
-            "task": index_to_task.get(task_idx, ""),
-            "n_episodes": len(by_task.get(task_idx, [])),
-            "percentiles": percentiles[task_idx],
-        }
-        for task_idx in sorted(percentiles)
-    ]
+        by_task = _group_lengths_by_task(episode_lengths, episode_to_task_index)
+        index_to_task = {idx: task for task, idx in task_to_task_index.items()}
+        percentiles = compute_task_percentiles(by_task)
+        rows = [
+            {
+                "task_index": task_idx,
+                "task": index_to_task.get(task_idx, ""),
+                "n_episodes": len(by_task.get(task_idx, [])),
+                "percentiles": percentiles[task_idx],
+            }
+            for task_idx in sorted(percentiles)
+        ]
 
-    if is_main_or_solo:
-        try:
-            _atomic_write_jsonlines(rows, path)
-        except (OSError, PermissionError) as e:
-            root_key = str(root)
-            if root_key not in _READONLY_WARNED:
-                _READONLY_WARNED.add(root_key)
-                logging.warning(
-                    "Could not write speed percentiles to %s (%s); using in-memory "
-                    "values for this run. The compute will repeat on every load until "
-                    "the file can be written.",
-                    path,
-                    e,
-                )
-    if distributed:
-        acc.wait_for_everyone()
-    return percentiles
+        if is_main_or_solo:
+            try:
+                _atomic_write_jsonlines(rows, path)
+            except (OSError, PermissionError) as e:
+                root_key = str(root)
+                if root_key not in _READONLY_WARNED:
+                    _READONLY_WARNED.add(root_key)
+                    logging.warning(
+                        "Could not write speed percentiles to %s (%s); using in-memory "
+                        "values for this run. The compute will repeat on every load until "
+                        "the file can be written.",
+                        path,
+                        e,
+                    )
+        return percentiles
+    finally:
+        if distributed:
+            acc.wait_for_everyone()

@@ -449,6 +449,7 @@ def lerobot_dataset_factory(
     episodes_factory,
     hf_dataset_factory,
     mock_snapshot_download_factory,
+    mock_hf_hub_download_factory,
     lerobot_dataset_metadata_factory,
 ) -> LeRobotDatasetFactory:
     def _create_lerobot_dataset(
@@ -494,6 +495,14 @@ def lerobot_dataset_factory(
             episodes=episode_dicts,
             hf_dataset=hf_dataset,
         )
+        mock_hf_hub_download = mock_hf_hub_download_factory(
+            info=info,
+            stats=stats,
+            episodes_stats=episodes_stats,
+            tasks=tasks,
+            episodes=episode_dicts,
+            hf_dataset=hf_dataset,
+        )
         mock_metadata = lerobot_dataset_metadata_factory(
             root=root,
             repo_id=repo_id,
@@ -507,10 +516,12 @@ def lerobot_dataset_factory(
             patch("opentau.datasets.lerobot_dataset.LeRobotDatasetMetadata") as mock_metadata_patch,
             patch("opentau.datasets.lerobot_dataset.get_safe_version") as mock_get_safe_version_patch,
             patch("opentau.datasets.lerobot_dataset.snapshot_download") as mock_snapshot_download_patch,
+            patch("opentau.datasets.lerobot_dataset.hf_hub_download") as mock_hf_hub_download_patch,
         ):
             mock_metadata_patch.return_value = mock_metadata
             mock_get_safe_version_patch.side_effect = lambda repo_id, version: version
             mock_snapshot_download_patch.side_effect = mock_snapshot_download
+            mock_hf_hub_download_patch.side_effect = mock_hf_hub_download
 
             # Construct a minimal TrainPipelineConfig for the dataset
             from dataclasses import dataclass

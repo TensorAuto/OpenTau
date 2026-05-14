@@ -132,3 +132,89 @@ def mock_snapshot_download_factory(
         return _mock_snapshot_download
 
     return _mock_snapshot_download_func
+
+
+@pytest.fixture(scope="session")
+def mock_hf_hub_download_factory(
+    info_factory,
+    info_path,
+    stats_factory,
+    stats_path,
+    episodes_stats_factory,
+    episodes_stats_path,
+    tasks_factory,
+    tasks_path,
+    episodes_factory,
+    episode_path,
+    single_episode_parquet_path,
+    hf_dataset_factory,
+):
+    """Patch hf_hub_download so a single-file fetch writes the expected fixture file.
+
+    Mirrors mock_snapshot_download_factory, but for the one-file-at-a-time path
+    used by LeRobotDataset.download_files (which snapshot_download mocking does
+    not cover).
+    """
+
+    def _mock_hf_hub_download_func(
+        info: dict | None = None,
+        stats: dict | None = None,
+        episodes_stats: list[dict] | None = None,
+        tasks: list[dict] | None = None,
+        episodes: list[dict] | None = None,
+        hf_dataset: datasets.Dataset | None = None,
+    ):
+        if not info:
+            info = info_factory()
+        if not stats:
+            stats = stats_factory(features=info["features"])
+        if not episodes_stats:
+            episodes_stats = episodes_stats_factory(
+                features=info["features"], total_episodes=info["total_episodes"]
+            )
+        if not tasks:
+            tasks = tasks_factory(total_tasks=info["total_tasks"])
+        if not episodes:
+            episodes = episodes_factory(
+                total_episodes=info["total_episodes"], total_frames=info["total_frames"], tasks=tasks
+            )
+        if not hf_dataset:
+            hf_dataset = hf_dataset_factory(tasks=tasks, episodes=episodes, fps=info["fps"])
+
+        def _mock_hf_hub_download(
+            repo_id: str,
+            filename: str,
+            local_dir: str | Path | None = None,
+            *args,
+            **kwargs,
+        ) -> str:
+            if not local_dir:
+                local_dir = OPENTAU_TEST_DIR
+            local_dir = Path(local_dir)
+            path = Path(filename)
+
+            if path.suffix == ".parquet" and path.stem.startswith("episode_"):
+                ep_idx = int(path.stem[len("episode_") :])  # 'episode_000000' -> 0
+                single_episode_parquet_path(local_dir, ep_idx, hf_dataset, info)
+            elif filename == INFO_PATH:
+                info_path(local_dir, info)
+            elif filename == STATS_PATH:
+                stats_path(local_dir, stats)
+            elif filename == EPISODES_STATS_PATH:
+                episodes_stats_path(local_dir, episodes_stats)
+            elif filename == TASKS_PATH:
+                tasks_path(local_dir, tasks)
+            elif filename == EPISODES_PATH:
+                episode_path(local_dir, episodes)
+            else:
+                # Video files (and anything else without a fixture writer): the
+                # tests that hit this path never decode them, so an empty
+                # placeholder is enough to satisfy the on-disk checks.
+                fpath = local_dir / filename
+                fpath.parent.mkdir(parents=True, exist_ok=True)
+                fpath.touch()
+            return str(local_dir / filename)
+
+        return _mock_hf_hub_download
+
+    return _mock_hf_hub_download_func
