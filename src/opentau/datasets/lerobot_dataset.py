@@ -1685,16 +1685,21 @@ class LeRobotDataset(BaseDataset):
                 tmp_path = cache_dir / f"{cache_key}.{uuid.uuid4().hex}.tmp"
                 try:
                     scanner = pa_dataset.scanner(filter=filter_expr)
+                    # Arrow IPC *stream* format (new_stream), not file format:
+                    # HF's Dataset.from_file memory-maps via pa.ipc.open_stream,
+                    # which only reads the stream format. Writing the file
+                    # format here makes from_file misparse the footer as a
+                    # stream message ("Expected to read N metadata bytes ...").
                     with pa.OSFile(str(tmp_path), "wb") as sink:
                         writer = None
                         for batch in scanner.to_batches():
                             if writer is None:
-                                writer = pa.ipc.new_file(sink, batch.schema)
+                                writer = pa.ipc.new_stream(sink, batch.schema)
                             writer.write_batch(batch)
                         if writer is None:
                             # No rows matched the filter — still emit a valid
-                            # (empty) Arrow file so the mmap load below works.
-                            writer = pa.ipc.new_file(sink, pa_dataset.schema)
+                            # (empty) Arrow stream so the mmap load below works.
+                            writer = pa.ipc.new_stream(sink, pa_dataset.schema)
                         writer.close()
                     os.replace(tmp_path, arrow_path)  # atomic publish
                 finally:
