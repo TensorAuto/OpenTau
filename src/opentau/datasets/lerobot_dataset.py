@@ -87,7 +87,6 @@ import functools
 import json
 import logging
 import math
-import re
 import shutil
 import traceback
 from abc import abstractmethod
@@ -218,6 +217,12 @@ def retry_random_on_failure(f):
 
 
 CODEBASE_VERSION = "v2.1"
+
+# Thread-pool width for the per-file `hf_hub_download` fan-out in `download_files`.
+# The work is network-I/O-bound (the GIL is released during each request), so a
+# width well above the core count is fine; 16 keeps enough round-trips in flight
+# without hammering the Hub.
+_DOWNLOAD_MAX_WORKERS = 16
 
 # Set of repo_ids for which we've already emitted the "missing control_mode" warning.
 # Keyed at module level so duplicates are suppressed across multiple LeRobotDataset
@@ -1584,7 +1589,7 @@ class LeRobotDataset(BaseDataset):
                 local_dir=self.root,
             )
 
-        with ThreadPoolExecutor(max_workers=16) as pool:
+        with ThreadPoolExecutor(max_workers=_DOWNLOAD_MAX_WORKERS) as pool:
             # list() forces the lazy map so any per-file failure propagates.
             list(pool.map(_fetch, missing))
 
@@ -1642,32 +1647,31 @@ class LeRobotDataset(BaseDataset):
         Loads the per-episode parquet files via `load_dataset("parquet", ...)`,
         which builds a memory-mapped Arrow cache under `$HF_HOME/datasets/`. The
         cache costs disk (~1-5x the parquet, compression-dependent — see #277)
-        but the loaded dataset is genuinely memory-mapped (resident pages are
-        file-backed and reclaimable), so RAM stays bounded by the OS page cache
-        rather than the dataset size. That is essential here: 8 ranks each load
-        the full mixture, and the multi-hundred-GB video repos would otherwise
-        OOM the node. A hand-rolled `pa_ds.to_table()` + `Dataset(table)` (or
-        streaming to a self-written Arrow IPC file + `Dataset.from_file`) was
-        tried and both materialised into anonymous RAM instead of mmapping —
-        `load_dataset` routes through HF's ParquetDatasetBuilder, whose Arrow
-        cache `Dataset.from_file` *does* memory-map correctly.
+        and nothing prunes it, so a multi-hundred-GB mixture needs that much
+        extra disk provisioned. In exchange the loaded dataset is genuinely
+        memory-mapped (resident pages are file-backed and reclaimable), so RAM
+        stays bounded by the OS page cache rather than the dataset size. That is
+        essential here: 8 ranks each load the full mixture, and the
+        multi-hundred-GB video repos would otherwise OOM the node. A hand-rolled
+        `pa_ds.to_table()` + `Dataset(table)` (or streaming to a self-written
+        Arrow IPC file + `Dataset.from_file`) was tried and both materialised
+        into anonymous RAM instead of mmapping — `load_dataset` routes through
+        HF's ParquetDatasetBuilder, whose Arrow cache `Dataset.from_file` *does*
+        memory-map correctly.
+
+        Schema is inferred from the parquet files themselves; it is intentionally
+        not validated against `meta/info.json`. This lets cross-file column drift
+        load instead of raising a cast error, at the cost of `info.json` no
+        longer being the authoritative schema (drift now surfaces as a
+        `load_dataset` failure rather than a feature-cast error).
 
         Files are passed in sorted-episode order so the hf_dataset row layout
         stays aligned with `episode_data_index["from"/"to"]` — see the
-        `sorted(episodes)` note in __init__.
+        `sorted(episodes)` note in __init__. `self.episodes` is always a concrete
+        list here: __init__ backfills it with the full episode list before this
+        method is ever called.
         """
-        # Derive the parquet glob from the meta data_path template so that
-        # datasets with a non-default `info["data_path"]` (deeper nesting,
-        # flat layout, etc.) keep working. Default template is
-        # "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"
-        # which yields the glob "data/chunk-*/episode_*.parquet". Assumes the
-        # template uses simple `{name}` / `{name:fmt}` placeholders and no
-        # literal `{{`/`}}` escapes — true for every in-repo writer.
-        if self.episodes is None:
-            glob_pattern = re.sub(r"\{[^}]+\}", "*", self.meta.data_path)
-            files = [str(p) for p in sorted(self.root.glob(glob_pattern))]
-        else:
-            files = [str(self.root / self.meta.get_data_file_path(ep_idx)) for ep_idx in self.episodes]
+        files = [str(self.root / self.meta.get_data_file_path(ep_idx)) for ep_idx in self.episodes]
         if not files:
             raise FileNotFoundError(f"No parquet files for {self.repo_id} under {self.root}")
         hf_dataset = load_dataset("parquet", data_files=files, split="train")

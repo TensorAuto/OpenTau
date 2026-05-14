@@ -126,6 +126,17 @@ class TestEpisodeToTaskIndex:
         t2i = {"taskA": 0}
         assert episode_to_task_index_from_episodes(episodes, t2i) == {2: 0}
 
+    def test_unresolvable_task_label_skipped(self):
+        # A task label absent from task_to_task_index (episodes.jsonl /
+        # tasks.jsonl drift) is skipped, not raised on; resolvable episodes
+        # in the same dataset still come through.
+        episodes = {
+            0: {"tasks": ["ghost"], "length": 100},
+            1: {"tasks": ["taskA"], "length": 200},
+        }
+        t2i = {"taskA": 0}
+        assert episode_to_task_index_from_episodes(episodes, t2i) == {1: 0}
+
 
 class TestBucketEpisodeLength:
     @pytest.fixture

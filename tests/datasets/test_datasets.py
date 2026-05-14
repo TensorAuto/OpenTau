@@ -145,6 +145,29 @@ def test_dataset_no_episodes_loads_all(tmp_path, lerobot_dataset_factory):
     _assert_episode_row_alignment(dataset)
 
 
+def test_download_files_skips_present_files(tmp_path, lerobot_dataset_factory):
+    """download_files must not call hf_hub_download for files already on disk.
+
+    This is the core of the 429-avoidance fix: a pre-downloaded episode set
+    should make download_files a no-op with zero Hub requests. Constructing
+    the dataset already places every selected-episode file on disk, so a
+    second download_files pass over the same paths must fetch nothing.
+    """
+    dataset = lerobot_dataset_factory(
+        root=tmp_path / "test",
+        repo_id=DUMMY_REPO_ID,
+        total_episodes=10,
+        total_frames=400,
+        episodes=[2, 5, 6],
+    )
+    files = dataset.get_episodes_file_paths()
+    assert files, "expected a non-empty file list for the test to be meaningful"
+    assert all((dataset.root / f).is_file() for f in files), "fixture should pre-place all files"
+    with patch("opentau.datasets.lerobot_dataset.hf_hub_download") as mock_hf_hub_download:
+        dataset.download_files(files)
+    mock_hf_hub_download.assert_not_called()
+
+
 def test_add_frame_missing_task(tmp_path, empty_lerobot_dataset_factory):
     features = {"state": {"dtype": "float32", "shape": (1,), "names": None}}
     dataset = empty_lerobot_dataset_factory(root=tmp_path / "test", features=features)
