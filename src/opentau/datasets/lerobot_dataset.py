@@ -84,15 +84,12 @@ Example:
 import contextlib
 import copy
 import functools
-import hashlib
 import json
 import logging
 import math
-import os
 import re
 import shutil
 import traceback
-import uuid
 from abc import abstractmethod
 from pathlib import Path
 from typing import Callable
@@ -101,14 +98,11 @@ import datasets
 import numpy as np
 import packaging.version
 import PIL.Image
-import pyarrow as pa
-import pyarrow.dataset as pa_ds
 import torch
 import torch.nn.functional as F  # noqa: N812
 import torch.utils
-from datasets import Dataset, DatasetInfo, concatenate_datasets
+from datasets import concatenate_datasets, load_dataset
 from einops import rearrange
-from filelock import FileLock
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from huggingface_hub.constants import REPOCARD_NAME
 from huggingface_hub.errors import RevisionNotFoundError
@@ -1582,7 +1576,25 @@ class LeRobotDataset(BaseDataset):
         return fpaths
 
     def load_hf_dataset(self) -> datasets.Dataset:
-        """hf_dataset contains all the observations, states, actions, rewards, etc."""
+        """hf_dataset contains all the observations, states, actions, rewards, etc.
+
+        Loads the per-episode parquet files via `load_dataset("parquet", ...)`,
+        which builds a memory-mapped Arrow cache under `$HF_HOME/datasets/`. The
+        cache costs disk (~1-5x the parquet, compression-dependent — see #277)
+        but the loaded dataset is genuinely memory-mapped (resident pages are
+        file-backed and reclaimable), so RAM stays bounded by the OS page cache
+        rather than the dataset size. That is essential here: 8 ranks each load
+        the full mixture, and the multi-hundred-GB video repos would otherwise
+        OOM the node. A hand-rolled `pa_ds.to_table()` + `Dataset(table)` (or
+        streaming to a self-written Arrow IPC file + `Dataset.from_file`) was
+        tried and both materialised into anonymous RAM instead of mmapping —
+        `load_dataset` routes through HF's ParquetDatasetBuilder, whose Arrow
+        cache `Dataset.from_file` *does* memory-map correctly.
+
+        Files are passed in sorted-episode order so the hf_dataset row layout
+        stays aligned with `episode_data_index["from"/"to"]` — see the
+        `sorted(episodes)` note in __init__.
+        """
         # Derive the parquet glob from the meta data_path template so that
         # datasets with a non-default `info["data_path"]` (deeper nesting,
         # flat layout, etc.) keep working. Default template is
@@ -1590,122 +1602,16 @@ class LeRobotDataset(BaseDataset):
         # which yields the glob "data/chunk-*/episode_*.parquet". Assumes the
         # template uses simple `{name}` / `{name:fmt}` placeholders and no
         # literal `{{`/`}}` escapes — true for every in-repo writer.
-        glob_pattern = re.sub(r"\{[^}]+\}", "*", self.meta.data_path)
-        paths = sorted(self.root.glob(glob_pattern))
-        if not paths:
-            raise FileNotFoundError(f"No parquet files matching {glob_pattern!r} under {self.root}")
-        pa_dataset = pa_ds.dataset(list(map(str, paths)), format="parquet")
-        filter_expr = pa_ds.field("episode_index").isin(self.episodes) if self.episodes is not None else None
-
-        # Image-dtype columns hold raw image bytes inline in the parquet and
-        # need the HF `Image()` feature to decode on access. The mmap path
-        # loads via `Dataset.from_file`, which infers features from the Arrow
-        # schema and so cannot reconstruct `Image()`; route those datasets (all
-        # small in this corpus) through the in-RAM path instead. Everything
-        # else — including the multi-hundred-GB video repos — goes through the
-        # memory-mapped path so the mixture load doesn't OOM the node.
-        has_image_feature = any(ft.get("dtype") == "image" for ft in self.meta.features.values())
-        if has_image_feature:
-            hf_dataset = self._load_hf_dataset_in_ram(pa_dataset, filter_expr)
+        if self.episodes is None:
+            glob_pattern = re.sub(r"\{[^}]+\}", "*", self.meta.data_path)
+            files = [str(p) for p in sorted(self.root.glob(glob_pattern))]
         else:
-            hf_dataset = self._load_hf_dataset_mmap(pa_dataset, filter_expr)
+            files = [str(self.root / self.meta.get_data_file_path(ep_idx)) for ep_idx in self.episodes]
+        if not files:
+            raise FileNotFoundError(f"No parquet files for {self.repo_id} under {self.root}")
+        hf_dataset = load_dataset("parquet", data_files=files, split="train")
         hf_dataset.set_transform(hf_transform_to_torch)
         return hf_dataset
-
-    def _load_hf_dataset_in_ram(self, pa_dataset: pa_ds.Dataset, filter_expr) -> datasets.Dataset:
-        """Materialize the filtered parquet fully in RAM and wrap it in a Dataset.
-
-        Used only for datasets with `image`-dtype columns, which need the HF
-        `Image()` feature applied via the typed `Dataset(...)` constructor.
-        Such datasets are small in this corpus, so the in-RAM cost is bounded.
-        """
-        features = get_hf_features_from_features(self.meta.features)
-        table = pa_dataset.to_table(filter=filter_expr)
-        try:
-            return Dataset(table, info=DatasetInfo(features=features))
-        except (TypeError, ValueError) as cast_err:
-            # info.json's declared features routinely drift from what was
-            # actually written to parquet. HF's typed Dataset constructor
-            # surfaces this as several different exceptions depending on the
-            # kind of drift — observed in this dataset corpus:
-            #   * TypeError("Couldn't cast ...")            — type drift
-            #   * ValueError("Keys mismatch ...")           — column-set drift
-            #   * ValueError("External features info don't match ...")
-            #                                               — fixed vs variable
-            #                                                 length list drift
-            # They all mean the same thing (stale metadata) and all want the
-            # same fallback: drop the declared features and infer them from the
-            # parquet so the dataset still loads. `features` is built by our
-            # own get_hf_features_from_features from a valid pa.Table, so a
-            # TypeError/ValueError from this constructor is always a metadata/
-            # parquet reconciliation failure, never a programming error — hence
-            # catching the exception types rather than grepping their messages
-            # (the message text varies and embeds huge schema dumps). The
-            # underlying metadata still needs a curator-side fix.
-            reason = str(cast_err).splitlines()[0][:200]
-            logging.warning(
-                "Feature reconciliation from meta/info.json failed for %s (%s); "
-                "falling back to parquet-inferred features.",
-                self.repo_id,
-                reason,
-            )
-            return Dataset(table)
-
-    def _load_hf_dataset_mmap(self, pa_dataset: pa_ds.Dataset, filter_expr) -> datasets.Dataset:
-        """Stream the filtered parquet into a memory-mapped Arrow IPC file.
-
-        `to_table()` materializes every filtered row in RAM. With 8 ranks each
-        loading the full mixture, the multi-hundred-GB video repos
-        (humanoid-everyday-*) blow past node memory and OOM. Streaming the
-        scanner batch-by-batch into an Arrow IPC file keeps only one batch
-        resident during the write, and `Dataset.from_file` then mmaps the
-        result — resident memory is bounded by the OS page cache, not the
-        dataset size, and the mapping is shared across all ranks on the node.
-
-        The Arrow file is cached under the dataset root keyed by
-        (revision, episode selection): reruns skip the conversion entirely and
-        the key invalidates when either input changes. A per-key FileLock
-        serialises the write across ranks sharing the node-local cache dir —
-        exactly one rank runs the conversion, the rest block then mmap the
-        result. (Going through `load_dataset`/`Dataset.from_parquet` instead
-        would route through ParquetDatasetBuilder, which rewrites an
-        uncompressed Arrow cache at $HF_HOME at 1-5x source size — see #277.)
-        """
-        cache_dir = self.root / ".arrow_cache"
-        episodes_key = "all" if self.episodes is None else ",".join(map(str, sorted(self.episodes)))
-        cache_key = hashlib.sha256(f"{self.revision}\0{episodes_key}".encode()).hexdigest()[:16]
-        arrow_path = cache_dir / f"{cache_key}.arrow"
-        lock_path = cache_dir / f"{cache_key}.lock"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-
-        # FileLock releases on process exit (fcntl), so a crashed writer can't
-        # deadlock the others; the loser of the race just finds the file ready.
-        with FileLock(str(lock_path)):
-            if not arrow_path.is_file():
-                tmp_path = cache_dir / f"{cache_key}.{uuid.uuid4().hex}.tmp"
-                try:
-                    scanner = pa_dataset.scanner(filter=filter_expr)
-                    # Arrow IPC *stream* format (new_stream), not file format:
-                    # HF's Dataset.from_file memory-maps via pa.ipc.open_stream,
-                    # which only reads the stream format. Writing the file
-                    # format here makes from_file misparse the footer as a
-                    # stream message ("Expected to read N metadata bytes ...").
-                    with pa.OSFile(str(tmp_path), "wb") as sink:
-                        writer = None
-                        for batch in scanner.to_batches():
-                            if writer is None:
-                                writer = pa.ipc.new_stream(sink, batch.schema)
-                            writer.write_batch(batch)
-                        if writer is None:
-                            # No rows matched the filter — still emit a valid
-                            # (empty) Arrow stream so the mmap load below works.
-                            writer = pa.ipc.new_stream(sink, pa_dataset.schema)
-                        writer.close()
-                    os.replace(tmp_path, arrow_path)  # atomic publish
-                finally:
-                    Path(tmp_path).unlink(missing_ok=True)
-
-        return Dataset.from_file(str(arrow_path))
 
     def create_hf_dataset(self) -> datasets.Dataset:
         """Create an empty HuggingFace dataset with the correct features.
