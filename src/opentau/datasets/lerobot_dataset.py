@@ -363,17 +363,18 @@ class LeRobotDatasetMetadata(DatasetMetadata):
             if is_valid_version(self.revision):
                 self.revision = get_safe_version(self.repo_id, self.revision)
 
-            # In distributed training, only rank 0 downloads to avoid race conditions
-            # where other ranks read metadata before the download has finished.
-            acc = get_proc_accelerator()
-            if acc is not None and acc.num_processes > 1:
-                if acc.is_main_process:
-                    (self.root / "meta").mkdir(exist_ok=True, parents=True)
-                    self.pull_from_repo(allow_patterns="meta/")
-                acc.wait_for_everyone()
-            else:
-                (self.root / "meta").mkdir(exist_ok=True, parents=True)
-                self.pull_from_repo(allow_patterns="meta/")
+            # All ranks attempt the metadata download. snapshot_download uses a
+            # per-repo filelock under the hood, so concurrent callers from
+            # sibling ranks don't double-fetch — one winner does the download,
+            # the rest block on the lock and then resolve as cache hits.
+            # The previous rank-0-only + accelerator.wait_for_everyone()
+            # pattern was racy in practice: under DeepSpeed launch the barrier
+            # did not reliably gate non-zero ranks until rank 0 finished
+            # pull_from_repo, so downstream ranks would reach load_metadata
+            # before meta/info.json existed on disk and crash with
+            # FileNotFoundError.
+            (self.root / "meta").mkdir(exist_ok=True, parents=True)
+            self.pull_from_repo(allow_patterns="meta/")
             self.load_metadata()
 
     def load_metadata(self) -> None:
@@ -1305,27 +1306,17 @@ class LeRobotDataset(BaseDataset):
             src_root = HF_OPENTAU_HOME / src_repo
             src_info_path = src_root / INFO_PATH
             if not src_info_path.is_file():
-                acc = get_proc_accelerator()
-                if acc is not None and acc.num_processes > 1:
-                    if acc.is_main_process:
-                        src_info_path.parent.mkdir(exist_ok=True, parents=True)
-                        hf_hub_download(
-                            repo_id=src_repo,
-                            filename=INFO_PATH,
-                            repo_type="dataset",
-                            revision=src_revision,
-                            local_dir=src_root,
-                        )
-                    acc.wait_for_everyone()
-                else:
-                    src_info_path.parent.mkdir(exist_ok=True, parents=True)
-                    hf_hub_download(
-                        repo_id=src_repo,
-                        filename=INFO_PATH,
-                        repo_type="dataset",
-                        revision=src_revision,
-                        local_dir=src_root,
-                    )
+                # All ranks fetch concurrently — hf_hub_download uses a per-file
+                # filelock, so sibling ranks coalesce on the same download.
+                # See LeRobotDatasetMetadata.__init__ for the same fix pattern.
+                src_info_path.parent.mkdir(exist_ok=True, parents=True)
+                hf_hub_download(
+                    repo_id=src_repo,
+                    filename=INFO_PATH,
+                    repo_type="dataset",
+                    revision=src_revision,
+                    local_dir=src_root,
+                )
             src_info = json.loads(src_info_path.read_text())
             self._overlay = {
                 "source_repo": src_repo,
