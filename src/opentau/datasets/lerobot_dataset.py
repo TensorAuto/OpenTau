@@ -1660,10 +1660,11 @@ class LeRobotDataset(BaseDataset):
         memory-map correctly.
 
         Schema is inferred from the parquet files themselves; it is intentionally
-        not validated against `meta/info.json`. This lets cross-file column drift
-        load instead of raising a cast error, at the cost of `info.json` no
-        longer being the authoritative schema (drift now surfaces as a
-        `load_dataset` failure rather than a feature-cast error).
+        not validated against `meta/info.json`. So a parquet/`info.json` mismatch
+        now loads silently — the parquet's own schema wins and `info.json` is no
+        longer authoritative. A mismatch *between* the parquet files of a single
+        dataset still fails, but as a `load_dataset` concatenation error rather
+        than the old explicit feature-cast error.
 
         Files are passed in sorted-episode order so the hf_dataset row layout
         stays aligned with `episode_data_index["from"/"to"]` — see the
