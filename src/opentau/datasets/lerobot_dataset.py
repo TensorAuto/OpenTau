@@ -1616,18 +1616,25 @@ class LeRobotDataset(BaseDataset):
         table = pa_dataset.to_table(filter=filter_expr)
         try:
             hf_dataset = Dataset(table, info=DatasetInfo(features=features))
-        except TypeError as cast_err:
-            # info.json's declared feature types can drift from what was actually
-            # written to parquet (e.g. shape=[1] gets serialized as Value(...) by
-            # get_hf_features_from_features but the parquet column was emitted
-            # as list<...>). The strict cast in HF's Dataset constructor then
-            # raises TypeError("Couldn't cast ..."). Surface a warning and fall
-            # back to schema-inferred features so the dataset still loads; the
-            # underlying metadata still needs a curator-side fix.
-            if "Couldn't cast" not in str(cast_err):
+        except (TypeError, ValueError) as cast_err:
+            # info.json's declared features can drift from what was actually
+            # written to parquet, in two ways:
+            #   * type drift — e.g. shape=[1] gets serialized as Value(...) by
+            #     get_hf_features_from_features but the parquet column was
+            #     emitted as list<...>; HF's Dataset constructor then raises
+            #     TypeError("Couldn't cast ...").
+            #   * column-set drift — parquet has a column info.json never
+            #     declared (e.g. gripper_activity_action); HF raises
+            #     ValueError("Keys mismatch ...").
+            # Both mean the same thing — stale metadata — and both want the
+            # same fallback: use parquet-inferred features so the dataset
+            # still loads. The underlying metadata still needs a curator fix.
+            msg = str(cast_err)
+            if "Couldn't cast" not in msg and "Keys mismatch" not in msg:
                 raise
             logging.warning(
-                "Feature cast from meta/info.json failed for %s (%s); falling back to parquet-inferred features.",
+                "Feature reconciliation from meta/info.json failed for %s (%s); "
+                "falling back to parquet-inferred features.",
                 self.repo_id,
                 cast_err,
             )
