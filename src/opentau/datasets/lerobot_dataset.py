@@ -1614,7 +1614,24 @@ class LeRobotDataset(BaseDataset):
         pa_dataset = pa_ds.dataset(list(map(str, paths)), format="parquet")
         filter_expr = pa_ds.field("episode_index").isin(self.episodes) if self.episodes is not None else None
         table = pa_dataset.to_table(filter=filter_expr)
-        hf_dataset = Dataset(table, info=DatasetInfo(features=features))
+        try:
+            hf_dataset = Dataset(table, info=DatasetInfo(features=features))
+        except TypeError as cast_err:
+            # info.json's declared feature types can drift from what was actually
+            # written to parquet (e.g. shape=[1] gets serialized as Value(...) by
+            # get_hf_features_from_features but the parquet column was emitted
+            # as list<...>). The strict cast in HF's Dataset constructor then
+            # raises TypeError("Couldn't cast ..."). Surface a warning and fall
+            # back to schema-inferred features so the dataset still loads; the
+            # underlying metadata still needs a curator-side fix.
+            if "Couldn't cast" not in str(cast_err):
+                raise
+            logging.warning(
+                "Feature cast from meta/info.json failed for %s (%s); falling back to parquet-inferred features.",
+                self.repo_id,
+                cast_err,
+            )
+            hf_dataset = Dataset(table)
         hf_dataset.set_transform(hf_transform_to_torch)
         return hf_dataset
 
