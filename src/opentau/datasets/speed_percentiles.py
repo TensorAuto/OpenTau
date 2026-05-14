@@ -271,39 +271,47 @@ def load_or_compute_speed_percentiles(
     distributed = acc is not None and acc.num_processes > 1
     is_main_or_solo = (not distributed) or acc.is_main_process
 
-    if path.is_file():
-        # `episode_to_task_index` already drops episodes with empty tasks,
-        # so its length is the per-task episode count we want to compare
-        # against the on-disk sum.
-        return _read_persisted(path, len(episode_to_task_index), warn=is_main_or_solo)
+    # NB: the barrier at the end of this function must run on every code path,
+    # not just the compute path. Otherwise a rank that arrives *after* rank 0
+    # has finished writing the file takes the early-return branch (file now
+    # exists), skips the barrier, and silently desyncs the collective counter
+    # for every subsequent collective in the mixture-load loop — manifesting
+    # as a NCCL hang at a much later (and entirely unrelated) sync point.
+    try:
+        if path.is_file():
+            # `episode_to_task_index` already drops episodes with empty tasks,
+            # so its length is the per-task episode count we want to compare
+            # against the on-disk sum.
+            return _read_persisted(path, len(episode_to_task_index), warn=is_main_or_solo)
 
-    by_task = _group_lengths_by_task(episode_lengths, episode_to_task_index)
-    index_to_task = {idx: task for task, idx in task_to_task_index.items()}
-    percentiles = compute_task_percentiles(by_task)
-    rows = [
-        {
-            "task_index": task_idx,
-            "task": index_to_task.get(task_idx, ""),
-            "n_episodes": len(by_task.get(task_idx, [])),
-            "percentiles": percentiles[task_idx],
-        }
-        for task_idx in sorted(percentiles)
-    ]
+        by_task = _group_lengths_by_task(episode_lengths, episode_to_task_index)
+        index_to_task = {idx: task for task, idx in task_to_task_index.items()}
+        percentiles = compute_task_percentiles(by_task)
+        rows = [
+            {
+                "task_index": task_idx,
+                "task": index_to_task.get(task_idx, ""),
+                "n_episodes": len(by_task.get(task_idx, [])),
+                "percentiles": percentiles[task_idx],
+            }
+            for task_idx in sorted(percentiles)
+        ]
 
-    if is_main_or_solo:
-        try:
-            _atomic_write_jsonlines(rows, path)
-        except (OSError, PermissionError) as e:
-            root_key = str(root)
-            if root_key not in _READONLY_WARNED:
-                _READONLY_WARNED.add(root_key)
-                logging.warning(
-                    "Could not write speed percentiles to %s (%s); using in-memory "
-                    "values for this run. The compute will repeat on every load until "
-                    "the file can be written.",
-                    path,
-                    e,
-                )
-    if distributed:
-        acc.wait_for_everyone()
-    return percentiles
+        if is_main_or_solo:
+            try:
+                _atomic_write_jsonlines(rows, path)
+            except (OSError, PermissionError) as e:
+                root_key = str(root)
+                if root_key not in _READONLY_WARNED:
+                    _READONLY_WARNED.add(root_key)
+                    logging.warning(
+                        "Could not write speed percentiles to %s (%s); using in-memory "
+                        "values for this run. The compute will repeat on every load until "
+                        "the file can be written.",
+                        path,
+                        e,
+                    )
+        return percentiles
+    finally:
+        if distributed:
+            acc.wait_for_everyone()
