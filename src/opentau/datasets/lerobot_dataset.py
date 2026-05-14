@@ -1255,6 +1255,13 @@ class LeRobotDataset(BaseDataset):
         # episode_data_index["from"/"to"] (built in self.episodes order in
         # get_episode_data_index). Mismatched order would silently return
         # rows from the wrong episode for callers that pass an unsorted list.
+        #
+        # `self.episodes` is backfilled with the full episode list further down
+        # when it is None (so downstream indexing always has a concrete list),
+        # which destroys the "no subset requested" signal. Capture it now so
+        # `download_episodes` can still distinguish a whole-repo pull from a
+        # subset pull.
+        self._episodes_were_specified = episodes is not None
         self.episodes = sorted(episodes) if episodes is not None else None
         self.tolerance_s = tolerance_s
         self.skip_timestamp_check = skip_timestamp_check
@@ -1540,7 +1547,7 @@ class LeRobotDataset(BaseDataset):
 
     @on_accelerate_main_proc(local=True, _sync=True)
     def download_files(self, files: list[str]) -> None:
-        """Fetch an explicit list of repo files, one `hf_hub_download` per file.
+        """Fetch the files from `files` that are missing on disk, one `hf_hub_download` each.
 
         `snapshot_download(allow_patterns=<thousands of explicit paths>)` spends
         many minutes GIL-held and I/O-idle inside `filter_repo_objects`, whose
@@ -1548,11 +1555,25 @@ class LeRobotDataset(BaseDataset):
         watchdog while sibling ranks wait at the `_sync` broadcast.
         `hf_hub_download` targets each file by exact path, skipping the filter
         entirely; a thread pool overlaps the network round-trips (the GIL is
-        released during I/O). Files already present in `local_dir` are not
-        re-downloaded.
+        released during I/O).
         """
         if not files:
             return
+        # `hf_hub_download` issues a network metadata request per file even
+        # when the file is already in `local_dir`. Calling it for an
+        # already-complete episode set burns one HF API request per file and
+        # trips the 3000 req / 5 min rate limit (429). Skip files already on
+        # disk — when the selected episodes were pre-downloaded this is a
+        # no-op that makes zero requests.
+        missing = [f for f in files if not (self.root / f).is_file()]
+        if not missing:
+            return
+        logging.info(
+            "%s: %d/%d episode files absent on disk, downloading them",
+            self.repo_id,
+            len(missing),
+            len(files),
+        )
 
         def _fetch(fpath: str) -> None:
             hf_hub_download(
@@ -1565,7 +1586,7 @@ class LeRobotDataset(BaseDataset):
 
         with ThreadPoolExecutor(max_workers=16) as pool:
             # list() forces the lazy map so any per-file failure propagates.
-            list(pool.map(_fetch, files))
+            list(pool.map(_fetch, missing))
 
     def download_episodes(self, download_videos: bool = True) -> None:
         """Downloads the dataset from the given 'repo_id' at the provided version. If 'episodes' is given, this
@@ -1574,9 +1595,12 @@ class LeRobotDataset(BaseDataset):
         """
         # TODO(rcadene, aliberts): implement faster transfer
         # https://huggingface.co/docs/huggingface_hub/en/guides/download#faster-downloads
-        if self.episodes is None:
+        if not self._episodes_were_specified:
             # Whole-dataset download: snapshot_download with no allow_patterns
-            # has nothing to filter, so there is no filter_repo_objects blowup.
+            # has nothing to filter, so there is no filter_repo_objects blowup,
+            # and it lists the repo tree in O(1) API calls instead of one
+            # metadata request per file. `self.episodes` has been backfilled to
+            # the full list by now, so branch on the construction-time flag.
             ignore_patterns = None if download_videos else "videos/"
             self.pull_from_repo(ignore_patterns=ignore_patterns)
             return
