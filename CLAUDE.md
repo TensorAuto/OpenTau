@@ -100,6 +100,8 @@ Three drop-in profiling scripts read the same `TrainPipelineConfig`:
 
 `FIND_UNUSED_PARAMS=false` (env var, read in `train.py`) reclaims ~10-15% of step time once a config has been audited.
 
+For *hung* runs (NCCL collective stuck, dataloader worker wedged in a C extension, anything `debugpy` can't reach), `py-spy` is in the `dev` extra. `py-spy dump --pid <pid>` attaches non-cooperatively and prints the Python stack of every thread — pair with `pgrep -f 'opentau/scripts/train.py'` to find ranks. Run as the same user as the target on Linux (no `sudo` typically needed); on macOS, prefix with `sudo` (Apple ptrace restriction).
+
 ## Architecture
 
 ### Configuration system (draccus)
