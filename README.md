@@ -30,6 +30,7 @@ Whether you use the official OpenPi codebase or LeRobot’s reimplementation, yo
 - Knowledge insulation between the VLM backbone and the action expert
 - Dropout in the VLM to reduce overfitting
 - Authentic $\pi_{0.6}$ policy with a Gemma 3 4B backbone, 448×448 vision, and 5-step flow matching
+- Hierarchical $\pi_{0.7}$ policy: high-level planner + low-level controller with a SpaceTime SigLIP video encoder on a Gemma 3 backbone
 - A reinforcement learning pipeline described in $\pi^*_{0.6}$
 - And more...
 
@@ -50,6 +51,7 @@ OpenTau ($\tau$) is a tool developed by *[Tensor][1]* to bridge this gap, and we
 |    $\pi^{*}_{0.6}$ style Reinforcement Learning Pipeline |            ❌            |                ❌                 |      ✅      |
 |                               Post-training on Human Data|            ❌            |                ❌                 |      ✅      |
 |            Authentic $\pi_{0.6}$ Policy (Gemma 3 4B backbone, 448×448 vision) |       ❌            |                ❌                 |      ✅      |
+|  Hierarchical $\pi_{0.7}$ Policy (HL Planner + LL Controller, SpaceTime SigLIP video encoder) |       ❌            |                ❌                 |      ✅      |
 |                                                Framework |      Jax / PyTorch       |             PyTorch               |   PyTorch    |
 
 ## Quick Start
@@ -63,6 +65,8 @@ For using local notebooks to train and evaluate models, find the notebooks at [n
 For using the Google Colab notebooks to train and evaluate models, find the colab notebooks here: [pi05_training](https://colab.research.google.com/drive/1DeU0lNnEzs1KHo0Nkgh4YKBr-xu9moBM?usp=sharing) and [pi05_evaluation_only](https://colab.research.google.com/drive/1U_AyuH9WYMT4anEWvsOtIT7g01jA0WGm?usp=sharing) respectively.
 
 To spin up a $\pi_{0.6}$ training run, start from [configs/examples/pi06_training_config.json](https://github.com/TensorAuto/OpenTau/blob/main/configs/examples/pi06_training_config.json). The policy is selected by setting `"type": "pi06"` and differs from $\pi_{0.5}$ in its Gemma 3 4B backbone, 448×448 image resolution, ~860M-parameter action expert, and 5-step flow-matching default.
+
+$\pi_{0.7}$ splits the model into a high-level planner that proposes subgoals and a low-level controller that executes them. The current implementation pairs a Gemma 3 backbone with a SpaceTime SigLIP video encoder so the controller can attend over temporal context, and the two stages train independently. To train the low-level controller, start from [configs/examples/pi07_low_level_libero.json](https://github.com/TensorAuto/OpenTau/blob/main/configs/examples/pi07_low_level_libero.json) (select via `"type": "pi07_low_level"`); the high-level planner is registered as `"type": "pi07_high_level"`.
 
 ## Training Diagnostics
 
@@ -98,6 +102,7 @@ We provide fully functioning $\pi_{0.5}$ checkpoints trained with high success r
 | [TensorAuto/tPi0.5-libero][2] | A $\pi_{0.5}$ model checkpoint trained on the LIBERO dataset with discrete actions and knowledge insulation.  | 98.4% (10) <br> 97.6% (Goal) <br> 100% (Object) <br> 98% (Spatial) |
 | [TensorAuto/pi05_base][5]     | A $\pi_{0.5}$ model checkpoint converted from the official openpi checkpoint, with language embeddings added. | N/A                                                                |
 | $\pi_{0.6}$ checkpoints       | Coming soon — the `pi06` policy is implemented and ready to train from scratch; first TensorAuto-published checkpoint will appear here once released. | N/A |
+| $\pi_{0.7}$ checkpoints       | Coming soon — the hierarchical `pi07_high_level` + `pi07_low_level` policies are implemented and ready to train from scratch; first TensorAuto-published checkpoint will appear here once released. | N/A |
 | More coming soon...           |                                                                                                               |                                                                    |
 
 ## Acknowledgements
