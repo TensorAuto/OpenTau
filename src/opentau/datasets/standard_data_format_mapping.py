@@ -79,6 +79,14 @@ DATA_FEATURES_NAME_MAPPING = {
         "prompt": "task",
         "response": "response",
     },
+    # `TensorAuto/libero` is the corrected re-export of upstream
+    # `physical-intelligence/libero`: identical frames/episodes, but the fps
+    # label is fixed (10 -> 20 Hz) and the format bumped (v2.0 -> v2.1). The
+    # upstream copy carries a *wrong* fps=10 label even though its actions are
+    # authored at the sim's native 20 Hz, which silently breaks training/eval
+    # frequency alignment. We deliberately do NOT keep a
+    # `physical-intelligence/libero` entry here (an unmapped repo_id raises at
+    # dataset build) to discourage its use — point configs at `TensorAuto/libero`.
     "TensorAuto/libero": {
         "camera0": "image",
         "camera1": "wrist_image",
