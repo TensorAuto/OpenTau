@@ -125,7 +125,9 @@ class EnvConfig(draccus.ChoiceRegistry, abc.ABC):
         import_name: Name under which the environment should be imported. For LIBERO, this doesn't need to be set.
         make_id: Gymnasium/Gym environment id (e.g., ``"CartPole-v1"``) when using ``gym.make``-style construction.
         task: Optional task or suite identifier understood by the environment.
-        fps: Target frames-per-second used for stepping/rendering.
+        fps: Target stepping frequency in Hz. Exact meaning is env-specific; for
+            LIBERO it is the robosuite control frequency (``LiberoEnv`` overrides
+            the default to 20).
         features: Mapping from logical feature names (e.g., ``"action"``,
             ``"pixels/agentview_image"``) to :class:`~opentau.configs.types.PolicyFeature`
             definitions consumed by policies.
@@ -218,6 +220,10 @@ class LiberoEnv(EnvConfig):
     )
 
     def __post_init__(self):
+        if self.fps <= 0:
+            raise ValueError(
+                f"LIBERO env.fps (robosuite control frequency in Hz) must be positive, got {self.fps}"
+            )
         if self.obs_type == "pixels":
             self.features["pixels/agentview_image"] = PolicyFeature(
                 type=FeatureType.VISUAL, shape=(360, 360, 3)

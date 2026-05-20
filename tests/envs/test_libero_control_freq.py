@@ -55,6 +55,14 @@ def test_libero_gym_kwargs_carries_control_freq():
     assert gym_kwargs["control_freq"] == 10
 
 
+@pytest.mark.parametrize("bad_fps", [0, -5])
+def test_libero_config_rejects_nonpositive_fps(bad_fps):
+    # fps now drives the sim control loop, so a non-positive value must fail loudly
+    # at config time rather than passing through to robosuite.
+    with pytest.raises(ValueError, match="must be positive"):
+        LiberoEnvConfig(fps=bad_fps)
+
+
 @patch("opentau.envs.libero.get_libero_path", return_value="/tmp/libero")
 @patch("opentau.envs.libero.OffScreenRenderEnv")
 def test_control_freq_reaches_robosuite(mock_offscreen, _mock_path):
