@@ -95,7 +95,10 @@ def create_fake_train_config() -> TrainPipelineConfig:
     mixture_cfg = DatasetMixtureConfig(datasets=[dataset_cfg], weights=[1.0])
     policy_cfg = DummyPolicyConfig()
 
-    # Create the main config with minimal required parameters
+    # Create the main config with minimal required parameters.
+    # batch_size is required: TrainPipelineConfig.__post_init__ raises when neither
+    # batch_size nor dataloader_batch_size is set. Conversion never trains, so any
+    # valid value works.
     cfg = TrainPipelineConfig(
         dataset_mixture=mixture_cfg,
         policy=policy_cfg,
@@ -104,6 +107,7 @@ def create_fake_train_config() -> TrainPipelineConfig:
         max_state_dim=32,
         max_action_dim=32,
         action_chunk=50,
+        batch_size=1,
     )
 
     return cfg
