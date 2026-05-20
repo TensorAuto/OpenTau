@@ -56,7 +56,7 @@ def load_dataset_config(path: Path) -> tuple[Path, str, list[int]]:
         raise ValueError(f"No 'datasets' in {path}")
     first = datasets[0]
     root = Path(first["root"]).resolve()
-    repo_id = first.get("repo_id", "physical-intelligence/libero")
+    repo_id = first.get("repo_id", "TensorAuto/libero")
     episodes = first.get("episodes", [0])
     episodes = sorted(episodes) if isinstance(episodes, list) else list(range(episodes))
     return root, repo_id, episodes

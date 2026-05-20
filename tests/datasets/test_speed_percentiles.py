@@ -358,7 +358,7 @@ class TestLoadOrComputeSpeedPercentiles:
 
 
 class TestLiberoSnapshot:
-    """Sanity check against the well-formed `physical-intelligence/libero`
+    """Sanity check against the well-formed `TensorAuto/libero`
     distribution: every task should be well populated (>= 10 distinct
     lengths) and each yields 10 ascending percentiles spanning a sensible
     frame range. Skips when the dataset isn't cached locally.
@@ -366,9 +366,9 @@ class TestLiberoSnapshot:
 
     def test_compute_smoke(self):
         lerobot_root = os.environ.get("LEROBOT_HOME") or os.path.expanduser("~/.cache/huggingface/lerobot")
-        ep_path = os.path.join(lerobot_root, "physical-intelligence/libero/meta/episodes.jsonl")
+        ep_path = os.path.join(lerobot_root, "TensorAuto/libero/meta/episodes.jsonl")
         if not os.path.isfile(ep_path):
-            pytest.skip(f"no local copy of physical-intelligence/libero at {ep_path}")
+            pytest.skip(f"no local copy of TensorAuto/libero at {ep_path}")
         import json
         from collections import defaultdict
 

@@ -183,9 +183,8 @@ class DatasetMixtureMetadata:
                 "mean": np.zeros((3, 1, 1), dtype=np.float32),
                 "std": np.zeros((3, 1, 1), dtype=np.float32),
             }
-            # `count` is only present in v2.1+ stats; v2.0 datasets like
-            # `physical-intelligence/libero` (LeRobot v2.0 format) carry
-            # only mean/std/min/max. Mirror it from the state stats when
+            # `count` is only present in v2.1+ stats; LeRobot v2.0-format
+            # datasets carry only mean/std/min/max. Mirror it from the state stats when
             # available — the empty-camera placeholder doesn't actually
             # need a meaningful count, but downstream code that asserts
             # the field's presence shouldn't crash. Issue #264.

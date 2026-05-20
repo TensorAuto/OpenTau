@@ -79,7 +79,7 @@ DATA_FEATURES_NAME_MAPPING = {
         "prompt": "task",
         "response": "response",
     },
-    "physical-intelligence/libero": {
+    "TensorAuto/libero": {
         "camera0": "image",
         "camera1": "wrist_image",
         "state": "state",

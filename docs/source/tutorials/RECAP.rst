@@ -23,7 +23,7 @@ Stage 1: SFT Training the VLA policy on whole libero dataset till convergence.
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Pi0 pretrained checkpoint is used as starting point for this step.
-Pi0 is trained on whole libero dataset (physical-intelligence/libero) for around 10k steps before it converges to 80% success rate on moka pot libero-10 task.
+Pi0 is trained on whole libero dataset (TensorAuto/libero) for around 10k steps before it converges to 80% success rate on moka pot libero-10 task.
 During the whole training, :math:`I_t` indicator is set to True for all the data points, i.e. assuming that the expert policy is always taking optimal action for a given state.
 Training the policy on whole libero tasks gives a better baseline for the offline RL training compared to just training on a single task.
 
@@ -35,14 +35,14 @@ Example of important config fields for SFT training:
     "dataset_mixture": {
         "datasets": [
             {
-                "repo_id": "physical-intelligence/libero"
+                "repo_id": "TensorAuto/libero"
             }
 
         ],
         "weights": [
             1.0
         ],
-        "action_freq": 10.0,
+        "action_freq": 20.0,
         "image_resample_strategy": "nearest",
         "vector_resample_strategy": "nearest"
     },
@@ -115,13 +115,13 @@ Example of important config fields for value function training:
     "dataset_mixture": {
         "datasets": [
             {
-                "repo_id": "physical-intelligence/libero"
+                "repo_id": "TensorAuto/libero"
             }
         ],
         "weights": [
             1.0
         ],
-        "action_freq": 10.0,
+        "action_freq": 20.0,
         "image_resample_strategy": "nearest",
         "vector_resample_strategy": "nearest"
     },
@@ -177,7 +177,7 @@ Example of important config fields for value function training:
     "dataset_mixture": {
         "datasets": [
             {
-                "repo_id": "physical-intelligence/libero",
+                "repo_id": "TensorAuto/libero",
                 "episodes": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
             },
             {
@@ -189,7 +189,7 @@ Example of important config fields for value function training:
             1.0,
             1.0
         ],
-        "action_freq": 10.0,
+        "action_freq": 20.0,
         "image_resample_strategy": "nearest",
         "vector_resample_strategy": "nearest"
     },
@@ -267,7 +267,7 @@ Example of important config fields for VLA policy fine-tuning:
     "dataset_mixture": {
         "datasets": [
             {
-                "repo_id": "physical-intelligence/libero"
+                "repo_id": "TensorAuto/libero"
             },
             {
                 "repo_id": "OpenTau/libero-rollouts",
@@ -279,7 +279,7 @@ Example of important config fields for VLA policy fine-tuning:
             1.0,
             1.0
         ],
-        "action_freq": 10.0,
+        "action_freq": 20.0,
         "image_resample_strategy": "nearest",
         "vector_resample_strategy": "nearest"
     },
@@ -318,7 +318,7 @@ Example:
    {
     "datasets": [
         {
-            "repo_id": "physical-intelligence/libero",
+            "repo_id": "TensorAuto/libero",
             "root": "/home/autox/akshay/OpenTau/libero_rollout_0_rank0/rank0",
             "episodes": [4]
             }
@@ -326,7 +326,7 @@ Example:
     "weights": [
         1.0
     ],
-    "action_freq": 10.0,
+    "action_freq": 20.0,
     "image_resample_strategy": "nearest",
     "vector_resample_strategy": "nearest",
     "val_split_ratio": 0

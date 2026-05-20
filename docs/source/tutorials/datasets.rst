@@ -15,7 +15,7 @@ You can define a dataset mixture in your configuration file using the ``dataset_
         "dataset_mixture": {
             "datasets": [
                 {
-                    "repo_id": "physical-intelligence/libero"
+                    "repo_id": "TensorAuto/libero"
                 },
                 {
                     "repo_id": "lerobot/droid_100"
@@ -25,7 +25,7 @@ You can define a dataset mixture in your configuration file using the ``dataset_
                 0.3,
                 0.7
             ],
-            "action_freq": 30.0,
+            "action_freq": 20.0,
         },
         ...
     }
@@ -44,7 +44,7 @@ For example:
         "dataset_mixture": {
             "datasets": [
                 {
-                    "repo_id": "physical-intelligence/libero",
+                    "repo_id": "TensorAuto/libero",
                     "data_features_name_mapping": {
                         "camera0": "observation.images.exterior_image_1_left",
                         "camera1": "observation.images.exterior_image_2_left"
@@ -59,7 +59,7 @@ For example:
                 0.3,
                 0.7
             ],
-            "action_freq": 30.0,
+            "action_freq": 20.0,
         },
         ...
     }
