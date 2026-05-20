@@ -180,7 +180,10 @@ class LiberoEnv(EnvConfig):
     Args:
         task: The LIBERO task or suite to use (e.g., ``"libero_10"``).
         task_ids: Optional list of specific task IDs within the suite to use (if ``None``, all tasks in the suite are used).
-        fps: Target frames-per-second for stepping/rendering.
+        fps: Robosuite control frequency (Hz) for the LIBERO sim — the rate at
+            which each ``env.step`` advances the simulation. Threaded through to
+            ``OffScreenRenderEnv(control_freq=...)``. Defaults to 20, robosuite's
+            native LIBERO rate (the value used before this field was wired up).
         episode_length: Maximum length of each episode in steps.
         obs_type: Type of observations to use (e.g., ``"pixels_agent_pos"``).
         render_mode: Rendering mode for the environment (e.g., ``"rgb_array"``).
@@ -193,7 +196,7 @@ class LiberoEnv(EnvConfig):
 
     task: str = "libero_10"  # can also choose libero_spatial, libero_object, etc.
     task_ids: list[int] | None = None
-    fps: int = 30
+    fps: int = 20  # robosuite control frequency (Hz); see field docstring above
     episode_length: int = 520
     obs_type: str = "pixels_agent_pos"
     render_mode: str = "rgb_array"
@@ -269,4 +272,5 @@ class LiberoEnv(EnvConfig):
             "obs_type": self.obs_type,
             "render_mode": self.render_mode,
             "task_ids": task_ids,
+            "control_freq": self.fps,
         }

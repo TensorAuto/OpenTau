@@ -122,6 +122,7 @@ class LiberoEnv(gym.Env):
         camera_name_mapping: dict[str, list[str]] | None = None,
         num_steps_wait: int = 10,
         render_cam: str | None = None,
+        control_freq: int = 20,
     ):
         r"""Initialize the LiberoEnv.
         Args:
@@ -140,6 +141,8 @@ class LiberoEnv(gym.Env):
             camera_name_mapping: Optional mapping from raw camera names to desired observation keys.
             num_steps_wait: Number of no-op steps to take after reset to stabilize the environment.
             render_cam: The camera name to use for rendering. If None, uses the first camera.
+            control_freq: Robosuite control frequency in Hz — how far each ``step`` advances the
+                sim (one control step = ``1 / control_freq`` seconds). Passed to ``OffScreenRenderEnv``.
         """
         super().__init__()
         self.task_id = task_id
@@ -172,6 +175,7 @@ class LiberoEnv(gym.Env):
                 f"got string {self.camera_name_mapping[cam]} for {cam} instead"
             )
         self.num_steps_wait = num_steps_wait
+        self.control_freq = control_freq
         self.episode_index = episode_index
         # Load once and keep
         self._init_states = _get_task_init_states(task_suite, self.task_id) if self.init_states else None
@@ -239,6 +243,7 @@ class LiberoEnv(gym.Env):
             "bddl_file_name": task_bddl_file,
             "camera_heights": self.observation_height,
             "camera_widths": self.observation_width,
+            "control_freq": self.control_freq,
         }
         env = OffScreenRenderEnv(**env_args)
         env.reset()

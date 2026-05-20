@@ -105,7 +105,7 @@
     "env": {
         "type": "libero",
         "task": "libero_10",
-        "fps": 10,
+        "fps": 20,
         "max_parallel_tasks": 1,
         "task_ids": [0],
         "episode_length": 100,
