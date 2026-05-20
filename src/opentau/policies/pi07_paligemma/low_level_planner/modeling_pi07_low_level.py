@@ -44,13 +44,13 @@ from opentau.policies.pi05.paligemma_with_expert import (
 )
 from opentau.policies.pi07.video_encoder import SpaceTimeSiglipVideoEncoder
 from opentau.policies.pi07_paligemma.low_level_planner.configuration_pi07_low_level import (
-    PI07lowlevelPlannerConfig,
+    PI07PaligemmaLowLevelPlannerConfig,
 )
 from opentau.policies.pretrained import PreTrainedPolicy, T
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
 
-ItemType = Literal["text", "video", "state", "discrete_action", "action"]
+ItemType = Literal["text", "image", "video", "state", "discrete_action", "action"]
 AttentionMode = Literal["continue", "bidirectional", "causal"]
 
 
@@ -69,13 +69,16 @@ class ContextItem:
     Fields:
         data: Per-type input. ``text``/``discrete_action``: token IDs
             ``(B, L)``. ``video``: pixel video ``(B, T, C, H, W)`` in
-            ``[0, 1]``. ``state``: continuous state ``(B, T, max_state_dim)``.
+            ``[0, 1]``. ``image``: single pixel image ``(B, C, H, W)`` in
+            ``[-1, 1]`` (subgoal images, embedded via the VLM's image tower).
+            ``state``: continuous state ``(B, T, max_state_dim)``.
             ``action``: noisy actions ``(B, chunk_size, max_action_dim)``.
         item_type: Dispatch key for which embedding path to take.
         pad_mask: Padding mask. ``(B,)`` per-sample is allowed for
-            ``video`` (the model expands it to ``(B, num_video_tokens)``).
-            All other types must pass ``(B, L)`` matching the embedded
-            sequence length. ``True`` = real, ``False`` = padded.
+            ``video``/``image`` (the model expands it to
+            ``(B, num_image_tokens)``). All other types must pass ``(B, L)``
+            matching the embedded sequence length. ``True`` = real,
+            ``False`` = padded.
         attention: 1-D attention pattern for this block:
             - ``"continue"``: ``[0]*L`` — token continues the previous
               block's attention scope (bidirectional with everything before).
@@ -287,12 +290,12 @@ def pad_discrete_tokens(tokens: list[list[int]], max_length: int) -> tuple[np.nd
 class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
     """Wrapper class around PI07LowLevelPlannerFlowMatching model to train and run inference within OpenTau."""
 
-    config_class = PI07lowlevelPlannerConfig
+    config_class = PI07PaligemmaLowLevelPlannerConfig
     name = "pi07_paligemma_low_level_planner"
 
     def __init__(
         self,
-        config: PI07lowlevelPlannerConfig,
+        config: PI07PaligemmaLowLevelPlannerConfig,
         dataset_stats: dict[str, dict[str, Tensor]] | None = None,
     ):
         """Initializes the PI07LowLevelPlannerPolicy.
@@ -699,11 +702,11 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             state (per-timestep stream)
             ", " — gated by sample_has_response
             response ("Subtask: …") — gated per-token by response_masks
-            ", " — gated by sample_has_subgoal
-            "Subgoal: "
-            subgoal videos (one per camera, per-sample masked)
             ", " — gated by sample_has_metadata
             metadata ("Metadata: Speed: …") — gated per-token by metadata_masks
+            ", " — gated by sample_has_subgoal
+            "Subgoal: "
+            subgoal images (one per camera, per-sample masked)
             ":\n"
             (training only)
             "Action: " — excluded from cross-attention
@@ -715,7 +718,7 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         lang_tokens, lang_masks = self.prepare_language(batch)
         response_tokens, response_masks = self.prepare_response(batch)
         metadata_tokens, metadata_masks = self.prepare_metadata(batch)
-        subgoal_videos, subgoal_vid_masks = self.prepare_subgoal_images(batch)
+        subgoal_images, subgoal_img_masks = self.prepare_subgoal_images(batch)
         state = self.prepare_state(batch)
 
         bsize = state.shape[0]
@@ -782,9 +785,31 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             )
         )
 
-        # Subgoal block: gated by sample_has_subgoal (OR across cameras).
-        if subgoal_vid_masks:
-            sample_has_subgoal = torch.stack(subgoal_vid_masks, dim=0).any(dim=0)
+        # Metadata block: gated by sample_has_metadata.
+        sample_has_metadata = metadata_masks.any(dim=1)
+        md_comma_tokens, md_comma_len = self._embed_text(", ", bsize, device)
+        items.append(
+            ContextItem(
+                data=md_comma_tokens,
+                item_type="text",
+                pad_mask=sample_has_metadata[:, None].expand(bsize, md_comma_len),
+                attention="continue",
+            )
+        )
+        items.append(
+            ContextItem(
+                data=metadata_tokens,
+                item_type="text",
+                pad_mask=metadata_masks,
+                attention="bidirectional",
+            )
+        )
+
+        # Subgoal block at the prefix tail (after all text), per π0.7 Fig. 19:
+        # image goals come after the text prompt. Gated by sample_has_subgoal
+        # (OR across cameras).
+        if subgoal_img_masks:
+            sample_has_subgoal = torch.stack(subgoal_img_masks, dim=0).any(dim=0)
         else:
             sample_has_subgoal = torch.zeros(bsize, dtype=torch.bool, device=device)
 
@@ -806,35 +831,15 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
                 attention="bidirectional",
             )
         )
-        for sg_vid, sg_vid_mask in zip(subgoal_videos, subgoal_vid_masks, strict=True):
+        for sg_img, sg_img_mask in zip(subgoal_images, subgoal_img_masks, strict=True):
             items.append(
                 ContextItem(
-                    data=sg_vid,
-                    item_type="video",
-                    pad_mask=sg_vid_mask,
+                    data=sg_img,
+                    item_type="image",
+                    pad_mask=sg_img_mask,
                     attention="continue",
                 )
             )
-
-        # Metadata block: gated by sample_has_metadata.
-        sample_has_metadata = metadata_masks.any(dim=1)
-        md_comma_tokens, md_comma_len = self._embed_text(", ", bsize, device)
-        items.append(
-            ContextItem(
-                data=md_comma_tokens,
-                item_type="text",
-                pad_mask=sample_has_metadata[:, None].expand(bsize, md_comma_len),
-                attention="continue",
-            )
-        )
-        items.append(
-            ContextItem(
-                data=metadata_tokens,
-                item_type="text",
-                pad_mask=metadata_masks,
-                attention="bidirectional",
-            )
-        )
 
         # Always-real state-end terminator.
         state_end_tokens, _ = self._embed_text(":\n", bsize, device)
@@ -1072,16 +1077,20 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         """Preprocess camera inputs into (B, T, C, H, W) video tensors.
 
         Pixel values stay in [0, 1]; the SpaceTime SigLIP encoder rescales
-        to [-1, 1] internally.  Padded history frames are handled inside the
-        video encoder via temporal attention masking (not pixel zeroing).
+        to [-1, 1] internally.  Padded history frames are zeroed at the pixel
+        level here (read from ``batch["obs_history_is_pad"]``) AND masked inside
+        the video encoder via temporal attention, mirroring pi07.
 
         Args:
-            batch: Batch of data containing image/video tensors.
+            batch: Batch of data containing image/video tensors. May contain
+                ``obs_history_is_pad`` ``(B, T)`` marking padded history frames.
 
         Returns:
             A tuple (videos, vid_masks) where each element is a list
             with one entry per camera.
         """
+        obs_history_is_pad = batch.get("obs_history_is_pad")
+
         videos: list[Tensor] = []
         vid_masks: list[Tensor] = []
 
@@ -1101,6 +1110,12 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             vid = batch[key]  # (B, T, C, H, W) or (B, C, H, W)
             if vid.ndim == 4:
                 vid = vid.unsqueeze(1)  # (B, C, H, W) -> (B, 1, C, H, W)
+
+            if obs_history_is_pad is not None:
+                # Zero padded history frames at the pixel level (defense in
+                # depth alongside the encoder's temporal-attention mask) so the
+                # encoder never processes clamped/repeated content.
+                vid = vid * (~obs_history_is_pad)[:, :, None, None, None]
 
             if self.config.resize_imgs_with_padding is not None:
                 b, t_frames = vid.shape[:2]
@@ -1128,18 +1143,19 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         return videos, vid_masks
 
     def prepare_subgoal_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
-        """Preprocess subgoal images for SpaceTime SigLIP embedding.
+        """Preprocess subgoal images for the VLM image tower.
 
         Derives subgoal keys from ``config.image_features``: for each
         ``camera{k}`` the corresponding batch key is ``subgoal{k}``.
         If no ``subgoal{k}`` keys are present in the batch, zero-filled
-        ``(B, 1, C, H, W)`` tensors with masks all ``False`` are returned
+        ``(B, C, H, W)`` tensors with masks all ``False`` are returned
         so that the prefix sequence length stays fixed.
 
-        Pixel values stay in ``[0, 1]``; the SpaceTime SigLIP encoder
-        rescales to ``[-1, 1]`` internally.  Each image is unsqueezed to
-        ``(B, 1, C, H, W)`` (single-frame video) so it can be passed
-        directly to :meth:`embed_video`.
+        Each image is resized with aspect-ratio padding and rescaled from
+        ``[0, 1]`` to ``[-1, 1]`` (the range SigLIP expects), then embedded
+        via :meth:`PaliGemmaWithExpertModel.embed_image` as a 4-D
+        ``(B, C, H, W)`` tensor (byte-identical to ``embed_video`` at T=1 on
+        the shared vision tower).
 
         When ``batch["subgoal_is_pad"]`` is ``True`` for a sample, the
         subgoal slots for that sample are zeroed out and masks cleared.
@@ -1159,11 +1175,11 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
                 ``config.image_features``.
 
         Returns:
-            A tuple ``(subgoal_videos, subgoal_vid_masks)`` of lists,
-            where each video has shape ``(B, 1, C, H, W)`` in ``[0, 1]``.
+            A tuple ``(subgoal_images, subgoal_img_masks)`` of lists,
+            where each image has shape ``(B, C, H, W)`` in ``[-1, 1]``.
         """
-        subgoal_videos: list[Tensor] = []
-        subgoal_vid_masks: list[Tensor] = []
+        subgoal_images: list[Tensor] = []
+        subgoal_img_masks: list[Tensor] = []
 
         subgoal_keys = [key.replace("camera", "subgoal") for key in self.config.image_features]
         present_keys = [key for key in subgoal_keys if key in batch]
@@ -1191,11 +1207,11 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             # (comma + ``Subgoal:`` + image tokens are fully masked out).
             h, w = self.config.resize_imgs_with_padding or (224, 224)
             for _ in subgoal_keys:
-                subgoal_videos.append(torch.zeros(bsize, 1, 3, h, w, device=device))
-                subgoal_vid_masks.append(torch.zeros(bsize, dtype=torch.bool, device=device))
-            return subgoal_videos, subgoal_vid_masks
+                subgoal_images.append(torch.zeros(bsize, 3, h, w, device=device))
+                subgoal_img_masks.append(torch.zeros(bsize, dtype=torch.bool, device=device))
+            return subgoal_images, subgoal_img_masks
 
-        last_vid: Tensor | None = None
+        last_img: Tensor | None = None
         last_mask: Tensor | None = None
 
         for key in present_keys:
@@ -1204,18 +1220,19 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             if self.config.resize_imgs_with_padding is not None:
                 subgoal_img = resize_with_pad(subgoal_img, *self.config.resize_imgs_with_padding, pad_value=0)
 
-            vid = subgoal_img.unsqueeze(1)  # (B, 1, C, H, W), pixels in [0, 1]
+            # Normalize from [0, 1] to [-1, 1] as expected by SigLIP.
+            subgoal_img = subgoal_img * 2.0 - 1.0  # (B, C, H, W)
 
-            vid_device = vid.device
-            mask = torch.ones(bsize, dtype=torch.bool, device=vid_device)
+            img_device = subgoal_img.device
+            mask = torch.ones(bsize, dtype=torch.bool, device=img_device)
 
-            is_pad = subgoal_is_pad.to(device=vid_device, dtype=torch.bool)
+            is_pad = subgoal_is_pad.to(device=img_device, dtype=torch.bool)
             mask = mask & ~is_pad
-            vid = vid * (~is_pad)[:, None, None, None, None]
+            subgoal_img = subgoal_img * (~is_pad)[:, None, None, None]
 
-            subgoal_videos.append(vid)
-            subgoal_vid_masks.append(mask)
-            last_vid = vid
+            subgoal_images.append(subgoal_img)
+            subgoal_img_masks.append(mask)
+            last_img = subgoal_img
             last_mask = mask
 
         # Pad to len(subgoal_keys) regardless of empty_cameras so the prefix
@@ -1223,12 +1240,12 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         # present/missing keys and empty_cameras=0, the prior loop produced
         # fewer slots than subgoal_keys and made the prefix length depend on
         # which subgoal{k} keys happened to be in the batch.
-        if last_vid is not None and last_mask is not None:
+        if last_img is not None and last_mask is not None:
             for _ in missing_keys:
-                subgoal_videos.append(torch.zeros_like(last_vid))
-                subgoal_vid_masks.append(torch.zeros_like(last_mask))
+                subgoal_images.append(torch.zeros_like(last_img))
+                subgoal_img_masks.append(torch.zeros_like(last_mask))
 
-        return subgoal_videos, subgoal_vid_masks
+        return subgoal_images, subgoal_img_masks
 
     def prepare_language(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
         """Tokenize the text input.
@@ -1270,12 +1287,15 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
           default to float zeros; ``mistake`` defaults to ``False``; every
           ``*_is_pad`` defaults to ``True`` (no metadata conditioning),
           matching an all-padded training batch.
-        - **Mixed keys** — only some of the six keys present: fill each missing
-          key with that same default so behavior matches a batch where every key
-          was specified explicitly.
+        - **Mixed keys** — only some keys present: fill each missing key with
+          that same default so behavior matches a batch where every key was
+          specified explicitly.
+        - ``robot_type`` / ``control_mode`` are string lists (empty string is
+          the pad signal, no separate ``_is_pad`` flag) and default to ``[""]``.
 
-        Per-sample on/off is controlled only by ``*_is_pad`` after hydration;
-        varying fields across rows uses the batch tensors, not missing dict keys.
+        Per-sample on/off is controlled only by ``*_is_pad`` (or the empty
+        string for ``robot_type`` / ``control_mode``) after hydration; varying
+        fields across rows uses the batch tensors, not missing dict keys.
         """
         bsz = batch["state"].shape[0]
         dev = batch["state"].device
@@ -1291,6 +1311,10 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
             batch["quality_is_pad"] = torch.ones(bsz, dtype=torch.bool, device=dev)
         if "mistake_is_pad" not in batch:
             batch["mistake_is_pad"] = torch.ones(bsz, dtype=torch.bool, device=dev)
+        if "robot_type" not in batch:
+            batch["robot_type"] = [""] * bsz
+        if "control_mode" not in batch:
+            batch["control_mode"] = [""] * bsz
 
     def _hydrate_optional_conditioning_batch(self, batch: dict) -> None:
         """Ensure response / metadata keys exist (training + inference parity).
@@ -1337,11 +1361,12 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
     def prepare_metadata(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
         """Tokenize episode metadata into PaliGemma token IDs.
 
-        Builds strings ``Metadata: Speed: … Quality: … Mistake: …`` only from
-        fields whose ``*_is_pad`` flag is ``False``. For each sample, if
-        ``speed_is_pad`` / ``quality_is_pad`` / ``mistake_is_pad`` is ``True``,
-        that field is omitted entirely (not concatenated to ``segments``). When
-        every flag is pad, the row is ``""`` before tokenization.
+        Builds strings ``Metadata: Speed: … Quality: … Mistake: … Robot: …
+        Control: …`` only from fields whose ``*_is_pad`` flag is ``False``
+        (``robot_type`` / ``control_mode`` are strings, omitted when empty).
+        For each sample, a padded or empty field is omitted entirely (not
+        concatenated to ``segments``). When every field is pad, the row is
+        ``""`` before tokenization.
 
         Always runs :meth:`_hydrate_metadata_batch` first so callers see the same
         outcomes whether they hit :meth:`sample_actions` (often no metadata
@@ -1403,26 +1428,45 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         pad_speed = _row_bool("speed_is_pad")
         pad_quality = _row_bool("quality_is_pad")
         pad_mistake = _row_bool("mistake_is_pad")
+        robot_types = batch["robot_type"]
+        control_modes = batch["control_mode"]
 
         metadata_rows: list[str] = []
-        for speed, quality, mistake, speed_is_pad, quality_is_pad, mistake_is_pad in zip(
+        for (
+            speed,
+            quality,
+            mistake,
+            speed_is_pad,
+            quality_is_pad,
+            mistake_is_pad,
+            robot_type,
+            control_mode,
+        ) in zip(
             speed_t,
             quality_t,
             mistake_t,
             pad_speed,
             pad_quality,
             pad_mistake,
+            robot_types,
+            control_modes,
             strict=True,
         ):
             segments: list[str] = []
-            # *_is_pad True → omit that field from the metadata string (same as dataloader mask).
+            # *_is_pad True (or empty string) → omit that field from the metadata
+            # string (same as the dataloader mask). Each segment carries its own
+            # trailing ", " and segments are space-joined, matching pi07.
             if not speed_is_pad.item():
-                segments.append(f"Speed: {speed.item()}")
+                segments.append(f"Speed: {str(speed.item())}, ")
             if not quality_is_pad.item():
-                segments.append(f"Quality: {quality.item()}")
+                segments.append(f"Quality: {str(quality.item())}, ")
             if not mistake_is_pad.item():
-                segments.append(f"Mistake: {str(mistake.item())}")
-            metadata_rows.append(f"Metadata: {', '.join(segments)}" if segments else "")
+                segments.append(f"Mistake: {str(mistake.item())}, ")
+            if robot_type:
+                segments.append(f"Robot: {robot_type}, ")
+            if control_mode:
+                segments.append(f"Control: {control_mode}, ")
+            metadata_rows.append(f"Metadata: {' '.join(segments)}" if segments else "")
 
         tokenized = self.language_tokenizer.__call__(
             metadata_rows,
@@ -1478,7 +1522,7 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
     │      kv cache           │Gemma │                           │
     │      ┌─────────────────►│Expert│ ◄── adaRMS(time)          │
     │      │                  │      │                           │
-    │     ┌┴────────────┐     │ x 10 │                           │
+    │     ┌┴────────────┐     │ x 5  │                           │
     │     │             │     └──▲───┘                           │
     │     │  PaliGemma  │        │                               │
     │     │             │       noise                            │
@@ -1493,7 +1537,9 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
     └────────────────────────────────────────────────────────────┘
     """
 
-    def __init__(self, config: PI07lowlevelPlannerConfig, discrete_action_vocab_size: int | None = None):
+    def __init__(
+        self, config: PI07PaligemmaLowLevelPlannerConfig, discrete_action_vocab_size: int | None = None
+    ):
         """Initializes the PI07LowLevelPlannerFlowMatching model.
 
         Args:
@@ -1503,14 +1549,11 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         super().__init__()
         self.config = config
 
-        load_pretrained_paligemma = (
-            self.config.init_strategy == "expert_only_he_init"
-        )  # only load pretrained paligemma if we are He-initializing the expert only
         paligemma_with_expert_config = PaliGemmaWithExpertConfig(
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=self.config.train_expert_only,
             attention_implementation=self.config.attention_implementation,
-            load_pretrained_paligemma=load_pretrained_paligemma,
+            load_pretrained_paligemma=False,
             discrete_action_vocab_size=discrete_action_vocab_size,
             dropout=self.config.dropout,
             gradient_checkpointing=self.config.gradient_checkpointing,
@@ -1536,35 +1579,6 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         self.time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
 
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
-
-        self._init_model()
-
-    def _init_weights(self, module: nn.Module) -> None:
-        """Initialize weights using He (Kaiming) initialization.
-
-        Args:
-            module: The module to initialize.
-        """
-        if isinstance(module, nn.Linear):
-            nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.LayerNorm):
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
-
-    def _init_model(self) -> None:
-        """Initialize the model weights based on the configuration."""
-        if self.config.init_strategy == "no_init":
-            return
-        elif self.config.init_strategy == "full_he_init":
-            for m in self.modules():
-                self._init_weights(m)
-        elif self.config.init_strategy == "expert_only_he_init":
-            for m in self.paligemma_with_expert.gemma_expert.modules():
-                self._init_weights(m)
-        else:
-            raise ValueError(f"Invalid init strategy: {self.config.init_strategy}")
 
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
         """Samples Gaussian noise.
@@ -1658,10 +1672,24 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
         if t == "action":
             emb = self.action_in_proj(item.data.to(dtype=_preferred_dtype()))
             return emb, item.pad_mask
+        if t == "image":
+            # Subgoal images: 4-D (B, C, H, W) in [-1, 1] through the VLM's
+            # image tower (byte-identical to embed_video at T=1 on the shared
+            # tower). Run unconditionally so all ranks stay in lockstep — no
+            # data-dependent skip; the per-sample mask zeros padded slots
+            # downstream.
+            image = item.data
+            per_sample_mask = item.pad_mask
+            if per_sample_mask.ndim != 1:
+                raise ValueError(
+                    f"image pad_mask must be (B,) per-sample; got shape {tuple(per_sample_mask.shape)}."
+                )
+            emb = self.paligemma_with_expert.embed_image(image).to(dtype=_preferred_dtype())
+            expanded = per_sample_mask[:, None].expand(emb.shape[0], emb.shape[1])
+            return emb, expanded
         if t == "video":
             # The unified SigLIP video encoder accepts variable T
-            # (short-circuiting the temporal sublayer at T=1), so single-frame
-            # subgoal videos are forwarded as-is without padding to num_frames.
+            # (short-circuiting the temporal sublayer at T=1).
             video = item.data
             obs_pad = item.obs_history_is_pad
             per_sample_mask = item.pad_mask

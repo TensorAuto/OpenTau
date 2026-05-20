@@ -47,7 +47,7 @@ from opentau.policies.pi07_paligemma.high_level_planner.configuration_pi07_high_
     PI07HighLevelPlannerConfig as PI07PaligemmaHighLevelPlannerConfig,
 )
 from opentau.policies.pi07_paligemma.low_level_planner.configuration_pi07_low_level import (
-    PI07lowlevelPlannerConfig as PI07PaligemmaLowLevelPlannerConfig,
+    PI07PaligemmaLowLevelPlannerConfig,
 )
 from opentau.policies.pretrained import PreTrainedPolicy
 from opentau.policies.value.configuration_value import ValueConfig

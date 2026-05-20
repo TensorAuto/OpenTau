@@ -18,7 +18,7 @@ from transformers import AutoTokenizer
 
 from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from opentau.policies.pi07_paligemma.low_level_planner.configuration_pi07_low_level import (
-    PI07lowlevelPlannerConfig,
+    PI07PaligemmaLowLevelPlannerConfig,
 )
 from opentau.policies.pi07_paligemma.low_level_planner.modeling_pi07_low_level import (
     ContextItem,
@@ -45,6 +45,7 @@ def _legacy_embed_prefix(
     discrete_actions=None,
     discrete_action_masks=None,
     obs_history_is_pad=None,
+    return_items=False,
 ):
     """Drive ``PI07LowLevelPlannerPolicy._build_prefix_items`` from the
     raw tensors these tests already construct, then run the resulting
@@ -113,6 +114,8 @@ def _legacy_embed_prefix(
         discrete_actions=discrete_actions,
         discrete_action_masks=discrete_action_masks,
     )
+    if return_items:
+        return items
     embs, pad_masks, att_masks, _num_cross = PI07LowLevelPlannerFlowMatching.embed_prefix(model, items)
     return embs, pad_masks, att_masks
 
@@ -145,8 +148,8 @@ class TestPI07LowLevelPlannerIntegration:
     """Integration tests for the PI07 low-level planner pipeline."""
 
     @staticmethod
-    def _make_config() -> PI07lowlevelPlannerConfig:
-        config = PI07lowlevelPlannerConfig(
+    def _make_config() -> PI07PaligemmaLowLevelPlannerConfig:
+        config = PI07PaligemmaLowLevelPlannerConfig(
             n_obs_steps=N_OBS_STEPS,
             chunk_size=CHUNK_SIZE,
             n_action_steps=CHUNK_SIZE,
@@ -195,10 +198,10 @@ class TestPI07LowLevelPlannerIntegration:
         p = 0
         p += VIDEO_TOKENS
         p += PROMPT_MAX_LENGTH
-        p += m["state_lead"] + N_OBS_STEPS + m["comma"]
-        p += RESPONSE_MAX_LENGTH
-        p += m["subgoal_lead"] + SUBGOAL_TOKENS + m["comma"]
-        p += METADATA_MAX_LENGTH
+        p += m["state_lead"] + N_OBS_STEPS
+        p += m["comma"] + RESPONSE_MAX_LENGTH
+        p += m["comma"] + METADATA_MAX_LENGTH
+        p += m["comma"] + m["subgoal_lead"] + SUBGOAL_TOKENS
         p += m["prefix_end"]
         p += m["action_lead"] + DISCRETE_ACTION_MAX_LENGTH
         return p
@@ -209,10 +212,10 @@ class TestPI07LowLevelPlannerIntegration:
         p = 0
         p += VIDEO_TOKENS
         p += PROMPT_MAX_LENGTH
-        p += m["state_lead"] + INFER_STATE_TOKENS + m["comma"]
-        p += RESPONSE_MAX_LENGTH
-        p += m["subgoal_lead"] + SUBGOAL_TOKENS + m["comma"]
-        p += METADATA_MAX_LENGTH
+        p += m["state_lead"] + INFER_STATE_TOKENS
+        p += m["comma"] + RESPONSE_MAX_LENGTH
+        p += m["comma"] + METADATA_MAX_LENGTH
+        p += m["comma"] + m["subgoal_lead"] + SUBGOAL_TOKENS
         p += m["prefix_end"]
         return p
 
@@ -251,11 +254,13 @@ class TestPI07LowLevelPlannerIntegration:
         resp_lo = LANG_START + PROMPT_MAX_LENGTH + m["state_lead"] + state_t + m["comma"]
         resp_slice = slice(resp_lo, resp_lo + RESPONSE_MAX_LENGTH)
 
-        sg_lo = resp_lo + RESPONSE_MAX_LENGTH + m["subgoal_lead"]
-        sg_slice = slice(sg_lo, sg_lo + SUBGOAL_TOKENS)
-
-        meta_lo = sg_lo + SUBGOAL_TOKENS + m["comma"]
+        # Metadata precedes subgoal; subgoal (comma + "Subgoal: " + image
+        # tokens) sits at the prefix tail.
+        meta_lo = resp_lo + RESPONSE_MAX_LENGTH + m["comma"]
         meta_slice = slice(meta_lo, meta_lo + METADATA_MAX_LENGTH)
+
+        sg_lo = meta_lo + METADATA_MAX_LENGTH + m["comma"] + m["subgoal_lead"]
+        sg_slice = slice(sg_lo, sg_lo + SUBGOAL_TOKENS)
 
         for i in range(prefix_pad_masks.shape[0]):
             assert torch.all(prefix_pad_masks[i, :VIDEO_TOKENS] == 1)
@@ -265,7 +270,7 @@ class TestPI07LowLevelPlannerIntegration:
             self._check_ones_before_zeros(prefix_pad_masks[i, meta_slice])
 
             if not inference_mode:
-                da_lo = meta_lo + METADATA_MAX_LENGTH + m["prefix_end"] + m["action_lead"]
+                da_lo = sg_lo + SUBGOAL_TOKENS + m["prefix_end"] + m["action_lead"]
                 da_slice = slice(da_lo, da_lo + DISCRETE_ACTION_MAX_LENGTH)
                 self._check_ones_before_zeros(prefix_pad_masks[i, da_slice])
 
@@ -1128,6 +1133,53 @@ class TestPI07EmbedPrefixInvariants:
         _embs, _pad, _att, num_cross = PI07LowLevelPlannerFlowMatching.embed_prefix(model, items)
         assert num_cross == 5  # 3 + 2; the trailing 4 + 1 are excluded.
 
+    def test_train_inference_prefix_item_order_parity(self):
+        """Training (``include_discrete_actions=True``) and inference (``False``)
+        build the same prefix block ordering, differing only by the trailing
+        training-only ``Action:`` + discrete-action items. Both paths share
+        ``_build_prefix_items``, so a one-sided block append regresses loudly here.
+        """
+        model = TestPI07LowLevelPlannerResponseEmbedding._make_mock_model(hidden_size=8)
+        bsz = 2
+        common = {
+            "videos": [torch.zeros(bsz, 1, 3, 8, 8)],
+            "vid_masks": [torch.ones(bsz, dtype=torch.bool)],
+            "lang_tokens": torch.zeros(bsz, 5, dtype=torch.long),
+            "lang_masks": torch.ones(bsz, 5, dtype=torch.bool),
+            "state": torch.zeros(bsz, 1, 8),
+            "response_tokens": torch.zeros(bsz, RESPONSE_MAX_LENGTH, dtype=torch.long),
+            "response_masks": torch.zeros(bsz, RESPONSE_MAX_LENGTH, dtype=torch.bool),
+            "metadata_tokens": torch.zeros(bsz, METADATA_MAX_LENGTH, dtype=torch.long),
+            "metadata_masks": torch.zeros(bsz, METADATA_MAX_LENGTH, dtype=torch.bool),
+            "subgoal_videos": [torch.zeros(bsz, 3, 224, 224)],
+            "subgoal_vid_masks": [torch.zeros(bsz, dtype=torch.bool)],
+        }
+
+        infer_items = _legacy_embed_prefix(model, return_items=True, **common)
+        train_items = _legacy_embed_prefix(
+            model,
+            return_items=True,
+            discrete_actions=torch.zeros(bsz, DISCRETE_ACTION_MAX_LENGTH, dtype=torch.long),
+            discrete_action_masks=torch.ones(bsz, DISCRETE_ACTION_MAX_LENGTH, dtype=torch.bool),
+            **common,
+        )
+
+        infer_types = [it.item_type for it in infer_items]
+        train_types = [it.item_type for it in train_items]
+
+        # Inference prefix is a strict prefix of the training prefix.
+        assert train_types[: len(infer_types)] == infer_types, (
+            f"train/inference prefix order diverged:\n  infer={infer_types}\n  train={train_types}"
+        )
+        # Training appends exactly the "Action: " indicator (text) + discrete actions.
+        assert train_types[len(infer_types) :] == ["text", "discrete_action"]
+        # Subgoal is embedded as an "image" block (A3) and sits before the
+        # training-only discrete-action tail.
+        assert "image" in infer_types
+        assert train_types.index("discrete_action") > max(
+            i for i, t in enumerate(train_types) if t == "image"
+        )
+
 
 class TestPI07LowLevelPlannerResponseEmbedding:
     """CPU-only tests verifying response token masking in ``embed_prefix``.
@@ -1430,16 +1482,14 @@ class TestPI07LowLevelPlannerMetadataEmbedding:
     :meth:`PI07LowLevelPlannerPolicy.prepare_metadata` (real tokenizer + the
     same ``speed`` / ``quality`` / ``mistake`` + ``*_is_pad`` rules as training).
 
-    Prefix slice after the response block (no subgoal images):
-        ... [response] [\", \" sg] [\"Subgoal: \"] [\", \" md] [metadata] [\":\\n\"]
+    Prefix slice after the response block (subgoal now sits at the tail):
+        ... [response] [\", \" md] [metadata] [\", \" sg] [\"Subgoal: \"] [\":\\n\"]
 
     The metadata ``\", \"`` separator uses ``sample_has_metadata = metadata_masks.any(dim=1)``.
     """
 
     _STATE_LEAD_LEN = len(TestPI07LowLevelPlannerResponseEmbedding._STATE_LEAD_IDS)
     _COMMA_LEN = len(TestPI07LowLevelPlannerResponseEmbedding._COMMA_IDS)
-    _SG_COMMA_LEN = len(TestPI07LowLevelPlannerResponseEmbedding._COMMA_IDS)
-    _SG_START_LEN = len(TestPI07LowLevelPlannerResponseEmbedding._SUBGOAL_LEAD_IDS)
     _MD_COMMA_LEN = len(TestPI07LowLevelPlannerResponseEmbedding._COMMA_IDS)
     _VID_TOKENS = 6
 
@@ -1517,8 +1567,9 @@ class TestPI07LowLevelPlannerMetadataEmbedding:
         resp_comma_end = resp_comma_start + cls._COMMA_LEN
         resp_start = resp_comma_end
         resp_end = resp_start + resp_len
-        # Subgoal header block (no subgoal images when lists empty)
-        md_comma_start = resp_end + cls._SG_COMMA_LEN + cls._SG_START_LEN
+        # Metadata block now sits directly after the response (subgoal moved to
+        # the tail, so no subgoal header precedes the metadata).
+        md_comma_start = resp_end
         md_comma_end = md_comma_start + cls._MD_COMMA_LEN
         meta_start = md_comma_end
         meta_end = meta_start + METADATA_MAX_LENGTH
@@ -1724,16 +1775,17 @@ class TestPI07LowLevelPlannerSubgoalEmbedding:
     :meth:`PI07LowLevelPlannerPolicy.prepare_subgoal_images` (same
     ``image_features`` / ``subgoal{k}`` layout as training).
 
-    After the response block: ``\", \"`` (subgoal) → ``\"Subgoal: \"`` →
-    SigLIP tokens per camera.  ``sample_has_subgoal`` is
-    ``torch.stack(subgoal_vid_masks, dim=0).any(dim=0)``.
+    Subgoal sits at the prefix tail (after the metadata block): ``\", \"``
+    (subgoal) → ``\"Subgoal: \"`` → image tokens per camera (via
+    ``embed_image``).  ``sample_has_subgoal`` is
+    ``torch.stack(subgoal_img_masks, dim=0).any(dim=0)``.
     """
 
     _VID = 6
     _STATE_LEAD = len(TestPI07LowLevelPlannerResponseEmbedding._STATE_LEAD_IDS)
     _COMMA = len(TestPI07LowLevelPlannerResponseEmbedding._COMMA_IDS)
     _SG_START = len(TestPI07LowLevelPlannerResponseEmbedding._SUBGOAL_LEAD_IDS)
-    _N_SG_TOKENS = 6  # mock ``embed_video`` / ``video_encoder.num_video_tokens``
+    _N_SG_TOKENS = 4  # mock ``paligemma_with_expert.embed_image`` token count
 
     @classmethod
     def _prepare_subgoal(cls, batch: dict) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
@@ -1813,7 +1865,9 @@ class TestPI07LowLevelPlannerSubgoalEmbedding:
         rcomma_hi = rcomma_lo + cls._COMMA
         resp_lo = rcomma_hi
         resp_hi = resp_lo + resp_len
-        sg_comma_lo = resp_hi
+        # Metadata block (md comma + METADATA_MAX_LENGTH tokens) now precedes the
+        # subgoal block, so the subgoal comma starts after it.
+        sg_comma_lo = resp_hi + cls._COMMA + METADATA_MAX_LENGTH
         sg_comma_hi = sg_comma_lo + cls._COMMA
         sg_start_lo = sg_comma_hi
         sg_start_hi = sg_start_lo + cls._SG_START
@@ -2068,11 +2122,10 @@ class TestPI07LowLevelPlannerSubgoalEmbedding:
         assert torch.equal(pm_a, pm_b)
 
     # ------------------------------------------------------------------ #
-    # n_obs_steps > 1: subgoals are single-frame (B, 1, C, H, W) and the
-    # encoder accepts variable T in [1, max_num_frames], so they pass through
-    # unpadded — the wrapper's T=1 short-circuit handles the temporal axis.
+    # Subgoals route through ``embed_image`` as 4-D (B, C, H, W) tensors,
+    # while the main history video still goes through ``embed_video``.
     # ------------------------------------------------------------------ #
-    def test_subgoal_passed_through_at_t1_when_n_obs_steps_gt_one(self):
+    def test_subgoal_routed_through_embed_image(self):
         bsz = 2
         n_obs_steps = 4
         batch = self._subgoal_batch(
@@ -2080,24 +2133,30 @@ class TestPI07LowLevelPlannerSubgoalEmbedding:
             include_tensors=True,
             subgoal_is_pad=torch.tensor([True, False]),
         )
-        sg_videos, sg_masks = self._prepare_subgoal(batch)
+        sg_images, sg_masks = self._prepare_subgoal(batch)
         rt, rm, mt, mm = self._empty_response_metadata(bsz)
 
-        captured: list[tuple[tuple[int, ...], torch.Tensor | None]] = []
         model = TestPI07LowLevelPlannerResponseEmbedding._make_mock_model(hidden_size=8)
         model.video_encoder.num_frames = n_obs_steps
+
+        video_calls: list[tuple[tuple[int, ...], torch.Tensor | None]] = []
+        image_calls: list[tuple[int, ...]] = []
 
         def _capturing_embed_video(video, obs_history_is_pad=None):
             t = video.shape[1]
             max_t = model.video_encoder.num_frames
             if not 1 <= t <= max_t:
                 raise ValueError(f"Expected 1 <= T <= {max_t}; got {t}.")
-            captured.append((tuple(video.shape), obs_history_is_pad))
+            video_calls.append((tuple(video.shape), obs_history_is_pad))
             return torch.zeros(video.shape[0], 6, 8, dtype=torch.bfloat16)
 
-        model.embed_video = _capturing_embed_video
+        def _capturing_embed_image(image):
+            image_calls.append(tuple(image.shape))
+            return torch.zeros(image.shape[0], 4, 8, dtype=torch.bfloat16)
 
-        # Call embed_prefix directly so we can install the capturing mock.
+        model.embed_video = _capturing_embed_video
+        model.paligemma_with_expert.embed_image = _capturing_embed_image
+
         _legacy_embed_prefix(
             model,
             videos=[torch.zeros(bsz, n_obs_steps, 3, 8, 8)],
@@ -2109,15 +2168,16 @@ class TestPI07LowLevelPlannerSubgoalEmbedding:
             response_masks=rm,
             metadata_tokens=mt,
             metadata_masks=mm,
-            subgoal_videos=sg_videos,
+            subgoal_videos=sg_images,
             subgoal_vid_masks=sg_masks,
         )
 
-        # Expect one embed_video call per main-video camera (T=n_obs_steps,
-        # obs_history_is_pad=None), then one per subgoal camera at T=1 with
-        # obs_history_is_pad=None — the encoder's T=1 short-circuit handles
-        # the temporal axis without padding.
-        assert len(captured) == 1 + len(sg_videos)
-        for shape, pad in captured[1:]:
-            assert shape == (bsz, 1, 3, 224, 224), shape
-            assert pad is None
+        # Main history video → one embed_video call (T=n_obs_steps); subgoal
+        # images → embed_image, one call per subgoal camera, each a 4-D
+        # (B, C, H, W) tensor. embed_image runs unconditionally (no per-sample
+        # skip), so the padded sample is still embedded then masked downstream.
+        assert len(video_calls) == 1
+        assert video_calls[0][0] == (bsz, n_obs_steps, 3, 8, 8)
+        assert len(image_calls) == len(sg_images)
+        for shape in image_calls:
+            assert shape == (bsz, 3, 224, 224), shape
