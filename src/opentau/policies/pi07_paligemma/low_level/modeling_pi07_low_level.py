@@ -1206,12 +1206,11 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
 
         if len(present_keys) == 0:
             # No subgoal tensors in batch (typical for Libero eval): fabricate one
-            # slot per entry in ``image_features``, same cardinality as when the
-            # dataloader emits ``subgoal{k}`` tensors. Filled with 0 (not the -1
-            # used for missing-camera slots below) so it stays byte-identical to
-            # the per-sample-padded path (``img * 0``); the cleared masks make the
-            # value inert and yield the same prefix as training with
-            # ``subgoal_is_pad=True`` everywhere.
+            # zero slot per entry in ``image_features``, same cardinality as when
+            # the dataloader emits ``subgoal{k}`` tensors. The cleared masks make
+            # the fill value inert (these tokens are masked out of attention), and
+            # yield the same prefix as training with ``subgoal_is_pad=True``
+            # everywhere (comma + ``Subgoal:`` + image tokens fully masked out).
             h, w = self.config.resize_imgs_with_padding or (224, 224)
             for _ in subgoal_keys:
                 subgoal_images.append(torch.zeros(bsize, 3, h, w, device=device))
@@ -1249,9 +1248,9 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         # which subgoal{k} keys happened to be in the batch.
         if last_img is not None and last_mask is not None:
             for _ in missing_keys:
-                # -1 (black) matches pi07's missing-camera placeholder fill; the
-                # cleared mask makes the value inert, but keeps exact parity.
-                subgoal_images.append(torch.full_like(last_img, -1.0))
+                # Fill value is inert: the cleared mask excludes these slots from
+                # attention, so the placeholder pixels never reach the model.
+                subgoal_images.append(torch.zeros_like(last_img))
                 subgoal_img_masks.append(torch.zeros_like(last_mask))
 
         return subgoal_images, subgoal_img_masks
@@ -1531,7 +1530,7 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
     │      kv cache           │Gemma │                           │
     │      ┌─────────────────►│Expert│ ◄── adaRMS(time)          │
     │      │                  │      │                           │
-    │     ┌┴────────────┐     │ x 5  │                           │
+    │     ┌┴────────────┐     │ x 10 │                           │
     │     │             │     └──▲───┘                           │
     │     │  PaliGemma  │        │                               │
     │     │             │       noise                            │

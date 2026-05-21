@@ -57,7 +57,7 @@ class PI07PaligemmaLowLevelConfig(PreTrainedConfig):
         discrete_action_max_length: Maximum length for discrete action tokens. Defaults to 32.
         proj_width: Width of the projection layer. Defaults to 1024.
         dropout: Dropout rate. Defaults to 0.1.
-        num_steps: Number of flow matching steps for decoding. Defaults to 5.
+        num_steps: Number of flow matching steps for decoding. Defaults to 10.
         attention_implementation: Attention implementation to use ("eager", "sdpa", or "fa2").
             Defaults to "eager". "sdpa" dispatches to ``torch.nn.functional.scaled_dot_product_attention``
             (frees ~5.6 GiB on forward at the bs ceiling tested; see PR #182). "fa2" is accepted for
@@ -132,7 +132,7 @@ class PI07PaligemmaLowLevelConfig(PreTrainedConfig):
     dropout: float = 0.1
 
     # Decoding
-    num_steps: int = 5
+    num_steps: int = 10
 
     # Real Time Inference
     # maximum number of frozen actions
