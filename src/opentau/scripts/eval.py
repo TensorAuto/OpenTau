@@ -24,6 +24,7 @@ import concurrent.futures as cf
 import datetime as dt
 import json
 import logging
+import re
 import threading
 import time
 from collections import defaultdict
@@ -887,6 +888,23 @@ def consolidate_eval_info(eval_infos: list[dict]) -> dict:
         "per_group": per_groups,
         "overall": overall,
     }
+
+
+def collect_grid_summary_videos(videos_dir: Path) -> list[tuple[str, str]]:
+    """Find per-task grid_summary.mp4 files under ``videos_dir`` for wandb logging.
+
+    Returns sorted ``(task_name, path)`` pairs, where ``task_name`` is the
+    per-task subdir name with any trailing ``_rank{N}`` stripped (so wandb keys
+    stay stable across GPU-count changes). Individual ``eval_episode_*.mp4``
+    clips are intentionally excluded.
+    """
+    if not videos_dir.exists():
+        return []
+    results = [
+        (re.sub(r"_rank\d+$", "", grid_path.parent.name), str(grid_path))
+        for grid_path in videos_dir.rglob("grid_summary.mp4")
+    ]
+    return sorted(results)
 
 
 def main():
