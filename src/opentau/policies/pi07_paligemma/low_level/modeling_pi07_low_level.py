@@ -43,8 +43,8 @@ from opentau.policies.pi05.paligemma_with_expert import (
     PaliGemmaWithExpertModel,
 )
 from opentau.policies.pi07.video_encoder import SpaceTimeSiglipVideoEncoder
-from opentau.policies.pi07_paligemma.low_level_planner.configuration_pi07_low_level import (
-    PI07PaligemmaLowLevelPlannerConfig,
+from opentau.policies.pi07_paligemma.low_level.configuration_pi07_low_level import (
+    PI07PaligemmaLowLevelConfig,
 )
 from opentau.policies.pretrained import PreTrainedPolicy, T
 from opentau.utils.accelerate_utils import get_proc_accelerator
@@ -58,8 +58,8 @@ AttentionMode = Literal["continue", "bidirectional", "causal"]
 class ContextItem:
     """One token-block contributed to the prefix or suffix sequence.
 
-    The ``PI07LowLevelPlannerPolicy`` builds a list of ``ContextItem``s and
-    hands it to the ``PI07LowLevelPlannerFlowMatching`` model. The model
+    The ``PI07PaligemmaLowLevelPolicy`` builds a list of ``ContextItem``s and
+    hands it to the ``PI07PaligemmaLowLevelFlowMatching`` model. The model
     embeds each item by ``item_type`` (text, video, state, discrete_action,
     action), concatenates the embeddings, and derives the 1-D attention
     mask from each item's ``attention`` setting. To add or rearrange
@@ -287,18 +287,18 @@ def pad_discrete_tokens(tokens: list[list[int]], max_length: int) -> tuple[np.nd
     return np.array(discrete_action_tokens), np.array(discrete_action_masks)
 
 
-class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
-    """Wrapper class around PI07LowLevelPlannerFlowMatching model to train and run inference within OpenTau."""
+class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
+    """Wrapper class around PI07PaligemmaLowLevelFlowMatching model to train and run inference within OpenTau."""
 
-    config_class = PI07PaligemmaLowLevelPlannerConfig
-    name = "pi07_paligemma_low_level_planner"
+    config_class = PI07PaligemmaLowLevelConfig
+    name = "pi07_paligemma_low_level"
 
     def __init__(
         self,
-        config: PI07PaligemmaLowLevelPlannerConfig,
+        config: PI07PaligemmaLowLevelConfig,
         dataset_stats: dict[str, dict[str, Tensor]] | None = None,
     ):
-        """Initializes the PI07LowLevelPlannerPolicy.
+        """Initializes the PI07PaligemmaLowLevelPolicy.
 
         Args:
             config: Policy configuration class instance or None, in which case the default instantiation of
@@ -328,7 +328,7 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         )
         # Get vocab size from processor
         discrete_action_vocab_size = getattr(self.discrete_action_processor, "vocab_size", None)
-        self.model = PI07LowLevelPlannerFlowMatching(
+        self.model = PI07PaligemmaLowLevelFlowMatching(
             config, discrete_action_vocab_size=discrete_action_vocab_size
         )
 
@@ -692,7 +692,7 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
         This is the **single place** to edit when adding a new conditioning
         block, removing one, or rearranging the order. The downstream
-        ``PI07LowLevelPlannerFlowMatching`` is layout-agnostic.
+        ``PI07PaligemmaLowLevelFlowMatching`` is layout-agnostic.
 
         Layout (top-to-bottom = sequence order):
 
@@ -1109,6 +1109,11 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         for key in present_img_keys:
             vid = batch[key]  # (B, T, C, H, W) or (B, C, H, W)
             if vid.ndim == 4:
+                if self.config.n_obs_steps > 1:
+                    raise ValueError(
+                        f"Expected 5D video tensor (B, T, C, H, W) when n_obs_steps > 1, "
+                        f"got shape {vid.shape}. Ensure select_action() is being used."
+                    )
                 vid = vid.unsqueeze(1)  # (B, C, H, W) -> (B, 1, C, H, W)
 
             if obs_history_is_pad is not None:
@@ -1201,10 +1206,12 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
 
         if len(present_keys) == 0:
             # No subgoal tensors in batch (typical for Libero eval): fabricate one
-            # zero slot per entry in ``image_features``, same cardinality as when
-            # the dataloader emits ``subgoal{k}`` tensors. Cleared masks yield the
-            # same prefix as training with ``subgoal_is_pad=True`` everywhere
-            # (comma + ``Subgoal:`` + image tokens are fully masked out).
+            # slot per entry in ``image_features``, same cardinality as when the
+            # dataloader emits ``subgoal{k}`` tensors. Filled with 0 (not the -1
+            # used for missing-camera slots below) so it stays byte-identical to
+            # the per-sample-padded path (``img * 0``); the cleared masks make the
+            # value inert and yield the same prefix as training with
+            # ``subgoal_is_pad=True`` everywhere.
             h, w = self.config.resize_imgs_with_padding or (224, 224)
             for _ in subgoal_keys:
                 subgoal_images.append(torch.zeros(bsize, 3, h, w, device=device))
@@ -1242,7 +1249,9 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         # which subgoal{k} keys happened to be in the batch.
         if last_img is not None and last_mask is not None:
             for _ in missing_keys:
-                subgoal_images.append(torch.zeros_like(last_img))
+                # -1 (black) matches pi07's missing-camera placeholder fill; the
+                # cleared mask makes the value inert, but keeps exact parity.
+                subgoal_images.append(torch.full_like(last_img, -1.0))
                 subgoal_img_masks.append(torch.zeros_like(last_mask))
 
         return subgoal_images, subgoal_img_masks
@@ -1482,8 +1491,8 @@ class PI07LowLevelPlannerPolicy(PreTrainedPolicy):
         return metadata_tokens, metadata_masks
 
 
-class PI07LowLevelPlannerFlowMatching(nn.Module):
-    """π07 Low-Level Planner — A Vision-Language-Action Flow Matching model with
+class PI07PaligemmaLowLevelFlowMatching(nn.Module):
+    """π07 Low-Level — A Vision-Language-Action Flow Matching model with
     SpaceTime SigLIP video, subtask/subgoal conditioning, and episode metadata.
 
     Architecturally inherits the π0.5 PaliGemma + Gemma-Expert flow-matching
@@ -1537,10 +1546,8 @@ class PI07LowLevelPlannerFlowMatching(nn.Module):
     └────────────────────────────────────────────────────────────┘
     """
 
-    def __init__(
-        self, config: PI07PaligemmaLowLevelPlannerConfig, discrete_action_vocab_size: int | None = None
-    ):
-        """Initializes the PI07LowLevelPlannerFlowMatching model.
+    def __init__(self, config: PI07PaligemmaLowLevelConfig, discrete_action_vocab_size: int | None = None):
+        """Initializes the PI07PaligemmaLowLevelFlowMatching model.
 
         Args:
             config: Model configuration.

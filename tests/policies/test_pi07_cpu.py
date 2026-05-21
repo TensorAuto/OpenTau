@@ -1269,7 +1269,7 @@ class TestPi07ConfigPlumbing:
             "opentau.policies.pi07.high_level_planner.configuration_pi07_high_level.PI07HighLevelPlannerConfig",
             "opentau.policies.pi07.low_level.configuration_pi07_low_level.PI07LowLevelConfig",
             "opentau.policies.pi07_paligemma.high_level_planner.configuration_pi07_high_level.PI07HighLevelPlannerConfig",
-            "opentau.policies.pi07_paligemma.low_level_planner.configuration_pi07_low_level.PI07PaligemmaLowLevelPlannerConfig",
+            "opentau.policies.pi07_paligemma.low_level.configuration_pi07_low_level.PI07PaligemmaLowLevelConfig",
         ],
     )
     def test_discrete_action_tokenizer_path_default_all_policies(self, config_dotted: str):

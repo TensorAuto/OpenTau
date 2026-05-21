@@ -19,7 +19,7 @@
         "val_enable_optional_key_dropout": false
     },
     "policy": {
-        "type": "pi07_paligemma_low_level_planner",
+        "type": "pi07_paligemma_low_level",
         "pretrained_path": "TensorAuto/pi05_base",
         "n_obs_steps": 1,
         "normalization_mapping": {

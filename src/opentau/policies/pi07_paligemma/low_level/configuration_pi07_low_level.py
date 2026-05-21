@@ -31,12 +31,12 @@ from opentau.optim.schedulers import (
 )
 
 
-@PreTrainedConfig.register_subclass("pi07_paligemma_low_level_planner")
+@PreTrainedConfig.register_subclass("pi07_paligemma_low_level")
 @dataclass
-class PI07PaligemmaLowLevelPlannerConfig(PreTrainedConfig):
-    """Configuration class for the pi07_paligemma_low_level_planner policy.
+class PI07PaligemmaLowLevelConfig(PreTrainedConfig):
+    """Configuration class for the pi07_paligemma_low_level policy.
 
-    This class defines the configuration parameters for the PI07PaligemmaLowLevelPlanner model, including
+    This class defines the configuration parameters for the PI07PaligemmaLowLevel model, including
     input/output structure, model architecture, training settings, and preprocessing.
 
     Args:

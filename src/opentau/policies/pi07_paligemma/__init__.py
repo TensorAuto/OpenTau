@@ -15,5 +15,5 @@
 
 Houses the high-level planner and the low-level planner for the
 ``pi07_reimplemented`` model. File names follow the ``pi07_<level>``
-convention (e.g. ``low_level_planner/modeling_pi07_low_level.py``).
+convention (e.g. ``low_level/modeling_pi07_low_level.py``).
 """
