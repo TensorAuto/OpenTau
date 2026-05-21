@@ -817,12 +817,17 @@ def train(cfg: TrainPipelineConfig):
                     json.dump(eval_info, f, indent=2)
 
                 # Log grid-summary eval videos to wandb (skip individual clips).
+                # Main-process-only, and globs the shared videos_dir, so it
+                # assumes every rank wrote to a filesystem the main process can
+                # read (true for the single-node multi-GPU setup; non-rank-0
+                # videos on a multi-node run without a shared FS won't be seen).
                 if cfg.wandb.enable and cfg.eval.max_episodes_rendered > 0:
-                    for task_name, grid_path in collect_grid_summary_videos(videos_dir):
-                        accelerator.log(
-                            {f"Eval Videos/{task_name}": wandb.Video(grid_path)},
-                            step=step,
-                        )
+                    grid_videos = {
+                        f"Eval Videos/{task_name}": wandb.Video(grid_path)
+                        for task_name, grid_path in collect_grid_summary_videos(videos_dir)
+                    }
+                    if grid_videos:
+                        accelerator.log(grid_videos, step=step)
 
             # This barrier is to ensure all processes finishes evaluation before the next training step
             # Some processes might be slower than others
