@@ -17,13 +17,13 @@ import torch
 from transformers import AutoTokenizer
 
 from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
-from opentau.policies.pi07_paligemma.low_level_planner.configuration_pi07_low_level import (
-    PI07lowlevelPlannerConfig,
+from opentau.policies.pi07_paligemma.low_level.configuration_pi07_low_level import (
+    PI07PaligemmaLowLevelConfig,
 )
-from opentau.policies.pi07_paligemma.low_level_planner.modeling_pi07_low_level import (
+from opentau.policies.pi07_paligemma.low_level.modeling_pi07_low_level import (
     ContextItem,
-    PI07LowLevelPlannerFlowMatching,
-    PI07LowLevelPlannerPolicy,
+    PI07PaligemmaLowLevelFlowMatching,
+    PI07PaligemmaLowLevelPolicy,
     make_att_2d_masks,
 )
 
@@ -45,8 +45,9 @@ def _legacy_embed_prefix(
     discrete_actions=None,
     discrete_action_masks=None,
     obs_history_is_pad=None,
+    return_items=False,
 ):
-    """Drive ``PI07LowLevelPlannerPolicy._build_prefix_items`` from the
+    """Drive ``PI07PaligemmaLowLevelPolicy._build_prefix_items`` from the
     raw tensors these tests already construct, then run the resulting
     items through ``model.embed_prefix``.
 
@@ -56,7 +57,7 @@ def _legacy_embed_prefix(
     only require editing one place) is exercised here automatically,
     rather than silently testing a parallel re-implementation.
 
-    The wiring: a bare ``PI07LowLevelPlannerPolicy`` instance is
+    The wiring: a bare ``PI07PaligemmaLowLevelPolicy`` instance is
     fabricated with ``object.__new__`` and its ``prepare_*`` methods
     are stubbed to return the supplied tensors. The fake policy
     borrows the model's ``language_tokenizer`` so ``_embed_text``
@@ -72,10 +73,10 @@ def _legacy_embed_prefix(
     ``AttributeError`` that points at an unrelated test failure.
     """
 
-    class _StrictFakePolicy(PI07LowLevelPlannerPolicy):
+    class _StrictFakePolicy(PI07PaligemmaLowLevelPolicy):
         """Subclass that errors loudly on any unstubbed attribute access.
 
-        Bypasses ``PI07LowLevelPlannerPolicy.__init__`` via
+        Bypasses ``PI07PaligemmaLowLevelPolicy.__init__`` via
         ``object.__new__``; only the attributes assigned below are
         valid. Any other attribute read raises a clear error that
         names the missing attribute and the helper that owns it,
@@ -87,7 +88,7 @@ def _legacy_embed_prefix(
             raise AttributeError(
                 f"_legacy_embed_prefix fake policy is missing attribute "
                 f"{name!r}; if _build_prefix_items now reads this, extend "
-                f"the helper in tests/policies/test_pi07_paligemma_low_level_planner.py."
+                f"the helper in tests/policies/test_pi07_paligemma_low_level.py."
             )
 
     fake_policy = object.__new__(_StrictFakePolicy)
@@ -106,14 +107,16 @@ def _legacy_embed_prefix(
     if obs_history_is_pad is not None:
         batch["obs_history_is_pad"] = obs_history_is_pad
 
-    items = PI07LowLevelPlannerPolicy._build_prefix_items(
+    items = PI07PaligemmaLowLevelPolicy._build_prefix_items(
         fake_policy,
         batch,
         include_discrete_actions=discrete_actions is not None,
         discrete_actions=discrete_actions,
         discrete_action_masks=discrete_action_masks,
     )
-    embs, pad_masks, att_masks, _num_cross = PI07LowLevelPlannerFlowMatching.embed_prefix(model, items)
+    if return_items:
+        return items
+    embs, pad_masks, att_masks, _num_cross = PI07PaligemmaLowLevelFlowMatching.embed_prefix(model, items)
     return embs, pad_masks, att_masks
 
 
@@ -141,12 +144,12 @@ SUBGOAL_TOKENS = NUM_SUBGOAL_CAMERAS * SIGLIP_TOKENS_PER_SUBGOAL  # 256
 INFER_STATE_TOKENS = 1
 
 
-class TestPI07LowLevelPlannerIntegration:
-    """Integration tests for the PI07 low-level planner pipeline."""
+class TestPI07PaligemmaLowLevelIntegration:
+    """Integration tests for the PI07 low-level pipeline."""
 
     @staticmethod
-    def _make_config() -> PI07lowlevelPlannerConfig:
-        config = PI07lowlevelPlannerConfig(
+    def _make_config() -> PI07PaligemmaLowLevelConfig:
+        config = PI07PaligemmaLowLevelConfig(
             n_obs_steps=N_OBS_STEPS,
             chunk_size=CHUNK_SIZE,
             n_action_steps=CHUNK_SIZE,
@@ -195,10 +198,10 @@ class TestPI07LowLevelPlannerIntegration:
         p = 0
         p += VIDEO_TOKENS
         p += PROMPT_MAX_LENGTH
-        p += m["state_lead"] + N_OBS_STEPS + m["comma"]
-        p += RESPONSE_MAX_LENGTH
-        p += m["subgoal_lead"] + SUBGOAL_TOKENS + m["comma"]
-        p += METADATA_MAX_LENGTH
+        p += m["state_lead"] + N_OBS_STEPS
+        p += m["comma"] + RESPONSE_MAX_LENGTH
+        p += m["comma"] + METADATA_MAX_LENGTH
+        p += m["comma"] + m["subgoal_lead"] + SUBGOAL_TOKENS
         p += m["prefix_end"]
         p += m["action_lead"] + DISCRETE_ACTION_MAX_LENGTH
         return p
@@ -209,10 +212,10 @@ class TestPI07LowLevelPlannerIntegration:
         p = 0
         p += VIDEO_TOKENS
         p += PROMPT_MAX_LENGTH
-        p += m["state_lead"] + INFER_STATE_TOKENS + m["comma"]
-        p += RESPONSE_MAX_LENGTH
-        p += m["subgoal_lead"] + SUBGOAL_TOKENS + m["comma"]
-        p += METADATA_MAX_LENGTH
+        p += m["state_lead"] + INFER_STATE_TOKENS
+        p += m["comma"] + RESPONSE_MAX_LENGTH
+        p += m["comma"] + METADATA_MAX_LENGTH
+        p += m["comma"] + m["subgoal_lead"] + SUBGOAL_TOKENS
         p += m["prefix_end"]
         return p
 
@@ -251,11 +254,13 @@ class TestPI07LowLevelPlannerIntegration:
         resp_lo = LANG_START + PROMPT_MAX_LENGTH + m["state_lead"] + state_t + m["comma"]
         resp_slice = slice(resp_lo, resp_lo + RESPONSE_MAX_LENGTH)
 
-        sg_lo = resp_lo + RESPONSE_MAX_LENGTH + m["subgoal_lead"]
-        sg_slice = slice(sg_lo, sg_lo + SUBGOAL_TOKENS)
-
-        meta_lo = sg_lo + SUBGOAL_TOKENS + m["comma"]
+        # Metadata precedes subgoal; subgoal (comma + "Subgoal: " + image
+        # tokens) sits at the prefix tail.
+        meta_lo = resp_lo + RESPONSE_MAX_LENGTH + m["comma"]
         meta_slice = slice(meta_lo, meta_lo + METADATA_MAX_LENGTH)
+
+        sg_lo = meta_lo + METADATA_MAX_LENGTH + m["comma"] + m["subgoal_lead"]
+        sg_slice = slice(sg_lo, sg_lo + SUBGOAL_TOKENS)
 
         for i in range(prefix_pad_masks.shape[0]):
             assert torch.all(prefix_pad_masks[i, :VIDEO_TOKENS] == 1)
@@ -265,7 +270,7 @@ class TestPI07LowLevelPlannerIntegration:
             self._check_ones_before_zeros(prefix_pad_masks[i, meta_slice])
 
             if not inference_mode:
-                da_lo = meta_lo + METADATA_MAX_LENGTH + m["prefix_end"] + m["action_lead"]
+                da_lo = sg_lo + SUBGOAL_TOKENS + m["prefix_end"] + m["action_lead"]
                 da_slice = slice(da_lo, da_lo + DISCRETE_ACTION_MAX_LENGTH)
                 self._check_ones_before_zeros(prefix_pad_masks[i, da_slice])
 
@@ -333,10 +338,10 @@ class TestPI07LowLevelPlannerIntegration:
     @pytest.mark.gpu
     @pytest.mark.slow
     def test_complete_pi07_low_level_pipeline(self, lerobot_dataset_metadata):
-        """Test the PI07 low-level planner pipeline: forward (training) and select_action (inference)."""
+        """Test the PI07 low-level pipeline: forward (training) and select_action (inference)."""
 
         config = self._make_config()
-        policy = PI07LowLevelPlannerPolicy(config, dataset_stats=lerobot_dataset_metadata.stats)
+        policy = PI07PaligemmaLowLevelPolicy(config, dataset_stats=lerobot_dataset_metadata.stats)
         tokenizer = policy.model.language_tokenizer
 
         batch_size = 1
@@ -589,7 +594,7 @@ class TestPI07LowLevelPlannerIntegration:
         assert action.shape == (1, MAX_ACTION_DIM)
 
 
-class TestPI07LowLevelPlannerObsHistoryRegression:
+class TestPI07PaligemmaLowLevelObsHistoryRegression:
     """GPU integration test for the SpaceTime SigLIP pipeline driven through a
     real PaliGemma backbone. The standalone (CPU-only) tests for the encoder's
     temporal-attention mask construction and PE behavior live in
@@ -645,7 +650,7 @@ class TestPI07LowLevelPlannerObsHistoryRegression:
         torch.testing.assert_close(out_none, out_false, msg="T=1: obs_history_is_pad=False should match None")
 
 
-class TestPI07LowLevelPlannerStateEmbedding:
+class TestPI07PaligemmaLowLevelStateEmbedding:
     """CPU-only tests verifying state embeddings in ``embed_prefix`` under all
     five observation-history conditions.
 
@@ -685,10 +690,10 @@ class TestPI07LowLevelPlannerStateEmbedding:
 
     @classmethod
     def _make_mock_model(cls, hidden_size: int = 8):
-        """Minimal ``PI07LowLevelPlannerFlowMatching`` with stubs — enough to
+        """Minimal ``PI07PaligemmaLowLevelFlowMatching`` with stubs — enough to
         drive ``embed_prefix`` on CPU with non-zero state embeddings."""
         h = hidden_size
-        model = object.__new__(PI07LowLevelPlannerFlowMatching)
+        model = object.__new__(PI07PaligemmaLowLevelFlowMatching)
 
         _text_cfg = type("_TextConfig", (), {"hidden_size": h})()
         _pg_cfg = type("_PaliGemmaConfig", (), {"text_config": _text_cfg})()
@@ -1084,10 +1089,10 @@ class TestPI07EmbedPrefixInvariants:
 
     def _make_mock_model(self, hidden_size: int = 8):
         """Reuse the lightweight CPU stub from
-        :class:`TestPI07LowLevelPlannerStateEmbedding` so this test
+        :class:`TestPI07PaligemmaLowLevelStateEmbedding` so this test
         class has no PaliGemma / GPU dependency.
         """
-        return TestPI07LowLevelPlannerStateEmbedding._make_mock_model(hidden_size=hidden_size)
+        return TestPI07PaligemmaLowLevelStateEmbedding._make_mock_model(hidden_size=hidden_size)
 
     @staticmethod
     def _text_item(bsize: int, length: int, *, exclude: bool) -> ContextItem:
@@ -1112,7 +1117,7 @@ class TestPI07EmbedPrefixInvariants:
             self._text_item(1, 1, exclude=False),
         ]
         with pytest.raises(ValueError, match="contiguous trailing run"):
-            PI07LowLevelPlannerFlowMatching.embed_prefix(model, items)
+            PI07PaligemmaLowLevelFlowMatching.embed_prefix(model, items)
 
     def test_all_included_then_all_excluded_ok(self):
         """The legal layout (excluded items as a trailing run) returns
@@ -1125,15 +1130,62 @@ class TestPI07EmbedPrefixInvariants:
             self._text_item(1, 4, exclude=True),
             self._text_item(1, 1, exclude=True),
         ]
-        _embs, _pad, _att, num_cross = PI07LowLevelPlannerFlowMatching.embed_prefix(model, items)
+        _embs, _pad, _att, num_cross = PI07PaligemmaLowLevelFlowMatching.embed_prefix(model, items)
         assert num_cross == 5  # 3 + 2; the trailing 4 + 1 are excluded.
 
+    def test_train_inference_prefix_item_order_parity(self):
+        """Training (``include_discrete_actions=True``) and inference (``False``)
+        build the same prefix block ordering, differing only by the trailing
+        training-only ``Action:`` + discrete-action items. Both paths share
+        ``_build_prefix_items``, so a one-sided block append regresses loudly here.
+        """
+        model = TestPI07PaligemmaLowLevelResponseEmbedding._make_mock_model(hidden_size=8)
+        bsz = 2
+        common = {
+            "videos": [torch.zeros(bsz, 1, 3, 8, 8)],
+            "vid_masks": [torch.ones(bsz, dtype=torch.bool)],
+            "lang_tokens": torch.zeros(bsz, 5, dtype=torch.long),
+            "lang_masks": torch.ones(bsz, 5, dtype=torch.bool),
+            "state": torch.zeros(bsz, 1, 8),
+            "response_tokens": torch.zeros(bsz, RESPONSE_MAX_LENGTH, dtype=torch.long),
+            "response_masks": torch.zeros(bsz, RESPONSE_MAX_LENGTH, dtype=torch.bool),
+            "metadata_tokens": torch.zeros(bsz, METADATA_MAX_LENGTH, dtype=torch.long),
+            "metadata_masks": torch.zeros(bsz, METADATA_MAX_LENGTH, dtype=torch.bool),
+            "subgoal_videos": [torch.zeros(bsz, 3, 224, 224)],
+            "subgoal_vid_masks": [torch.zeros(bsz, dtype=torch.bool)],
+        }
 
-class TestPI07LowLevelPlannerResponseEmbedding:
+        infer_items = _legacy_embed_prefix(model, return_items=True, **common)
+        train_items = _legacy_embed_prefix(
+            model,
+            return_items=True,
+            discrete_actions=torch.zeros(bsz, DISCRETE_ACTION_MAX_LENGTH, dtype=torch.long),
+            discrete_action_masks=torch.ones(bsz, DISCRETE_ACTION_MAX_LENGTH, dtype=torch.bool),
+            **common,
+        )
+
+        infer_types = [it.item_type for it in infer_items]
+        train_types = [it.item_type for it in train_items]
+
+        # Inference prefix is a strict prefix of the training prefix.
+        assert train_types[: len(infer_types)] == infer_types, (
+            f"train/inference prefix order diverged:\n  infer={infer_types}\n  train={train_types}"
+        )
+        # Training appends exactly the "Action: " indicator (text) + discrete actions.
+        assert train_types[len(infer_types) :] == ["text", "discrete_action"]
+        # Subgoal is embedded as an "image" block (A3) and sits before the
+        # training-only discrete-action tail.
+        assert "image" in infer_types
+        assert train_types.index("discrete_action") > max(
+            i for i, t in enumerate(train_types) if t == "image"
+        )
+
+
+class TestPI07PaligemmaLowLevelResponseEmbedding:
     """CPU-only tests verifying response token masking in ``embed_prefix``.
 
     ``response_tokens`` / ``response_masks`` come from
-    :meth:`PI07LowLevelPlannerPolicy.prepare_response` (real PaliGemma tokenizer),
+    :meth:`PI07PaligemmaLowLevelPolicy.prepare_response` (real PaliGemma tokenizer),
     then are fed into a lightweight ``embed_prefix`` mock.
 
     Prefix layout (no-optionals simplified):
@@ -1154,8 +1206,8 @@ class TestPI07LowLevelPlannerResponseEmbedding:
     @classmethod
     def _get_prepare_policy(cls) -> object:
         if cls._cached_prepare_policy is None:
-            policy = object.__new__(PI07LowLevelPlannerPolicy)
-            policy.config = TestPI07LowLevelPlannerIntegration._make_config()
+            policy = object.__new__(PI07PaligemmaLowLevelPolicy)
+            policy.config = TestPI07PaligemmaLowLevelIntegration._make_config()
             policy.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
             cls._cached_prepare_policy = policy
         return cls._cached_prepare_policy
@@ -1170,7 +1222,7 @@ class TestPI07LowLevelPlannerResponseEmbedding:
             batch["response"] = responses
 
         policy = cls._get_prepare_policy()
-        return PI07LowLevelPlannerPolicy.prepare_response(policy, batch)
+        return PI07PaligemmaLowLevelPolicy.prepare_response(policy, batch)
 
     @classmethod
     def _fake_tokenizer(cls):
@@ -1193,7 +1245,7 @@ class TestPI07LowLevelPlannerResponseEmbedding:
     @classmethod
     def _make_mock_model(cls, hidden_size: int = 8):
         h = hidden_size
-        model = object.__new__(PI07LowLevelPlannerFlowMatching)
+        model = object.__new__(PI07PaligemmaLowLevelFlowMatching)
 
         _text_cfg = type("_TextConfig", (), {"hidden_size": h})()
         _pg_cfg = type("_PaliGemmaConfig", (), {"text_config": _text_cfg})()
@@ -1423,30 +1475,28 @@ class TestPI07LowLevelPlannerResponseEmbedding:
         )
 
 
-class TestPI07LowLevelPlannerMetadataEmbedding:
+class TestPI07PaligemmaLowLevelMetadataEmbedding:
     """CPU-only tests for metadata pad masks in ``embed_prefix``.
 
     ``metadata_tokens`` / ``metadata_masks`` come from
-    :meth:`PI07LowLevelPlannerPolicy.prepare_metadata` (real tokenizer + the
+    :meth:`PI07PaligemmaLowLevelPolicy.prepare_metadata` (real tokenizer + the
     same ``speed`` / ``quality`` / ``mistake`` + ``*_is_pad`` rules as training).
 
-    Prefix slice after the response block (no subgoal images):
-        ... [response] [\", \" sg] [\"Subgoal: \"] [\", \" md] [metadata] [\":\\n\"]
+    Prefix slice after the response block (subgoal now sits at the tail):
+        ... [response] [\", \" md] [metadata] [\", \" sg] [\"Subgoal: \"] [\":\\n\"]
 
     The metadata ``\", \"`` separator uses ``sample_has_metadata = metadata_masks.any(dim=1)``.
     """
 
-    _STATE_LEAD_LEN = len(TestPI07LowLevelPlannerResponseEmbedding._STATE_LEAD_IDS)
-    _COMMA_LEN = len(TestPI07LowLevelPlannerResponseEmbedding._COMMA_IDS)
-    _SG_COMMA_LEN = len(TestPI07LowLevelPlannerResponseEmbedding._COMMA_IDS)
-    _SG_START_LEN = len(TestPI07LowLevelPlannerResponseEmbedding._SUBGOAL_LEAD_IDS)
-    _MD_COMMA_LEN = len(TestPI07LowLevelPlannerResponseEmbedding._COMMA_IDS)
+    _STATE_LEAD_LEN = len(TestPI07PaligemmaLowLevelResponseEmbedding._STATE_LEAD_IDS)
+    _COMMA_LEN = len(TestPI07PaligemmaLowLevelResponseEmbedding._COMMA_IDS)
+    _MD_COMMA_LEN = len(TestPI07PaligemmaLowLevelResponseEmbedding._COMMA_IDS)
     _VID_TOKENS = 6
 
     @classmethod
     def _prepare_metadata(cls, batch: dict) -> tuple[torch.Tensor, torch.Tensor]:
-        policy = TestPI07LowLevelPlannerResponseEmbedding._get_prepare_policy()
-        return PI07LowLevelPlannerPolicy.prepare_metadata(policy, batch)
+        policy = TestPI07PaligemmaLowLevelResponseEmbedding._get_prepare_policy()
+        return PI07PaligemmaLowLevelPolicy.prepare_metadata(policy, batch)
 
     @classmethod
     def _metadata_batch(
@@ -1493,7 +1543,7 @@ class TestPI07LowLevelPlannerMetadataEmbedding:
     ) -> tuple[torch.Tensor, dict]:
         """Run ``embed_prefix`` with real-shaped metadata; return ``pad_masks`` and
         slice indices for the metadata ``\", \"`` and metadata token block."""
-        model = TestPI07LowLevelPlannerResponseEmbedding._make_mock_model(hidden_size=hidden_size)
+        model = TestPI07PaligemmaLowLevelResponseEmbedding._make_mock_model(hidden_size=hidden_size)
         assert metadata_tokens.shape[1] == METADATA_MAX_LENGTH
 
         (_, pad_masks, _) = _legacy_embed_prefix(
@@ -1517,8 +1567,9 @@ class TestPI07LowLevelPlannerMetadataEmbedding:
         resp_comma_end = resp_comma_start + cls._COMMA_LEN
         resp_start = resp_comma_end
         resp_end = resp_start + resp_len
-        # Subgoal header block (no subgoal images when lists empty)
-        md_comma_start = resp_end + cls._SG_COMMA_LEN + cls._SG_START_LEN
+        # Metadata block now sits directly after the response (subgoal moved to
+        # the tail, so no subgoal header precedes the metadata).
+        md_comma_start = resp_end
         md_comma_end = md_comma_start + cls._MD_COMMA_LEN
         meta_start = md_comma_end
         meta_end = meta_start + METADATA_MAX_LENGTH
@@ -1532,7 +1583,7 @@ class TestPI07LowLevelPlannerMetadataEmbedding:
 
     @classmethod
     def _empty_response(cls, bsz: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return TestPI07LowLevelPlannerResponseEmbedding._prepare_response([""] * bsz)
+        return TestPI07PaligemmaLowLevelResponseEmbedding._prepare_response([""] * bsz)
 
     # ------------------------------------------------------------------ #
     # All metadata dropped (all *_is_pad True) — same as inference defaults
@@ -1717,39 +1768,40 @@ class TestPI07LowLevelPlannerMetadataEmbedding:
         assert torch.equal(pm_a, pm_b)
 
 
-class TestPI07LowLevelPlannerSubgoalEmbedding:
+class TestPI07PaligemmaLowLevelSubgoalEmbedding:
     """CPU-only tests for subgoal block pad masks in ``embed_prefix``.
 
     ``subgoal_videos`` / ``subgoal_vid_masks`` come from
-    :meth:`PI07LowLevelPlannerPolicy.prepare_subgoal_images` (same
+    :meth:`PI07PaligemmaLowLevelPolicy.prepare_subgoal_images` (same
     ``image_features`` / ``subgoal{k}`` layout as training).
 
-    After the response block: ``\", \"`` (subgoal) → ``\"Subgoal: \"`` →
-    SigLIP tokens per camera.  ``sample_has_subgoal`` is
-    ``torch.stack(subgoal_vid_masks, dim=0).any(dim=0)``.
+    Subgoal sits at the prefix tail (after the metadata block): ``\", \"``
+    (subgoal) → ``\"Subgoal: \"`` → image tokens per camera (via
+    ``embed_image``).  ``sample_has_subgoal`` is
+    ``torch.stack(subgoal_img_masks, dim=0).any(dim=0)``.
     """
 
     _VID = 6
-    _STATE_LEAD = len(TestPI07LowLevelPlannerResponseEmbedding._STATE_LEAD_IDS)
-    _COMMA = len(TestPI07LowLevelPlannerResponseEmbedding._COMMA_IDS)
-    _SG_START = len(TestPI07LowLevelPlannerResponseEmbedding._SUBGOAL_LEAD_IDS)
-    _N_SG_TOKENS = 6  # mock ``embed_video`` / ``video_encoder.num_video_tokens``
+    _STATE_LEAD = len(TestPI07PaligemmaLowLevelResponseEmbedding._STATE_LEAD_IDS)
+    _COMMA = len(TestPI07PaligemmaLowLevelResponseEmbedding._COMMA_IDS)
+    _SG_START = len(TestPI07PaligemmaLowLevelResponseEmbedding._SUBGOAL_LEAD_IDS)
+    _N_SG_TOKENS = 4  # mock ``paligemma_with_expert.embed_image`` token count
 
     @classmethod
     def _prepare_subgoal(cls, batch: dict) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        policy = TestPI07LowLevelPlannerResponseEmbedding._get_prepare_policy()
-        return PI07LowLevelPlannerPolicy.prepare_subgoal_images(policy, batch)
+        policy = TestPI07PaligemmaLowLevelResponseEmbedding._get_prepare_policy()
+        return PI07PaligemmaLowLevelPolicy.prepare_subgoal_images(policy, batch)
 
     @classmethod
     def _empty_response_metadata(cls, bsz: int) -> tuple[torch.Tensor, ...]:
-        rt, rm = TestPI07LowLevelPlannerResponseEmbedding._prepare_response([""] * bsz)
-        mb = TestPI07LowLevelPlannerMetadataEmbedding._metadata_batch(
+        rt, rm = TestPI07PaligemmaLowLevelResponseEmbedding._prepare_response([""] * bsz)
+        mb = TestPI07PaligemmaLowLevelMetadataEmbedding._metadata_batch(
             bsz,
             speed_pad=True,
             quality_pad=True,
             mistake_pad=True,
         )
-        mt, mm = TestPI07LowLevelPlannerMetadataEmbedding._prepare_metadata(mb)
+        mt, mm = TestPI07PaligemmaLowLevelMetadataEmbedding._prepare_metadata(mb)
         return rt, rm, mt, mm
 
     @classmethod
@@ -1789,7 +1841,7 @@ class TestPI07LowLevelPlannerSubgoalEmbedding:
         prompt_len: int = 5,
         hidden_size: int = 8,
     ) -> tuple[torch.Tensor, dict]:
-        model = TestPI07LowLevelPlannerResponseEmbedding._make_mock_model(hidden_size=hidden_size)
+        model = TestPI07PaligemmaLowLevelResponseEmbedding._make_mock_model(hidden_size=hidden_size)
         model.video_encoder.num_frames = n_obs_steps
         assert len(subgoal_videos) == len(subgoal_vid_masks)
 
@@ -1813,7 +1865,9 @@ class TestPI07LowLevelPlannerSubgoalEmbedding:
         rcomma_hi = rcomma_lo + cls._COMMA
         resp_lo = rcomma_hi
         resp_hi = resp_lo + resp_len
-        sg_comma_lo = resp_hi
+        # Metadata block (md comma + METADATA_MAX_LENGTH tokens) now precedes the
+        # subgoal block, so the subgoal comma starts after it.
+        sg_comma_lo = resp_hi + cls._COMMA + METADATA_MAX_LENGTH
         sg_comma_hi = sg_comma_lo + cls._COMMA
         sg_start_lo = sg_comma_hi
         sg_start_hi = sg_start_lo + cls._SG_START
@@ -2068,11 +2122,10 @@ class TestPI07LowLevelPlannerSubgoalEmbedding:
         assert torch.equal(pm_a, pm_b)
 
     # ------------------------------------------------------------------ #
-    # n_obs_steps > 1: subgoals are single-frame (B, 1, C, H, W) and the
-    # encoder accepts variable T in [1, max_num_frames], so they pass through
-    # unpadded — the wrapper's T=1 short-circuit handles the temporal axis.
+    # Subgoals route through ``embed_image`` as 4-D (B, C, H, W) tensors,
+    # while the main history video still goes through ``embed_video``.
     # ------------------------------------------------------------------ #
-    def test_subgoal_passed_through_at_t1_when_n_obs_steps_gt_one(self):
+    def test_subgoal_routed_through_embed_image(self):
         bsz = 2
         n_obs_steps = 4
         batch = self._subgoal_batch(
@@ -2080,24 +2133,30 @@ class TestPI07LowLevelPlannerSubgoalEmbedding:
             include_tensors=True,
             subgoal_is_pad=torch.tensor([True, False]),
         )
-        sg_videos, sg_masks = self._prepare_subgoal(batch)
+        sg_images, sg_masks = self._prepare_subgoal(batch)
         rt, rm, mt, mm = self._empty_response_metadata(bsz)
 
-        captured: list[tuple[tuple[int, ...], torch.Tensor | None]] = []
-        model = TestPI07LowLevelPlannerResponseEmbedding._make_mock_model(hidden_size=8)
+        model = TestPI07PaligemmaLowLevelResponseEmbedding._make_mock_model(hidden_size=8)
         model.video_encoder.num_frames = n_obs_steps
+
+        video_calls: list[tuple[tuple[int, ...], torch.Tensor | None]] = []
+        image_calls: list[tuple[int, ...]] = []
 
         def _capturing_embed_video(video, obs_history_is_pad=None):
             t = video.shape[1]
             max_t = model.video_encoder.num_frames
             if not 1 <= t <= max_t:
                 raise ValueError(f"Expected 1 <= T <= {max_t}; got {t}.")
-            captured.append((tuple(video.shape), obs_history_is_pad))
+            video_calls.append((tuple(video.shape), obs_history_is_pad))
             return torch.zeros(video.shape[0], 6, 8, dtype=torch.bfloat16)
 
-        model.embed_video = _capturing_embed_video
+        def _capturing_embed_image(image):
+            image_calls.append(tuple(image.shape))
+            return torch.zeros(image.shape[0], 4, 8, dtype=torch.bfloat16)
 
-        # Call embed_prefix directly so we can install the capturing mock.
+        model.embed_video = _capturing_embed_video
+        model.paligemma_with_expert.embed_image = _capturing_embed_image
+
         _legacy_embed_prefix(
             model,
             videos=[torch.zeros(bsz, n_obs_steps, 3, 8, 8)],
@@ -2109,15 +2168,16 @@ class TestPI07LowLevelPlannerSubgoalEmbedding:
             response_masks=rm,
             metadata_tokens=mt,
             metadata_masks=mm,
-            subgoal_videos=sg_videos,
+            subgoal_videos=sg_images,
             subgoal_vid_masks=sg_masks,
         )
 
-        # Expect one embed_video call per main-video camera (T=n_obs_steps,
-        # obs_history_is_pad=None), then one per subgoal camera at T=1 with
-        # obs_history_is_pad=None — the encoder's T=1 short-circuit handles
-        # the temporal axis without padding.
-        assert len(captured) == 1 + len(sg_videos)
-        for shape, pad in captured[1:]:
-            assert shape == (bsz, 1, 3, 224, 224), shape
-            assert pad is None
+        # Main history video → one embed_video call (T=n_obs_steps); subgoal
+        # images → embed_image, one call per subgoal camera, each a 4-D
+        # (B, C, H, W) tensor. embed_image runs unconditionally (no per-sample
+        # skip), so the padded sample is still embedded then masked downstream.
+        assert len(video_calls) == 1
+        assert video_calls[0][0] == (bsz, n_obs_steps, 3, 8, 8)
+        assert len(image_calls) == len(sg_images)
+        for shape in image_calls:
+            assert shape == (bsz, 3, 224, 224), shape

@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Low-level planner for π07 (PaliGemma variant).
+Low-level component for π07 (PaliGemma variant).
 
-This module implements the low-level planner of the π07 hierarchical
+This module implements the low-level component of the π07 hierarchical
 architecture. It uses a SpaceTime SigLIP video encoder, processes temporal
 state sequences (one continuous token per timestep), and supports optional
 subtask response, subgoal image, and metadata conditioning. Action generation

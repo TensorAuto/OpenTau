@@ -16,7 +16,7 @@
 
 This is the **canonical** test file for the unified ``SpaceTimeSiglipVideoEncoder``.
 All three callers — pi05_mem (PaliGemma backbone), pi07/low_level (Gemma 3
-backbone), and pi07_paligemma/low_level_planner (legacy PaliGemma backbone) —
+backbone), and pi07_paligemma/low_level (legacy PaliGemma backbone) —
 share the same encoder implementation, so coverage lives here in one place.
 
 Most tests are parametrized over both ``gemma3`` and ``paligemma`` projector

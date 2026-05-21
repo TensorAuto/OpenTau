@@ -20,9 +20,7 @@ for the PI05 Vision-Language-Action Flow Model. It includes settings for the mod
 optimization, scheduling, and data processing.
 """
 
-import logging
 from dataclasses import dataclass, field
-from typing import Literal
 
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
@@ -33,16 +31,16 @@ from opentau.optim.schedulers import (
 )
 
 
-@PreTrainedConfig.register_subclass("pi07_paligemma_low_level_planner")
+@PreTrainedConfig.register_subclass("pi07_paligemma_low_level")
 @dataclass
-class PI07lowlevelPlannerConfig(PreTrainedConfig):
-    """Configuration class for the pi07_paligemma_low_level_planner policy.
+class PI07PaligemmaLowLevelConfig(PreTrainedConfig):
+    """Configuration class for the pi07_paligemma_low_level policy.
 
-    This class defines the configuration parameters for the PI07PaligemmaLowLevelPlanner model, including
+    This class defines the configuration parameters for the PI07PaligemmaLowLevel model, including
     input/output structure, model architecture, training settings, and preprocessing.
 
     Args:
-        n_obs_steps: Number of observation steps to use. Defaults to 1.
+        n_obs_steps: Number of observation steps to use. Defaults to 6.
         history_interval: Temporal stride between the ``n_obs_steps`` stacked
             frames in the inference buffer, in environment steps. Defaults to 1.
         chunk_size: Size of the action chunk. The upper bound for n_action_steps. Defaults to 50.
@@ -60,8 +58,6 @@ class PI07lowlevelPlannerConfig(PreTrainedConfig):
         proj_width: Width of the projection layer. Defaults to 1024.
         dropout: Dropout rate. Defaults to 0.1.
         num_steps: Number of flow matching steps for decoding. Defaults to 10.
-        init_strategy: Initialization strategy. One of "no_init", "full_he_init", "expert_only_he_init".
-            Defaults to "full_he_init".
         attention_implementation: Attention implementation to use ("eager", "sdpa", or "fa2").
             Defaults to "eager". "sdpa" dispatches to ``torch.nn.functional.scaled_dot_product_attention``
             (frees ~5.6 GiB on forward at the bs ceiling tested; see PR #182). "fa2" is accepted for
@@ -78,7 +74,7 @@ class PI07lowlevelPlannerConfig(PreTrainedConfig):
     """
 
     # Input / output structure.
-    n_obs_steps: int = 1
+    n_obs_steps: int = 6
     chunk_size: int = 50
     n_action_steps: int = 50
 
@@ -114,9 +110,6 @@ class PI07lowlevelPlannerConfig(PreTrainedConfig):
     # Language Tokenizer
     prompt_max_length: int = 256
 
-    # Maximum length of the indicator tokens
-    discrete_action_indicator_max_length: int = 3
-
     # Maximum token length for subtask response from the high-level planner
     response_max_length: int = 52
 
@@ -136,9 +129,7 @@ class PI07lowlevelPlannerConfig(PreTrainedConfig):
     proj_width: int = 1024
 
     # Dropout
-    # Default kept at 0.0 so that pi07_paligemma matches pi05's deterministic behaviour
-    # when configs share other knobs; opt in via --policy.dropout=0.1 if regularisation is desired.
-    dropout: float = 0.0
+    dropout: float = 0.1
 
     # Decoding
     num_steps: int = 10
@@ -146,9 +137,6 @@ class PI07lowlevelPlannerConfig(PreTrainedConfig):
     # Real Time Inference
     # maximum number of frozen actions
     max_delay: int = 0
-
-    # Initialization strategy
-    init_strategy: Literal["no_init", "full_he_init", "expert_only_he_init"] = "full_he_init"
 
     # Attention utils
     attention_implementation: str = "eager"
@@ -204,19 +192,6 @@ class PI07lowlevelPlannerConfig(PreTrainedConfig):
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
                 f"{self.n_action_steps} for `n_action_steps` and {self.chunk_size} for `chunk_size`."
             )
-
-        assert self.init_strategy in ["no_init", "full_he_init", "expert_only_he_init"], (
-            f"Invalid init strategy: {self.init_strategy} must be one of ['no_init', 'full_he_init', 'expert_only_he_init']"
-        )
-
-        if self.init_strategy == "expert_only_he_init" and self.pretrained_path == "lerobot/pi05":
-            raise ValueError(
-                "You cannot load pretrained PI0 model when init_strategy is 'expert_only_he_init' due to differences in PaliGemma tokenizer vocab sizes."
-            )
-
-        if self.pretrained_path is not None and self.pretrained_path != "lerobot/pi05":
-            logging.info("Setting init_strategy to 'no_init' because we are resuming from a checkpoint.")
-            self.init_strategy = "no_init"
 
         if self.max_delay > self.chunk_size:
             raise ValueError(

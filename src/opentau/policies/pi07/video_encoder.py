@@ -24,7 +24,7 @@ matches a single-image VLA.
 
 This module is the **single, canonical** implementation of the SigLIP
 video encoder; all callers — pi05_mem, pi07/low_level (Gemma 3 backbone),
-and pi07_paligemma/low_level_planner (legacy PaliGemma backbone) — import
+and pi07_paligemma/low_level (legacy PaliGemma backbone) — import
 from here.
 
 Key properties:
