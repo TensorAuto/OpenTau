@@ -99,6 +99,8 @@ class TestFlexParity:
             (8, 1, 256, 256, 320, 64),  # pi07_paligemma-like GQA shape, with KV prefix
             (8, 1, 256, 256, 256, 64),  # equal Q/KV length
             (4, 4, 64, 128, 128, 32),  # smaller head_dim path (no kernel_options needed)
+            (8, 1, 256, 96, 160, 32),  # non-multiple-of-64 Q_LEN — exercises the pad path
+            (8, 1, 256, 40, 64, 16),  # short Q_LEN (< 64) — fully padded, validates softmax
         ],
     )
     def test_flex_matches_sdpa_bf16(self, num_att, num_kv, head_dim, s_q, s_kv, prefix_kv):

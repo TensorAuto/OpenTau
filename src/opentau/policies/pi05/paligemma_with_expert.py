@@ -87,19 +87,28 @@ def _build_flex_block_mask(attention_mask: torch.Tensor, q_len: int) -> BlockMas
 _FLEX_MIN_BLOCK_SIZE = 64
 """Smallest BlockMask BLOCK_SIZE that flex_attention's Inductor lowering
 accepts on Ampere + PyTorch 2.10. Going below this triggers a
-``LoweringException`` from ``inductor.graph::expect_true``. See _flex_can_use."""
+``LoweringException`` from ``inductor.graph::expect_true``. Q_LENs that
+aren't a multiple of this are right-padded inside ``flex_attention_forward``."""
+
+_FLEX_MIN_Q_LEN = 128
+"""Smallest absolute Q_LEN flex_attention's lowering accepts on Ampere +
+PyTorch 2.10. A single BlockMask tile (Q_LEN == BLOCK_SIZE) fails even
+when BLOCK_SIZE itself is valid; the lowering needs at least two Q tiles.
+Empirically Q_LEN=128 works with BLOCK_SIZE in {64, 128} and Q_LEN=64
+fails for any BLOCK_SIZE choice. Q_LENs below this floor get padded up
+to 128 in ``flex_attention_forward``."""
 
 
 def _flex_block_mask_size(q_len: int, kv_len: int) -> int:
     """Pick a BlockMask BLOCK_SIZE that the kernel tiles divide evenly.
 
-    Two constraints interact:
-      * Q_LEN has to be a multiple of BLOCK_SIZE; with ``dynamic=False``
-        the Inductor lowering hits an AssertionError on a non-divisible
-        Q_LEN. (KV_LEN gets rounded up with pad-masking and is OK.)
-      * BLOCK_SIZE must be at least ``_FLEX_MIN_BLOCK_SIZE`` (the
-        lowering fails below this on Ampere). Callers must first check
-        ``_flex_can_use``; this helper assumes a valid q_len.
+    Q_LEN must be a multiple of BLOCK_SIZE (with ``dynamic=False`` the
+    Inductor lowering hits an AssertionError on a non-divisible Q_LEN;
+    KV_LEN rounds up with pad-masking and is OK), and BLOCK_SIZE must be
+    at least ``_FLEX_MIN_BLOCK_SIZE`` (the lowering fails below this on
+    Ampere). Callers right-pad Q to a multiple of ``_FLEX_MIN_BLOCK_SIZE``
+    before invoking this, so the divisibility check below always succeeds
+    at 64 or larger.
 
     Picks the largest power-of-two ≤ 128 that divides Q_LEN.
     """
@@ -107,21 +116,6 @@ def _flex_block_mask_size(q_len: int, kv_len: int) -> int:
     while block_size > _FLEX_MIN_BLOCK_SIZE and q_len % block_size != 0:
         block_size //= 2
     return block_size
-
-
-def _flex_can_use(q_len: int) -> bool:
-    """Whether the current PyTorch flex_attention lowering can handle Q_LEN.
-
-    On Ampere (sm_86) + PyTorch 2.10, the Inductor lowering for
-    flex_attention raises a ``LoweringException`` from ``expect_true``
-    when BLOCK_SIZE drops below 64. Callers fall back to SDPA in that
-    case — the eager / sdpa path always works and the seq lengths that
-    fall through here (< 64, or non-multiples-of-64 below 128) are the
-    short / debug shapes where attention is not the bottleneck anyway.
-    Real training sequences in pi07_paligemma are O(1024) and always
-    multiples of 64, so the hot path is unaffected.
-    """
-    return q_len >= _FLEX_MIN_BLOCK_SIZE and q_len % _FLEX_MIN_BLOCK_SIZE == 0
 
 
 def _flex_kernel_options(head_dim: int) -> dict | None:
@@ -943,13 +937,6 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         Returns:
             torch.Tensor: Attention output of shape (B, S_q, num_attention_heads * head_dim).
         """
-        # Short / non-divisible Q_LEN trips the Inductor lowering on the
-        # current PyTorch — fall back to SDPA. See ``_flex_can_use``.
-        if not _flex_can_use(query_states.shape[1]):
-            return self.sdpa_attention_forward(
-                attention_mask, batch_size, head_dim, query_states, key_states, value_states
-            )
-
         num_att_heads = self.config.paligemma_config.text_config.num_attention_heads
         num_key_value_heads = self.config.paligemma_config.text_config.num_key_value_heads
         num_key_value_groups = num_att_heads // num_key_value_heads
@@ -976,6 +963,28 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         key_states = key_states.transpose(1, 2).contiguous()
         value_states = value_states.transpose(1, 2).contiguous()
 
+        # Pad Q (and the mask's Q axis) up to a multiple of _FLEX_MIN_BLOCK_SIZE
+        # AND at least _FLEX_MIN_Q_LEN, so the Inductor lowering's tile
+        # divisibility + two-tile-minimum constraints are both satisfied.
+        # Padded Q rows attend to KV index 0 only — the choice of KV index is
+        # arbitrary, the only requirement is at least one True per row so
+        # softmax doesn't see an all-``-inf`` row and emit NaN — and the
+        # corresponding output rows are sliced off below.
+        q_len = query_states.shape[2]
+        pad_target = max(_FLEX_MIN_Q_LEN, -(-q_len // _FLEX_MIN_BLOCK_SIZE) * _FLEX_MIN_BLOCK_SIZE)
+        pad_q = pad_target - q_len
+        if pad_q:
+            query_states = nn.functional.pad(query_states, (0, 0, 0, pad_q))
+            pad_rows = torch.zeros(
+                attention_mask.shape[0],
+                pad_q,
+                attention_mask.shape[2],
+                dtype=attention_mask.dtype,
+                device=attention_mask.device,
+            )
+            pad_rows[:, :, 0] = True
+            attention_mask = torch.cat([attention_mask, pad_rows], dim=1)
+
         block_mask = _build_flex_block_mask(attention_mask, query_states.shape[2])
 
         att_output = _flex_attention_compiled(
@@ -986,6 +995,9 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             scale=head_dim**-0.5,
             kernel_options=_flex_kernel_options(head_dim),
         )
+
+        if pad_q:
+            att_output = att_output[:, :, :q_len, :]
 
         # (B, H, S_q, D_h) → (B, S_q, H * D_h) to match eager / sdpa output.
         att_output = att_output.permute(0, 2, 1, 3)
