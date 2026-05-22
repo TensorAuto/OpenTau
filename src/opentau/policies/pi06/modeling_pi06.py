@@ -930,8 +930,12 @@ class PI06FlowMatching(nn.Module):
         pad_masks.append(action_mask)
         # Start a new bidirectional block for the action tokens. The leading `1`
         # breaks the prefix-to-suffix block boundary, the following `0`s keep
-        # all action tokens inside one bidirectional group.
-        att_masks += [1] + ([0] * (self.config.n_action_steps - 1))
+        # all action tokens inside one bidirectional group. The block spans the full
+        # chunk_size (= the noise/x_t length); n_action_steps is the execution horizon
+        # applied later in select_action, not the number of action tokens. Using
+        # n_action_steps here would mismatch the chunk_size-length pad mask and crash
+        # make_att_2d_masks when n_action_steps < chunk_size.
+        att_masks += [1] + ([0] * (self.config.chunk_size - 1))
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)

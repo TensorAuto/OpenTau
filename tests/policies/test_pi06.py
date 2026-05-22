@@ -337,6 +337,41 @@ class TestPI06ExecutionHorizon:
         assert calls["n"] == 2
         assert a_next[0, 0].item() == 2000.0
 
+    def test_embed_suffix_attn_mask_spans_full_chunk(self, monkeypatch):
+        """Real-path guard the mocked select_action test above misses.
+
+        ``embed_suffix`` must build the action attention mask over the full
+        ``chunk_size`` (= the noise/x_t length), not ``n_action_steps``. Before the
+        fix it used ``n_action_steps``, so for ``n_action_steps < chunk_size`` the
+        returned ``att_masks`` (len ``n_action_steps``) and ``pad_masks`` (len
+        ``chunk_size``) mismatched and ``make_att_2d_masks`` crashed -- in both the
+        training forward and the inference denoise step, upstream of the Euler step.
+        """
+        import torch.nn as nn
+
+        from opentau.policies.pi06.modeling_pi06 import PI06FlowMatching
+
+        mod = "opentau.policies.pi06.modeling_pi06"
+        monkeypatch.setattr(f"{mod}._preferred_dtype", lambda: torch.float32)
+        monkeypatch.setattr(
+            f"{mod}.create_sinusoidal_pos_embedding",
+            lambda timestep, dim, **kw: torch.zeros(timestep.shape[0], dim),
+        )
+
+        cfg = self._config(chunk_size=10, n_action_steps=3, max_delay=0)
+        fm = object.__new__(PI06FlowMatching)
+        nn.Module.__init__(fm)  # set up _modules so we can attach the stub layers
+        fm.config = cfg
+        fm.action_in_proj = nn.Identity()
+        fm.time_mlp_in = nn.Identity()
+        fm.time_mlp_out = nn.Identity()
+
+        out = PI06FlowMatching.embed_suffix(
+            fm, torch.zeros(1, cfg.chunk_size, cfg.max_action_dim), torch.zeros(1)
+        )
+        pad_masks, att_masks = out[1], out[2]
+        assert pad_masks.shape[1] == att_masks.shape[1] == cfg.chunk_size
+
 
 # Gemma3WithExpertConfig defaults — locks in π0.6 topology
 

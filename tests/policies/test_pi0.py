@@ -480,3 +480,52 @@ class TestPI0ExecutionHorizon:
         a_next = PI0Policy.select_action(policy, batch)
         assert calls["n"] == 2
         assert a_next[0, 0].item() == 2000.0
+
+    def test_embed_suffix_attn_mask_spans_full_chunk(self, monkeypatch):
+        """Real-path guard the mocked select_action test above misses.
+
+        ``embed_suffix`` must build the action attention mask over the full
+        ``chunk_size``, not ``n_action_steps`` -- otherwise the ``att_masks`` and the
+        ``chunk_size``-length ``pad_masks`` mismatch and ``make_att_2d_masks`` crashes
+        for ``n_action_steps < chunk_size``. pi0 also builds its inference noise at
+        ``chunk_size`` now (so the decoded chunk, this mask, and the ``denoise_step``
+        output slice all align). pi0's ``embed_suffix`` hardcodes bfloat16; only the
+        sinusoidal time embedding is stubbed, with real (tiny) projections so the
+        state/action/time feature dims stay consistent through the concats.
+        """
+        import torch.nn as nn
+
+        from opentau.policies.pi0.modeling_pi0 import PI0FlowMatching
+
+        mod = "opentau.policies.pi0.modeling_pi0"
+        monkeypatch.setattr(
+            f"{mod}.create_sinusoidal_pos_embedding",
+            lambda timestep, dim, **kw: torch.zeros(1, dim),
+        )
+
+        cfg = PI0Config(
+            chunk_size=10,
+            n_action_steps=3,
+            safety_buffer=0,
+            max_state_dim=self.MAX_STATE_DIM,
+            max_action_dim=self.MAX_ACTION_DIM,
+            proj_width=16,
+        )
+        pw, dt = cfg.proj_width, torch.bfloat16
+        fm = object.__new__(PI0FlowMatching)
+        nn.Module.__init__(fm)  # set up _modules so we can attach the stub layers
+        fm.config = cfg
+        fm.state_proj = nn.Linear(cfg.max_state_dim, pw).to(dt)
+        fm.action_in_proj = nn.Linear(cfg.max_action_dim, pw).to(dt)
+        fm.action_time_mlp_in = nn.Linear(pw * 2, pw).to(dt)
+        fm.action_time_mlp_out = nn.Linear(pw, pw).to(dt)
+
+        out = PI0FlowMatching.embed_suffix(
+            fm,
+            torch.zeros(1, cfg.max_state_dim, dtype=dt),
+            torch.zeros(1, cfg.chunk_size, cfg.max_action_dim),
+            torch.zeros(1),
+        )
+        pad_masks, att_masks = out[1], out[2]
+        # one state token + chunk_size action tokens.
+        assert pad_masks.shape[1] == att_masks.shape[1] == 1 + cfg.chunk_size

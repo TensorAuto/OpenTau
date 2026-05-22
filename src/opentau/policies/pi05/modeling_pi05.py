@@ -1234,8 +1234,12 @@ class PI05FlowMatching(nn.Module):
         action_mask = torch.ones(bsize, action_dim, dtype=torch.bool, device=device)
         pad_masks.append(action_mask)
 
-        # Set attention masks so that image, language and state inputs do not attend to action tokens
-        att_masks += [1] + ([0] * (self.config.n_action_steps - 1))
+        # Set attention masks so that image, language and state inputs do not attend to action tokens.
+        # The action block spans the full chunk_size (= the noise/x_t length, here and in the
+        # training forward); n_action_steps is the execution horizon applied later in select_action,
+        # not the number of action tokens. Using n_action_steps here would mismatch the chunk_size-
+        # length pad mask and crash make_att_2d_masks when n_action_steps < chunk_size.
+        att_masks += [1] + ([0] * (self.config.chunk_size - 1))
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)

@@ -771,8 +771,12 @@ class PI0FlowMatching(nn.Module):
         action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=device)
         pad_masks.append(action_time_mask)
 
-        # Set attention masks so that image, language and state inputs do not attend to action tokens
-        att_masks += [1] + ([0] * (self.config.n_action_steps - 1))
+        # Set attention masks so that image, language and state inputs do not attend to action tokens.
+        # The action block spans the full chunk_size (= the noise/x_t length, both in the training
+        # forward and inference). n_action_steps is the execution horizon applied later in
+        # select_action, not the number of action tokens; using it here would mismatch the
+        # chunk_size-length pad mask and crash make_att_2d_masks when n_action_steps < chunk_size.
+        att_masks += [1] + ([0] * (self.config.chunk_size - 1))
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -873,7 +877,11 @@ class PI0FlowMatching(nn.Module):
         device = state.device
 
         if noise is None:
-            actions_shape = (bsize, self.config.n_action_steps, self.config.max_action_dim)
+            # Decode the full trained chunk (chunk_size); select_action executes only the
+            # first n_action_steps (receding horizon). This must be chunk_size so the action
+            # tokens, the embed_suffix attention mask, and the denoise_step output slice all
+            # align -- otherwise v_t (chunk_size) mismatches x_t (n_action_steps) in the Euler step.
+            actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
