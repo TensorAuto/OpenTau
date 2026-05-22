@@ -105,6 +105,7 @@ def test_control_freq_reaches_real_robosuite_sim():
         n_envs=1,
         gym_kwargs={"task_ids": {"libero_10": [0]}, "control_freq": 13},
         env_cls=gym.vector.SyncVectorEnv,
+        init_states=False,
     )
     vec = envs["libero_10"][0]
     try:

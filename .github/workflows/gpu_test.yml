@@ -89,8 +89,16 @@ jobs:
         shell: bash
         run: |
           source .venv/bin/activate
-          mkdir -p /tmp/libero-assets/libero/libero
-          export LIBERO_CONFIG_PATH="$(pwd)/.github/assets/libero"
+          # Point LIBERO at the assets bundled inside the installed package (the
+          # fork's MANIFEST grafts bddl_files/init_files/assets) so the real-sim
+          # GPU test can build a genuine OffScreenRenderEnv. The .github/assets/libero
+          # config used by the mocked CPU tests points every path at an empty /tmp
+          # tree, which is fine for mocks but not for a real env build (it reads the
+          # bddl file via get_libero_path("bddl_files")).
+          export LIBERO_CONFIG_PATH=/tmp/libero-cfg
+          mkdir -p "$LIBERO_CONFIG_PATH"
+          touch "$LIBERO_CONFIG_PATH/config.yaml"  # pre-create so the LIBERO import skips its first-run input() prompt
+          python -c "from libero.libero import set_libero_default_path; set_libero_default_path()"
           pytest -m "gpu" -n 0 -v tests/
 
   stop-runner:
