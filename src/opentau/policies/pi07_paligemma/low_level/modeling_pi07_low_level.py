@@ -1998,6 +1998,12 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
 
         Factored out so that :meth:`forward`, :meth:`sample_actions`, and
         :meth:`denoise_step` share one definition of what's in the suffix.
+
+        Invariant: the action block must stay the *trailing* ``chunk_size``
+        tokens of the suffix. :meth:`forward` and :meth:`denoise_step` recover
+        the action outputs with ``suffix_out[:, -chunk_size:]``; if a future
+        block is appended after the actions, that slice (and those call sites)
+        must be updated accordingly.
         """
         bsize = x_t.shape[0]
         action_mask = torch.ones(bsize, x_t.shape[1], dtype=torch.bool, device=x_t.device)
