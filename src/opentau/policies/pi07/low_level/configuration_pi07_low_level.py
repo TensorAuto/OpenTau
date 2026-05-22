@@ -55,9 +55,12 @@ class PI07LowLevelConfig(PreTrainedConfig):
         history_interval: Temporal stride between the ``n_obs_steps``
             stacked frames in the inference buffer, in environment steps.
             Defaults to 1.
-        chunk_size: Size of the action chunk (upper bound for
-            ``n_action_steps``). Defaults to 50.
-        n_action_steps: Number of action steps to predict. Defaults to 50.
+        chunk_size: Trained action-chunk length, i.e. the prediction horizon the
+            model always decodes at inference. Upper bound for ``n_action_steps``.
+            Defaults to 50.
+        n_action_steps: Inference execution horizon -- how many actions from each
+            predicted chunk are executed before the policy re-queries with fresh
+            observations. Must be <= ``chunk_size``. Defaults to 50.
         normalization_mapping: Mapping of feature names to normalization modes.
         max_state_dim: Maximum dimension for state vectors. Defaults to 32.
         max_action_dim: Maximum dimension for action vectors. Defaults to 32.
@@ -261,6 +264,15 @@ class PI07LowLevelConfig(PreTrainedConfig):
         if self.max_delay > self.chunk_size:
             raise ValueError(
                 f"The max delay must be less than or equal to the chunk size. Got {self.max_delay} for `max_delay` and {self.chunk_size} for `chunk_size`."
+            )
+
+        if self.n_action_steps < self.chunk_size and self.max_delay != 0:
+            raise ValueError(
+                "A shortened execution horizon (n_action_steps < chunk_size) is not yet "
+                "supported together with real-time inference delay (max_delay > 0); they "
+                "would entangle the action-queue prefix logic. Got "
+                f"n_action_steps={self.n_action_steps}, chunk_size={self.chunk_size}, "
+                f"max_delay={self.max_delay}."
             )
 
     def validate_features(self) -> None:

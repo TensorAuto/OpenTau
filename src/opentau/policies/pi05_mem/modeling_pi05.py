@@ -522,7 +522,12 @@ class PI05MemPolicy(PreTrainedPolicy):
             delay = torch.tensor(delay, dtype=torch.long, device=batch["state"].device)
             actions = self.sample_actions(batch, noise=noise, action_prefix=action_prefix, delay=delay)
             actions = rearrange(actions, "b c d -> c b d")
-            self._action_queue.extend(actions[delay:])
+            # Execute only the first n_action_steps of the predicted chunk, then
+            # re-query with fresh observations (receding horizon). The config guard
+            # (n_action_steps < chunk_size => max_delay == 0 => delay == 0) keeps this
+            # slice in range and exactly n_action_steps long; when n_action_steps ==
+            # chunk_size it clamps to actions[delay:] (unchanged behaviour).
+            self._action_queue.extend(actions[delay : delay + self.config.n_action_steps])
             assert len(self._action_queue) == self.config.n_action_steps, (
                 f"Action queue must have {self.config.n_action_steps} actions"
             )
@@ -1099,7 +1104,10 @@ class PI05MemFlowMatching(nn.Module):
         )
 
         assert suffix_out is not None
-        suffix_out = suffix_out[:, -self.config.n_action_steps :]
+        # Supervise the whole chunk the model was trained to predict. n_action_steps
+        # is the inference-time execution horizon only and must not truncate the
+        # training target (chunk_size is the prediction horizon).
+        suffix_out = suffix_out[:, -self.config.chunk_size :]
         v_t = self.action_out_proj(suffix_out)
         v_t = v_t.to(dtype=torch.float32)
 
@@ -1249,7 +1257,10 @@ class PI05MemFlowMatching(nn.Module):
         )
         suffix_out = outputs_embeds[1]
         assert suffix_out is not None
-        suffix_out = suffix_out[:, -self.config.n_action_steps :]
+        # Denoise the full chunk_size chunk so v_t matches x_t in the Euler step.
+        # n_action_steps (execution horizon) is applied later in select_action, not
+        # at decode time.
+        suffix_out = suffix_out[:, -self.config.chunk_size :]
         v_t = self.action_out_proj(suffix_out)
         v_t = v_t.to(dtype=torch.float32)
         return v_t

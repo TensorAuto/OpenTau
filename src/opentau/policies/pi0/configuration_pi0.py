@@ -43,8 +43,11 @@ class PI0Config(PreTrainedConfig):
 
     Args:
         n_obs_steps: Number of observation steps to use. Defaults to 1.
-        chunk_size: Size of the action chunk. The upper bound for n_action_steps. Defaults to 50.
-        n_action_steps: Number of action steps to predict. Defaults to 50.
+        chunk_size: Trained action-chunk length, i.e. the prediction horizon the model
+            always decodes at inference. Upper bound for n_action_steps. Defaults to 50.
+        n_action_steps: Inference execution horizon -- how many actions from each
+            predicted chunk are executed before the policy re-queries with fresh
+            observations. Must be <= chunk_size. Defaults to 50.
         safety_buffer: Safety buffer size. Defaults to 0.
         normalization_mapping: Mapping of feature names to normalization modes.
             Defaults to identity for visual features and mean-std for state and action.
@@ -175,6 +178,15 @@ class PI0Config(PreTrainedConfig):
         if self.n_obs_steps != 1:
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
+            )
+
+        if self.n_action_steps < self.chunk_size and self.safety_buffer != 0:
+            raise ValueError(
+                "A shortened execution horizon (n_action_steps < chunk_size) is not yet "
+                "supported together with a non-zero safety_buffer; they would entangle the "
+                "action-queue refill logic. Got "
+                f"n_action_steps={self.n_action_steps}, chunk_size={self.chunk_size}, "
+                f"safety_buffer={self.safety_buffer}."
             )
 
     def validate_features(self) -> None:

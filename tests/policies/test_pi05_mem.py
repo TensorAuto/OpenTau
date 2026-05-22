@@ -20,6 +20,7 @@ import torch
 
 from opentau.policies.pi05_mem.configuration_pi05 import PI05MemConfig
 from opentau.policies.pi05_mem.modeling_pi05 import (
+    PI05MemPolicy,
     create_sinusoidal_pos_embedding,
     make_att_2d_masks,
     pad_discrete_tokens,
@@ -598,3 +599,78 @@ class TestBuildHistoryBatchEmitsObsHistoryIsPad:
             else:
                 assert torch.all(state[t] == 7.0), f"state[{t}] zero-filled but mask says real"
                 assert torch.all(cam[t] == 5.0), f"camera[{t}] zero-filled but mask says real"
+
+
+class TestPI05MemExecutionHorizon:
+    """Regression coverage for ``n_action_steps`` as a short execution horizon.
+
+    ``chunk_size`` is the trained prediction horizon (always decoded);
+    ``n_action_steps`` (<= chunk_size) is how many actions are executed before
+    re-querying. ``n_action_steps < chunk_size`` used to broadcast-crash the
+    denoise/MSE paths and trip the queue assert; these CPU tests guard that path.
+    """
+
+    MAX_STATE_DIM = 32
+    MAX_ACTION_DIM = 32
+
+    @classmethod
+    def _config(cls, chunk_size=10, n_action_steps=3, max_delay=0):
+        # n_obs_steps=1 skips the temporal-history branch in select_action.
+        return PI05MemConfig(
+            n_obs_steps=1,
+            chunk_size=chunk_size,
+            n_action_steps=n_action_steps,
+            max_delay=max_delay,
+            max_state_dim=cls.MAX_STATE_DIM,
+            max_action_dim=cls.MAX_ACTION_DIM,
+        )
+
+    def test_guard_rejects_short_horizon_with_delay(self):
+        # A shortened execution horizon is not compatible with the real-time
+        # delay prefix path; the config must reject it loudly.
+        with pytest.raises(ValueError, match="max_delay"):
+            self._config(chunk_size=10, n_action_steps=3, max_delay=2)
+
+    def test_guard_allows_short_horizon_without_delay(self):
+        cfg = self._config(chunk_size=10, n_action_steps=3, max_delay=0)
+        assert (cfg.chunk_size, cfg.n_action_steps, cfg.max_delay) == (10, 3, 0)
+
+    def test_guard_allows_full_horizon_with_delay(self):
+        # n_action_steps == chunk_size keeps the real-time-delay path available.
+        cfg = self._config(chunk_size=10, n_action_steps=10, max_delay=2)
+        assert cfg.max_delay == 2
+
+    def test_select_action_executes_first_n_then_requeries(self):
+        """Model decodes the full ``chunk_size`` chunk, but ``select_action``
+        executes only the first ``n_action_steps`` before re-querying.
+        """
+        chunk_size, n_steps, bsz = 10, 3, 2
+        cfg = self._config(chunk_size=chunk_size, n_action_steps=n_steps, max_delay=0)
+
+        policy = object.__new__(PI05MemPolicy)
+        policy.config = cfg
+        policy.eval = lambda: None  # bypass nn.Module.eval (no __init__ was run)
+        PI05MemPolicy.reset(policy)
+
+        calls = {"n": 0}
+
+        def fake_sample_actions(batch, noise=None, action_prefix=None, delay=None):
+            # Return a full chunk_size chunk; element value encodes
+            # (call_index * 1000 + timestep) so we can assert which timesteps run.
+            calls["n"] += 1
+            ts = torch.arange(chunk_size, dtype=torch.float32).reshape(1, chunk_size, 1)
+            return (calls["n"] * 1000 + ts).expand(bsz, chunk_size, self.MAX_ACTION_DIM).clone()
+
+        policy.sample_actions = fake_sample_actions
+        batch = {"state": torch.zeros(bsz, self.MAX_STATE_DIM)}
+
+        # First n_steps actions all come from a single decode (call 1), in order.
+        acts = [PI05MemPolicy.select_action(policy, batch) for _ in range(n_steps)]
+        assert calls["n"] == 1
+        assert [tuple(a.shape) for a in acts] == [(bsz, self.MAX_ACTION_DIM)] * n_steps
+        assert [a[0, 0].item() for a in acts] == [1000.0, 1001.0, 1002.0]
+
+        # Queue drained after n_action_steps -> next call re-queries (call 2).
+        a_next = PI05MemPolicy.select_action(policy, batch)
+        assert calls["n"] == 2
+        assert a_next[0, 0].item() == 2000.0

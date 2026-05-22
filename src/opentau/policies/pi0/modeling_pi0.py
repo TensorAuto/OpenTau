@@ -368,7 +368,12 @@ class PI0Policy(PreTrainedPolicy):
         if len(self._action_queue) <= self.config.safety_buffer:
             actions = self.sample_actions(batch, noise=noise)
             actions = rearrange(actions, "b c d -> c b d")
-            self._action_queue.extend(actions)
+            # sample_actions decodes the full chunk_size chunk, but only the first
+            # n_action_steps form the execution horizon (receding horizon). The queue's
+            # maxlen is n_action_steps, so extending with the whole chunk would silently
+            # drop the leading actions and execute the wrong tail; slice explicitly. When
+            # n_action_steps == chunk_size this is the whole chunk (unchanged behaviour).
+            self._action_queue.extend(actions[: self.config.n_action_steps])
         return self._action_queue.popleft()
 
     @torch.no_grad()
@@ -831,7 +836,10 @@ class PI0FlowMatching(nn.Module):
             use_cache=False,
             fill_kv_cache=False,
         )
-        suffix_out = suffix_out[:, -self.config.n_action_steps :]
+        # Supervise the whole chunk the model was trained to predict. n_action_steps
+        # is the inference-time execution horizon only and must not truncate the
+        # training target (chunk_size is the prediction horizon).
+        suffix_out = suffix_out[:, -self.config.chunk_size :]
         # Original openpi code, upcast attention output
         v_t = self.action_out_proj(suffix_out)
         v_t = v_t.to(dtype=torch.float32)
@@ -947,7 +955,10 @@ class PI0FlowMatching(nn.Module):
             fill_kv_cache=False,
         )
         suffix_out = outputs_embeds[1]
-        suffix_out = suffix_out[:, -self.config.n_action_steps :]
+        # Denoise the full chunk_size chunk so v_t matches x_t in the Euler step.
+        # n_action_steps (execution horizon) is applied later in select_action, not
+        # at decode time.
+        suffix_out = suffix_out[:, -self.config.chunk_size :]
         v_t = self.action_out_proj(suffix_out)
         v_t = v_t.to(dtype=torch.float32)
         return v_t
