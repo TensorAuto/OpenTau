@@ -26,6 +26,11 @@ import logging
 
 import torch
 from torch import nn
+from torch.nn.attention.flex_attention import (
+    BlockMask,
+    create_block_mask,
+    flex_attention,
+)
 from transformers import (
     AutoConfig,
     Cache,
@@ -36,6 +41,113 @@ from transformers import (
 )
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
+
+# torch.compile of flex_attention is required to fuse the Triton kernel; the
+# uncompiled path falls back to a slow eager reference. Compile once at module
+# load and reuse across forwards — the inner dispatch keys on input shapes so a
+# single compiled callable handles all sequence lengths we throw at it.
+_flex_attention_compiled = torch.compile(flex_attention, dynamic=False)
+
+
+def _build_flex_block_mask(attention_mask: torch.Tensor, q_len: int) -> BlockMask:
+    """Convert a dense ``(B, S_q, S_kv)`` bool attention mask to a flex BlockMask.
+
+    ``mask_mod`` closes over the dense tensor and indexes it per (b, q, kv)
+    position. flex_attention's ``create_block_mask`` calls this on a
+    BLOCK_SIZE-spaced grid to identify which tiles can be skipped entirely
+    — the actual attention kernel only visits the surviving blocks. The
+    per-position index inside a surviving block is still evaluated, so the
+    per-element semantic matches the SDPA path exactly.
+
+    Module-level (not a method) so it can be exercised against fake-self
+    test fixtures the same way ``eager_attention_forward`` /
+    ``sdpa_attention_forward`` are.
+    """
+    b, s_q, _s_kv = attention_mask.shape
+    # In KV-cache fill / replay the mask's Q-len may exceed the actual query
+    # length (pi05 padding artifact). The flex kernel reads only the q_len
+    # leading rows, so slice the mask to match.
+    if s_q != q_len:
+        attention_mask = attention_mask[:, :q_len, :]
+
+    def mask_mod(b_idx, h_idx, q_idx, kv_idx):
+        return attention_mask[b_idx, q_idx, kv_idx]
+
+    return create_block_mask(
+        mask_mod,
+        B=b,
+        H=None,
+        Q_LEN=q_len,
+        KV_LEN=attention_mask.shape[2],
+        device=attention_mask.device,
+        BLOCK_SIZE=_flex_block_mask_size(q_len, attention_mask.shape[2]),
+    )
+
+
+_FLEX_MIN_BLOCK_SIZE = 64
+"""Smallest BlockMask BLOCK_SIZE that flex_attention's Inductor lowering
+accepts on Ampere + PyTorch 2.10. Going below this triggers a
+``LoweringException`` from ``inductor.graph::expect_true``. See _flex_can_use."""
+
+
+def _flex_block_mask_size(q_len: int, kv_len: int) -> int:
+    """Pick a BlockMask BLOCK_SIZE that the kernel tiles divide evenly.
+
+    Two constraints interact:
+      * Q_LEN has to be a multiple of BLOCK_SIZE; with ``dynamic=False``
+        the Inductor lowering hits an AssertionError on a non-divisible
+        Q_LEN. (KV_LEN gets rounded up with pad-masking and is OK.)
+      * BLOCK_SIZE must be at least ``_FLEX_MIN_BLOCK_SIZE`` (the
+        lowering fails below this on Ampere). Callers must first check
+        ``_flex_can_use``; this helper assumes a valid q_len.
+
+    Picks the largest power-of-two ≤ 128 that divides Q_LEN.
+    """
+    block_size = 128
+    while block_size > _FLEX_MIN_BLOCK_SIZE and q_len % block_size != 0:
+        block_size //= 2
+    return block_size
+
+
+def _flex_can_use(q_len: int) -> bool:
+    """Whether the current PyTorch flex_attention lowering can handle Q_LEN.
+
+    On Ampere (sm_86) + PyTorch 2.10, the Inductor lowering for
+    flex_attention raises a ``LoweringException`` from ``expect_true``
+    when BLOCK_SIZE drops below 64. Callers fall back to SDPA in that
+    case — the eager / sdpa path always works and the seq lengths that
+    fall through here (< 64, or non-multiples-of-64 below 128) are the
+    short / debug shapes where attention is not the bottleneck anyway.
+    Real training sequences in pi07_paligemma are O(1024) and always
+    multiples of 64, so the hot path is unaffected.
+    """
+    return q_len >= _FLEX_MIN_BLOCK_SIZE and q_len % _FLEX_MIN_BLOCK_SIZE == 0
+
+
+def _flex_kernel_options(head_dim: int) -> dict | None:
+    """Pick Triton tile sizes that fit Ampere consumer-class shared memory.
+
+    flex_attention's default autotune configs are sized for Hopper SRAM
+    (228 KB/SM); RTX 3090 / 4090 only expose ~100 KB/SM, so the defaults
+    OOM at head_dim >= 192. We pin small tiles for both kernels:
+      * forward kernel uses ``BLOCK_M`` / ``BLOCK_N``,
+      * backward kernel uses ``BLOCK_M1`` / ``BLOCK_N1`` (for dK/dV) and
+        ``BLOCK_M2`` / ``BLOCK_N2`` (for dQ).
+    Pinning all four (plus ``num_stages=1``) keeps every pipeline under the
+    Ampere limit. On Hopper this is suboptimal but still correct; benchmark
+    and override there if it matters.
+    """
+    if head_dim >= 192:
+        return {
+            "BLOCK_M": 32,
+            "BLOCK_N": 32,
+            "BLOCK_M1": 32,
+            "BLOCK_N1": 32,
+            "BLOCK_M2": 32,
+            "BLOCK_N2": 32,
+            "num_stages": 1,
+        }
+    return None
 
 
 def _preferred_dtype():
@@ -100,8 +212,13 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
             gemma_expert_config: Configuration dictionary for the Gemma expert model.
             freeze_vision_encoder: Whether to freeze the vision encoder. Defaults to True.
             train_expert_only: Whether to train only the expert model. Defaults to True.
-            attention_implementation: Attention implementation to use ("eager", "sdpa",
-                or "fa2"). Defaults to "eager".
+            attention_implementation: Attention implementation to use ("eager",
+                "sdpa", "fa2", or "flex"). "flex" routes through
+                ``torch.nn.attention.flex_attention`` and JIT-compiles a
+                fused Triton kernel specialized to the block-causal mask
+                used here, yielding fwd+bwd speedups and lower peak memory
+                vs. "sdpa" by exploiting block-sparsity in the mask.
+                Defaults to "eager".
             discrete_action_vocab_size: Vocabulary size for discrete actions.
             dropout: Dropout probability. Defaults to 0.1.
             gradient_checkpointing: Wrap each decoder-layer body in
@@ -214,10 +331,10 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
                 "You set `freeze_vision_encoder=False` and `train_expert_only=True` which are not compatible."
             )
 
-        if self.attention_implementation not in ["eager", "sdpa", "fa2"]:
+        if self.attention_implementation not in ["eager", "sdpa", "fa2", "flex"]:
             raise ValueError(
                 f"Wrong value provided for `attention_implementation` ({self.attention_implementation}). "
-                "Expected 'eager', 'sdpa', or 'fa2'."
+                "Expected 'eager', 'sdpa', 'fa2', or 'flex'."
             )
         if self.attention_implementation == "fa2":
             # "fa2" has been accepted by the validator historically but never
@@ -225,7 +342,7 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
             # existing configs keep running.
             logging.warning(
                 "attention_implementation='fa2' is not implemented; falling back to 'eager'. "
-                "Consider switching to 'sdpa' for ~10-15% better throughput."
+                "Consider switching to 'sdpa' or 'flex' for better throughput."
             )
 
 
@@ -616,6 +733,11 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             which on A100 dispatches to FlashAttention-2 or the
             memory-efficient backend — 2-3x faster than eager at pi05's
             sequence length.
+          - ``"flex"``: ``torch.nn.attention.flex_attention`` JIT-compiles
+            a fused Triton kernel from the block-causal mask, exploiting
+            its block-sparsity to skip fully-masked tiles entirely. Same
+            output as ``"sdpa"`` within softmax-reassociation noise; lower
+            peak memory and faster on the mask shapes this model uses.
           - ``"fa2"``: accepted for backward compatibility; falls back to
             eager with a warning emitted at config validation time.
 
@@ -625,6 +747,8 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         impl = self.config.attention_implementation
         if impl == "sdpa":
             return self.sdpa_attention_forward
+        if impl == "flex":
+            return self.flex_attention_forward
         # "eager" and legacy "fa2" both land here; "fa2" already warned
         # during __post_init__.
         return self.eager_attention_forward
@@ -780,6 +904,90 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         )
 
         # att_output: (B, H, S, D_h) → (B, S, H * D_h) to match eager output.
+        att_output = att_output.permute(0, 2, 1, 3)
+        att_output = att_output.reshape(batch_size, -1, num_key_value_heads * num_key_value_groups * head_dim)
+
+        return att_output
+
+    def flex_attention_forward(
+        self,
+        attention_mask: torch.Tensor,
+        batch_size: int,
+        head_dim: int,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """FlexAttention forward — JIT-fused Triton kernel for block-causal masks.
+
+        Output is shape- and semantic-equivalent to ``sdpa_attention_forward``;
+        differences vs. SDPA are softmax-reassociation noise (~1e-3 max-abs-err
+        in bf16). Vs. ``eager_attention_forward`` (which upcasts Q/K to fp32
+        before the matmul) the gap is one order of magnitude larger but still
+        within FlashAttention's standard parity envelope.
+
+        The mask is passed in dense ``(B, S_q, S_kv)`` form — the same tensor
+        the SDPA path consumes — and converted to a ``BlockMask`` here so
+        flex_attention can skip fully-masked 128x128 tiles. For pi07_paligemma's
+        prefix-bidirectional + causal-tail pattern the lower triangle dominates,
+        so the block-sparse skip is a real win.
+
+        Args:
+            attention_mask: Boolean mask of shape (B, S_q, S_kv); ``True`` = attend.
+            batch_size: Batch size.
+            head_dim: Per-head dimension.
+            query_states: Query states of shape (B, S_q, num_attention_heads, head_dim).
+            key_states: Key states of shape (B, S_kv, num_key_value_heads, head_dim).
+            value_states: Value states of shape (B, S_kv, num_key_value_heads, head_dim).
+
+        Returns:
+            torch.Tensor: Attention output of shape (B, S_q, num_attention_heads * head_dim).
+        """
+        # Short / non-divisible Q_LEN trips the Inductor lowering on the
+        # current PyTorch — fall back to SDPA. See ``_flex_can_use``.
+        if not _flex_can_use(query_states.shape[1]):
+            return self.sdpa_attention_forward(
+                attention_mask, batch_size, head_dim, query_states, key_states, value_states
+            )
+
+        num_att_heads = self.config.paligemma_config.text_config.num_attention_heads
+        num_key_value_heads = self.config.paligemma_config.text_config.num_key_value_heads
+        num_key_value_groups = num_att_heads // num_key_value_heads
+        sequence_length = key_states.shape[1]
+
+        # GQA expansion — same as eager / sdpa paths. We could pass
+        # enable_gqa=True to flex_attention instead, but explicit expansion
+        # keeps the three backends interchangeable from the caller's view.
+        key_states = key_states[:, :, :, None, :].expand(
+            batch_size, sequence_length, num_key_value_heads, num_key_value_groups, head_dim
+        )
+        key_states = key_states.reshape(
+            batch_size, sequence_length, num_key_value_heads * num_key_value_groups, head_dim
+        )
+        value_states = value_states[:, :, :, None, :].expand(
+            batch_size, sequence_length, num_key_value_heads, num_key_value_groups, head_dim
+        )
+        value_states = value_states.reshape(
+            batch_size, sequence_length, num_key_value_heads * num_key_value_groups, head_dim
+        )
+
+        # flex_attention expects (B, H, S, D_h).
+        query_states = query_states.transpose(1, 2).contiguous()
+        key_states = key_states.transpose(1, 2).contiguous()
+        value_states = value_states.transpose(1, 2).contiguous()
+
+        block_mask = _build_flex_block_mask(attention_mask, query_states.shape[2])
+
+        att_output = _flex_attention_compiled(
+            query_states,
+            key_states,
+            value_states,
+            block_mask=block_mask,
+            scale=head_dim**-0.5,
+            kernel_options=_flex_kernel_options(head_dim),
+        )
+
+        # (B, H, S_q, D_h) → (B, S_q, H * D_h) to match eager / sdpa output.
         att_output = att_output.permute(0, 2, 1, 3)
         att_output = att_output.reshape(batch_size, -1, num_key_value_heads * num_key_value_groups * head_dim)
 
