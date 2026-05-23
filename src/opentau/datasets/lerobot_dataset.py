@@ -698,6 +698,10 @@ class BaseDataset(torch.utils.data.Dataset):
         self.response_drop_prob = dm.response_drop_prob if dm else 0.0
         self.metadata_drop_all_prob = dm.metadata_drop_all_prob if dm else 0.0
         self.metadata_drop_each_prob = dm.metadata_drop_each_prob if dm else 0.0
+        # Whether `_emit_optional_keys` injects the dataset's native `meta.fps`
+        # under the `fps` / `fps_is_pad` keys. Independent of the dropout rolls
+        # above — fps is intrinsic to the dataset, not a noisy label.
+        self.emit_fps = dm.emit_fps if dm else True
         # Whether the above drop rolls actually fire. `make_dataset` flips this
         # off on the validation subset (unless `val_enable_optional_key_dropout`
         # is set). Subgoal *frame* selection (end-of-segment vs. uniform window)
@@ -875,6 +879,15 @@ class BaseDataset(torch.utils.data.Dataset):
         pad signal — a consumer seeing ``""`` can assume the field was
         unavailable or was masked this step.
 
+        ``fps`` (the dataset's native frame rate) is emitted as a
+        ``torch.long`` scalar alongside ``fps_is_pad`` when
+        ``self.emit_fps`` is True. Unlike the other metadata fields, ``fps``
+        does **not** participate in the dropout rolls — it's an intrinsic
+        property of the dataset, not a noisy label — so it's always
+        non-padded when emitted. Set ``emit_fps=False`` on the mixture to
+        omit the keys entirely (the policy's ``prepare_metadata`` falls
+        through to its default-pad path).
+
         Dropout order:
             1. ``history_state_drop_prob``: zero ``state`` and historical camera
                frames; mark ``obs_history_is_pad`` all True.
@@ -885,6 +898,7 @@ class BaseDataset(torch.utils.data.Dataset):
             4. ``metadata_drop_all_prob``: mask {speed, mistake, quality,
                robot_type, control_mode} together. If this didn't fire,
                ``metadata_drop_each_prob`` rolls independently for each field.
+               ``fps`` is **not** included in these rolls.
 
         Dropout rolls use the default torch RNG (auto-seeded per worker).
 
@@ -974,6 +988,12 @@ class BaseDataset(torch.utils.data.Dataset):
             val = self.meta.info.get(key) or ""
             drop_this = drop_meta_all or _roll(self.metadata_drop_each_prob)
             standard_item[key] = "" if drop_this else val
+
+        # (6) Native fps: intrinsic dataset property, not a noisy label. Emitted
+        # unconditionally (no dropout) when `emit_fps` is enabled on the mixture.
+        if self.emit_fps:
+            standard_item["fps"] = torch.tensor(int(self.meta.fps), dtype=torch.long)
+            standard_item["fps_is_pad"] = torch.tensor(False)
 
     def resize_with_pad(self, img, width, height, pad_value=0) -> torch.Tensor:
         """Resize an image to target dimensions with padding.

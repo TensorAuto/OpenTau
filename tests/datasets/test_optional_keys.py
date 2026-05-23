@@ -64,7 +64,9 @@ class _DummyBaseDataset(BaseDataset):
         response_drop_prob=0.0,
         metadata_drop_all_prob=0.0,
         metadata_drop_each_prob=0.0,
+        emit_fps=True,
         meta_info: dict | None = None,
+        meta_fps: int = 30,
     ):
         torch.utils.data.Dataset.__init__(self)
         self.resolution = resolution
@@ -79,10 +81,16 @@ class _DummyBaseDataset(BaseDataset):
         self.response_drop_prob = response_drop_prob
         self.metadata_drop_all_prob = metadata_drop_all_prob
         self.metadata_drop_each_prob = metadata_drop_each_prob
+        self.emit_fps = emit_fps
         self.enable_optional_key_dropout = True
         # Stub meta surface so _to_standard_data_format can read robot_type /
         # control_mode without instantiating a real LeRobotDatasetMetadata.
-        self.meta = SimpleNamespace(info=meta_info if meta_info is not None else {})
+        # `fps` mirrors `LeRobotDatasetMetadata.fps` so `_emit_optional_keys`
+        # can populate the new `fps` / `fps_is_pad` sample keys.
+        self.meta = SimpleNamespace(
+            info=meta_info if meta_info is not None else {},
+            fps=meta_fps,
+        )
 
     def _get_feature_mapping_key(self) -> str:
         return _TEST_MAPPING_KEY
@@ -682,3 +690,77 @@ class TestRobotTypeControlMode:
         out = ds._to_standard_data_format(_full_raw_item(ds))
         assert type(out["robot_type"]) is str
         assert type(out["control_mode"]) is str
+
+
+# `fps` is emitted as an intrinsic dataset property — always present (non-pad)
+# when `emit_fps=True`, omitted entirely when `emit_fps=False`. Unlike speed /
+# quality / mistake / robot_type / control_mode it does NOT participate in any
+# of the `metadata_drop_*_prob` dropout rolls.
+
+
+class TestFpsEmission:
+    def test_fps_emitted_with_meta_fps_value(self):
+        ds = _DummyBaseDataset(num_cams=1, meta_fps=20)
+        out = ds._to_standard_data_format(_full_raw_item(ds))
+        assert out["fps"].dtype == torch.long
+        assert out["fps"].item() == 20
+        assert out["fps_is_pad"].item() is False
+
+    def test_fps_emitted_as_torch_long_dtype(self):
+        ds = _DummyBaseDataset(num_cams=1, meta_fps=50)
+        out = ds._to_standard_data_format(_full_raw_item(ds))
+        assert out["fps"].dtype == torch.long
+
+    def test_fps_omitted_when_emit_fps_false(self):
+        ds = _DummyBaseDataset(num_cams=1, emit_fps=False, meta_fps=20)
+        out = ds._to_standard_data_format(_full_raw_item(ds))
+        assert "fps" not in out
+        assert "fps_is_pad" not in out
+
+    def test_fps_unaffected_by_metadata_drop_all_prob(self):
+        # fps is intrinsic to the dataset, not a noisy label — it must NOT
+        # participate in `metadata_drop_*_prob` rolls.
+        ds = _DummyBaseDataset(
+            num_cams=1,
+            meta_fps=15,
+            metadata_drop_all_prob=1.0,
+            metadata_drop_each_prob=1.0,
+        )
+        out = ds._to_standard_data_format(_full_raw_item(ds))
+        # Other metadata fields are dropped — but fps stays.
+        assert out["speed_is_pad"].item() is True
+        assert out["quality_is_pad"].item() is True
+        assert out["mistake_is_pad"].item() is True
+        assert out["robot_type"] == ""
+        assert out["control_mode"] == ""
+        assert out["fps"].item() == 15
+        assert out["fps_is_pad"].item() is False
+
+    def test_fps_unaffected_by_disabled_dropout(self):
+        # `enable_optional_key_dropout=False` (the val-subset path) must keep
+        # the same emit behavior — fps is gated by `emit_fps`, not by dropout.
+        ds = _DummyBaseDataset(
+            num_cams=1,
+            meta_fps=25,
+            metadata_drop_all_prob=1.0,
+            metadata_drop_each_prob=1.0,
+        )
+        ds.enable_optional_key_dropout = False
+        out = ds._to_standard_data_format(_full_raw_item(ds))
+        assert out["fps"].item() == 25
+        assert out["fps_is_pad"].item() is False
+
+    def test_default_collate_stacks_mixed_fps(self):
+        """Heterogeneous-fps batches (different datasets in a mixture) must
+        collate cleanly: the per-sample `fps` tensors become a (B,) long
+        tensor and `fps_is_pad` becomes a (B,) bool tensor."""
+        from torch.utils.data import default_collate
+
+        ds_a = _DummyBaseDataset(num_cams=1, meta_fps=30)
+        ds_b = _DummyBaseDataset(num_cams=1, meta_fps=50)
+        item_a = ds_a._to_standard_data_format(_full_raw_item(ds_a))
+        item_b = ds_b._to_standard_data_format(_full_raw_item(ds_b))
+        batch = default_collate([item_a, item_b])
+        assert batch["fps"].dtype == torch.long
+        assert batch["fps"].tolist() == [30, 50]
+        assert batch["fps_is_pad"].tolist() == [False, False]

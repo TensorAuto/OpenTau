@@ -665,17 +665,24 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
         """Tokenizes the metadata for training.
 
         Wraps each metadata string with an ``<eos>`` suffix, then tokenizes and
-        pads to ``metadata_max_length``.
+        pads to ``metadata_max_length``. Numeric fields (``speed`` / ``quality``
+        / ``mistake`` / ``fps``) are paired with ``_is_pad`` flags — pad-True
+        entries are omitted from the segment string. ``fps`` is the dataset's
+        native frame rate (``torch.long``); when absent or padded the
+        ``fps:`` segment is dropped (no header, no comma).
         """
 
         metadata = []
-        for speed, quality, mistake, speed_is_pad, quality_is_pad, mistake_is_pad in zip(
+        batch_size = batch["state"].shape[0]
+        for speed, quality, mistake, speed_is_pad, quality_is_pad, mistake_is_pad, fps, fps_is_pad in zip(
             batch["speed"],
             batch["quality"],
             batch["mistake"],
             batch["speed_is_pad"],
             batch["quality_is_pad"],
             batch["mistake_is_pad"],
+            batch.get("fps", torch.zeros(batch_size, dtype=torch.long)),
+            batch.get("fps_is_pad", torch.ones(batch_size, dtype=torch.bool)),
             strict=True,
         ):
             segments = []
@@ -687,6 +694,9 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
 
             if not mistake_is_pad:
                 segments.append(f"Mistake: {str(mistake.item())}, ")
+
+            if not fps_is_pad:
+                segments.append(f"fps: {str(fps.item())}, ")
 
             metadata.append(f"Metadata: {' '.join(segments)}")
 

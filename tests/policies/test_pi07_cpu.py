@@ -542,6 +542,148 @@ class TestPrepareMetadataSegments:
             assert "Mistake:" not in line
 
 
+class TestPrepareMetadataFps:
+    """Verify the ``fps`` segment construction in the pi07 planners.
+
+    ``fps`` is the dataset's native frame rate. The planner tokenizes it
+    with the lowercase ``"fps: N, "`` header, positioned between
+    ``Robot:`` and ``Control:`` for consistency with the
+    ``Speed → Quality → Mistake → Robot → fps → Control`` ordering pinned
+    in the segment-assembly loop of all four pi07 / pi07_paligemma
+    modelling files. The segment is omitted entirely (no header, no
+    comma) when ``fps_is_pad`` is ``True`` or when the ``fps`` key is
+    absent from the batch.
+    """
+
+    @staticmethod
+    def _planner_methods():
+        from opentau.policies.pi07.high_level_planner.modeling_pi07_high_level import (
+            PI07HighLevelPlannerPolicy,
+        )
+        from opentau.policies.pi07.low_level.modeling_pi07_low_level import (
+            PI07LowLevelPolicy,
+        )
+
+        return {
+            "low": PI07LowLevelPolicy.prepare_metadata,
+            "high": PI07HighLevelPlannerPolicy.prepare_metadata,
+        }
+
+    @pytest.mark.parametrize("planner", ["low", "high"])
+    def test_fps_present_emits_lowercase_segment(self, planner):
+        """``fps=30`` non-pad → ``"fps: 30, "`` appears in the prefix."""
+        method = self._planner_methods()[planner]
+        fake, captured = _make_fake_planner()
+
+        batch_size = 2
+        batch = {
+            "state": torch.zeros(batch_size, 1),
+            "fps": torch.tensor([30, 50], dtype=torch.long),
+            "fps_is_pad": torch.tensor([False, False]),
+        }
+
+        method(fake, batch)
+
+        assert len(captured) == batch_size
+        for line, fps in zip(captured, [30, 50], strict=True):
+            assert line.startswith("Metadata: ")
+            assert f"fps: {fps}, " in line
+            # Lowercase per spec — must NOT be "Fps:" or "FPS:".
+            assert "Fps:" not in line
+            assert "FPS:" not in line
+
+    @pytest.mark.parametrize("planner", ["low", "high"])
+    def test_fps_padded_omits_segment(self, planner):
+        """``fps_is_pad=True`` → no ``"fps:"`` substring, no stray comma."""
+        method = self._planner_methods()[planner]
+        fake, captured = _make_fake_planner()
+
+        batch_size = 2
+        batch = {
+            "state": torch.zeros(batch_size, 1),
+            "fps": torch.tensor([30, 30], dtype=torch.long),
+            "fps_is_pad": torch.tensor([True, True]),
+            "robot_type": ["franka", "ur5"],
+        }
+
+        method(fake, batch)
+
+        for line in captured:
+            assert "fps:" not in line
+            # No stray double commas where the fps segment would have lived.
+            assert ", ," not in line
+            # Robot segment still present (unaffected by fps padding).
+            assert "Robot: " in line
+
+    @pytest.mark.parametrize("planner", ["low", "high"])
+    def test_fps_key_absent_omits_segment(self, planner):
+        """Missing ``fps`` key entirely → batch.get default-pad path drops it."""
+        method = self._planner_methods()[planner]
+        fake, captured = _make_fake_planner()
+
+        batch_size = 3
+        batch = {
+            "state": torch.zeros(batch_size, 1),
+            "robot_type": ["franka", "franka", "franka"],
+        }
+
+        method(fake, batch)
+
+        for line in captured:
+            assert "fps:" not in line
+
+    @pytest.mark.parametrize("planner", ["low", "high"])
+    def test_fps_slots_between_robot_and_control(self, planner):
+        """The new fps segment sits between Robot: and Control: in the prefix string."""
+        method = self._planner_methods()[planner]
+        fake, captured = _make_fake_planner()
+
+        batch_size = 1
+        batch = {
+            "state": torch.zeros(batch_size, 1),
+            "fps": torch.tensor([20], dtype=torch.long),
+            "fps_is_pad": torch.tensor([False]),
+            "robot_type": ["franka"],
+            "control_mode": ["joint"],
+        }
+
+        method(fake, batch)
+
+        line = captured[0]
+        robot_idx = line.index("Robot: ")
+        fps_idx = line.index("fps: 20")
+        control_idx = line.index("Control: ")
+        assert robot_idx < fps_idx < control_idx, f"Expected Robot < fps < Control ordering in {line!r}"
+
+    @pytest.mark.parametrize("planner", ["low", "high"])
+    def test_fps_with_partial_segments(self, planner):
+        """fps + a subset of other metadata still produces a well-formed prefix."""
+        method = self._planner_methods()[planner]
+        fake, captured = _make_fake_planner()
+
+        batch_size = 2
+        # Sample 0: fps + robot_type only. Sample 1: fps + control_mode only.
+        batch = {
+            "state": torch.zeros(batch_size, 1),
+            "fps": torch.tensor([30, 50], dtype=torch.long),
+            "fps_is_pad": torch.tensor([False, False]),
+            "robot_type": ["franka", ""],
+            "control_mode": ["", "joint"],
+        }
+
+        method(fake, batch)
+
+        assert captured[0].startswith("Metadata: ")
+        assert "Robot: franka, " in captured[0]
+        assert "fps: 30, " in captured[0]
+        assert "Control:" not in captured[0]
+
+        assert captured[1].startswith("Metadata: ")
+        assert "Robot:" not in captured[1]
+        assert "fps: 50, " in captured[1]
+        assert "Control: joint, " in captured[1]
+
+
 # `embed_prefix` conditional-block guards
 #
 # The low-level component skips entire prefix blocks when their availability

@@ -2253,3 +2253,130 @@ class TestPI07PaligemmaLowLevelExecutionHorizon:
         a_next = PI07PaligemmaLowLevelPolicy.select_action(policy, batch)
         assert calls["n"] == 2
         assert a_next[0, 0].item() == 2000.0
+
+
+# CPU-only tests for the metadata-string assembly loop in
+# ``PI07PaligemmaLowLevelPolicy.prepare_metadata``. Pin the contract that
+# ``fps`` is tokenized with the lowercase ``"fps: N, "`` header positioned
+# between ``Robot:`` and ``Control:`` and omitted entirely when ``fps_is_pad``
+# is True (or when the keys are missing — ``_hydrate_metadata_batch`` defaults
+# them to all-padded).
+
+
+def _pg_ll_make_fake_policy(metadata_max_length: int = 4):
+    """Construct a stubbed PI07PaligemmaLowLevelPolicy for prepare_metadata tests.
+
+    ``prepare_metadata`` calls ``self._hydrate_metadata_batch(batch)`` first,
+    so a bare ``SimpleNamespace`` doesn't work — we use
+    ``object.__new__(PI07PaligemmaLowLevelPolicy)`` to get a real instance
+    with the class methods bound, then stub only the tokenizer + config to
+    skip the PaliGemma backbone download.
+    """
+    import types
+
+    captured: list[str] = []
+
+    def stub_call(metadata, **kwargs):
+        captured.extend(metadata)
+        batch_size = len(metadata)
+        max_length = kwargs.get("max_length", 4)
+        return {
+            "input_ids": torch.zeros((batch_size, max_length), dtype=torch.long),
+            "attention_mask": torch.zeros((batch_size, max_length), dtype=torch.long),
+        }
+
+    tokenizer = types.SimpleNamespace()
+    tokenizer.__call__ = stub_call
+
+    policy = object.__new__(PI07PaligemmaLowLevelPolicy)
+    policy.language_tokenizer = tokenizer
+    policy.config = types.SimpleNamespace(metadata_max_length=metadata_max_length)
+    return policy, captured
+
+
+class TestPaligemmaLowLevelFpsSegment:
+    def test_fps_present_emits_lowercase_segment(self):
+        policy, captured = _pg_ll_make_fake_policy()
+        batch_size = 2
+        batch = {
+            "state": torch.zeros(batch_size, 1),
+            "fps": torch.tensor([30, 50], dtype=torch.long),
+            "fps_is_pad": torch.tensor([False, False]),
+        }
+        # _hydrate_metadata_batch will fill in speed/quality/mistake/* defaults
+        # (all padded) and empty robot_type/control_mode lists.
+
+        PI07PaligemmaLowLevelPolicy.prepare_metadata(policy, batch)
+
+        assert len(captured) == batch_size
+        for line, fps in zip(captured, [30, 50], strict=True):
+            assert line.startswith("Metadata: ")
+            assert f"fps: {fps}, " in line
+            assert "Fps:" not in line and "FPS:" not in line
+
+    def test_fps_padded_omits_segment(self):
+        policy, captured = _pg_ll_make_fake_policy()
+        batch_size = 1
+        batch = {
+            "state": torch.zeros(batch_size, 1),
+            "fps": torch.tensor([30], dtype=torch.long),
+            "fps_is_pad": torch.tensor([True]),
+            "robot_type": ["franka"],
+        }
+
+        PI07PaligemmaLowLevelPolicy.prepare_metadata(policy, batch)
+
+        assert "fps:" not in captured[0]
+        assert ", ," not in captured[0]
+        assert "Robot: franka, " in captured[0]
+
+    def test_fps_key_absent_omits_segment(self):
+        """``_hydrate_metadata_batch`` defaults ``fps_is_pad`` to True when
+        absent, so missing keys collapse to the same "no segment" behaviour
+        as explicit-pad."""
+        policy, captured = _pg_ll_make_fake_policy()
+        batch_size = 3
+        batch = {"state": torch.zeros(batch_size, 1)}
+
+        PI07PaligemmaLowLevelPolicy.prepare_metadata(policy, batch)
+
+        for line in captured:
+            assert "fps:" not in line
+
+    def test_fps_slots_between_robot_and_control(self):
+        policy, captured = _pg_ll_make_fake_policy()
+        batch_size = 1
+        batch = {
+            "state": torch.zeros(batch_size, 1),
+            "fps": torch.tensor([20], dtype=torch.long),
+            "fps_is_pad": torch.tensor([False]),
+            "robot_type": ["franka"],
+            "control_mode": ["joint"],
+        }
+
+        PI07PaligemmaLowLevelPolicy.prepare_metadata(policy, batch)
+
+        line = captured[0]
+        robot_idx = line.index("Robot: ")
+        fps_idx = line.index("fps: 20")
+        control_idx = line.index("Control: ")
+        assert robot_idx < fps_idx < control_idx, f"Expected Robot < fps < Control ordering in {line!r}"
+
+    def test_fps_default_torch_long(self):
+        """fps is hydrated with ``torch.long`` defaults; assert ``_row_long``
+        preserves the dtype through the broadcast path."""
+        policy, captured = _pg_ll_make_fake_policy()
+        # Scalar-broadcast fps (one element, fan out to (B,)).
+        batch_size = 3
+        batch = {
+            "state": torch.zeros(batch_size, 1),
+            "fps": torch.tensor([25], dtype=torch.long),
+            "fps_is_pad": torch.tensor([False]),
+        }
+
+        PI07PaligemmaLowLevelPolicy.prepare_metadata(policy, batch)
+
+        # All three samples get fps: 25 from the scalar-broadcast.
+        assert len(captured) == 3
+        for line in captured:
+            assert "fps: 25, " in line

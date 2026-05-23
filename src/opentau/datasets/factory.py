@@ -131,6 +131,12 @@ def resolve_delta_timestamps(
     """
     delta_timestamps: dict[str, list[float]] = {}
     action_freq = cfg.dataset_mixture.action_freq
+    # Mixed-frequency training: `action_freq=None` opts out of resampling.
+    # Substituting `ds_meta.fps` makes every delta-timestamp land exactly on
+    # this dataset's native frame boundaries, so nearest-neighbor sampling is
+    # a no-op and consecutive frames are returned unchanged.
+    if action_freq is None:
+        action_freq = ds_meta.fps
 
     if dataset_cfg.repo_id is None:
         raise ValueError("dataset_cfg.repo_id must not be None when resolving delta timestamps.")
