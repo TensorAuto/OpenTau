@@ -326,7 +326,8 @@ class TestPI07HighLevelPlannerIntegration:
 
 # CPU-only tests for the metadata-string assembly loop in
 # ``PI07HighLevelPlannerPolicy.prepare_metadata``. Pin the contract that ``fps``
-# is tokenized with the lowercase ``"fps: N, "`` header positioned between
+# is tokenized with the ``"FPS: N, "`` header (uppercase to match the sibling
+# ``Speed:``/``Quality:``/``Mistake:`` labels) positioned after
 # ``Speed/Quality/Mistake`` (this planner has no ``Robot:``/``Control:``
 # segments) and omitted entirely when ``fps_is_pad`` is True.
 
@@ -381,7 +382,7 @@ def _pg_hl_base_batch(batch_size: int) -> dict:
 
 
 class TestPaligemmaHighLevelFpsSegment:
-    def test_fps_present_emits_lowercase_segment(self):
+    def test_fps_present_emits_uppercase_segment(self):
         method = PI07HighLevelPlannerPolicy.prepare_metadata
         fake, captured = _pg_hl_make_fake_planner()
 
@@ -394,8 +395,8 @@ class TestPaligemmaHighLevelFpsSegment:
         assert len(captured) == 2
         for line, fps in zip(captured, [30, 50], strict=True):
             assert line.startswith("Metadata: ")
-            assert f"fps: {fps}, " in line
-            assert "Fps:" not in line and "FPS:" not in line
+            assert f"FPS: {fps}, " in line
+            assert "fps:" not in line and "Fps:" not in line
 
     def test_fps_padded_omits_segment(self):
         method = PI07HighLevelPlannerPolicy.prepare_metadata
@@ -407,7 +408,7 @@ class TestPaligemmaHighLevelFpsSegment:
 
         method(fake, batch)
 
-        assert "fps:" not in captured[0]
+        assert "FPS:" not in captured[0]
         # No stray comma where the fps segment would have lived.
         assert ", ," not in captured[0]
 
@@ -421,4 +422,4 @@ class TestPaligemmaHighLevelFpsSegment:
         method(fake, batch)
 
         for line in captured:
-            assert "fps:" not in line
+            assert "FPS:" not in line

@@ -2257,10 +2257,11 @@ class TestPI07PaligemmaLowLevelExecutionHorizon:
 
 # CPU-only tests for the metadata-string assembly loop in
 # ``PI07PaligemmaLowLevelPolicy.prepare_metadata``. Pin the contract that
-# ``fps`` is tokenized with the lowercase ``"fps: N, "`` header positioned
-# between ``Robot:`` and ``Control:`` and omitted entirely when ``fps_is_pad``
-# is True (or when the keys are missing — ``_hydrate_metadata_batch`` defaults
-# them to all-padded).
+# ``fps`` is tokenized with the ``"FPS: N, "`` header (uppercase to match
+# the sibling ``Speed:``/``Quality:``/``Mistake:``/``Robot:``/``Control:``
+# labels) positioned between ``Robot:`` and ``Control:`` and omitted entirely
+# when ``fps_is_pad`` is True (or when the keys are missing —
+# ``_hydrate_metadata_batch`` defaults them to all-padded).
 
 
 def _pg_ll_make_fake_policy(metadata_max_length: int = 4):
@@ -2295,7 +2296,7 @@ def _pg_ll_make_fake_policy(metadata_max_length: int = 4):
 
 
 class TestPaligemmaLowLevelFpsSegment:
-    def test_fps_present_emits_lowercase_segment(self):
+    def test_fps_present_emits_uppercase_segment(self):
         policy, captured = _pg_ll_make_fake_policy()
         batch_size = 2
         batch = {
@@ -2311,8 +2312,8 @@ class TestPaligemmaLowLevelFpsSegment:
         assert len(captured) == batch_size
         for line, fps in zip(captured, [30, 50], strict=True):
             assert line.startswith("Metadata: ")
-            assert f"fps: {fps}, " in line
-            assert "Fps:" not in line and "FPS:" not in line
+            assert f"FPS: {fps}, " in line
+            assert "fps:" not in line and "Fps:" not in line
 
     def test_fps_padded_omits_segment(self):
         policy, captured = _pg_ll_make_fake_policy()
@@ -2326,7 +2327,7 @@ class TestPaligemmaLowLevelFpsSegment:
 
         PI07PaligemmaLowLevelPolicy.prepare_metadata(policy, batch)
 
-        assert "fps:" not in captured[0]
+        assert "FPS:" not in captured[0]
         assert ", ," not in captured[0]
         assert "Robot: franka, " in captured[0]
 
@@ -2341,7 +2342,7 @@ class TestPaligemmaLowLevelFpsSegment:
         PI07PaligemmaLowLevelPolicy.prepare_metadata(policy, batch)
 
         for line in captured:
-            assert "fps:" not in line
+            assert "FPS:" not in line
 
     def test_fps_slots_between_robot_and_control(self):
         policy, captured = _pg_ll_make_fake_policy()
@@ -2358,9 +2359,9 @@ class TestPaligemmaLowLevelFpsSegment:
 
         line = captured[0]
         robot_idx = line.index("Robot: ")
-        fps_idx = line.index("fps: 20")
+        fps_idx = line.index("FPS: 20")
         control_idx = line.index("Control: ")
-        assert robot_idx < fps_idx < control_idx, f"Expected Robot < fps < Control ordering in {line!r}"
+        assert robot_idx < fps_idx < control_idx, f"Expected Robot < FPS < Control ordering in {line!r}"
 
     def test_fps_default_torch_long(self):
         """fps is hydrated with ``torch.long`` defaults; assert ``_row_long``
@@ -2376,7 +2377,7 @@ class TestPaligemmaLowLevelFpsSegment:
 
         PI07PaligemmaLowLevelPolicy.prepare_metadata(policy, batch)
 
-        # All three samples get fps: 25 from the scalar-broadcast.
+        # All three samples get FPS: 25 from the scalar-broadcast.
         assert len(captured) == 3
         for line in captured:
-            assert "fps: 25, " in line
+            assert "FPS: 25, " in line

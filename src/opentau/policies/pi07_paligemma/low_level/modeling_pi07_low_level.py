@@ -1385,16 +1385,17 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         """Tokenize episode metadata into PaliGemma token IDs.
 
         Builds strings ``Metadata: Speed: … Quality: … Mistake: … Robot: …
-        fps: … Control: …`` only from fields whose ``*_is_pad`` flag is
+        FPS: … Control: …`` only from fields whose ``*_is_pad`` flag is
         ``False`` (``robot_type`` / ``control_mode`` are strings, omitted
         when empty). For each sample, a padded or empty field is omitted
         entirely (not concatenated to ``segments``). When every field is
         pad, the row is ``""`` before tokenization.
 
-        ``fps`` is the dataset's native frame rate (``torch.long``); the
-        segment is omitted when ``fps_is_pad`` is True. Segment ordering is
-        ``Speed → Quality → Mistake → Robot → fps → Control`` to match the
-        other pi07 / pi07_paligemma ``prepare_metadata`` implementations.
+        ``fps`` is the effective per-sample frame rate (``torch.long``);
+        the segment is omitted when ``fps_is_pad`` is True. Segment
+        ordering is ``Speed → Quality → Mistake → Robot → FPS → Control``
+        to match the other pi07 / pi07_paligemma ``prepare_metadata``
+        implementations.
 
         Always runs :meth:`_hydrate_metadata_batch` first so callers see the same
         outcomes whether they hit :meth:`sample_actions` (often no metadata
@@ -1512,7 +1513,7 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
             if robot_type:
                 segments.append(f"Robot: {robot_type}, ")
             if not fps_is_pad.item():
-                segments.append(f"fps: {str(fps.item())}, ")
+                segments.append(f"FPS: {str(fps.item())}, ")
             if control_mode:
                 segments.append(f"Control: {control_mode}, ")
             metadata_rows.append(f"Metadata: {' '.join(segments)}" if segments else "")

@@ -696,7 +696,7 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
                 segments.append(f"Mistake: {str(mistake.item())}, ")
 
             if not fps_is_pad:
-                segments.append(f"fps: {str(fps.item())}, ")
+                segments.append(f"FPS: {str(fps.item())}, ")
 
             metadata.append(f"Metadata: {' '.join(segments)}")
 

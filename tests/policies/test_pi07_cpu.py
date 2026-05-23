@@ -545,11 +545,12 @@ class TestPrepareMetadataSegments:
 class TestPrepareMetadataFps:
     """Verify the ``fps`` segment construction in the pi07 planners.
 
-    ``fps`` is the dataset's native frame rate. The planner tokenizes it
-    with the lowercase ``"fps: N, "`` header, positioned between
-    ``Robot:`` and ``Control:`` for consistency with the
-    ``Speed → Quality → Mistake → Robot → fps → Control`` ordering pinned
-    in the segment-assembly loop of all four pi07 / pi07_paligemma
+    ``fps`` is the effective per-sample frame rate. The planner tokenizes
+    it with the ``"FPS: N, "`` header (uppercase to match the sibling
+    ``Speed:``/``Quality:``/``Mistake:``/``Robot:``/``Control:`` labels),
+    positioned between ``Robot:`` and ``Control:`` for consistency with
+    the ``Speed → Quality → Mistake → Robot → FPS → Control`` ordering
+    pinned in the segment-assembly loop of all four pi07 / pi07_paligemma
     modelling files. The segment is omitted entirely (no header, no
     comma) when ``fps_is_pad`` is ``True`` or when the ``fps`` key is
     absent from the batch.
@@ -570,8 +571,8 @@ class TestPrepareMetadataFps:
         }
 
     @pytest.mark.parametrize("planner", ["low", "high"])
-    def test_fps_present_emits_lowercase_segment(self, planner):
-        """``fps=30`` non-pad → ``"fps: 30, "`` appears in the prefix."""
+    def test_fps_present_emits_uppercase_segment(self, planner):
+        """``fps=30`` non-pad → ``"FPS: 30, "`` appears in the prefix."""
         method = self._planner_methods()[planner]
         fake, captured = _make_fake_planner()
 
@@ -587,14 +588,14 @@ class TestPrepareMetadataFps:
         assert len(captured) == batch_size
         for line, fps in zip(captured, [30, 50], strict=True):
             assert line.startswith("Metadata: ")
-            assert f"fps: {fps}, " in line
-            # Lowercase per spec — must NOT be "Fps:" or "FPS:".
+            assert f"FPS: {fps}, " in line
+            # Uppercase per spec — must NOT be "fps:" or "Fps:".
+            assert "fps:" not in line
             assert "Fps:" not in line
-            assert "FPS:" not in line
 
     @pytest.mark.parametrize("planner", ["low", "high"])
     def test_fps_padded_omits_segment(self, planner):
-        """``fps_is_pad=True`` → no ``"fps:"`` substring, no stray comma."""
+        """``fps_is_pad=True`` → no ``"FPS:"`` substring, no stray comma."""
         method = self._planner_methods()[planner]
         fake, captured = _make_fake_planner()
 
@@ -609,7 +610,7 @@ class TestPrepareMetadataFps:
         method(fake, batch)
 
         for line in captured:
-            assert "fps:" not in line
+            assert "FPS:" not in line
             # No stray double commas where the fps segment would have lived.
             assert ", ," not in line
             # Robot segment still present (unaffected by fps padding).
@@ -630,7 +631,7 @@ class TestPrepareMetadataFps:
         method(fake, batch)
 
         for line in captured:
-            assert "fps:" not in line
+            assert "FPS:" not in line
 
     @pytest.mark.parametrize("planner", ["low", "high"])
     def test_fps_slots_between_robot_and_control(self, planner):
@@ -651,9 +652,9 @@ class TestPrepareMetadataFps:
 
         line = captured[0]
         robot_idx = line.index("Robot: ")
-        fps_idx = line.index("fps: 20")
+        fps_idx = line.index("FPS: 20")
         control_idx = line.index("Control: ")
-        assert robot_idx < fps_idx < control_idx, f"Expected Robot < fps < Control ordering in {line!r}"
+        assert robot_idx < fps_idx < control_idx, f"Expected Robot < FPS < Control ordering in {line!r}"
 
     @pytest.mark.parametrize("planner", ["low", "high"])
     def test_fps_with_partial_segments(self, planner):
@@ -675,12 +676,12 @@ class TestPrepareMetadataFps:
 
         assert captured[0].startswith("Metadata: ")
         assert "Robot: franka, " in captured[0]
-        assert "fps: 30, " in captured[0]
+        assert "FPS: 30, " in captured[0]
         assert "Control:" not in captured[0]
 
         assert captured[1].startswith("Metadata: ")
         assert "Robot:" not in captured[1]
-        assert "fps: 50, " in captured[1]
+        assert "FPS: 50, " in captured[1]
         assert "Control: joint, " in captured[1]
 
 

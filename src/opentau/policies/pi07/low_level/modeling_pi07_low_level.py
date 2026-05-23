@@ -1140,7 +1140,7 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
                 segments.append(f"Robot: {robot_type}, ")
 
             if not fps_is_pad:
-                segments.append(f"fps: {str(fps.item())}, ")
+                segments.append(f"FPS: {str(fps.item())}, ")
 
             if control_mode:
                 segments.append(f"Control: {control_mode}, ")
