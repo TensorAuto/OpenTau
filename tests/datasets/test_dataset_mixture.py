@@ -226,6 +226,22 @@ class TestWeightedDatasetMixture:
         assert mixture.sample_weights is not None
         assert mixture.meta is not None
 
+    @pytest.mark.slow  # 1 sec
+    def test_init_action_freq_none(self, train_pipeline_config, datasets_factory):
+        """``action_freq=None`` is accepted (mixed-frequency mixtures) and the
+        attribute round-trips as ``None``.
+
+        Companion to the signature change made alongside PR #324: the
+        constructor previously annotated ``action_freq: float`` but
+        ``DatasetMixtureConfig.action_freq`` is ``float | None`` and
+        ``make_dataset_mixture`` forwards ``None`` through. Keep this test
+        green if the param ever gets narrowed back to ``float``.
+        """
+        datasets = datasets_factory(2)
+        dataset_weights = [1.0 / len(datasets)] * len(datasets)
+        mixture = WeightedDatasetMixture(train_pipeline_config, datasets, dataset_weights, action_freq=None)
+        assert mixture.action_freq is None
+
     def test_init_empty_datasets(self, train_pipeline_config):
         """Test initialization with empty dataset list."""
         with pytest.raises(ValueError, match="The list of datasets cannot be empty"):

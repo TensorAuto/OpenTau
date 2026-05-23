@@ -53,11 +53,16 @@ Functions:
     pad_vector: Pads the last dimension of a vector to a target size with zeros.
 
 Example:
-    Create a dataset mixture with two datasets:
+    Create a dataset mixture with two datasets resampled to a shared 30 Hz:
         >>> datasets = [dataset1, dataset2]
         >>> weights = [0.7, 0.3]  # 70% from dataset1, 30% from dataset2
         >>> mixture = WeightedDatasetMixture(cfg, datasets, weights, action_freq=30.0)
         >>> dataloader = mixture.get_dataloader()
+
+    Mixed-frequency mixture (no resampling) — each dataset is sampled at its
+    own native fps, so a single batch can contain samples drawn at different
+    rates:
+        >>> mixture = WeightedDatasetMixture(cfg, datasets, weights, action_freq=None)
 """
 
 import functools
@@ -335,7 +340,7 @@ class WeightedDatasetMixture:
         cfg: TrainPipelineConfig,
         datasets: List[BaseDataset],
         dataset_weights: List[float],
-        action_freq: float,
+        action_freq: Optional[float],
     ):
         """
         Initializes the WeightedDatasetMixture.
@@ -345,6 +350,13 @@ class WeightedDatasetMixture:
             datasets (List[Dataset]): A list of PyTorch Dataset objects.
             dataset_weights (List[float]): A list of weights corresponding to each dataset.
                                           These determine the relative sampling frequency.
+            action_freq (Optional[float]): Common action frequency (Hz) the
+                mixture's datasets are resampled to. ``None`` means no
+                resampling — each dataset is sampled at its native fps, so a
+                single batch may mix samples from sources running at different
+                rates (mixed-frequency training). Stored as informational
+                state and forwarded to downstream consumers (e.g.
+                ``BaseDataset._action_freq``); not used arithmetically here.
         """
         if not datasets:
             raise ValueError("The list of datasets cannot be empty.")
@@ -362,7 +374,8 @@ class WeightedDatasetMixture:
         self.cfg = cfg
         self.datasets = datasets
         self.dataset_weights = dataset_weights
-        self.action_freq = action_freq  # Frequency used for resampling action output
+        # Common resample rate (Hz); None = mixed-frequency (native fps per dataset).
+        self.action_freq: Optional[float] = action_freq
         self.dataset_names = self._make_dataset_names(cfg, datasets)  # For logging
 
         logging.info("Initializing WeightedDatasetMixture...")
