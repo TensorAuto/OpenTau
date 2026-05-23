@@ -2381,3 +2381,21 @@ class TestPaligemmaLowLevelFpsSegment:
         assert len(captured) == 3
         for line in captured:
             assert "FPS: 25, " in line
+
+    def test_fps_mixed_pad_across_batch(self):
+        """Per-sample ``fps_is_pad`` must be honored row-by-row — production
+        path for heterogeneous LeRobot + VQA mixtures, where the VQA pad
+        row (``fps=0, fps_is_pad=True``) sits next to a LeRobot row
+        (``fps=30, fps_is_pad=False``) in the same batch.
+        """
+        policy, captured = _pg_ll_make_fake_policy()
+        batch = {
+            "state": torch.zeros(2, 1),
+            "fps": torch.tensor([30, 0], dtype=torch.long),
+            "fps_is_pad": torch.tensor([False, True]),
+        }
+
+        PI07PaligemmaLowLevelPolicy.prepare_metadata(policy, batch)
+
+        assert "FPS: 30, " in captured[0]
+        assert "FPS:" not in captured[1]

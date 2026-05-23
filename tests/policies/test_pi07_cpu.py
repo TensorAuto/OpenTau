@@ -684,6 +684,35 @@ class TestPrepareMetadataFps:
         assert "FPS: 50, " in captured[1]
         assert "Control: joint, " in captured[1]
 
+    @pytest.mark.parametrize("planner", ["low", "high"])
+    def test_fps_mixed_pad_across_batch(self, planner):
+        """Per-sample ``fps_is_pad`` must be honored row-by-row — sample 0 with
+        ``fps_is_pad=False`` keeps its FPS segment while sample 1 with
+        ``fps_is_pad=True`` drops it. This is the production path now
+        triggered by heterogeneous LeRobot + VQA mixtures, where the VQA
+        pad row (``fps=0, fps_is_pad=True``) sits next to a LeRobot row
+        (``fps=30, fps_is_pad=False``) in the same batch.
+        """
+        method = self._planner_methods()[planner]
+        fake, captured = _make_fake_planner()
+
+        batch_size = 2
+        batch = {
+            "state": torch.zeros(batch_size, 1),
+            "fps": torch.tensor([30, 0], dtype=torch.long),
+            "fps_is_pad": torch.tensor([False, True]),
+            "robot_type": ["franka", "franka"],
+        }
+
+        method(fake, batch)
+
+        # Sample 0 (LeRobot): non-pad → FPS segment present.
+        assert "FPS: 30, " in captured[0]
+        assert "Robot: franka, " in captured[0]
+        # Sample 1 (VQA): pad → FPS segment dropped, no stray "FPS: 0, ".
+        assert "FPS:" not in captured[1]
+        assert "Robot: franka, " in captured[1]
+
 
 # `embed_prefix` conditional-block guards
 #

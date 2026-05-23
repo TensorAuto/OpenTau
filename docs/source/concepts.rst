@@ -132,7 +132,14 @@ see :ref:`Training-time dropout <standard-data-format-optional-keys-dropout>`.
 
 ``fps`` is the **effective per-sample frame rate** of the (possibly
 resampled) action chunk: ``DatasetMixtureConfig.action_freq`` when set,
-otherwise the dataset's native ``meta.fps``. Heterogeneous-frequency
+otherwise the dataset's native ``meta.fps``. The tokenized ``FPS: N, ``
+segment adds ~3-4 BPE tokens to the metadata prefix, which still fits
+comfortably inside the default ``metadata_max_length=52`` — but long
+``robot_type`` strings combined with a fully-populated metadata batch
+leave less headroom than before, and the underlying tokenizer call uses
+``truncation=True`` silently. Bump ``metadata_max_length`` (a field on
+each pi07 / pi07_paligemma config) if you start seeing the trailing
+``Control:`` segment get clipped. Heterogeneous-frequency
 mixtures (``action_freq=None``) need it so the policy can condition on
 each sample's rate — a 30 Hz chunk and a 50 Hz chunk carry different
 real-time horizons even when both are ``chunk_size`` frames long. Unlike
@@ -289,6 +296,18 @@ for reproducibility.
      - Per-field independent mask roll for each of ``speed``,
        ``mistake``, ``quality``, ``robot_type``, ``control_mode``.
        Only rolled when the shared drop did not fire.
+
+.. note::
+
+   ``fps`` is **not** in either drop pool — when ``emit_fps=True`` it
+   stays non-pad for every LeRobot sample regardless of the rolls. This
+   shifts the semantics of ``metadata_drop_all_prob=1.0``: pre-PR it
+   meant "no metadata segment at all", post-PR it means "fps-only
+   metadata segment" (the policy's ``has_metadata`` branch sees a
+   non-empty metadata mask and keeps the ``Metadata: FPS: N, `` block
+   in the prefix). If you're running a no-metadata ablation, also set
+   ``emit_fps=False`` on the mixture (and ``EnvMetadataConfig.emit_fps=False``
+   at eval) to recover the pre-PR behaviour.
    * - ``val_enable_optional_key_dropout``
      - ``False``
      - Whether the five drop rolls above also fire on the **validation**

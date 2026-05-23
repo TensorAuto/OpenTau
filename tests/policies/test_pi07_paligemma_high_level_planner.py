@@ -423,3 +423,21 @@ class TestPaligemmaHighLevelFpsSegment:
 
         for line in captured:
             assert "FPS:" not in line
+
+    def test_fps_mixed_pad_across_batch(self):
+        """Per-sample ``fps_is_pad`` must be honored row-by-row — production
+        path for heterogeneous LeRobot + VQA mixtures, where the VQA pad
+        row (``fps=0, fps_is_pad=True``) sits next to a LeRobot row
+        (``fps=30, fps_is_pad=False``) in the same batch.
+        """
+        method = PI07HighLevelPlannerPolicy.prepare_metadata
+        fake, captured = _pg_hl_make_fake_planner()
+
+        batch = _pg_hl_base_batch(batch_size=2)
+        batch["fps"] = torch.tensor([30, 0], dtype=torch.long)
+        batch["fps_is_pad"] = torch.tensor([False, True])
+
+        method(fake, batch)
+
+        assert "FPS: 30, " in captured[0]
+        assert "FPS:" not in captured[1]
