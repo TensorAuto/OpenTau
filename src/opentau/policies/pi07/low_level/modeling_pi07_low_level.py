@@ -1087,12 +1087,12 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
 
         Args:
             batch: Batch dict that may contain any of:
-                ``"speed"``, ``"quality"``, ``"mistake"`` (float tensors with
-                a corresponding ``_is_pad`` bool tensor — entries marked as
-                pad are dropped), and ``"robot_type"``, ``"control_mode"``
-                (lists of strings — empty string is the pad signal, no
-                separate ``_is_pad`` flag). Missing keys are treated as
-                fully padded.
+                ``"speed"``, ``"quality"``, ``"mistake"``, ``"fps"`` (numeric
+                tensors with a corresponding ``_is_pad`` bool tensor —
+                entries marked as pad are dropped), and ``"robot_type"``,
+                ``"control_mode"`` (lists of strings — empty string is the
+                pad signal, no separate ``_is_pad`` flag). Missing keys are
+                treated as fully padded.
 
         Returns:
             A tuple ``(metadata_tokens, metadata_masks)`` with shapes
@@ -1111,6 +1111,8 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
             mistake_is_pad,
             robot_type,
             control_mode,
+            fps,
+            fps_is_pad,
         ) in zip(
             batch.get("speed", torch.zeros(batch_size, dtype=torch.float32)),
             batch.get("quality", torch.zeros(batch_size, dtype=torch.float32)),
@@ -1120,6 +1122,8 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
             batch.get("mistake_is_pad", torch.ones(batch_size, dtype=torch.bool)),
             batch.get("robot_type", [""] * batch_size),
             batch.get("control_mode", [""] * batch_size),
+            batch.get("fps", torch.zeros(batch_size, dtype=torch.long)),
+            batch.get("fps_is_pad", torch.ones(batch_size, dtype=torch.bool)),
             strict=True,
         ):
             segments = []
@@ -1134,6 +1138,9 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
 
             if robot_type:
                 segments.append(f"Robot: {robot_type}, ")
+
+            if not fps_is_pad:
+                segments.append(f"FPS: {str(fps.item())}, ")
 
             if control_mode:
                 segments.append(f"Control: {control_mode}, ")

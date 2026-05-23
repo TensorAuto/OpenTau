@@ -172,13 +172,23 @@ def add_eval_metadata(observation: dict[str, Any], cfg: TrainPipelineConfig) -> 
     broadcast as ``list[str]`` of length ``num_envs``. Fields set to
     ``None`` on the config are skipped, so the corresponding batch key
     stays absent and the policy's ``prepare_metadata`` pad default kicks
-    in. ``cfg.env`` is guaranteed non-``None`` here — ``eval_policy``
+    in.
+
+    ``fps`` is the env's stepping frequency (:attr:`EnvConfig.fps`,
+    e.g. ``20`` for LIBERO) and is broadcast as a ``torch.long`` tensor
+    with ``fps_is_pad=False`` whenever ``meta.emit_fps`` is ``True``
+    (the default). Set ``emit_fps=False`` on ``EnvMetadataConfig`` to
+    skip it — useful when resuming a checkpoint trained without fps
+    conditioning.
+
+    ``cfg.env`` is guaranteed non-``None`` here — ``eval_policy``
     dereferences ``cfg.env.type`` before the rollout loop starts.
 
     Args:
         observation: Observation dict produced by ``preprocess_observation``
             (must contain ``state`` to source the batch size and device).
-        cfg: Training/eval pipeline config; reads ``cfg.env.metadata``.
+        cfg: Training/eval pipeline config; reads ``cfg.env.metadata`` and
+            ``cfg.env.fps``.
 
     Returns:
         The observation dict, mutated in place.
@@ -202,6 +212,10 @@ def add_eval_metadata(observation: dict[str, Any], cfg: TrainPipelineConfig) -> 
         val = getattr(meta, key)
         if val is not None:
             observation[key] = [val] * batch_size
+
+    if meta.emit_fps:
+        observation["fps"] = torch.tensor([cfg.env.fps] * batch_size, dtype=torch.long, device=device)
+        observation["fps_is_pad"] = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
     return observation
 

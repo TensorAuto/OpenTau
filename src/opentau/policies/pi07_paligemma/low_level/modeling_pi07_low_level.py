@@ -1305,6 +1305,12 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
           specified explicitly.
         - ``robot_type`` / ``control_mode`` are string lists (empty string is
           the pad signal, no separate ``_is_pad`` flag) and default to ``[""]``.
+        - ``fps`` (the dataset's native frame rate, ``torch.long``) defaults
+          to zeros and ``fps_is_pad`` defaults to ``True`` when the keys
+          are absent. The dataloader emits ``fps`` unconditionally (no
+          dropout) when ``DatasetMixtureConfig.emit_fps=True``; inference
+          batches built by ``add_eval_metadata`` set it when
+          ``EnvMetadataConfig.emit_fps=True``.
 
         Per-sample on/off is controlled only by ``*_is_pad`` (or the empty
         string for ``robot_type`` / ``control_mode``) after hydration; varying
@@ -1328,6 +1334,10 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
             batch["robot_type"] = [""] * bsz
         if "control_mode" not in batch:
             batch["control_mode"] = [""] * bsz
+        if "fps" not in batch:
+            batch["fps"] = torch.zeros(bsz, dtype=torch.long, device=dev)
+        if "fps_is_pad" not in batch:
+            batch["fps_is_pad"] = torch.ones(bsz, dtype=torch.bool, device=dev)
 
     def _hydrate_optional_conditioning_batch(self, batch: dict) -> None:
         """Ensure response / metadata keys exist (training + inference parity).
@@ -1375,11 +1385,17 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         """Tokenize episode metadata into PaliGemma token IDs.
 
         Builds strings ``Metadata: Speed: … Quality: … Mistake: … Robot: …
-        Control: …`` only from fields whose ``*_is_pad`` flag is ``False``
-        (``robot_type`` / ``control_mode`` are strings, omitted when empty).
-        For each sample, a padded or empty field is omitted entirely (not
-        concatenated to ``segments``). When every field is pad, the row is
-        ``""`` before tokenization.
+        FPS: … Control: …`` only from fields whose ``*_is_pad`` flag is
+        ``False`` (``robot_type`` / ``control_mode`` are strings, omitted
+        when empty). For each sample, a padded or empty field is omitted
+        entirely (not concatenated to ``segments``). When every field is
+        pad, the row is ``""`` before tokenization.
+
+        ``fps`` is the effective per-sample frame rate (``torch.long``);
+        the segment is omitted when ``fps_is_pad`` is True. Segment
+        ordering is ``Speed → Quality → Mistake → Robot → FPS → Control``
+        to match the other pi07 / pi07_paligemma ``prepare_metadata``
+        implementations.
 
         Always runs :meth:`_hydrate_metadata_batch` first so callers see the same
         outcomes whether they hit :meth:`sample_actions` (often no metadata
@@ -1390,14 +1406,15 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         scalar tensors broadcast like ``subgoal_is_pad``.
 
         .. note::
-            ``speed_is_pad`` / ``quality_is_pad`` / ``mistake_is_pad`` each
-            default to ``torch.ones(B, dtype=bool)`` (treat-as-pad) when the
-            key is missing from ``batch``. This is a behavior change from
-            the previous treat-as-real (``torch.zeros``) default. Hand-built
-            inference batches that supply ``"speed"`` / ``"quality"`` /
-            ``"mistake"`` but omit the corresponding ``_is_pad`` flag will
-            now have those metadata fields silently dropped from the prefix
-            string — pass ``..._is_pad=torch.zeros(...)`` explicitly when the
+            ``speed_is_pad`` / ``quality_is_pad`` / ``mistake_is_pad`` /
+            ``fps_is_pad`` each default to ``torch.ones(B, dtype=bool)``
+            (treat-as-pad) when the key is missing from ``batch``. This is
+            a behavior change from the previous treat-as-real
+            (``torch.zeros``) default. Hand-built inference batches that
+            supply ``"speed"`` / ``"quality"`` / ``"mistake"`` / ``"fps"``
+            but omit the corresponding ``_is_pad`` flag will now have
+            those metadata fields silently dropped from the prefix string
+            — pass ``..._is_pad=torch.zeros(...)`` explicitly when the
             metadata is real.
 
         Args:
@@ -1423,6 +1440,18 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
                 )
             return t
 
+        def _row_long(key: str) -> Tensor:
+            """``(B,)`` long-int row (``fps``), scalar-broadcastable."""
+            t = batch[key]
+            t = torch.as_tensor(t, dtype=torch.long, device=device).reshape(-1)
+            if t.numel() == 1:
+                t = t.expand(b)
+            elif t.shape[0] != b:
+                raise ValueError(
+                    f"{key} must have shape ({b},) or be scalar broadcastable; got {tuple(t.shape)}."
+                )
+            return t
+
         def _row_bool(key: str) -> Tensor:
             """``(B,)`` boolean row (``mistake`` or ``*_is_pad``), scalar-broadcastable."""
             t = batch[key]
@@ -1438,9 +1467,11 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         speed_t = _row_float("speed")
         quality_t = _row_float("quality")
         mistake_t = _row_bool("mistake")
+        fps_t = _row_long("fps")
         pad_speed = _row_bool("speed_is_pad")
         pad_quality = _row_bool("quality_is_pad")
         pad_mistake = _row_bool("mistake_is_pad")
+        pad_fps = _row_bool("fps_is_pad")
         robot_types = batch["robot_type"]
         control_modes = batch["control_mode"]
 
@@ -1454,6 +1485,8 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
             mistake_is_pad,
             robot_type,
             control_mode,
+            fps,
+            fps_is_pad,
         ) in zip(
             speed_t,
             quality_t,
@@ -1463,6 +1496,8 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
             pad_mistake,
             robot_types,
             control_modes,
+            fps_t,
+            pad_fps,
             strict=True,
         ):
             segments: list[str] = []
@@ -1477,6 +1512,8 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
                 segments.append(f"Mistake: {str(mistake.item())}, ")
             if robot_type:
                 segments.append(f"Robot: {robot_type}, ")
+            if not fps_is_pad.item():
+                segments.append(f"FPS: {str(fps.item())}, ")
             if control_mode:
                 segments.append(f"Control: {control_mode}, ")
             metadata_rows.append(f"Metadata: {' '.join(segments)}" if segments else "")

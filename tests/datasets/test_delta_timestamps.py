@@ -318,6 +318,82 @@ def test_resolve_delta_timestamps_only_state_feature(train_pipeline_config, data
     assert dt_mean["state"] == [0.0]
 
 
+def test_resolve_delta_timestamps_native_fps_substitution(
+    train_pipeline_config, dataset_config, lerobot_dataset_metadata
+):
+    """`action_freq=None` swaps in the dataset's native fps.
+
+    With chunk-style action indices and a mismatched native fps, the
+    resulting per-action timestamps must land on native-fps frame
+    boundaries (``i / ds_meta.fps``) — so nearest-neighbor resampling is
+    a no-op and consecutive frames are returned unchanged.
+    """
+    # `action_delta_indices` is a property derived from `chunk_size`
+    # (see PI0Config.action_delta_indices = list(range(chunk_size))), so drive
+    # the test via `chunk_size` rather than monkey-patching the property.
+    train_pipeline_config.policy.chunk_size = 4
+    train_pipeline_config.dataset_mixture.action_freq = None
+
+    # Inject the action feature into the metadata so it gets picked up.
+    lerobot_dataset_metadata.features.update({"actions": {"dtype": "float32", "shape": [32]}})
+    # Pin native fps to something distinct from the legacy default (30) so the
+    # substitution is observable in the output.
+    lerobot_dataset_metadata.fps = 50
+
+    dt_mean, _, _, _ = resolve_delta_timestamps(
+        train_pipeline_config, dataset_config, lerobot_dataset_metadata
+    )
+
+    # Each delta-timestamp value equals `i / native_fps`.
+    expected = [i / 50 for i in range(4)]
+    assert np.allclose(dt_mean["actions"], expected)
+
+
+def test_resolve_delta_timestamps_native_fps_differs_per_dataset(
+    train_pipeline_config, dataset_config, lerobot_dataset_metadata
+):
+    """Two datasets in the same mixture with different native fps must
+    produce different timestamps when action_freq is None.
+
+    This is the core invariant of mixed-frequency training: a 30 Hz source
+    and a 50 Hz source see chunk timestamps scaled to their respective
+    rates, so nearest-neighbor sampling lands on consecutive native frames
+    in both cases.
+    """
+    train_pipeline_config.policy.chunk_size = 3
+    train_pipeline_config.dataset_mixture.action_freq = None
+    lerobot_dataset_metadata.features.update({"actions": {"dtype": "float32", "shape": [32]}})
+
+    lerobot_dataset_metadata.fps = 30
+    dt_a, _, _, _ = resolve_delta_timestamps(train_pipeline_config, dataset_config, lerobot_dataset_metadata)
+
+    lerobot_dataset_metadata.fps = 50
+    dt_b, _, _, _ = resolve_delta_timestamps(train_pipeline_config, dataset_config, lerobot_dataset_metadata)
+
+    assert np.allclose(dt_a["actions"], [0 / 30, 1 / 30, 2 / 30])
+    assert np.allclose(dt_b["actions"], [0 / 50, 1 / 50, 2 / 50])
+    # Sanity check: the two are genuinely different (not just numerically
+    # close by accident).
+    assert not np.allclose(dt_a["actions"], dt_b["actions"])
+
+
+def test_resolve_delta_timestamps_action_freq_overrides_native_fps(
+    train_pipeline_config, dataset_config, lerobot_dataset_metadata
+):
+    """When `action_freq` is set (non-None), the native fps is ignored."""
+    train_pipeline_config.policy.chunk_size = 3
+    train_pipeline_config.dataset_mixture.action_freq = 30.0
+    lerobot_dataset_metadata.features.update({"actions": {"dtype": "float32", "shape": [32]}})
+    lerobot_dataset_metadata.fps = 50  # different native fps — must be overridden
+
+    dt_mean, _, _, _ = resolve_delta_timestamps(
+        train_pipeline_config, dataset_config, lerobot_dataset_metadata
+    )
+
+    # Timestamps reflect the configured `action_freq=30`, not native fps=50.
+    assert np.allclose(dt_mean["actions"], [0 / 30, 1 / 30, 2 / 30])
+
+
 def test_resolve_delta_timestamps_other_features_ignored(
     train_pipeline_config, dataset_config, lerobot_dataset_metadata
 ):

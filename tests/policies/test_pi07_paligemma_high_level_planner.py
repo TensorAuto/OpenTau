@@ -322,3 +322,122 @@ class TestPI07HighLevelPlannerIntegration:
         # Output shapes.
         assert memory_tokens.shape == (1, MEMORY_MAX_LENGTH)
         assert response_tokens.shape == (1, RESPONSE_MAX_LENGTH)
+
+
+# CPU-only tests for the metadata-string assembly loop in
+# ``PI07HighLevelPlannerPolicy.prepare_metadata``. Pin the contract that ``fps``
+# is tokenized with the ``"FPS: N, "`` header (uppercase to match the sibling
+# ``Speed:``/``Quality:``/``Mistake:`` labels) positioned after
+# ``Speed/Quality/Mistake`` (this planner has no ``Robot:``/``Control:``
+# segments) and omitted entirely when ``fps_is_pad`` is True.
+
+
+def _pg_hl_make_fake_planner(metadata_max_length: int = 4):
+    """Construct a minimal ``self`` stand-in for the high-level pi07_paligemma
+    planner's ``prepare_metadata`` method.
+
+    The method only touches ``self.language_tokenizer`` and
+    ``self.config.metadata_max_length`` (no ``_hydrate_metadata_batch``), so a
+    plain SimpleNamespace with a stub tokenizer is enough — no PaliGemma
+    backbone, no HuggingFace download.
+    """
+    import types
+
+    captured: list[str] = []
+
+    def stub_call(metadata, **kwargs):
+        captured.extend(metadata)
+        batch_size = len(metadata)
+        max_length = kwargs.get("max_length", 4)
+        return {
+            "input_ids": torch.zeros((batch_size, max_length), dtype=torch.long),
+            "attention_mask": torch.zeros((batch_size, max_length), dtype=torch.long),
+        }
+
+    tokenizer = types.SimpleNamespace()
+    tokenizer.__call__ = stub_call
+    fake = types.SimpleNamespace(
+        language_tokenizer=tokenizer,
+        config=types.SimpleNamespace(metadata_max_length=metadata_max_length),
+    )
+    return fake, captured
+
+
+def _pg_hl_base_batch(batch_size: int) -> dict:
+    """Build a batch with the mandatory speed/quality/mistake keys.
+
+    Unlike pi07's ``prepare_metadata``, this planner reads ``batch["speed"]``
+    etc. directly (no ``batch.get`` fallback), so every required numeric
+    + ``_is_pad`` key must be present.
+    """
+    return {
+        "state": torch.zeros(batch_size, 1),
+        "speed": torch.tensor([50.0] * batch_size, dtype=torch.float32),
+        "quality": torch.tensor([3.0] * batch_size, dtype=torch.float32),
+        "mistake": torch.tensor([False] * batch_size, dtype=torch.bool),
+        "speed_is_pad": torch.tensor([True] * batch_size),
+        "quality_is_pad": torch.tensor([True] * batch_size),
+        "mistake_is_pad": torch.tensor([True] * batch_size),
+    }
+
+
+class TestPaligemmaHighLevelFpsSegment:
+    def test_fps_present_emits_uppercase_segment(self):
+        method = PI07HighLevelPlannerPolicy.prepare_metadata
+        fake, captured = _pg_hl_make_fake_planner()
+
+        batch = _pg_hl_base_batch(batch_size=2)
+        batch["fps"] = torch.tensor([30, 50], dtype=torch.long)
+        batch["fps_is_pad"] = torch.tensor([False, False])
+
+        method(fake, batch)
+
+        assert len(captured) == 2
+        for line, fps in zip(captured, [30, 50], strict=True):
+            assert line.startswith("Metadata: ")
+            assert f"FPS: {fps}, " in line
+            assert "fps:" not in line and "Fps:" not in line
+
+    def test_fps_padded_omits_segment(self):
+        method = PI07HighLevelPlannerPolicy.prepare_metadata
+        fake, captured = _pg_hl_make_fake_planner()
+
+        batch = _pg_hl_base_batch(batch_size=1)
+        batch["fps"] = torch.tensor([30], dtype=torch.long)
+        batch["fps_is_pad"] = torch.tensor([True])
+
+        method(fake, batch)
+
+        assert "FPS:" not in captured[0]
+        # No stray comma where the fps segment would have lived.
+        assert ", ," not in captured[0]
+
+    def test_fps_key_absent_omits_segment(self):
+        method = PI07HighLevelPlannerPolicy.prepare_metadata
+        fake, captured = _pg_hl_make_fake_planner()
+
+        # Note: no "fps" / "fps_is_pad" keys at all — the `batch.get` defaults
+        # should kick in and produce no segment.
+        batch = _pg_hl_base_batch(batch_size=3)
+        method(fake, batch)
+
+        for line in captured:
+            assert "FPS:" not in line
+
+    def test_fps_mixed_pad_across_batch(self):
+        """Per-sample ``fps_is_pad`` must be honored row-by-row — production
+        path for heterogeneous LeRobot + VQA mixtures, where the VQA pad
+        row (``fps=0, fps_is_pad=True``) sits next to a LeRobot row
+        (``fps=30, fps_is_pad=False``) in the same batch.
+        """
+        method = PI07HighLevelPlannerPolicy.prepare_metadata
+        fake, captured = _pg_hl_make_fake_planner()
+
+        batch = _pg_hl_base_batch(batch_size=2)
+        batch["fps"] = torch.tensor([30, 0], dtype=torch.long)
+        batch["fps_is_pad"] = torch.tensor([False, True])
+
+        method(fake, batch)
+
+        assert "FPS: 30, " in captured[0]
+        assert "FPS:" not in captured[1]

@@ -174,7 +174,14 @@ class DatasetMixtureConfig:
             same length as `datasets` when provided. If None, weights are inferred
             from dataset lengths. Defaults to None.
         action_freq: Frequency at which actions from the dataset mixture are
-            resampled, in Hz. Defaults to 30.0.
+            resampled, in Hz. ``None`` (default) disables resampling — each
+            dataset is sampled at its native fps, so a single batch can mix
+            samples from sources running at different rates (predicting
+            ``chunk_size`` consecutive native frames per sample). Set a
+            positive float to resample every dataset in the mixture to that
+            common rate via nearest-neighbor frame selection. When using
+            ``None``, prefer also setting ``emit_fps=True`` so the policy
+            can condition on the per-sample rate.
         image_resample_strategy: Resample strategy for image features. Must be
             one of 'linear' or 'nearest'. Defaults to 'nearest'.
         vector_resample_strategy: Resample strategy for non-image features, such
@@ -227,6 +234,23 @@ class DatasetMixtureConfig:
             must have a non-empty ``control_mode`` after the optional
             ``DatasetConfig.control_mode`` override has been applied. Defaults
             to ``False`` (empty / missing values are allowed).
+        emit_fps: Whether ``__getitem__`` returns the *effective*
+            per-sample frame rate (``action_freq`` if set, else the
+            dataset's native ``meta.fps``) as the ``fps`` metadata key
+            (``torch.long`` scalar, paired with ``fps_is_pad=False``).
+            Default ``False`` — fps conditioning is an opt-in feature so
+            pre-PR checkpoints resume without the policy's metadata
+            prefix gaining an unfamiliar ``FPS:`` segment. Flip to
+            ``True`` for new training runs that want per-sample
+            frame-rate conditioning (especially heterogeneous-frequency
+            mixtures where ``action_freq=None`` lets each dataset run at
+            its native rate). Unlike the other metadata fields, ``fps``
+            is **not** rolled by ``metadata_drop_*_prob`` — it's an
+            intrinsic property of the chunk, not a noisy label, so it
+            is always present (non-pad) for LeRobot samples when
+            ``emit_fps=True``. VQA samples (no temporal axis) emit
+            ``fps=0, fps_is_pad=True`` regardless so heterogeneous
+            VLA + VQA batches stay schema-aligned.
         tolerance_s: Mixture-wide default tolerance (in seconds) for the
             load-time ``check_timestamps_sync`` call inside
             ``LeRobotDataset.__init__``. Each dataset's frame-to-frame
@@ -254,9 +278,9 @@ class DatasetMixtureConfig:
 
     Raises:
         ValueError: If `weights` is provided and its length doesn't match
-            `datasets`, if `action_freq` is not positive, if resample
-            strategies are invalid, or if any drop probability is outside
-            ``[0, 1]``.
+            `datasets`, if `action_freq` is not None and not positive, if
+            resample strategies are invalid, or if any drop probability is
+            outside ``[0, 1]``.
     """
 
     # List of dataset configs to be used in the mixture.
@@ -265,7 +289,8 @@ class DatasetMixtureConfig:
     # Must be the same length as `datasets` when provided.
     weights: list[float] | None = None
     # Frequency at which the actions from dataset mixture are resampled, in Hz.
-    action_freq: float = 30.0
+    # ``None`` disables resampling — each dataset is sampled at its native fps.
+    action_freq: float | None = None
     # Resample strategy for image features
     image_resample_strategy: str = "nearest"
     # Resample strategy for non-image features, such as action or state
@@ -297,6 +322,16 @@ class DatasetMixtureConfig:
     require_non_empty_robot_type: bool = False
     require_non_empty_control_mode: bool = False
 
+    # Whether `__getitem__` emits the effective per-sample fps as the `fps`
+    # metadata key. Default `False` so pre-PR checkpoints resume cleanly
+    # (no new `FPS:` segment in the policy's metadata prefix). Flip to
+    # `True` for new training runs that want per-sample fps conditioning;
+    # especially relevant for heterogeneous-frequency mixtures
+    # (`action_freq=None`). Independent of `metadata_drop_*_prob` — fps
+    # is intrinsic to the chunk, not a noisy label, so it is always
+    # present (never padded) for LeRobot samples when this is True.
+    emit_fps: bool = False
+
     # Mixture-wide defaults for the load-time timestamp-sync check. Each
     # dataset can override these via `DatasetConfig.{tolerance_s,
     # skip_timestamp_check}`. The default tolerance matches
@@ -308,8 +343,8 @@ class DatasetMixtureConfig:
         """Validate dataset mixture configuration."""
         if self.weights is not None and len(self.datasets) != len(self.weights):
             raise ValueError("The length of `weights` must match the length of `datasets`.")
-        if self.action_freq <= 0:
-            raise ValueError(f"`action_freq` must be a positive number, got {self.action_freq}.")
+        if self.action_freq is not None and self.action_freq <= 0:
+            raise ValueError(f"`action_freq` must be a positive number or None, got {self.action_freq}.")
         if self.image_resample_strategy not in ["linear", "nearest"]:
             raise ValueError(
                 f"`image_resample_strategy` must be one of ['linear', 'nearest'], got {self.image_resample_strategy}."

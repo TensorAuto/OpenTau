@@ -76,6 +76,13 @@ class EnvMetadataConfig:
             ``None``.
         control_mode: ``"joint"`` (joint-position control) or ``"ee"``
             (end-effector control), or ``None``.
+        emit_fps: Whether to broadcast :attr:`EnvConfig.fps` as the ``fps``
+            metadata field at inference (paralleling
+            :attr:`DatasetMixtureConfig.emit_fps` at training time).
+            Defaults to ``False`` — fps conditioning is opt-in so old
+            checkpoints resume cleanly (no surprise ``FPS:`` segment in
+            the policy's metadata prefix). Flip to ``True`` for
+            checkpoints trained with the training-side ``emit_fps=True``.
     """
 
     speed: int | None = None
@@ -83,6 +90,7 @@ class EnvMetadataConfig:
     mistake: bool | None = None
     robot_type: str | None = None
     control_mode: ControlMode | None = None
+    emit_fps: bool = False
 
     def __post_init__(self) -> None:
         # `isinstance(x, bool)` guards exclude Python bools — `bool` is a

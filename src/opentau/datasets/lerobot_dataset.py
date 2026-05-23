@@ -301,9 +301,28 @@ class DatasetMetadata:
         """Shapes for the different features."""
         return {key: tuple(ft["shape"]) for key, ft in self.features.items()}
 
+    @property
+    def fps(self) -> int | None:
+        """Native frame rate of the dataset.
+
+        Returns ``None`` for datasets without a temporal axis (e.g. VQA
+        image-text datasets). Subclasses with real frame-rate metadata
+        (``LeRobotDatasetMetadata``) override this to return the int from
+        ``info["fps"]``. Downstream callers that emit fps as a sample key
+        treat ``None`` as the pad signal so heterogeneous mixtures
+        (VLA + VQA) stay batchable.
+        """
+        return None
+
 
 class VQADatasetMetadata(DatasetMetadata):
-    """Metadata class for vqa datasets (vision-language datasets)."""
+    """Metadata class for vqa datasets (vision-language datasets).
+
+    Inherits ``fps -> None`` from :class:`DatasetMetadata` since VQA
+    samples have no temporal axis. :meth:`BaseDataset._emit_optional_keys`
+    sees this and emits ``fps_is_pad=True`` for VQA samples in a mixture,
+    keeping every batch row schema-aligned with the LeRobot samples.
+    """
 
     pass
 
@@ -698,6 +717,15 @@ class BaseDataset(torch.utils.data.Dataset):
         self.response_drop_prob = dm.response_drop_prob if dm else 0.0
         self.metadata_drop_all_prob = dm.metadata_drop_all_prob if dm else 0.0
         self.metadata_drop_each_prob = dm.metadata_drop_each_prob if dm else 0.0
+        # `_emit_optional_keys` emits the *effective* per-sample fps when this
+        # is True: the mixture's `action_freq` if set (every dataset has been
+        # resampled to that rate via `resolve_delta_timestamps`), else the
+        # dataset's native `meta.fps`. Independent of the dropout rolls above.
+        # Default-False fallback matches `DatasetMixtureConfig.emit_fps` so
+        # the "no mixture config" path (VQA-only / unit tests) behaves the
+        # same as the explicit-mixture default.
+        self.emit_fps = dm.emit_fps if dm else False
+        self._action_freq = dm.action_freq if dm else None
         # Whether the above drop rolls actually fire. `make_dataset` flips this
         # off on the validation subset (unless `val_enable_optional_key_dropout`
         # is set). Subgoal *frame* selection (end-of-segment vs. uniform window)
@@ -875,6 +903,20 @@ class BaseDataset(torch.utils.data.Dataset):
         pad signal — a consumer seeing ``""`` can assume the field was
         unavailable or was masked this step.
 
+        ``fps`` (the *effective* per-sample frame rate — ``action_freq`` if
+        set on the mixture, else the dataset's native ``meta.fps``) is
+        emitted as a ``torch.long`` scalar alongside ``fps_is_pad`` when
+        ``self.emit_fps`` is True. Unlike the other metadata fields,
+        ``fps`` does **not** participate in the dropout rolls — it's an
+        intrinsic property of the (possibly resampled) chunk, not a noisy
+        label — so it's always non-padded for samples that have a real
+        frame rate. Samples from VQA datasets (where
+        :attr:`DatasetMetadata.fps` is ``None``) emit
+        ``fps=0, fps_is_pad=True`` so a heterogeneous VLA + VQA mixture
+        stays schema-aligned across the batch. Set ``emit_fps=False`` on
+        the mixture to omit the keys entirely (the policy's
+        ``prepare_metadata`` falls through to its default-pad path).
+
         Dropout order:
             1. ``history_state_drop_prob``: zero ``state`` and historical camera
                frames; mark ``obs_history_is_pad`` all True.
@@ -885,6 +927,7 @@ class BaseDataset(torch.utils.data.Dataset):
             4. ``metadata_drop_all_prob``: mask {speed, mistake, quality,
                robot_type, control_mode} together. If this didn't fire,
                ``metadata_drop_each_prob`` rolls independently for each field.
+               ``fps`` is **not** included in these rolls.
 
         Dropout rolls use the default torch RNG (auto-seeded per worker).
 
@@ -974,6 +1017,27 @@ class BaseDataset(torch.utils.data.Dataset):
             val = self.meta.info.get(key) or ""
             drop_this = drop_meta_all or _roll(self.metadata_drop_each_prob)
             standard_item[key] = "" if drop_this else val
+
+        # (6) Effective fps: the rate the action chunk actually runs at after
+        # any mixture-level resampling. When `action_freq` is set, every
+        # dataset's chunks are nearest-neighbor resampled to that rate by
+        # `resolve_delta_timestamps`, so tokenizing the dataset's native
+        # `meta.fps` would mislead the policy (the chunk timing differs).
+        # When `action_freq is None` (no resampling), the chunk runs at the
+        # dataset's native rate. Datasets without a temporal axis (VQA;
+        # `DatasetMetadata.fps` returns ``None``) emit pad so heterogeneous
+        # VLA + VQA mixtures stay schema-aligned across the batch. Always
+        # non-pad (no dropout) for real-rate samples when emit_fps is
+        # enabled on the mixture.
+        if self.emit_fps:
+            native_fps = self.meta.fps
+            if native_fps is None:
+                standard_item["fps"] = torch.tensor(0, dtype=torch.long)
+                standard_item["fps_is_pad"] = torch.tensor(True)
+            else:
+                effective_fps = int(self._action_freq) if self._action_freq is not None else int(native_fps)
+                standard_item["fps"] = torch.tensor(effective_fps, dtype=torch.long)
+                standard_item["fps_is_pad"] = torch.tensor(False)
 
     def resize_with_pad(self, img, width, height, pad_value=0) -> torch.Tensor:
         """Resize an image to target dimensions with padding.

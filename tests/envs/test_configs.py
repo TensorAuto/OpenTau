@@ -188,6 +188,24 @@ class TestEnvMetadataConfig:
         assert cfg.mistake is None
         assert cfg.robot_type is None
         assert cfg.control_mode is None
+        # `emit_fps` is a boolean toggle (not a None-presence field) and
+        # defaults to False — fps conditioning is opt-in so pre-PR
+        # checkpoints resume cleanly without an unfamiliar ``FPS:``
+        # segment in the metadata prefix.
+        assert cfg.emit_fps is False
+
+    def test_emit_fps_can_be_enabled(self):
+        cfg = EnvMetadataConfig(emit_fps=True)
+        assert cfg.emit_fps is True
+
+    def test_emit_fps_kept_orthogonal_to_other_fields(self):
+        """Setting ``emit_fps`` must not perturb the other fields' defaults."""
+        cfg = EnvMetadataConfig(emit_fps=True)
+        assert cfg.speed is None
+        assert cfg.quality is None
+        assert cfg.mistake is None
+        assert cfg.robot_type is None
+        assert cfg.control_mode is None
 
     @pytest.mark.parametrize("mode", ["joint", "ee"])
     @pytest.mark.parametrize("speed", [0, 10, 50, 90, 100])

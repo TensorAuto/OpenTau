@@ -74,8 +74,45 @@ def test_invalid_action_freq_raises_error(invalid_freq):
     """
     Tests that a ValueError is raised if action_freq is zero or negative.
     """
-    with pytest.raises(ValueError, match=f"`action_freq` must be a positive number, got {invalid_freq}."):
+    with pytest.raises(
+        ValueError,
+        match=rf"`action_freq` must be a positive number or None, got {invalid_freq}\.",
+    ):
         DatasetMixtureConfig(action_freq=invalid_freq)
+
+
+def test_action_freq_defaults_to_none():
+    """`action_freq=None` is the new default — each dataset trains at its native fps."""
+    cfg = DatasetMixtureConfig()
+    assert cfg.action_freq is None
+
+
+def test_action_freq_none_is_valid():
+    """Explicit `None` is accepted and disables resampling."""
+    cfg = DatasetMixtureConfig(action_freq=None)
+    assert cfg.action_freq is None
+
+
+def test_action_freq_positive_still_valid():
+    """A positive float still pins every dataset to that common rate."""
+    cfg = DatasetMixtureConfig(action_freq=30.0)
+    assert cfg.action_freq == 30.0
+
+
+def test_emit_fps_defaults_to_false():
+    """The new `emit_fps` toggle is opt-in — pre-PR checkpoints resume cleanly
+    because the policy's metadata prefix doesn't gain an unfamiliar ``FPS:``
+    segment by default. New training runs that want per-sample fps
+    conditioning set `emit_fps=True` explicitly.
+    """
+    cfg = DatasetMixtureConfig()
+    assert cfg.emit_fps is False
+
+
+def test_emit_fps_can_be_enabled():
+    """Setting `emit_fps=True` opts in to per-sample fps tokenization."""
+    cfg = DatasetMixtureConfig(emit_fps=True)
+    assert cfg.emit_fps is True
 
 
 def test_invalid_image_resample_strategy_raises_error():

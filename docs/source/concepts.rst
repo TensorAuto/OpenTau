@@ -28,7 +28,7 @@ This class:
 *   Combines multiple ``LeRobotDataset`` and ``VQADataset`` instances.
 *   Different weights can be assigned to each dataset to control the sampling frequency; if weights are omitted (or set to ``null`` in JSON), weights default to dataset lengths.
 *   Aggregates statistics from all constituent datasets to ensure consistent normalization across the mixture.
-*   Resamples the action output frequency to match the action frequency specified in the configuration.
+*   Resamples the action output frequency to match the ``action_freq`` specified in the configuration. When ``action_freq`` is ``None`` (the default), resampling is disabled — each dataset is sampled at its native fps and a single batch can mix samples spanning different real-time horizons (set ``action_freq`` to a positive float to re-anchor every dataset to a common rate). When running mixed-frequency training, opt in to ``DatasetMixtureConfig.emit_fps=True`` so the per-sample effective rate is surfaced via the ``fps`` standard-format key (see :ref:`standard-data-format-optional-keys`) and the policy can condition on it.
 
 Metadata
 ^^^^^^^^
@@ -130,6 +130,34 @@ Like ``speed``, ``mistake``, and ``quality``, they participate in the
 ``metadata_drop_all_prob`` / ``metadata_drop_each_prob`` dropout rolls —
 see :ref:`Training-time dropout <standard-data-format-optional-keys-dropout>`.
 
+``fps`` is the **effective per-sample frame rate** of the (possibly
+resampled) action chunk: ``DatasetMixtureConfig.action_freq`` when set,
+otherwise the dataset's native ``meta.fps``. The tokenized ``FPS: N, ``
+segment adds ~3-4 BPE tokens to the metadata prefix, which still fits
+comfortably inside the default ``metadata_max_length=52`` — but long
+``robot_type`` strings combined with a fully-populated metadata batch
+leave less headroom than before, and the underlying tokenizer call uses
+``truncation=True`` silently. Bump ``metadata_max_length`` (a field on
+each pi07 / pi07_paligemma config) if you start seeing the trailing
+``Control:`` segment get clipped. Heterogeneous-frequency
+mixtures (``action_freq=None``) need it so the policy can condition on
+each sample's rate — a 30 Hz chunk and a 50 Hz chunk carry different
+real-time horizons even when both are ``chunk_size`` frames long. Unlike
+the other metadata fields, ``fps`` does **not** participate in the
+dropout rolls — it's an intrinsic property of the chunk, not a noisy
+label, so it's always non-pad when emitted from a dataset that has a
+real frame rate. Samples from VQA datasets (no temporal axis) emit
+``fps=0, fps_is_pad=True`` so heterogeneous VLA + VQA mixtures stay
+schema-aligned across the batch; the policy's ``prepare_metadata``
+then drops the ``FPS:`` segment for those rows. Emission is gated by
+``DatasetMixtureConfig.emit_fps`` (default ``False`` — pre-PR
+checkpoints resume cleanly because the policy's metadata prefix doesn't
+gain an unfamiliar ``FPS:`` segment). Flip to ``True`` for new training
+runs that want per-sample fps conditioning, especially heterogeneous
+mixtures where ``action_freq=None`` lets each dataset run at its native
+rate. At inference, ``EnvMetadataConfig.emit_fps`` (same default
+``False``) gates the eval-side broadcast of ``cfg.env.fps``.
+
 .. code-block:: python
 
     {
@@ -181,6 +209,20 @@ see :ref:`Training-time dropout <standard-data-format-optional-keys-dropout>`.
 
         "quality": torch.LongTensor,   # Scalar in {1,2,3,4,5}; episode-level quality score.
         "quality_is_pad": torch.BoolTensor,
+
+        "fps": torch.LongTensor,       # Scalar; effective per-sample frame rate of the action chunk.
+                                       # When `DatasetMixtureConfig.action_freq` is set, every dataset is
+                                       # resampled to that rate (via `resolve_delta_timestamps`) and `fps`
+                                       # reports `action_freq`. When `action_freq is None` (the default),
+                                       # the chunk runs at the dataset's native `meta.fps`. Gated by
+                                       # `DatasetMixtureConfig.emit_fps` (default `False` — opt-in); the
+                                       # key is omitted entirely when `emit_fps=False`. Does NOT
+                                       # participate in `metadata_drop_*_prob` — fps is an intrinsic
+                                       # property of the chunk, not a noisy label.
+        "fps_is_pad": torch.BoolTensor,    # Always False when emitted from a real-rate sample. VQA samples
+                                           # (no temporal axis) emit `fps_is_pad=True` so heterogeneous
+                                           # VLA + VQA batches stay schema-aligned; `prepare_metadata`
+                                           # then drops the `FPS:` segment for those rows.
 
         "subgoal0": torch.Tensor,       # shape (3, H, W), values in [0,1]. A single future frame from
                                         # camera0 sampled either at end-of-segment (with probability
@@ -257,6 +299,16 @@ for reproducibility.
      - Per-field independent mask roll for each of ``speed``,
        ``mistake``, ``quality``, ``robot_type``, ``control_mode``.
        Only rolled when the shared drop did not fire.
+
+.. note::
+
+   ``fps`` is **not** in either drop pool — when ``emit_fps=True`` it
+   stays non-pad for every LeRobot sample regardless of the rolls. This
+   means under ``emit_fps=True``, ``metadata_drop_all_prob=1.0`` produces
+   a "fps-only metadata segment" rather than "no metadata segment at
+   all" (the policy's ``has_metadata`` branch sees a non-empty metadata
+   mask and keeps the ``Metadata: FPS: N, `` block in the prefix). For a
+   true no-metadata ablation, keep the default ``emit_fps=False``.
    * - ``val_enable_optional_key_dropout``
      - ``False``
      - Whether the five drop rolls above also fire on the **validation**
