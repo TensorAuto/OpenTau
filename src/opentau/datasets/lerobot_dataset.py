@@ -721,7 +721,10 @@ class BaseDataset(torch.utils.data.Dataset):
         # is True: the mixture's `action_freq` if set (every dataset has been
         # resampled to that rate via `resolve_delta_timestamps`), else the
         # dataset's native `meta.fps`. Independent of the dropout rolls above.
-        self.emit_fps = dm.emit_fps if dm else True
+        # Default-False fallback matches `DatasetMixtureConfig.emit_fps` so
+        # the "no mixture config" path (VQA-only / unit tests) behaves the
+        # same as the explicit-mixture default.
+        self.emit_fps = dm.emit_fps if dm else False
         self._action_freq = dm.action_freq if dm else None
         # Whether the above drop rolls actually fire. `make_dataset` flips this
         # off on the validation subset (unless `val_enable_optional_key_dropout`

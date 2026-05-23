@@ -232,31 +232,31 @@ class TestAddEvalMetadata:
     silently changes the prefix the model sees at eval.
     """
 
-    def test_all_none_default_skips_user_keys_but_still_emits_fps(self):
+    def test_all_none_default_skips_every_key(self):
         """``EnvMetadataConfig`` defaults: every user-controlled field is
-        ``None`` *but* ``emit_fps`` defaults to ``True``, so the helper still
-        injects ``fps`` / ``fps_is_pad`` from ``cfg.env.fps``.
+        ``None`` and ``emit_fps`` defaults to ``False``, so the helper
+        injects **no** metadata keys at all. This preserves pre-PR
+        behaviour for any eval config that doesn't opt in.
         """
         obs = _make_obs()
         original_keys = set(obs.keys())
         out = add_eval_metadata(obs, cfg=_make_cfg())
         assert out is obs  # mutated-in-place contract
-        new_keys = set(out.keys()) - original_keys
-        assert new_keys == {"fps", "fps_is_pad"}, (
-            f"unexpected injected keys: {new_keys}; only fps/fps_is_pad should appear "
-            f"under the all-None metadata default"
+        assert set(out.keys()) == original_keys, (
+            f"unexpected injected keys under all-None metadata default: {set(out.keys()) - original_keys}"
         )
 
-    def test_emit_fps_false_skips_fps(self):
-        """``emit_fps=False`` on ``EnvMetadataConfig`` reverts the helper to the
-        legacy "skip all when nothing set" behaviour — useful when resuming a
-        checkpoint trained without fps conditioning.
+    def test_emit_fps_true_injects_fps(self):
+        """``emit_fps=True`` opts in to broadcasting ``cfg.env.fps`` as a
+        ``(B,)`` torch.long tensor with ``fps_is_pad=False``.
         """
         obs = _make_obs()
         original_keys = set(obs.keys())
-        out = add_eval_metadata(obs, cfg=_make_cfg(emit_fps=False))
-        assert set(out.keys()) == original_keys, (
-            "no keys should be injected when emit_fps=False and every metadata field is None"
+        out = add_eval_metadata(obs, cfg=_make_cfg(emit_fps=True))
+        new_keys = set(out.keys()) - original_keys
+        assert new_keys == {"fps", "fps_is_pad"}, (
+            f"unexpected injected keys: {new_keys}; emit_fps=True with no other "
+            f"metadata fields should inject only fps/fps_is_pad"
         )
 
     @pytest.mark.parametrize("batch_size", [1, 4])
@@ -317,10 +317,10 @@ class TestAddEvalMetadata:
         assert f"{key}_is_pad" not in obs, "string fields use empty-string as pad signal, not a flag"
 
     def test_partial_fields_only_inject_specified_keys(self):
-        # `emit_fps=False` so this test isolates the user-set fields from the
-        # default fps injection (covered separately in test_emit_fps_*).
+        # `emit_fps` defaults to False, so this exercises the user-set fields
+        # in isolation from the fps emission path (covered separately).
         obs = _make_obs()
-        add_eval_metadata(obs, cfg=_make_cfg(emit_fps=False, speed=30, robot_type="UR5"))
+        add_eval_metadata(obs, cfg=_make_cfg(speed=30, robot_type="UR5"))
 
         assert "speed" in obs and "speed_is_pad" in obs
         assert "robot_type" in obs
@@ -340,26 +340,25 @@ class TestAddEvalMetadata:
 
         Using "meta" device makes this CPU-host portable (no real CUDA
         required) while still exercising the device-routing branch in the
-        helper.
+        helper. Opts in to ``emit_fps=True`` so the fps device-routing
+        branch is also exercised.
         """
         obs = _make_obs(batch_size=2, device="meta")
-        add_eval_metadata(obs, cfg=_make_cfg(speed=20, mistake=True))
+        add_eval_metadata(obs, cfg=_make_cfg(emit_fps=True, speed=20, mistake=True))
 
         assert obs["speed"].device.type == "meta"
         assert obs["speed_is_pad"].device.type == "meta"
         assert obs["mistake"].device.type == "meta"
         assert obs["mistake_is_pad"].device.type == "meta"
-        # fps gets injected too under the default `emit_fps=True`; it must
-        # share the same device as state.
         assert obs["fps"].device.type == "meta"
         assert obs["fps_is_pad"].device.type == "meta"
 
     @pytest.mark.parametrize("batch_size", [1, 4])
     def test_fps_injects_long_tensor_from_env_fps(self, batch_size):
-        """``emit_fps=True`` (default) → broadcast ``cfg.env.fps`` as a
+        """``emit_fps=True`` opt-in → broadcast ``cfg.env.fps`` as a
         ``(B,)`` torch.long tensor with ``fps_is_pad=False`` rows."""
         obs = _make_obs(batch_size=batch_size)
-        add_eval_metadata(obs, cfg=_make_cfg(fps=20))  # LiberoEnv-style fps
+        add_eval_metadata(obs, cfg=_make_cfg(emit_fps=True, fps=20))  # LiberoEnv-style fps
 
         assert obs["fps"].dtype == torch.long
         assert obs["fps"].shape == (batch_size,)
@@ -373,13 +372,14 @@ class TestAddEvalMetadata:
         """The fps value source is ``cfg.env.fps`` (env stepping freq), NOT a
         field on ``EnvMetadataConfig`` (which only carries the on/off toggle)."""
         obs = _make_obs(batch_size=2)
-        add_eval_metadata(obs, cfg=_make_cfg(fps=50))
+        add_eval_metadata(obs, cfg=_make_cfg(emit_fps=True, fps=50))
 
         assert torch.equal(obs["fps"], torch.full((2,), 50, dtype=torch.long))
 
     def test_fps_disabled_skips_only_fps_keys(self):
-        """``emit_fps=False`` skips the fps injection but leaves other set
-        fields alone — they go through the regular None-presence gating."""
+        """``emit_fps=False`` (the default) skips the fps injection but leaves
+        other set fields alone — they go through the regular None-presence
+        gating. The explicit ``emit_fps=False`` documents intent."""
         obs = _make_obs(batch_size=2)
         add_eval_metadata(obs, cfg=_make_cfg(emit_fps=False, speed=30, robot_type="UR5"))
 

@@ -99,16 +99,20 @@ def test_action_freq_positive_still_valid():
     assert cfg.action_freq == 30.0
 
 
-def test_emit_fps_defaults_to_true():
-    """The new `emit_fps` toggle defaults to True so the policy gets fps conditioning out of the box."""
+def test_emit_fps_defaults_to_false():
+    """The new `emit_fps` toggle is opt-in — pre-PR checkpoints resume cleanly
+    because the policy's metadata prefix doesn't gain an unfamiliar ``FPS:``
+    segment by default. New training runs that want per-sample fps
+    conditioning set `emit_fps=True` explicitly.
+    """
     cfg = DatasetMixtureConfig()
-    assert cfg.emit_fps is True
-
-
-def test_emit_fps_can_be_disabled():
-    """Setting `emit_fps=False` should be accepted (legacy-checkpoint resume escape hatch)."""
-    cfg = DatasetMixtureConfig(emit_fps=False)
     assert cfg.emit_fps is False
+
+
+def test_emit_fps_can_be_enabled():
+    """Setting `emit_fps=True` opts in to per-sample fps tokenization."""
+    cfg = DatasetMixtureConfig(emit_fps=True)
+    assert cfg.emit_fps is True
 
 
 def test_invalid_image_resample_strategy_raises_error():

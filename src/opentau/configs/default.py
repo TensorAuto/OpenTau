@@ -234,15 +234,23 @@ class DatasetMixtureConfig:
             must have a non-empty ``control_mode`` after the optional
             ``DatasetConfig.control_mode`` override has been applied. Defaults
             to ``False`` (empty / missing values are allowed).
-        emit_fps: Whether ``__getitem__`` returns the dataset's native
-            ``meta.fps`` as the ``fps`` metadata key (``torch.long`` scalar,
-            paired with ``fps_is_pad=False``). Default ``True``. When
-            ``False``, neither ``fps`` nor ``fps_is_pad`` appears in the
-            sample dict and the pi07 / pi07_paligemma policy prefix omits
-            the ``fps:`` segment. Unlike the other metadata fields, ``fps``
-            is **not** rolled by ``metadata_drop_*_prob`` — it's an intrinsic
-            property of the dataset, not a noisy label, so it is always
-            present when ``emit_fps=True``.
+        emit_fps: Whether ``__getitem__`` returns the *effective*
+            per-sample frame rate (``action_freq`` if set, else the
+            dataset's native ``meta.fps``) as the ``fps`` metadata key
+            (``torch.long`` scalar, paired with ``fps_is_pad=False``).
+            Default ``False`` — fps conditioning is an opt-in feature so
+            pre-PR checkpoints resume without the policy's metadata
+            prefix gaining an unfamiliar ``FPS:`` segment. Flip to
+            ``True`` for new training runs that want per-sample
+            frame-rate conditioning (especially heterogeneous-frequency
+            mixtures where ``action_freq=None`` lets each dataset run at
+            its native rate). Unlike the other metadata fields, ``fps``
+            is **not** rolled by ``metadata_drop_*_prob`` — it's an
+            intrinsic property of the chunk, not a noisy label, so it
+            is always present (non-pad) for LeRobot samples when
+            ``emit_fps=True``. VQA samples (no temporal axis) emit
+            ``fps=0, fps_is_pad=True`` regardless so heterogeneous
+            VLA + VQA batches stay schema-aligned.
         tolerance_s: Mixture-wide default tolerance (in seconds) for the
             load-time ``check_timestamps_sync`` call inside
             ``LeRobotDataset.__init__``. Each dataset's frame-to-frame
@@ -314,11 +322,15 @@ class DatasetMixtureConfig:
     require_non_empty_robot_type: bool = False
     require_non_empty_control_mode: bool = False
 
-    # Whether `__getitem__` emits the dataset's native fps as the `fps`
-    # metadata key. Independent of `metadata_drop_*_prob` — fps is intrinsic
-    # to the dataset, not a noisy label, so it is always present (never
-    # padded) when this is True.
-    emit_fps: bool = True
+    # Whether `__getitem__` emits the effective per-sample fps as the `fps`
+    # metadata key. Default `False` so pre-PR checkpoints resume cleanly
+    # (no new `FPS:` segment in the policy's metadata prefix). Flip to
+    # `True` for new training runs that want per-sample fps conditioning;
+    # especially relevant for heterogeneous-frequency mixtures
+    # (`action_freq=None`). Independent of `metadata_drop_*_prob` — fps
+    # is intrinsic to the chunk, not a noisy label, so it is always
+    # present (never padded) for LeRobot samples when this is True.
+    emit_fps: bool = False
 
     # Mixture-wide defaults for the load-time timestamp-sync check. Each
     # dataset can override these via `DatasetConfig.{tolerance_s,

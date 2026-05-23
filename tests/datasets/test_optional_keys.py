@@ -64,7 +64,7 @@ class _DummyBaseDataset(BaseDataset):
         response_drop_prob=0.0,
         metadata_drop_all_prob=0.0,
         metadata_drop_each_prob=0.0,
-        emit_fps=True,
+        emit_fps=False,
         action_freq: float | None = None,
         meta_info: dict | None = None,
         meta_fps: int = 30,
@@ -699,26 +699,34 @@ class TestRobotTypeControlMode:
 
 
 # `fps` is emitted as an intrinsic dataset property — always present (non-pad)
-# when `emit_fps=True`, omitted entirely when `emit_fps=False`. Unlike speed /
-# quality / mistake / robot_type / control_mode it does NOT participate in any
-# of the `metadata_drop_*_prob` dropout rolls.
+# when `emit_fps=True`, omitted entirely when `emit_fps=False` (the default).
+# Unlike speed / quality / mistake / robot_type / control_mode it does NOT
+# participate in any of the `metadata_drop_*_prob` dropout rolls.
 
 
 class TestFpsEmission:
     def test_fps_emitted_with_meta_fps_value(self):
-        ds = _DummyBaseDataset(num_cams=1, meta_fps=20)
+        ds = _DummyBaseDataset(num_cams=1, emit_fps=True, meta_fps=20)
         out = ds._to_standard_data_format(_full_raw_item(ds))
         assert out["fps"].dtype == torch.long
         assert out["fps"].item() == 20
         assert out["fps_is_pad"].item() is False
 
     def test_fps_emitted_as_torch_long_dtype(self):
-        ds = _DummyBaseDataset(num_cams=1, meta_fps=50)
+        ds = _DummyBaseDataset(num_cams=1, emit_fps=True, meta_fps=50)
         out = ds._to_standard_data_format(_full_raw_item(ds))
         assert out["fps"].dtype == torch.long
 
     def test_fps_omitted_when_emit_fps_false(self):
+        # The default — pre-PR behaviour preserved.
         ds = _DummyBaseDataset(num_cams=1, emit_fps=False, meta_fps=20)
+        out = ds._to_standard_data_format(_full_raw_item(ds))
+        assert "fps" not in out
+        assert "fps_is_pad" not in out
+
+    def test_fps_omitted_by_default(self):
+        """The fixture default mirrors production: ``emit_fps=False`` ⇒ no fps keys."""
+        ds = _DummyBaseDataset(num_cams=1, meta_fps=20)
         out = ds._to_standard_data_format(_full_raw_item(ds))
         assert "fps" not in out
         assert "fps_is_pad" not in out
@@ -728,6 +736,7 @@ class TestFpsEmission:
         # participate in `metadata_drop_*_prob` rolls.
         ds = _DummyBaseDataset(
             num_cams=1,
+            emit_fps=True,
             meta_fps=15,
             metadata_drop_all_prob=1.0,
             metadata_drop_each_prob=1.0,
@@ -747,6 +756,7 @@ class TestFpsEmission:
         # the same emit behavior — fps is gated by `emit_fps`, not by dropout.
         ds = _DummyBaseDataset(
             num_cams=1,
+            emit_fps=True,
             meta_fps=25,
             metadata_drop_all_prob=1.0,
             metadata_drop_each_prob=1.0,
@@ -762,8 +772,8 @@ class TestFpsEmission:
         tensor and `fps_is_pad` becomes a (B,) bool tensor."""
         from torch.utils.data import default_collate
 
-        ds_a = _DummyBaseDataset(num_cams=1, meta_fps=30)
-        ds_b = _DummyBaseDataset(num_cams=1, meta_fps=50)
+        ds_a = _DummyBaseDataset(num_cams=1, emit_fps=True, meta_fps=30)
+        ds_b = _DummyBaseDataset(num_cams=1, emit_fps=True, meta_fps=50)
         item_a = ds_a._to_standard_data_format(_full_raw_item(ds_a))
         item_b = ds_b._to_standard_data_format(_full_raw_item(ds_b))
         batch = default_collate([item_a, item_b])
@@ -779,7 +789,7 @@ class TestFpsEmission:
         different timing than the chunk actually carries.
         """
         # Dataset is natively 50 Hz, but the mixture pins everything to 30 Hz.
-        ds = _DummyBaseDataset(num_cams=1, meta_fps=50, action_freq=30.0)
+        ds = _DummyBaseDataset(num_cams=1, emit_fps=True, meta_fps=50, action_freq=30.0)
         out = ds._to_standard_data_format(_full_raw_item(ds))
         assert out["fps"].item() == 30
         assert out["fps_is_pad"].item() is False
@@ -787,7 +797,7 @@ class TestFpsEmission:
     def test_fps_reports_native_when_action_freq_none(self):
         """When `action_freq is None` (no resampling), the chunk runs at the
         dataset's native rate — that's what gets emitted."""
-        ds = _DummyBaseDataset(num_cams=1, meta_fps=50, action_freq=None)
+        ds = _DummyBaseDataset(num_cams=1, emit_fps=True, meta_fps=50, action_freq=None)
         out = ds._to_standard_data_format(_full_raw_item(ds))
         assert out["fps"].item() == 50
         assert out["fps_is_pad"].item() is False
@@ -797,8 +807,9 @@ class TestFpsEmission:
 # on the base class (and on ``VQADatasetMetadata``, which inherits via ``pass``).
 # `_emit_optional_keys` must catch that and emit ``fps=0, fps_is_pad=True``
 # instead of crashing on ``int(None)`` — otherwise any heterogeneous mixture
-# that includes a VQA dataset crashes at the first sample fetch under the
-# default ``emit_fps=True``.
+# with ``emit_fps=True`` crashes at the first VQA sample fetch. (Under the
+# default ``emit_fps=False`` the path is a no-op; these tests opt in to
+# exercise the heterogeneous-batch behaviour explicitly.)
 
 
 class TestFpsEmissionVQA:
@@ -819,7 +830,7 @@ class TestFpsEmissionVQA:
         """
         from opentau.datasets.lerobot_dataset import VQADatasetMetadata
 
-        ds = _DummyBaseDataset(num_cams=1)
+        ds = _DummyBaseDataset(num_cams=1, emit_fps=True)
         ds.meta = VQADatasetMetadata(info={"features": {}})
         out = ds._to_standard_data_format(_full_raw_item(ds))
         assert "fps" in out and "fps_is_pad" in out
@@ -833,7 +844,7 @@ class TestFpsEmissionVQA:
         ``action_freq`` would be misleading."""
         from opentau.datasets.lerobot_dataset import VQADatasetMetadata
 
-        ds = _DummyBaseDataset(num_cams=1, action_freq=30.0)
+        ds = _DummyBaseDataset(num_cams=1, emit_fps=True, action_freq=30.0)
         ds.meta = VQADatasetMetadata(info={"features": {}})
         out = ds._to_standard_data_format(_full_raw_item(ds))
         assert out["fps"].item() == 0
@@ -850,11 +861,11 @@ class TestFpsEmissionVQA:
         from opentau.datasets.lerobot_dataset import VQADatasetMetadata
 
         # LeRobot-shaped sample.
-        ds_vla = _DummyBaseDataset(num_cams=1, meta_fps=30)
+        ds_vla = _DummyBaseDataset(num_cams=1, emit_fps=True, meta_fps=30)
         item_vla = ds_vla._to_standard_data_format(_full_raw_item(ds_vla))
 
         # VQA-shaped sample (same dummy class, real VQA metadata).
-        ds_vqa = _DummyBaseDataset(num_cams=1)
+        ds_vqa = _DummyBaseDataset(num_cams=1, emit_fps=True)
         ds_vqa.meta = VQADatasetMetadata(info={"features": {}})
         item_vqa = ds_vqa._to_standard_data_format(_full_raw_item(ds_vqa))
 
