@@ -41,11 +41,16 @@ import os
 import uuid
 from collections import defaultdict
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from opentau.datasets.utils import load_jsonlines, write_jsonlines
 from opentau.utils.accelerate_utils import get_proc_accelerator
+
+if TYPE_CHECKING:
+    import datasets
+    import torch
 
 # Boundary percentiles, ascending. Length 10 by design: 11 buckets.
 SPEED_PERCENTILES: tuple[int, ...] = (5, 15, 25, 35, 45, 55, 65, 75, 85, 95)
@@ -140,9 +145,9 @@ def _group_lengths_by_task(
 
 
 def episode_to_task_index_from_hf_dataset(
-    hf_dataset,
+    hf_dataset: datasets.Dataset,
     episodes: list[int],
-    episode_data_index: dict[str, object],
+    episode_data_index: dict[str, torch.Tensor],
     epi2idx: dict[int, int],
     valid_task_indices: set[int],
 ) -> dict[int, int]:
@@ -247,15 +252,18 @@ def load_or_compute_speed_percentiles(
     compute the percentiles from ``episode_lengths`` and persist the
     file.
 
-    One-shot migration: when the on-disk file is missing rows for tasks
-    that *do* have resolved episodes in this load, the file is recomputed
-    (logged at INFO) and rewritten with the full task set. This recovers
-    datasets whose existing percentile file was written before
-    :func:`episode_to_task_index_from_hf_dataset` — those files only have
-    rows for the subset of tasks whose ``episodes.jsonl::tasks[0]`` string
-    happened to match ``tasks.jsonl``, so almost every episode bucketed to
-    ``SPARSE_TASK_BUCKET``. The recompute is a no-op once the file is
-    rewritten.
+    Append-only migration: when the on-disk file is missing rows for
+    tasks that *do* have resolved episodes in this load, percentiles are
+    computed for the missing tasks only and appended to the file (logged
+    at WARNING so the rewrite is visible). Existing rows are preserved
+    verbatim. This recovers datasets whose existing percentile file was
+    written before :func:`episode_to_task_index_from_hf_dataset` — those
+    files were missing rows for tasks whose ``episodes.jsonl::tasks[0]``
+    string didn't match ``tasks.jsonl``, so every episode of those tasks
+    bucketed to ``SPARSE_TASK_BUCKET``. The append-only design avoids
+    clobbering existing percentiles with subset-derived samples when the
+    current load is a mixture / subset; force a full recompute by
+    deleting the file.
 
     Distributed-safe: every rank computes the percentiles in-memory
     (the result is deterministic from the inputs), but only the main
@@ -307,9 +315,10 @@ def load_or_compute_speed_percentiles(
     # for every subsequent collective in the mixture-load loop — manifesting
     # as a NCCL hang at a much later (and entirely unrelated) sync point.
     try:
+        existing_rows: list[dict] = []
         if path.is_file():
-            rows = load_jsonlines(path)
-            on_disk_indices = {int(row["task_index"]) for row in rows}
+            existing_rows = load_jsonlines(path)
+            on_disk_indices = {int(row["task_index"]) for row in existing_rows}
             expected_indices = set(episode_to_task_index.values())
             missing = expected_indices - on_disk_indices
             if not missing:
@@ -324,7 +333,7 @@ def load_or_compute_speed_percentiles(
                     # than on-disk) are silent — the on-disk percentiles
                     # were computed from a larger, more robust sample, so
                     # using them is if anything an improvement.
-                    on_disk_total = sum(int(row.get("n_episodes", 0)) for row in rows)
+                    on_disk_total = sum(int(row.get("n_episodes", 0)) for row in existing_rows)
                     current_total = len(episode_to_task_index)
                     if on_disk_total < current_total:
                         logging.warning(
@@ -336,34 +345,49 @@ def load_or_compute_speed_percentiles(
                             on_disk_total,
                             current_total,
                         )
-                return {int(row["task_index"]): row["percentiles"] for row in rows}
+                return {int(row["task_index"]): row["percentiles"] for row in existing_rows}
 
+            # Append-only migration: compute percentiles for the *missing*
+            # tasks only, then merge with existing rows. Recomputing every
+            # task from the current load would clobber existing rows that
+            # were computed from a larger, more robust episode set when
+            # the current load is a subset (the dominant case for
+            # mixture training). The user can still force a full recompute
+            # by deleting the file.
             if is_main_or_solo:
-                logging.info(
-                    "Recomputing %s: on-disk file is missing %d task(s) that have resolved "
-                    "episodes in this load — likely written before the per-frame task_index "
-                    "fix. Rewriting with the full task set.",
-                    path,
+                logging.warning(
+                    "Adding %d missing task(s) %s to %s. Existing rows preserved; "
+                    "delete the file to force a full recompute.",
                     len(missing),
+                    sorted(missing),
+                    path,
                 )
-            # Fall through to the compute + write branch below.
+            task_indices_to_compute = missing
+        else:
+            # File doesn't exist — fresh compute over every resolved task.
+            task_indices_to_compute = set(episode_to_task_index.values())
 
-        by_task = _group_lengths_by_task(episode_lengths, episode_to_task_index)
+        # Compute percentiles for the target task set only.
+        by_task: dict[int, list[int]] = defaultdict(list)
+        for ep_idx, task_idx in episode_to_task_index.items():
+            if task_idx in task_indices_to_compute:
+                by_task[task_idx].append(episode_lengths[ep_idx])
         index_to_task = {idx: task for task, idx in task_to_task_index.items()}
-        percentiles = compute_task_percentiles(by_task)
-        rows = [
+        new_percentiles = compute_task_percentiles(dict(by_task))
+        new_rows = [
             {
                 "task_index": task_idx,
                 "task": index_to_task.get(task_idx, ""),
                 "n_episodes": len(by_task.get(task_idx, [])),
-                "percentiles": percentiles[task_idx],
+                "percentiles": new_percentiles[task_idx],
             }
-            for task_idx in sorted(percentiles)
+            for task_idx in sorted(new_percentiles)
         ]
+        rows_to_write = existing_rows + new_rows
 
         if is_main_or_solo:
             try:
-                _atomic_write_jsonlines(rows, path)
+                _atomic_write_jsonlines(rows_to_write, path)
             except (OSError, PermissionError) as e:
                 root_key = str(root)
                 if root_key not in _READONLY_WARNED:
@@ -375,7 +399,11 @@ def load_or_compute_speed_percentiles(
                         path,
                         e,
                     )
-        return percentiles
+
+        # Merge existing on-disk percentiles with newly-computed ones.
+        merged = {int(row["task_index"]): row["percentiles"] for row in existing_rows}
+        merged.update(new_percentiles)
+        return merged
     finally:
         if distributed:
             acc.wait_for_everyone()

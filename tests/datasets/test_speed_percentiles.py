@@ -539,13 +539,14 @@ class TestLoadOrComputeSpeedPercentiles:
         # `.get(missing_idx)` returns None → bucket 50.
         assert bucket_episode_length(123, out.get(99)) == SPARSE_TASK_BUCKET
 
-    def test_recompute_when_persisted_file_missing_tasks(self, tmp_path, caplog):
+    def test_migration_adds_missing_tasks_and_preserves_existing(self, tmp_path, caplog):
         # Simulates the state left by the pre-fix code: tasks.jsonl was
         # paraphrased relative to episodes.jsonl, the string-keyed lookup
         # only resolved a subset of tasks, and the resulting percentile
         # file is missing rows for every drifted task. The new loader
-        # detects the missing tasks against the (now correctly resolved)
-        # episode_to_task_index and recomputes.
+        # detects the missing tasks and *appends* fresh rows for them,
+        # leaving existing rows untouched (so subset loads don't clobber
+        # full-set percentiles).
         el, e2t, t2i = _fake_meta(
             {
                 "taskA": list(range(100, 200)),  # 100 episodes
@@ -555,44 +556,96 @@ class TestLoadOrComputeSpeedPercentiles:
         path = tmp_path / SPEED_PERCENTILES_PATH
         path.parent.mkdir(parents=True, exist_ok=True)
         # Pre-write a file with only taskA — taskB (task_index=1) is
-        # missing, simulating the buggy first-pass output.
-        bogus_percentiles = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+        # missing, simulating the buggy first-pass output. Use deliberately
+        # round percentiles that compute would never produce so we can
+        # tell whether they survived the migration.
+        sentinel_percentiles = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
         write_jsonlines(
             [
                 {
                     "task_index": 0,
                     "task": "taskA",
                     "n_episodes": 100,
-                    "percentiles": bogus_percentiles,
+                    "percentiles": sentinel_percentiles,
                 }
             ],
             path,
         )
 
-        with caplog.at_level("INFO"):
+        with caplog.at_level("WARNING"):
             out = load_or_compute_speed_percentiles(tmp_path, el, e2t, t2i)
 
-        # Both tasks now have percentiles — recompute ran.
+        # Both tasks present in the returned dict.
         assert set(out.keys()) == {0, 1}
-        assert out[0] is not None
+        # taskA's pre-existing sentinel percentiles are preserved — this
+        # is the key behavior the reviewer flagged. Recomputing would
+        # have replaced them with [108.95, ...] (np.percentile of 100..200).
+        assert out[0] == sentinel_percentiles
+        # taskB was computed fresh from the current load.
         assert out[1] is not None
-        # The bogus pre-existing percentiles were discarded by recompute.
-        assert out[0] != bogus_percentiles
-        # Info log fired with the expected migration message.
-        recompute_msgs = [
-            r.message for r in caplog.records if "Recomputing" in r.message and "missing 1" in r.message
-        ]
-        assert recompute_msgs, [r.message for r in caplog.records]
-        # The on-disk file was rewritten with both tasks.
+        # WARNING-level migration log fired with the expected text.
+        warn_msgs = [r.message for r in caplog.records if "Adding 1 missing task" in r.message]
+        assert warn_msgs, [r.message for r in caplog.records]
+        # The on-disk file now has both rows; taskA's row is unchanged.
         rows = load_jsonlines(path)
         assert {int(r["task_index"]) for r in rows} == {0, 1}
+        task_a_row = next(r for r in rows if r["task_index"] == 0)
+        assert task_a_row["percentiles"] == sentinel_percentiles
+        assert task_a_row["n_episodes"] == 100  # also preserved
 
-        # Second call takes the fast read path — no Recompute, no Stale.
+        # Second call takes the fast read path — no migration, no Stale.
         caplog.clear()
-        with caplog.at_level("INFO"):
+        with caplog.at_level("WARNING"):
             load_or_compute_speed_percentiles(tmp_path, el, e2t, t2i)
-        assert not any("Recomputing" in r.message for r in caplog.records)
+        assert not any("Adding" in r.message for r in caplog.records)
         assert not any("Stale" in r.message for r in caplog.records)
+
+    def test_migration_on_subset_load_does_not_clobber_existing(self, tmp_path, caplog):
+        # The scenario the reviewer pinned: a pre-fix file was written
+        # with full-dataset percentiles for taskA (n=100), but the new
+        # load is a 10% subset that resolves both taskA (subset n=10)
+        # *and* a previously-drifted taskB. The migration must add a
+        # taskB row from the subset, but the high-fidelity taskA
+        # percentiles must survive untouched — otherwise the next full
+        # load would inherit subset-sized samples for taskA.
+        full_lengths = list(range(100, 200))  # 100 distinct lengths
+        subset_lengths = full_lengths[:10]
+        full_el, full_e2t, t2i = _fake_meta({"taskA": full_lengths, "taskB": list(range(50, 150))})
+        # First write: full-dataset taskA only (taskB drifted under old code).
+        load_or_compute_speed_percentiles(
+            tmp_path,
+            {ep: full_lengths[ep] for ep in range(len(full_lengths))},
+            dict.fromkeys(range(len(full_lengths)), 0),
+            {"taskA": 0, "taskB": 1},
+        )
+        path = tmp_path / SPEED_PERCENTILES_PATH
+        full_task_a = next(r for r in load_jsonlines(path) if r["task_index"] == 0)["percentiles"]
+
+        # Now simulate a subset load that resolves both taskA and taskB.
+        subset_el = {}
+        subset_e2t = {}
+        next_ep = 0
+        for length in subset_lengths:
+            subset_el[next_ep] = length
+            subset_e2t[next_ep] = 0
+            next_ep += 1
+        for length in list(range(50, 60)):  # 10 subset episodes for taskB
+            subset_el[next_ep] = length
+            subset_e2t[next_ep] = 1
+            next_ep += 1
+
+        with caplog.at_level("WARNING"):
+            out = load_or_compute_speed_percentiles(tmp_path, subset_el, subset_e2t, t2i)
+
+        # taskA's full-dataset percentiles must survive.
+        assert out[0] == full_task_a, "subset-load migration clobbered full-dataset taskA percentiles"
+        # taskB row added (sparse because only 10 subset episodes).
+        assert 1 in out
+        # On-disk file has both, taskA row unchanged.
+        rows = load_jsonlines(path)
+        on_disk_task_a = next(r for r in rows if r["task_index"] == 0)
+        assert on_disk_task_a["percentiles"] == full_task_a
+        assert on_disk_task_a["n_episodes"] == len(full_lengths)
 
 
 class TestLiberoSnapshot:
