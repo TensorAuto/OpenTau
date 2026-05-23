@@ -38,8 +38,9 @@ Pipeline (all CPU):
        will see.
     3. Drain the weighted dataloader until ``--total-chunks`` action
        chunks have been collected; each batch yields chunks already
-       resampled to ``mixture.action_freq`` and right-padded to
-       ``max_action_dim``.
+       resampled to ``mixture.action_freq`` (or to each dataset's native
+       fps when ``action_freq is None`` -- mixed-frequency mixtures) and
+       right-padded to ``max_action_dim``.
     4. Min-max-normalize each chunk to ``[-1, 1]`` using
        ``mixture.meta.stats["actions"]`` -- the same min/max the policy
        will use at training via
@@ -191,8 +192,10 @@ def parse_args() -> argparse.Namespace:
             "standardization). Default: a hand-rolled equivalent that "
             "weight-allocates a budget per dataset, reads action+timestamp "
             "columns directly from parquet, and resamples to "
-            "mixture.action_freq via scipy.interp1d. Both paths respect "
-            "the mixture's weights and global FPS."
+            "mixture.action_freq via scipy.interp1d -- or to each dataset's "
+            "native fps when mixture.action_freq is None (mixed-frequency "
+            "mode). Both paths respect the mixture's weights and the same "
+            "fps convention."
         ),
     )
     p.add_argument(

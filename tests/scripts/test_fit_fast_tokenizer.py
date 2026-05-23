@@ -25,6 +25,8 @@ respect by substituting each dataset's native fps (same convention as
 
 from __future__ import annotations
 
+import numpy as np
+
 from opentau.configs.default import DatasetConfig
 from opentau.scripts.fit_fast_tokenizer import _sample_chunks_for_dataset_manual
 from tests.fixtures.constants import DEFAULT_FPS, DUMMY_REPO_ID
@@ -45,19 +47,21 @@ class TestSampleChunksManualActionFreq:
         cfg = DatasetConfig(repo_id=DUMMY_REPO_ID, root=str(root))
         return _sample_chunks_for_dataset_manual((0, cfg, n_chunks, chunk_size, action_freq, seed))
 
-    def test_none_action_freq_uses_native_fps(self, tmp_path, lerobot_dataset_factory):
-        """``action_freq=None`` substitutes ``meta.info['fps']`` per-dataset.
+    def test_none_action_freq_matches_explicit_native_fps(self, tmp_path, lerobot_dataset_factory):
+        """``action_freq=None`` produces the same chunks as ``action_freq=native_fps``.
 
-        With chunk_size=10 against a 30 fps synthetic dataset, the chunks
-        should match those returned when ``action_freq`` is explicitly
-        set to the native fps. They span the same wall-clock duration and
-        target the same native timestamps, so the BPE-corpus content is
-        equivalent under both call styles.
+        The substitution is the *only* difference between the two call
+        styles -- everything downstream of ``target_dt = 1.0 / action_freq``
+        is identical -- so on a single 30 fps dataset, with the same seed,
+        the two paths must yield byte-equivalent chunks. Re-using one root
+        (the worker is read-only on the dataset) keeps the comparison from
+        being polluted by any non-determinism in the factory's synthetic
+        data generation.
         """
         # Materialize a 30 fps synthetic dataset on disk via the shared
         # fixture; the worker later constructs a fresh ``LeRobotDatasetMetadata``
         # from ``root`` and reads the parquet directly.
-        root = tmp_path / "ds_none"
+        root = tmp_path / "ds"
         lerobot_dataset_factory(root=root, total_episodes=3, total_frames=150)
 
         idx_none, chunks_none, err_none = self._run(root, action_freq=None)
@@ -67,11 +71,12 @@ class TestSampleChunksManualActionFreq:
         for c in chunks_none:
             assert c.shape == (10, 6), f"unexpected chunk shape {c.shape}"
 
-        # Same seed + same effective action_freq must yield identical chunks.
-        # Use a separate root to keep the deterministic per-dataset rng split
-        # from being contaminated by any caching side-effects on the first call.
-        root2 = tmp_path / "ds_native"
-        lerobot_dataset_factory(root=root2, total_episodes=3, total_frames=150)
-        _, chunks_native, err_native = self._run(root2, action_freq=float(DEFAULT_FPS))
+        _, chunks_native, err_native = self._run(root, action_freq=float(DEFAULT_FPS))
         assert err_native is None
-        assert len(chunks_native) == 8
+        assert len(chunks_native) == len(chunks_none)
+        # ``assert_allclose`` (not ``assert_array_equal``) because the
+        # interpolator targets ``t0 + k*(1/fps)`` floats which are not
+        # bit-equal to the native timestamps for general ``t0``; the
+        # rounding error stays well below 1e-6 in float32.
+        for c_none, c_native in zip(chunks_none, chunks_native, strict=True):
+            np.testing.assert_allclose(c_none, c_native, rtol=1e-6, atol=1e-6)
