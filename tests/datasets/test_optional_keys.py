@@ -65,6 +65,7 @@ class _DummyBaseDataset(BaseDataset):
         metadata_drop_all_prob=0.0,
         metadata_drop_each_prob=0.0,
         emit_fps=True,
+        action_freq: float | None = None,
         meta_info: dict | None = None,
         meta_fps: int = 30,
     ):
@@ -82,6 +83,11 @@ class _DummyBaseDataset(BaseDataset):
         self.metadata_drop_all_prob = metadata_drop_all_prob
         self.metadata_drop_each_prob = metadata_drop_each_prob
         self.emit_fps = emit_fps
+        # Mirrors `BaseDataset._action_freq` (mixture-level `action_freq`).
+        # When set, `_emit_optional_keys` emits this value as the effective
+        # fps instead of `meta.fps` — matching the rate that
+        # `resolve_delta_timestamps` resampled the chunk to.
+        self._action_freq = action_freq
         self.enable_optional_key_dropout = True
         # Stub meta surface so _to_standard_data_format can read robot_type /
         # control_mode without instantiating a real LeRobotDatasetMetadata.
@@ -764,3 +770,24 @@ class TestFpsEmission:
         assert batch["fps"].dtype == torch.long
         assert batch["fps"].tolist() == [30, 50]
         assert batch["fps_is_pad"].tolist() == [False, False]
+
+    def test_fps_reports_action_freq_when_resampling(self):
+        """When the mixture sets `action_freq`, every chunk is nearest-neighbor
+        resampled to that rate by `resolve_delta_timestamps`. The emitted
+        `fps` must reflect the *effective* rate of the resampled chunk, not
+        the dataset's native rate — otherwise the prefix tells the model a
+        different timing than the chunk actually carries.
+        """
+        # Dataset is natively 50 Hz, but the mixture pins everything to 30 Hz.
+        ds = _DummyBaseDataset(num_cams=1, meta_fps=50, action_freq=30.0)
+        out = ds._to_standard_data_format(_full_raw_item(ds))
+        assert out["fps"].item() == 30
+        assert out["fps_is_pad"].item() is False
+
+    def test_fps_reports_native_when_action_freq_none(self):
+        """When `action_freq is None` (no resampling), the chunk runs at the
+        dataset's native rate — that's what gets emitted."""
+        ds = _DummyBaseDataset(num_cams=1, meta_fps=50, action_freq=None)
+        out = ds._to_standard_data_format(_full_raw_item(ds))
+        assert out["fps"].item() == 50
+        assert out["fps_is_pad"].item() is False

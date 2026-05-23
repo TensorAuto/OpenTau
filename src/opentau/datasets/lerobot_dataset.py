@@ -698,10 +698,12 @@ class BaseDataset(torch.utils.data.Dataset):
         self.response_drop_prob = dm.response_drop_prob if dm else 0.0
         self.metadata_drop_all_prob = dm.metadata_drop_all_prob if dm else 0.0
         self.metadata_drop_each_prob = dm.metadata_drop_each_prob if dm else 0.0
-        # Whether `_emit_optional_keys` injects the dataset's native `meta.fps`
-        # under the `fps` / `fps_is_pad` keys. Independent of the dropout rolls
-        # above — fps is intrinsic to the dataset, not a noisy label.
+        # `_emit_optional_keys` emits the *effective* per-sample fps when this
+        # is True: the mixture's `action_freq` if set (every dataset has been
+        # resampled to that rate via `resolve_delta_timestamps`), else the
+        # dataset's native `meta.fps`. Independent of the dropout rolls above.
         self.emit_fps = dm.emit_fps if dm else True
+        self._action_freq = dm.action_freq if dm else None
         # Whether the above drop rolls actually fire. `make_dataset` flips this
         # off on the validation subset (unless `val_enable_optional_key_dropout`
         # is set). Subgoal *frame* selection (end-of-segment vs. uniform window)
@@ -879,14 +881,16 @@ class BaseDataset(torch.utils.data.Dataset):
         pad signal — a consumer seeing ``""`` can assume the field was
         unavailable or was masked this step.
 
-        ``fps`` (the dataset's native frame rate) is emitted as a
-        ``torch.long`` scalar alongside ``fps_is_pad`` when
-        ``self.emit_fps`` is True. Unlike the other metadata fields, ``fps``
-        does **not** participate in the dropout rolls — it's an intrinsic
-        property of the dataset, not a noisy label — so it's always
-        non-padded when emitted. Set ``emit_fps=False`` on the mixture to
-        omit the keys entirely (the policy's ``prepare_metadata`` falls
-        through to its default-pad path).
+        ``fps`` (the *effective* per-sample frame rate — ``action_freq`` if
+        set on the mixture, else the dataset's native ``meta.fps``) is
+        emitted as a ``torch.long`` scalar alongside ``fps_is_pad`` when
+        ``self.emit_fps`` is True. Unlike the other metadata fields,
+        ``fps`` does **not** participate in the dropout rolls — it's an
+        intrinsic property of the (possibly resampled) chunk, not a noisy
+        label — so it's always non-padded when emitted. Set
+        ``emit_fps=False`` on the mixture to omit the keys entirely (the
+        policy's ``prepare_metadata`` falls through to its default-pad
+        path).
 
         Dropout order:
             1. ``history_state_drop_prob``: zero ``state`` and historical camera
@@ -989,10 +993,17 @@ class BaseDataset(torch.utils.data.Dataset):
             drop_this = drop_meta_all or _roll(self.metadata_drop_each_prob)
             standard_item[key] = "" if drop_this else val
 
-        # (6) Native fps: intrinsic dataset property, not a noisy label. Emitted
-        # unconditionally (no dropout) when `emit_fps` is enabled on the mixture.
+        # (6) Effective fps: the rate the action chunk actually runs at after
+        # any mixture-level resampling. When `action_freq` is set, every
+        # dataset's chunks are nearest-neighbor resampled to that rate by
+        # `resolve_delta_timestamps`, so tokenizing the dataset's native
+        # `meta.fps` would mislead the policy (the chunk timing differs).
+        # When `action_freq is None` (no resampling), the chunk runs at the
+        # dataset's native rate. Always non-pad (no dropout) when emit_fps
+        # is enabled on the mixture.
         if self.emit_fps:
-            standard_item["fps"] = torch.tensor(int(self.meta.fps), dtype=torch.long)
+            effective_fps = int(self._action_freq) if self._action_freq is not None else int(self.meta.fps)
+            standard_item["fps"] = torch.tensor(effective_fps, dtype=torch.long)
             standard_item["fps_is_pad"] = torch.tensor(False)
 
     def resize_with_pad(self, img, width, height, pad_value=0) -> torch.Tensor:
