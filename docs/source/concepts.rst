@@ -28,7 +28,7 @@ This class:
 *   Combines multiple ``LeRobotDataset`` and ``VQADataset`` instances.
 *   Different weights can be assigned to each dataset to control the sampling frequency; if weights are omitted (or set to ``null`` in JSON), weights default to dataset lengths.
 *   Aggregates statistics from all constituent datasets to ensure consistent normalization across the mixture.
-*   Resamples the action output frequency to match the action frequency specified in the configuration.
+*   Resamples the action output frequency to match the ``action_freq`` specified in the configuration. When ``action_freq`` is ``None`` (the default), resampling is disabled — each dataset is sampled at its native fps and a single batch can mix samples spanning different real-time horizons (set ``action_freq`` to a positive float to re-anchor every dataset to a common rate). The per-sample effective rate is surfaced via the ``fps`` standard-format key (see :ref:`standard-data-format-optional-keys`) so the policy can condition on it.
 
 Metadata
 ^^^^^^^^
@@ -130,6 +130,21 @@ Like ``speed``, ``mistake``, and ``quality``, they participate in the
 ``metadata_drop_all_prob`` / ``metadata_drop_each_prob`` dropout rolls —
 see :ref:`Training-time dropout <standard-data-format-optional-keys-dropout>`.
 
+``fps`` is the **effective per-sample frame rate** of the (possibly
+resampled) action chunk: ``DatasetMixtureConfig.action_freq`` when set,
+otherwise the dataset's native ``meta.fps``. Heterogeneous-frequency
+mixtures (``action_freq=None``) need it so the policy can condition on
+each sample's rate — a 30 Hz chunk and a 50 Hz chunk carry different
+real-time horizons even when both are ``chunk_size`` frames long. Unlike
+the other metadata fields, ``fps`` does **not** participate in the
+dropout rolls — it's an intrinsic property of the chunk, not a noisy
+label, so it's always non-pad when emitted. Emission is gated by
+``DatasetMixtureConfig.emit_fps`` (default ``True``); set it to
+``False`` to omit both ``fps`` and ``fps_is_pad`` from the sample dict
+(useful when resuming a checkpoint that was trained without fps
+conditioning, so the policy's metadata prefix doesn't gain an unfamiliar
+``FPS:`` segment).
+
 .. code-block:: python
 
     {
@@ -181,6 +196,19 @@ see :ref:`Training-time dropout <standard-data-format-optional-keys-dropout>`.
 
         "quality": torch.LongTensor,   # Scalar in {1,2,3,4,5}; episode-level quality score.
         "quality_is_pad": torch.BoolTensor,
+
+        "fps": torch.LongTensor,       # Scalar; effective per-sample frame rate of the action chunk.
+                                       # When `DatasetMixtureConfig.action_freq` is set, every dataset is
+                                       # resampled to that rate (via `resolve_delta_timestamps`) and `fps`
+                                       # reports `action_freq`. When `action_freq is None` (the default),
+                                       # the chunk runs at the dataset's native `meta.fps`. Gated by
+                                       # `DatasetMixtureConfig.emit_fps` (default `True`); the key is
+                                       # omitted entirely when `emit_fps=False`. Does NOT participate in
+                                       # `metadata_drop_*_prob` — fps is an intrinsic property of the
+                                       # chunk, not a noisy label.
+        "fps_is_pad": torch.BoolTensor,    # Always False when emitted (no dropout). Defaults to True only
+                                           # if a hand-built inference batch supplies `fps` without the
+                                           # paired flag — `prepare_metadata` then drops the segment.
 
         "subgoal0": torch.Tensor,       # shape (3, H, W), values in [0,1]. A single future frame from
                                         # camera0 sampled either at end-of-segment (with probability
