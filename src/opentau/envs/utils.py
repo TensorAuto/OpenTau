@@ -71,9 +71,21 @@ def preprocess_observation(np_observations: dict, cfg: TrainPipelineConfig) -> d
     return_observations["state"] = agent_pos
 
     batch_size = agent_pos.shape[0]
-    # add padding flags for cameras if needed
+    # Mirror training-time ``BaseDataset._standardize_images``: when the env exposes
+    # fewer cameras than the policy was trained with (e.g. LIBERO emits only
+    # ``camera0``/``camera1`` but the policy was trained with ``num_cams=4``),
+    # zero-fill the missing ``cameraN`` slots and flag them in ``img_is_pad``.
+    # Without this the eval batch has fewer image keys than any training batch,
+    # so the VLM sees a strictly shorter visual prefix than at training and
+    # ``Normalize`` prints a missing-key warning for every absent slot every step.
     if cfg.num_cams > 0:
-        return_observations["img_is_pad"] = torch.zeros((batch_size, cfg.num_cams), dtype=torch.bool)
+        img_is_pad = torch.zeros((batch_size, cfg.num_cams), dtype=torch.bool)
+        for i in range(cfg.num_cams):
+            key = f"camera{i}"
+            if key not in return_observations:
+                return_observations[key] = torch.zeros((batch_size, 3, *cfg.resolution), dtype=torch.float32)
+                img_is_pad[:, i] = True
+        return_observations["img_is_pad"] = img_is_pad
 
     # convert all floating point tensors to bfloat16 to save memory
     acc = get_proc_accelerator()

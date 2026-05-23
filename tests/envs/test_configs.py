@@ -21,6 +21,7 @@ import pytest
 
 from opentau.configs.types import FeatureType, PolicyFeature
 from opentau.envs.configs import EnvConfig, EnvMetadataConfig
+from opentau.envs.configs import LiberoEnv as LiberoEnvConfig
 
 
 class TestEnvConfig:
@@ -259,6 +260,59 @@ class TestEnvMetadataConfig:
     def test_control_mode_must_be_joint_or_ee(self, bad_mode):
         with pytest.raises(ValueError, match=r"control_mode must be one of"):
             EnvMetadataConfig(control_mode=bad_mode)
+
+
+class TestLiberoEnvNumCams:
+    """Pin the LIBERO ``num_cams`` field contract.
+
+    LIBERO exposes at most two cameras (``agentview_image`` + wrist
+    ``robot0_eye_in_hand_image``). The eval-time policy may have been
+    trained with a larger ``cfg.num_cams`` against a multi-domain mixture;
+    in that case ``preprocess_observation`` zero-fills the remaining slots,
+    so this field only constrains how many *real* LIBERO cameras to render
+    — not how many ``cameraN`` slots the policy sees.
+    """
+
+    def test_default_is_two_cams(self):
+        cfg = LiberoEnvConfig()
+        assert cfg.num_cams == 2
+        assert cfg.camera_name == "agentview_image,robot0_eye_in_hand_image"
+
+    def test_num_cams_one_auto_derives_camera_name(self):
+        """``num_cams=1`` with the default ``camera_name`` rewrites it to
+        ``"agentview_image"`` — users don't have to restate the camera list."""
+        cfg = LiberoEnvConfig(num_cams=1)
+        assert cfg.num_cams == 1
+        assert cfg.camera_name == "agentview_image"
+
+    def test_num_cams_one_with_explicit_one_cam_name(self):
+        cfg = LiberoEnvConfig(num_cams=1, camera_name="agentview_image")
+        assert cfg.num_cams == 1
+        assert cfg.camera_name == "agentview_image"
+
+    @pytest.mark.parametrize("bad", [0, 3, 4, -1])
+    def test_num_cams_out_of_range_raises(self, bad):
+        with pytest.raises(ValueError, match=r"num_cams must be 1 .* or 2"):
+            LiberoEnvConfig(num_cams=bad)
+
+    def test_default_two_cam_name_auto_collapses_when_num_cams_one(self):
+        """Setting ``num_cams=1`` while leaving ``camera_name`` at the 2-cam
+        default string (whether explicitly typed or just inherited) collapses
+        to the 1-cam name. Anything else is treated as a true mismatch and
+        raises — see the next test."""
+        cfg = LiberoEnvConfig(num_cams=1, camera_name="agentview_image,robot0_eye_in_hand_image")
+        assert cfg.camera_name == "agentview_image"
+
+    def test_inconsistent_non_default_camera_name_raises(self):
+        """A non-default 2-cam name with ``num_cams=1`` is a real mismatch —
+        the auto-rewrite only catches the exact default string, not arbitrary
+        2-cam pairs."""
+        with pytest.raises(ValueError, match=r"camera_name has 2 entries"):
+            LiberoEnvConfig(num_cams=1, camera_name="agentview_image,frontview_image")
+
+    def test_num_cams_two_with_one_cam_name_raises(self):
+        with pytest.raises(ValueError, match=r"camera_name has 1 entries"):
+            LiberoEnvConfig(num_cams=2, camera_name="agentview_image")
 
 
 class TestEnvConfigMetadataField:

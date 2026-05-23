@@ -18,6 +18,7 @@ import warnings
 from types import SimpleNamespace
 
 import gymnasium as gym
+import numpy as np
 import pytest
 import torch
 
@@ -26,6 +27,7 @@ from opentau.envs.utils import (
     add_eval_metadata,
     are_all_envs_same_type,
     check_env_attributes_and_types,
+    preprocess_observation,
 )
 
 
@@ -388,3 +390,98 @@ class TestAddEvalMetadata:
         # Existing user-set fields still flow.
         assert "speed" in obs
         assert obs["robot_type"] == ["UR5", "UR5"]
+
+
+class TestPreprocessObservationCameraPadding:
+    """Pin the train↔eval input parity contract for ``preprocess_observation``.
+
+    Training-time ``BaseDataset._standardize_images`` (in
+    ``opentau.datasets.lerobot_dataset``) always emits a ``num_cams``-wide
+    camera stack with zero-fill for missing slots and a matching
+    ``img_is_pad`` mask. Eval-time observations from an env that exposes
+    fewer cameras (e.g. LIBERO with 2 cameras while a checkpoint was
+    trained on a 4-camera mixture) must be padded the same way, otherwise
+    the VLM prefix at eval is strictly shorter than at any training step
+    and ``Normalize`` emits a missing-key warning every forward call.
+    """
+
+    @staticmethod
+    def _make_cfg(num_cams: int, resolution: tuple[int, int] = (224, 224), max_state_dim: int = 8):
+        return SimpleNamespace(
+            num_cams=num_cams,
+            resolution=resolution,
+            max_state_dim=max_state_dim,
+        )
+
+    @staticmethod
+    def _make_pixel_obs(
+        *,
+        batch_size: int = 2,
+        height: int = 224,
+        width: int = 224,
+        n_present_cams: int = 2,
+        state_dim: int = 8,
+    ) -> dict:
+        rng = np.random.default_rng(0)
+        pixels = {
+            f"camera{i}": rng.integers(0, 256, size=(batch_size, height, width, 3), dtype=np.uint8)
+            for i in range(n_present_cams)
+        }
+        agent_pos = np.zeros((batch_size, state_dim), dtype=np.float32)
+        return {"pixels": pixels, "agent_pos": agent_pos}
+
+    def test_missing_cameras_are_zero_filled(self):
+        """``num_cams=4`` with 2 present cameras → ``camera2``/``camera3``
+        are added as zero tensors and ``img_is_pad[:, 2:] == True``."""
+        cfg = self._make_cfg(num_cams=4)
+        obs = self._make_pixel_obs(batch_size=2, n_present_cams=2)
+        out = preprocess_observation(obs, cfg)
+
+        for i in range(4):
+            assert f"camera{i}" in out, f"camera{i} missing from preprocessed output"
+            assert out[f"camera{i}"].shape == (2, 3, 224, 224)
+
+        # Real cameras: derived from random uint8 input, so non-zero.
+        assert out["camera0"].float().abs().sum().item() > 0
+        assert out["camera1"].float().abs().sum().item() > 0
+        # Padded cameras: exactly zero.
+        assert out["camera2"].float().abs().sum().item() == 0
+        assert out["camera3"].float().abs().sum().item() == 0
+
+        expected_pad = torch.tensor(
+            [[False, False, True, True], [False, False, True, True]],
+            dtype=torch.bool,
+        )
+        assert torch.equal(out["img_is_pad"].cpu(), expected_pad)
+
+    def test_all_cameras_present_no_padding(self):
+        """``num_cams=2`` with 2 present cameras → no zero-fill, ``img_is_pad`` all False."""
+        cfg = self._make_cfg(num_cams=2)
+        out = preprocess_observation(self._make_pixel_obs(batch_size=3, n_present_cams=2), cfg)
+
+        assert {"camera0", "camera1"}.issubset(out)
+        assert "camera2" not in out
+        assert torch.equal(out["img_is_pad"].cpu(), torch.zeros((3, 2), dtype=torch.bool))
+
+    def test_img_is_pad_shape_matches_num_cams(self):
+        """``img_is_pad`` is always ``(B, num_cams)``; ``num_cams=4`` with 1
+        present camera → padded for slots 1/2/3."""
+        cfg = self._make_cfg(num_cams=4)
+        out = preprocess_observation(self._make_pixel_obs(batch_size=5, n_present_cams=1), cfg)
+
+        assert out["img_is_pad"].shape == (5, 4)
+        expected = torch.tensor([[False, True, True, True]] * 5, dtype=torch.bool)
+        assert torch.equal(out["img_is_pad"].cpu(), expected)
+
+    def test_zero_filled_camera_shape_uses_cfg_resolution(self):
+        """Zero-filled cameras use ``cfg.resolution``, not the env's raw HxW.
+        Mirrors the training contract where ``_standardize_images`` allocates
+        ``torch.zeros((3, *self.resolution))``."""
+        cfg = self._make_cfg(num_cams=3, resolution=(96, 128))
+        out = preprocess_observation(
+            self._make_pixel_obs(batch_size=2, height=240, width=320, n_present_cams=2),
+            cfg,
+        )
+
+        assert out["camera0"].shape == (2, 3, 96, 128)
+        assert out["camera2"].shape == (2, 3, 96, 128)

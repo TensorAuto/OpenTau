@@ -197,7 +197,16 @@ class LiberoEnv(EnvConfig):
         episode_length: Maximum length of each episode in steps.
         obs_type: Type of observations to use (e.g., ``"pixels_agent_pos"``).
         render_mode: Rendering mode for the environment (e.g., ``"rgb_array"``).
-        camera_name: Comma-separated names of cameras to use for rendering.
+        num_cams: Number of LIBERO cameras to expose at eval. Must be ``1``
+            (agentview only) or ``2`` (agentview + wrist eye-in-hand);
+            defaults to ``2``. When the underlying policy was trained with a
+            larger ``cfg.num_cams`` (e.g. a multi-domain mixture with 4 camera
+            slots), ``preprocess_observation`` zero-fills the remaining
+            ``cameraN`` slots so the train↔eval input structure stays aligned.
+        camera_name: Comma-separated names of LIBERO raw cameras to render.
+            Auto-derived from ``num_cams`` when unspecified (``num_cams=1`` →
+            ``"agentview_image"``, ``num_cams=2`` → ``"agentview_image,robot0_eye_in_hand_image"``).
+            If set explicitly it must contain exactly ``num_cams`` entries.
         init_states: Whether to initialize states randomly.
         camera_name_mapping: Optional mapping from camera names to standardized keys.
         features: Mapping from logical feature names to :class:`~opentau.configs.types.PolicyFeature` definitions.
@@ -210,6 +219,7 @@ class LiberoEnv(EnvConfig):
     episode_length: int = 520
     obs_type: str = "pixels_agent_pos"
     render_mode: str = "rgb_array"
+    num_cams: int = 2
     camera_name: str = "agentview_image,robot0_eye_in_hand_image"
     init_states: bool = True
     camera_name_mapping: dict[str, str] | None = None
@@ -228,6 +238,23 @@ class LiberoEnv(EnvConfig):
     )
 
     def __post_init__(self):
+        if self.num_cams not in (1, 2):
+            raise ValueError(
+                f"LIBERO env.num_cams must be 1 (agentview only) or 2 (agentview + wrist), "
+                f"got {self.num_cams}. LIBERO exposes at most two cameras."
+            )
+        # Auto-derive ``camera_name`` from ``num_cams`` when the user only set
+        # ``num_cams=1`` and left ``camera_name`` at the 2-cam default. Set both
+        # explicitly to use a non-default LIBERO camera pair.
+        if self.num_cams == 1 and self.camera_name == "agentview_image,robot0_eye_in_hand_image":
+            self.camera_name = "agentview_image"
+        n_in_name = len([c for c in self.camera_name.split(",") if c.strip()])
+        if n_in_name != self.num_cams:
+            raise ValueError(
+                f"LIBERO env: num_cams={self.num_cams} but camera_name has {n_in_name} "
+                f"entries ({self.camera_name!r}). Set them consistently."
+            )
+
         if self.fps <= 0:
             raise ValueError(
                 f"LIBERO env.fps (robosuite control frequency in Hz) must be positive, got {self.fps}"
