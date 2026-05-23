@@ -74,9 +74,10 @@ class TestSampleChunksManualActionFreq:
         _, chunks_native, err_native = self._run(root, action_freq=float(DEFAULT_FPS))
         assert err_native is None
         assert len(chunks_native) == len(chunks_none)
-        # ``assert_allclose`` (not ``assert_array_equal``) because the
-        # interpolator targets ``t0 + k*(1/fps)`` floats which are not
-        # bit-equal to the native timestamps for general ``t0``; the
-        # rounding error stays well below 1e-6 in float32.
+        # ``assert_array_equal`` (not ``assert_allclose``): empirically, with
+        # both calls hitting the same parquet and the same rng-seeded episode /
+        # start picks, the interp's target timestamps land on native frame
+        # boundaries closely enough that ``scipy.interpolate.interp1d`` returns
+        # bit-equal output. A future divergence would surface here immediately.
         for c_none, c_native in zip(chunks_none, chunks_native, strict=True):
-            np.testing.assert_allclose(c_none, c_native, rtol=1e-6, atol=1e-6)
+            np.testing.assert_array_equal(c_none, c_native)
