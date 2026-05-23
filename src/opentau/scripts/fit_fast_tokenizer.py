@@ -405,7 +405,7 @@ def _compute_budgets_weighted(mixture_cfg: DatasetMixtureConfig, total_chunks: i
 
 
 def _sample_chunks_for_dataset_manual(
-    args: tuple[int, Any, int, int, float, int],
+    args: tuple[int, Any, int, int, float | None, int],
 ) -> tuple[int, list[np.ndarray], str | None]:
     """Worker: sample ``n_chunks`` action chunks of shape ``(chunk_size, native_dim)``
     resampled to ``action_freq`` via ``scipy.interpolate.interp1d``.
@@ -414,6 +414,11 @@ def _sample_chunks_for_dataset_manual(
     overhead. The interp matches LeRobot's vector_resample_strategy="nearest"
     closely enough for tokenizer fitting (``kind="linear"`` here is actually
     slightly more accurate; we don't need the strict step-resample behavior).
+
+    When ``action_freq is None`` (mixed-frequency mixture), each dataset is
+    sampled at its own native fps -- mirrors ``factory.resolve_delta_timestamps``
+    substituting ``ds_meta.fps`` so the chunk is ``chunk_size`` consecutive
+    native frames and the interp lands exactly on native frame boundaries.
     """
     idx, cfg, n_chunks, chunk_size, action_freq, seed = args
     if n_chunks <= 0:
@@ -426,6 +431,8 @@ def _sample_chunks_for_dataset_manual(
 
         meta = LeRobotDatasetMetadata(cfg.repo_id, root=cfg.root, revision=cfg.revision)
         native_fps = float(meta.info["fps"])
+        if action_freq is None:
+            action_freq = native_fps
         target_dt = 1.0 / action_freq
         chunk_duration = (chunk_size - 1) * target_dt  # seconds spanned by a chunk
         # Need at least ceil(chunk_duration * native_fps) + 1 native frames per chunk.
@@ -513,7 +520,7 @@ def _sample_via_manual(
     mixture_cfg: DatasetMixtureConfig,
     total_chunks: int,
     chunk_size: int,
-    action_freq: float,
+    action_freq: float | None,
     seed: int,
     num_workers: int,
 ) -> tuple[list[np.ndarray], list[int], dict[int, str]]:
@@ -1016,10 +1023,12 @@ def main() -> int:
     logger.info("Parsing mixture JSON: %s", args.mixture_json)
     mixture_cfg, mixture_hash = _parse_mixture(args.mixture_json)
     logger.info(
-        "Mixture has %d datasets (hash=%s); action_freq=%g",
+        "Mixture has %d datasets (hash=%s); action_freq=%s",
         len(mixture_cfg.datasets),
         mixture_hash[:12],
-        mixture_cfg.action_freq,
+        "None (mixed-frequency, per-dataset native fps)"
+        if mixture_cfg.action_freq is None
+        else f"{mixture_cfg.action_freq:g}",
     )
 
     # --- Phase 2: build mixture & gather chunks ---
@@ -1077,7 +1086,7 @@ def main() -> int:
             mixture_cfg,
             args.total_chunks,
             args.chunk_size,
-            float(mixture_cfg.action_freq),
+            mixture_cfg.action_freq,
             args.seed,
             args.num_workers,
         )
