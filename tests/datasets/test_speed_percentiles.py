@@ -381,18 +381,40 @@ class TestLoadOrComputeSpeedPercentiles:
         # And the bucket lookup falls back to SPARSE_TASK_BUCKET.
         assert bucket_episode_length(42, out2[0]) == SPARSE_TASK_BUCKET
 
-    def test_stale_file_logs_warning_but_still_used(self, tmp_path, caplog):
+    def test_stale_warning_fires_when_episodes_appended(self, tmp_path, caplog):
         # First write: 100 episodes for taskA.
         el, e2t, t2i = _fake_meta({"taskA": list(range(100, 200))})
         load_or_compute_speed_percentiles(tmp_path, el, e2t, t2i)
 
-        # Second load with a different episode count — file should still
-        # be used, but a WARNING fires.
+        # Second load has *more* episodes for the same task — the on-disk
+        # percentiles were computed from fewer episodes than the current
+        # load is using (genuine staleness: new data was appended). File
+        # is still trusted, but a WARNING fires so the user knows the
+        # percentile distribution may not reflect the current dataset.
         el2, e2t2, t2i2 = _fake_meta({"taskA": list(range(100, 250))})  # 150 episodes
         with caplog.at_level("WARNING"):
             out = load_or_compute_speed_percentiles(tmp_path, el2, e2t2, t2i2)
         assert out[0] is not None
         assert any("Stale" in rec.message and "speed_percentiles" in rec.message for rec in caplog.records), [
+            rec.message for rec in caplog.records
+        ]
+
+    def test_no_stale_warning_for_subset_load(self, tmp_path, caplog):
+        # First write: 150 episodes for taskA.
+        el, e2t, t2i = _fake_meta({"taskA": list(range(100, 250))})
+        load_or_compute_speed_percentiles(tmp_path, el, e2t, t2i)
+
+        # Second load is a subset — current has *fewer* episodes than
+        # the on-disk file was computed from. This is the dominant case
+        # for heterogeneous mixture training (a 10% mix loads ~45 of
+        # 457 episodes per dataset). The on-disk percentiles are
+        # already a more robust sample than a recompute on the subset
+        # would produce, so no warning fires.
+        el2, e2t2, t2i2 = _fake_meta({"taskA": list(range(100, 150))})  # 50 episodes
+        with caplog.at_level("WARNING"):
+            out = load_or_compute_speed_percentiles(tmp_path, el2, e2t2, t2i2)
+        assert out[0] is not None
+        assert not any("Stale" in rec.message for rec in caplog.records), [
             rec.message for rec in caplog.records
         ]
 
@@ -402,6 +424,45 @@ class TestLoadOrComputeSpeedPercentiles:
         with caplog.at_level("WARNING"):
             load_or_compute_speed_percentiles(tmp_path, el, e2t, t2i)
         assert not any("Stale" in rec.message for rec in caplog.records)
+
+    def test_clean_regeneration_after_file_deletion(self, tmp_path, caplog):
+        # Workflow: user deletes meta/speed_percentiles.jsonl across the
+        # mixture and lets the next run rebuild it from scratch. After
+        # deletion, the loader must take the compute path, write a fresh
+        # file based on whatever the current load can resolve, and not
+        # log spurious staleness or migration warnings on this run or
+        # the next.
+        el, e2t, t2i = _fake_meta({"taskA": list(range(100, 200)), "taskB": list(range(50, 150))})
+        path = tmp_path / SPEED_PERCENTILES_PATH
+
+        # Initial write.
+        load_or_compute_speed_percentiles(tmp_path, el, e2t, t2i)
+        assert path.is_file()
+
+        # Simulate the user's "rm meta/speed_percentiles.jsonl" step.
+        path.unlink()
+
+        caplog.clear()
+        with caplog.at_level("INFO"):
+            out = load_or_compute_speed_percentiles(tmp_path, el, e2t, t2i)
+
+        # File was regenerated.
+        assert path.is_file()
+        # Both tasks present with valid percentiles.
+        assert set(out.keys()) == {0, 1}
+        assert all(out[k] is not None and len(out[k]) == 10 for k in out)
+        # No noise: no Recomputing-migration log, no Stale warning.
+        assert not any("Recomputing" in r.message for r in caplog.records), [
+            r.message for r in caplog.records
+        ]
+        assert not any("Stale" in r.message for r in caplog.records), [r.message for r in caplog.records]
+
+        # And the regenerated file is self-consistent on the next load.
+        caplog.clear()
+        with caplog.at_level("INFO"):
+            out2 = load_or_compute_speed_percentiles(tmp_path, el, e2t, t2i)
+        assert out2 == out
+        assert not any("Recomputing" in r.message or "Stale" in r.message for r in caplog.records)
 
     def test_concurrent_writes_produce_valid_file(self, tmp_path):
         # Multiple threads racing on the same root must not corrupt the

@@ -239,10 +239,13 @@ def load_or_compute_speed_percentiles(
 
     If ``root / meta/speed_percentiles.jsonl`` already exists, load it
     verbatim — staleness is accepted by design (a WARNING is logged when
-    the on-disk per-task ``n_episodes`` total disagrees with the current
-    load, but the file is still trusted; delete it to force a recompute).
-    Otherwise compute the percentiles from ``episode_lengths`` and
-    persist the file.
+    the on-disk file was computed from *fewer* episodes than the current
+    load is using, i.e. episodes were appended since; subset loads, where
+    the current load uses fewer episodes than on-disk, are silent because
+    the on-disk percentiles are a more robust sample). The file is
+    trusted in both cases — delete it to force a recompute. Otherwise
+    compute the percentiles from ``episode_lengths`` and persist the
+    file.
 
     One-shot migration: when the on-disk file is missing rows for tasks
     that *do* have resolved episodes in this load, the file is recomputed
@@ -311,15 +314,24 @@ def load_or_compute_speed_percentiles(
             missing = expected_indices - on_disk_indices
             if not missing:
                 if is_main_or_solo:
-                    # `episode_to_task_index` already drops episodes that couldn't
-                    # be resolved, so its length is the per-task episode count we
-                    # want to compare against the on-disk sum.
+                    # ``episode_to_task_index`` covers only episodes that
+                    # were both (a) resolved by the per-frame ``task_index``
+                    # lookup and (b) selected for this load. The directional
+                    # check below warns only when the current load has *more*
+                    # episodes than the on-disk file was computed from
+                    # (i.e. episodes were appended since the file was
+                    # written). Subset loads (current uses fewer episodes
+                    # than on-disk) are silent — the on-disk percentiles
+                    # were computed from a larger, more robust sample, so
+                    # using them is if anything an improvement.
                     on_disk_total = sum(int(row.get("n_episodes", 0)) for row in rows)
                     current_total = len(episode_to_task_index)
-                    if on_disk_total != current_total:
+                    if on_disk_total < current_total:
                         logging.warning(
-                            "Stale %s: on-disk per-task n_episodes sums to %d, current load has %d. "
-                            "Using on-disk percentiles as-is; delete the file to force recompute.",
+                            "Stale %s: on-disk percentiles were computed from %d episodes, "
+                            "but current load has %d. New episodes may have been appended "
+                            "since the file was written. Using on-disk percentiles as-is; "
+                            "delete the file to force recompute.",
                             path,
                             on_disk_total,
                             current_total,
