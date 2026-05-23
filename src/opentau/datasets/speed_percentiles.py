@@ -68,10 +68,11 @@ SPARSE_TASK_BUCKET = 50
 # ``_CONTROL_MODE_WARNED`` pattern in ``lerobot_dataset.py``.
 _READONLY_WARNED: set[str] = set()
 
-# Module-level set of unresolved episode task labels we've already warned
-# about, so episodes.jsonl / tasks.jsonl drift in a dataset only logs once
-# per distinct bad label per process instead of once per episode per rank.
-_UNRESOLVED_TASK_WARNED: set[str] = set()
+# Module-level set of unknown per-frame ``task_index`` integers we've
+# already warned about. Keyed by the integer index, so a corrupt parquet
+# pointing many episodes at a missing index logs once per distinct index
+# per process instead of once per episode per rank.
+_UNKNOWN_TASK_INDEX_WARNED: set[int] = set()
 
 
 def compute_task_percentiles(
@@ -138,44 +139,64 @@ def _group_lengths_by_task(
     return dict(by_task)
 
 
-def episode_to_task_index_from_episodes(
-    episodes: dict[int, dict],
-    task_to_task_index: dict[str, int],
+def episode_to_task_index_from_hf_dataset(
+    hf_dataset,
+    episodes: list[int],
+    episode_data_index: dict[str, object],
+    epi2idx: dict[int, int],
+    valid_task_indices: set[int],
 ) -> dict[int, int]:
-    """Build ``{ep_idx: task_idx}`` from ``meta/episodes.jsonl`` entries.
+    """Build ``{ep_idx: task_idx}`` by reading the per-frame parquet.
 
-    Episodes whose ``tasks`` field is a multi-element list silently use
-    ``tasks[0]`` — the codebase assumes an N-to-1 episode-to-task
-    relationship even though the field is structurally a list. Episodes
-    with an empty / missing ``tasks`` list are skipped.
+    Each row of the per-episode parquet carries an authoritative integer
+    ``task_index`` column (written by :meth:`LeRobotDataset._save_episode_table`
+    and consumed by :meth:`LeRobotDataset.__getitem__`). Resolving the
+    per-episode task this way bypasses any drift between
+    ``episodes.jsonl::tasks[0]`` (a string) and ``tasks.jsonl::task`` (the
+    string keyed by ``task_index``) — a paraphrased ``tasks.jsonl`` no
+    longer breaks the lookup.
 
-    Episodes whose ``tasks[0]`` is absent from ``task_to_task_index`` are
-    also skipped (with a deduped warning) rather than raising. This guards
-    against ``episodes.jsonl`` / ``tasks.jsonl`` drift in dataset metadata
-    — a `tasks.jsonl` with stale/incomplete entries, or an
-    ``episodes.jsonl`` that stores integer task indices instead of task
-    strings. Skipped episodes are still trained on; they just fall back to
-    ``SPARSE_TASK_BUCKET`` in the downstream speed-bucket lookup, which
-    already tolerates a missing ``episode_to_task_index`` entry.
+    Only the *first* row of each episode is read; the parquet's
+    ``task_index`` is constant within an episode by construction.
+
+    Episodes whose resolved ``task_index`` is not present in
+    ``valid_task_indices`` (i.e. the index points to a task that ``tasks.jsonl``
+    doesn't define — genuine metadata corruption, not paraphrasing) are
+    skipped with a deduped WARNING. Skipped episodes are still trained on;
+    they just fall back to ``SPARSE_TASK_BUCKET`` in the downstream
+    speed-bucket lookup, which already tolerates a missing
+    ``episode_to_task_index`` entry.
+
+    Args:
+        hf_dataset: The dataset's per-frame HF ``Dataset`` (parquet-backed).
+        episodes: Selected episode indices (the dataset's ``self.episodes``).
+        episode_data_index: ``{"from": Tensor, "to": Tensor}`` giving the
+            start/end row in ``hf_dataset`` for each selected episode.
+        epi2idx: Maps ``episode_index`` to its position in
+            ``episode_data_index["from"]``.
+        valid_task_indices: All ``task_index`` values defined in
+            ``tasks.jsonl`` (i.e. ``set(meta.task_to_task_index.values())``).
+            Used solely to detect parquet rows that point at a task the
+            metadata doesn't know about.
     """
+    if not episodes:
+        return {}
+    start_indices = [int(episode_data_index["from"][epi2idx[ep]].item()) for ep in episodes]
+    task_indices = hf_dataset.with_format("arrow").select(start_indices)["task_index"].to_pylist()
     out: dict[int, int] = {}
-    for ep_idx, ep_info in episodes.items():
-        tasks = ep_info.get("tasks") or []
-        if not tasks:
-            continue
-        task_idx = task_to_task_index.get(tasks[0])
-        if task_idx is None:
-            key = str(tasks[0])
-            if key not in _UNRESOLVED_TASK_WARNED:
-                _UNRESOLVED_TASK_WARNED.add(key)
+    for ep, task_idx in zip(episodes, task_indices, strict=True):
+        task_idx = int(task_idx)
+        if task_idx not in valid_task_indices:
+            if task_idx not in _UNKNOWN_TASK_INDEX_WARNED:
+                _UNKNOWN_TASK_INDEX_WARNED.add(task_idx)
                 logging.warning(
-                    "Episode task label %r is not present in tasks.jsonl; episode(s) "
-                    "using it fall back to the sparse speed bucket. This indicates "
-                    "episodes.jsonl / tasks.jsonl drift in the dataset metadata.",
-                    tasks[0],
+                    "Episode parquet rows reference task_index=%d which is not defined "
+                    "in tasks.jsonl; episode(s) using it fall back to the sparse speed "
+                    "bucket. This indicates corrupt dataset metadata.",
+                    task_idx,
                 )
             continue
-        out[ep_idx] = task_idx
+        out[ep] = task_idx
     return out
 
 
@@ -208,37 +229,6 @@ def _atomic_write_jsonlines(rows: list[dict], path: Path) -> None:
                 tmp_path.unlink()
 
 
-def _read_persisted(
-    path: Path,
-    current_total: int,
-    *,
-    warn: bool,
-) -> dict[int, list[float] | None]:
-    """Load the percentile file and warn if its episode total is stale.
-
-    A mismatch between the sum of on-disk ``n_episodes`` and the current
-    load's episode total means episodes were added (or filtered) since
-    the file was first written. Per spec the file is still trusted —
-    the warning is just to cut debugging time when a small-N first run
-    accidentally freezes the percentile distribution.
-
-    ``warn`` is gated by the caller (typically ``acc.is_main_process``)
-    so an 8-rank run produces a single warning line, not eight.
-    """
-    rows = load_jsonlines(path)
-    if warn:
-        on_disk_total = sum(int(row.get("n_episodes", 0)) for row in rows)
-        if on_disk_total != current_total:
-            logging.warning(
-                "Stale %s: on-disk per-task n_episodes sums to %d, current load has %d. "
-                "Using on-disk percentiles as-is; delete the file to force recompute.",
-                path,
-                on_disk_total,
-                current_total,
-            )
-    return {int(row["task_index"]): row["percentiles"] for row in rows}
-
-
 def load_or_compute_speed_percentiles(
     root: Path,
     episode_lengths: dict[int, int],
@@ -253,6 +243,16 @@ def load_or_compute_speed_percentiles(
     load, but the file is still trusted; delete it to force a recompute).
     Otherwise compute the percentiles from ``episode_lengths`` and
     persist the file.
+
+    One-shot migration: when the on-disk file is missing rows for tasks
+    that *do* have resolved episodes in this load, the file is recomputed
+    (logged at INFO) and rewritten with the full task set. This recovers
+    datasets whose existing percentile file was written before
+    :func:`episode_to_task_index_from_hf_dataset` — those files only have
+    rows for the subset of tasks whose ``episodes.jsonl::tasks[0]`` string
+    happened to match ``tasks.jsonl``, so almost every episode bucketed to
+    ``SPARSE_TASK_BUCKET``. The recompute is a no-op once the file is
+    rewritten.
 
     Distributed-safe: every rank computes the percentiles in-memory
     (the result is deterministic from the inputs), but only the main
@@ -282,7 +282,7 @@ def load_or_compute_speed_percentiles(
             ``LeRobotDataset.episode_lengths`` so the percentile compute
             and the per-episode bucket pre-fill share one source.
         episode_to_task_index: ``{ep_idx: task_idx}`` — typically built
-            via :func:`episode_to_task_index_from_episodes`.
+            via :func:`episode_to_task_index_from_hf_dataset`.
         task_to_task_index: ``{task_string: task_index}`` — used only to
             denormalize the task string into each row for human
             inspection.
@@ -305,10 +305,36 @@ def load_or_compute_speed_percentiles(
     # as a NCCL hang at a much later (and entirely unrelated) sync point.
     try:
         if path.is_file():
-            # `episode_to_task_index` already drops episodes with empty tasks,
-            # so its length is the per-task episode count we want to compare
-            # against the on-disk sum.
-            return _read_persisted(path, len(episode_to_task_index), warn=is_main_or_solo)
+            rows = load_jsonlines(path)
+            on_disk_indices = {int(row["task_index"]) for row in rows}
+            expected_indices = set(episode_to_task_index.values())
+            missing = expected_indices - on_disk_indices
+            if not missing:
+                if is_main_or_solo:
+                    # `episode_to_task_index` already drops episodes that couldn't
+                    # be resolved, so its length is the per-task episode count we
+                    # want to compare against the on-disk sum.
+                    on_disk_total = sum(int(row.get("n_episodes", 0)) for row in rows)
+                    current_total = len(episode_to_task_index)
+                    if on_disk_total != current_total:
+                        logging.warning(
+                            "Stale %s: on-disk per-task n_episodes sums to %d, current load has %d. "
+                            "Using on-disk percentiles as-is; delete the file to force recompute.",
+                            path,
+                            on_disk_total,
+                            current_total,
+                        )
+                return {int(row["task_index"]): row["percentiles"] for row in rows}
+
+            if is_main_or_solo:
+                logging.info(
+                    "Recomputing %s: on-disk file is missing %d task(s) that have resolved "
+                    "episodes in this load — likely written before the per-frame task_index "
+                    "fix. Rewriting with the full task set.",
+                    path,
+                    len(missing),
+                )
+            # Fall through to the compute + write branch below.
 
         by_task = _group_lengths_by_task(episode_lengths, episode_to_task_index)
         index_to_task = {idx: task for task, idx in task_to_task_index.items()}

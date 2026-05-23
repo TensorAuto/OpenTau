@@ -36,7 +36,7 @@ from opentau.datasets.speed_percentiles import (
     SPEED_PERCENTILES_PATH,
     bucket_episode_length,
     compute_task_percentiles,
-    episode_to_task_index_from_episodes,
+    episode_to_task_index_from_hf_dataset,
     load_or_compute_speed_percentiles,
 )
 from opentau.datasets.utils import load_jsonlines, write_jsonlines
@@ -49,16 +49,56 @@ def _fake_meta(task_to_lengths: dict[str, list[int]]):
     — the same triple a real ``LeRobotDataset.__init__`` would assemble.
     """
     episode_lengths: dict[int, int] = {}
-    episodes: dict[int, dict] = {}
+    e2t: dict[int, int] = {}
     task_to_task_index = {task: i for i, task in enumerate(task_to_lengths)}
     next_ep = 0
     for task, lengths in task_to_lengths.items():
         for length in lengths:
             episode_lengths[next_ep] = length
-            episodes[next_ep] = {"episode_index": next_ep, "tasks": [task], "length": length}
+            e2t[next_ep] = task_to_task_index[task]
             next_ep += 1
-    e2t = episode_to_task_index_from_episodes(episodes, task_to_task_index)
     return episode_lengths, e2t, task_to_task_index
+
+
+def _fake_hf_dataset(per_episode_data: list[tuple[int, int, int]]):
+    """Build a fake hf_dataset + episode_data_index + epi2idx.
+
+    Args:
+        per_episode_data: list of ``(episode_index, length, task_index)`` tuples,
+            one per episode, in the order they should appear in the parquet.
+
+    Returns ``(hf_dataset, episodes, episode_data_index, epi2idx)`` — the same
+    four objects that ``LeRobotDataset.__init__`` passes to
+    :func:`episode_to_task_index_from_hf_dataset`.
+    """
+    import torch
+    from datasets import Dataset
+
+    task_indices_col: list[int] = []
+    episode_index_col: list[int] = []
+    starts: list[int] = []
+    ends: list[int] = []
+    epi2idx: dict[int, int] = {}
+    pos = 0
+    for i, (ep, length, task_idx) in enumerate(per_episode_data):
+        starts.append(pos)
+        task_indices_col.extend([task_idx] * length)
+        episode_index_col.extend([ep] * length)
+        pos += length
+        ends.append(pos)
+        epi2idx[ep] = i
+    ds = Dataset.from_dict(
+        {
+            "task_index": task_indices_col,
+            "episode_index": episode_index_col,
+        }
+    )
+    episode_data_index = {
+        "from": torch.tensor(starts),
+        "to": torch.tensor(ends),
+    }
+    episodes = [ep for ep, _, _ in per_episode_data]
+    return ds, episodes, episode_data_index, epi2idx
 
 
 class TestComputeTaskPercentiles:
@@ -103,39 +143,121 @@ class TestComputeTaskPercentiles:
         assert out[2] is None
 
 
-class TestEpisodeToTaskIndex:
-    def test_single_task_episodes(self):
-        episodes = {
-            0: {"tasks": ["taskA"], "length": 100},
-            1: {"tasks": ["taskB"], "length": 200},
-        }
-        t2i = {"taskA": 0, "taskB": 1}
-        assert episode_to_task_index_from_episodes(episodes, t2i) == {0: 0, 1: 1}
+class TestEpisodeToTaskIndexFromHfDataset:
+    """Pin the parquet-keyed lookup that replaced the old string-keyed one.
 
-    def test_multi_task_uses_first(self):
-        episodes = {0: {"tasks": ["taskA", "taskB"], "length": 100}}
-        t2i = {"taskA": 0, "taskB": 1}
-        assert episode_to_task_index_from_episodes(episodes, t2i) == {0: 0}
+    The previous implementation matched ``episodes.jsonl::tasks[0]`` against
+    ``tasks.jsonl::task``; any paraphrase in either file broke the match
+    and forced every affected episode to ``SPARSE_TASK_BUCKET``. The new
+    implementation reads the authoritative integer ``task_index`` from the
+    per-frame parquet, so paraphrases are inert and the warning fires only
+    when the parquet itself references an index that ``tasks.jsonl``
+    doesn't define (genuine metadata corruption).
+    """
 
-    def test_empty_tasks_skipped(self):
-        episodes = {
-            0: {"tasks": [], "length": 100},
-            1: {"length": 200},
-            2: {"tasks": ["taskA"], "length": 300},
-        }
-        t2i = {"taskA": 0}
-        assert episode_to_task_index_from_episodes(episodes, t2i) == {2: 0}
+    @pytest.fixture(autouse=True)
+    def _reset_warn_cache(self, monkeypatch):
+        # The dedup set is module-level, so without reset a test that warns
+        # would suppress the warning in the next test for the same index.
+        from opentau.datasets import speed_percentiles as sp
 
-    def test_unresolvable_task_label_skipped(self):
-        # A task label absent from task_to_task_index (episodes.jsonl /
-        # tasks.jsonl drift) is skipped, not raised on; resolvable episodes
-        # in the same dataset still come through.
-        episodes = {
-            0: {"tasks": ["ghost"], "length": 100},
-            1: {"tasks": ["taskA"], "length": 200},
-        }
-        t2i = {"taskA": 0}
-        assert episode_to_task_index_from_episodes(episodes, t2i) == {1: 0}
+        monkeypatch.setattr(sp, "_UNKNOWN_TASK_INDEX_WARNED", set())
+
+    def test_happy_path_resolves_every_episode(self):
+        ds, episodes, edi, epi2idx = _fake_hf_dataset(
+            [
+                (0, 50, 0),
+                (1, 100, 1),
+                (2, 75, 0),
+            ]
+        )
+        out = episode_to_task_index_from_hf_dataset(
+            hf_dataset=ds,
+            episodes=episodes,
+            episode_data_index=edi,
+            epi2idx=epi2idx,
+            valid_task_indices={0, 1},
+        )
+        assert out == {0: 0, 1: 1, 2: 0}
+
+    def test_unknown_task_index_skipped_with_warning(self, caplog):
+        # Episode 1 points at task_index=99 which isn't in tasks.jsonl
+        # (valid_task_indices). It's dropped; resolvable episodes pass.
+        ds, episodes, edi, epi2idx = _fake_hf_dataset(
+            [
+                (0, 50, 0),
+                (1, 100, 99),
+                (2, 75, 0),
+            ]
+        )
+        with caplog.at_level("WARNING"):
+            out = episode_to_task_index_from_hf_dataset(
+                hf_dataset=ds,
+                episodes=episodes,
+                episode_data_index=edi,
+                epi2idx=epi2idx,
+                valid_task_indices={0, 1},
+            )
+        assert out == {0: 0, 2: 0}
+        bad_msgs = [r.message for r in caplog.records if "task_index=99" in r.message]
+        assert len(bad_msgs) == 1
+
+    def test_repeated_unknown_index_dedupes_warning(self, caplog):
+        # Three episodes all reference the same bad index — the deduper
+        # collapses to a single warning per distinct index per process.
+        ds, episodes, edi, epi2idx = _fake_hf_dataset(
+            [
+                (0, 50, 99),
+                (1, 100, 99),
+                (2, 75, 99),
+            ]
+        )
+        with caplog.at_level("WARNING"):
+            out = episode_to_task_index_from_hf_dataset(
+                hf_dataset=ds,
+                episodes=episodes,
+                episode_data_index=edi,
+                epi2idx=epi2idx,
+                valid_task_indices={0, 1},
+            )
+        assert out == {}
+        bad_msgs = [r.message for r in caplog.records if "task_index=99" in r.message]
+        assert len(bad_msgs) == 1
+
+    def test_empty_episodes_returns_empty_without_touching_dataset(self):
+        # When no episodes are selected, the function must not even peek
+        # at the dataset — important for tiny / lazy hf_dataset stubs.
+        ds, _, edi, epi2idx = _fake_hf_dataset([(0, 50, 0)])
+        out = episode_to_task_index_from_hf_dataset(
+            hf_dataset=ds,
+            episodes=[],
+            episode_data_index=edi,
+            epi2idx=epi2idx,
+            valid_task_indices={0},
+        )
+        assert out == {}
+
+    def test_paraphrased_tasks_jsonl_does_not_warn(self, caplog):
+        # The whole point of this rewrite: even when tasks.jsonl uses a
+        # paraphrased string for what episodes.jsonl calls something else,
+        # the parquet's task_index is authoritative — no warning fires
+        # because no string comparison happens.
+        ds, episodes, edi, epi2idx = _fake_hf_dataset(
+            [
+                (0, 50, 0),
+                (1, 100, 1),
+            ]
+        )
+        with caplog.at_level("WARNING"):
+            out = episode_to_task_index_from_hf_dataset(
+                hf_dataset=ds,
+                episodes=episodes,
+                episode_data_index=edi,
+                epi2idx=epi2idx,
+                valid_task_indices={0, 1},
+            )
+        assert out == {0: 0, 1: 1}
+        assert not any("task_index" in r.message for r in caplog.records)
 
 
 class TestBucketEpisodeLength:
@@ -355,6 +477,61 @@ class TestLoadOrComputeSpeedPercentiles:
         assert out == {}
         # `.get(missing_idx)` returns None → bucket 50.
         assert bucket_episode_length(123, out.get(99)) == SPARSE_TASK_BUCKET
+
+    def test_recompute_when_persisted_file_missing_tasks(self, tmp_path, caplog):
+        # Simulates the state left by the pre-fix code: tasks.jsonl was
+        # paraphrased relative to episodes.jsonl, the string-keyed lookup
+        # only resolved a subset of tasks, and the resulting percentile
+        # file is missing rows for every drifted task. The new loader
+        # detects the missing tasks against the (now correctly resolved)
+        # episode_to_task_index and recomputes.
+        el, e2t, t2i = _fake_meta(
+            {
+                "taskA": list(range(100, 200)),  # 100 episodes
+                "taskB": list(range(50, 150)),  # 100 more episodes — index 1
+            }
+        )
+        path = tmp_path / SPEED_PERCENTILES_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Pre-write a file with only taskA — taskB (task_index=1) is
+        # missing, simulating the buggy first-pass output.
+        bogus_percentiles = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+        write_jsonlines(
+            [
+                {
+                    "task_index": 0,
+                    "task": "taskA",
+                    "n_episodes": 100,
+                    "percentiles": bogus_percentiles,
+                }
+            ],
+            path,
+        )
+
+        with caplog.at_level("INFO"):
+            out = load_or_compute_speed_percentiles(tmp_path, el, e2t, t2i)
+
+        # Both tasks now have percentiles — recompute ran.
+        assert set(out.keys()) == {0, 1}
+        assert out[0] is not None
+        assert out[1] is not None
+        # The bogus pre-existing percentiles were discarded by recompute.
+        assert out[0] != bogus_percentiles
+        # Info log fired with the expected migration message.
+        recompute_msgs = [
+            r.message for r in caplog.records if "Recomputing" in r.message and "missing 1" in r.message
+        ]
+        assert recompute_msgs, [r.message for r in caplog.records]
+        # The on-disk file was rewritten with both tasks.
+        rows = load_jsonlines(path)
+        assert {int(r["task_index"]) for r in rows} == {0, 1}
+
+        # Second call takes the fast read path — no Recompute, no Stale.
+        caplog.clear()
+        with caplog.at_level("INFO"):
+            load_or_compute_speed_percentiles(tmp_path, el, e2t, t2i)
+        assert not any("Recomputing" in r.message for r in caplog.records)
+        assert not any("Stale" in r.message for r in caplog.records)
 
 
 class TestLiberoSnapshot:

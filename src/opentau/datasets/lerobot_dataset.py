@@ -114,7 +114,7 @@ from opentau.datasets.image_writer import AsyncImageWriter, write_image
 from opentau.datasets.speed_percentiles import (
     SPARSE_TASK_BUCKET,
     bucket_episode_length,
-    episode_to_task_index_from_episodes,
+    episode_to_task_index_from_hf_dataset,
     load_or_compute_speed_percentiles,
 )
 from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
@@ -1490,8 +1490,12 @@ class LeRobotDataset(BaseDataset):
         # Both the percentile compute and the per-episode pre-fill below
         # consume `self.episode_lengths` so the two paths can't drift on
         # what counts as an "episode length".
-        self.episode_to_task_index: dict[int, int] = episode_to_task_index_from_episodes(
-            self.meta.episodes, self.meta.task_to_task_index
+        self.episode_to_task_index: dict[int, int] = episode_to_task_index_from_hf_dataset(
+            hf_dataset=self.hf_dataset,
+            episodes=self.episodes,
+            episode_data_index=self.episode_data_index,
+            epi2idx=self.epi2idx,
+            valid_task_indices=set(self.meta.task_to_task_index.values()),
         )
         self.speed_percentiles_by_task: dict[int, list[float] | None] = load_or_compute_speed_percentiles(
             root=self.root,
@@ -1500,11 +1504,11 @@ class LeRobotDataset(BaseDataset):
             task_to_task_index=self.meta.task_to_task_index,
         )
         # Pre-compute the bucket per episode so __getitem__ stays a dict
-        # lookup. Episodes with no task entry (impossible in well-formed
-        # datasets) and tasks missing from the on-disk percentile file
-        # (possible after hand-editing) both land at SPARSE_TASK_BUCKET.
+        # lookup. Episodes whose task_index pointed at a row missing from
+        # tasks.jsonl, and tasks missing from the on-disk percentile file
+        # (possible after hand-editing), both land at SPARSE_TASK_BUCKET.
         self.speed_raw_by_episode: dict[int, int] = {}
-        for ep in self.meta.episodes:
+        for ep in self.episodes:
             task_idx = self.episode_to_task_index.get(ep)
             if task_idx is None:
                 self.speed_raw_by_episode[ep] = SPARSE_TASK_BUCKET
