@@ -823,7 +823,7 @@ def train(cfg: TrainPipelineConfig):
                 # videos on a multi-node run without a shared FS won't be seen).
                 if cfg.wandb.enable and cfg.eval.max_episodes_rendered > 0:
                     grid_videos = {
-                        f"Eval Videos/{task_name}": wandb.Video(grid_path)
+                        f"Eval Videos/{task_name}": wandb.Video(grid_path, format="mp4")
                         for task_name, grid_path in collect_grid_summary_videos(videos_dir)
                     }
                     if grid_videos:
