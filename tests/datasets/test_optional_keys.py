@@ -791,3 +791,74 @@ class TestFpsEmission:
         out = ds._to_standard_data_format(_full_raw_item(ds))
         assert out["fps"].item() == 50
         assert out["fps_is_pad"].item() is False
+
+
+# VQA datasets have no temporal axis — `DatasetMetadata.fps` returns ``None``
+# on the base class (and on ``VQADatasetMetadata``, which inherits via ``pass``).
+# `_emit_optional_keys` must catch that and emit ``fps=0, fps_is_pad=True``
+# instead of crashing on ``int(None)`` — otherwise any heterogeneous mixture
+# that includes a VQA dataset crashes at the first sample fetch under the
+# default ``emit_fps=True``.
+
+
+class TestFpsEmissionVQA:
+    def test_base_metadata_fps_returns_none(self):
+        """``DatasetMetadata.fps`` is ``None`` for non-LeRobot datasets."""
+        from opentau.datasets.lerobot_dataset import DatasetMetadata, VQADatasetMetadata
+
+        assert DatasetMetadata().fps is None
+        assert VQADatasetMetadata().fps is None
+
+    def test_vqa_metadata_emits_pad_row(self):
+        """A dataset whose ``meta.fps`` is ``None`` (i.e. a VQA dataset) must
+        still produce a complete sample dict so heterogeneous batches stay
+        schema-aligned. The fps row is padded out as
+        ``fps=0, fps_is_pad=True`` (mirroring the speed/quality/mistake pad
+        shape) — the policy's ``prepare_metadata`` then drops the ``FPS:``
+        segment for that sample.
+        """
+        from opentau.datasets.lerobot_dataset import VQADatasetMetadata
+
+        ds = _DummyBaseDataset(num_cams=1)
+        ds.meta = VQADatasetMetadata(info={"features": {}})
+        out = ds._to_standard_data_format(_full_raw_item(ds))
+        assert "fps" in out and "fps_is_pad" in out
+        assert out["fps"].dtype == torch.long
+        assert out["fps"].item() == 0
+        assert out["fps_is_pad"].item() is True
+
+    def test_vqa_pad_ignores_action_freq(self):
+        """Even when the mixture sets ``action_freq``, a VQA sample emits
+        pad — VQA has no actions to be at any rate, so reporting
+        ``action_freq`` would be misleading."""
+        from opentau.datasets.lerobot_dataset import VQADatasetMetadata
+
+        ds = _DummyBaseDataset(num_cams=1, action_freq=30.0)
+        ds.meta = VQADatasetMetadata(info={"features": {}})
+        out = ds._to_standard_data_format(_full_raw_item(ds))
+        assert out["fps"].item() == 0
+        assert out["fps_is_pad"].item() is True
+
+    def test_heterogeneous_vla_vqa_collate(self):
+        """The pad-row trick keeps batches schema-aligned across a
+        VLA + VQA mixture: default_collate stacks fps into a ``(B,)`` long
+        tensor and fps_is_pad into a ``(B,)`` bool tensor with the
+        per-sample on/off correctly set.
+        """
+        from torch.utils.data import default_collate
+
+        from opentau.datasets.lerobot_dataset import VQADatasetMetadata
+
+        # LeRobot-shaped sample.
+        ds_vla = _DummyBaseDataset(num_cams=1, meta_fps=30)
+        item_vla = ds_vla._to_standard_data_format(_full_raw_item(ds_vla))
+
+        # VQA-shaped sample (same dummy class, real VQA metadata).
+        ds_vqa = _DummyBaseDataset(num_cams=1)
+        ds_vqa.meta = VQADatasetMetadata(info={"features": {}})
+        item_vqa = ds_vqa._to_standard_data_format(_full_raw_item(ds_vqa))
+
+        batch = default_collate([item_vla, item_vqa])
+        assert batch["fps"].dtype == torch.long
+        assert batch["fps"].tolist() == [30, 0]
+        assert batch["fps_is_pad"].tolist() == [False, True]

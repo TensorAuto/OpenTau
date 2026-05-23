@@ -138,7 +138,11 @@ each sample's rate — a 30 Hz chunk and a 50 Hz chunk carry different
 real-time horizons even when both are ``chunk_size`` frames long. Unlike
 the other metadata fields, ``fps`` does **not** participate in the
 dropout rolls — it's an intrinsic property of the chunk, not a noisy
-label, so it's always non-pad when emitted. Emission is gated by
+label, so it's always non-pad when emitted from a dataset that has a
+real frame rate. Samples from VQA datasets (no temporal axis) emit
+``fps=0, fps_is_pad=True`` so heterogeneous VLA + VQA mixtures stay
+schema-aligned across the batch; the policy's ``prepare_metadata``
+then drops the ``FPS:`` segment for those rows. Emission is gated by
 ``DatasetMixtureConfig.emit_fps`` (default ``True``); set it to
 ``False`` to omit both ``fps`` and ``fps_is_pad`` from the sample dict
 (useful when resuming a checkpoint that was trained without fps
