@@ -94,6 +94,7 @@ Example:
         >>> print(f"FPS: {info['video.fps']}, Resolution: {info['video.width']}x{info['video.height']}")
 """
 
+import functools
 import importlib
 import json
 import logging
@@ -112,37 +113,45 @@ import torchvision
 from datasets.features.features import register_feature
 from PIL import Image
 
-_safe_default_codec: str | None = None
+
+@functools.cache
+def _load_torchcodec_videodecoder():
+    """Probe whether ``torchcodec.decoders.VideoDecoder`` is usable on this host.
+
+    Returns the ``VideoDecoder`` class on success, or ``None`` if either the
+    Python package is missing or its compiled extension fails to load (e.g.
+    no compatible system FFmpeg). Wide except: ``find_spec`` itself can raise
+    on broken installs, and the extension import surfaces failures as either
+    ``ImportError`` or ``RuntimeError``. Cached via ``functools.cache`` so the
+    probe runs once per process and is thread-safe; tests can re-probe with
+    ``_load_torchcodec_videodecoder.cache_clear()``.
+    """
+    try:
+        if importlib.util.find_spec("torchcodec") is None:
+            logging.warning(
+                "'torchcodec' is not available in your platform, falling back to 'pyav' as the default decoder."
+            )
+            return None
+        from torchcodec.decoders import VideoDecoder
+    except (ImportError, RuntimeError, ValueError) as e:
+        logging.warning(
+            "'torchcodec' failed to load (%s); falling back to 'pyav' as the default decoder.",
+            e,
+        )
+        return None
+    return VideoDecoder
 
 
+@functools.cache
 def get_safe_default_codec() -> str:
     """Get the default video codec backend.
 
-    Prefers ``torchcodec`` when both the Python package is installed AND its
-    compiled extension can actually load (which requires a compatible system
-    FFmpeg). Falls back to ``"pyav"`` otherwise. Result is cached at module
-    level so the load attempt only happens once per process.
+    Returns ``"torchcodec"`` when the compiled extension actually loads on this
+    host (requires a compatible system FFmpeg), else ``"pyav"``. Cached for the
+    lifetime of the process; tests can re-probe with
+    ``get_safe_default_codec.cache_clear()``.
     """
-    global _safe_default_codec
-    if _safe_default_codec is not None:
-        return _safe_default_codec
-    if importlib.util.find_spec("torchcodec") is not None:
-        try:
-            from torchcodec.decoders import VideoDecoder  # noqa: F401
-        except (ImportError, RuntimeError) as e:
-            logging.warning(
-                "'torchcodec' failed to load (%s); falling back to 'pyav' as the default decoder.",
-                e,
-            )
-        else:
-            _safe_default_codec = "torchcodec"
-            return _safe_default_codec
-    else:
-        logging.warning(
-            "'torchcodec' is not available in your platform, falling back to 'pyav' as the default decoder."
-        )
-    _safe_default_codec = "pyav"
-    return _safe_default_codec
+    return "torchcodec" if _load_torchcodec_videodecoder() is not None else "pyav"
 
 
 _safe_encoding_vcodec: str | None = None
@@ -206,11 +215,16 @@ def decode_video_frames(
     if backend is None:
         backend = get_safe_default_codec()
     if backend == "torchcodec":
-        return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s)
-    elif backend in ["pyav", "video_reader"]:
+        if _load_torchcodec_videodecoder() is None:
+            logging.warning(
+                "Caller requested backend='torchcodec' but it failed to load; using 'pyav' for this decode."
+            )
+            backend = "pyav"
+        else:
+            return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s)
+    if backend in ("pyav", "video_reader"):
         return decode_video_frames_torchvision(video_path, timestamps, tolerance_s, backend)
-    else:
-        raise ValueError(f"Unsupported video backend: {backend}")
+    raise ValueError(f"Unsupported video backend: {backend}")
 
 
 def decode_video_frames_torchvision(
@@ -329,10 +343,11 @@ def decode_video_frames_torchcodec(
     can be adjusted during encoding to take into account decoding time and video size in bytes.
     """
 
-    if importlib.util.find_spec("torchcodec"):
-        from torchcodec.decoders import VideoDecoder
-    else:
-        raise ImportError("torchcodec is required but not available.")
+    VideoDecoder = _load_torchcodec_videodecoder()  # noqa: N806
+    if VideoDecoder is None:
+        raise ImportError(
+            "torchcodec is required but not loadable on this host (see prior warning for details)."
+        )
 
     # initialize video decoder
     decoder = VideoDecoder(video_path, device=device, seek_mode="exact")
