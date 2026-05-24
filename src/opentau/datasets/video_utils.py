@@ -94,6 +94,7 @@ Example:
         >>> print(f"FPS: {info['video.fps']}, Resolution: {info['video.width']}x{info['video.height']}")
 """
 
+import functools
 import importlib
 import json
 import logging
@@ -110,27 +111,61 @@ import pyarrow as pa
 import torch
 import torchvision
 from datasets.features.features import register_feature
-from packaging import version
 from PIL import Image
 
 
-def get_safe_default_codec() -> str:
-    """Get the default video codec backend, falling back to pyav if torchcodec is unavailable.
+@functools.cache
+def _load_torchcodec_videodecoder() -> tuple[type | None, BaseException | None]:
+    """Probe whether ``torchcodec.decoders.VideoDecoder`` is usable on this host.
 
-    Returns:
-        Backend name: "torchcodec" if available, otherwise "pyav".
+    Returns a ``(VideoDecoder, None)`` pair on success, or ``(None, exc)`` if
+    either the Python package is missing or its compiled extension fails to
+    load (e.g. no compatible system FFmpeg). Carrying the original exception
+    forward lets direct callers of the torchcodec decode path surface the root
+    cause in their own raise, even when the probe's warning has been dropped
+    (e.g. probe fires before ``init_logging``) or rotated out of a long-lived
+    log. Wide except: ``find_spec`` can itself raise ``ValueError`` on broken
+    installs, and the extension import surfaces failures as either
+    ``ImportError`` or ``RuntimeError``. Cached via ``functools.cache`` so the
+    probe runs once per process and is thread-safe; tests can re-probe with
+    ``_load_torchcodec_videodecoder.cache_clear()``.
     """
+    try:
+        if importlib.util.find_spec("torchcodec") is None:
+            exc = ModuleNotFoundError("torchcodec is not installed on this platform.")
+            logging.warning("%s Falling back to 'pyav' as the default decoder.", exc)
+            return None, exc
+        from torchcodec.decoders import VideoDecoder
+    except (ImportError, RuntimeError, ValueError) as e:
+        logging.warning(
+            "'torchcodec' failed to load (%s); falling back to 'pyav' as the default decoder.",
+            e,
+        )
+        return None, e
+    return VideoDecoder, None
 
-    if version.parse(torch.__version__) >= version.parse("2.8.0"):
-        return "pyav"
-    else:
-        if importlib.util.find_spec("torchcodec"):
-            return "torchcodec"
-        else:
-            logging.warning(
-                "'torchcodec' is not available in your platform, falling back to 'pyav' as a default decoder"
-            )
-            return "pyav"
+
+@functools.cache
+def _warn_explicit_torchcodec_unloadable() -> None:
+    """Emit the explicit-backend-fallback warning at most once per process.
+
+    Without this guard the warning fires inside ``decode_video_frames``, which
+    sits in ``LeRobotDataset._query_videos`` and is invoked O(num_video_keys)
+    times per dataloader step. A real run logs tens of thousands of copies.
+    """
+    logging.warning("Caller requested backend='torchcodec' but it failed to load; using 'pyav' instead.")
+
+
+def get_safe_default_codec() -> str:
+    """Get the default video codec backend.
+
+    Returns ``"torchcodec"`` when the compiled extension actually loads on this
+    host (requires a compatible system FFmpeg), else ``"pyav"``. The underlying
+    probe is cached in ``_load_torchcodec_videodecoder``; this wrapper is left
+    uncached so that ``dataclasses.field(default_factory=...)`` callers get the
+    fresh-instance semantics they expect from ``default_factory``.
+    """
+    return "torchcodec" if _load_torchcodec_videodecoder()[0] is not None else "pyav"
 
 
 _safe_encoding_vcodec: str | None = None
@@ -184,21 +219,32 @@ def decode_video_frames(
         video_path (Path): Path to the video file.
         timestamps (list[float]): List of timestamps to extract frames.
         tolerance_s (float): Allowed deviation in seconds for frame retrieval.
-        backend (str, optional): Backend to use for decoding. Defaults to "torchcodec" when available in the platform; otherwise, defaults to "pyav"..
+        backend (str, optional): Backend to use for decoding. Defaults to "torchcodec" when available in the platform; otherwise, defaults to "pyav".
 
     Returns:
         torch.Tensor: Decoded frames.
 
-    Currently supports torchcodec on cpu and pyav.
+    Currently supports torchcodec on cpu and pyav. If the caller explicitly
+    requests ``backend="torchcodec"`` but the host's torchcodec extension
+    cannot load (e.g. missing system FFmpeg, ABI mismatch), this function
+    silently downgrades to ``"pyav"`` with a once-per-process warning. The two
+    decoders pick frames using non-equivalent logic (pts seek + argmin vs.
+    ``round(ts * average_fps)`` indexing), so the decoded pixels for the same
+    ``(video_path, timestamps)`` pair can differ within ``tolerance_s``;
+    callers needing strict backend selection should check
+    ``get_safe_default_codec() == "torchcodec"`` before dispatching.
     """
     if backend is None:
         backend = get_safe_default_codec()
     if backend == "torchcodec":
-        return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s)
-    elif backend in ["pyav", "video_reader"]:
+        if _load_torchcodec_videodecoder()[0] is None:
+            _warn_explicit_torchcodec_unloadable()
+            backend = "pyav"
+        else:
+            return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s)
+    if backend in ("pyav", "video_reader"):
         return decode_video_frames_torchvision(video_path, timestamps, tolerance_s, backend)
-    else:
-        raise ValueError(f"Unsupported video backend: {backend}")
+    raise ValueError(f"Unsupported video backend: {backend}")
 
 
 def decode_video_frames_torchvision(
@@ -317,10 +363,11 @@ def decode_video_frames_torchcodec(
     can be adjusted during encoding to take into account decoding time and video size in bytes.
     """
 
-    if importlib.util.find_spec("torchcodec"):
-        from torchcodec.decoders import VideoDecoder
-    else:
-        raise ImportError("torchcodec is required but not available.")
+    VideoDecoder, probe_exc = _load_torchcodec_videodecoder()  # noqa: N806
+    if VideoDecoder is None:
+        raise ImportError(
+            f"torchcodec is required but not loadable on this host: {probe_exc!r}"
+        ) from probe_exc
 
     # initialize video decoder
     decoder = VideoDecoder(video_path, device=device, seek_mode="exact")
