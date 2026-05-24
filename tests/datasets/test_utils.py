@@ -17,6 +17,7 @@
 
 import logging
 
+import pytest
 import torch
 from datasets import Dataset
 from huggingface_hub import DatasetCard
@@ -63,11 +64,18 @@ def test_calculate_episode_data_index():
     assert torch.equal(episode_data_index["to"], torch.tensor([2, 3, 6]))
 
 
-def test_v21_warning_dedup(caplog):
+@pytest.fixture
+def reset_v21_warning_state():
+    """Reset module-global v2.0 warning dedup state around a test so a failed
+    assert doesn't leak polluted state to later tests in the same worker."""
     datasets_utils._V21_WARNED_REPOS.clear()
     datasets_utils._V21_FULL_MESSAGE_SHOWN = False
-    caplog.set_level(logging.WARNING, logger=datasets_utils.__name__)
+    yield
+    datasets_utils._V21_WARNED_REPOS.clear()
+    datasets_utils._V21_FULL_MESSAGE_SHOWN = False
 
+
+def test_v21_warning_dedup(caplog, reset_v21_warning_state):
     with caplog.at_level(logging.WARNING):
         check_version_compatibility("org/first", "2.0", "2.1")
         check_version_compatibility("org/second", "2.0", "2.1")
@@ -87,6 +95,3 @@ def test_v21_warning_dedup(caplog):
         assert repo_id in msg
         assert "convert_dataset_v20_to_v21.py" in msg
         assert "discord.com/invite" not in msg
-
-    datasets_utils._V21_WARNED_REPOS.clear()
-    datasets_utils._V21_FULL_MESSAGE_SHOWN = False
