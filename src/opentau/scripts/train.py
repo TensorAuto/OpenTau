@@ -649,6 +649,9 @@ def train(cfg: TrainPipelineConfig):
 
             # save axillary objects such as configs, training step, and rng state
             if accelerator.is_main_process:
+                logging.info(
+                    f"Saved sampler state for {len(accelerator._dataloaders)} dataloaders to {checkpoint_dir}"
+                )
                 logging.info(f"Checkpoint policy after step {step}")
                 cfg.policy.pretrained_path = checkpoint_dir
                 save_checkpoint(checkpoint_dir, step, cfg)

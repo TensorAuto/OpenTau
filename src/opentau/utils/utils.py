@@ -193,6 +193,15 @@ def init_logging(accelerator: accelerate.Accelerator | None = None, level=loggin
 
     logging.basicConfig(level=level, force=True, handlers=[console_handler])
 
+    # accelerate's save_accelerator_state emits one INFO line per dataloader; a
+    # WeightedDatasetMixture run can have hundreds. The matching load path already
+    # only emits one summary line, so silence the save side to match.
+    class _DropDataloaderSamplerSaveSpam(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            return not record.getMessage().startswith("Sampler state for dataloader ")
+
+    logging.getLogger("accelerate.checkpointing").addFilter(_DropDataloaderSamplerSaveSpam())
+
     if accelerator and not accelerator.is_main_process:
         # Disable duplicate logging on non-main processes
         logging.info(f"Setting logging level on non-main process {accelerator.process_index} to WARNING.")
