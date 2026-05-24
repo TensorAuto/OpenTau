@@ -54,9 +54,22 @@ When implementing a new policy class (e.g., `DiffusionPolicy`), follow these ste
 """
 
 import itertools
+import warnings
 
 from opentau.__version__ import __version__  # noqa: F401
 from opentau.utils import transformers_patch  # noqa: F401
+
+# PyTorch 2.10 DataLoader unconditionally passes the deprecated `device` kwarg
+# to Tensor.pin_memory() / Tensor.is_pinned() via
+# torch.utils.data._utils.pin_memory.pin_memory; warning is emitted by torch
+# itself, not by any user code. Filter is harmless on older torch and becomes
+# a no-op once the upstream DataLoader stops passing the kwarg.
+warnings.filterwarnings(
+    "ignore",
+    message=r"The argument 'device' of Tensor\.(pin_memory|is_pinned)\(\) is deprecated",
+    category=DeprecationWarning,
+    module=r"torch\.utils\.data\._utils\.pin_memory$",
+)
 
 # TODO(rcadene): Improve policies and envs. As of now, an item in `available_policies`
 # refers to a yaml file AND a modeling name. Same for `available_envs` which refers to
