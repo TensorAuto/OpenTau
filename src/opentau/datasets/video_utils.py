@@ -231,8 +231,8 @@ def decode_video_frames(
     decoders pick frames using non-equivalent logic (pts seek + argmin vs.
     ``round(ts * average_fps)`` indexing), so the decoded pixels for the same
     ``(video_path, timestamps)`` pair can differ within ``tolerance_s``;
-    callers needing strict backend selection should check the return of
-    ``_load_torchcodec_videodecoder()`` before dispatching.
+    callers needing strict backend selection should check
+    ``get_safe_default_codec() == "torchcodec"`` before dispatching.
     """
     if backend is None:
         backend = get_safe_default_codec()
