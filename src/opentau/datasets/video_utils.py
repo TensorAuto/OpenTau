@@ -110,27 +110,39 @@ import pyarrow as pa
 import torch
 import torchvision
 from datasets.features.features import register_feature
-from packaging import version
 from PIL import Image
+
+_safe_default_codec: str | None = None
 
 
 def get_safe_default_codec() -> str:
-    """Get the default video codec backend, falling back to pyav if torchcodec is unavailable.
+    """Get the default video codec backend.
 
-    Returns:
-        Backend name: "torchcodec" if available, otherwise "pyav".
+    Prefers ``torchcodec`` when both the Python package is installed AND its
+    compiled extension can actually load (which requires a compatible system
+    FFmpeg). Falls back to ``"pyav"`` otherwise. Result is cached at module
+    level so the load attempt only happens once per process.
     """
-
-    if version.parse(torch.__version__) >= version.parse("2.8.0"):
-        return "pyav"
-    else:
-        if importlib.util.find_spec("torchcodec"):
-            return "torchcodec"
-        else:
+    global _safe_default_codec
+    if _safe_default_codec is not None:
+        return _safe_default_codec
+    if importlib.util.find_spec("torchcodec") is not None:
+        try:
+            from torchcodec.decoders import VideoDecoder  # noqa: F401
+        except (ImportError, RuntimeError) as e:
             logging.warning(
-                "'torchcodec' is not available in your platform, falling back to 'pyav' as a default decoder"
+                "'torchcodec' failed to load (%s); falling back to 'pyav' as the default decoder.",
+                e,
             )
-            return "pyav"
+        else:
+            _safe_default_codec = "torchcodec"
+            return _safe_default_codec
+    else:
+        logging.warning(
+            "'torchcodec' is not available in your platform, falling back to 'pyav' as the default decoder."
+        )
+    _safe_default_codec = "pyav"
+    return _safe_default_codec
 
 
 _safe_encoding_vcodec: str | None = None
