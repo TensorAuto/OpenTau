@@ -646,12 +646,13 @@ def train(cfg: TrainPipelineConfig):
             # save the accelerator state
             # This will save the model, optimizer, and lr_scheduler state
             accelerator.save_state(checkpoint_dir)
+            if accelerator.is_main_process:
+                # Mirrors the load-side "All dataloader sampler states loaded successfully"
+                # summary, since init_logging suppresses the per-dataloader save lines.
+                logging.info(f"Saved all dataloader sampler states to {checkpoint_dir}")
 
             # save axillary objects such as configs, training step, and rng state
             if accelerator.is_main_process:
-                logging.info(
-                    f"Saved sampler state for {len(accelerator._dataloaders)} dataloaders to {checkpoint_dir}"
-                )
                 logging.info(f"Checkpoint policy after step {step}")
                 cfg.policy.pretrained_path = checkpoint_dir
                 save_checkpoint(checkpoint_dir, step, cfg)

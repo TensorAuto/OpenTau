@@ -200,6 +200,43 @@ def test_init_logging_clears_previous_handlers(reset_logging_state):
     assert len(logging.root.handlers) == 1  # Should still only have one handler
 
 
+def test_init_logging_drops_sampler_state_save_spam(reset_logging_state):
+    """init_logging silences the per-dataloader sampler save log from accelerate.checkpointing.
+
+    Guards against two regressions: someone removing the filter, or the predicate
+    being broadened to swallow unrelated accelerate.checkpointing log lines (in
+    particular, the load-side summary message).
+    """
+    from opentau.utils.utils import _DropDataloaderSamplerSaveSpam
+
+    init_logging()
+    accel_logger = logging.getLogger("accelerate.checkpointing")
+
+    # Idempotent install: a second init_logging() call shouldn't stack filters.
+    init_logging()
+    installed = [f for f in accel_logger.filters if isinstance(f, _DropDataloaderSamplerSaveSpam)]
+    assert len(installed) == 1
+
+    captured: list[logging.LogRecord] = []
+    sink = logging.Handler()
+    sink.emit = captured.append
+    accel_logger.addHandler(sink)
+    try:
+        accel_logger.info("Sampler state for dataloader 0 saved in /tmp/sampler.bin")
+        accel_logger.info("Sampler state for dataloader 7 saved in /tmp/sampler_7.bin")
+        accel_logger.info("Model weights saved in /tmp/model.safetensors")
+        accel_logger.info("All dataloader sampler states loaded successfully")
+    finally:
+        accel_logger.removeHandler(sink)
+        for f in installed:
+            accel_logger.removeFilter(f)
+
+    messages = [r.getMessage() for r in captured]
+    assert not any(m.startswith("Sampler state for dataloader ") for m in messages)
+    assert "Model weights saved in /tmp/model.safetensors" in messages
+    assert "All dataloader sampler states loaded successfully" in messages
+
+
 def test_format_big_number():
     assert format_big_number(4) == "4"
     assert format_big_number(4 * 1e3) == "4K"
