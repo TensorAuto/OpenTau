@@ -68,7 +68,7 @@ warnings.filterwarnings(
     "ignore",
     message=r"The argument 'device' of Tensor\.(pin_memory|is_pinned)\(\) is deprecated",
     category=DeprecationWarning,
-    module=r"torch\.utils\.data\._utils\.pin_memory",
+    module=r"torch\.utils\.data\._utils\.pin_memory$",
 )
 
 # TODO(rcadene): Improve policies and envs. As of now, an item in `available_policies`
