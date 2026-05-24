@@ -602,6 +602,33 @@ def is_valid_version(version: str) -> bool:
         return False
 
 
+_V21_WARNED_REPOS: set[str] = set()
+_V21_FULL_MESSAGE_SHOWN: bool = False
+
+
+def _warn_v21_global_stats(repo_id: str, version: packaging.version.Version) -> None:
+    """Emit the global-stats upgrade warning, deduplicated across the process.
+
+    The first v2.0 repo triggers the full V21_MESSAGE so the user sees how to
+    convert. Subsequent unique repo_ids only get a one-liner naming the repo,
+    so a mixture with hundreds of v2.0 datasets doesn't drown the log.
+    Re-warns for the same repo_id are suppressed entirely.
+    """
+    global _V21_FULL_MESSAGE_SHOWN
+    if repo_id in _V21_WARNED_REPOS:
+        return
+    _V21_WARNED_REPOS.add(repo_id)
+    if not _V21_FULL_MESSAGE_SHOWN:
+        logging.warning(V21_MESSAGE.format(repo_id=repo_id, version=version))
+        _V21_FULL_MESSAGE_SHOWN = True
+    else:
+        logging.warning(
+            f"Dataset {repo_id} is in v{version} format (uses global stats); "
+            f"run `python src/opentau/datasets/v21/convert_dataset_v20_to_v21.py "
+            f"--repo-id={repo_id}` to upgrade. See the first v2.0 warning above for details."
+        )
+
+
 def check_version_compatibility(
     repo_id: str,
     version_to_check: str | packaging.version.Version,
@@ -633,7 +660,7 @@ def check_version_compatibility(
     if v_check.major < v_current.major and enforce_breaking_major:
         raise BackwardCompatibilityError(repo_id, v_check)
     elif v_check.minor < v_current.minor:
-        logging.warning(V21_MESSAGE.format(repo_id=repo_id, version=v_check))
+        _warn_v21_global_stats(repo_id, v_check)
 
 
 def get_repo_versions(repo_id: str) -> list[packaging.version.Version]:

@@ -15,12 +15,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+
 import torch
 from datasets import Dataset
 from huggingface_hub import DatasetCard
 
+from opentau.datasets import utils as datasets_utils
 from opentau.datasets.push_dataset_to_hub.utils import calculate_episode_data_index
-from opentau.datasets.utils import create_lerobot_dataset_card, hf_transform_to_torch
+from opentau.datasets.utils import (
+    check_version_compatibility,
+    create_lerobot_dataset_card,
+    hf_transform_to_torch,
+)
 
 
 def test_default_parameters():
@@ -54,3 +61,32 @@ def test_calculate_episode_data_index():
     episode_data_index = calculate_episode_data_index(dataset)
     assert torch.equal(episode_data_index["from"], torch.tensor([0, 2, 3]))
     assert torch.equal(episode_data_index["to"], torch.tensor([2, 3, 6]))
+
+
+def test_v21_warning_dedup(caplog):
+    datasets_utils._V21_WARNED_REPOS.clear()
+    datasets_utils._V21_FULL_MESSAGE_SHOWN = False
+    caplog.set_level(logging.WARNING, logger=datasets_utils.__name__)
+
+    with caplog.at_level(logging.WARNING):
+        check_version_compatibility("org/first", "2.0", "2.1")
+        check_version_compatibility("org/second", "2.0", "2.1")
+        check_version_compatibility("org/third", "2.0", "2.1")
+        check_version_compatibility("org/first", "2.0", "2.1")  # dup: silent
+
+    warning_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warning_messages) == 3, warning_messages
+
+    # First message is the long-form V21_MESSAGE for the first repo (contains
+    # the Discord help link which only appears in the long form).
+    assert "org/first" in warning_messages[0]
+    assert "discord.com/invite" in warning_messages[0]
+
+    # Subsequent messages are the one-liner naming the repo and the convert script.
+    for repo_id, msg in zip(["org/second", "org/third"], warning_messages[1:], strict=True):
+        assert repo_id in msg
+        assert "convert_dataset_v20_to_v21.py" in msg
+        assert "discord.com/invite" not in msg
+
+    datasets_utils._V21_WARNED_REPOS.clear()
+    datasets_utils._V21_FULL_MESSAGE_SHOWN = False
