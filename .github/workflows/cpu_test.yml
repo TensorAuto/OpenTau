@@ -32,14 +32,55 @@ env:
   PRE_COMMIT_HOME: "/pre-commit-cache"
 
 jobs:
-  cpu-tests:
-    # Block PRs from non-org accounts to keep fork code off our runners.
-    # `push` and `workflow_dispatch` already require write access, so the
-    # short-circuit lets them through unchanged.
+  precheck:
+    # Decide whether the `pull_request` run is redundant with the `push` run.
+    # If the PR branch already contains every commit on the base ref, the
+    # merge would fast-forward and the merge tree equals the head tree that
+    # `push` already tested. For `push` / `workflow_dispatch`, always run.
     if: >-
       github.event_name != 'pull_request'
       || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
       || github.event.pull_request.user.login == 'claude[bot]'
+    name: Pre-check
+    runs-on: ubuntu-latest
+    outputs:
+      run-tests: ${{ steps.decide.outputs.run-tests }}
+    steps:
+      - name: Decide whether to run tests
+        id: decide
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "Event=$EVENT_NAME; always run tests."
+            echo "run-tests=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          status=$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/compare/${BASE_SHA}...${HEAD_SHA}" \
+            | jq -r '.status' || echo "unknown")
+          echo "Compare status: $status"
+          case "$status" in
+            identical|ahead)
+              echo "Head contains base; push run already covered this tree. Skipping."
+              echo "run-tests=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Head does not strictly contain base; running tests."
+              echo "run-tests=true" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+  cpu-tests:
+    needs: precheck
+    if: needs.precheck.outputs.run-tests == 'true'
     name: CPU Tests
     runs-on: ubuntu-latest
     steps:
@@ -120,3 +161,28 @@ jobs:
           flags: cpu
           name: cpu-coverage
           fail_ci_if_error: false
+
+  status:
+    # Stable status check for branch protection. Passes when `cpu-tests`
+    # succeeded OR was skipped because `precheck` determined the push run
+    # already covered this tree. Point required-status-checks at this job.
+    needs: [precheck, cpu-tests]
+    if: always()
+    name: CPU Tests Status
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report aggregated result
+        env:
+          PRECHECK_RESULT: ${{ needs.precheck.result }}
+          TESTS_RESULT: ${{ needs.cpu-tests.result }}
+        run: |
+          set -euo pipefail
+          echo "precheck=$PRECHECK_RESULT cpu-tests=$TESTS_RESULT"
+          if [ "$PRECHECK_RESULT" != "success" ]; then
+            echo "Pre-check did not succeed."
+            exit 1
+          fi
+          case "$TESTS_RESULT" in
+            success|skipped) echo "OK" ;;
+            *) exit 1 ;;
+          esac
