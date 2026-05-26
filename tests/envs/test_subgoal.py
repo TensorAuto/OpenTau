@@ -263,19 +263,22 @@ class TestCall:
 
     def test_caches_decoded_frames(self, monkeypatch):
         """Calling ``__call__`` twice in the same rollout (with the same
-        chosen episodes) only decodes each (episode, camera) pair once.
+        chosen episodes) only loads each episode's frames once. The
+        episode-level cache batches all cameras together so an
+        image-dtype dataset (cameras share a parquet) doesn't pay per-
+        camera I/O.
         """
         gen = _make_generator(monkeypatch)
         random.seed(0)
         obs = _make_obs(batch_size=2)
         gen.start_episode([_PROMPT_A, _PROMPT_B])
 
-        with patch.object(gen, "_decode_last_frame", wraps=gen._decode_last_frame) as decode_spy:
+        with patch.object(gen, "_load_episode_frames", wraps=gen._load_episode_frames) as load_spy:
             gen(obs)
             gen(obs)
-            # 2 envs → 2 episodes × 2 cameras = 4 decodes total; the second
+            # 2 envs → 2 episodes, one load per episode; the second
             # __call__ should be served entirely from cache.
-            assert decode_spy.call_count == 4
+            assert load_spy.call_count == 2
 
     def test_call_without_start_episode_raises(self, monkeypatch):
         gen = _make_generator(monkeypatch)
@@ -294,6 +297,44 @@ class TestCall:
         obs = _make_obs(batch_size=4)  # mismatching B
         with pytest.raises(ValueError, match="batch size"):
             gen(obs)
+
+    def test_image_dtype_loads_via_parquet_path(self, monkeypatch):
+        """When the dataset exposes cameras as image-dtype (``TensorAuto/libero``
+        is the real-world case — both cameras stored per-frame in parquet),
+        the generator hits the ``load_dataset`` + parquet path and not the
+        video decoder. All image cameras for one episode share a single
+        parquet load.
+        """
+        meta = _build_fake_meta(video_keys=())  # no video cameras
+        meta.image_keys = ["image", "wrist_image"]
+        meta.get_data_file_path = MagicMock(side_effect=lambda ep_idx: f"data/episode_{ep_idx:06d}.parquet")
+
+        fake_row = {
+            "image": torch.full((3, 256, 256), 0.3, dtype=torch.float32),
+            "wrist_image": torch.full((3, 256, 256), 0.7, dtype=torch.float32),
+        }
+        # ``load_dataset(...).set_transform(...); ds[idx]`` is what the
+        # generator does. Mock both calls with a small in-memory stand-in.
+        fake_ds = MagicMock()
+        fake_ds.__getitem__ = MagicMock(return_value=fake_row)
+
+        monkeypatch.setattr("opentau.envs.subgoal.LeRobotDatasetMetadata", lambda *args, **kwargs: meta)
+        monkeypatch.setattr("opentau.envs.subgoal.load_dataset", lambda *args, **kwargs: fake_ds)
+
+        gen = LiberoLastFrameSubgoalGenerator(resolution=(64, 64), num_cams=2)
+        gen._resolve_data_path = MagicMock(return_value="<fake-parquet>")
+
+        random.seed(0)
+        gen.start_episode([_PROMPT_A])
+        out = gen(_make_obs(batch_size=1))
+
+        assert out["subgoal0"].shape == (1, 3, 64, 64)
+        assert out["subgoal1"].shape == (1, 3, 64, 64)
+        # ``set_transform`` should fire (the parquet rows are PIL until
+        # transformed) and ``__getitem__`` exactly once (cameras share the
+        # row).
+        fake_ds.set_transform.assert_called_once()
+        fake_ds.__getitem__.assert_called_once()
 
 
 class TestAddSubgoalImages:

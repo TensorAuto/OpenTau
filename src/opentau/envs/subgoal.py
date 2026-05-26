@@ -40,11 +40,13 @@ from typing import Any, Protocol
 
 import torch
 import torch.nn.functional as F  # noqa: N812
+from datasets import load_dataset
 from huggingface_hub import hf_hub_download
 from torch import Tensor
 
 from opentau.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
+from opentau.datasets.utils import hf_transform_to_torch
 from opentau.datasets.video_utils import decode_video_frames
 
 
@@ -245,18 +247,27 @@ class LiberoLastFrameSubgoalGenerator:
         return out
 
     def _cached_frame(self, ep_idx: int, raw_key: str) -> Tensor:
-        cache = self._frame_cache.setdefault(ep_idx, {})
-        if raw_key not in cache:
-            cache[raw_key] = self._decode_last_frame(ep_idx, raw_key)
-        return cache[raw_key]
+        """Per-(episode, camera) lookup with episode-level batch decode.
 
-    def _decode_last_frame(self, ep_idx: int, raw_key: str) -> Tensor:
-        """Decode the last frame of ``ep_idx`` from camera ``raw_key``.
+        Cache misses load *every* camera of the episode in one shot so an
+        image-dtype dataset (where all cameras share the same parquet
+        file) avoids loading the parquet once per camera.
+        """
+        if ep_idx not in self._frame_cache:
+            self._frame_cache[ep_idx] = self._load_episode_frames(ep_idx)
+        return self._frame_cache[ep_idx][raw_key]
 
-        Returns a CPU float tensor of shape ``(3, *self.resolution)`` in
-        ``[0, 1]`` — same convention as the training-time
-        ``_emit_optional_keys`` path so the model sees identically
-        prepared subgoals at train and eval.
+    def _load_episode_frames(self, ep_idx: int) -> dict[str, Tensor]:
+        """Decode the last frame of ``ep_idx`` for every camera in ``camera_keys``.
+
+        Returns a dict ``{raw_key: (3, *resolution) float tensor in [0, 1]}``
+        — same convention as the training-time ``_emit_optional_keys`` path
+        so the model sees identically prepared subgoals at train and eval.
+
+        Video cameras decode one frame each via ``decode_video_frames``.
+        Image cameras share a single parquet load so a multi-image-camera
+        dataset (e.g. ``TensorAuto/libero`` with ``image`` + ``wrist_image``)
+        only pays the parquet I/O once per episode.
         """
         info = self.meta.episodes[ep_idx]
         length = int(info["length"])
@@ -265,18 +276,31 @@ class LiberoLastFrameSubgoalGenerator:
                 f"LiberoLastFrameSubgoalGenerator: episode {ep_idx} in {self.repo_id!r} has "
                 f"non-positive length {length!r}."
             )
-        last_ts = (length - 1) / self.fps
+        last_idx_in_ep = length - 1
 
-        if raw_key in self.meta.video_keys:
-            local_path = self._resolve_video_path(ep_idx, raw_key)
-            frames = decode_video_frames(local_path, [last_ts], self.tolerance_s)
-            frame = frames[0]
-        else:
-            raise NotImplementedError(
-                f"LiberoLastFrameSubgoalGenerator: image-dtype subgoal cameras are not "
-                f"supported yet (raw_key={raw_key!r}). Only video-dtype cameras are wired up."
-            )
+        video_keys = [rk for rk in self.camera_keys.values() if rk in self.meta.video_keys]
+        image_keys = [rk for rk in self.camera_keys.values() if rk in self.meta.image_keys]
 
+        out: dict[str, Tensor] = {}
+
+        if video_keys:
+            last_ts = last_idx_in_ep / self.fps
+            for raw_key in video_keys:
+                local_path = self._resolve_video_path(ep_idx, raw_key)
+                frames = decode_video_frames(local_path, [last_ts], self.tolerance_s)
+                out[raw_key] = self._finalize_frame(frames[0], ep_idx, raw_key)
+
+        if image_keys:
+            local_path = self._resolve_data_path(ep_idx)
+            ds = load_dataset("parquet", data_files=str(local_path), split="train")
+            ds.set_transform(hf_transform_to_torch)
+            row = ds[last_idx_in_ep]
+            for raw_key in image_keys:
+                out[raw_key] = self._finalize_frame(row[raw_key], ep_idx, raw_key)
+
+        return out
+
+    def _finalize_frame(self, frame: Tensor, ep_idx: int, raw_key: str) -> Tensor:
         if frame.ndim != 3 or frame.shape[0] != 3:
             raise ValueError(
                 f"LiberoLastFrameSubgoalGenerator: expected decoded frame shape (3, H, W), "
@@ -290,6 +314,18 @@ class LiberoLastFrameSubgoalGenerator:
             hf_hub_download(
                 repo_id=self.meta.repo_id,
                 filename=str(self.meta.get_video_file_path(ep_idx, raw_key)),
+                repo_type="dataset",
+                revision=self.meta.revision,
+                local_dir=self.meta.root,
+            )
+        return local_path
+
+    def _resolve_data_path(self, ep_idx: int) -> Path:
+        local_path = self.meta.root / self.meta.get_data_file_path(ep_idx)
+        if not local_path.is_file():
+            hf_hub_download(
+                repo_id=self.meta.repo_id,
+                filename=str(self.meta.get_data_file_path(ep_idx)),
                 repo_type="dataset",
                 revision=self.meta.revision,
                 local_dir=self.meta.root,
