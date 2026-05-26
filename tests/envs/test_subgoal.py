@@ -90,6 +90,7 @@ def _make_generator(
     num_cams: int = 2,
     fake_meta=None,
     decoded_frame_value: float = 0.5,
+    seed: int | None = None,
 ) -> LiberoLastFrameSubgoalGenerator:
     """Build a generator with patched metadata + a stub video decoder.
 
@@ -106,7 +107,7 @@ def _make_generator(
     monkeypatch.setattr("opentau.envs.subgoal.LeRobotDatasetMetadata", lambda *args, **kwargs: fake_meta)
     monkeypatch.setattr("opentau.envs.subgoal.decode_video_frames", lambda *args, **kwargs: fake_frame)
 
-    gen = LiberoLastFrameSubgoalGenerator(resolution=resolution, num_cams=num_cams)
+    gen = LiberoLastFrameSubgoalGenerator(resolution=resolution, num_cams=num_cams, seed=seed)
     # Stub out _resolve_video_path on the live instance so the decoded-
     # path code never touches hf_hub_download.
     gen._resolve_video_path = MagicMock(return_value="<fake-path>")
@@ -188,19 +189,37 @@ class TestStartEpisode:
             gen.start_episode([_UNKNOWN_PROMPT])
 
     def test_deterministic_with_seeded_random(self, monkeypatch):
-        """Two ``start_episode`` calls with the same seed pick the same
-        episodes — protects against accidental use of an unseeded RNG
-        that would foil reproducibility-by-seed expectations.
+        """Two generators with the same ``seed`` produce the same per-rollout
+        picks — locks in the per-instance ``random.Random`` so the global
+        ``random`` state cannot foil reproducibility-by-seed expectations.
         """
-        gen = _make_generator(monkeypatch)
+        gen_a = _make_generator(monkeypatch, seed=123)
+        gen_a.start_episode([_PROMPT_A, _PROMPT_A, _PROMPT_A])
+        first = list(gen_a._local.chosen_episodes)
 
-        random.seed(123)
+        gen_b = _make_generator(monkeypatch, seed=123)
+        gen_b.start_episode([_PROMPT_A, _PROMPT_A, _PROMPT_A])
+        second = list(gen_b._local.chosen_episodes)
+
+        assert first == second
+
+    def test_global_random_state_does_not_affect_picks(self, monkeypatch):
+        """Per-instance RNG isolates picks from the process-global
+        ``random`` — mutating the global state between picks must not
+        change the per-rollout selection.
+        """
+        gen = _make_generator(monkeypatch, seed=7)
         gen.start_episode([_PROMPT_A, _PROMPT_A])
         first = list(gen._local.chosen_episodes)
 
-        random.seed(123)
-        gen.start_episode([_PROMPT_A, _PROMPT_A])
-        second = list(gen._local.chosen_episodes)
+        # Burn the global RNG. With a per-instance RNG, this is invisible
+        # to the generator; without it, the second pick would diverge.
+        for _ in range(100):
+            random.random()
+
+        gen2 = _make_generator(monkeypatch, seed=7)
+        gen2.start_episode([_PROMPT_A, _PROMPT_A])
+        second = list(gen2._local.chosen_episodes)
 
         assert first == second
 

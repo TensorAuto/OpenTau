@@ -115,6 +115,26 @@ class LiberoLastFrameSubgoalGenerator:
     Today only ``repo_id="TensorAuto/libero"`` is exercised; other
     LeRobot v2.1 repos with the same camera-name convention should work
     but are not tested.
+
+    Train↔eval distribution shift (intentional, naive baseline):
+        Training samples a *within-episode* future frame
+        (``BaseDataset._sample_subgoal_frame``: uniform ``[t, t+4s]`` or
+        segment end). This generator picks a *different* episode (matched
+        only by task language) and always returns its last frame. That's
+        a different conditional distribution from training; the policy
+        was not conditioned on a foreign trajectory's terminus. This is
+        deliberate as a first baseline — see the PR that introduced this
+        module for the rationale. Follow-up improvements (uniform
+        within-episode sampling, or sampling from the rollout's own
+        replay) would close most of the gap.
+
+    Memory:
+        The per-(episode, camera) frame cache is unbounded — it grows
+        monotonically across rollouts and survives every mid-training
+        eval block. Bounded in practice by the source dataset size
+        (~660 MB worst case for full LIBERO at the default resolution),
+        but a larger source would need an LRU. TODO if/when this
+        generator gets pointed at a non-LIBERO repo.
     """
 
     def __init__(
@@ -124,6 +144,8 @@ class LiberoLastFrameSubgoalGenerator:
         resolution: tuple[int, int] = (256, 256),
         num_cams: int = 2,
         tolerance_s: float = 1e-4,
+        revision: str | None = None,
+        seed: int | None = None,
     ):
         """Load dataset metadata and build the task-language episode index.
 
@@ -139,6 +161,22 @@ class LiberoLastFrameSubgoalGenerator:
                 cameras the source dataset actually exposes (typically 2
                 for LIBERO).
             tolerance_s: Timestamp tolerance for video frame decoding.
+            revision: Optional explicit dataset revision (e.g. ``"v2.1"``,
+                a branch, or a commit SHA). ``None`` falls back to
+                ``CODEBASE_VERSION`` inside
+                :class:`LeRobotDatasetMetadata` — currently ``v2.1``,
+                matching ``TensorAuto/libero``. Pin this when the
+                codebase and dataset versions might drift apart and you
+                need the eval-time subgoals to come from a specific
+                relabel pass.
+            seed: Seed for the per-instance ``random.Random`` used to
+                pick episodes in :meth:`start_episode`. ``None`` falls
+                back to a default-constructed ``Random`` (entropy-seeded
+                per process). Threading ``cfg.seed`` here is what makes
+                episode picks reproducible across runs; the process-
+                global ``random`` is not used so concurrent
+                ``eval_policy_all`` workers don't race on shared RNG
+                state.
         """
         self.repo_id = repo_id
         self.resolution = resolution
@@ -147,7 +185,7 @@ class LiberoLastFrameSubgoalGenerator:
         # `LeRobotDatasetMetadata.__init__` downloads only the `meta/`
         # subdir on cache miss — the video files themselves are pulled
         # lazily by `_decode_last_frame` on first use.
-        self.meta = LeRobotDatasetMetadata(repo_id=repo_id, root=root)
+        self.meta = LeRobotDatasetMetadata(repo_id=repo_id, root=root, revision=revision)
 
         if repo_id not in DATA_FEATURES_NAME_MAPPING:
             raise KeyError(
@@ -188,6 +226,15 @@ class LiberoLastFrameSubgoalGenerator:
         # clobber each other's per-rollout pick.
         self._frame_cache: dict[int, dict[str, Tensor]] = {}
         self._local = threading.local()
+        # Per-instance RNG (not the process-global `random`) so a fixed
+        # `seed` reproduces the per-rollout episode picks even when
+        # other code paths consume the global RNG between rollouts.
+        # Threadlocal `chosen_episodes` already isolates the *outcome*
+        # of each pick from concurrent threads; for bit-identical picks
+        # under `max_parallel_tasks > 1` you'd additionally need per-
+        # thread RNGs (not done here — single-threaded eval is the
+        # common case and the LiberoEnv default).
+        self._rng = random.Random(seed)
 
     @property
     def fps(self) -> int:
@@ -213,7 +260,7 @@ class LiberoLastFrameSubgoalGenerator:
                     f"prompt {prompt!r} (dataset has {len(self.lang_to_episodes)} known task "
                     f"languages)."
                 )
-            chosen.append(random.choice(candidates))
+            chosen.append(self._rng.choice(candidates))
         self._local.chosen_episodes = chosen
 
     def __call__(self, observation: dict[str, Any]) -> dict[str, Tensor]:

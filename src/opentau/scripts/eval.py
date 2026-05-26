@@ -205,7 +205,13 @@ def rollout(
         observation = preprocess_observation(observation, cfg=cfg)
         observation = add_envs_task(env, observation)
         observation = add_eval_metadata(observation, cfg=cfg)
-        observation = add_subgoal_images(observation, subgoal_generator)
+        # Mirror the loop-body gate: only inject subgoals if the loop
+        # body ran at least once and called ``start_episode``. Guards
+        # against the theoretical zero-step rollout where the generator
+        # would otherwise raise ``RuntimeError("start_episode must be
+        # called first")`` from its ``__call__``.
+        if subgoal_episode_picked:
+            observation = add_subgoal_images(observation, subgoal_generator)
         all_observations.append(deepcopy(observation))
 
     # Stack the sequence along the first dimension so that we have (batch, sequence, *) tensors.
@@ -590,18 +596,26 @@ def make_subgoal_generator(cfg: TrainPipelineConfig) -> SubgoalImageGenerator | 
     Returns ``None`` when the env is not a LIBERO env or
     ``cfg.env.subgoal_source`` is unset — both cases fall back to the
     policy's missing-key default in ``prepare_subgoal_images``.
+
+    Threads ``cfg.seed`` into the generator's per-instance RNG so the
+    per-rollout episode picks are reproducible across runs, and logs the
+    resolved dataset revision so a silent drift between
+    ``CODEBASE_VERSION`` and the source repo is visible in the eval log.
     """
     if not isinstance(cfg.env, LiberoEnv) or cfg.env.subgoal_source is None:
         return None
-    logging.info(
-        f"[subgoal] Loading LiberoLastFrameSubgoalGenerator from {cfg.env.subgoal_source!r} "
-        f"(resolution={cfg.resolution}, num_cams={cfg.num_cams})."
-    )
-    return LiberoLastFrameSubgoalGenerator(
+    generator = LiberoLastFrameSubgoalGenerator(
         repo_id=cfg.env.subgoal_source,
         resolution=tuple(cfg.resolution),
         num_cams=cfg.num_cams,
+        seed=cfg.seed,
     )
+    logging.info(
+        f"[subgoal] Loaded LiberoLastFrameSubgoalGenerator from {cfg.env.subgoal_source!r} "
+        f"(revision={generator.meta.revision!r}, resolution={cfg.resolution}, "
+        f"num_cams={cfg.num_cams}, seed={cfg.seed!r})."
+    )
+    return generator
 
 
 @parser.wrap()
