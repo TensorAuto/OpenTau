@@ -37,10 +37,16 @@ jobs:
     # If the PR branch already contains every commit on the base ref, the
     # merge would fast-forward and the merge tree equals the head tree that
     # `push` already tested. For `push` / `workflow_dispatch`, always run.
-    if: >-
-      github.event_name != 'pull_request'
-      || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
-      || github.event.pull_request.user.login == 'claude[bot]'
+    #
+    # Safe to run on any author: this job only hits the GitHub compare API,
+    # it does not check out fork code. The author-association gate is on
+    # `cpu-tests` below so fork PRs still skip the runner-heavy job.
+    #
+    # Note: we infer "push covered this tree" purely from the FF compare
+    # status; we don't query the push workflow's actual conclusion for the
+    # same SHA. In practice push lands after the PR's skip-path status job,
+    # so branch protection sees push's real result. If `push` is ever
+    # gated/filtered so it doesn't fire for a SHA, revisit this assumption.
     name: Pre-check
     runs-on: ubuntu-latest
     outputs:
@@ -80,7 +86,15 @@ jobs:
 
   cpu-tests:
     needs: precheck
-    if: needs.precheck.outputs.run-tests == 'true'
+    # Block PRs from non-org accounts to keep fork code off our runners.
+    # `push` and `workflow_dispatch` already require write access, so the
+    # short-circuit lets them through unchanged. A skipped job counts as a
+    # passing required check, which preserves the pre-PR behaviour for forks.
+    if: >-
+      needs.precheck.outputs.run-tests == 'true'
+      && (github.event_name != 'pull_request'
+          || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
+          || github.event.pull_request.user.login == 'claude[bot]')
     name: CPU Tests
     runs-on: ubuntu-latest
     steps:
