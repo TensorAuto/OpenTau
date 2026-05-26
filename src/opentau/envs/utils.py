@@ -30,6 +30,7 @@ from torchvision.transforms import Compose, Resize, ToTensor
 
 from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.lerobot_dataset import BaseDataset
+from opentau.envs.subgoal import SubgoalImageGenerator
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import auto_torch_device
 
@@ -229,6 +230,35 @@ def add_eval_metadata(observation: dict[str, Any], cfg: TrainPipelineConfig) -> 
         observation["fps"] = torch.tensor([cfg.env.fps] * batch_size, dtype=torch.long, device=device)
         observation["fps_is_pad"] = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
+    return observation
+
+
+def add_subgoal_images(
+    observation: dict[str, Any],
+    generator: SubgoalImageGenerator | None,
+) -> dict[str, Any]:
+    r"""Inject ``subgoal{k}`` / ``subgoal_is_pad`` keys from a generator.
+
+    Mirrors :func:`add_envs_task` / :func:`add_eval_metadata`: the generator
+    inspects ``observation`` (which already carries ``camera{k}``, ``state``,
+    ``img_is_pad``, ``prompt``, and any pi07 metadata keys) and returns the
+    subgoal batch keys the policy's ``prepare_subgoal_images`` consumes.
+
+    The caller is expected to have invoked ``generator.start_episode(prompts)``
+    once at the top of the rollout — the per-step ``__call__`` only reads the
+    cached choice. When ``generator`` is ``None``, this is a no-op and the
+    policy's missing-key fallback (zero subgoals, ``mask=False``) takes over.
+
+    Args:
+        observation: Observation dict mutated in place via ``.update(...)``.
+        generator: Subgoal image generator, or ``None`` to skip injection.
+
+    Returns:
+        The observation dict, mutated in place.
+    """
+    if generator is None:
+        return observation
+    observation.update(generator(observation))
     return observation
 
 

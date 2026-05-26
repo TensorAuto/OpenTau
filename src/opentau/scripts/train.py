@@ -42,7 +42,12 @@ from opentau.optim.factory import make_optimizer_and_scheduler
 from opentau.optim.master_weights import MasterWeightOptimizer
 from opentau.policies.factory import make_policy
 from opentau.policies.pretrained import PreTrainedPolicy
-from opentau.scripts.eval import collect_grid_summary_videos, consolidate_eval_info, eval_policy_all
+from opentau.scripts.eval import (
+    collect_grid_summary_videos,
+    consolidate_eval_info,
+    eval_policy_all,
+    make_subgoal_generator,
+)
 from opentau.utils.accelerate_utils import set_proc_accelerator
 from opentau.utils.logging_utils import AverageMeter, MetricsTracker
 from opentau.utils.random_utils import set_seed
@@ -423,11 +428,13 @@ def train(cfg: TrainPipelineConfig):
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
     eval_envs = None
+    eval_subgoal_generator = None
     if cfg.eval_freq > 0 and cfg.env is not None:
         logging.info("Creating env")
         eval_envs = make_envs(
             cfg.env, cfg, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs
         )
+        eval_subgoal_generator = make_subgoal_generator(cfg)
 
     logging.info("Creating policy")
     # FSDP needs the policy built in fp32 so its ``MixedPrecision(
@@ -782,6 +789,7 @@ def train(cfg: TrainPipelineConfig):
                     max_episodes_rendered=cfg.eval.max_episodes_rendered,
                     start_seed=cfg.seed,
                     max_parallel_tasks=cfg.env.max_parallel_tasks,
+                    subgoal_generator=eval_subgoal_generator,
                 )
 
             eval_info = gather_object([eval_info])  # gather across all accelerator processes

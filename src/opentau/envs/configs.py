@@ -209,6 +209,15 @@ class LiberoEnv(EnvConfig):
             independent of how many real LIBERO cameras this field renders.
         init_states: Whether to initialize states randomly.
         camera_name_mapping: Optional mapping from camera names to standardized keys.
+        subgoal_source: HuggingFace repo id of the v2.1 LeRobot dataset to source
+            subgoal images from at eval time, or ``None`` to disable subgoal
+            injection. When set (today only ``"TensorAuto/libero"`` is exercised),
+            :func:`opentau.scripts.eval.eval` constructs a
+            :class:`~opentau.envs.subgoal.LiberoLastFrameSubgoalGenerator` that
+            samples a random matching episode per env at each ``rollout()`` call
+            and serves its last frame as the subgoal — matching the pi07
+            low-level / pi07-paligemma training-time ``subgoal{k}`` input. Behavior
+            with repos other than ``"TensorAuto/libero"`` is undefined.
         features: Mapping from logical feature names to :class:`~opentau.configs.types.PolicyFeature` definitions.
         features_map: Mapping from environment keys to standardized OpenTau keys.
     """
@@ -222,6 +231,7 @@ class LiberoEnv(EnvConfig):
     camera_name: str = "agentview_image,robot0_eye_in_hand_image"
     init_states: bool = True
     camera_name_mapping: dict[str, str] | None = None
+    subgoal_source: str | None = None
     features: dict[str, PolicyFeature] = field(
         default_factory=lambda: {
             "action": PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
