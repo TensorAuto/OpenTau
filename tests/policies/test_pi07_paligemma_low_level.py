@@ -2424,31 +2424,64 @@ class TestSkipNormalizationWeights:
         cfg = PI07PaligemmaLowLevelConfig(skip_normalization_weights=True)
         assert cfg.skip_normalization_weights is True
 
-    def test_predicate_matches_all_eight_saved_buffer_keys(self):
-        """Exercises the production predicate
-        :py:func:`opentau.policies.pi07_paligemma.low_level.modeling_pi07_low_level._is_normalize_buffer_key`
-        directly so the test fails (rather than passes vacuously) when a
-        future edit broadens, narrows, or renames the predicate.
-
-        The eight keys below are the full set written by the current
+    def test_predicate_matches_real_normalize_buffer_keys(self):
+        """Grounds the predicate against the keys a real
         :py:class:`~opentau.policies.normalize.Normalize` /
-        :py:class:`~opentau.policies.normalize.Unnormalize` modules — if
-        ``create_stats_buffers`` ever grows a new buffer name this list
-        needs an entry and the predicate needs an update; the assertion
-        pins both sides together.
+        :py:class:`~opentau.policies.normalize.Unnormalize` actually
+        produces in its ``state_dict()`` — instead of hand-built keys
+        that happen to match by prefix coincidence.
+
+        Catches future refactors to either side of the contract: the
+        ``buffer_`` prefix or ``.`` → ``_`` mangling in
+        :py:class:`~opentau.policies.normalize.Normalize.__init__` (line
+        ~215), the per-mode buffer field names from
+        :py:func:`~opentau.policies.normalize.create_stats_buffers`
+        (``mean``/``std`` vs ``min``/``max``), and the predicate's
+        ``startswith`` anchor.
         """
-        saved_buffer_keys = [
-            "normalize_inputs.buffer_state.mean",
-            "normalize_inputs.buffer_state.std",
-            "normalize_targets.buffer_actions.mean",
-            "normalize_targets.buffer_actions.std",
-            "unnormalize_outputs.buffer_actions.mean",
-            "unnormalize_outputs.buffer_actions.std",
-            "normalize_discrete_actions.buffer_actions.min",
-            "normalize_discrete_actions.buffer_actions.max",
-        ]
-        for key in saved_buffer_keys:
-            assert _is_normalize_buffer_key(key), f"{key!r} should be stripped but predicate returned False"
+        from opentau.policies.normalize import Normalize, Unnormalize
+
+        features = {
+            "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(8,)),
+            "observation.images.top": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224)),
+            "action": PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
+        }
+        norm_map_mean_std = {
+            FeatureType.STATE: NormalizationMode.MEAN_STD,
+            FeatureType.VISUAL: NormalizationMode.IDENTITY,
+            FeatureType.ACTION: NormalizationMode.MEAN_STD,
+        }
+        norm_map_min_max = {
+            FeatureType.STATE: NormalizationMode.MIN_MAX,
+            FeatureType.VISUAL: NormalizationMode.IDENTITY,
+            FeatureType.ACTION: NormalizationMode.MIN_MAX,
+        }
+
+        normalize_mean_std_keys = list(Normalize(features, norm_map_mean_std).state_dict().keys())
+        unnormalize_mean_std_keys = list(Unnormalize(features, norm_map_mean_std).state_dict().keys())
+        normalize_min_max_keys = list(Normalize(features, norm_map_min_max).state_dict().keys())
+
+        # Each (Un)Normalize submodule attaches as ``normalize_inputs`` /
+        # ``normalize_targets`` / ``unnormalize_outputs`` /
+        # ``normalize_discrete_actions`` on the policy, so prepend each of
+        # those prefixes to get the saved-checkpoint shape.
+        for prefix, child_keys in [
+            ("normalize_inputs.", normalize_mean_std_keys),
+            ("normalize_targets.", normalize_mean_std_keys),
+            ("unnormalize_outputs.", unnormalize_mean_std_keys),
+            ("normalize_discrete_actions.", normalize_min_max_keys),
+        ]:
+            assert child_keys, (
+                f"Normalize / Unnormalize produced no keys for {prefix!r}; test fixture is broken"
+            )
+            for child_key in child_keys:
+                saved_key = prefix + child_key
+                assert _is_normalize_buffer_key(saved_key), (
+                    f"production saved key {saved_key!r} (built from "
+                    f"feature {child_key!r} under {prefix!r}) is not "
+                    "matched by _is_normalize_buffer_key — predicate or "
+                    "buffer-naming convention has drifted"
+                )
 
     def test_predicate_anchored_at_key_start(self):
         """The predicate must NOT match nested submodule keys that merely
