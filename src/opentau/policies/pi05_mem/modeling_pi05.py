@@ -314,6 +314,10 @@ class PI05MemPolicy(PreTrainedPolicy):
 
         acc = get_proc_accelerator()
         is_main_process = acc.is_main_process if acc else True
+        # Populated inside the try block when skip_normalization_weights fires;
+        # used outside the try/except to gate the inf-buffer guard so the
+        # ValueError is not swallowed by the broad except below.
+        stripped_keys: frozenset[str] = frozenset()
         try:
             if is_main_process:
                 logging.info("Loading model from: %s", pretrained_name_or_path)
@@ -367,14 +371,27 @@ class PI05MemPolicy(PreTrainedPolicy):
             # (outside the `if remap_count > 0` block) — promotion is needed
             # whether or not any other keys were renamed.
             model._promote_legacy_norm_buffers_in_state_dict(remapped_state_dict)
+
+            # Strip saved normalize/unnormalize buffers when the user opted in
+            # via config.skip_normalization_weights — see PreTrainedConfig and
+            # PreTrainedPolicy._strip_normalization_buffers_from_state_dict.
+            remapped_state_dict, stripped_keys = cls._strip_normalization_buffers_from_state_dict(
+                remapped_state_dict, model.config, is_main_process=is_main_process
+            )
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
 
-            if missing_keys and is_main_process:
-                logging.warning("Missing keys when loading state dict: %d keys", len(missing_keys))
-                for key in missing_keys[:20]:
+            # Hide deliberately-stripped buffer keys from the missing-keys
+            # warning so the noisy WARNING does not directly contradict the
+            # INFO logged just above. ``stripped_keys`` is empty when the
+            # flag is off, so this is a no-op for default loads.
+            unintended_missing = [key for key in missing_keys if key not in stripped_keys]
+
+            if unintended_missing and is_main_process:
+                logging.warning("Missing keys when loading state dict: %d keys", len(unintended_missing))
+                for key in unintended_missing[:20]:
                     logging.warning("  - %s", key)
-                if len(missing_keys) > 20:
-                    logging.warning("  ... and %d more", len(missing_keys) - 20)
+                if len(unintended_missing) > 20:
+                    logging.warning("  ... and %d more", len(unintended_missing) - 20)
 
             if unexpected_keys and is_main_process:
                 logging.warning("Unexpected keys when loading state dict: %d keys", len(unexpected_keys))
@@ -383,12 +400,17 @@ class PI05MemPolicy(PreTrainedPolicy):
                 if len(unexpected_keys) > 20:
                     logging.warning("  ... and %d more", len(unexpected_keys) - 20)
 
-            if not missing_keys and not unexpected_keys and is_main_process:
+            if not unintended_missing and not unexpected_keys and is_main_process:
                 logging.info("All keys loaded successfully!")
 
         except Exception as e:
             if is_main_process:
                 logging.warning("Could not remap state dict keys: %s", e)
+
+        # Outside the try/except so the ValueError is not swallowed by the
+        # broad except above. The helper no-ops when ``stripped_keys`` is
+        # empty (flag was off or the try block bailed before the strip ran).
+        cls._assert_normalize_buffers_initialized(model, stripped_keys=stripped_keys)
 
         return model
 

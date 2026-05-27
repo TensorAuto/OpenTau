@@ -328,11 +328,25 @@ class PI0Policy(PreTrainedPolicy):
         # load via `model.load_state_dict(..., strict=True)`.
         model._promote_legacy_norm_buffers_in_state_dict(transformed_state_dict)
 
+        # Strip saved normalize/unnormalize buffers when the user opted in
+        # via config.skip_normalization_weights — see PreTrainedConfig and
+        # PreTrainedPolicy._strip_normalization_buffers_from_state_dict.
+        transformed_state_dict, stripped_keys = cls._strip_normalization_buffers_from_state_dict(
+            transformed_state_dict, model.config
+        )
+
         # Load the transformed state dict
         msg = model.load_state_dict(transformed_state_dict, strict=strict)
 
-        # Log message
-        log_model_loading_keys(msg.missing_keys, msg.unexpected_keys)
+        # Hide deliberately-stripped buffer keys from the missing-keys log so
+        # it does not contradict the INFO emitted by the strip helper just
+        # above. ``stripped_keys`` is empty when the flag is off (no-op).
+        unintended_missing = [k for k in msg.missing_keys if k not in stripped_keys]
+        log_model_loading_keys(unintended_missing, msg.unexpected_keys)
+
+        # When the strip ran, fail loudly if dataset_stats was not wired in.
+        # No-op for the default load path.
+        cls._assert_normalize_buffers_initialized(model, stripped_keys=stripped_keys)
         return model
 
     def get_optim_params(self) -> dict:

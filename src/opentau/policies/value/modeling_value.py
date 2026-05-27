@@ -33,6 +33,7 @@ from transformers import AutoTokenizer
 
 from opentau.policies.normalize import Normalize
 from opentau.policies.pretrained import PreTrainedPolicy
+from opentau.policies.utils import log_model_loading_keys
 from opentau.policies.value.configuration_value import ValueConfig
 from opentau.policies.value.siglip_gemma import (
     SiglipGemmaValueConfig,
@@ -203,6 +204,49 @@ class ValueFunction(PreTrainedPolicy):
         there is no internal state to reset.
         """
         pass  # Value functions don't need state reset
+
+    @classmethod
+    def _load_as_safetensor(
+        cls, model: "ValueFunction", model_file: str, map_location: str, strict: bool
+    ) -> "ValueFunction":
+        """Load via an intermediate state dict so ``skip_normalization_weights`` is honored.
+
+        The base :py:meth:`~opentau.policies.pretrained.PreTrainedPolicy._load_as_safetensor`
+        calls ``safetensors.torch.load_model`` directly, which writes the file's
+        tensors into the model in place — there is no intermediate dict on which
+        :py:meth:`~opentau.policies.pretrained.PreTrainedPolicy._strip_normalization_buffers_from_state_dict`
+        could operate. This override routes through ``load_file`` + ``load_state_dict``
+        so the strip + inf-buffer guard apply to ``ValueFunction`` too.
+
+        Args:
+            model: The model instance.
+            model_file: Path to the safetensors file.
+            map_location: Device to map weights to.
+            strict: Whether to enforce strict key matching.
+
+        Returns:
+            The loaded model instance.
+        """
+        from safetensors.torch import load_file
+
+        state_dict = load_file(model_file, device=map_location)
+
+        # Strip saved normalize/unnormalize buffers when the user opted in via
+        # config.skip_normalization_weights — see PreTrainedConfig.
+        state_dict, stripped_keys = cls._strip_normalization_buffers_from_state_dict(state_dict, model.config)
+
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=strict)
+
+        # Hide deliberately-stripped buffer keys from the missing-keys log so
+        # it does not contradict the INFO emitted by the strip helper just
+        # above. ``stripped_keys`` is empty when the flag is off (no-op).
+        unintended_missing = [k for k in missing_keys if k not in stripped_keys]
+        log_model_loading_keys(unintended_missing, unexpected_keys)
+
+        # When the strip ran, fail loudly if dataset_stats was not wired in.
+        # No-op for the default load path.
+        cls._assert_normalize_buffers_initialized(model, stripped_keys=stripped_keys)
+        return model
 
     def get_optim_params(self) -> dict:
         """Returns the parameters to be optimized.

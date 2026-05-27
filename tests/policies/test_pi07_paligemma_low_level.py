@@ -24,8 +24,6 @@ from opentau.policies.pi07_paligemma.low_level.modeling_pi07_low_level import (
     ContextItem,
     PI07PaligemmaLowLevelFlowMatching,
     PI07PaligemmaLowLevelPolicy,
-    _find_inf_normalize_buffers,
-    _is_normalize_buffer_key,
     make_att_2d_masks,
 )
 
@@ -2410,17 +2408,13 @@ class TestPaligemmaLowLevelFpsSegment:
 
 
 class TestSkipNormalizationWeights:
-    """Pins ``skip_normalization_weights`` config field + the filter rule used
-    inside :py:meth:`PI07PaligemmaLowLevelPolicy.from_pretrained` to strip
-    saved ``normalize_*`` / ``unnormalize_*`` buffer tensors from the loaded
-    state dict.
+    """Smoke test that ``PI07PaligemmaLowLevelConfig`` still carries the
+    inherited ``skip_normalization_weights`` field.
 
-    Why this matters: when finetuning a checkpoint whose saved normalization
-    stats were aggregated over a different dataset mixture than the
-    finetuning data, the saved buffers clobber the freshly-initialised stats
-    from ``dataset_stats``. The model then keeps normalising in the wrong
-    space and cannot recover via training alone (buffers are
-    ``requires_grad=False``). This knob bypasses the clobber.
+    Cross-policy tests for the field default and keyword-settability live
+    in :mod:`tests.policies.test_pretrained_skip_normalization`. The shared
+    predicate / inf-guard tests live in
+    :mod:`tests.policies.test_normalize_helpers`.
     """
 
     def test_default_is_false(self):
@@ -2430,150 +2424,3 @@ class TestSkipNormalizationWeights:
     def test_can_be_set_true(self):
         cfg = PI07PaligemmaLowLevelConfig(skip_normalization_weights=True)
         assert cfg.skip_normalization_weights is True
-
-    def test_predicate_matches_real_normalize_buffer_keys(self):
-        """Grounds the predicate against the keys a real
-        :py:class:`~opentau.policies.normalize.Normalize` /
-        :py:class:`~opentau.policies.normalize.Unnormalize` actually
-        produces in its ``state_dict()`` — instead of hand-built keys
-        that happen to match by prefix coincidence.
-
-        Catches future refactors to either side of the contract: the
-        ``buffer_`` prefix or ``.`` → ``_`` mangling in
-        :py:class:`~opentau.policies.normalize.Normalize.__init__` (line
-        ~215), the per-mode buffer field names from
-        :py:func:`~opentau.policies.normalize.create_stats_buffers`
-        (``mean``/``std`` vs ``min``/``max``), and the predicate's
-        ``startswith`` anchor.
-        """
-        from opentau.policies.normalize import Normalize, Unnormalize
-
-        features = {
-            "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(8,)),
-            "observation.images.top": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224)),
-            "action": PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
-        }
-        norm_map_mean_std = {
-            FeatureType.STATE: NormalizationMode.MEAN_STD,
-            FeatureType.VISUAL: NormalizationMode.IDENTITY,
-            FeatureType.ACTION: NormalizationMode.MEAN_STD,
-        }
-        norm_map_min_max = {
-            FeatureType.STATE: NormalizationMode.MIN_MAX,
-            FeatureType.VISUAL: NormalizationMode.IDENTITY,
-            FeatureType.ACTION: NormalizationMode.MIN_MAX,
-        }
-
-        normalize_mean_std_keys = list(
-            Normalize(features, norm_map_mean_std, num_datasets=1).state_dict().keys()
-        )
-        unnormalize_mean_std_keys = list(
-            Unnormalize(features, norm_map_mean_std, num_datasets=1).state_dict().keys()
-        )
-        normalize_min_max_keys = list(
-            Normalize(features, norm_map_min_max, num_datasets=1).state_dict().keys()
-        )
-
-        # Each (Un)Normalize submodule attaches as ``normalize_inputs`` /
-        # ``normalize_targets`` / ``unnormalize_outputs`` /
-        # ``normalize_discrete_actions`` on the policy, so prepend each of
-        # those prefixes to get the saved-checkpoint shape.
-        for prefix, child_keys in [
-            ("normalize_inputs.", normalize_mean_std_keys),
-            ("normalize_targets.", normalize_mean_std_keys),
-            ("unnormalize_outputs.", unnormalize_mean_std_keys),
-            ("normalize_discrete_actions.", normalize_min_max_keys),
-        ]:
-            assert child_keys, (
-                f"Normalize / Unnormalize produced no keys for {prefix!r}; test fixture is broken"
-            )
-            for child_key in child_keys:
-                saved_key = prefix + child_key
-                assert _is_normalize_buffer_key(saved_key), (
-                    f"production saved key {saved_key!r} (built from "
-                    f"feature {child_key!r} under {prefix!r}) is not "
-                    "matched by _is_normalize_buffer_key — predicate or "
-                    "buffer-naming convention has drifted"
-                )
-
-    def test_predicate_anchored_at_key_start(self):
-        """The predicate must NOT match nested submodule keys that merely
-        contain ``normalize`` further down (e.g. a future
-        ``model.<layer>.normalize_internal.weight``). Anchoring at the
-        start of the key is what keeps the strip surgical to the eight
-        top-level buffer tensors.
-        """
-        non_buffer_keys = [
-            "model.paligemma_with_expert.foo.weight",
-            "state_proj.weight",
-            "model.some_layer.normalize_inputs_internal.weight",
-            "model.unnormalize_helper.scratch",
-            "language_tokenizer.embedding",
-        ]
-        for key in non_buffer_keys:
-            assert not _is_normalize_buffer_key(key), f"{key!r} should be kept but predicate returned True"
-
-    def test_find_inf_normalize_buffers_detects_init_inf_sentinels(self):
-        """The runtime guard helper used by
-        :py:meth:`PI07PaligemmaLowLevelPolicy.from_pretrained` must catch
-        the ``skip_normalization_weights=True`` + missing ``dataset_stats``
-        combination — where :py:func:`~opentau.policies.normalize.create_stats_buffers`
-        leaves the Normalize buffers at the ``torch.inf`` sentinel.
-
-        Mirrors the production layout: a parent module that holds a
-        :py:class:`~opentau.policies.normalize.Normalize` submodule under
-        the attribute name ``normalize_inputs``, with no ``dataset_stats``
-        passed so the buffers stay at ``inf``.
-        """
-        import torch.nn as nn
-
-        from opentau.policies.normalize import Normalize
-
-        features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(7,))}
-        norm_map = {FeatureType.ACTION: NormalizationMode.MEAN_STD}
-
-        parent = nn.Module()
-        parent.normalize_inputs = Normalize(features, norm_map, num_datasets=1)
-
-        inf_buffers = _find_inf_normalize_buffers(parent)
-        assert inf_buffers, "expected the helper to flag at least one inf buffer for a stats-less Normalize"
-        assert all(name.startswith("normalize_inputs.") for name in inf_buffers), (
-            f"flagged buffers must all be under the parent's normalize_inputs path; got {inf_buffers!r}"
-        )
-
-    def test_find_inf_normalize_buffers_empty_when_stats_passed(self):
-        """When ``dataset_stats`` is wired through, every Normalize /
-        Unnormalize buffer is finite and the helper returns an empty
-        list — the production load path then skips the ValueError.
-        """
-        import numpy as np
-        import torch.nn as nn
-
-        from opentau.policies.normalize import Normalize, Unnormalize
-
-        features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(7,))}
-        norm_map = {FeatureType.ACTION: NormalizationMode.MEAN_STD}
-        stats = {"action": {"mean": np.zeros(7, dtype=np.float32), "std": np.ones(7, dtype=np.float32)}}
-
-        parent = nn.Module()
-        parent.normalize_inputs = Normalize(features, norm_map, per_dataset_stats=[stats])
-        parent.unnormalize_outputs = Unnormalize(features, norm_map, per_dataset_stats=[stats])
-
-        assert _find_inf_normalize_buffers(parent) == []
-
-    def test_find_inf_normalize_buffers_ignores_non_buffer_params(self):
-        """The helper must only flag Normalize / Unnormalize buffer
-        params — never an unrelated parameter that happens to contain
-        ``inf`` (e.g. a deliberately-initialised attention bias, an
-        embedding being NaN-checked, etc.).
-        """
-        import torch.nn as nn
-
-        parent = nn.Module()
-        # Looks like a Normalize buffer name but is NOT under a
-        # normalize_*/unnormalize_* attribute path — verifies the
-        # predicate is anchored at the parameter-path start.
-        parent.some_layer = nn.Linear(4, 4)
-        parent.some_layer.bias.data.fill_(float("inf"))
-
-        assert _find_inf_normalize_buffers(parent) == []

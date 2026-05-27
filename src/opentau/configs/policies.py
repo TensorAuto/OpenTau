@@ -269,6 +269,24 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
             normalization mode to apply.
         output_normalization_modes: Similar dictionary as `input_normalization_modes`, but to unnormalize to
             the original scale.
+        skip_normalization_weights: When loading via :py:meth:`~opentau.policies.pretrained.PreTrainedPolicy.from_pretrained`,
+            drop the saved ``normalize_*`` / ``unnormalize_*`` buffer tensors from the state dict
+            before ``load_state_dict``. The buffers freshly initialised from ``dataset_stats``
+            then survive — use this when finetuning a checkpoint whose saved normalization stats
+            were aggregated over a different dataset mixture than the finetuning data. The
+            buffers are registered as ``nn.Parameter(requires_grad=False)``, so training alone
+            cannot recover from inheriting the wrong stats. **Requires ``dataset_stats`` to be
+            supplied to ``__init__``** (e.g. via :py:func:`opentau.policies.factory.make_policy`);
+            otherwise the buffers stay at the ``inf`` sentinel from
+            :py:func:`opentau.policies.normalize.create_stats_buffers` and the next forward
+            crashes. **One-shot:** after the strip fires successfully, ``from_pretrained`` resets
+            the flag to ``False`` on the model's config so that subsequent ``save_pretrained`` /
+            resume / inference loads do not re-strip the now-correct finetuned buffers. The
+            model was trained against the saved stats, so switching the normalization mid-training
+            only makes sense when followed by further training, not when loading purely for
+            inference. Honored by every policy whose ``from_pretrained`` (or ``_load_as_safetensor``)
+            calls :py:meth:`~opentau.policies.pretrained.PreTrainedPolicy._strip_normalization_buffers_from_state_dict`.
+            Defaults to ``False`` (no behaviour change).
     """
 
     n_obs_steps: int = 1
@@ -282,6 +300,7 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
     # automatic gradient scaling is used.
     use_amp: bool = False
     pretrained_path: str | None = None
+    skip_normalization_weights: bool = False
 
     # When False, `_save_pretrained` strips normalize_*.buffer_* / unnormalize_*.buffer_*
     # keys from the state_dict before writing model.safetensors. Reloading then requires
