@@ -24,6 +24,7 @@ from opentau.policies.pi07_paligemma.low_level.modeling_pi07_low_level import (
     ContextItem,
     PI07PaligemmaLowLevelFlowMatching,
     PI07PaligemmaLowLevelPolicy,
+    _find_inf_normalize_buffers,
     _is_normalize_buffer_key,
     make_att_2d_masks,
 )
@@ -2499,3 +2500,68 @@ class TestSkipNormalizationWeights:
         ]
         for key in non_buffer_keys:
             assert not _is_normalize_buffer_key(key), f"{key!r} should be kept but predicate returned True"
+
+    def test_find_inf_normalize_buffers_detects_init_inf_sentinels(self):
+        """The runtime guard helper used by
+        :py:meth:`PI07PaligemmaLowLevelPolicy.from_pretrained` must catch
+        the ``skip_normalization_weights=True`` + missing ``dataset_stats``
+        combination — where :py:func:`~opentau.policies.normalize.create_stats_buffers`
+        leaves the Normalize buffers at the ``torch.inf`` sentinel.
+
+        Mirrors the production layout: a parent module that holds a
+        :py:class:`~opentau.policies.normalize.Normalize` submodule under
+        the attribute name ``normalize_inputs``, with no ``dataset_stats``
+        passed so the buffers stay at ``inf``.
+        """
+        import torch.nn as nn
+
+        from opentau.policies.normalize import Normalize
+
+        features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(7,))}
+        norm_map = {FeatureType.ACTION: NormalizationMode.MEAN_STD}
+
+        parent = nn.Module()
+        parent.normalize_inputs = Normalize(features, norm_map, stats=None)
+
+        inf_buffers = _find_inf_normalize_buffers(parent)
+        assert inf_buffers, "expected the helper to flag at least one inf buffer for a stats-less Normalize"
+        assert all(name.startswith("normalize_inputs.") for name in inf_buffers), (
+            f"flagged buffers must all be under the parent's normalize_inputs path; got {inf_buffers!r}"
+        )
+
+    def test_find_inf_normalize_buffers_empty_when_stats_passed(self):
+        """When ``dataset_stats`` is wired through, every Normalize /
+        Unnormalize buffer is finite and the helper returns an empty
+        list — the production load path then skips the ValueError.
+        """
+        import numpy as np
+        import torch.nn as nn
+
+        from opentau.policies.normalize import Normalize, Unnormalize
+
+        features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(7,))}
+        norm_map = {FeatureType.ACTION: NormalizationMode.MEAN_STD}
+        stats = {"action": {"mean": np.zeros(7, dtype=np.float32), "std": np.ones(7, dtype=np.float32)}}
+
+        parent = nn.Module()
+        parent.normalize_inputs = Normalize(features, norm_map, stats=stats)
+        parent.unnormalize_outputs = Unnormalize(features, norm_map, stats=stats)
+
+        assert _find_inf_normalize_buffers(parent) == []
+
+    def test_find_inf_normalize_buffers_ignores_non_buffer_params(self):
+        """The helper must only flag Normalize / Unnormalize buffer
+        params — never an unrelated parameter that happens to contain
+        ``inf`` (e.g. a deliberately-initialised attention bias, an
+        embedding being NaN-checked, etc.).
+        """
+        import torch.nn as nn
+
+        parent = nn.Module()
+        # Looks like a Normalize buffer name but is NOT under a
+        # normalize_*/unnormalize_* attribute path — verifies the
+        # predicate is anchored at the parameter-path start.
+        parent.some_layer = nn.Linear(4, 4)
+        parent.some_layer.bias.data.fill_(float("inf"))
+
+        assert _find_inf_normalize_buffers(parent) == []

@@ -125,6 +125,27 @@ def _is_normalize_buffer_key(key: str) -> bool:
     return key.startswith("normalize_") or key.startswith("unnormalize_")
 
 
+def _find_inf_normalize_buffers(module: nn.Module) -> list[str]:
+    """Return the names of every Normalize / Unnormalize buffer parameter on
+    ``module`` that still holds the ``torch.inf`` sentinel from
+    :py:func:`~opentau.policies.normalize.create_stats_buffers`.
+
+    Used by :py:meth:`PI07PaligemmaLowLevelPolicy.from_pretrained` to detect
+    the ``skip_normalization_weights=True`` + missing ``dataset_stats``
+    combination: the strip voids the "load_state_dict will refill these"
+    branch of the ``dataset_stats`` contract, so without ``dataset_stats``
+    the buffers stay at ``inf`` and the next forward crashes inside
+    :py:meth:`~opentau.policies.normalize.Normalize.forward` with a
+    "use a pretrained model" error that actively misleads when a
+    pretrained model *was* used.
+    """
+    return [
+        name
+        for name, param in module.named_parameters()
+        if _is_normalize_buffer_key(name) and torch.isinf(param).any()
+    ]
+
+
 def create_sinusoidal_pos_embedding(
     time: Tensor, dimension: int, min_period: float, max_period: float, device: torch.device | str = "cpu"
 ) -> Tensor:
@@ -419,6 +440,11 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         # Now manually load and remap the state dict
         acc = get_proc_accelerator()
         is_main_process = acc.is_main_process if acc else True
+        # Tracks whether the strip branch fired inside the try block below.
+        # Used outside the try/except to gate the inf-buffer guard so the
+        # ValueError is not swallowed by the broad `except Exception` that
+        # otherwise just warns and returns the (broken) model.
+        strip_ran = False
         try:
             # Try to load the pytorch_model.bin or model.safetensors file
             if is_main_process:
@@ -495,6 +521,7 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
                 # persists False, and later resumes / inference loads do not
                 # re-strip the now-correct finetuned buffers.
                 model.config.skip_normalization_weights = False
+                strip_ran = True
 
             # Load the remapped state dict into the model
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
@@ -525,6 +552,29 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         except Exception as e:
             if is_main_process:
                 logging.warning("Could not remap state dict keys: %s", e)
+
+        # Outside the try/except so the ValueError is not swallowed.
+        # Gated on `strip_ran` so this only fires when the load path
+        # actually reached and executed the strip branch — i.e. the user
+        # asked for skip_normalization_weights AND the load succeeded far
+        # enough to apply it. The strip voids the "load_state_dict will
+        # refill these" half of the dataset_stats contract, so without
+        # dataset_stats wired into __init__, the buffers stay at the
+        # torch.inf sentinel from create_stats_buffers and the next
+        # forward crashes inside Normalize.forward with a "use a
+        # pretrained model" message that actively misleads here.
+        if strip_ran:
+            inf_buffers = _find_inf_normalize_buffers(model)
+            if inf_buffers:
+                raise ValueError(
+                    "skip_normalization_weights=True requires `dataset_stats` to be "
+                    "passed to __init__ (e.g. via "
+                    "`opentau.policies.factory.make_policy(..., ds_meta=...)`) so "
+                    "the fresh buffers can replace the stripped saved ones; got "
+                    f"{len(inf_buffers)} uninitialized (inf) buffer(s): "
+                    + ", ".join(inf_buffers[:5])
+                    + (f", ... ({len(inf_buffers) - 5} more)" if len(inf_buffers) > 5 else "")
+                )
 
         return model
 
