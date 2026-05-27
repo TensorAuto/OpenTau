@@ -341,7 +341,7 @@ class TestPI07PaligemmaLowLevelIntegration:
         """Test the PI07 low-level pipeline: forward (training) and select_action (inference)."""
 
         config = self._make_config()
-        policy = PI07PaligemmaLowLevelPolicy(config, dataset_stats=lerobot_dataset_metadata.stats)
+        policy = PI07PaligemmaLowLevelPolicy(config, per_dataset_stats=[lerobot_dataset_metadata.stats])
         tokenizer = policy.model.language_tokenizer
 
         batch_size = 1

@@ -359,7 +359,7 @@ class TestPI07LowLevelIntegration:
         """Test the PI07 low-level component pipeline: forward (training) and select_action (inference)."""
 
         config = self._make_config()
-        policy = PI07LowLevelPolicy(config, dataset_stats=lerobot_dataset_metadata.stats)
+        policy = PI07LowLevelPolicy(config, per_dataset_stats=[lerobot_dataset_metadata.stats])
         tokenizer = policy.model.language_tokenizer
 
         batch_size = 1
@@ -635,7 +635,7 @@ class TestPI07LowLevelIntegration:
         offsets on real Gemma 3 weights.
         """
         config = self._make_config()
-        policy = PI07LowLevelPolicy(config, dataset_stats=lerobot_dataset_metadata.stats)
+        policy = PI07LowLevelPolicy(config, per_dataset_stats=[lerobot_dataset_metadata.stats])
         tokenizer = policy.model.language_tokenizer
 
         batch_size = 1
@@ -744,7 +744,7 @@ class TestPI07LowLevelRegression:
     @staticmethod
     def _make_policy(lerobot_dataset_metadata) -> PI07LowLevelPolicy:
         config = TestPI07LowLevelIntegration._make_config()
-        policy = PI07LowLevelPolicy(config, dataset_stats=lerobot_dataset_metadata.stats)
+        policy = PI07LowLevelPolicy(config, per_dataset_stats=[lerobot_dataset_metadata.stats])
         policy.to(dtype=torch.bfloat16, device="cuda")
         return policy
 

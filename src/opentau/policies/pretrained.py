@@ -273,10 +273,17 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         training-time ``dataset_names`` list (stored on ``self.config``) to
         the corresponding integer index.
 
+        Single-dataset fallback: when the batch lacks BOTH keys AND the
+        policy was constructed with ``num_datasets <= 1`` (or legacy
+        ``dataset_names is None``), default to zeros so callers don't have
+        to inject ``dataset_index`` for the one-row buffer. Multi-dataset
+        policies always require the caller to be explicit; otherwise mixing
+        samples from different datasets without identification is silently
+        wrong.
+
         Raises:
-            KeyError: neither ``dataset_index`` nor ``dataset_repo_id`` was provided.
-            RuntimeError: ``dataset_repo_id`` was provided but the policy was
-                loaded without a ``dataset_names`` list.
+            KeyError: neither ``dataset_index`` nor ``dataset_repo_id`` was
+                provided AND the policy has more than one dataset.
             ValueError: a name was provided that isn't in ``dataset_names``.
         """
         if "dataset_index" in batch:
@@ -286,10 +293,14 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
             return idx.to(dtype=torch.long)
 
         if "dataset_repo_id" not in batch:
+            num_datasets = len(self._dataset_name_to_index) if self._dataset_name_to_index else 1
+            if num_datasets <= 1:
+                batch_size, device = self._infer_batch_size_and_device(batch)
+                return torch.zeros(batch_size or 1, dtype=torch.long, device=device)
             raise KeyError(
-                "Per-dataset normalization requires either `dataset_index` "
-                "(LongTensor of shape (B,)) or `dataset_repo_id` (str or "
-                "list[str] of length B) in the batch."
+                "Per-dataset normalization with >1 dataset requires either "
+                "`dataset_index` (LongTensor of shape (B,)) or "
+                "`dataset_repo_id` (str or list[str] of length B) in the batch."
             )
 
         if self._dataset_name_to_index is None:
@@ -298,7 +309,6 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                 "`dataset_repo_id` strings. Either pass `batch['dataset_index']` "
                 "directly or rebuild the policy via `make_policy(cfg, ds_meta=...)`."
             )
-
         raw = batch["dataset_repo_id"]
         batch_size, device = self._infer_batch_size_and_device(batch)
         names = [raw] * (batch_size or 1) if isinstance(raw, str) else list(raw)

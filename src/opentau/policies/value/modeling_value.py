@@ -138,7 +138,21 @@ class ValueFunction(PreTrainedPolicy):
         super().__init__(config)
         config.validate_features()
         self.config = config
-        self.normalize_inputs = Normalize(config.input_features, config.normalization_mapping, dataset_stats)
+        # The shared `Normalize` module accepts `per_dataset_stats: list[dict]`
+        # since the per-dataset normalization rewrite. `ValueFunction`'s
+        # external API still takes a single ``dataset_stats: dict | None`` —
+        # wrap into a singleton list so the policy keeps working without
+        # forcing every caller to migrate. The single-dataset path is
+        # equivalent to the old behaviour (stacked buffer of leading dim 1,
+        # `dataset_index=0` for every sample).
+        per_dataset_stats = [dataset_stats] if dataset_stats is not None else None
+        num_datasets = 1
+        self.normalize_inputs = Normalize(
+            config.input_features,
+            config.normalization_mapping,
+            per_dataset_stats=per_dataset_stats,
+            num_datasets=num_datasets,
+        )
 
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-270m")
         self.model = ValueModel(config)
@@ -228,7 +242,11 @@ class ValueFunction(PreTrainedPolicy):
         """
         self.eval()
 
-        batch = self.normalize_inputs(batch)
+        # `ValueFunction` is a single-dataset policy (its `Normalize` was
+        # built with `num_datasets=1`); `_resolve_dataset_index` defaults
+        # to zeros in that case so callers don't need to inject the index.
+        dataset_index = self._resolve_dataset_index(batch)
+        batch = self.normalize_inputs(batch, dataset_index)
 
         images, img_masks = self.prepare_images(batch)
         lang_tokens, lang_masks = self.prepare_language(batch)
@@ -245,7 +263,11 @@ class ValueFunction(PreTrainedPolicy):
         Returns:
             Tuple of (loss_dict, None) where loss_dict contains the MSE loss
         """
-        batch = self.normalize_inputs(batch)
+        # `ValueFunction` is a single-dataset policy (its `Normalize` was
+        # built with `num_datasets=1`); `_resolve_dataset_index` defaults
+        # to zeros in that case so callers don't need to inject the index.
+        dataset_index = self._resolve_dataset_index(batch)
+        batch = self.normalize_inputs(batch, dataset_index)
 
         images, img_masks = self.prepare_images(batch)
         lang_tokens, lang_masks = self.prepare_language(batch)

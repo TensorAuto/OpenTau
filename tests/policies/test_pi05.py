@@ -262,7 +262,7 @@ class TestPI05Integration:
 
         # Initialize policy with unified training mode
         config = pi05_training_config.policy
-        policy = PI05Policy(config, dataset_stats=lerobot_dataset_metadata.stats)
+        policy = PI05Policy(config, per_dataset_stats=[lerobot_dataset_metadata.stats])
 
         # Test data preparation pipeline
         batch_size = 1
@@ -590,7 +590,7 @@ def test_pi05_loc_tokens_in_response_produce_finite_loss(pi05_training_config, l
     promotion wired in `PI05Policy.__init__` / `PI05FlowMatching.__init__`."""
 
     config = pi05_training_config.policy
-    policy = PI05Policy(config, dataset_stats=lerobot_dataset_metadata.stats)
+    policy = PI05Policy(config, per_dataset_stats=[lerobot_dataset_metadata.stats])
 
     # PI05Policy and PI05FlowMatching share a single tokenizer instance so
     # token IDs cannot drift between the two layers.

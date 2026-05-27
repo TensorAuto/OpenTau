@@ -232,7 +232,7 @@ def test_policy_end_to_end_cuda():
     }
 
     print("[e2e] device=cuda dtype=bfloat16 pretrained_path=None n_obs_steps=4")
-    policy = PI05MemPolicy(config, dataset_stats=dataset_stats).to(device="cuda", dtype=torch.bfloat16)
+    policy = PI05MemPolicy(config, per_dataset_stats=[dataset_stats]).to(device="cuda", dtype=torch.bfloat16)
 
     batch_size = 1
     batch = {
