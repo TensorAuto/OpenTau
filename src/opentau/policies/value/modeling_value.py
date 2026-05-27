@@ -163,6 +163,28 @@ class ValueFunction(PreTrainedPolicy):
                 len(per_dataset_stats),
             )
             per_dataset_stats = per_dataset_stats[:1]
+            if dataset_names is not None:
+                dataset_names = dataset_names[:1]
+        # `super().__init__(config)` already populated `self._dataset_name_to_index`
+        # from `config.dataset_names`. The value policy is single-dataset by
+        # construction, so any multi-dataset config the caller carried in
+        # would leave a 3-entry name map pointing at a 1-row buffer — an
+        # inference call with `dataset_repo_id='<second>'` would index out
+        # of range. Rebuild the name map to match the truncated stats.
+        if dataset_names is not None:
+            self.config.dataset_names = list(dataset_names)
+            self._dataset_name_to_index = {name: i for i, name in enumerate(dataset_names)}
+        elif getattr(self.config, "dataset_names", None) and len(self.config.dataset_names) > 1:
+            kept = self.config.dataset_names[:1]
+            logging.warning(
+                "ValueFunction is single-dataset; truncating "
+                "`config.dataset_names` from %s to %s to match the 1-row "
+                "Normalize buffer.",
+                list(self.config.dataset_names),
+                kept,
+            )
+            self.config.dataset_names = kept
+            self._dataset_name_to_index = {name: i for i, name in enumerate(kept)}
         num_datasets = 1
         self.normalize_inputs = Normalize(
             config.input_features,

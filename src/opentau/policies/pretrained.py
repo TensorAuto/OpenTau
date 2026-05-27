@@ -281,18 +281,66 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         policy.eval()
         return policy
 
+    # Keys injected by `_TaggedDataset` (and by inference callers) that don't
+    # represent data living on the policy's compute device. Skipped when
+    # `_infer_batch_size_and_device` walks the batch — otherwise the helper
+    # could return CPU based on a `dataset_index` that the caller hand-built
+    # on CPU even when every actual observation tensor is on GPU.
+    _NON_DATA_BATCH_KEYS: frozenset[str] = frozenset({"dataset_index", "dataset_repo_id"})
+
+    def _model_device(self) -> torch.device:
+        """Return the policy's compute device, falling back to CPU on a no-param policy."""
+        try:
+            return next(self.parameters()).device
+        except StopIteration:
+            return torch.device("cpu")
+
+    def _stacked_num_datasets(self) -> int:
+        """Return the leading dim of the stacked Normalize/Unnormalize buffers.
+
+        This is the *source of truth* for "how many datasets does this policy
+        normalize across" — the per-feature stat buffers are shaped
+        ``(num_datasets, *feat_shape)`` regardless of whether the policy was
+        constructed via `make_policy` (which populates
+        `config.dataset_names`) or directly (which may leave it ``None``).
+        Used by `_resolve_dataset_index`'s single-dataset fallback so the
+        zero-default kicks in only when the buffer truly has one row.
+
+        Returns ``1`` when no Normalize/Unnormalize module is attached or
+        when none of them have any ``buffer_*`` submodule (IDENTITY-only
+        policies). That's safe because the zero-default-on-no-key branch
+        is itself a no-op in that case.
+        """
+        for module_name in NORM_MODULE_NAMES:
+            module = getattr(self, module_name, None)
+            if module is None:
+                continue
+            for child_name, child in module.named_children():
+                if not child_name.startswith("buffer_"):
+                    continue
+                for stat_name in ("mean", "std", "min", "max"):
+                    if stat_name in child:
+                        return int(child[stat_name].shape[0])
+        return 1
+
     def _infer_batch_size_and_device(self, batch: dict[str, Tensor]) -> tuple[int, torch.device]:
-        """Find any tensor in ``batch`` and return (batch_size, device).
+        """Find any data tensor in ``batch`` and return (batch_size, device).
 
         Used by ``_resolve_dataset_index`` when the caller supplied
         ``dataset_repo_id`` as a Python string/list — we need to allocate the
-        index tensor on the same device as the rest of the batch.
+        index tensor on the same device as the rest of the batch. Skips the
+        mixture-/inference-injected ``dataset_index`` / ``dataset_repo_id``
+        keys so a CPU-resident dataset_index doesn't override a GPU batch
+        when iteration order happens to put it first.
         """
-        for v in batch.values():
+        for key, v in batch.items():
+            if key in self._NON_DATA_BATCH_KEYS:
+                continue
             if isinstance(v, Tensor):
                 return v.shape[0] if v.ndim > 0 else 1, v.device
-        # No tensors in the batch — fall back to CPU and trust caller's len(list).
-        return 0, torch.device("cpu")
+        # No data tensors in the batch — fall back to the policy's own device
+        # rather than CPU so subsequent `index_select` runs on the right side.
+        return 0, self._model_device()
 
     def _resolve_dataset_index(self, batch: dict[str, Tensor]) -> Tensor:
         """Resolve per-sample dataset indices from a training or inference batch.
@@ -323,24 +371,33 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
             idx = batch["dataset_index"]
             if not isinstance(idx, Tensor):
                 idx = torch.as_tensor(idx, dtype=torch.long)
-            # Move to whichever device the batch tensors live on. The
-            # dataloader's `pin_memory=True` materializes everything as CPU
-            # tensors and Accelerate later does the host->device copy on a
-            # per-key basis — `dataset_index` rides along for tensor keys,
-            # but a caller hand-constructing a batch on GPU may leave the
-            # index on CPU, breaking `index_select` inside Normalize.
-            _, device = self._infer_batch_size_and_device(batch)
-            return idx.to(dtype=torch.long, device=device)
+            # Move to the policy's compute device, not to "whichever device
+            # the first batch tensor happens to live on": `_infer_batch_size_and_device`
+            # iterates dict-insertion order, so a caller that put
+            # `dataset_index` first in their batch dict would have returned the
+            # index's own (CPU) device and made this a no-op, then crashed at
+            # `index_select` inside Normalize. Reading from `self.parameters()`
+            # is unambiguous and matches where Normalize's buffers actually
+            # live.
+            return idx.to(dtype=torch.long, device=self._model_device())
 
         if "dataset_repo_id" not in batch:
-            num_datasets = len(self._dataset_name_to_index) if self._dataset_name_to_index else 1
+            # Source of truth is the buffer's leading dim, NOT
+            # `len(self._dataset_name_to_index)`. A caller can construct a
+            # policy directly (`PI05Policy(config, per_dataset_stats=[s1, s2])`
+            # without setting `config.dataset_names`) — the name map stays
+            # None, but the buffer has 2 rows, so falling through to
+            # "default to zeros" would silently normalize every sample
+            # against `s1` and ignore `s2`. Reading the buffer is unambiguous.
+            num_datasets = self._stacked_num_datasets()
             if num_datasets <= 1:
                 batch_size, device = self._infer_batch_size_and_device(batch)
                 return torch.zeros(batch_size or 1, dtype=torch.long, device=device)
             raise KeyError(
-                "Per-dataset normalization with >1 dataset requires either "
-                "`dataset_index` (LongTensor of shape (B,)) or "
-                "`dataset_repo_id` (str or list[str] of length B) in the batch."
+                f"Per-dataset normalization with {num_datasets} datasets "
+                "requires either `dataset_index` (LongTensor of shape (B,)) "
+                "or `dataset_repo_id` (str or list[str] of length B) in the "
+                "batch."
             )
 
         if self._dataset_name_to_index is None:

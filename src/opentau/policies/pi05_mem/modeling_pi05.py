@@ -361,9 +361,11 @@ class PI05MemPolicy(PreTrainedPolicy):
             if remap_count > 0 and is_main_process:
                 logging.info("Remapped %d state dict keys", remap_count)
 
-                # Promote legacy single-dataset Normalize/Unnormalize buffers from
+            # Promote legacy single-dataset Normalize/Unnormalize buffers from
             # `(*feat_shape,)` to the new `(1, *feat_shape)` stacked layout so pre-PR
-            # checkpoints load via `model.load_state_dict(...)`.
+            # checkpoints load via `model.load_state_dict(...)`. Always run
+            # (outside the `if remap_count > 0` block) — promotion is needed
+            # whether or not any other keys were renamed.
             model._promote_legacy_norm_buffers_in_state_dict(remapped_state_dict)
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
 

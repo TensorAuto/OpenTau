@@ -21,6 +21,7 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from pprint import pformat
 from typing import Any
 
@@ -568,17 +569,37 @@ def train(cfg: TrainPipelineConfig):
         accelerator.register_save_state_pre_hook(_strip_norm_buffers_pre_save)
 
     if cfg.resume:
-        # load accelerator state
-        # This will load the model, optimizer, and lr_scheduler state.
-        # When `save_normalization_stats=False`, the on-disk safetensors lacks
-        # `normalize_*.buffer_*` keys, so the default `strict=True` load
-        # raises. Pass `strict=False` to let those missing keys pass — the
-        # buffers were already repopulated by `_inject_stats` inside
-        # `make_policy(cfg, ds_meta=...)` above, so this leaves them at the
-        # right values rather than silently overwriting.
+        # Inspect the on-disk safetensors header (rather than trusting the
+        # *current* `cfg.policy.save_normalization_stats` flag) to decide
+        # whether `strict=True` would crash on missing norm-buffer keys.
+        # This makes resume robust to the user toggling the flag between the
+        # initial run and the resume — the file on disk is the only source
+        # of truth for what's actually missing. Reading the header is also
+        # cheap; safetensors parses just the index.
         load_kwargs: dict = {}
-        if not cfg.policy.save_normalization_stats:
-            load_kwargs["strict"] = False
+        try:
+            from safetensors import safe_open
+
+            ckpt_safetensors = Path(cfg.checkpoint_path) / "model.safetensors"
+            if ckpt_safetensors.exists():
+                with safe_open(str(ckpt_safetensors), framework="pt") as f:
+                    saved_keys = set(f.keys())
+                if not any(is_norm_buffer_key(k) for k in saved_keys):
+                    # The disk checkpoint omits every norm buffer — strict
+                    # load would raise. The buffers were already repopulated
+                    # by `_inject_stats` inside `make_policy(..., ds_meta=...)`
+                    # above, so falling back to `strict=False` leaves them at
+                    # the right values rather than silently overwriting.
+                    load_kwargs["strict"] = False
+        except Exception as e:
+            logging.warning(
+                "Could not inspect %s/model.safetensors to decide strict mode "
+                "for resume (%s). Falling back to the cfg flag.",
+                cfg.checkpoint_path,
+                e,
+            )
+            if not cfg.policy.save_normalization_stats:
+                load_kwargs["strict"] = False
         accelerator.load_state(cfg.checkpoint_path, **load_kwargs)
 
         # When the master-weights wrapper is in use, the live bf16 weights
