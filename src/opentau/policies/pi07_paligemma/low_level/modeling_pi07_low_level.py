@@ -451,6 +451,23 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
             if remap_count > 0 and is_main_process:
                 logging.info("Remapped %d state dict keys", remap_count)
 
+            # Strip saved normalize/unnormalize buffers so the
+            # ``dataset_stats``-initialised buffers from ``__init__`` survive
+            # the load. ``requires_grad=False`` on those tensors means training
+            # alone cannot recover from inheriting the wrong stats.
+            if config.skip_normalization_weights:
+                n_before = len(remapped_state_dict)
+                remapped_state_dict = {
+                    key: val
+                    for key, val in remapped_state_dict.items()
+                    if not (key.startswith("normalize_") or key.startswith("unnormalize_"))
+                }
+                if is_main_process:
+                    logging.info(
+                        "skip_normalization_weights=True; dropped %d saved normalize/unnormalize buffer keys",
+                        n_before - len(remapped_state_dict),
+                    )
+
             # Load the remapped state dict into the model
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
 

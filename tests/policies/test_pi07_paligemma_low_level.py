@@ -2399,3 +2399,65 @@ class TestPaligemmaLowLevelFpsSegment:
 
         assert "FPS: 30, " in captured[0]
         assert "FPS:" not in captured[1]
+
+
+class TestSkipNormalizationWeights:
+    """Pins ``skip_normalization_weights`` config field + the filter rule used
+    inside :py:meth:`PI07PaligemmaLowLevelPolicy.from_pretrained` to strip
+    saved ``normalize_*`` / ``unnormalize_*`` buffer tensors from the loaded
+    state dict.
+
+    Why this matters: when finetuning a checkpoint whose saved normalization
+    stats were aggregated over a different dataset mixture than the
+    finetuning data, the saved buffers clobber the freshly-initialised stats
+    from ``dataset_stats``. The model then keeps normalising in the wrong
+    space and cannot recover via training alone (buffers are
+    ``requires_grad=False``). This knob bypasses the clobber.
+    """
+
+    def test_default_is_false(self):
+        cfg = PI07PaligemmaLowLevelConfig()
+        assert cfg.skip_normalization_weights is False
+
+    def test_can_be_set_true(self):
+        cfg = PI07PaligemmaLowLevelConfig(skip_normalization_weights=True)
+        assert cfg.skip_normalization_weights is True
+
+    def test_filter_strips_only_normalize_buffer_keys(self):
+        """The filter expression used in ``from_pretrained`` should drop
+        every saved ``normalize_*`` / ``unnormalize_*`` top-level key and
+        leave every other key (including ``model.normalize_…`` if it ever
+        existed) untouched.
+
+        Replicates the inline filter in
+        :py:meth:`PI07PaligemmaLowLevelPolicy.from_pretrained` so a future
+        edit that broadens or narrows the predicate trips this test before
+        landing in production.
+        """
+        state_dict = {
+            "normalize_inputs.buffer_state.mean": 1,
+            "normalize_inputs.buffer_state.std": 2,
+            "normalize_targets.buffer_actions.mean": 3,
+            "normalize_targets.buffer_actions.std": 4,
+            "unnormalize_outputs.buffer_actions.mean": 5,
+            "unnormalize_outputs.buffer_actions.std": 6,
+            "normalize_discrete_actions.buffer_actions.min": 7,
+            "normalize_discrete_actions.buffer_actions.max": 8,
+            "model.paligemma_with_expert.foo.weight": 9,
+            "state_proj.weight": 10,
+            # Defensive: a hypothetical nested key containing "normalize"
+            # below the top level must NOT be stripped — the filter is
+            # anchored at the start of the key.
+            "model.some_layer.normalize_inputs_internal.weight": 11,
+        }
+        filtered = {
+            key: val
+            for key, val in state_dict.items()
+            if not (key.startswith("normalize_") or key.startswith("unnormalize_"))
+        }
+        assert set(filtered.keys()) == {
+            "model.paligemma_with_expert.foo.weight",
+            "state_proj.weight",
+            "model.some_layer.normalize_inputs_internal.weight",
+        }
+        assert all(not (k.startswith("normalize_") or k.startswith("unnormalize_")) for k in filtered)

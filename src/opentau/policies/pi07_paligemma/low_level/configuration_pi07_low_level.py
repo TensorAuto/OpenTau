@@ -67,6 +67,14 @@ class PI07PaligemmaLowLevelConfig(PreTrainedConfig):
             backward compatibility but logs a warning and falls back to "eager".
         freeze_vision_encoder: Whether to freeze the vision encoder during fine-tuning. Defaults to True.
         train_expert_only: Whether to train only the expert module. Defaults to False.
+        skip_normalization_weights: When loading via :py:meth:`from_pretrained`, drop the saved
+            ``normalize_*`` / ``unnormalize_*`` buffer tensors from the state dict before
+            ``load_state_dict``. The buffers freshly initialised from ``dataset_stats`` then
+            survive — use this when finetuning a checkpoint whose saved normalization stats
+            were aggregated over a different dataset mixture than the finetuning data. Note
+            that the model was trained against the saved stats; switching the normalization
+            mid-training only makes sense when followed by further training, not when
+            loading purely for inference. Defaults to False (no behaviour change).
         optimizer_lr: Learning rate for the optimizer. Defaults to 2.5e-5.
         optimizer_betas: Beta parameters for AdamW optimizer. Defaults to (0.9, 0.95).
         optimizer_eps: Epsilon parameter for AdamW optimizer. Defaults to 1e-8.
@@ -147,6 +155,7 @@ class PI07PaligemmaLowLevelConfig(PreTrainedConfig):
     # Finetuning settings
     freeze_vision_encoder: bool = True
     train_expert_only: bool = False
+    skip_normalization_weights: bool = False
     # Wrap each transformer-layer forward in torch.utils.checkpoint to trade
     # ~25-33% same-batch compute for ~30-40 GB of activation memory per rank,
     # typically netting +10-25% throughput once the freed memory is spent on
