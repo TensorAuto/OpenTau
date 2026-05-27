@@ -128,7 +128,12 @@ This is distinct from ``action_is_pad``, which masks padded *timesteps*
 along the action chunk. The two masks are AND-ed together inside each
 policy's MSE block: a slot in ``(B, chunk_size, max_action_dim)`` contributes
 to the loss only when both its timestep is real (``~action_is_pad``) and
-its dim is real (column index ``< action_dim``).
+its dim is real (column index ``< action_dim``). Policies with a
+real-time-inference frozen prefix (pi05, pi05_mem, pi06, pi07,
+pi07_paligemma) AND in a third condition, ``~prefix_mask`` — see
+``flow_matching_masked_mse`` in :mod:`opentau.policies.pi06.modeling_pi06`
+for the full reduction. pi0 has no such frozen prefix and uses only the
+two conditions above.
 
 When ``action_dim`` is absent (single-dataset configs, externally constructed
 inference batches), all ``max_action_dim`` columns are treated as real and

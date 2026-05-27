@@ -151,6 +151,14 @@ def test_action_dim_zero_yields_zero_loss():
     assert loss.item() == pytest.approx(0.0, abs=1e-6)
 
 
+def test_helper_raises_on_action_dim_batch_size_mismatch():
+    """A caller that passes `batch_size` inconsistent with `action_dim.shape[0]`
+    gets a clear error from the helper, not a silent downstream broadcast bug."""
+    action_dim = torch.tensor([3, 5, 7], dtype=torch.long)
+    with pytest.raises(ValueError, match="does not match batch_size"):
+        make_action_dim_mask(action_dim, max_action_dim=8, batch_size=2, device=torch.device("cpu"))
+
+
 def test_helper_is_total_when_action_dim_exceeds_max():
     """``make_action_dim_mask`` clamps via the strict-less comparison, so
     requesting ``action_dim > max_action_dim`` simply yields an all-True

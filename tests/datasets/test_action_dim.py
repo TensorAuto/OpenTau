@@ -254,3 +254,65 @@ def test_two_datasets_with_different_action_dims(
     assert item_a["actions"].shape[-1] == ds_a.cfg.max_action_dim
     assert item_b["actions"].shape[-1] == ds_b.cfg.max_action_dim
     assert item_a["actions"].shape[-1] == item_b["actions"].shape[-1]
+
+
+def test_cross_dataset_batch_routes_action_dim_into_loss(
+    lerobot_dataset_factory,
+    info_factory,
+    hf_dataset_factory,
+    tasks_factory,
+    episodes_factory,
+    stats_factory,
+    episodes_stats_factory,
+    tmp_path,
+):
+    """End-to-end heterogeneous-DoF scenario the fix targets: collate one
+    item from a 4-DoF dataset and one from a 9-DoF dataset into a single
+    batch, then verify (a) ``batch["action_dim"]`` is ``[4, 9]`` after
+    default collation and (b) feeding that into ``flow_matching_masked_mse``
+    produces the masked-mean we expect by hand (5-dim tail of item 0 and
+    23-dim tail of item 1 both excluded from the reduction).
+
+    The unit test ``test_flow_matching_masked_mse_excludes_padded_dims``
+    covers the loss math with a synthetic ``action_dim`` tensor; this test
+    closes the dataset → policy boundary by actually collating real
+    standardized items."""
+    from opentau.policies.pi06.modeling_pi06 import flow_matching_masked_mse
+
+    common = {
+        "lerobot_dataset_factory": lerobot_dataset_factory,
+        "info_factory": info_factory,
+        "hf_dataset_factory": hf_dataset_factory,
+        "tasks_factory": tasks_factory,
+        "episodes_factory": episodes_factory,
+        "stats_factory": stats_factory,
+        "episodes_stats_factory": episodes_stats_factory,
+        "tmp_path": tmp_path,
+    }
+    ds_a = _make_dataset(**common, action_dim=4, suffix="mixed_a")
+    ds_b = _make_dataset(**common, action_dim=9, suffix="mixed_b")
+    max_action_dim = ds_a.cfg.max_action_dim
+    chunk = ds_a.cfg.action_chunk
+
+    batch = torch.utils.data.default_collate([ds_a[0], ds_b[0]])
+    assert batch["action_dim"].tolist() == [4, 9]
+    assert batch["actions"].shape == (2, chunk, max_action_dim)
+
+    # Hand-crafted velocity tensors: u_t - v_t = 1 everywhere → per-element MSE = 1.
+    # No frozen prefix, no timestep padding — isolates the action_dim contribution.
+    u_t = torch.ones(2, chunk, max_action_dim)
+    v_t = torch.zeros(2, chunk, max_action_dim)
+    prefix_mask = torch.zeros(2, chunk, dtype=torch.bool)
+    actions_is_pad = torch.zeros(2, chunk, dtype=torch.bool)
+    loss = flow_matching_masked_mse(
+        u_t,
+        v_t,
+        prefix_mask,
+        actions_is_pad,
+        max_action_dim=max_action_dim,
+        action_dim=batch["action_dim"],
+    )
+    # Sample 0 contributes chunk * 4 slots; sample 1 contributes chunk * 9.
+    expected_denom = chunk * 4 + chunk * 9
+    expected = torch.tensor(expected_denom / (expected_denom + 1e-8))
+    torch.testing.assert_close(loss, expected)

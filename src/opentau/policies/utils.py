@@ -136,6 +136,14 @@ def make_action_dim_mask(
     """
     if action_dim is None:
         return torch.ones((batch_size, max_action_dim), dtype=torch.bool, device=device)
+    if action_dim.shape != (batch_size,):
+        # Catch caller drift (e.g. a sliced `action_dim` passed with the
+        # original `batch_size`) at the helper boundary — silent shape
+        # mismatches propagate into broadcast errors deep in the loss reduction.
+        raise ValueError(
+            f"action_dim.shape {tuple(action_dim.shape)} does not match "
+            f"batch_size={batch_size}; expected ({batch_size},)"
+        )
     arange = torch.arange(max_action_dim, device=device)
     return rearrange(arange, "d -> 1 d") < rearrange(action_dim.to(device=device), "b -> b 1")
 
