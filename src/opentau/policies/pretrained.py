@@ -592,8 +592,13 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         When the flag is off, returns ``(state_dict, frozenset())`` unchanged
         so callers can use the result unconditionally. When the flag is on:
 
-        - Returns a new dict with every key matching :py:func:`is_norm_buffer_key`
-          removed, plus the (possibly empty) ``frozenset`` of stripped keys.
+        - On the strip-fired path (at least one matching key in the dict),
+          returns a *filtered* dict with every key matching
+          :py:func:`is_norm_buffer_key` removed, plus the ``frozenset`` of
+          stripped keys. On the no-match path (flag set but no
+          ``normalize_*`` / ``unnormalize_*`` keys in the dict), returns
+          the input dict unchanged by identity — same as the flag-off
+          contract — paired with an empty ``frozenset``.
         - Logs an ``INFO`` line with the number of dropped keys on the main
           process, or a ``WARNING`` if the flag was set but no matching keys
           were present (so a user who flipped the flag *expecting* to void
@@ -631,19 +636,6 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
             return state_dict, frozenset()
 
         stripped_keys: frozenset[str] = frozenset(key for key in state_dict if is_norm_buffer_key(key))
-        filtered_state_dict = {key: val for key, val in state_dict.items() if key not in stripped_keys}
-
-        if is_main_process:
-            if not stripped_keys:
-                logging.warning(
-                    "skip_normalization_weights=True but no normalize_/unnormalize_ "
-                    "keys were present in the saved state dict; the flag had no effect."
-                )
-            else:
-                logging.info(
-                    "skip_normalization_weights=True; dropped %d saved normalize/unnormalize buffer keys",
-                    len(stripped_keys),
-                )
 
         # One-shot semantics: the flag is consumed by this load (whether the
         # strip actually dropped keys or the no-op warning fired). Reset on
@@ -652,6 +644,24 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         # finetuned buffers.
         config.skip_normalization_weights = False
 
+        if not stripped_keys:
+            # Flag was set but no matching keys in the dict — skip the O(N)
+            # filtering comprehension (a fresh dict identical to the input)
+            # and return the input by identity, matching the flag-off
+            # contract.
+            if is_main_process:
+                logging.warning(
+                    "skip_normalization_weights=True but no normalize_/unnormalize_ "
+                    "keys were present in the saved state dict; the flag had no effect."
+                )
+            return state_dict, stripped_keys
+
+        filtered_state_dict = {key: val for key, val in state_dict.items() if key not in stripped_keys}
+        if is_main_process:
+            logging.info(
+                "skip_normalization_weights=True; dropped %d saved normalize/unnormalize buffer keys",
+                len(stripped_keys),
+            )
         return filtered_state_dict, stripped_keys
 
     @classmethod
