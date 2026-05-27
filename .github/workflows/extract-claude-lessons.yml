@@ -44,11 +44,17 @@ jobs:
       )
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Lessons extraction is best-effort: when claude-code-action exits non-zero
+    # (e.g. anthropic_api_key over its usage limit, transient API failure, OIDC
+    # hiccup), we don't want a red cross next to the just-merged PR. Mirror the
+    # pattern in claude-pr-review.yml (job- + step-level continue-on-error).
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
       - uses: anthropics/claude-code-action@v1
+        continue-on-error: true
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           # Match the bot allowlist in the job-level `if:` above. Never `*` on
