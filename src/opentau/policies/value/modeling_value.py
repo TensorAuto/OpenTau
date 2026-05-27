@@ -125,27 +125,44 @@ class ValueFunction(PreTrainedPolicy):
         self,
         config: ValueConfig,
         dataset_stats: dict[str, dict[str, Tensor]] | None = None,
+        per_dataset_stats: list[dict[str, dict[str, Tensor]]] | None = None,
+        dataset_names: list[str] | None = None,
     ):
         """Initializes the ValueFunction policy.
 
         Args:
-            config: Value Function configuration class instance or None, in which case the default instantiation of
-                the configuration class is used.
-            dataset_stats: Dataset statistics to be used for normalization. If not passed here, it is expected
-                that they will be passed with a call to `load_state_dict` before the policy is used.
+            config: Value Function configuration class instance.
+            dataset_stats: Legacy single-dataset stats dict. Wrapped into a
+                singleton list internally. Mutually exclusive with
+                ``per_dataset_stats``.
+            per_dataset_stats: Ordered list of per-dataset stat dicts.
+                Accepted for compatibility with ``make_policy``'s new
+                plumbing — value is single-dataset by design, so only the
+                first entry is used and a warning fires for longer lists.
+            dataset_names: Accepted for compatibility with ``make_policy``;
+                only the first entry is consumed.
         """
 
         super().__init__(config)
         config.validate_features()
         self.config = config
-        # The shared `Normalize` module accepts `per_dataset_stats: list[dict]`
-        # since the per-dataset normalization rewrite. `ValueFunction`'s
-        # external API still takes a single ``dataset_stats: dict | None`` —
-        # wrap into a singleton list so the policy keeps working without
-        # forcing every caller to migrate. The single-dataset path is
-        # equivalent to the old behaviour (stacked buffer of leading dim 1,
-        # `dataset_index=0` for every sample).
-        per_dataset_stats = [dataset_stats] if dataset_stats is not None else None
+        # Reconcile the dual external API: callers either pass the legacy
+        # single dict via ``dataset_stats`` or the new list-of-dicts via
+        # ``per_dataset_stats``. They must not pass both.
+        if dataset_stats is not None and per_dataset_stats is not None:
+            raise ValueError(
+                "Pass either `dataset_stats` (legacy single-dataset) or "
+                "`per_dataset_stats` (new list form), not both."
+            )
+        if per_dataset_stats is None and dataset_stats is not None:
+            per_dataset_stats = [dataset_stats]
+        if per_dataset_stats is not None and len(per_dataset_stats) > 1:
+            logging.warning(
+                "ValueFunction is single-dataset by design; received %d "
+                "per_dataset_stats entries — only the first will be used.",
+                len(per_dataset_stats),
+            )
+            per_dataset_stats = per_dataset_stats[:1]
         num_datasets = 1
         self.normalize_inputs = Normalize(
             config.input_features,

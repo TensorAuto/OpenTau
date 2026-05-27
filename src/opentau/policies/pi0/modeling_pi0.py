@@ -322,6 +322,12 @@ class PI0Policy(PreTrainedPolicy):
         # Apply tiling of linear input weights if needed
         model._tile_linear_input_weight(transformed_state_dict)
 
+        # Promote legacy single-dataset Normalize/Unnormalize buffers from
+        # `(*feat_shape,)` to the new `(1, *feat_shape)` stacked layout so
+        # pre-PR checkpoints (including everything under TensorAuto/*) still
+        # load via `model.load_state_dict(..., strict=True)`.
+        model._promote_legacy_norm_buffers_in_state_dict(transformed_state_dict)
+
         # Load the transformed state dict
         msg = model.load_state_dict(transformed_state_dict, strict=strict)
 

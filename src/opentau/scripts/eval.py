@@ -164,6 +164,15 @@ def rollout(
         if return_observations:
             all_observations.append(deepcopy(observation))
 
+        # Tag the observation with which training-time dataset's stats to
+        # use for per-sample Normalize/Unnormalize. `EvalConfig.dataset_repo_id`
+        # is `None` by default, in which case the policy's
+        # `_resolve_dataset_index` single-dataset fallback handles things —
+        # required only for multi-dataset checkpoints.
+        eval_dataset_repo_id = getattr(cfg.eval, "dataset_repo_id", None)
+        if eval_dataset_repo_id is not None:
+            observation["dataset_repo_id"] = eval_dataset_repo_id
+
         with torch.inference_mode():
             action = policy.select_action(observation)
 

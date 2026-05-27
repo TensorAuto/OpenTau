@@ -332,6 +332,10 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
                 print(f"Remapped {remap_count} state dict keys")
 
             # Load the remapped state dict into the model
+            # Promote legacy single-dataset Normalize/Unnormalize buffers from
+            # `(*feat_shape,)` to the new `(1, *feat_shape)` stacked layout so pre-PR
+            # checkpoints load via `model.load_state_dict(...)`.
+            model._promote_legacy_norm_buffers_in_state_dict(remapped_state_dict)
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
 
             if missing_keys and is_main_process:

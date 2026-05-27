@@ -224,16 +224,24 @@ class DatasetMixtureMetadata:
         action range. Most callers should consume ``per_dataset_stats`` /
         ``dataset_names`` directly.
         """
-        stats_with_actions = [s for s in self.per_dataset_stats if "actions" in s]
-        if not stats_with_actions:
+        # Co-iterate stats and weights so a non-trailing dataset lacking
+        # ``actions`` keeps the weight alignment correct. Slicing
+        # ``self._dataset_weights[:N]`` would silently misalign if e.g.
+        # `per_dataset_stats[1]` lacked actions — the BPE codec would then
+        # fit a weighted mean using dataset 0's weight applied to dataset 2's
+        # action distribution.
+        filtered: list[tuple[dict[str, np.ndarray], float]] = [
+            ({"actions": s["actions"]}, w)
+            for s, w in zip(self.per_dataset_stats, self._dataset_weights, strict=True)
+            if "actions" in s
+        ]
+        if not filtered:
             raise ValueError(
                 "No dataset in the mixture exposes 'actions' stats; aggregated_action_stats() is undefined."
             )
-        # `aggregate_stats` walks every feature key across every dataset;
-        # pull just the "actions" sub-dicts so the call is cheap.
         agg = aggregate_stats(
-            [{"actions": s["actions"]} for s in stats_with_actions],
-            weights=self._dataset_weights[: len(stats_with_actions)],
+            [s for s, _ in filtered],
+            weights=[w for _, w in filtered],
         )
         return agg["actions"]
 

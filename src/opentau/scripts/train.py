@@ -569,8 +569,17 @@ def train(cfg: TrainPipelineConfig):
 
     if cfg.resume:
         # load accelerator state
-        # This will load the model, optimizer, and lr_scheduler state
-        accelerator.load_state(cfg.checkpoint_path)
+        # This will load the model, optimizer, and lr_scheduler state.
+        # When `save_normalization_stats=False`, the on-disk safetensors lacks
+        # `normalize_*.buffer_*` keys, so the default `strict=True` load
+        # raises. Pass `strict=False` to let those missing keys pass — the
+        # buffers were already repopulated by `_inject_stats` inside
+        # `make_policy(cfg, ds_meta=...)` above, so this leaves them at the
+        # right values rather than silently overwriting.
+        load_kwargs: dict = {}
+        if not cfg.policy.save_normalization_stats:
+            load_kwargs["strict"] = False
+        accelerator.load_state(cfg.checkpoint_path, **load_kwargs)
 
         # When the master-weights wrapper is in use, the live bf16 weights
         # have just been overwritten by ``accelerator.load_state``. Rebuild

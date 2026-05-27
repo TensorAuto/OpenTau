@@ -230,6 +230,17 @@ def _gather_and_broadcast(stat: Tensor, dataset_index: Tensor, batch_val: Tensor
     """
     gathered = stat.index_select(0, dataset_index)  # (B, *feat_shape)
     extra = batch_val.ndim - gathered.ndim
+    if extra < 0:
+        # Batch tensor has fewer dims than the buffer — silent broadcasting
+        # would produce a shape mismatch later, or worse, broadcast along
+        # the wrong axis. Surface this loudly so the misconfiguration is
+        # caught at the feature in question rather than mid-step.
+        raise ValueError(
+            f"Stats buffer rank ({gathered.ndim}) exceeds batch tensor rank "
+            f"({batch_val.ndim}); expected batch_val to have at least as many "
+            f"dims as the (D, *feat_shape) buffer. Stats shape={tuple(stat.shape)}, "
+            f"gathered shape={tuple(gathered.shape)}, batch shape={tuple(batch_val.shape)}."
+        )
     if extra > 0:
         gathered = gathered.reshape(gathered.shape[0], *((1,) * extra), *gathered.shape[1:])
     return gathered

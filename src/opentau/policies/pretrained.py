@@ -28,14 +28,10 @@ from pathlib import Path
 from typing import Type, TypeVar
 
 import numpy as np
-import packaging
-import safetensors
 import torch
 from huggingface_hub import hf_hub_download
 from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
 from huggingface_hub.errors import HfHubHTTPError
-from safetensors.torch import load_model as load_model_as_safetensor
-from safetensors.torch import save_file as save_safetensor_file
 from safetensors.torch import save_model as save_model_as_safetensor
 from torch import Tensor, nn
 
@@ -45,18 +41,26 @@ from opentau.utils.hub import HubMixin
 
 T = TypeVar("T", bound="PreTrainedPolicy")
 
+# Module attribute names a pi policy may attach to itself for input/output
+# normalization. Single source of truth — referenced by `NORM_BUFFER_PREFIXES`,
+# `_save_pretrained`'s detach/restore loop, `_inject_stats`, and
+# `_check_norm_stats_loaded`. Not every policy defines all four (high-level
+# planners only have `normalize_inputs`, value only has `normalize_inputs`);
+# the consumers all guard on `getattr(self, attr, None) is None`.
+NORM_MODULE_NAMES: tuple[str, ...] = (
+    "normalize_inputs",
+    "normalize_targets",
+    "normalize_discrete_actions",
+    "unnormalize_outputs",
+)
+
 # State-dict key prefixes for the per-feature normalization buffers attached
 # by `Normalize` / `Unnormalize`. Used by `_save_pretrained` (when
 # `save_normalization_stats=False`) and by `train.py`'s Accelerate save-hook
 # to strip the buffers from the on-disk safetensors. Kept here (not in
 # normalize.py) so the train script can import it without picking up torch's
 # heavy normalize module unless it actually constructs a policy.
-NORM_BUFFER_PREFIXES: tuple[str, ...] = (
-    "normalize_inputs.buffer_",
-    "normalize_targets.buffer_",
-    "normalize_discrete_actions.buffer_",
-    "unnormalize_outputs.buffer_",
-)
+NORM_BUFFER_PREFIXES: tuple[str, ...] = tuple(f"{name}.buffer_" for name in NORM_MODULE_NAMES)
 
 
 def is_norm_buffer_key(key: str) -> bool:
@@ -158,13 +162,30 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         if include_norm_stats:
             save_model_as_safetensor(model_to_save, out_path)
         else:
-            # `save_model` doesn't expose a filter argument, so build the
-            # filtered state_dict ourselves and write via `save_file`. Clone
-            # tensors that share storage with another retained tensor to
-            # avoid safetensors' "duplicated tensors" rejection.
-            state_dict = model_to_save.state_dict()
-            filtered = {k: v for k, v in state_dict.items() if not is_norm_buffer_key(k)}
-            save_safetensor_file(filtered, out_path)
+            # `safetensors.save_file` does NOT dedup tied tensors (lm_head /
+            # embed_tokens on PaliGemma-backed policies), so feeding it a
+            # filtered state_dict raises "Some tensors share memory". Instead,
+            # temporarily detach the per-feature Normalize / Unnormalize
+            # buffers from the module tree, reuse `save_model_as_safetensor`
+            # (which calls `_remove_duplicate_names` internally), then
+            # reattach. Buffer presence is restored on the way out — even on
+            # writer exceptions.
+            detached: list[tuple[nn.Module, str, nn.ParameterDict]] = []
+            for module_name in NORM_MODULE_NAMES:
+                module = getattr(model_to_save, module_name, None)
+                if module is None:
+                    continue
+                for child_name in list(vars(module).get("_modules", {}).keys()):
+                    if not child_name.startswith("buffer_"):
+                        continue
+                    child = module._modules[child_name]
+                    detached.append((module, child_name, child))
+                    del module._modules[child_name]
+            try:
+                save_model_as_safetensor(model_to_save, out_path)
+            finally:
+                for module, child_name, child in detached:
+                    module._modules[child_name] = child
 
     @classmethod
     def from_pretrained(
@@ -245,6 +266,18 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                     f"{SAFETENSORS_SINGLE_FILE} not found on the HuggingFace Hub in {model_id}"
                 ) from e
 
+        # Surface the stats-less-checkpoint round-trip mistake at
+        # policy-construction time rather than at first forward. This catches
+        # direct `from_pretrained` callers (notebooks, gRPC server,
+        # downstream scripts) that bypass `make_policy`'s injection path.
+        # The check is best-effort: legitimate workflows that load weights
+        # and then call `_inject_stats(...)` manually can suppress it by
+        # constructing via `cls(config, per_dataset_stats=...).load_state_dict(...)`
+        # instead. `make_policy` always satisfies this either by calling
+        # `_inject_stats` (when `ds_meta` was passed) or by re-running this
+        # same check itself.
+        policy._check_norm_stats_loaded()
+
         policy.eval()
         return policy
 
@@ -290,7 +323,14 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
             idx = batch["dataset_index"]
             if not isinstance(idx, Tensor):
                 idx = torch.as_tensor(idx, dtype=torch.long)
-            return idx.to(dtype=torch.long)
+            # Move to whichever device the batch tensors live on. The
+            # dataloader's `pin_memory=True` materializes everything as CPU
+            # tensors and Accelerate later does the host->device copy on a
+            # per-key basis — `dataset_index` rides along for tensor keys,
+            # but a caller hand-constructing a batch on GPU may leave the
+            # index on CPU, breaking `index_select` inside Normalize.
+            _, device = self._infer_batch_size_and_device(batch)
+            return idx.to(dtype=torch.long, device=device)
 
         if "dataset_repo_id" not in batch:
             num_datasets = len(self._dataset_name_to_index) if self._dataset_name_to_index else 1
@@ -337,19 +377,38 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         Args:
             per_dataset_stats: Ordered list of per-dataset stat dicts (same
                 shape ``Normalize`` accepts at construction).
-            dataset_names: Optional ordered list of names; when provided also
-                updates ``self.config.dataset_names`` and the cached
-                ``_dataset_name_to_index`` lookup so inference-time
-                ``dataset_repo_id`` resolution works after the injection.
+            dataset_names: Ordered list of names parallel to
+                ``per_dataset_stats``. **Strongly recommended.** When
+                provided, the existing ``self.config.dataset_names`` is
+                cross-checked against this list and any mismatch raises —
+                otherwise an out-of-order injection would silently corrupt
+                the name→index lookup, mapping samples to the wrong row at
+                inference. When ``None``, ``self.config.dataset_names`` is
+                trusted as-is and the caller is responsible for keeping
+                ``per_dataset_stats`` in the same order.
         """
         from opentau.policies.normalize import _stat_to_float32_tensor
 
-        for module_attr in (
-            "normalize_inputs",
-            "normalize_targets",
-            "normalize_discrete_actions",
-            "unnormalize_outputs",
-        ):
+        if dataset_names is not None:
+            existing = getattr(self.config, "dataset_names", None)
+            if existing is not None and list(existing) != list(dataset_names):
+                raise ValueError(
+                    "_inject_stats: provided `dataset_names` "
+                    f"{list(dataset_names)} disagrees with existing "
+                    f"`config.dataset_names` {list(existing)}. Reordering "
+                    "the names without reordering `per_dataset_stats` would "
+                    "silently map samples to the wrong stats row. Pass the "
+                    "names in the same order as the policy was originally "
+                    "constructed, or omit `dataset_names`."
+                )
+            if len(dataset_names) != len(per_dataset_stats):
+                raise ValueError(
+                    f"_inject_stats: dataset_names ({len(dataset_names)}) "
+                    f"and per_dataset_stats ({len(per_dataset_stats)}) must "
+                    "have the same length."
+                )
+
+        for module_attr in NORM_MODULE_NAMES:
             module = getattr(self, module_attr, None)
             if module is None:
                 continue
@@ -387,17 +446,14 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         """Raise a clear error if any Normalize/Unnormalize buffer is still ∞.
 
         Called by ``make_policy`` after a checkpoint load when no
-        ``per_dataset_stats`` was supplied — surfaces the
+        ``per_dataset_stats`` was supplied, and by the base
+        ``from_pretrained`` so direct callers (notebooks, gRPC server,
+        downstream scripts) surface the
         ``save_normalization_stats=False`` round-trip mistake at
         policy-construction time rather than at the first forward.
         """
         bad: list[str] = []
-        for module_attr in (
-            "normalize_inputs",
-            "normalize_targets",
-            "normalize_discrete_actions",
-            "unnormalize_outputs",
-        ):
+        for module_attr in NORM_MODULE_NAMES:
             module = getattr(self, module_attr, None)
             if module is None:
                 continue
@@ -411,6 +467,48 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                 f"buffers are still +inf: {bad}. Either re-save the checkpoint "
                 "with `save_normalization_stats=True`, or pass `ds_meta=` to "
                 "`make_policy(...)` so stats are injected after load."
+            )
+
+    def _promote_legacy_norm_buffers_in_state_dict(self, state_dict_to_load: dict) -> None:
+        """Reshape pre-PR ``normalize_*.buffer_*`` entries to the new stacked rank.
+
+        Before this PR, Normalize/Unnormalize buffers were saved with shape
+        ``(*feat_shape,)`` (single-dataset). The new format is
+        ``(num_datasets, *feat_shape)`` with a leading dataset axis. Legacy
+        checkpoints on disk (everything under ``TensorAuto/*`` predating
+        this change) load through ``load_state_dict`` and would raise on
+        size mismatch.
+
+        This shim walks the incoming state_dict, finds any norm-buffer key
+        whose loaded tensor is exactly one rank shy of the matching
+        in-memory buffer, and prepends a leading axis with ``unsqueeze(0)``
+        (single-dataset assumption — appropriate for any legacy
+        checkpoint, since they were trained against a single mixture and
+        the single-dataset case is the new D=1 row). Logs a one-time
+        warning so the user knows the buffers were promoted.
+
+        Operates in-place on ``state_dict_to_load``. Safe to call
+        unconditionally; new-format checkpoints are unchanged.
+        """
+        own_state = dict(self.state_dict())
+        promoted: list[str] = []
+        for key in list(state_dict_to_load):
+            if not is_norm_buffer_key(key):
+                continue
+            loaded = state_dict_to_load[key]
+            target = own_state.get(key)
+            if target is None:
+                continue
+            if loaded.ndim == target.ndim - 1 and tuple(loaded.shape) == tuple(target.shape[1:]):
+                state_dict_to_load[key] = loaded.unsqueeze(0)
+                promoted.append(key)
+        if promoted:
+            logging.warning(
+                "Promoted %d legacy single-dataset Normalize/Unnormalize "
+                "buffers to the new (1, *feat_shape) stacked layout. "
+                "Sample keys: %s",
+                len(promoted),
+                promoted[:3],
             )
 
     def _tile_linear_input_weight(self, state_dict_to_load: dict):
@@ -455,25 +553,21 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         Returns:
             T: The model with loaded weights.
         """
-        # Create base kwargs
-        kwargs = {"strict": strict}
+        # Pre-load the state_dict so we can run the legacy Normalize/Unnormalize
+        # buffer migration shim before handing it off. `safetensors.torch.load_model`
+        # would otherwise raise on the shape mismatch between pre-PR
+        # `(*feat_shape,)` buffers and the new `(1, *feat_shape)` layout.
+        from safetensors.torch import load_file as load_safetensor_file
 
-        # Add device parameter for newer versions that support it
-        if packaging.version.parse(safetensors.__version__) >= packaging.version.parse("0.4.3"):
-            kwargs["device"] = map_location
-
-        # Load the model with appropriate kwargs
-        missing_keys, unexpected_keys = load_model_as_safetensor(model, model_file, **kwargs)
+        device_arg = map_location if map_location != "cpu" else "cpu"
+        state_dict = load_safetensor_file(model_file, device=device_arg)
+        model._promote_legacy_norm_buffers_in_state_dict(state_dict)
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=strict)
         log_model_loading_keys(missing_keys, unexpected_keys)
-
-        # For older versions, manually move to device if needed
-        if "device" not in kwargs and map_location != "cpu":
-            logging.warning(
-                "Loading model weights on other devices than 'cpu' is not supported natively in your version of safetensors."
-                " This means that the model is loaded on 'cpu' first and then copied to the device."
-                " This leads to a slower loading time."
-                " Please update safetensors to version 0.4.3 or above for improved performance."
-            )
+        if map_location != "cpu":
+            # The model already received its weights on `map_location` via
+            # ``load_safetensor_file(..., device=...)``; this is a defensive
+            # no-op on top.
             model.to(map_location)
         return model
 

@@ -94,6 +94,12 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
             "prompt": ["Pick up yellow lego block and put it in the bin"],
             "img_is_pad": torch.zeros((1, 1), dtype=torch.bool, device=self.device),
         }
+        # Mirror `_prepare_observation`'s dataset tagging for the warmup call —
+        # otherwise a multi-dataset checkpoint trips `_resolve_dataset_index`
+        # at compile time rather than at the first real request.
+        warmup_dataset_repo_id = getattr(self.cfg.server, "dataset_repo_id", None)
+        if warmup_dataset_repo_id is not None:
+            observation["dataset_repo_id"] = warmup_dataset_repo_id
         action_prefix = torch.zeros(
             (1, self.cfg.action_chunk, self.cfg.max_action_dim), dtype=self.dtype, device=self.device
         )
@@ -188,6 +194,15 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
 
         # Process prompt
         batch["prompt"] = [request.prompt] if request.prompt else [""]
+
+        # Tag the batch with which training-time dataset's stats to use for
+        # per-sample Normalize/Unnormalize. When `server.dataset_repo_id` is
+        # `None` (default), the policy's `_resolve_dataset_index` single-
+        # dataset fallback handles things — only needed for multi-dataset
+        # checkpoints.
+        server_dataset_repo_id = getattr(self.cfg.server, "dataset_repo_id", None)
+        if server_dataset_repo_id is not None:
+            batch["dataset_repo_id"] = server_dataset_repo_id
         if request.prefix_action:
             prefix_action = torch.tensor(
                 np.array(
