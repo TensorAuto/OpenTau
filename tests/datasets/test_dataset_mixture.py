@@ -421,6 +421,11 @@ class TestWeightedDatasetMixtureIntegration:
         # somehow this is faster than list(dataset[0])
         dataset_samples = [datasets[0][idx] for idx in range(len(datasets[0]))]
         dataloader_iter = iter(dataloader)
+        # The `_TaggedDataset` wrapper inside `WeightedDatasetMixture` adds two
+        # mixture-level identification keys to every sample; the raw
+        # `datasets[0][idx]` lookups below intentionally bypass that wrapper,
+        # so strip the wrapper-added keys before the content comparison.
+        wrapper_only_keys = {"dataset_repo_id", "dataset_index"}
         # sample from dataloader 20 times and check that the samples exist in the dataset
         for _ in range(20):
             sample = next(dataloader_iter)
@@ -431,6 +436,7 @@ class TestWeightedDatasetMixtureIntegration:
                 if isinstance(value, torch.Tensor)
                 else (value[0] if isinstance(value, list) and len(value) > 0 else value)
                 for key, value in sample.items()
+                if key not in wrapper_only_keys
             }
             assert any(are_tensor_dicts_equal(sample, item) for item in dataset_samples)
 
