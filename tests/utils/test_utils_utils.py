@@ -25,6 +25,7 @@ import torch
 from opentau.utils.hub import HubMixin
 from opentau.utils.utils import (
     capture_timestamp_utc,
+    create_dummy_observation,
     encode_accelerator_state_dict,
     format_big_number,
     get_channel_first_image_shape,
@@ -390,3 +391,24 @@ def test_another_invalid_shape_raises_value_error():
 def test_encode_accelerator_state_dict(obj, expected):
     output = encode_accelerator_state_dict(obj)
     assert output == expected, f"Expected {expected}, but got {output} for input"
+
+
+def test_create_dummy_observation_includes_dataset_index():
+    """Regression for #341: the smoke-test observation must carry a
+    `dataset_index` so multi-dataset checkpoints don't crash inside
+    `_resolve_dataset_index`.
+    """
+
+    @dataclass
+    class _Cfg:
+        resolution: tuple = (224, 224)
+        num_cams: int = 2
+        max_state_dim: int = 32
+        action_chunk: int = 10
+
+    obs = create_dummy_observation(_Cfg(), device=torch.device("cpu"), dtype=torch.float32)
+
+    assert "dataset_index" in obs
+    assert obs["dataset_index"].shape == (1,)
+    assert obs["dataset_index"].dtype == torch.long
+    assert torch.equal(obs["dataset_index"], torch.zeros(1, dtype=torch.long))

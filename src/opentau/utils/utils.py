@@ -402,6 +402,11 @@ def create_dummy_observation(cfg, device, dtype=torch.bfloat16) -> dict:
         "prompt": ["Pick up yellow lego block and put it in the bin"],
         "img_is_pad": torch.zeros((1, cfg.num_cams), dtype=torch.bool, device=device),
         "action_is_pad": torch.zeros((1, cfg.action_chunk), dtype=torch.bool, device=device),
+        # Pin per-sample normalization to dataset row 0 so checkpoints trained
+        # with per-dataset stats on >1 datasets don't trip
+        # `_resolve_dataset_index`'s "missing selector" guard. A no-op for
+        # single-dataset policies (the fallback would resolve to the same).
+        "dataset_index": torch.zeros((1,), dtype=torch.long, device=device),
     }
 
 
