@@ -1983,16 +1983,6 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         if time is None:
             time = self.sample_time(batch_size, actions.device)
 
-        # Per-dim mask reused below to zero noise at padded dims (input-side)
-        # and to mask the velocity MSE (loss-side). See pi05 for the rationale.
-        dim_mask = make_action_dim_mask(
-            action_dim,
-            self.config.max_action_dim,
-            batch_size=batch_size,
-            device=actions.device,
-        )
-        noise = noise * rearrange(dim_mask, "b d -> b 1 d").to(noise.dtype)
-
         # handle real time inference delay
         delay = torch.randint(0, self.config.max_delay + 1, (batch_size,))
         prefix_mask = rearrange(torch.arange(self.config.chunk_size), "c -> 1 c") < rearrange(
@@ -2063,8 +2053,14 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         # Remove dim padding
         mse_loss = mse_loss[:, :, : self.config.max_action_dim]
 
-        # `dim_mask` was built once above (before noise masking) and is reused
-        # here as the per-dim (B, max_action_dim) bool component of the loss mask.
+        # Per-dim mask (B, 1, D) — True for real action dims; all-True fallback
+        # when `action_dim` is absent keeps single-dataset behavior unchanged.
+        dim_mask = make_action_dim_mask(
+            action_dim,
+            self.config.max_action_dim,
+            batch_size=mse_loss.shape[0],
+            device=mse_loss.device,
+        )
         full_mask = postfix_mask & rearrange(dim_mask, "b d -> b 1 d")  # (B, chunk, D)
 
         # Do not include frozen, timestep-padded, or dim-padded entries in the mean.

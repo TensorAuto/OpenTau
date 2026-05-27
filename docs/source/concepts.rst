@@ -124,16 +124,6 @@ dims — under per-dataset normalization (where padded-dim stats are
 ``mean=0, std=0``) that signal is a clean "predict 0 here" that contaminates
 samples in the same batch which do use those dims.
 
-The same per-dim mask is also applied to the sampled flow-matching noise
-*before* the action expert's input embedding (``action_in_proj``). This
-zeros out ``noise`` at padded dims, which in turn makes ``x_t =
-(1-t)*noise + t*actions`` and the target velocity ``u_t = noise - actions``
-both zero at padded dims — so the action expert never sees the noise that
-would otherwise leak into predictions at *real* dims via attention. The
-input-side mask is complementary to the loss-side mask: the loss-side mask
-ensures padded slots don't contribute to the gradient; the input-side mask
-ensures padded slots don't contaminate the embedding.
-
 This is distinct from ``action_is_pad``, which masks padded *timesteps*
 along the action chunk. The two masks are AND-ed together inside each
 policy's MSE block: a slot in ``(B, chunk_size, max_action_dim)`` contributes

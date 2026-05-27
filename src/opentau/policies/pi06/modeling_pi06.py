@@ -1057,20 +1057,6 @@ class PI06FlowMatching(nn.Module):
         if time is None:
             time = self.sample_time(batch_size, actions.device)
 
-        # Zero noise at zero-padded action dims so the action expert's input
-        # embedding never sees noise the model isn't supervised on. The MSE
-        # reduction below (via `flow_matching_masked_mse`) reapplies the same
-        # mask. All-True (no-op) when `action_dim is None`.
-        noise = noise * rearrange(
-            make_action_dim_mask(
-                action_dim,
-                self.config.max_action_dim,
-                batch_size=batch_size,
-                device=actions.device,
-            ),
-            "b d -> b 1 d",
-        ).to(noise.dtype)
-
         # Real-time inference delay: randomly freeze a prefix of the action chunk.
         delay = torch.randint(0, self.config.max_delay + 1, (batch_size,))
         prefix_mask = rearrange(torch.arange(self.config.chunk_size), "c -> 1 c") < rearrange(

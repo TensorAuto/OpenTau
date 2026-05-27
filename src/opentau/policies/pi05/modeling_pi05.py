@@ -1379,19 +1379,6 @@ class PI05FlowMatching(nn.Module):
         if time is None:
             time = self.sample_time(batch_size, actions.device)
 
-        # Build per-dim mask once and reuse it twice: (a) zero out noise at
-        # zero-padded action dims so the action expert's input embedding
-        # never sees noise the model isn't supervised on; (b) AND into the
-        # MSE reduction further down. All-True (no-op) when `action_dim is
-        # None` — preserves the backwards-compat contract.
-        dim_mask = make_action_dim_mask(
-            action_dim,
-            self.config.max_action_dim,
-            batch_size=batch_size,
-            device=actions.device,
-        )
-        noise = noise * rearrange(dim_mask, "b d -> b 1 d").to(noise.dtype)
-
         # handle real time inference delay
         delay = torch.randint(0, self.config.max_delay + 1, (batch_size,))
         prefix_mask = rearrange(torch.arange(self.config.chunk_size), "c -> 1 c") < rearrange(
@@ -1465,8 +1452,14 @@ class PI05FlowMatching(nn.Module):
         # Remove dim padding
         mse_loss = mse_loss[:, :, : self.config.max_action_dim]
 
-        # `dim_mask` was built once above (before noise masking) and is reused
-        # here as the per-dim (B, max_action_dim) bool component of the loss mask.
+        # Per-dim mask (B, 1, D) — True for real action dims; all-True fallback
+        # when `action_dim` is absent keeps single-dataset behavior unchanged.
+        dim_mask = make_action_dim_mask(
+            action_dim,
+            self.config.max_action_dim,
+            batch_size=mse_loss.shape[0],
+            device=mse_loss.device,
+        )
         full_mask = postfix_mask & rearrange(dim_mask, "b d -> b 1 d")  # (B, chunk, D)
 
         # Do not include frozen, timestep-padded, or dim-padded entries in the mean.
