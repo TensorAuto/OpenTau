@@ -283,6 +283,19 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
     use_amp: bool = False
     pretrained_path: str | None = None
 
+    # When False, `_save_pretrained` strips normalize_*.buffer_* / unnormalize_*.buffer_*
+    # keys from the state_dict before writing model.safetensors. Reloading then requires
+    # the caller to pass `ds_meta=` (or `stats=`) to `make_policy` so the buffers can be
+    # repopulated; otherwise the inf-init assertion fires at first forward.
+    save_normalization_stats: bool = True
+
+    # Ordered list of dataset names this policy was trained on. Used by the per-sample
+    # Normalize/Unnormalize indexing path to map an inference-time
+    # `batch["dataset_repo_id"]` (str) into the leading dim of the stacked stats
+    # buffers. `None` only for policies constructed outside the standard
+    # `make_policy(ds_meta=...)` path (e.g. legacy single-stats fallbacks).
+    dataset_names: list[str] | None = None
+
     # Deprecated: latency fields are no longer used. Kept for backward-compatible
     # loading of old JSON configs. Must remain 0.0; non-zero values will raise.
     cloud_vlm_latency_mean: float = 0.0

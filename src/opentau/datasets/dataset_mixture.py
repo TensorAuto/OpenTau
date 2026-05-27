@@ -72,12 +72,58 @@ from typing import List, Optional
 
 import numpy as np
 import torch
-from torch.utils.data import ConcatDataset, DataLoader, Sampler
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, Sampler
 
 from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.compute_stats import aggregate_stats
 from opentau.datasets.lerobot_dataset import BaseDataset, DatasetMetadata
 from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
+
+
+class _TaggedDataset(Dataset):
+    """Wraps a ``BaseDataset`` so every sample carries its mixture-level identity.
+
+    The wrapped sample dict gains two keys:
+
+      - ``"dataset_repo_id"``: ``str`` — the deduplicated mixture-level name
+        (matches an entry in ``DatasetMixtureMetadata.dataset_names``).
+        Default PyTorch collate batches a per-sample ``str`` into a
+        ``list[str]`` of length B.
+      - ``"dataset_index"``: ``torch.long`` scalar — the position of this
+        dataset in ``DatasetMixtureMetadata.dataset_names``. Default collate
+        stacks into a ``(B,)`` long tensor.
+
+    Policies read either key via ``PreTrainedPolicy._resolve_dataset_index``
+    and route per-sample into the stacked Normalize/Unnormalize buffers.
+
+    The wrapper exposes the underlying dataset's ``.meta`` so callers of
+    ``WeightedDatasetMixture`` (e.g. metadata validation, per-dataset val
+    loaders) keep working unchanged. ``len`` delegates as well.
+    """
+
+    def __init__(self, base: Dataset, dataset_repo_id: str, dataset_index: int):
+        self._base = base
+        self._dataset_repo_id = dataset_repo_id
+        # Pre-build the scalar long tensor once so __getitem__ doesn't
+        # allocate per call.
+        self._dataset_index_tensor = torch.tensor(int(dataset_index), dtype=torch.long)
+        # Preserve `.meta` so `WeightedDatasetMixture.__init__`'s validation
+        # (`hasattr(ds, "meta") and ds.meta is not None`) still works after
+        # wrapping. `Subset` / `random_split` produce wrappers without a
+        # `.meta`, so look one level deeper if needed.
+        meta = getattr(base, "meta", None)
+        if meta is None and hasattr(base, "dataset"):
+            meta = getattr(base.dataset, "meta", None)
+        self.meta = meta
+
+    def __len__(self) -> int:
+        return len(self._base)
+
+    def __getitem__(self, idx):
+        item = self._base[idx]
+        item["dataset_repo_id"] = self._dataset_repo_id
+        item["dataset_index"] = self._dataset_index_tensor
+        return item
 
 
 def pad_vector(vector: np.ndarray, new_dim: int) -> np.ndarray:
@@ -114,21 +160,82 @@ def _apply_data_feature_name_mapping_overrides(
 
 
 class DatasetMixtureMetadata:
-    """A class to hold metadata for a mixture of datasets.
+    """Per-dataset metadata for a mixture (no cross-dataset stat aggregation).
 
-    This is used to aggregate metadata from multiple datasets into a single object.
+    Each underlying dataset's stats are normalised into the standard data
+    format (feature renaming, state/action padding to ``cfg.max_state_dim`` /
+    ``cfg.max_action_dim``, missing-camera zero placeholders) and kept
+    *separate* on ``self.per_dataset_stats``. The policy's Normalize /
+    Unnormalize layers stack these along a new leading dim and use a
+    per-sample ``dataset_index`` to select the right row.
+
+    Attributes:
+        per_dataset_stats: ``list[dict[str, dict[str, np.ndarray]]]`` ordered
+            to match ``dataset_names``. ``per_dataset_stats[i]`` is the
+            standardised stats dict for dataset ``dataset_names[i]``.
+        dataset_names: Ordered deduplicated mixture-level names (matches
+            ``WeightedDatasetMixture._make_dataset_names`` output).
+        dataset_name_to_index: ``{name: i}`` reverse lookup for O(1)
+            inference-time resolution.
     """
 
     def __init__(
-        self, cfg: TrainPipelineConfig, metadatas: List[DatasetMetadata], dataset_weights: List[float]
+        self,
+        cfg: TrainPipelineConfig,
+        metadatas: List[DatasetMetadata],
+        dataset_weights: List[float],
+        dataset_names: List[str] | None = None,
     ):
         self.cfg = cfg
+        self._dataset_weights = list(dataset_weights)
 
         # convert each metadata stats to the standard data format
         for metadata in metadatas:
             metadata.stats = self._to_standard_data_format(metadata.repo_id, metadata.stats)
 
-        self.stats = aggregate_stats([metadata.stats for metadata in metadatas], weights=dataset_weights)
+        # Per-dataset stats (no cross-dataset aggregation). Policies stack
+        # these along a leading axis and index per-sample.
+        self.per_dataset_stats: list[dict[str, dict[str, np.ndarray]]] = [m.stats for m in metadatas]
+
+        # Names default to repo_id when WeightedDatasetMixture didn't supply
+        # deduplicated names (e.g. tests that instantiate the metadata
+        # directly). Duplicates would break the str -> index mapping; surface
+        # them rather than silently keeping the last one.
+        if dataset_names is None:
+            dataset_names = [m.repo_id for m in metadatas]
+        if len(dataset_names) != len(metadatas):
+            raise ValueError(f"dataset_names ({len(dataset_names)}) must match metadatas ({len(metadatas)}).")
+        if len(set(dataset_names)) != len(dataset_names):
+            dups = [n for n in dataset_names if dataset_names.count(n) > 1]
+            raise ValueError(
+                f"dataset_names must be unique; got duplicates {sorted(set(dups))}. "
+                "Use WeightedDatasetMixture's `_make_dataset_names` which appends "
+                "`#N` suffixes for repeated repo ids."
+            )
+        self.dataset_names: list[str] = list(dataset_names)
+        self.dataset_name_to_index: dict[str, int] = {n: i for i, n in enumerate(self.dataset_names)}
+
+    def aggregated_action_stats(self) -> dict[str, np.ndarray]:
+        """Single mixture-wide action stats (mean/std/min/max/count).
+
+        Backwards-compat helper for the rare consumers that genuinely need a
+        single set of action stats across the whole mixture — currently only
+        ``fit_fast_tokenizer.py``, which fits one BPE codec over a global
+        action range. Most callers should consume ``per_dataset_stats`` /
+        ``dataset_names`` directly.
+        """
+        stats_with_actions = [s for s in self.per_dataset_stats if "actions" in s]
+        if not stats_with_actions:
+            raise ValueError(
+                "No dataset in the mixture exposes 'actions' stats; aggregated_action_stats() is undefined."
+            )
+        # `aggregate_stats` walks every feature key across every dataset;
+        # pull just the "actions" sub-dicts so the call is cheap.
+        agg = aggregate_stats(
+            [{"actions": s["actions"]} for s in stats_with_actions],
+            weights=self._dataset_weights[: len(stats_with_actions)],
+        )
+        return agg["actions"]
 
     def _to_standard_data_format(
         self, repo_id: str, stats: dict[str, dict[str, np.ndarray]]
@@ -372,16 +479,30 @@ class WeightedDatasetMixture:
             )
 
         self.cfg = cfg
-        self.datasets = datasets
-        self.dataset_weights = dataset_weights
         # Common resample rate (Hz); None = mixed-frequency (native fps per dataset).
         self.action_freq: Optional[float] = action_freq
-        self.dataset_names = self._make_dataset_names(cfg, datasets)  # For logging
+        self.dataset_weights = dataset_weights
+        self.dataset_names = self._make_dataset_names(cfg, datasets)  # For logging + tagging
+
+        # Validate meta presence on the UN-wrapped inputs (so the error
+        # message points to the real source) before wrapping.
+        if not all(hasattr(ds, "meta") and ds.meta is not None for ds in datasets):
+            raise ValueError("All datasets must have a 'meta' attribute with valid metadata.")
+
+        # Wrap every underlying dataset so __getitem__ injects
+        # `dataset_repo_id: str` and `dataset_index: torch.long`. The policy's
+        # Normalize/Unnormalize uses these to gather per-sample stats.
+        # `_TaggedDataset` preserves `.meta` so `get_per_dataset_dataloaders`
+        # and other consumers keep working.
+        self.datasets = [
+            _TaggedDataset(ds, name, idx)
+            for idx, (ds, name) in enumerate(zip(datasets, self.dataset_names, strict=True))
+        ]
 
         logging.info("Initializing WeightedDatasetMixture...")
         self._log_dataset_info()
 
-        self.concatenated_dataset: ConcatDataset = ConcatDataset(datasets)
+        self.concatenated_dataset: ConcatDataset = ConcatDataset(self.datasets)
         logging.info(f"Total length of concatenated dataset: {len(self.concatenated_dataset)}")
 
         self.sample_weights: torch.Tensor = self._calculate_sample_weights()
@@ -394,10 +515,12 @@ class WeightedDatasetMixture:
             )
         logging.info("-" * 30)
 
-        # aggregate metadata
-        if not all(hasattr(ds, "meta") and ds.meta is not None for ds in datasets):
-            raise ValueError("All datasets must have a 'meta' attribute with valid metadata.")
-        self.meta = DatasetMixtureMetadata(cfg, [ds.meta for ds in datasets], dataset_weights)
+        self.meta = DatasetMixtureMetadata(
+            cfg,
+            [ds.meta for ds in datasets],
+            dataset_weights,
+            dataset_names=self.dataset_names,
+        )
 
     @staticmethod
     def _make_dataset_names(cfg: TrainPipelineConfig, datasets: List[BaseDataset]) -> List[str]:

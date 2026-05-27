@@ -52,6 +52,7 @@ from transformers import AutoProcessor, AutoTokenizer
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import NormalizationMode
 from opentau.policies.normalize import Normalize, Unnormalize
+from opentau.policies.normalize import resolve_num_datasets as _num_datasets
 from opentau.policies.pi07.gemma3_with_expert import (
     Gemma3WithExpertModel,
 )
@@ -317,20 +318,40 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
     def __init__(
         self,
         config: PI07LowLevelConfig,
-        dataset_stats: dict[str, dict[str, Tensor]] | None = None,
+        per_dataset_stats: list[dict[str, dict[str, Tensor]]] | None = None,
+        dataset_names: list[str] | None = None,
     ):
         super().__init__(config)
         config.validate_features()
         self.config = config
-        self.normalize_inputs = Normalize(config.input_features, config.normalization_mapping, dataset_stats)
+        num_datasets = _num_datasets(per_dataset_stats, dataset_names, config)
+        self.normalize_inputs = Normalize(
+            config.input_features,
+            config.normalization_mapping,
+            per_dataset_stats=per_dataset_stats,
+            dataset_names=dataset_names,
+            num_datasets=num_datasets,
+        )
         self.normalize_targets = Normalize(
-            config.output_features, config.normalization_mapping, dataset_stats
+            config.output_features,
+            config.normalization_mapping,
+            per_dataset_stats=per_dataset_stats,
+            dataset_names=dataset_names,
+            num_datasets=num_datasets,
         )
         self.normalize_discrete_actions = Normalize(
-            config.output_features, {"ACTION": NormalizationMode.MIN_MAX}, dataset_stats
+            config.output_features,
+            {"ACTION": NormalizationMode.MIN_MAX},
+            per_dataset_stats=per_dataset_stats,
+            dataset_names=dataset_names,
+            num_datasets=num_datasets,
         )
         self.unnormalize_outputs = Unnormalize(
-            config.output_features, config.normalization_mapping, dataset_stats
+            config.output_features,
+            config.normalization_mapping,
+            per_dataset_stats=per_dataset_stats,
+            dataset_names=dataset_names,
+            num_datasets=num_datasets,
         )
 
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-4b-pt")
@@ -677,7 +698,8 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
                 f"Delay must be None or between 0 and {self.config.max_delay}"
             )
 
-        batch = self.normalize_inputs(batch)
+        dataset_index = self._resolve_dataset_index(batch)
+        batch = self.normalize_inputs(batch, dataset_index)
 
         # `_build_history_batch` (called from `select_action` upstream) emits
         # this; it's None when the caller skipped that step (e.g. n_obs_steps
@@ -715,7 +737,7 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             action_prefix = torch.zeros(actions_shape, dtype=lang_tokens.dtype, device=lang_tokens.device)
         else:
-            normalized = self.normalize_targets({"actions": action_prefix})["actions"]
+            normalized = self.normalize_targets({"actions": action_prefix}, dataset_index)["actions"]
             action_prefix = F.pad(
                 normalized,
                 (0, 0, 0, self.config.chunk_size - normalized.shape[1]),
@@ -744,7 +766,7 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
         original_action_dim = action_feature.shape[0]
         actions = actions[:, :, :original_action_dim]
 
-        actions = self.unnormalize_outputs({"actions": actions})["actions"]
+        actions = self.unnormalize_outputs({"actions": actions}, dataset_index)["actions"]
 
         return actions
 
@@ -764,9 +786,10 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
         Returns:
             Dict with ``"MSE"`` and ``"CE"`` scalar loss tensors.
         """
-        batch = self.normalize_inputs(batch)
-        batch["discrete_actions"] = self.normalize_discrete_actions(dict(batch))["actions"]
-        batch = self.normalize_targets(batch)
+        dataset_index = self._resolve_dataset_index(batch)
+        batch = self.normalize_inputs(batch, dataset_index)
+        batch["discrete_actions"] = self.normalize_discrete_actions(dict(batch), dataset_index)["actions"]
+        batch = self.normalize_targets(batch, dataset_index)
 
         obs_history_is_pad = batch.get("obs_history_is_pad")
         if obs_history_is_pad is None:

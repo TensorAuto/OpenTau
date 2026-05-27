@@ -42,9 +42,12 @@ Pipeline (all CPU):
        fps when ``action_freq is None`` -- mixed-frequency mixtures) and
        right-padded to ``max_action_dim``.
     4. Min-max-normalize each chunk to ``[-1, 1]`` using
-       ``mixture.meta.stats["actions"]`` -- the same min/max the policy
-       will use at training via
-       ``Normalize({"ACTION": NormalizationMode.MIN_MAX})``.
+       ``mixture.meta.aggregated_action_stats()`` -- the same global
+       min/max the BPE codec is fit over. (The training policy itself
+       normalizes per-dataset via
+       ``Normalize({"ACTION": NormalizationMode.MIN_MAX})``; the
+       tokenizer collapses to one global range so the discrete vocab
+       is shared across the mixture.)
     5. Call ``UniversalActionProcessor.fit(...)`` (DCT + Rust BpeTrainer)
        and ``save_pretrained`` the result. The upstream remote-code
        source ``processing_action_tokenizer.py`` is copied alongside so
@@ -716,18 +719,25 @@ def _build_mixture_parallel(train_cfg: Any, num_workers: int) -> Any:
 
 
 def _extract_action_stats(mixture_meta: Any, action_dim: int) -> tuple[np.ndarray, np.ndarray]:
-    """Pull mixture-aggregated ``action`` min/max (already padded to
-    ``max_action_dim`` and computed with NaN-tolerant aggregation by
-    ``DatasetMixtureMetadata``).
+    """Pull a single global ``action`` min/max across the whole mixture.
+
+    Per-dataset normalization (the production training path) keeps separate
+    stats per source, but the BPE tokenizer fits one codec over a shared
+    action range — call ``mixture_meta.aggregated_action_stats()`` to compute
+    that on demand. Output is already padded to ``max_action_dim`` and uses
+    NaN-tolerant aggregation under the hood.
 
     Dims that are ``NaN`` across the whole mixture fall back to ``[-1, 1]`` so
     the normalization step never divides by zero.
     """
-    action_stats = mixture_meta.stats.get("actions")
-    if action_stats is None:
+    try:
+        action_stats = mixture_meta.aggregated_action_stats()
+    except (AttributeError, ValueError) as e:
         raise RuntimeError(
-            f"Mixture meta is missing 'actions' stats. Available keys: {sorted(mixture_meta.stats or [])}"
-        )
+            "Mixture meta does not expose `aggregated_action_stats()` or has no "
+            "'actions' contributor. Ensure the mixture was built from "
+            "`WeightedDatasetMixture` (which produces `DatasetMixtureMetadata`)."
+        ) from e
     action_min = np.asarray(action_stats["min"], dtype=np.float64).ravel()
     action_max = np.asarray(action_stats["max"], dtype=np.float64).ravel()
     if action_min.shape[0] < action_dim:

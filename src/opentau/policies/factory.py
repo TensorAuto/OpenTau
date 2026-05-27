@@ -215,17 +215,44 @@ def make_policy(
     policy_cls = get_policy_class(cfg.type)
 
     kwargs = {}
+    per_dataset_stats: list[dict[str, dict[str, np.ndarray]]] | None = None
+    dataset_names: list[str] | None = None
 
     if ds_meta is not None:
         features = dataset_to_policy_features(ds_meta.features)
-        kwargs["dataset_stats"] = ds_meta.stats
+        # `DatasetMixtureMetadata` exposes per-dataset stats + names; a bare
+        # `LeRobotDatasetMetadata` (single-dataset path, e.g. some scripts /
+        # tests) exposes only `.stats` — wrap it into a singleton list so the
+        # policy ctor sees a uniform shape.
+        if hasattr(ds_meta, "per_dataset_stats") and hasattr(ds_meta, "dataset_names"):
+            per_dataset_stats = list(ds_meta.per_dataset_stats)
+            dataset_names = list(ds_meta.dataset_names)
+        else:
+            per_dataset_stats = [ds_meta.stats]
+            dataset_names = [getattr(ds_meta, "repo_id", "default")]
 
     if not features_already_set:
         cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
         cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
 
     if stats is not None:
-        kwargs["dataset_stats"] = stats
+        # External per-dataset stats override. Accept either a single
+        # dict-of-features (wrapped into a singleton list) or an already-
+        # listed `per_dataset_stats`.
+        if isinstance(stats, dict):
+            per_dataset_stats = [stats]
+            dataset_names = dataset_names or ["external"]
+        else:
+            per_dataset_stats = list(stats)
+            dataset_names = dataset_names or [f"external_{i}" for i in range(len(per_dataset_stats))]
+
+    if per_dataset_stats is not None:
+        kwargs["per_dataset_stats"] = per_dataset_stats
+        kwargs["dataset_names"] = dataset_names
+        # Persist the ordered name list into the policy config so it survives
+        # save -> load. Inference-time `batch["dataset_repo_id"]` strings are
+        # resolved against this list.
+        cfg.dataset_names = list(dataset_names)
 
     if execution_target is not None:
         kwargs["execution_target"] = execution_target
@@ -242,6 +269,15 @@ def make_policy(
         policy = policy_cls(**kwargs)
 
     assert isinstance(policy, nn.Module)
+
+    # If the checkpoint was saved with save_normalization_stats=False the
+    # buffers loaded back as +inf — repopulate from the caller's stats if we
+    # have them, otherwise raise a clear error rather than letting the first
+    # forward fail mid-step.
+    if cfg.pretrained_path and per_dataset_stats is not None:
+        policy._inject_stats(per_dataset_stats, dataset_names=dataset_names)
+    elif cfg.pretrained_path:
+        policy._check_norm_stats_loaded()
 
     # policy = torch.compile(policy, mode="reduce-overhead")
 

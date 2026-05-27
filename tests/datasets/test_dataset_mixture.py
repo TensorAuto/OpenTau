@@ -86,9 +86,18 @@ class TestDatasetMixtureMetadata:
         metadata_mixture = DatasetMixtureMetadata(train_pipeline_config, metadatas, dataset_weights)
 
         assert metadata_mixture.cfg == train_pipeline_config
-        assert "state" in metadata_mixture.stats
-        assert "actions" in metadata_mixture.stats
-        assert "camera0" in metadata_mixture.stats
+        # `per_dataset_stats` replaces the previously-aggregated `stats` dict;
+        # there is one entry per underlying dataset, each carrying the standard
+        # feature set after `_to_standard_data_format` normalization.
+        assert len(metadata_mixture.per_dataset_stats) == 1
+        assert "state" in metadata_mixture.per_dataset_stats[0]
+        assert "actions" in metadata_mixture.per_dataset_stats[0]
+        assert "camera0" in metadata_mixture.per_dataset_stats[0]
+        # `dataset_names` defaults to the underlying repo_ids when the caller
+        # doesn't override (the WeightedDatasetMixture path supplies its own
+        # deduplicated list).
+        assert metadata_mixture.dataset_names == [lerobot_dataset_metadata.repo_id]
+        assert metadata_mixture.dataset_name_to_index == {lerobot_dataset_metadata.repo_id: 0}
 
     @patch("opentau.datasets.dataset_mixture.DATA_FEATURES_NAME_MAPPING")
     def test_to_standard_data_format(self, mock_name_mapping, train_pipeline_config):
@@ -218,7 +227,12 @@ class TestWeightedDatasetMixture:
         mixture = WeightedDatasetMixture(train_pipeline_config, datasets, dataset_weights, action_freq)
 
         assert mixture.cfg == train_pipeline_config
-        assert mixture.datasets == datasets
+        # `mixture.datasets` is the list of `_TaggedDataset` wrappers (not the
+        # raw user-supplied datasets); compare on `len` and verify the
+        # wrappers expose the underlying `.meta`.
+        assert len(mixture.datasets) == len(datasets)
+        for wrapped, original in zip(mixture.datasets, datasets, strict=True):
+            assert wrapped.meta is original.meta
         assert mixture.dataset_weights == dataset_weights
         assert mixture.action_freq == action_freq
         assert len(mixture.dataset_names) == 5
@@ -443,16 +457,21 @@ class TestWeightedDatasetMixtureIntegration:
 
     @pytest.mark.slow  # 1 sec
     def test_integration_metadata_aggregation(self, train_pipeline_config, datasets_factory):
-        """Test that metadata is properly aggregated from multiple datasets."""
+        """Test that per-dataset metadata is properly populated from multiple datasets."""
         datasets = datasets_factory(2)
         dataset_weights = [0.6, 0.4]
 
         mixture = WeightedDatasetMixture(train_pipeline_config, datasets, dataset_weights, 30.0)
 
-        # Verify aggregated metadata
+        # Verify per-dataset metadata (no cross-dataset aggregation any more —
+        # the policy stacks these along a per-sample axis instead).
         assert mixture.meta is not None
-        assert hasattr(mixture.meta, "stats")
+        assert hasattr(mixture.meta, "per_dataset_stats")
+        assert hasattr(mixture.meta, "dataset_names")
         assert hasattr(mixture.meta, "features")
+        assert len(mixture.meta.per_dataset_stats) == 2
+        assert mixture.meta.dataset_names == mixture.dataset_names
+        assert mixture.meta.dataset_name_to_index[mixture.dataset_names[0]] == 0
 
         # Verify features are properly configured
         features = mixture.meta.features

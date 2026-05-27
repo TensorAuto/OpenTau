@@ -159,47 +159,54 @@ def test_normalize(insert_temporal_dim, capsys):
         for key in output_batch:
             output_batch[key] = torch.stack([output_batch[key]] * tdim, dim=1)
 
-    # test without stats
-    normalize = Normalize(input_features, norm_map, stats=None)
+    # The per-sample dataset index — every sample comes from dataset 0 since
+    # this is a single-dataset construction. Layout matches the per-sample
+    # `dataset_index` field that `_TaggedDataset` injects into training
+    # batches.
+    dataset_index = torch.zeros(bsize, dtype=torch.long)
+
+    # test without stats (D=1 stacked buffer initialised to inf — the forward
+    # assertion trips because no row has been populated yet).
+    normalize = Normalize(input_features, norm_map, per_dataset_stats=None, num_datasets=1)
     for ft in input_features:
         assert hasattr(normalize, "buffer_" + ft.replace(".", "_"))
 
     with pytest.raises(AssertionError):
-        normalize(input_batch)
+        normalize(input_batch, dataset_index)
 
-    # test with stats
-    normalize = Normalize(input_features, norm_map, stats=dataset_stats)
-    normalize(input_batch)
+    # test with stats — wrap the single-dataset stats into a one-element list.
+    normalize = Normalize(input_features, norm_map, per_dataset_stats=[dataset_stats])
+    normalize(input_batch, dataset_index)
 
-    # test loading pretrained models
-    new_normalize = Normalize(input_features, norm_map, stats=None)
+    # test loading pretrained models (state-dict round-trip preserves stats).
+    new_normalize = Normalize(input_features, norm_map, per_dataset_stats=None, num_datasets=1)
     new_normalize.load_state_dict(normalize.state_dict())
-    new_normalize(input_batch)
+    new_normalize(input_batch, dataset_index)
 
     # test without stats
-    unnormalize = Unnormalize(output_features, norm_map, stats=None)
+    unnormalize = Unnormalize(output_features, norm_map, per_dataset_stats=None, num_datasets=1)
     with pytest.raises(AssertionError):
-        unnormalize(output_batch)
+        unnormalize(output_batch, dataset_index)
 
     # test with stats
-    unnormalize = Unnormalize(output_features, norm_map, stats=dataset_stats)
+    unnormalize = Unnormalize(output_features, norm_map, per_dataset_stats=[dataset_stats])
     for ft in output_features:
         assert hasattr(unnormalize, "buffer_" + ft.replace(".", "_"))
 
-    unnormalize(output_batch)
+    unnormalize(output_batch, dataset_index)
 
     # test loading pretrained models
-    new_unnormalize = Unnormalize(output_features, norm_map, stats=None)
+    new_unnormalize = Unnormalize(output_features, norm_map, per_dataset_stats=None, num_datasets=1)
     new_unnormalize.load_state_dict(unnormalize.state_dict())
-    unnormalize(output_batch)
+    unnormalize(output_batch, dataset_index)
 
     # check warmings
-    normalize({"observation.image": torch.randn(bsize, 3, 96, 96)})
+    normalize({"observation.image": torch.randn(bsize, 3, 96, 96)}, dataset_index)
     captured = capsys.readouterr()
 
     assert "Warning: observation.state was missing from the batch during " in captured.err
 
-    unnormalize({})
+    unnormalize({}, dataset_index)
     captured = capsys.readouterr()
 
     assert "Warning: action was missing from the batch during " in captured.err

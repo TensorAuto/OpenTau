@@ -120,7 +120,13 @@ class PI05OnnxWrapper(torch.nn.Module):
         original_action_dim = self.policy.config.action_feature.shape[0]
         actions = actions[:, :, :original_action_dim]
 
-        actions = self.policy.unnormalize_outputs({"actions": actions})["actions"]
+        # ONNX export traces with a single fixed dataset choice (the first
+        # entry in config.dataset_names). The unnormalize call needs an
+        # explicit dataset_index since this wrapper bypasses
+        # `_resolve_dataset_index` (no `batch["dataset_repo_id"]` available).
+        bsize = lang_tokens.shape[0]
+        dataset_index = torch.zeros(bsize, dtype=torch.long, device=lang_tokens.device)
+        actions = self.policy.unnormalize_outputs({"actions": actions}, dataset_index)["actions"]
         return actions
 
 

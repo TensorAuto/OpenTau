@@ -27,6 +27,7 @@ import os
 from pathlib import Path
 from typing import Type, TypeVar
 
+import numpy as np
 import packaging
 import safetensors
 import torch
@@ -34,6 +35,7 @@ from huggingface_hub import hf_hub_download
 from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
 from huggingface_hub.errors import HfHubHTTPError
 from safetensors.torch import load_model as load_model_as_safetensor
+from safetensors.torch import save_file as save_safetensor_file
 from safetensors.torch import save_model as save_model_as_safetensor
 from torch import Tensor, nn
 
@@ -42,6 +44,25 @@ from opentau.policies.utils import log_model_loading_keys
 from opentau.utils.hub import HubMixin
 
 T = TypeVar("T", bound="PreTrainedPolicy")
+
+# State-dict key prefixes for the per-feature normalization buffers attached
+# by `Normalize` / `Unnormalize`. Used by `_save_pretrained` (when
+# `save_normalization_stats=False`) and by `train.py`'s Accelerate save-hook
+# to strip the buffers from the on-disk safetensors. Kept here (not in
+# normalize.py) so the train script can import it without picking up torch's
+# heavy normalize module unless it actually constructs a policy.
+NORM_BUFFER_PREFIXES: tuple[str, ...] = (
+    "normalize_inputs.buffer_",
+    "normalize_targets.buffer_",
+    "normalize_discrete_actions.buffer_",
+    "unnormalize_outputs.buffer_",
+)
+
+
+def is_norm_buffer_key(key: str) -> bool:
+    """Return True iff ``key`` names a Normalize/Unnormalize stat parameter."""
+    return any(key.startswith(prefix) for prefix in NORM_BUFFER_PREFIXES)
+
 
 DEFAULT_POLICY_CARD = """
 ---
@@ -91,6 +112,16 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                 f"`model = {self.__class__.__name__}.from_pretrained(PRETRAINED_MODEL_NAME)`"
             )
         self.config = config
+        # Build the name -> index lookup used by `_resolve_dataset_index` to
+        # map inference-time `batch["dataset_repo_id"]` (str) to the leading
+        # axis of the stacked Normalize buffers. Stays None for legacy
+        # checkpoints whose config.json predates the per-dataset rewrite —
+        # those callers must pass `batch["dataset_index"]` directly.
+        names = getattr(config, "dataset_names", None)
+        if names is None:
+            self._dataset_name_to_index: dict[str, int] | None = None
+        else:
+            self._dataset_name_to_index = {name: i for i, name in enumerate(names)}
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -99,15 +130,41 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         if not getattr(cls, "name", None):
             raise TypeError(f"Class {cls.__name__} must define 'name'")
 
-    def _save_pretrained(self, save_directory: Path) -> None:
+    def _save_pretrained(
+        self,
+        save_directory: Path,
+        *,
+        include_norm_stats: bool | None = None,
+    ) -> None:
         """Saves the policy and its configuration to a directory.
 
         Args:
             save_directory: The directory to save the policy to.
+            include_norm_stats: When ``None`` (default), defers to
+                ``self.config.save_normalization_stats``. When set, overrides
+                the config field for this call. When effectively False the
+                ``normalize_*.buffer_*`` / ``unnormalize_*.buffer_*`` keys are
+                excluded from the on-disk ``model.safetensors`` — reloading
+                then requires the caller to pass ``ds_meta=`` (or call
+                ``policy._inject_stats``) so the buffers can be repopulated.
         """
         self.config._save_pretrained(save_directory)
         model_to_save = self.module if hasattr(self, "module") else self
-        save_model_as_safetensor(model_to_save, str(save_directory / SAFETENSORS_SINGLE_FILE))
+
+        if include_norm_stats is None:
+            include_norm_stats = getattr(self.config, "save_normalization_stats", True)
+
+        out_path = str(save_directory / SAFETENSORS_SINGLE_FILE)
+        if include_norm_stats:
+            save_model_as_safetensor(model_to_save, out_path)
+        else:
+            # `save_model` doesn't expose a filter argument, so build the
+            # filtered state_dict ourselves and write via `save_file`. Clone
+            # tensors that share storage with another retained tensor to
+            # avoid safetensors' "duplicated tensors" rejection.
+            state_dict = model_to_save.state_dict()
+            filtered = {k: v for k, v in state_dict.items() if not is_norm_buffer_key(k)}
+            save_safetensor_file(filtered, out_path)
 
     @classmethod
     def from_pretrained(
@@ -190,6 +247,161 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
 
         policy.eval()
         return policy
+
+    def _infer_batch_size_and_device(self, batch: dict[str, Tensor]) -> tuple[int, torch.device]:
+        """Find any tensor in ``batch`` and return (batch_size, device).
+
+        Used by ``_resolve_dataset_index`` when the caller supplied
+        ``dataset_repo_id`` as a Python string/list — we need to allocate the
+        index tensor on the same device as the rest of the batch.
+        """
+        for v in batch.values():
+            if isinstance(v, Tensor):
+                return v.shape[0] if v.ndim > 0 else 1, v.device
+        # No tensors in the batch — fall back to CPU and trust caller's len(list).
+        return 0, torch.device("cpu")
+
+    def _resolve_dataset_index(self, batch: dict[str, Tensor]) -> Tensor:
+        """Resolve per-sample dataset indices from a training or inference batch.
+
+        Training path: the dataloader's ``_TaggedDataset`` wrapper attaches
+        ``batch["dataset_index"]`` as a ``(B,)`` ``LongTensor`` already.
+
+        Inference path: the caller passes ``batch["dataset_repo_id"]`` as
+        either a single ``str`` (broadcast to the full batch) or a
+        ``list[str]`` of length B. We map each name through the policy's
+        training-time ``dataset_names`` list (stored on ``self.config``) to
+        the corresponding integer index.
+
+        Raises:
+            KeyError: neither ``dataset_index`` nor ``dataset_repo_id`` was provided.
+            RuntimeError: ``dataset_repo_id`` was provided but the policy was
+                loaded without a ``dataset_names`` list.
+            ValueError: a name was provided that isn't in ``dataset_names``.
+        """
+        if "dataset_index" in batch:
+            idx = batch["dataset_index"]
+            if not isinstance(idx, Tensor):
+                idx = torch.as_tensor(idx, dtype=torch.long)
+            return idx.to(dtype=torch.long)
+
+        if "dataset_repo_id" not in batch:
+            raise KeyError(
+                "Per-dataset normalization requires either `dataset_index` "
+                "(LongTensor of shape (B,)) or `dataset_repo_id` (str or "
+                "list[str] of length B) in the batch."
+            )
+
+        if self._dataset_name_to_index is None:
+            raise RuntimeError(
+                "Policy was loaded without `dataset_names`; cannot resolve "
+                "`dataset_repo_id` strings. Either pass `batch['dataset_index']` "
+                "directly or rebuild the policy via `make_policy(cfg, ds_meta=...)`."
+            )
+
+        raw = batch["dataset_repo_id"]
+        batch_size, device = self._infer_batch_size_and_device(batch)
+        names = [raw] * (batch_size or 1) if isinstance(raw, str) else list(raw)
+        try:
+            indices = [self._dataset_name_to_index[n] for n in names]
+        except KeyError as e:
+            raise ValueError(
+                f"dataset_repo_id {e.args[0]!r} not in this policy's training "
+                f"set {list(self._dataset_name_to_index)}"
+            ) from None
+        return torch.tensor(indices, dtype=torch.long, device=device)
+
+    def _inject_stats(
+        self,
+        per_dataset_stats: list[dict[str, dict[str, Tensor | np.ndarray]]],
+        dataset_names: list[str] | None = None,
+    ) -> None:
+        """Overwrite the Normalize/Unnormalize buffers in-place from ``per_dataset_stats``.
+
+        Used to repopulate stats after loading a checkpoint that was saved
+        with ``save_normalization_stats=False``. The buffer shapes and dtypes
+        must already match (i.e. the policy must have been constructed with
+        the same number of datasets and the same feature set as the stats
+        being injected).
+
+        Args:
+            per_dataset_stats: Ordered list of per-dataset stat dicts (same
+                shape ``Normalize`` accepts at construction).
+            dataset_names: Optional ordered list of names; when provided also
+                updates ``self.config.dataset_names`` and the cached
+                ``_dataset_name_to_index`` lookup so inference-time
+                ``dataset_repo_id`` resolution works after the injection.
+        """
+        from opentau.policies.normalize import _stat_to_float32_tensor
+
+        for module_attr in (
+            "normalize_inputs",
+            "normalize_targets",
+            "normalize_discrete_actions",
+            "unnormalize_outputs",
+        ):
+            module = getattr(self, module_attr, None)
+            if module is None:
+                continue
+            for feature_key, ft in module.features.items():
+                norm_mode = module.norm_map.get(ft.type)
+                if norm_mode is None or norm_mode.name == "IDENTITY":
+                    continue
+                buffer_attr = "buffer_" + feature_key.replace(".", "_")
+                buffer = getattr(module, buffer_attr, None)
+                if buffer is None:
+                    continue
+                stat_names = ("mean", "std") if norm_mode.name == "MEAN_STD" else ("min", "max")
+                for stat in stat_names:
+                    rows = [_stat_to_float32_tensor(s[feature_key][stat]) for s in per_dataset_stats]
+                    new_tensor = torch.stack(rows, dim=0).to(
+                        device=buffer[stat].device, dtype=buffer[stat].dtype
+                    )
+                    if new_tensor.shape != buffer[stat].shape:
+                        raise ValueError(
+                            f"Injected stats shape {tuple(new_tensor.shape)} does not match "
+                            f"existing buffer shape {tuple(buffer[stat].shape)} for "
+                            f"{module_attr}.{buffer_attr}['{stat}']."
+                        )
+                    with torch.no_grad():
+                        buffer[stat].data.copy_(new_tensor)
+            # Refresh the module's own dataset_names cache.
+            if dataset_names is not None:
+                module.dataset_names = list(dataset_names)
+
+        if dataset_names is not None:
+            self.config.dataset_names = list(dataset_names)
+            self._dataset_name_to_index = {name: i for i, name in enumerate(dataset_names)}
+
+    def _check_norm_stats_loaded(self) -> None:
+        """Raise a clear error if any Normalize/Unnormalize buffer is still ∞.
+
+        Called by ``make_policy`` after a checkpoint load when no
+        ``per_dataset_stats`` was supplied — surfaces the
+        ``save_normalization_stats=False`` round-trip mistake at
+        policy-construction time rather than at the first forward.
+        """
+        bad: list[str] = []
+        for module_attr in (
+            "normalize_inputs",
+            "normalize_targets",
+            "normalize_discrete_actions",
+            "unnormalize_outputs",
+        ):
+            module = getattr(self, module_attr, None)
+            if module is None:
+                continue
+            for name, param in module.named_parameters(recurse=True):
+                if name.startswith("buffer_") and torch.isinf(param).any():
+                    bad.append(f"{module_attr}.{name}")
+        if bad:
+            raise RuntimeError(
+                "Normalization buffers were not initialised from a checkpoint "
+                "and no per_dataset_stats / ds_meta was passed. The following "
+                f"buffers are still +inf: {bad}. Either re-save the checkpoint "
+                "with `save_normalization_stats=True`, or pass `ds_meta=` to "
+                "`make_policy(...)` so stats are injected after load."
+            )
 
     def _tile_linear_input_weight(self, state_dict_to_load: dict):
         """Modifies the `state_dict_to_load` in-place by tiling linear layer input weights.

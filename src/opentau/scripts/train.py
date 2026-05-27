@@ -41,7 +41,7 @@ from opentau.envs.utils import close_envs
 from opentau.optim.factory import make_optimizer_and_scheduler
 from opentau.optim.master_weights import MasterWeightOptimizer
 from opentau.policies.factory import make_policy
-from opentau.policies.pretrained import PreTrainedPolicy
+from opentau.policies.pretrained import PreTrainedPolicy, is_norm_buffer_key
 from opentau.scripts.eval import (
     collect_grid_summary_videos,
     consolidate_eval_info,
@@ -548,6 +548,24 @@ def train(cfg: TrainPipelineConfig):
 
     # Register the LR scheduler for checkpointing
     accelerator.register_for_checkpointing(lr_scheduler)
+
+    # When `save_normalization_stats=False`, strip the per-feature Normalize /
+    # Unnormalize buffers from each model state_dict that Accelerate is about
+    # to write under `accelerator.save_state(...)`. The hook runs on every
+    # rank before the actual safetensors write, so the filtered keys never
+    # land on disk. The reload side relies on `make_policy(..., ds_meta=...)`
+    # to call `_inject_stats(...)` and repopulate the buffers (see
+    # `policies/factory.py::make_policy`).
+    if not cfg.policy.save_normalization_stats:
+
+        def _strip_norm_buffers_pre_save(models, weights, input_dir):
+            del models, input_dir
+            for sd in weights:
+                for k in list(sd):
+                    if is_norm_buffer_key(k):
+                        del sd[k]
+
+        accelerator.register_save_state_pre_hook(_strip_norm_buffers_pre_save)
 
     if cfg.resume:
         # load accelerator state
