@@ -2464,9 +2464,15 @@ class TestSkipNormalizationWeights:
             FeatureType.ACTION: NormalizationMode.MIN_MAX,
         }
 
-        normalize_mean_std_keys = list(Normalize(features, norm_map_mean_std).state_dict().keys())
-        unnormalize_mean_std_keys = list(Unnormalize(features, norm_map_mean_std).state_dict().keys())
-        normalize_min_max_keys = list(Normalize(features, norm_map_min_max).state_dict().keys())
+        normalize_mean_std_keys = list(
+            Normalize(features, norm_map_mean_std, num_datasets=1).state_dict().keys()
+        )
+        unnormalize_mean_std_keys = list(
+            Unnormalize(features, norm_map_mean_std, num_datasets=1).state_dict().keys()
+        )
+        normalize_min_max_keys = list(
+            Normalize(features, norm_map_min_max, num_datasets=1).state_dict().keys()
+        )
 
         # Each (Un)Normalize submodule attaches as ``normalize_inputs`` /
         # ``normalize_targets`` / ``unnormalize_outputs`` /
@@ -2527,7 +2533,7 @@ class TestSkipNormalizationWeights:
         norm_map = {FeatureType.ACTION: NormalizationMode.MEAN_STD}
 
         parent = nn.Module()
-        parent.normalize_inputs = Normalize(features, norm_map, stats=None)
+        parent.normalize_inputs = Normalize(features, norm_map, num_datasets=1)
 
         inf_buffers = _find_inf_normalize_buffers(parent)
         assert inf_buffers, "expected the helper to flag at least one inf buffer for a stats-less Normalize"
@@ -2550,8 +2556,8 @@ class TestSkipNormalizationWeights:
         stats = {"action": {"mean": np.zeros(7, dtype=np.float32), "std": np.ones(7, dtype=np.float32)}}
 
         parent = nn.Module()
-        parent.normalize_inputs = Normalize(features, norm_map, stats=stats)
-        parent.unnormalize_outputs = Unnormalize(features, norm_map, stats=stats)
+        parent.normalize_inputs = Normalize(features, norm_map, per_dataset_stats=[stats])
+        parent.unnormalize_outputs = Unnormalize(features, norm_map, per_dataset_stats=[stats])
 
         assert _find_inf_normalize_buffers(parent) == []
 
