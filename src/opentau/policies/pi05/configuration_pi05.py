@@ -64,8 +64,10 @@ class PI05Config(PreTrainedConfig):
         num_steps: Number of flow matching steps for decoding. Defaults to 10.
         attention_implementation: Attention implementation to use ("eager", "sdpa", or "fa2").
             Defaults to "eager". "sdpa" dispatches to ``torch.nn.functional.scaled_dot_product_attention``
-            (frees ~5.6 GiB on forward at the bs ceiling tested; see PR #182). "fa2" is accepted for
-            backward compatibility but logs a warning and falls back to "eager".
+            (frees ~5.6 GiB on forward at the bs ceiling tested; see PR #182). "fa2" uses PyTorch
+            ``flex_attention`` with a BlockMask compiled from the block-causal mask — gives true
+            FA2-class throughput on the pi05 pattern, where ``"sdpa"`` falls back to the
+            memory-efficient backend because of the explicit attn_mask.
         freeze_vision_encoder: Whether to freeze the vision encoder during fine-tuning. Defaults to True.
         train_expert_only: Whether to train only the expert module. Defaults to False.
         optimizer_lr: Learning rate for the optimizer. Defaults to 2.5e-5.
