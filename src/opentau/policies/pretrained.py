@@ -36,6 +36,7 @@ from safetensors.torch import save_model as save_model_as_safetensor
 from torch import Tensor, nn
 
 from opentau.configs.policies import PreTrainedConfig
+from opentau.policies.normalize import _materialize
 from opentau.policies.utils import log_model_loading_keys
 from opentau.utils.hub import HubMixin
 
@@ -597,10 +598,15 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
           process, or a ``WARNING`` if the flag was set but no matching keys
           were present (so a user who flipped the flag *expecting* to void
           the saved stats gets a clear signal that the flag was a no-op).
-        - Resets ``config.skip_normalization_weights = False`` in place
-          **whether keys were dropped or the no-op warning fired** — a user
-          who opted in once should not have to remember to flip the flag
-          back before resume.
+        - Resets ``config.skip_normalization_weights = False`` on the
+          *in-memory* config **whether keys were dropped or the no-op
+          warning fired**. Persistence requires ``save_pretrained``: an
+          in-process resume that subsequently saves a checkpoint will
+          persist ``False`` to that checkpoint's ``config.json``. But
+          re-running ``from_pretrained`` on the original source path
+          (e.g. an interactive notebook session that hasn't yet saved)
+          will re-read ``True`` from the source ``config.json`` and
+          re-strip.
 
         The returned ``stripped_keys`` set is intended to be used by the
         caller to (a) filter out the deliberately-dropped keys from
@@ -702,13 +708,26 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         # or all at the inf sentinel (per_dataset_stats=None). There is no
         # reachable mixed state, so "any inf" ⇔ "per_dataset_stats missing"
         # ⇔ the actionable user error the message describes.
+        #
+        # Note: ``Normalize`` registers stats as ``nn.Parameter(..., requires_grad=False)``
+        # rather than via ``register_buffer``, so we iterate
+        # ``named_parameters()``, not ``named_buffers()``. Same convention as
+        # the inline ``Normalize.forward`` checks (see ``normalize.py``) and
+        # :py:meth:`_check_norm_stats_loaded`.
+        #
+        # ``_materialize`` is defensive: under FSDP2 (``fully_shard``), the
+        # param would be a ``DTensor`` and ``torch.isinf`` would raise the
+        # mixed-Tensor/DTensor error. ``from_pretrained`` runs before
+        # ``accelerator.prepare`` today (so params are still plain Tensors
+        # here), but the call is cheap on plain Tensors and keeps the
+        # helper safe for any future caller that invokes it post-wrap.
         inf_buffers: list[str] = []
         for module_attr in NORM_MODULE_NAMES:
             module = getattr(model, module_attr, None)
             if module is None:
                 continue
             for name, param in module.named_parameters(recurse=True):
-                if name.startswith("buffer_") and torch.isinf(param).any():
+                if name.startswith("buffer_") and torch.isinf(_materialize(param)).any():
                     inf_buffers.append(f"{module_attr}.{name}")
         if inf_buffers:
             raise ValueError(
