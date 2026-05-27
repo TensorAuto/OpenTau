@@ -362,13 +362,17 @@ class TestPI05Integration:
         policy.model.embed_prefix = original_embed_prefix
         policy.model.embed_suffix = original_embed_suffix
 
-        # check normalize and unnormalize by applying it on actions
+        # check normalize and unnormalize by applying it on actions. Per-dataset
+        # Normalize/Unnormalize now require an explicit `dataset_index`; we're
+        # calling the submodules directly here (bypassing the policy's
+        # `_resolve_dataset_index` helper), so pass a zero-row index manually.
         normalize_actions = policy.normalize_targets
         unnormalize_actions = policy.unnormalize_outputs
         action_output = {"actions": batch["actions"].to("cuda")}
+        dataset_index = torch.zeros(batch_size, dtype=torch.long, device="cuda")
         assert torch.allclose(
             action_output["actions"],
-            unnormalize_actions(normalize_actions(action_output))["actions"],
+            unnormalize_actions(normalize_actions(action_output, dataset_index), dataset_index)["actions"],
             atol=1e-6,
         )
 
