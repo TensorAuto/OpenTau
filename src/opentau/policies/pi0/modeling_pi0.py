@@ -488,7 +488,17 @@ class PI0Policy(PreTrainedPolicy):
         actions = batch["actions"]
         actions_is_pad = batch.get("action_is_pad")
 
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        losses = self.model.forward(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            actions,
+            noise,
+            time,
+            action_dim=batch.get("action_dim"),
+        )
 
         # Crop to max_action_dim before masking so the shapes are well-defined when
         # the model's velocity head emits extra trailing dims.
@@ -869,6 +879,7 @@ class PI0FlowMatching(nn.Module):
         actions: Tensor,
         noise: Tensor | None = None,
         time: Tensor | None = None,
+        action_dim: Tensor | None = None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors).
 
@@ -881,6 +892,9 @@ class PI0FlowMatching(nn.Module):
             actions: Action tensor.
             noise: Optional noise tensor.
             time: Optional time tensor.
+            action_dim: Optional ``(B,)`` long tensor of real per-sample action
+                dims; when provided, noise is masked at padded dims so the
+                action expert's input embedding doesn't see contaminating noise.
 
         Returns:
             The computed loss tensor.
@@ -890,6 +904,18 @@ class PI0FlowMatching(nn.Module):
 
         if time is None:
             time = self.sample_time(actions.shape[0], actions.device)
+
+        # Zero noise at padded action dims so the action expert's input
+        # embedding never sees noise the model isn't supervised on. The
+        # outer caller (`PI0Policy.compute_loss`) applies the same dim mask
+        # to the returned MSE losses. All-True (no-op) when `action_dim is None`.
+        dim_mask = make_action_dim_mask(
+            action_dim,
+            self.config.max_action_dim,
+            batch_size=actions.shape[0],
+            device=actions.device,
+        )
+        noise = noise * rearrange(dim_mask, "b d -> b 1 d").to(noise.dtype)
 
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions

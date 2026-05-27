@@ -134,6 +134,55 @@ def test_flow_matching_masked_mse_combines_with_timestep_pad():
     torch.testing.assert_close(loss, expected)
 
 
+def test_input_side_noise_masking_zeros_padded_dims():
+    """Each policy multiplies the per-dim mask into ``noise`` before forming
+    ``x_t = (1-t)*noise + t*actions``. Because zero-padded actions are also
+    zero at padded dims (post-normalization, ``(0-mean)/(std+eps)=0`` when
+    the unused-dim stats are ``(mean=0, std=0)``), the resulting ``x_t`` and
+    ``u_t = noise - actions`` are both zero at padded dims — so the action
+    expert's input embedding never sees the noise that would otherwise leak
+    into predictions at real dims via attention. This test exercises the
+    pattern policies use to apply that mask."""
+    bsz, chunk, dim = 2, 4, 8
+    actions = torch.zeros(bsz, chunk, dim)
+    # Real dims have non-zero values; padded dims are 0 (matches the
+    # post-normalization invariant for unused dims).
+    actions[0, :, :3] = torch.randn(chunk, 3)
+    actions[1, :, :5] = torch.randn(chunk, 5)
+    noise = torch.randn(bsz, chunk, dim)
+    action_dim = torch.tensor([3, 5], dtype=torch.long)
+
+    dim_mask = make_action_dim_mask(action_dim, dim, batch_size=bsz, device=torch.device("cpu"))
+    noise_masked = noise * rearrange(dim_mask, "b d -> b 1 d").to(noise.dtype)
+
+    # Build x_t (flow-matching noisy input) and u_t (target velocity) with a
+    # mid-trajectory time. After masking noise, both must be zero at padded
+    # dims regardless of `t`.
+    t = 0.4
+    x_t = t * noise_masked + (1 - t) * actions
+    u_t = noise_masked - actions
+
+    # Sample 0: dims 3..7 padded; sample 1: dims 5..7 padded.
+    assert (x_t[0, :, 3:] == 0).all()
+    assert (u_t[0, :, 3:] == 0).all()
+    assert (x_t[1, :, 5:] == 0).all()
+    assert (u_t[1, :, 5:] == 0).all()
+    # Real dims unchanged compared with the un-masked computation.
+    torch.testing.assert_close(x_t[0, :, :3], t * noise[0, :, :3] + (1 - t) * actions[0, :, :3])
+    torch.testing.assert_close(x_t[1, :, :5], t * noise[1, :, :5] + (1 - t) * actions[1, :, :5])
+
+
+def test_input_side_noise_masking_noop_when_action_dim_none():
+    """When `action_dim is None` the mask is all-True so noise is unchanged
+    — the input-side fix degrades to a no-op for single-dataset configs and
+    pre-#336 callers, preserving bit-identical behavior at the input embedding."""
+    bsz, chunk, dim = 2, 4, 8
+    noise = torch.randn(bsz, chunk, dim)
+    dim_mask = make_action_dim_mask(None, dim, batch_size=bsz, device=torch.device("cpu"))
+    noise_masked = noise * rearrange(dim_mask, "b d -> b 1 d").to(noise.dtype)
+    torch.testing.assert_close(noise_masked, noise)
+
+
 def test_action_dim_zero_yields_zero_loss():
     """A sample with ``action_dim=0`` (e.g. VQA-style item with no real action)
     contributes nothing to the loss, and behaves as if fully masked."""
