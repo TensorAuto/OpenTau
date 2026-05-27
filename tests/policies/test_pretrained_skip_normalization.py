@@ -54,21 +54,29 @@ from opentau.policies.pi07_paligemma.low_level.configuration_pi07_low_level impo
 from opentau.policies.pretrained import PreTrainedPolicy
 from opentau.policies.value.configuration_value import ValueConfig
 
-ALL_POLICY_CONFIGS = [
-    PI0Config,
-    PI05Config,
-    PI05ContinuousStateConfig,
-    PI05MemConfig,
-    PI06Config,
-    PI07LowLevelConfig,
-    PI07HighLevelConfig,
-    PI07PaligemmaLowLevelConfig,
-    PI07PaligemmaHighLevelConfig,
-    ValueConfig,
+# Parallel list of (cls, display_id) — display IDs disambiguate the two
+# ``PI07HighLevelPlannerConfig`` classes (one each in ``pi07`` and
+# ``pi07_paligemma``, same class name) which would otherwise render as
+# ``PI07HighLevelPlannerConfig0`` / ``PI07HighLevelPlannerConfig1`` under
+# pytest's default ``ids=lambda c: c.__name__`` and obscure which sibling
+# a failure came from.
+_POLICY_CONFIG_CASES = [
+    (PI0Config, "PI0Config"),
+    (PI05Config, "PI05Config"),
+    (PI05ContinuousStateConfig, "PI05ContinuousStateConfig"),
+    (PI05MemConfig, "PI05MemConfig"),
+    (PI06Config, "PI06Config"),
+    (PI07LowLevelConfig, "PI07LowLevelConfig"),
+    (PI07HighLevelConfig, "PI07HighLevelConfig"),
+    (PI07PaligemmaLowLevelConfig, "PI07PaligemmaLowLevelConfig"),
+    (PI07PaligemmaHighLevelConfig, "PI07PaligemmaHighLevelConfig"),
+    (ValueConfig, "ValueConfig"),
 ]
+ALL_POLICY_CONFIGS = [c for c, _ in _POLICY_CONFIG_CASES]
+_POLICY_CONFIG_IDS = [name for _, name in _POLICY_CONFIG_CASES]
 
 
-@pytest.mark.parametrize("config_cls", ALL_POLICY_CONFIGS, ids=lambda c: c.__name__)
+@pytest.mark.parametrize("config_cls", ALL_POLICY_CONFIGS, ids=_POLICY_CONFIG_IDS)
 def test_inherited_default_is_false(config_cls):
     """Every policy config inherits ``skip_normalization_weights = False``
     from :class:`PreTrainedConfig`. A regression here means a subclass
@@ -78,7 +86,7 @@ def test_inherited_default_is_false(config_cls):
     assert cfg.skip_normalization_weights is False
 
 
-@pytest.mark.parametrize("config_cls", ALL_POLICY_CONFIGS, ids=lambda c: c.__name__)
+@pytest.mark.parametrize("config_cls", ALL_POLICY_CONFIGS, ids=_POLICY_CONFIG_IDS)
 def test_can_be_set_true(config_cls):
     """The field is keyword-settable on every policy config. Catches a
     draccus-side renaming, a subclass overriding the field with a

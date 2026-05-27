@@ -279,9 +279,11 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
             supplied to ``__init__``** (e.g. via :py:func:`opentau.policies.factory.make_policy`);
             otherwise the buffers stay at the ``inf`` sentinel from
             :py:func:`opentau.policies.normalize.create_stats_buffers` and the next forward
-            crashes. **One-shot:** after the strip fires successfully, ``from_pretrained`` resets
-            the flag to ``False`` on the model's config so that subsequent ``save_pretrained`` /
-            resume / inference loads do not re-strip the now-correct finetuned buffers. The
+            crashes. **One-shot:** after the strip helper runs (whether keys were dropped or
+            the "had no effect" warning fired), the flag is reset to ``False`` on the model's
+            config so that subsequent ``save_pretrained`` / resume / inference loads do not
+            re-strip the now-correct finetuned buffers — a user who opted in once should not
+            have to remember to flip it back before resume. The
             model was trained against the saved stats, so switching the normalization mid-training
             only makes sense when followed by further training, not when loading purely for
             inference. Honored by every policy whose ``from_pretrained`` (or ``_load_as_safetensor``)
