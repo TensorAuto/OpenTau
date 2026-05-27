@@ -65,6 +65,7 @@ Default format (``n_obs_history=None``):
 
         "img_is_pad": torch.BoolTensor,  # shape (num_cams,) with values 0 or 1, where 1 indicates that the camera image is a padded image.
         "action_is_pad": torch.BoolTensor,  # shape (action_chunk,) with values 0 or 1, where 1 indicates that the action is a padded action.
+        "action_dim": torch.LongTensor,  # scalar shape (); collates to (B,). Real (pre-pad) trailing dim of ``actions``. Used by per-policy flow-matching MSE to skip the zero-pad dim columns; see "Action-dim padding mask" below.
         "obs_history_is_pad": torch.BoolTensor,  # shape (1,) — always False when n_obs_history is None.
     }
 
@@ -83,6 +84,7 @@ With observation history (``n_obs_history=T``):
 
         "img_is_pad": torch.BoolTensor,  # shape (num_cams,) — camera slot availability.
         "action_is_pad": torch.BoolTensor,  # shape (action_chunk,)
+        "action_dim": torch.LongTensor,  # scalar shape (); collates to (B,). Real (pre-pad) trailing dim of ``actions``.
         "obs_history_is_pad": torch.BoolTensor,  # shape (T,) — True for timesteps outside the episode boundary.
     }
 
@@ -106,6 +108,35 @@ The following fields are set in ``DatasetMixtureConfig``:
 *   ``history_interval``: Step interval between historical observation steps. Defaults to ``1``. Only relevant when ``n_obs_history`` is set.
 
 Cameras should be labeled in order of importance (e.g. camera0 is the most important camera, camera1 is the second most important camera, etc.). The model dataset will select the most important cameras to use if num_cams is less than the number of cameras in the dataset.
+
+Action-dim padding mask
+~~~~~~~~~~~~~~~~~~~~~~~
+
+For heterogeneous co-training across datasets with different native action
+dimensionalities (e.g. a 7-DoF arm dataset and a 14-DoF bimanual dataset in
+one mixture), ``actions`` is zero-padded along the last axis to
+``max_action_dim`` to keep batches rectangular. The per-sample ``action_dim``
+scalar records the real (pre-pad) trailing dim; each policy's flow-matching
+MSE on the velocity field uses it to skip the zero-pad columns and only
+score the dims that the source dataset actually uses. Without it, the
+action expert would be supervised against zero targets on the padded tail
+dims — under per-dataset normalization (where padded-dim stats are
+``mean=0, std=0``) that signal is a clean "predict 0 here" that contaminates
+samples in the same batch which do use those dims.
+
+This is distinct from ``action_is_pad``, which masks padded *timesteps*
+along the action chunk. The two masks are AND-ed together inside each
+policy's MSE block: a slot in ``(B, chunk_size, max_action_dim)`` contributes
+to the loss only when both its timestep is real (``~action_is_pad``) and
+its dim is real (column index ``< action_dim``).
+
+When ``action_dim`` is absent (single-dataset configs, externally constructed
+inference batches), all ``max_action_dim`` columns are treated as real and
+loss behavior is bit-identical to pre-fix. VQA-style items emit ``actions``
+already shaped ``(action_chunk, max_action_dim)`` and rely on the all-True
+``action_is_pad`` to drive the loss to zero — ``action_dim`` matches
+``max_action_dim`` for those items, and the all-True ``action_is_pad``
+still zeros the contribution.
 
 .. _standard-data-format-optional-keys:
 

@@ -865,6 +865,18 @@ class BaseDataset(torch.utils.data.Dataset):
                 continue
             standard_item[new_key] = item[key]
 
+        # Record the real (pre-pad) action dimensionality so per-policy MSE on
+        # the velocity field can mask out the zero-pad tail dims. For VQA-style
+        # items where `actions` is already shaped `(chunk, max_action_dim)`,
+        # this yields `max_action_dim` — the existing all-True `action_is_pad`
+        # still drives the loss to zero, so VQA behavior is unchanged.
+        real_action_dim = int(standard_item["actions"].shape[-1])
+        assert real_action_dim <= self.max_action_dim, (
+            f"real action dim {real_action_dim} exceeds max_action_dim="
+            f"{self.max_action_dim} (dataset={getattr(self, 'repo_id', '?')})"
+        )
+        standard_item["action_dim"] = torch.tensor(real_action_dim, dtype=torch.long)
+
         # pad state and action vectors
         standard_item["state"] = self.pad_vector(standard_item["state"], self.max_state_dim)
         standard_item["actions"] = self.pad_vector(standard_item["actions"], self.max_action_dim)

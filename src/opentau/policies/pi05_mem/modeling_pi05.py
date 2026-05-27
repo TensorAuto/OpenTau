@@ -41,7 +41,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
-from einops import rearrange, repeat
+from einops import rearrange
 from torch import Tensor, nn
 from transformers import AutoProcessor, AutoTokenizer
 
@@ -56,6 +56,7 @@ from opentau.policies.pi05.paligemma_with_expert import (
 from opentau.policies.pi05_mem.configuration_pi05 import PI05MemConfig
 from opentau.policies.pi07.video_encoder import SpaceTimeSiglipVideoEncoder
 from opentau.policies.pretrained import PreTrainedPolicy, T
+from opentau.policies.utils import make_action_dim_mask
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
 
@@ -694,6 +695,7 @@ class PI05MemPolicy(PreTrainedPolicy):
             discrete_actions,
             discrete_action_masks,
             obs_history_is_pad=obs_history_is_pad,
+            action_dim=batch.get("action_dim"),
         )
 
         mse_loss = losses["MSE"]
@@ -1079,6 +1081,7 @@ class PI05MemFlowMatching(nn.Module):
         discrete_actions: Tensor | None = None,
         discrete_action_masks: Tensor | None = None,
         obs_history_is_pad: Tensor | None = None,
+        action_dim: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """Do a full training forward pass and compute the loss."""
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
@@ -1171,12 +1174,19 @@ class PI05MemFlowMatching(nn.Module):
             in_episode_bound = rearrange(in_episode_bound, "b c -> b c 1")
             postfix_mask = torch.logical_and(postfix_mask, in_episode_bound)
 
-        mse_loss = mse_loss * postfix_mask
-
         mse_loss = mse_loss[:, :, : self.config.max_action_dim]
 
-        postfix_mask_expanded = repeat(postfix_mask, "b c 1 -> b c d", d=mse_loss.shape[-1])
-        mse_loss = mse_loss.sum() / (postfix_mask_expanded.sum() + 1e-8)
+        # Per-dim mask (B, 1, D) — True for real action dims; all-True fallback
+        # when `action_dim` is absent keeps single-dataset behavior unchanged.
+        dim_mask = make_action_dim_mask(
+            action_dim,
+            self.config.max_action_dim,
+            batch_size=mse_loss.shape[0],
+            device=mse_loss.device,
+        )
+        full_mask = postfix_mask & rearrange(dim_mask, "b d -> b 1 d")  # (B, chunk, D)
+
+        mse_loss = (mse_loss * full_mask).sum() / (full_mask.sum() + 1e-8)
 
         assert discrete_actions is not None
         assert discrete_action_masks is not None

@@ -29,7 +29,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
-from einops import rearrange, repeat
+from einops import rearrange
 from torch import Tensor, nn
 from transformers import AutoProcessor, AutoTokenizer
 
@@ -44,6 +44,7 @@ from opentau.policies.pi05.paligemma_with_expert import (
     PaliGemmaWithExpertModel,
 )
 from opentau.policies.pretrained import PreTrainedPolicy, T
+from opentau.policies.utils import make_action_dim_mask
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
 
@@ -730,6 +731,7 @@ class PI05Policy(PreTrainedPolicy):
             discrete_actions,
             discrete_action_masks,
             state=state,
+            action_dim=batch.get("action_dim"),
         )
 
         mse_loss = losses["MSE"]
@@ -1312,6 +1314,7 @@ class PI05FlowMatching(nn.Module):
         discrete_actions: Tensor | None = None,
         discrete_action_masks: Tensor | None = None,
         state: Tensor | None = None,
+        action_dim: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """Do a full training forward pass and compute the loss.
 
@@ -1446,14 +1449,21 @@ class PI05FlowMatching(nn.Module):
             )  # 0 for padded actions, 1 for non-padded actions
             postfix_mask = torch.logical_and(postfix_mask, in_episode_bound)
 
-        mse_loss = mse_loss * postfix_mask
-
-        # Remove padding
+        # Remove dim padding
         mse_loss = mse_loss[:, :, : self.config.max_action_dim]
 
-        # Do not include frozen actions and padded actions in the mean loss calculation
-        postfix_mask_expanded = repeat(postfix_mask, "b c 1 -> b c d", d=mse_loss.shape[-1])
-        mse_loss = mse_loss.sum() / (postfix_mask_expanded.sum() + 1e-8)
+        # Per-dim mask (B, 1, D) — True for real action dims; all-True fallback
+        # when `action_dim` is absent keeps single-dataset behavior unchanged.
+        dim_mask = make_action_dim_mask(
+            action_dim,
+            self.config.max_action_dim,
+            batch_size=mse_loss.shape[0],
+            device=mse_loss.device,
+        )
+        full_mask = postfix_mask & rearrange(dim_mask, "b d -> b 1 d")  # (B, chunk, D)
+
+        # Do not include frozen, timestep-padded, or dim-padded entries in the mean.
+        mse_loss = (mse_loss * full_mask).sum() / (full_mask.sum() + 1e-8)
 
         # compute cross entropy loss for discrete actions
         batch_size, seq_len = discrete_actions.shape

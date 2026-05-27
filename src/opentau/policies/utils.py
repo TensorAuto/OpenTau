@@ -26,7 +26,8 @@ import logging
 from collections import deque
 
 import torch
-from torch import nn
+from einops import rearrange
+from torch import Tensor, nn
 
 
 def populate_queues(
@@ -106,6 +107,37 @@ def get_output_shape(module: nn.Module, input_shape: tuple) -> tuple:
     with torch.inference_mode():
         output = module(dummy_input)
     return tuple(output.shape)
+
+
+def make_action_dim_mask(
+    action_dim: Tensor | None,
+    max_action_dim: int,
+    batch_size: int,
+    device: torch.device,
+) -> Tensor:
+    """Per-sample bool mask over action dims; True for real dims, False for zero-pad.
+
+    Heterogeneous datasets are zero-padded to ``max_action_dim`` along the last
+    action axis to keep batches rectangular, but the flow-matching MSE on the
+    velocity field should only score real dims for each sample. This helper
+    builds the per-dim mask that callers AND into their existing per-timestep
+    mask before reducing.
+
+    Args:
+        action_dim: Optional ``(B,)`` long tensor of the real (pre-pad) action
+            dimensionality for each sample. When ``None``, the returned mask is
+            all-True and the caller's reduction matches the pre-fix behavior.
+        max_action_dim: The padded action dim (last-axis length of ``actions``).
+        batch_size: Used to construct the all-True fallback shape.
+        device: Output device.
+
+    Returns:
+        ``(batch_size, max_action_dim)`` bool tensor.
+    """
+    if action_dim is None:
+        return torch.ones((batch_size, max_action_dim), dtype=torch.bool, device=device)
+    arange = torch.arange(max_action_dim, device=device)
+    return rearrange(arange, "d -> 1 d") < rearrange(action_dim.to(device=device), "b -> b 1")
 
 
 def log_model_loading_keys(missing_keys: list[str], unexpected_keys: list[str]) -> None:

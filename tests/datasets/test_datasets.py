@@ -422,6 +422,7 @@ def check_standard_data_format(item, delta_timestamps_params, dataset, train_pip
         ("response", None),
         ("img_is_pad", (train_pipeline_config.num_cams,)),
         ("action_is_pad", (train_pipeline_config.action_chunk,)),
+        ("action_dim", ()),
         ("obs_history_is_pad", obs_pad_shape),
     ]
     for i in range(train_pipeline_config.num_cams):
@@ -444,6 +445,10 @@ def check_standard_data_format(item, delta_timestamps_params, dataset, train_pip
         elif key in ("img_is_pad", "action_is_pad", "obs_history_is_pad"):
             assert item[key].shape == shape, f"{key}"
             assert isinstance(item[key], torch.BoolTensor), f"{key}"
+        elif key == "action_dim":
+            assert item[key].shape == shape, f"{key}"
+            assert item[key].dtype == torch.long, f"{key}"
+            assert 0 < int(item[key].item()) <= train_pipeline_config.max_action_dim, f"{key}"
 
     # test delta_timestamps — per-feature keys
     dt_mean = delta_timestamps_params[0]
