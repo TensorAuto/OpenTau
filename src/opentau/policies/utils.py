@@ -126,9 +126,13 @@ def make_action_dim_mask(
     Args:
         action_dim: Optional ``(B,)`` long tensor of the real (pre-pad) action
             dimensionality for each sample. When ``None``, the returned mask is
-            all-True and the caller's reduction matches the pre-fix behavior.
+            all-True so the dim-mask AND in the caller's reduction is a no-op
+            (pi0 additionally harmonized its `.mean()` to `sum / mask.sum()`
+            in this PR — see the PR body's "pi0 loss-magnitude shift" note;
+            the dim-mask itself is still a no-op when ``action_dim`` is None).
         max_action_dim: The padded action dim (last-axis length of ``actions``).
-        batch_size: Used to construct the all-True fallback shape.
+        batch_size: Used to construct the all-True fallback shape; when
+            ``action_dim`` is provided, must match ``action_dim.shape[0]``.
         device: Output device.
 
     Returns:

@@ -218,7 +218,7 @@ def test_dataset_raises_when_action_dim_exceeds_max(
     dataset.max_action_dim = 2
     # ``__getitem__`` wraps loader errors in a ``RuntimeError`` after retries,
     # so match the inner ``ValueError`` text via substring.
-    with pytest.raises(RuntimeError, match="exceeds max_action_dim"):
+    with pytest.raises(RuntimeError, match="is outside"):
         _ = dataset[0]
 
 

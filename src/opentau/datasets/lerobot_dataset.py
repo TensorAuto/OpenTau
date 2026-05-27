@@ -871,11 +871,14 @@ class BaseDataset(torch.utils.data.Dataset):
         # this yields `max_action_dim` — the existing all-True `action_is_pad`
         # still drives the loss to zero, so VQA behavior is unchanged.
         real_action_dim = int(standard_item["actions"].shape[-1])
-        if real_action_dim > self.max_action_dim:
+        if not 0 < real_action_dim <= self.max_action_dim:
             # Raise rather than assert so the check survives `python -O`.
+            # An empty trailing dim (`shape == (chunk, 0)`) would silently emit
+            # `action_dim=0` and contribute zero gradient at training time —
+            # treat it as a malformed dataset, same as exceeding the upper bound.
             raise ValueError(
-                f"real action dim {real_action_dim} exceeds max_action_dim="
-                f"{self.max_action_dim} (dataset={getattr(self, 'repo_id', '?')})"
+                f"real action dim {real_action_dim} is outside (0, "
+                f"{self.max_action_dim}] (dataset={getattr(self, 'repo_id', '?')})"
             )
         standard_item["action_dim"] = torch.tensor(real_action_dim, dtype=torch.long)
 
