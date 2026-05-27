@@ -188,6 +188,40 @@ def test_action_dim_default_dataloader_collation(
     assert (batch["action_dim"] == 3).all()
 
 
+def test_dataset_raises_when_action_dim_exceeds_max(
+    lerobot_dataset_factory,
+    info_factory,
+    hf_dataset_factory,
+    tasks_factory,
+    episodes_factory,
+    stats_factory,
+    episodes_stats_factory,
+    tmp_path,
+):
+    """A dataset whose native action dim is *larger* than the policy's
+    ``max_action_dim`` must raise (not silently truncate). The check lives in
+    ``_to_standard_data_format`` and is a ``ValueError`` (not ``assert``) so
+    it survives ``python -O``."""
+    dataset = _make_dataset(
+        lerobot_dataset_factory,
+        info_factory,
+        hf_dataset_factory,
+        tasks_factory,
+        episodes_factory,
+        stats_factory,
+        episodes_stats_factory,
+        tmp_path,
+        action_dim=4,
+        suffix="oversized",
+    )
+    # Force max_action_dim *below* the dataset's real action dim.
+    dataset.max_action_dim = 2
+    # ``__getitem__`` wraps loader errors in a ``RuntimeError`` after retries,
+    # so match the inner ``ValueError`` text via substring.
+    with pytest.raises(RuntimeError, match="exceeds max_action_dim"):
+        _ = dataset[0]
+
+
 def test_two_datasets_with_different_action_dims(
     lerobot_dataset_factory,
     info_factory,

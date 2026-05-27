@@ -151,11 +151,12 @@ def test_action_dim_zero_yields_zero_loss():
     assert loss.item() == pytest.approx(0.0, abs=1e-6)
 
 
-def test_action_dim_assertion_when_exceeds_max():
+def test_helper_is_total_when_action_dim_exceeds_max():
     """``make_action_dim_mask`` clamps via the strict-less comparison, so
     requesting ``action_dim > max_action_dim`` simply yields an all-True
-    mask (same as ``None``). The hard assertion lives in the dataset
-    standardization path; here we just confirm the helper is total."""
+    mask (same as ``None``). The hard boundary check lives in the dataset
+    standardization path (see ``tests/datasets/test_action_dim.py``); here
+    we just confirm the helper is total and doesn't raise."""
     action_dim = torch.tensor([99], dtype=torch.long)
     mask = make_action_dim_mask(action_dim, max_action_dim=4, batch_size=1, device=torch.device("cpu"))
     assert mask.shape == (1, 4)
