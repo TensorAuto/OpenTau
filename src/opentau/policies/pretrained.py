@@ -692,6 +692,16 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         # `_check_norm_stats_loaded` iterates, so the two guards stay
         # synchronized with `_save_pretrained`'s detach/restore loop and
         # `_inject_stats`.
+        #
+        # Note: the check intentionally does NOT cross-reference each inf
+        # buffer against ``stripped_keys`` (which would be a stricter
+        # "the specific buffer we just stripped is still inf" check). The
+        # broader "any normalize buffer is inf" check is safe here because
+        # ``create_stats_buffers`` rejects partial stats at ``__init__`` —
+        # buffers are either fully populated (per_dataset_stats supplied)
+        # or all at the inf sentinel (per_dataset_stats=None). There is no
+        # reachable mixed state, so "any inf" ⇔ "per_dataset_stats missing"
+        # ⇔ the actionable user error the message describes.
         inf_buffers: list[str] = []
         for module_attr in NORM_MODULE_NAMES:
             module = getattr(model, module_attr, None)
@@ -710,7 +720,6 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                 + ", ".join(inf_buffers[:5])
                 + (f", ... ({len(inf_buffers) - 5} more)" if len(inf_buffers) > 5 else "")
             )
-
 
     def _tile_linear_input_weight(self, state_dict_to_load: dict):
         """Modifies the `state_dict_to_load` in-place by tiling linear layer input weights.

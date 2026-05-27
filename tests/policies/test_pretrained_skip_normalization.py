@@ -268,9 +268,7 @@ class TestAssertNormalizeBuffersInitialized:
         """
         parent, normalize_keys, _ = _make_fake_module_with_normalize_buffers(stats=None)
 
-        with pytest.raises(
-            ValueError, match=r"skip_normalization_weights=True requires `per_dataset_stats`"
-        ):
+        with pytest.raises(ValueError, match=r"skip_normalization_weights=True requires `per_dataset_stats`"):
             PreTrainedPolicy._assert_normalize_buffers_initialized(parent, stripped_keys=normalize_keys)
 
     def test_passes_when_stats_passed_through(self):

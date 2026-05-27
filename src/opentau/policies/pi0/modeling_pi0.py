@@ -38,6 +38,7 @@ from opentau.policies.pi0.paligemma_with_expert import (
 )
 from opentau.policies.pretrained import PreTrainedPolicy
 from opentau.policies.utils import log_model_loading_keys
+from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
 
 
@@ -331,12 +332,21 @@ class PI0Policy(PreTrainedPolicy):
         # Strip saved normalize/unnormalize buffers when the user opted in
         # via config.skip_normalization_weights — see PreTrainedConfig and
         # PreTrainedPolicy._strip_normalization_buffers_from_state_dict.
+        # Thread is_main_process so the helper's INFO/WARNING fires once per
+        # load, not once per rank under DDP/FSDP.
+        acc = get_proc_accelerator()
+        is_main_process = acc.is_main_process if acc else True
         transformed_state_dict, stripped_keys = cls._strip_normalization_buffers_from_state_dict(
-            transformed_state_dict, model.config
+            transformed_state_dict, model.config, is_main_process=is_main_process
         )
 
-        # Load the transformed state dict
-        msg = model.load_state_dict(transformed_state_dict, strict=strict)
+        # When the strip removed keys, force strict=False on this load —
+        # otherwise the deliberately-dropped Normalize buffer keys would
+        # trigger RuntimeError("Missing key(s) ...") and mask the
+        # `skip_normalization_weights=True` semantics. Preserves strict=True
+        # for the default-load path (stripped_keys empty).
+        effective_strict = strict and not stripped_keys
+        msg = model.load_state_dict(transformed_state_dict, strict=effective_strict)
 
         # Hide deliberately-stripped buffer keys from the missing-keys log so
         # it does not contradict the INFO emitted by the strip helper just

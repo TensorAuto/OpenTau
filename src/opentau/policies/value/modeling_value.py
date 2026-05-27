@@ -39,6 +39,7 @@ from opentau.policies.value.siglip_gemma import (
     SiglipGemmaValueConfig,
     SiglipGemmaValueModel,
 )
+from opentau.utils.accelerate_utils import get_proc_accelerator
 
 
 def make_att_2d_masks(pad_masks, att_masks):
@@ -232,10 +233,22 @@ class ValueFunction(PreTrainedPolicy):
         state_dict = load_file(model_file, device=map_location)
 
         # Strip saved normalize/unnormalize buffers when the user opted in via
-        # config.skip_normalization_weights — see PreTrainedConfig.
-        state_dict, stripped_keys = cls._strip_normalization_buffers_from_state_dict(state_dict, model.config)
+        # config.skip_normalization_weights — see PreTrainedConfig. Thread
+        # is_main_process so the helper's INFO/WARNING fires once per load,
+        # not once per rank under DDP/FSDP.
+        acc = get_proc_accelerator()
+        is_main_process = acc.is_main_process if acc else True
+        state_dict, stripped_keys = cls._strip_normalization_buffers_from_state_dict(
+            state_dict, model.config, is_main_process=is_main_process
+        )
 
-        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=strict)
+        # When the strip removed keys, force strict=False on this load —
+        # otherwise the deliberately-dropped Normalize buffer keys would
+        # trigger RuntimeError("Missing key(s) ...") and mask the
+        # `skip_normalization_weights=True` semantics. Preserves strict=True
+        # for the default-load path (stripped_keys empty).
+        effective_strict = strict and not stripped_keys
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=effective_strict)
 
         # Hide deliberately-stripped buffer keys from the missing-keys log so
         # it does not contradict the INFO emitted by the strip helper just
@@ -243,8 +256,8 @@ class ValueFunction(PreTrainedPolicy):
         unintended_missing = [k for k in missing_keys if k not in stripped_keys]
         log_model_loading_keys(unintended_missing, unexpected_keys)
 
-        # When the strip ran, fail loudly if dataset_stats was not wired in.
-        # No-op for the default load path.
+        # When the strip ran, fail loudly if per_dataset_stats was not wired
+        # in. No-op for the default load path.
         cls._assert_normalize_buffers_initialized(model, stripped_keys=stripped_keys)
         return model
 
