@@ -21,6 +21,7 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from pprint import pformat
 from typing import Any
 
@@ -41,7 +42,7 @@ from opentau.envs.utils import close_envs
 from opentau.optim.factory import make_optimizer_and_scheduler
 from opentau.optim.master_weights import MasterWeightOptimizer
 from opentau.policies.factory import make_policy
-from opentau.policies.pretrained import PreTrainedPolicy
+from opentau.policies.pretrained import PreTrainedPolicy, is_norm_buffer_key
 from opentau.scripts.eval import (
     collect_grid_summary_videos,
     consolidate_eval_info,
@@ -549,10 +550,57 @@ def train(cfg: TrainPipelineConfig):
     # Register the LR scheduler for checkpointing
     accelerator.register_for_checkpointing(lr_scheduler)
 
+    # When `save_normalization_stats=False`, strip the per-feature Normalize /
+    # Unnormalize buffers from each model state_dict that Accelerate is about
+    # to write under `accelerator.save_state(...)`. The hook runs on every
+    # rank before the actual safetensors write, so the filtered keys never
+    # land on disk. The reload side relies on `make_policy(..., ds_meta=...)`
+    # to call `_inject_stats(...)` and repopulate the buffers (see
+    # `policies/factory.py::make_policy`).
+    if not cfg.policy.save_normalization_stats:
+
+        def _strip_norm_buffers_pre_save(models, weights, input_dir):
+            del models, input_dir
+            for sd in weights:
+                for k in list(sd):
+                    if is_norm_buffer_key(k):
+                        del sd[k]
+
+        accelerator.register_save_state_pre_hook(_strip_norm_buffers_pre_save)
+
     if cfg.resume:
-        # load accelerator state
-        # This will load the model, optimizer, and lr_scheduler state
-        accelerator.load_state(cfg.checkpoint_path)
+        # Inspect the on-disk safetensors header (rather than trusting the
+        # *current* `cfg.policy.save_normalization_stats` flag) to decide
+        # whether `strict=True` would crash on missing norm-buffer keys.
+        # This makes resume robust to the user toggling the flag between the
+        # initial run and the resume — the file on disk is the only source
+        # of truth for what's actually missing. Reading the header is also
+        # cheap; safetensors parses just the index.
+        load_kwargs: dict = {}
+        try:
+            from safetensors import safe_open
+
+            ckpt_safetensors = Path(cfg.checkpoint_path) / "model.safetensors"
+            if ckpt_safetensors.exists():
+                with safe_open(str(ckpt_safetensors), framework="pt") as f:
+                    saved_keys = set(f.keys())
+                if not any(is_norm_buffer_key(k) for k in saved_keys):
+                    # The disk checkpoint omits every norm buffer — strict
+                    # load would raise. The buffers were already repopulated
+                    # by `_inject_stats` inside `make_policy(..., ds_meta=...)`
+                    # above, so falling back to `strict=False` leaves them at
+                    # the right values rather than silently overwriting.
+                    load_kwargs["strict"] = False
+        except Exception as e:
+            logging.warning(
+                "Could not inspect %s/model.safetensors to decide strict mode "
+                "for resume (%s). Falling back to the cfg flag.",
+                cfg.checkpoint_path,
+                e,
+            )
+            if not cfg.policy.save_normalization_stats:
+                load_kwargs["strict"] = False
+        accelerator.load_state(cfg.checkpoint_path, **load_kwargs)
 
         # When the master-weights wrapper is in use, the live bf16 weights
         # have just been overwritten by ``accelerator.load_state``. Rebuild

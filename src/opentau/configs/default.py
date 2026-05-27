@@ -510,6 +510,16 @@ class EvalConfig:
 
     recording_root: str | None = None
 
+    # Which training-time dataset's normalization stats to use when calling
+    # `policy.select_action` on eval observations. ``None`` (default) falls
+    # through to the policy's `_resolve_dataset_index` single-dataset fallback
+    # (works for any policy trained on exactly one dataset). Set this to one
+    # of the strings in `policy.config.dataset_names` when running eval
+    # against a multi-dataset checkpoint, otherwise the inference call will
+    # raise a `KeyError`. Plumbed into each `select_action` call by
+    # `scripts/eval.py::rollout`.
+    dataset_repo_id: str | None = None
+
     def __post_init__(self):
         """Validate evaluation configuration."""
         if self.batch_size > self.n_episodes:

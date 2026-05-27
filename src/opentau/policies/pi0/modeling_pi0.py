@@ -30,6 +30,7 @@ from torch import Tensor, nn
 from transformers import AutoTokenizer
 
 from opentau.policies.normalize import Normalize, Unnormalize
+from opentau.policies.normalize import resolve_num_datasets as _num_datasets
 from opentau.policies.pi0.configuration_pi0 import PI0Config
 from opentau.policies.pi0.paligemma_with_expert import (
     PaliGemmaWithExpertConfig,
@@ -164,25 +165,48 @@ class PI0Policy(PreTrainedPolicy):
     def __init__(
         self,
         config: PI0Config,
-        dataset_stats: dict[str, dict[str, Tensor]] | None = None,
+        per_dataset_stats: list[dict[str, dict[str, Tensor]]] | None = None,
+        dataset_names: list[str] | None = None,
     ):
         """Initializes the PI0Policy.
 
         Args:
             config: Policy configuration class instance.
-            dataset_stats: Dataset statistics to be used for normalization. If not passed here, it is expected
-                that they will be passed with a call to `load_state_dict` before the policy is used.
+            per_dataset_stats: Ordered list of per-dataset stat dicts used to
+                fill the stacked Normalize/Unnormalize buffers. May be None
+                when constructing for a checkpoint load — in that case
+                ``config.dataset_names`` is consulted for the leading dim.
+            dataset_names: Ordered list parallel to ``per_dataset_stats``.
         """
 
         super().__init__(config)
         config.validate_features()
         self.config = config
-        self.normalize_inputs = Normalize(config.input_features, config.normalization_mapping, dataset_stats)
+        # Number of datasets the stacked buffers must accommodate. Falls back
+        # to `config.dataset_names` for checkpoint-load construction (no
+        # stats passed but the config remembers the trained-on dataset list)
+        # and to 1 as the legacy single-dataset default.
+        num_datasets = _num_datasets(per_dataset_stats, dataset_names, config)
+        self.normalize_inputs = Normalize(
+            config.input_features,
+            config.normalization_mapping,
+            per_dataset_stats=per_dataset_stats,
+            dataset_names=dataset_names,
+            num_datasets=num_datasets,
+        )
         self.normalize_targets = Normalize(
-            config.output_features, config.normalization_mapping, dataset_stats
+            config.output_features,
+            config.normalization_mapping,
+            per_dataset_stats=per_dataset_stats,
+            dataset_names=dataset_names,
+            num_datasets=num_datasets,
         )
         self.unnormalize_outputs = Unnormalize(
-            config.output_features, config.normalization_mapping, dataset_stats
+            config.output_features,
+            config.normalization_mapping,
+            per_dataset_stats=per_dataset_stats,
+            dataset_names=dataset_names,
+            num_datasets=num_datasets,
         )
 
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
@@ -298,6 +322,12 @@ class PI0Policy(PreTrainedPolicy):
         # Apply tiling of linear input weights if needed
         model._tile_linear_input_weight(transformed_state_dict)
 
+        # Promote legacy single-dataset Normalize/Unnormalize buffers from
+        # `(*feat_shape,)` to the new `(1, *feat_shape)` stacked layout so
+        # pre-PR checkpoints (including everything under TensorAuto/*) still
+        # load via `model.load_state_dict(..., strict=True)`.
+        model._promote_legacy_norm_buffers_in_state_dict(transformed_state_dict)
+
         # Load the transformed state dict
         msg = model.load_state_dict(transformed_state_dict, strict=strict)
 
@@ -387,7 +417,8 @@ class PI0Policy(PreTrainedPolicy):
         Returns:
             The sampled actions tensor of shape (batch_size, action_chunk_length, action_dim).
         """
-        batch = self.normalize_inputs(batch)
+        dataset_index = self._resolve_dataset_index(batch)
+        batch = self.normalize_inputs(batch, dataset_index)
 
         images, img_masks = self.prepare_images(batch)
         lang_tokens, lang_masks = self.prepare_language(batch)
@@ -406,7 +437,7 @@ class PI0Policy(PreTrainedPolicy):
         original_action_dim = self.config.action_feature.shape[0]
         actions = actions[:, :, :original_action_dim]
 
-        actions = self.unnormalize_outputs({"actions": actions})["actions"]
+        actions = self.unnormalize_outputs({"actions": actions}, dataset_index)["actions"]
 
         return actions
 
@@ -423,8 +454,9 @@ class PI0Policy(PreTrainedPolicy):
         Returns:
             A dictionary containing the loss components ("MSE" and "CE").
         """
-        batch = self.normalize_inputs(batch)
-        batch = self.normalize_targets(batch)
+        dataset_index = self._resolve_dataset_index(batch)
+        batch = self.normalize_inputs(batch, dataset_index)
+        batch = self.normalize_targets(batch, dataset_index)
 
         images, img_masks = self.prepare_images(batch)
         state = batch["state"]

@@ -359,7 +359,7 @@ class TestPI07LowLevelIntegration:
         """Test the PI07 low-level component pipeline: forward (training) and select_action (inference)."""
 
         config = self._make_config()
-        policy = PI07LowLevelPolicy(config, dataset_stats=lerobot_dataset_metadata.stats)
+        policy = PI07LowLevelPolicy(config, per_dataset_stats=[lerobot_dataset_metadata.stats])
         tokenizer = policy.model.language_tokenizer
 
         batch_size = 1
@@ -453,11 +453,17 @@ class TestPI07LowLevelIntegration:
         policy.model.embed_prefix = original_embed_prefix
         policy.model.embed_suffix = original_embed_suffix
 
-        # Verify normalize / unnormalize round-trip.
+        # Verify normalize / unnormalize round-trip. Calling the submodules
+        # directly bypasses the policy's `_resolve_dataset_index` helper, so
+        # pass an explicit (B,) long index of zeros (this fixture is
+        # single-dataset).
         action_output = {"actions": batch["actions"].to("cuda")}
+        dataset_index = torch.zeros(batch_size, dtype=torch.long, device="cuda")
         assert torch.allclose(
             action_output["actions"],
-            policy.unnormalize_outputs(policy.normalize_targets(action_output))["actions"],
+            policy.unnormalize_outputs(policy.normalize_targets(action_output, dataset_index), dataset_index)[
+                "actions"
+            ],
             atol=1e-6,
         )
 
@@ -635,7 +641,7 @@ class TestPI07LowLevelIntegration:
         offsets on real Gemma 3 weights.
         """
         config = self._make_config()
-        policy = PI07LowLevelPolicy(config, dataset_stats=lerobot_dataset_metadata.stats)
+        policy = PI07LowLevelPolicy(config, per_dataset_stats=[lerobot_dataset_metadata.stats])
         tokenizer = policy.model.language_tokenizer
 
         batch_size = 1
@@ -744,7 +750,7 @@ class TestPI07LowLevelRegression:
     @staticmethod
     def _make_policy(lerobot_dataset_metadata) -> PI07LowLevelPolicy:
         config = TestPI07LowLevelIntegration._make_config()
-        policy = PI07LowLevelPolicy(config, dataset_stats=lerobot_dataset_metadata.stats)
+        policy = PI07LowLevelPolicy(config, per_dataset_stats=[lerobot_dataset_metadata.stats])
         policy.to(dtype=torch.bfloat16, device="cuda")
         return policy
 

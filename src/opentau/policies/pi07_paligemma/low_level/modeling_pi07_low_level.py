@@ -38,6 +38,7 @@ from transformers import AutoProcessor, AutoTokenizer
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import NormalizationMode
 from opentau.policies.normalize import Normalize, Unnormalize
+from opentau.policies.normalize import resolve_num_datasets as _num_datasets
 from opentau.policies.pi05.paligemma_with_expert import (
     PaliGemmaWithExpertConfig,
     PaliGemmaWithExpertModel,
@@ -335,29 +336,49 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
     def __init__(
         self,
         config: PI07PaligemmaLowLevelConfig,
-        dataset_stats: dict[str, dict[str, Tensor]] | None = None,
+        per_dataset_stats: list[dict[str, dict[str, Tensor]]] | None = None,
+        dataset_names: list[str] | None = None,
     ):
         """Initializes the PI07PaligemmaLowLevelPolicy.
 
         Args:
-            config: Policy configuration class instance or None, in which case the default instantiation of
-                the configuration class is used.
-            dataset_stats: Dataset statistics to be used for normalization. If not passed here, it is expected
-                that they will be passed with a call to `load_state_dict` before the policy is used.
+            config: Policy configuration class instance.
+            per_dataset_stats: Ordered list of per-dataset stat dicts used to
+                fill the stacked Normalize/Unnormalize buffers.
+            dataset_names: Ordered list parallel to ``per_dataset_stats``.
         """
 
         super().__init__(config)
         config.validate_features()
         self.config = config
-        self.normalize_inputs = Normalize(config.input_features, config.normalization_mapping, dataset_stats)
+        num_datasets = _num_datasets(per_dataset_stats, dataset_names, config)
+        self.normalize_inputs = Normalize(
+            config.input_features,
+            config.normalization_mapping,
+            per_dataset_stats=per_dataset_stats,
+            dataset_names=dataset_names,
+            num_datasets=num_datasets,
+        )
         self.normalize_targets = Normalize(
-            config.output_features, config.normalization_mapping, dataset_stats
+            config.output_features,
+            config.normalization_mapping,
+            per_dataset_stats=per_dataset_stats,
+            dataset_names=dataset_names,
+            num_datasets=num_datasets,
         )
         self.normalize_discrete_actions = Normalize(
-            config.output_features, {"ACTION": NormalizationMode.MIN_MAX}, dataset_stats
+            config.output_features,
+            {"ACTION": NormalizationMode.MIN_MAX},
+            per_dataset_stats=per_dataset_stats,
+            dataset_names=dataset_names,
+            num_datasets=num_datasets,
         )
         self.unnormalize_outputs = Unnormalize(
-            config.output_features, config.normalization_mapping, dataset_stats
+            config.output_features,
+            config.normalization_mapping,
+            per_dataset_stats=per_dataset_stats,
+            dataset_names=dataset_names,
+            num_datasets=num_datasets,
         )
 
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
@@ -524,6 +545,10 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
                 strip_ran = True
 
             # Load the remapped state dict into the model
+            # Promote legacy single-dataset Normalize/Unnormalize buffers from
+            # `(*feat_shape,)` to the new `(1, *feat_shape)` stacked layout so pre-PR
+            # checkpoints load via `model.load_state_dict(...)`.
+            model._promote_legacy_norm_buffers_in_state_dict(remapped_state_dict)
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
 
             # Hide deliberately-stripped buffer keys from the missing-keys
@@ -1027,7 +1052,8 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
                 f"Delay must be None or between 0 and {self.config.max_delay}"
             )
 
-        batch = self.normalize_inputs(batch)
+        dataset_index = self._resolve_dataset_index(batch)
+        batch = self.normalize_inputs(batch, dataset_index)
 
         self._hydrate_optional_conditioning_batch(batch)
 
@@ -1042,7 +1068,7 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             action_prefix = torch.zeros(actions_shape, dtype=torch.float32, device=device)
         else:
-            action_prefix = self.normalize_targets({"actions": action_prefix})["actions"]
+            action_prefix = self.normalize_targets({"actions": action_prefix}, dataset_index)["actions"]
             action_prefix = F.pad(
                 action_prefix,
                 (0, 0, 0, self.config.chunk_size - action_prefix.shape[1]),
@@ -1072,7 +1098,7 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         original_action_dim = self.config.action_feature.shape[0]
         actions = actions[:, :, :original_action_dim]
 
-        actions = self.unnormalize_outputs({"actions": actions})["actions"]
+        actions = self.unnormalize_outputs({"actions": actions}, dataset_index)["actions"]
 
         return actions
 
@@ -1089,9 +1115,10 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         Returns:
             A dictionary containing the loss components ("MSE" and "CE").
         """
-        batch = self.normalize_inputs(batch)
-        batch["discrete_actions"] = self.normalize_discrete_actions(dict(batch))["actions"]
-        batch = self.normalize_targets(batch)
+        dataset_index = self._resolve_dataset_index(batch)
+        batch = self.normalize_inputs(batch, dataset_index)
+        batch["discrete_actions"] = self.normalize_discrete_actions(dict(batch), dataset_index)["actions"]
+        batch = self.normalize_targets(batch, dataset_index)
 
         self._hydrate_optional_conditioning_batch(batch)
 

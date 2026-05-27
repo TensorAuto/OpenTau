@@ -44,6 +44,7 @@ from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import NormalizationMode
 from opentau.datasets.grounding.tokenizer_utils import ensure_loc_tokens
 from opentau.policies.normalize import Normalize, Unnormalize
+from opentau.policies.normalize import resolve_num_datasets as _num_datasets
 from opentau.policies.pi06.configuration_pi06 import PI06Config
 from opentau.policies.pi06.gemma3_with_expert import (
     Gemma3WithExpertConfig,
@@ -257,29 +258,49 @@ class PI06Policy(PreTrainedPolicy):
     def __init__(
         self,
         config: PI06Config,
-        dataset_stats: dict[str, dict[str, Tensor]] | None = None,
+        per_dataset_stats: list[dict[str, dict[str, Tensor]]] | None = None,
+        dataset_names: list[str] | None = None,
     ):
         """Initializes the PI06Policy.
 
         Args:
             config: `PI06Config` instance.
-            dataset_stats: Optional dataset statistics for input/output
-                normalization; otherwise expected to be loaded via
-                `load_state_dict` before the policy runs.
+            per_dataset_stats: Ordered list of per-dataset stat dicts used to
+                fill the stacked Normalize/Unnormalize buffers.
+            dataset_names: Ordered list parallel to ``per_dataset_stats``.
         """
         super().__init__(config)
         config.validate_features()
         self.config = config
 
-        self.normalize_inputs = Normalize(config.input_features, config.normalization_mapping, dataset_stats)
+        num_datasets = _num_datasets(per_dataset_stats, dataset_names, config)
+        self.normalize_inputs = Normalize(
+            config.input_features,
+            config.normalization_mapping,
+            per_dataset_stats=per_dataset_stats,
+            dataset_names=dataset_names,
+            num_datasets=num_datasets,
+        )
         self.normalize_targets = Normalize(
-            config.output_features, config.normalization_mapping, dataset_stats
+            config.output_features,
+            config.normalization_mapping,
+            per_dataset_stats=per_dataset_stats,
+            dataset_names=dataset_names,
+            num_datasets=num_datasets,
         )
         self.normalize_discrete_actions = Normalize(
-            config.output_features, {"ACTION": NormalizationMode.MIN_MAX}, dataset_stats
+            config.output_features,
+            {"ACTION": NormalizationMode.MIN_MAX},
+            per_dataset_stats=per_dataset_stats,
+            dataset_names=dataset_names,
+            num_datasets=num_datasets,
         )
         self.unnormalize_outputs = Unnormalize(
-            config.output_features, config.normalization_mapping, dataset_stats
+            config.output_features,
+            config.normalization_mapping,
+            per_dataset_stats=per_dataset_stats,
+            dataset_names=dataset_names,
+            num_datasets=num_datasets,
         )
 
         # π0.6 uses Gemma 3's tokenizer. The same instance is shared with the
@@ -393,6 +414,12 @@ class PI06Policy(PreTrainedPolicy):
             if remap_count > 0 and is_main_process:
                 print(f"Remapped {remap_count} state dict keys")
 
+            # Promote legacy single-dataset Normalize/Unnormalize buffers from
+            # `(*feat_shape,)` to the new `(1, *feat_shape)` stacked layout so pre-PR
+            # checkpoints load via `model.load_state_dict(...)`. Always run
+            # (outside the `if remap_count > 0` block) — promotion is needed
+            # whether or not any other keys were renamed.
+            model._promote_legacy_norm_buffers_in_state_dict(remapped_state_dict)
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
             if missing_keys and is_main_process:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
@@ -545,7 +572,8 @@ class PI06Policy(PreTrainedPolicy):
                 f"Delay must be None or between 0 and {self.config.max_delay}"
             )
 
-        batch = self.normalize_inputs(batch)
+        dataset_index = self._resolve_dataset_index(batch)
+        batch = self.normalize_inputs(batch, dataset_index)
 
         images, img_masks = self.prepare_images(batch)
         lang_tokens, lang_masks = self.prepare_language(batch)
@@ -558,7 +586,7 @@ class PI06Policy(PreTrainedPolicy):
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             action_prefix = torch.zeros(actions_shape, dtype=lang_tokens.dtype, device=lang_tokens.device)
         else:
-            action_prefix = self.normalize_targets({"actions": action_prefix})["actions"]
+            action_prefix = self.normalize_targets({"actions": action_prefix}, dataset_index)["actions"]
             action_prefix = F.pad(action_prefix, (0, 0, 0, self.config.chunk_size - action_prefix.shape[1]))
 
         actions = self.model.sample_actions(
@@ -567,16 +595,17 @@ class PI06Policy(PreTrainedPolicy):
 
         original_action_dim = self.config.action_feature.shape[0]
         actions = actions[:, :, :original_action_dim]
-        actions = self.unnormalize_outputs({"actions": actions})["actions"]
+        actions = self.unnormalize_outputs({"actions": actions}, dataset_index)["actions"]
         return actions
 
     def forward(
         self, batch: dict[str, Tensor], noise: Tensor | None = None, time: Tensor | None = None
     ) -> dict[str, Tensor]:
         """Full training forward pass. Returns `{"MSE": ..., "CE": ...}`."""
-        batch = self.normalize_inputs(batch)
-        batch["discrete_actions"] = self.normalize_discrete_actions(dict(batch))["actions"]
-        batch = self.normalize_targets(batch)
+        dataset_index = self._resolve_dataset_index(batch)
+        batch = self.normalize_inputs(batch, dataset_index)
+        batch["discrete_actions"] = self.normalize_discrete_actions(dict(batch), dataset_index)["actions"]
+        batch = self.normalize_targets(batch, dataset_index)
 
         images, img_masks = self.prepare_images(batch)
         lang_tokens, lang_masks = self.prepare_language(batch)

@@ -125,20 +125,73 @@ class ValueFunction(PreTrainedPolicy):
         self,
         config: ValueConfig,
         dataset_stats: dict[str, dict[str, Tensor]] | None = None,
+        per_dataset_stats: list[dict[str, dict[str, Tensor]]] | None = None,
+        dataset_names: list[str] | None = None,
     ):
         """Initializes the ValueFunction policy.
 
         Args:
-            config: Value Function configuration class instance or None, in which case the default instantiation of
-                the configuration class is used.
-            dataset_stats: Dataset statistics to be used for normalization. If not passed here, it is expected
-                that they will be passed with a call to `load_state_dict` before the policy is used.
+            config: Value Function configuration class instance.
+            dataset_stats: Legacy single-dataset stats dict. Wrapped into a
+                singleton list internally. Mutually exclusive with
+                ``per_dataset_stats``.
+            per_dataset_stats: Ordered list of per-dataset stat dicts.
+                Accepted for compatibility with ``make_policy``'s new
+                plumbing — value is single-dataset by design, so only the
+                first entry is used and a warning fires for longer lists.
+            dataset_names: Accepted for compatibility with ``make_policy``;
+                only the first entry is consumed.
         """
 
         super().__init__(config)
         config.validate_features()
         self.config = config
-        self.normalize_inputs = Normalize(config.input_features, config.normalization_mapping, dataset_stats)
+        # Reconcile the dual external API: callers either pass the legacy
+        # single dict via ``dataset_stats`` or the new list-of-dicts via
+        # ``per_dataset_stats``. They must not pass both.
+        if dataset_stats is not None and per_dataset_stats is not None:
+            raise ValueError(
+                "Pass either `dataset_stats` (legacy single-dataset) or "
+                "`per_dataset_stats` (new list form), not both."
+            )
+        if per_dataset_stats is None and dataset_stats is not None:
+            per_dataset_stats = [dataset_stats]
+        if per_dataset_stats is not None and len(per_dataset_stats) > 1:
+            logging.warning(
+                "ValueFunction is single-dataset by design; received %d "
+                "per_dataset_stats entries — only the first will be used.",
+                len(per_dataset_stats),
+            )
+            per_dataset_stats = per_dataset_stats[:1]
+            if dataset_names is not None:
+                dataset_names = dataset_names[:1]
+        # `super().__init__(config)` already populated `self._dataset_name_to_index`
+        # from `config.dataset_names`. The value policy is single-dataset by
+        # construction, so any multi-dataset config the caller carried in
+        # would leave a 3-entry name map pointing at a 1-row buffer — an
+        # inference call with `dataset_repo_id='<second>'` would index out
+        # of range. Rebuild the name map to match the truncated stats.
+        if dataset_names is not None:
+            self.config.dataset_names = list(dataset_names)
+            self._dataset_name_to_index = {name: i for i, name in enumerate(dataset_names)}
+        elif getattr(self.config, "dataset_names", None) and len(self.config.dataset_names) > 1:
+            kept = self.config.dataset_names[:1]
+            logging.warning(
+                "ValueFunction is single-dataset; truncating "
+                "`config.dataset_names` from %s to %s to match the 1-row "
+                "Normalize buffer.",
+                list(self.config.dataset_names),
+                kept,
+            )
+            self.config.dataset_names = kept
+            self._dataset_name_to_index = {name: i for i, name in enumerate(kept)}
+        num_datasets = 1
+        self.normalize_inputs = Normalize(
+            config.input_features,
+            config.normalization_mapping,
+            per_dataset_stats=per_dataset_stats,
+            num_datasets=num_datasets,
+        )
 
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-270m")
         self.model = ValueModel(config)
@@ -228,7 +281,11 @@ class ValueFunction(PreTrainedPolicy):
         """
         self.eval()
 
-        batch = self.normalize_inputs(batch)
+        # `ValueFunction` is a single-dataset policy (its `Normalize` was
+        # built with `num_datasets=1`); `_resolve_dataset_index` defaults
+        # to zeros in that case so callers don't need to inject the index.
+        dataset_index = self._resolve_dataset_index(batch)
+        batch = self.normalize_inputs(batch, dataset_index)
 
         images, img_masks = self.prepare_images(batch)
         lang_tokens, lang_masks = self.prepare_language(batch)
@@ -245,7 +302,11 @@ class ValueFunction(PreTrainedPolicy):
         Returns:
             Tuple of (loss_dict, None) where loss_dict contains the MSE loss
         """
-        batch = self.normalize_inputs(batch)
+        # `ValueFunction` is a single-dataset policy (its `Normalize` was
+        # built with `num_datasets=1`); `_resolve_dataset_index` defaults
+        # to zeros in that case so callers don't need to inject the index.
+        dataset_index = self._resolve_dataset_index(batch)
+        batch = self.normalize_inputs(batch, dataset_index)
 
         images, img_masks = self.prepare_images(batch)
         lang_tokens, lang_masks = self.prepare_language(batch)

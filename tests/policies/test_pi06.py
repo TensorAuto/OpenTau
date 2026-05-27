@@ -887,7 +887,7 @@ def test_complete_pi06_pipeline_integration_smoke(lerobot_dataset_metadata):
         original = dataset_stats["actions"][k].astype(np.float32, copy=False)
         dataset_stats["actions"][k] = np.tile(original[:1], (config.chunk_size, 1))
 
-    policy = PI06Policy(config, dataset_stats=dataset_stats)
+    policy = PI06Policy(config, per_dataset_stats=[dataset_stats])
     policy.to(dtype=torch.bfloat16, device="cuda")
 
     batch = {
@@ -967,7 +967,7 @@ def test_pi06_loc_tokens_extend_vocab_and_resize_embeddings(lerobot_dataset_meta
             dtype=np.float32,
         )
 
-    policy = PI06Policy(config, dataset_stats=dataset_stats)
+    policy = PI06Policy(config, per_dataset_stats=[dataset_stats])
 
     # PI06Policy and PI06FlowMatching share a single tokenizer instance so
     # the outer encodes index the inner model's resized embedding correctly

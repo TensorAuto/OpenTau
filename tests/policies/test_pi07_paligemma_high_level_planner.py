@@ -146,7 +146,7 @@ class TestPI07HighLevelPlannerIntegration:
         """Test the PI07 high-level planner: forward (training) and sample_actions (inference)."""
 
         config = self._make_config()
-        policy = PI07HighLevelPlannerPolicy(config, dataset_stats=lerobot_dataset_metadata.stats)
+        policy = PI07HighLevelPlannerPolicy(config, per_dataset_stats=[lerobot_dataset_metadata.stats])
         tokenizer = policy.model.language_tokenizer
 
         batch_size = 1

@@ -50,6 +50,13 @@ class ServerConfig:
     max_workers: int = 4
     max_send_message_length_mb: int = 100
     max_receive_message_length_mb: int = 100
+    # Which training-time dataset's normalization stats to use for inference
+    # requests. ``None`` (default) falls through to the policy's
+    # `_resolve_dataset_index` single-dataset fallback (works for any
+    # checkpoint trained on exactly one dataset). Set this to one of the
+    # strings in `policy.config.dataset_names` when serving a multi-dataset
+    # checkpoint, otherwise the inference call will raise `KeyError`.
+    dataset_repo_id: str | None = None
 
     def __post_init__(self):
         """Validate server configuration parameters."""

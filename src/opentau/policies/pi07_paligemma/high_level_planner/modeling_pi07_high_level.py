@@ -35,6 +35,7 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from opentau.configs.policies import PreTrainedConfig
 from opentau.policies.normalize import Normalize
+from opentau.policies.normalize import resolve_num_datasets as _num_datasets
 from opentau.policies.pi05.paligemma_with_expert import (
     PaliGemmaWithExpertConfig,
     PaliGemmaWithExpertModel,
@@ -179,21 +180,30 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
     def __init__(
         self,
         config: PI07HighLevelPlannerConfig,
-        dataset_stats: dict[str, dict[str, Tensor]] | None = None,
+        per_dataset_stats: list[dict[str, dict[str, Tensor]]] | None = None,
+        dataset_names: list[str] | None = None,
     ):
         """Initializes the PI07HighLevelPlannerPolicy.
 
         Args:
             config: Policy configuration instance.
-            dataset_stats: Dataset statistics for input normalization. If not
-                provided here, they must be supplied via ``load_state_dict``
-                before the policy is used.
+            per_dataset_stats: Ordered list of per-dataset stat dicts used to
+                fill the stacked Normalize input-buffer. May be None when
+                constructing for a checkpoint load.
+            dataset_names: Ordered list parallel to ``per_dataset_stats``.
         """
 
         super().__init__(config)
         config.validate_features()
         self.config = config
-        self.normalize_inputs = Normalize(config.input_features, config.normalization_mapping, dataset_stats)
+        num_datasets = _num_datasets(per_dataset_stats, dataset_names, config)
+        self.normalize_inputs = Normalize(
+            config.input_features,
+            config.normalization_mapping,
+            per_dataset_stats=per_dataset_stats,
+            dataset_names=dataset_names,
+            num_datasets=num_datasets,
+        )
 
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
 
@@ -322,6 +332,10 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
                 print(f"Remapped {remap_count} state dict keys")
 
             # Load the remapped state dict into the model
+            # Promote legacy single-dataset Normalize/Unnormalize buffers from
+            # `(*feat_shape,)` to the new `(1, *feat_shape)` stacked layout so pre-PR
+            # checkpoints load via `model.load_state_dict(...)`.
+            model._promote_legacy_norm_buffers_in_state_dict(remapped_state_dict)
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
 
             if missing_keys and is_main_process:
@@ -465,7 +479,8 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
             ``Tensor`` of token IDs with shape ``(batch_size, seq_len)``.
         """
 
-        batch = self.normalize_inputs(batch)
+        dataset_index = self._resolve_dataset_index(batch)
+        batch = self.normalize_inputs(batch, dataset_index)
 
         images, img_masks = self.prepare_images(batch)
         lang_tokens, lang_masks = self.prepare_language(batch)
@@ -494,7 +509,8 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
             compatibility) and ``"CE"`` (sum of memory and response
             cross-entropy losses).
         """
-        batch = self.normalize_inputs(batch)
+        dataset_index = self._resolve_dataset_index(batch)
+        batch = self.normalize_inputs(batch, dataset_index)
 
         images, img_masks = self.prepare_images(
             batch

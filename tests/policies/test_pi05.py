@@ -262,7 +262,7 @@ class TestPI05Integration:
 
         # Initialize policy with unified training mode
         config = pi05_training_config.policy
-        policy = PI05Policy(config, dataset_stats=lerobot_dataset_metadata.stats)
+        policy = PI05Policy(config, per_dataset_stats=[lerobot_dataset_metadata.stats])
 
         # Test data preparation pipeline
         batch_size = 1
@@ -362,13 +362,17 @@ class TestPI05Integration:
         policy.model.embed_prefix = original_embed_prefix
         policy.model.embed_suffix = original_embed_suffix
 
-        # check normalize and unnormalize by applying it on actions
+        # check normalize and unnormalize by applying it on actions. Per-dataset
+        # Normalize/Unnormalize now require an explicit `dataset_index`; we're
+        # calling the submodules directly here (bypassing the policy's
+        # `_resolve_dataset_index` helper), so pass a zero-row index manually.
         normalize_actions = policy.normalize_targets
         unnormalize_actions = policy.unnormalize_outputs
         action_output = {"actions": batch["actions"].to("cuda")}
+        dataset_index = torch.zeros(batch_size, dtype=torch.long, device="cuda")
         assert torch.allclose(
             action_output["actions"],
-            unnormalize_actions(normalize_actions(action_output))["actions"],
+            unnormalize_actions(normalize_actions(action_output, dataset_index), dataset_index)["actions"],
             atol=1e-6,
         )
 
@@ -590,7 +594,7 @@ def test_pi05_loc_tokens_in_response_produce_finite_loss(pi05_training_config, l
     promotion wired in `PI05Policy.__init__` / `PI05FlowMatching.__init__`."""
 
     config = pi05_training_config.policy
-    policy = PI05Policy(config, dataset_stats=lerobot_dataset_metadata.stats)
+    policy = PI05Policy(config, per_dataset_stats=[lerobot_dataset_metadata.stats])
 
     # PI05Policy and PI05FlowMatching share a single tokenizer instance so
     # token IDs cannot drift between the two layers.
