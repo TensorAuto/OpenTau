@@ -71,10 +71,20 @@ class PI07PaligemmaLowLevelConfig(PreTrainedConfig):
             ``normalize_*`` / ``unnormalize_*`` buffer tensors from the state dict before
             ``load_state_dict``. The buffers freshly initialised from ``dataset_stats`` then
             survive — use this when finetuning a checkpoint whose saved normalization stats
-            were aggregated over a different dataset mixture than the finetuning data. Note
-            that the model was trained against the saved stats; switching the normalization
-            mid-training only makes sense when followed by further training, not when
-            loading purely for inference. Defaults to False (no behaviour change).
+            were aggregated over a different dataset mixture than the finetuning data.
+            **Requires ``dataset_stats`` to be supplied to ``__init__``** (e.g. via
+            :py:func:`opentau.policies.factory.make_policy`); otherwise the buffers stay at
+            the ``inf`` sentinel from :py:func:`opentau.policies.normalize.create_stats_buffers`
+            and the next forward crashes. **One-shot:** after the strip fires successfully,
+            :py:meth:`from_pretrained` resets the flag to ``False`` on the model's config so
+            that subsequent ``save_pretrained`` / resume / inference loads do not re-strip
+            the now-correct finetuned buffers. The model was trained against the saved
+            stats, so switching the normalization mid-training only makes sense when followed
+            by further training, not when loading purely for inference. **Scope:** only the
+            ``pi07_paligemma_low_level`` load path honours this knob today; ``pi05`` /
+            ``pi05_mem`` / ``pi06`` / ``pi07/low_level`` / ``pi0`` share the same trap and
+            should grow an equivalent knob as follow-up. Defaults to False (no behaviour
+            change).
         optimizer_lr: Learning rate for the optimizer. Defaults to 2.5e-5.
         optimizer_betas: Beta parameters for AdamW optimizer. Defaults to (0.9, 0.95).
         optimizer_eps: Epsilon parameter for AdamW optimizer. Defaults to 1e-8.

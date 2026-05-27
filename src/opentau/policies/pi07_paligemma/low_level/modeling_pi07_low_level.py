@@ -107,6 +107,24 @@ def _preferred_dtype():
     return torch.float32 if torch.onnx.is_in_onnx_export() else torch.bfloat16
 
 
+def _is_normalize_buffer_key(key: str) -> bool:
+    """Return True iff ``key`` is a top-level Normalize / Unnormalize buffer tensor
+    saved by :class:`~opentau.policies.normalize.Normalize` /
+    :class:`~opentau.policies.normalize.Unnormalize`.
+
+    Anchored at the start of ``key`` so a hypothetical nested submodule named
+    ``model.something.normalize_internal.weight`` is *not* matched — only the
+    eight top-level buffer tensors (`normalize_inputs.buffer_*.{mean,std}`,
+    `normalize_targets.buffer_*.{mean,std}`,
+    `unnormalize_outputs.buffer_*.{mean,std}`,
+    `normalize_discrete_actions.buffer_*.{min,max}`).
+
+    Single source of truth for the ``skip_normalization_weights`` filter so
+    tests can exercise the same predicate the production load path uses.
+    """
+    return key.startswith("normalize_") or key.startswith("unnormalize_")
+
+
 def create_sinusoidal_pos_embedding(
     time: Tensor, dimension: int, min_period: float, max_period: float, device: torch.device | str = "cpu"
 ) -> Tensor:
@@ -458,15 +476,18 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
             if config.skip_normalization_weights:
                 n_before = len(remapped_state_dict)
                 remapped_state_dict = {
-                    key: val
-                    for key, val in remapped_state_dict.items()
-                    if not (key.startswith("normalize_") or key.startswith("unnormalize_"))
+                    key: val for key, val in remapped_state_dict.items() if not _is_normalize_buffer_key(key)
                 }
                 if is_main_process:
                     logging.info(
                         "skip_normalization_weights=True; dropped %d saved normalize/unnormalize buffer keys",
                         n_before - len(remapped_state_dict),
                     )
+                # One-shot semantics: the flag is consumed by this load.
+                # Reset on the model's config so the next save_pretrained()
+                # persists False, and later resumes / inference loads do not
+                # re-strip the now-correct finetuned buffers.
+                model.config.skip_normalization_weights = False
 
             # Load the remapped state dict into the model
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)

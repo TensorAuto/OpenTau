@@ -24,6 +24,7 @@ from opentau.policies.pi07_paligemma.low_level.modeling_pi07_low_level import (
     ContextItem,
     PI07PaligemmaLowLevelFlowMatching,
     PI07PaligemmaLowLevelPolicy,
+    _is_normalize_buffer_key,
     make_att_2d_masks,
 )
 
@@ -2423,41 +2424,45 @@ class TestSkipNormalizationWeights:
         cfg = PI07PaligemmaLowLevelConfig(skip_normalization_weights=True)
         assert cfg.skip_normalization_weights is True
 
-    def test_filter_strips_only_normalize_buffer_keys(self):
-        """The filter expression used in ``from_pretrained`` should drop
-        every saved ``normalize_*`` / ``unnormalize_*`` top-level key and
-        leave every other key (including ``model.normalize_…`` if it ever
-        existed) untouched.
+    def test_predicate_matches_all_eight_saved_buffer_keys(self):
+        """Exercises the production predicate
+        :py:func:`opentau.policies.pi07_paligemma.low_level.modeling_pi07_low_level._is_normalize_buffer_key`
+        directly so the test fails (rather than passes vacuously) when a
+        future edit broadens, narrows, or renames the predicate.
 
-        Replicates the inline filter in
-        :py:meth:`PI07PaligemmaLowLevelPolicy.from_pretrained` so a future
-        edit that broadens or narrows the predicate trips this test before
-        landing in production.
+        The eight keys below are the full set written by the current
+        :py:class:`~opentau.policies.normalize.Normalize` /
+        :py:class:`~opentau.policies.normalize.Unnormalize` modules — if
+        ``create_stats_buffers`` ever grows a new buffer name this list
+        needs an entry and the predicate needs an update; the assertion
+        pins both sides together.
         """
-        state_dict = {
-            "normalize_inputs.buffer_state.mean": 1,
-            "normalize_inputs.buffer_state.std": 2,
-            "normalize_targets.buffer_actions.mean": 3,
-            "normalize_targets.buffer_actions.std": 4,
-            "unnormalize_outputs.buffer_actions.mean": 5,
-            "unnormalize_outputs.buffer_actions.std": 6,
-            "normalize_discrete_actions.buffer_actions.min": 7,
-            "normalize_discrete_actions.buffer_actions.max": 8,
-            "model.paligemma_with_expert.foo.weight": 9,
-            "state_proj.weight": 10,
-            # Defensive: a hypothetical nested key containing "normalize"
-            # below the top level must NOT be stripped — the filter is
-            # anchored at the start of the key.
-            "model.some_layer.normalize_inputs_internal.weight": 11,
-        }
-        filtered = {
-            key: val
-            for key, val in state_dict.items()
-            if not (key.startswith("normalize_") or key.startswith("unnormalize_"))
-        }
-        assert set(filtered.keys()) == {
+        saved_buffer_keys = [
+            "normalize_inputs.buffer_state.mean",
+            "normalize_inputs.buffer_state.std",
+            "normalize_targets.buffer_actions.mean",
+            "normalize_targets.buffer_actions.std",
+            "unnormalize_outputs.buffer_actions.mean",
+            "unnormalize_outputs.buffer_actions.std",
+            "normalize_discrete_actions.buffer_actions.min",
+            "normalize_discrete_actions.buffer_actions.max",
+        ]
+        for key in saved_buffer_keys:
+            assert _is_normalize_buffer_key(key), f"{key!r} should be stripped but predicate returned False"
+
+    def test_predicate_anchored_at_key_start(self):
+        """The predicate must NOT match nested submodule keys that merely
+        contain ``normalize`` further down (e.g. a future
+        ``model.<layer>.normalize_internal.weight``). Anchoring at the
+        start of the key is what keeps the strip surgical to the eight
+        top-level buffer tensors.
+        """
+        non_buffer_keys = [
             "model.paligemma_with_expert.foo.weight",
             "state_proj.weight",
             "model.some_layer.normalize_inputs_internal.weight",
-        }
-        assert all(not (k.startswith("normalize_") or k.startswith("unnormalize_")) for k in filtered)
+            "model.unnormalize_helper.scratch",
+            "language_tokenizer.embedding",
+        ]
+        for key in non_buffer_keys:
+            assert not _is_normalize_buffer_key(key), f"{key!r} should be kept but predicate returned True"
