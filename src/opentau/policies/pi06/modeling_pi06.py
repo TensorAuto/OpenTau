@@ -195,7 +195,7 @@ def flow_matching_masked_mse(
     prefix_mask: Tensor,
     actions_is_pad: Tensor | None,
     max_action_dim: int,
-    action_dim: Tensor | None = None,
+    real_action_dim: Tensor | None = None,
 ) -> Tensor:
     """Masked MSE for π0.6 flow matching.
 
@@ -216,7 +216,7 @@ def flow_matching_masked_mse(
             action chunk is padded (no real action target).
         max_action_dim: Number of leading action dims to score against;
             trailing dims are dropped before averaging.
-        action_dim: optional long `(B,)` — real (pre-pad) action dim per
+        real_action_dim: optional long `(B,)` — real (pre-pad) action dim per
             sample. When ``None`` all ``max_action_dim`` columns are scored.
     """
     mse_loss = F.mse_loss(u_t, v_t, reduction="none")
@@ -226,7 +226,7 @@ def flow_matching_masked_mse(
         postfix_mask = torch.logical_and(postfix_mask, in_episode_bound)
     mse_loss = mse_loss[:, :, :max_action_dim]
     dim_mask = make_action_dim_mask(
-        action_dim, max_action_dim, batch_size=mse_loss.shape[0], device=mse_loss.device
+        real_action_dim, max_action_dim, batch_size=mse_loss.shape[0], device=mse_loss.device
     )
     full_mask = postfix_mask & rearrange(dim_mask, "b d -> b 1 d")
     return (mse_loss * full_mask).sum() / (full_mask.sum() + 1e-8)
@@ -658,7 +658,7 @@ class PI06Policy(PreTrainedPolicy):
             time,
             discrete_actions,
             discrete_action_masks,
-            action_dim=batch.get("action_dim"),
+            real_action_dim=batch.get("real_action_dim"),
         )
 
         mse_loss = losses["MSE"]
@@ -1020,7 +1020,7 @@ class PI06FlowMatching(nn.Module):
         time: Tensor | None = None,
         discrete_actions: Tensor | None = None,
         discrete_action_masks: Tensor | None = None,
-        action_dim: Tensor | None = None,
+        real_action_dim: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """Full training forward pass. Returns `{"MSE": ..., "CE": ...}`."""
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
@@ -1110,7 +1110,7 @@ class PI06FlowMatching(nn.Module):
             prefix_mask=prefix_mask,
             actions_is_pad=actions_is_pad,
             max_action_dim=self.config.max_action_dim,
-            action_dim=action_dim,
+            real_action_dim=real_action_dim,
         )
 
         # Discrete-action cross-entropy (FAST tokens) via the dedicated head.

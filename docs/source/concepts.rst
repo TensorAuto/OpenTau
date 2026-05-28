@@ -65,7 +65,7 @@ Default format (``n_obs_history=None``):
 
         "img_is_pad": torch.BoolTensor,  # shape (num_cams,) with values 0 or 1, where 1 indicates that the camera image is a padded image.
         "action_is_pad": torch.BoolTensor,  # shape (action_chunk,) with values 0 or 1, where 1 indicates that the action is a padded action.
-        "action_dim": torch.LongTensor,  # scalar shape (); collates to (B,). Real (pre-pad) trailing dim of ``actions``. Used by per-policy flow-matching MSE to skip the zero-pad dim columns; see "Action-dim padding mask" below.
+        "real_action_dim": torch.LongTensor,  # scalar shape (); collates to (B,). Real (pre-pad) trailing dim of ``actions``. Used by per-policy flow-matching MSE to skip the zero-pad dim columns; see "Action-dim padding mask" below.
         "obs_history_is_pad": torch.BoolTensor,  # shape (1,) — always False when n_obs_history is None.
     }
 
@@ -84,7 +84,7 @@ With observation history (``n_obs_history=T``):
 
         "img_is_pad": torch.BoolTensor,  # shape (num_cams,) — camera slot availability.
         "action_is_pad": torch.BoolTensor,  # shape (action_chunk,)
-        "action_dim": torch.LongTensor,  # scalar shape (); collates to (B,). Real (pre-pad) trailing dim of ``actions``.
+        "real_action_dim": torch.LongTensor,  # scalar shape (); collates to (B,). Real (pre-pad) trailing dim of ``actions``.
         "obs_history_is_pad": torch.BoolTensor,  # shape (T,) — True for timesteps outside the episode boundary.
     }
 
@@ -115,33 +115,39 @@ Action-dim padding mask
 For heterogeneous co-training across datasets with different native action
 dimensionalities (e.g. a 7-DoF arm dataset and a 14-DoF bimanual dataset in
 one mixture), ``actions`` is zero-padded along the last axis to
-``max_action_dim`` to keep batches rectangular. The per-sample ``action_dim``
-scalar records the real (pre-pad) trailing dim; each policy's flow-matching
-MSE on the velocity field uses it to skip the zero-pad columns and only
-score the dims that the source dataset actually uses. Without it, the
-action expert would be supervised against zero targets on the padded tail
-dims — under per-dataset normalization (where padded-dim stats are
-``mean=0, std=0``) that signal is a clean "predict 0 here" that contaminates
-samples in the same batch which do use those dims.
+``max_action_dim`` to keep batches rectangular. The per-sample
+``real_action_dim`` scalar records the real (pre-pad) trailing dim; each
+policy's flow-matching MSE on the velocity field uses it to skip the
+zero-pad columns and only score the dims that the source dataset actually
+uses. Without it, the action expert would be supervised against zero
+targets on the padded tail dims — under per-dataset normalization (where
+padded-dim stats are ``mean=0, std=0``) that signal is a clean "predict 0
+here" that contaminates samples in the same batch which do use those dims.
+
+The name parallels (not collides with) the static ``original_action_dim``
+local variable in each policy's inference path
+(``sample_actions`` / ``select_action``), which is
+``self.config.action_feature.shape[0]`` — the deployed policy's
+homogeneous DoF, distinct from this per-sample dynamic key.
 
 This is distinct from ``action_is_pad``, which masks padded *timesteps*
 along the action chunk. The two masks are AND-ed together inside each
 policy's MSE block: a slot in ``(B, chunk_size, max_action_dim)`` contributes
 to the loss only when both its timestep is real (``~action_is_pad``) and
-its dim is real (column index ``< action_dim``). Policies with a
+its dim is real (column index ``< real_action_dim``). Policies with a
 real-time-inference frozen prefix (pi05, pi05_mem, pi06, pi07,
 pi07_paligemma) AND in a third condition, ``~prefix_mask`` — see
 ``flow_matching_masked_mse`` in :mod:`opentau.policies.pi06.modeling_pi06`
 for the full reduction. pi0 has no such frozen prefix and uses only the
 two conditions above.
 
-When ``action_dim`` is absent (single-dataset configs, externally constructed
-inference batches), all ``max_action_dim`` columns are treated as real and
-loss behavior is bit-identical to pre-fix. VQA-style items emit ``actions``
-already shaped ``(action_chunk, max_action_dim)`` and rely on the all-True
-``action_is_pad`` to drive the loss to zero — ``action_dim`` matches
-``max_action_dim`` for those items, and the all-True ``action_is_pad``
-still zeros the contribution.
+When ``real_action_dim`` is absent (single-dataset configs, externally
+constructed inference batches), all ``max_action_dim`` columns are treated
+as real and loss behavior is bit-identical to pre-fix. VQA-style items emit
+``actions`` already shaped ``(action_chunk, max_action_dim)`` and rely on
+the all-True ``action_is_pad`` to drive the loss to zero —
+``real_action_dim`` matches ``max_action_dim`` for those items, and the
+all-True ``action_is_pad`` still zeros the contribution.
 
 .. _standard-data-format-optional-keys:
 

@@ -731,7 +731,7 @@ class PI05Policy(PreTrainedPolicy):
             discrete_actions,
             discrete_action_masks,
             state=state,
-            action_dim=batch.get("action_dim"),
+            real_action_dim=batch.get("real_action_dim"),
         )
 
         mse_loss = losses["MSE"]
@@ -1314,7 +1314,7 @@ class PI05FlowMatching(nn.Module):
         discrete_actions: Tensor | None = None,
         discrete_action_masks: Tensor | None = None,
         state: Tensor | None = None,
-        action_dim: Tensor | None = None,
+        real_action_dim: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """Do a full training forward pass and compute the loss.
 
@@ -1453,9 +1453,9 @@ class PI05FlowMatching(nn.Module):
         mse_loss = mse_loss[:, :, : self.config.max_action_dim]
 
         # Per-dim mask (B, 1, D) — True for real action dims; all-True fallback
-        # when `action_dim` is absent keeps single-dataset behavior unchanged.
+        # when `real_action_dim` is absent keeps single-dataset behavior unchanged.
         dim_mask = make_action_dim_mask(
-            action_dim,
+            real_action_dim,
             self.config.max_action_dim,
             batch_size=mse_loss.shape[0],
             device=mse_loss.device,

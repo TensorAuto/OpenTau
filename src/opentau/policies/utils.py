@@ -110,7 +110,7 @@ def get_output_shape(module: nn.Module, input_shape: tuple) -> tuple:
 
 
 def make_action_dim_mask(
-    action_dim: Tensor | None,
+    real_action_dim: Tensor | None,
     max_action_dim: int,
     batch_size: int,
     device: torch.device,
@@ -124,32 +124,35 @@ def make_action_dim_mask(
     mask before reducing.
 
     Args:
-        action_dim: Optional ``(B,)`` long tensor of the real (pre-pad) action
-            dimensionality for each sample. When ``None``, the returned mask is
-            all-True so the dim-mask AND in the caller's reduction is a no-op
-            (pi0 additionally harmonized its `.mean()` to `sum / mask.sum()`
-            in this PR — see the PR body's "pi0 loss-magnitude shift" note;
-            the dim-mask itself is still a no-op when ``action_dim`` is None).
+        real_action_dim: Optional ``(B,)`` long tensor of the real (pre-pad)
+            action dimensionality for each sample (the batch key emitted by
+            ``LeRobotDataset._to_standard_data_format``). When ``None``, the
+            returned mask is all-True so the dim-mask AND in the caller's
+            reduction is a no-op (pi0 additionally harmonized its `.mean()`
+            to `sum / mask.sum()` in this PR — see the PR body's "pi0
+            loss-magnitude shift" note; the dim-mask itself is still a
+            no-op when ``real_action_dim`` is None).
         max_action_dim: The padded action dim (last-axis length of ``actions``).
         batch_size: Used to construct the all-True fallback shape; when
-            ``action_dim`` is provided, must match ``action_dim.shape[0]``.
+            ``real_action_dim`` is provided, must match
+            ``real_action_dim.shape[0]``.
         device: Output device.
 
     Returns:
         ``(batch_size, max_action_dim)`` bool tensor.
     """
-    if action_dim is None:
+    if real_action_dim is None:
         return torch.ones((batch_size, max_action_dim), dtype=torch.bool, device=device)
-    if action_dim.shape != (batch_size,):
-        # Catch caller drift (e.g. a sliced `action_dim` passed with the
+    if real_action_dim.shape != (batch_size,):
+        # Catch caller drift (e.g. a sliced `real_action_dim` passed with the
         # original `batch_size`) at the helper boundary — silent shape
         # mismatches propagate into broadcast errors deep in the loss reduction.
         raise ValueError(
-            f"action_dim.shape {tuple(action_dim.shape)} does not match "
+            f"real_action_dim.shape {tuple(real_action_dim.shape)} does not match "
             f"batch_size={batch_size}; expected ({batch_size},)"
         )
     arange = torch.arange(max_action_dim, device=device)
-    return rearrange(arange, "d -> 1 d") < rearrange(action_dim.to(device=device), "b -> b 1")
+    return rearrange(arange, "d -> 1 d") < rearrange(real_action_dim.to(device=device), "b -> b 1")
 
 
 def log_model_loading_keys(missing_keys: list[str], unexpected_keys: list[str]) -> None:

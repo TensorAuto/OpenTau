@@ -855,7 +855,7 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
             metadata_masks=metadata_masks,
             response_tokens=response_tokens,
             response_masks=response_masks,
-            action_dim=batch.get("action_dim"),
+            real_action_dim=batch.get("real_action_dim"),
         )
 
         mse_loss = losses["MSE"]
@@ -1786,7 +1786,7 @@ class PI07LowLevelFlowMatching(nn.Module):
         metadata_masks: Tensor | None = None,
         response_tokens: Tensor | None = None,
         response_masks: Tensor | None = None,
-        action_dim: Tensor | None = None,
+        real_action_dim: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """Training forward pass: embed all modalities and compute losses.
 
@@ -1927,9 +1927,9 @@ class PI07LowLevelFlowMatching(nn.Module):
         mse_loss = mse_loss[:, :, : self.config.max_action_dim]
 
         # Per-dim mask (B, 1, D) — True for real action dims; all-True fallback
-        # when `action_dim` is absent keeps single-dataset behavior unchanged.
+        # when `real_action_dim` is absent keeps single-dataset behavior unchanged.
         dim_mask = make_action_dim_mask(
-            action_dim,
+            real_action_dim,
             self.config.max_action_dim,
             batch_size=mse_loss.shape[0],
             device=mse_loss.device,

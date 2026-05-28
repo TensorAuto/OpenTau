@@ -72,7 +72,7 @@ def _make_dataset(
     stats_factory,
     episodes_stats_factory,
     tmp_path,
-    action_dim,
+    real_action_dim,
     suffix,
 ):
     """Build a minimal LeRobotDataset whose underlying parquet matches a
@@ -83,13 +83,13 @@ def _make_dataset(
     motor_features = {
         "action": {
             "dtype": "float32",
-            "shape": (action_dim,),
-            "names": [f"a{i}" for i in range(action_dim)],
+            "shape": (real_action_dim,),
+            "names": [f"a{i}" for i in range(real_action_dim)],
         },
         "state": {
             "dtype": "float32",
-            "shape": (action_dim,),
-            "names": [f"s{i}" for i in range(action_dim)],
+            "shape": (real_action_dim,),
+            "names": [f"s{i}" for i in range(real_action_dim)],
         },
     }
     info = info_factory(
@@ -107,7 +107,7 @@ def _make_dataset(
     stats = stats_factory(features=info["features"])
     episodes_stats = episodes_stats_factory(features=info["features"], total_episodes=3)
     dataset = lerobot_dataset_factory(
-        root=tmp_path / f"action_dim_{action_dim}_{suffix}",
+        root=tmp_path / f"action_dim_{real_action_dim}_{suffix}",
         repo_id=DUMMY_REPO_ID,
         total_episodes=3,
         total_frames=150,
@@ -146,14 +146,16 @@ def test_action_dim_reflects_pre_pad_shape(
         stats_factory,
         episodes_stats_factory,
         tmp_path,
-        action_dim=4,
+        real_action_dim=4,
         suffix="single",
     )
     item = dataset[25]
-    assert "action_dim" in item, "dataset must emit action_dim alongside the padded actions tensor"
-    assert item["action_dim"].shape == (), f"action_dim must be scalar (got {item['action_dim'].shape})"
-    assert item["action_dim"].dtype == torch.long
-    assert int(item["action_dim"].item()) == 4
+    assert "real_action_dim" in item, "dataset must emit action_dim alongside the padded actions tensor"
+    assert item["real_action_dim"].shape == (), (
+        f"real_action_dim must be scalar (got {item['real_action_dim'].shape})"
+    )
+    assert item["real_action_dim"].dtype == torch.long
+    assert int(item["real_action_dim"].item()) == 4
     assert item["actions"].shape == (dataset.cfg.action_chunk, dataset.cfg.max_action_dim)
 
 
@@ -177,15 +179,15 @@ def test_action_dim_default_dataloader_collation(
         stats_factory,
         episodes_stats_factory,
         tmp_path,
-        action_dim=3,
+        real_action_dim=3,
         suffix="collate",
     )
     loader = torch.utils.data.DataLoader(dataset, batch_size=4, shuffle=False, num_workers=0)
     batch = next(iter(loader))
-    assert "action_dim" in batch
-    assert batch["action_dim"].shape == (4,)
-    assert batch["action_dim"].dtype == torch.long
-    assert (batch["action_dim"] == 3).all()
+    assert "real_action_dim" in batch
+    assert batch["real_action_dim"].shape == (4,)
+    assert batch["real_action_dim"].dtype == torch.long
+    assert (batch["real_action_dim"] == 3).all()
 
 
 def test_dataset_raises_when_action_dim_exceeds_max(
@@ -211,7 +213,7 @@ def test_dataset_raises_when_action_dim_exceeds_max(
         stats_factory,
         episodes_stats_factory,
         tmp_path,
-        action_dim=4,
+        real_action_dim=4,
         suffix="oversized",
     )
     # Force max_action_dim *below* the dataset's real action dim.
@@ -245,12 +247,12 @@ def test_two_datasets_with_different_action_dims(
         "episodes_stats_factory": episodes_stats_factory,
         "tmp_path": tmp_path,
     }
-    ds_a = _make_dataset(**common, action_dim=4, suffix="a")
-    ds_b = _make_dataset(**common, action_dim=9, suffix="b")
+    ds_a = _make_dataset(**common, real_action_dim=4, suffix="a")
+    ds_b = _make_dataset(**common, real_action_dim=9, suffix="b")
     item_a = ds_a[10]
     item_b = ds_b[10]
-    assert int(item_a["action_dim"].item()) == 4
-    assert int(item_b["action_dim"].item()) == 9
+    assert int(item_a["real_action_dim"].item()) == 4
+    assert int(item_b["real_action_dim"].item()) == 9
     assert item_a["actions"].shape[-1] == ds_a.cfg.max_action_dim
     assert item_b["actions"].shape[-1] == ds_b.cfg.max_action_dim
     assert item_a["actions"].shape[-1] == item_b["actions"].shape[-1]
@@ -268,7 +270,7 @@ def test_cross_dataset_batch_routes_action_dim_into_loss(
 ):
     """End-to-end heterogeneous-DoF scenario the fix targets: collate one
     item from a 4-DoF dataset and one from a 9-DoF dataset into a single
-    batch, then verify (a) ``batch["action_dim"]`` is ``[4, 9]`` after
+    batch, then verify (a) ``batch["real_action_dim"]`` is ``[4, 9]`` after
     default collation and (b) feeding that into ``flow_matching_masked_mse``
     produces the masked-mean we expect by hand (5-dim tail of item 0 and
     23-dim tail of item 1 both excluded from the reduction).
@@ -289,13 +291,13 @@ def test_cross_dataset_batch_routes_action_dim_into_loss(
         "episodes_stats_factory": episodes_stats_factory,
         "tmp_path": tmp_path,
     }
-    ds_a = _make_dataset(**common, action_dim=4, suffix="mixed_a")
-    ds_b = _make_dataset(**common, action_dim=9, suffix="mixed_b")
+    ds_a = _make_dataset(**common, real_action_dim=4, suffix="mixed_a")
+    ds_b = _make_dataset(**common, real_action_dim=9, suffix="mixed_b")
     max_action_dim = ds_a.cfg.max_action_dim
     chunk = ds_a.cfg.action_chunk
 
     batch = torch.utils.data.default_collate([ds_a[0], ds_b[0]])
-    assert batch["action_dim"].tolist() == [4, 9]
+    assert batch["real_action_dim"].tolist() == [4, 9]
     assert batch["actions"].shape == (2, chunk, max_action_dim)
 
     # Hand-crafted velocity tensors: u_t - v_t = 1 everywhere → per-element MSE = 1.
@@ -310,7 +312,7 @@ def test_cross_dataset_batch_routes_action_dim_into_loss(
         prefix_mask,
         actions_is_pad,
         max_action_dim=max_action_dim,
-        action_dim=batch["action_dim"],
+        real_action_dim=batch["real_action_dim"],
     )
     # Sample 0 contributes chunk * 4 slots; sample 1 contributes chunk * 9.
     expected_denom = chunk * 4 + chunk * 9

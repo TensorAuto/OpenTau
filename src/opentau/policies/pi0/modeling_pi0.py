@@ -503,9 +503,9 @@ class PI0Policy(PreTrainedPolicy):
             )
 
         # Per-dim mask (B, 1, D) — True for real action dims; backwards compatible
-        # all-True fallback when `action_dim` is absent.
+        # all-True fallback when `real_action_dim` is absent.
         dim_mask = make_action_dim_mask(
-            batch.get("action_dim"),
+            batch.get("real_action_dim"),
             self.config.max_action_dim,
             batch_size=losses.shape[0],
             device=losses.device,

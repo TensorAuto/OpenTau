@@ -874,13 +874,13 @@ class BaseDataset(torch.utils.data.Dataset):
         if not 0 < real_action_dim <= self.max_action_dim:
             # Raise rather than assert so the check survives `python -O`.
             # An empty trailing dim (`shape == (chunk, 0)`) would silently emit
-            # `action_dim=0` and contribute zero gradient at training time —
+            # `real_action_dim=0` and contribute zero gradient at training time —
             # treat it as a malformed dataset, same as exceeding the upper bound.
             raise ValueError(
                 f"real action dim {real_action_dim} is outside (0, "
                 f"{self.max_action_dim}] (dataset={getattr(self, 'repo_id', '?')})"
             )
-        standard_item["action_dim"] = torch.tensor(real_action_dim, dtype=torch.long)
+        standard_item["real_action_dim"] = torch.tensor(real_action_dim, dtype=torch.long)
 
         # pad state and action vectors
         standard_item["state"] = self.pad_vector(standard_item["state"], self.max_state_dim)
