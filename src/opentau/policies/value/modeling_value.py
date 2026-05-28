@@ -167,15 +167,17 @@ class ValueFunction(PreTrainedPolicy):
             per_dataset_stats = per_dataset_stats[:1]
             if dataset_names is not None:
                 dataset_names = dataset_names[:1]
-        # `super().__init__(config)` already populated `self._dataset_name_to_index`
-        # from `config.dataset_names`. The value policy is single-dataset by
-        # construction, so any multi-dataset config the caller carried in
-        # would leave a 3-entry name map pointing at a 1-row buffer — an
-        # inference call with `dataset_repo_id='<second>'` would index out
-        # of range. Rebuild the name map to match the truncated stats.
+        # `super().__init__(config)` already populated `self._norm_key_to_index`
+        # and `self._dataset_to_norm_index` from `config.dataset_names` /
+        # `config.dataset_to_norm_index`. The value policy is single-dataset
+        # by design, so any multi-dataset config the caller carried in would
+        # leave maps pointing at a 1-row buffer — an inference call with
+        # `dataset_repo_id='<second>'` would index out of range. Rebuild
+        # both maps to match the truncated stats.
         if dataset_names is not None:
             self.config.dataset_names = list(dataset_names)
-            self._dataset_name_to_index = {name: i for i, name in enumerate(dataset_names)}
+            self._norm_key_to_index = {name: i for i, name in enumerate(dataset_names)}
+            self._dataset_to_norm_index = dict(self._norm_key_to_index)
         elif getattr(self.config, "dataset_names", None) and len(self.config.dataset_names) > 1:
             kept = self.config.dataset_names[:1]
             logging.warning(
@@ -186,7 +188,20 @@ class ValueFunction(PreTrainedPolicy):
                 kept,
             )
             self.config.dataset_names = kept
-            self._dataset_name_to_index = {name: i for i, name in enumerate(kept)}
+            self._norm_key_to_index = {name: i for i, name in enumerate(kept)}
+            # Truncating to a single row means the surviving row is row 0
+            # (we kept `dataset_names[:1]`), so the surviving dataset->row
+            # entries are exactly those that pointed at 0. Filter the
+            # persisted map down to those.
+            persisted = getattr(self.config, "dataset_to_norm_index", None) or {}
+            surviving = {k: v for k, v in persisted.items() if v == 0}
+            # Two distinct cases reach the fallback `{kept[0]: 0}`:
+            #   - persisted map was empty (legacy config without the
+            #     field, or freshly built value policy);
+            #   - persisted map had entries but none pointed at row 0
+            #     (would be a malformed config — defensive).
+            # Both want the identity mapping for the kept name.
+            self._dataset_to_norm_index = surviving or {kept[0]: 0}
         num_datasets = 1
         self.normalize_inputs = Normalize(
             config.input_features,

@@ -510,15 +510,24 @@ class EvalConfig:
 
     recording_root: str | None = None
 
-    # Which training-time dataset's normalization stats to use when calling
-    # `policy.select_action` on eval observations. ``None`` (default) falls
-    # through to the policy's `_resolve_dataset_index` single-dataset fallback
-    # (works for any policy trained on exactly one dataset). Set this to one
-    # of the strings in `policy.config.dataset_names` when running eval
-    # against a multi-dataset checkpoint, otherwise the inference call will
-    # raise a `KeyError`. Plumbed into each `select_action` call by
+    # Which training-time norm head to use when calling `policy.select_action`
+    # on eval observations. Either:
+    #   - set both `robot_type` and `control_mode` to address the head by
+    #     `(robot_type, control_mode)` (preferred for multi-head checkpoints
+    #     trained against the new per-`(robot_type, control_mode)`
+    #     aggregation),
+    #   - or set `dataset_repo_id` to a training-time dataset name (the
+    #     policy maps it to the norm head via its persisted
+    #     `dataset_to_norm_index`; back-compat path that also works on
+    #     legacy per-dataset checkpoints).
+    # When all three are ``None`` (default), single-head policies fall back
+    # to the `_resolve_dataset_index` zero-default; multi-head ones raise.
+    # The robot_type / control_mode pair takes precedence over
+    # `dataset_repo_id` when both are set. Plumbed by
     # `scripts/eval.py::rollout`.
     dataset_repo_id: str | None = None
+    robot_type: str | None = None
+    control_mode: str | None = None
 
     def __post_init__(self):
         """Validate evaluation configuration."""

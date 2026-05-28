@@ -315,12 +315,24 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
     # repopulated; otherwise the inf-init assertion fires at first forward.
     save_normalization_stats: bool = True
 
-    # Ordered list of dataset names this policy was trained on. Used by the per-sample
-    # Normalize/Unnormalize indexing path to map an inference-time
-    # `batch["dataset_repo_id"]` (str) into the leading dim of the stacked stats
-    # buffers. `None` only for policies constructed outside the standard
-    # `make_policy(ds_meta=...)` path (e.g. legacy single-stats fallbacks).
+    # Ordered list of norm-head identifiers this policy was trained on — one
+    # per row of the stacked Normalize/Unnormalize buffers. With
+    # `dataset_to_norm_index` set (new checkpoints), each entry is a norm key
+    # ("<robot_type>::<control_mode>" or a fallback dataset name). Legacy
+    # checkpoints (`dataset_to_norm_index is None`) carry one entry per
+    # training dataset and the entries are dataset names; the per-dataset and
+    # per-norm-head axes are then the same. `None` only for policies
+    # constructed outside the standard `make_policy(ds_meta=...)` path (e.g.
+    # legacy single-stats fallbacks).
     dataset_names: list[str] | None = None
+
+    # `{training_dataset_name: norm_head_row}` map persisted at training
+    # time. Lets inference resolve a `batch["dataset_repo_id"]` (a
+    # training-time dataset name) to the right row when datasets share a
+    # `(robot_type, control_mode)` head. `None` on legacy checkpoints; the
+    # policy then falls back to treating `dataset_names` as a 1:1
+    # per-dataset list (identity mapping) for inference-time lookup.
+    dataset_to_norm_index: dict[str, int] | None = None
 
     # Deprecated: latency fields are no longer used. Kept for backward-compatible
     # loading of old JSON configs. Must remain 0.0; non-zero values will raise.
