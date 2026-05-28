@@ -1732,7 +1732,51 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         """
         return self.video_encoder(video, obs_history_is_pad=obs_history_is_pad)
 
-    def _embed_item(self, item: ContextItem) -> tuple[Tensor, Tensor]:
+    def _global_run_image_tower(self, items: list[ContextItem]) -> bool:
+        """Decide once, across all ranks, whether the subgoal image tower runs.
+
+        :meth:`embed_prefix` calls this exactly once per forward — before the
+        per-item loop and on *every* rank, even one whose prefix happens to
+        contain no ``image`` item — then threads the result into each
+        :meth:`_embed_item` via ``run_image_tower``. Hoisting the collective
+        out of the per-item branch (mirroring pi07's ``embed_prefix``) is what
+        keeps DDP / FSDP collective counts aligned: a real
+        ``subgoal_present_local`` flows through
+        :func:`_global_or_branch_decisions`, so its presence-divergence check
+        actually fires (raising loudly) if a future heterogeneous mixture ever
+        gives ranks a different number of subgoal-image items — instead of the
+        all-reduce count silently desyncing and hanging at NCCL (CLAUDE.md hard
+        rule 5). Putting the all-reduce *inside* the ``image`` branch would
+        reintroduce exactly that anti-pattern.
+
+        The OR runs over all cameras (matching pi07's single ``has_subgoal``):
+        if any subgoal on any rank is real, every camera's tower runs, and the
+        per-camera pad masks still zero unused slots downstream. Bypassed
+        (returns ``True``) under ``torch.compile`` / ONNX export, where the
+        collective and Python branch can't be traced and the exported graph
+        must always include the tower.
+
+        Args:
+            items: The ordered prefix ``ContextItem``s passed to
+                :meth:`embed_prefix`.
+
+        Returns:
+            Whether this rank should run the image tower this step.
+        """
+        if torch.compiler.is_compiling() or torch.onnx.is_in_onnx_export():
+            return True
+        image_items = [it for it in items if it.item_type == "image"]
+        subgoal_present_local = bool(image_items)
+        subgoal_any_local = any(bool(it.pad_mask.any()) for it in image_items)
+        (run_image_tower,) = _global_or_branch_decisions(
+            presence_locals=(subgoal_present_local,),
+            any_locals=(subgoal_any_local,),
+            field_names=("subgoal_image",),
+            device=items[0].data.device,
+        )
+        return run_image_tower
+
+    def _embed_item(self, item: ContextItem, *, run_image_tower: bool | None = None) -> tuple[Tensor, Tensor]:
         """Embed a single ``ContextItem`` and return ``(emb, expanded_pad_mask)``.
 
         Dispatches on ``item.item_type``:
@@ -1756,10 +1800,12 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         - ``image``: subgoal image through PaliGemma's image tower. Same
           skip-and-emit-zeros efficiency win as ``video``, but the
           ``pad_mask`` here *is* per-sample data (``subgoal_is_pad`` can
-          diverge across ranks), so the run/skip decision is OR-reduced
-          across ranks via :func:`_global_or_branch_decisions` to keep the
-          DDP invariant. The skip is bypassed (tower runs unconditionally)
-          under ``torch.compile`` / ONNX export.
+          diverge across ranks). The cross-rank run/skip decision is computed
+          once per forward by :meth:`_global_run_image_tower` and threaded in
+          via ``run_image_tower`` — the collective is kept out of this
+          per-item branch (see that method). When called directly with
+          ``run_image_tower=None`` (single-process unit tests) it falls back
+          to a rank-local decision that fires no collective.
         - ``action``: noisy-action projection (suffix only).
 
         The pad mask is broadcast/expanded so the returned mask matches
@@ -1785,23 +1831,17 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         if t == "image":
             # Subgoal images: 4-D (B, C, H, W) in [-1, 1] through the VLM's
             # image tower (byte-identical to embed_video at T=1 on the shared
-            # tower). When no sample on ANY rank needs this subgoal, the image
-            # tower is skipped and zeros are emitted instead — a strict
-            # efficiency win (the per-sample mask zeros the slot regardless),
-            # e.g. at inference or whenever every rank's subgoal_is_pad is True.
+            # tower). When no sample needs this subgoal the tower is skipped and
+            # zeros are emitted — a strict, mask-equivalent efficiency win (the
+            # per-sample mask zeros the slot regardless), e.g. at inference or
+            # whenever subgoal_is_pad is all-True.
             #
-            # The skip is data-dependent: unlike the config-determined video
-            # mask, per-sample subgoal_is_pad can differ across ranks, so each
-            # rank's local ``.any()`` may diverge. Running the tower on some
-            # ranks but not others would desync DDP / FSDP collective counts and
-            # hang at NCCL (CLAUDE.md hard rule 5), so the run/skip decision is
-            # OR-reduced across ranks first via ``_global_or_branch_decisions``
-            # — presence is structurally True here (the image item is in the
-            # prefix on every rank by config), so only the ``.any()`` is
-            # reduced. Under torch.compile / ONNX export the all-reduce and the
-            # Python branch can't be traced (and export must bake in the tower
-            # so the exported graph can encode real subgoals), so run
-            # unconditionally.
+            # ``run_image_tower`` is the cross-rank decision computed once per
+            # forward in ``_global_run_image_tower`` and passed down by
+            # ``embed_prefix``; the collective lives there, not here, so it
+            # can't hide behind this per-item branch (CLAUDE.md hard rule 5).
+            # A direct call (single-process unit tests) leaves it None and we
+            # fall back to a purely-local decision that fires no collective.
             image = item.data
             per_sample_mask = item.pad_mask
             if per_sample_mask.ndim != 1:
@@ -1809,14 +1849,11 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
                     f"image pad_mask must be (B,) per-sample; got shape {tuple(per_sample_mask.shape)}."
                 )
             dtype = _preferred_dtype()
-            if torch.compiler.is_compiling() or torch.onnx.is_in_onnx_export():
-                run_image_tower = True
-            else:
-                (run_image_tower,) = _global_or_branch_decisions(
-                    presence_locals=(True,),
-                    any_locals=(bool(per_sample_mask.any()),),
-                    field_names=("subgoal_image",),
-                    device=image.device,
+            if run_image_tower is None:
+                run_image_tower = (
+                    torch.compiler.is_compiling()
+                    or torch.onnx.is_in_onnx_export()
+                    or bool(per_sample_mask.any())
                 )
             if run_image_tower:
                 emb = self.paligemma_with_expert.embed_image(image).to(dtype=dtype)
@@ -1893,10 +1930,16 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         pad_masks: list[Tensor] = []
         att_masks_flat: list[int] = []
 
+        # Cross-rank subgoal-image run/skip decision, computed once here (every
+        # rank, before the loop) and threaded into each item — see
+        # _global_run_image_tower for why the collective must not live inside
+        # the per-item ``image`` branch.
+        run_image_tower = self._global_run_image_tower(items)
+
         cross_att_running = 0
         cross_att_locked = False
         for item in items:
-            emb, mask = self._embed_item(item)
+            emb, mask = self._embed_item(item, run_image_tower=run_image_tower)
             length = emb.shape[1]
             embs.append(emb)
             pad_masks.append(mask)

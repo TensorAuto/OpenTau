@@ -1790,11 +1790,12 @@ def _find_free_port() -> int:
 def _ddp_image_skip_worker(rank: int, world_size: int, port: int, scenario: str) -> None:
     """Subprocess body for ``test_ddp_lockstep_image_tower_skip``.
 
-    Each rank drives ``_embed_item`` on an ``image`` item with a rank-specific
-    pad mask and asserts the run/skip decision matches the *global* OR — not the
-    rank-local ``.any()``. Must be module-level so the macOS ``spawn`` start
-    method can pickle it. Asserts raise in-process; ``mp.spawn(join=True)``
-    re-raises them in the parent test.
+    Each rank calls ``_global_run_image_tower`` — the single, hoisted collective
+    — on a rank-specific prefix and asserts the decision follows the *global* OR
+    (not the rank-local ``.any()``), and that a cross-rank presence mismatch
+    raises rather than silently desyncing. Must be module-level so the macOS
+    ``spawn`` start method can pickle it. Asserts raise in-process;
+    ``mp.spawn(join=True)`` re-raises them in the parent test.
     """
     import os
 
@@ -1805,36 +1806,49 @@ def _ddp_image_skip_worker(rank: int, world_size: int, port: int, scenario: str)
         bsz, h = 2, 8
         model = TestPI07PaligemmaLowLevelResponseEmbedding._make_mock_model(hidden_size=h)
 
-        called = {"hit": False}
+        def _image_item(mask: torch.Tensor) -> ContextItem:
+            return ContextItem(
+                data=torch.full((bsz, 3, 224, 224), 0.3),
+                item_type="image",
+                pad_mask=mask,
+                attention="continue",
+            )
 
-        def _recording_embed_image(image):
-            called["hit"] = True
-            return torch.zeros(image.shape[0], 4, h, dtype=torch.bfloat16)
-
-        model.paligemma_with_expert.embed_image = _recording_embed_image
-
-        if scenario == "divergent":
-            # rank 0 has no real subgoal, rank 1 does → global OR is True, so
-            # BOTH ranks must run the tower (rank 0 despite its all-False local
-            # mask). This is the lockstep guarantee the OR-reduce provides.
-            local_mask = torch.zeros(bsz, dtype=torch.bool) if rank == 0 else torch.tensor([False, True])
-            expect_called = True
-        else:  # "all_padded": no rank has a real subgoal → both skip.
-            local_mask = torch.zeros(bsz, dtype=torch.bool)
-            expect_called = False
-
-        item = ContextItem(
-            data=torch.full((bsz, 3, 224, 224), 0.3),
-            item_type="image",
-            pad_mask=local_mask,
+        # A non-image filler so every rank's prefix is non-empty (as in production,
+        # where video/text/state items always precede the subgoal block).
+        text_item = ContextItem(
+            data=torch.zeros(bsz, 3, dtype=torch.long),
+            item_type="text",
+            pad_mask=torch.ones(bsz, 3, dtype=torch.bool),
             attention="continue",
         )
-        emb, _ = model._embed_item(item)
 
-        assert emb.shape == (bsz, 4, h), (rank, scenario, tuple(emb.shape))
-        assert called["hit"] == expect_called, (
-            f"rank {rank} / {scenario}: embed_image called={called['hit']}, expected {expect_called}"
-        )
+        if scenario == "divergent":
+            # rank 0 has no real subgoal, rank 1 does → global OR True, so BOTH
+            # ranks must run (rank 0 despite its all-False local mask). This is
+            # the lockstep guarantee the hoisted OR-reduce provides.
+            mask = torch.zeros(bsz, dtype=torch.bool) if rank == 0 else torch.tensor([False, True])
+            assert model._global_run_image_tower([text_item, _image_item(mask)]), (
+                f"rank {rank}/divergent: expected global RUN despite local mask {mask.tolist()}"
+            )
+        elif scenario == "all_padded":
+            # No rank has a real subgoal → global OR False → both skip.
+            items = [text_item, _image_item(torch.zeros(bsz, dtype=torch.bool))]
+            assert not model._global_run_image_tower(items), f"rank {rank}/all_padded: expected SKIP"
+        elif scenario == "presence_divergence":
+            # rank 0's prefix has an image item, rank 1's has none. The helper's
+            # presence-divergence check must fire (loud RuntimeError) rather than
+            # let the per-rank collective count silently desync — the exact
+            # failure the hoist restores protection against (CLAUDE.md rule 5).
+            items = [text_item, _image_item(torch.tensor([False, True]))] if rank == 0 else [text_item]
+            try:
+                model._global_run_image_tower(items)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError(f"rank {rank}/presence_divergence: expected RuntimeError, got none")
+        else:
+            raise ValueError(f"unknown scenario {scenario!r}")
     finally:
         torch.distributed.destroy_process_group()
 
@@ -2256,9 +2270,10 @@ class TestPI07PaligemmaLowLevelSubgoalEmbedding:
             assert shape == (bsz, 3, 224, 224), shape
 
     # ------------------------------------------------------------------ #
-    # Image-tower skip: when no sample needs the subgoal (all-padded), the
-    # PaliGemma image tower is bypassed and zeros are emitted. Single-process
-    # (no process group), so the OR-reduce returns the local ``.any()``.
+    # Image-tower skip via _embed_item's local fallback: called directly with
+    # run_image_tower=None (no process group), the image branch decides from
+    # the rank-local ``.any()`` and fires no collective. The hoisted cross-rank
+    # decision is covered by the _global_run_image_tower / lockstep tests below.
     # ------------------------------------------------------------------ #
     def test_all_padded_subgoal_skips_image_tower(self):
         """All-padded subgoal mask → ``embed_image`` is not called and the image
@@ -2318,25 +2333,90 @@ class TestPI07PaligemmaLowLevelSubgoalEmbedding:
         assert expanded_mask.shape == (bsz, 4)
         assert expanded_mask[1].all() and not expanded_mask[0].any() and not expanded_mask[2].any()
 
+    def test_run_image_tower_override_wins_over_local_mask(self):
+        """The decision passed from ``embed_prefix`` overrides the local mask:
+        ``run_image_tower=False`` skips even a real sample; ``True`` runs even an
+        all-padded one. This is the contract that lets the cross-rank decision
+        actually control the per-item branch."""
+        bsz, h = 3, 8
+        model = TestPI07PaligemmaLowLevelResponseEmbedding._make_mock_model(hidden_size=h)
+        n_img_tokens = model.paligemma_with_expert.config.paligemma_config.text_config.num_image_tokens
+        calls: list[tuple[int, ...]] = []
+
+        def _capturing_embed_image(image):
+            calls.append(tuple(image.shape))
+            return torch.full((image.shape[0], 4, h), 1.0, dtype=torch.bfloat16)
+
+        model.paligemma_with_expert.embed_image = _capturing_embed_image
+
+        # Real sample but forced skip → zeros, no call.
+        real = ContextItem(
+            data=torch.full((bsz, 3, 224, 224), 0.5),
+            item_type="image",
+            pad_mask=torch.tensor([False, True, False]),
+            attention="continue",
+        )
+        emb_skip, _ = model._embed_item(real, run_image_tower=False)
+        assert calls == [], "run_image_tower=False must skip even a real sample"
+        assert emb_skip.shape == (bsz, n_img_tokens, h) and not emb_skip.any()
+
+        # All-padded but forced run → real output, one call.
+        padded = ContextItem(
+            data=torch.full((bsz, 3, 224, 224), 0.5),
+            item_type="image",
+            pad_mask=torch.zeros(bsz, dtype=torch.bool),
+            attention="continue",
+        )
+        emb_run, _ = model._embed_item(padded, run_image_tower=True)
+        assert calls == [(bsz, 3, 224, 224)], "run_image_tower=True must run even an all-padded sample"
+        assert emb_run.shape == (bsz, 4, h)
+
+    def test_global_run_image_tower_local_decision(self):
+        """Single-process (no process group): ``_global_run_image_tower`` returns
+        the local OR over image items — True if any camera mask is real, False
+        for all-padded, and False when the prefix has no image item at all."""
+        bsz, h = 2, 8
+        model = TestPI07PaligemmaLowLevelResponseEmbedding._make_mock_model(hidden_size=h)
+
+        def _img(mask):
+            return ContextItem(
+                data=torch.zeros(bsz, 3, 224, 224), item_type="image", pad_mask=mask, attention="continue"
+            )
+
+        text = ContextItem(
+            data=torch.zeros(bsz, 3, dtype=torch.long),
+            item_type="text",
+            pad_mask=torch.ones(bsz, 3, dtype=torch.bool),
+            attention="continue",
+        )
+        # Two cameras, one with a real sample → run.
+        assert model._global_run_image_tower(
+            [text, _img(torch.zeros(bsz, dtype=torch.bool)), _img(torch.tensor([False, True]))]
+        )
+        # All cameras all-padded → skip.
+        assert not model._global_run_image_tower([text, _img(torch.zeros(bsz, dtype=torch.bool))])
+        # No image item at all → skip (and no crash deriving the device).
+        assert not model._global_run_image_tower([text])
+
     # ------------------------------------------------------------------ #
-    # DDP lockstep: the run/skip decision must follow the *global* OR of the
-    # subgoal mask, not each rank's local ``.any()`` — otherwise ranks fire a
-    # different number of vision-encoder collectives and hang at NCCL. Verified
-    # here over a 2-rank gloo group on CPU (no GPU needed).
+    # DDP lockstep: the hoisted ``_global_run_image_tower`` collective must make
+    # the run/skip decision follow the *global* OR (not each rank's local
+    # ``.any()``), and must detect cross-rank presence divergence loudly —
+    # otherwise ranks fire a different number of collectives and hang at NCCL.
+    # Verified over a 2-rank gloo group on CPU (no GPU needed).
     # ------------------------------------------------------------------ #
     @pytest.mark.slow
     def test_ddp_lockstep_image_tower_skip(self):
-        """With divergent per-rank masks (rank 0 all-padded, rank 1 real) both
-        ranks must run the image tower; with all ranks padded both must skip."""
+        """Divergent per-rank masks → both ranks RUN (global OR); all-padded →
+        both SKIP; one rank missing the image item → loud RuntimeError, not a
+        silent collective-count desync."""
         import torch.multiprocessing as mp
 
         if not torch.distributed.is_available():
             pytest.skip("torch.distributed is not available")
 
-        # Divergent local masks → global OR True → both ranks RUN.
-        mp.spawn(_ddp_image_skip_worker, args=(2, _find_free_port(), "divergent"), nprocs=2, join=True)
-        # Every rank all-padded → global OR False → both ranks SKIP.
-        mp.spawn(_ddp_image_skip_worker, args=(2, _find_free_port(), "all_padded"), nprocs=2, join=True)
+        for scenario in ("divergent", "all_padded", "presence_divergence"):
+            mp.spawn(_ddp_image_skip_worker, args=(2, _find_free_port(), scenario), nprocs=2, join=True)
 
 
 class TestPI07PaligemmaLowLevelExecutionHorizon:
