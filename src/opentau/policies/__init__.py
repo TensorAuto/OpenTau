@@ -29,4 +29,18 @@ from .pi07.high_level_planner.configuration_pi07_high_level import (
 from .pi07.low_level.configuration_pi07_low_level import (
     PI07LowLevelConfig as PI07LowLevelConfig,
 )
+
+# Side-effect imports: the two ``pi07_paligemma`` config modules each carry an
+# ``@PreTrainedConfig.register_subclass(...)`` decorator that draccus relies on
+# to resolve ``--policy.type=pi07_paligemma_low_level`` /
+# ``pi07_paligemma_high_level_planner``. The high-level config class shares the
+# name ``PI07HighLevelPlannerConfig`` with its pi07 counterpart, so we cannot
+# re-export it from this package without shadowing the latter; importers reach
+# the class directly via its full module path or through ``get_policy_class``.
+from .pi07_paligemma.high_level_planner import (
+    configuration_pi07_high_level as _pi07_paligemma_high_level_config,  # noqa: F401
+)
+from .pi07_paligemma.low_level import (
+    configuration_pi07_low_level as _pi07_paligemma_low_level_config,  # noqa: F401
+)
 from .value.configuration_value import ValueConfig as ValueConfig
