@@ -512,7 +512,11 @@ def _aggregate_stats_per_head(
     n = len(mixture_cfg.datasets)
     raw_min: list[np.ndarray | None] = [None] * n
     raw_max: list[np.ndarray | None] = [None] * n
-    per_ds_info: list[dict[str, Any]] = [{}] * n
+    # Use list comprehensions (not `[{}] * n`) for mutable defaults so a future
+    # `per_ds_info[idx]["override_X"] = ...` doesn't silently fan out across
+    # all slots. The `[None] * n` / `["<no-repo-id>"] * n` patterns above are
+    # safe because their element types are immutable.
+    per_ds_info: list[dict[str, Any]] = [{} for _ in range(n)]
     per_ds_native_dim: list[int | None] = [None] * n
     per_ds_repo: list[str] = ["<no-repo-id>"] * n
     failures: list[tuple[int, str, str]] = []
@@ -608,6 +612,31 @@ def _aggregate_stats_per_head(
             shown,
             suffix,
         )
+        # Tighter signal for the specific divergence the deferred fallback-name
+        # dedup finding flagged: when a fallback-keyed repo_id appears more
+        # than once in the mixture, fit-time pools them under one shared key
+        # (since `compute_norm_key` returns the same string both times) while
+        # training keeps them as separate singleton heads (since
+        # `_make_dataset_names` deduplicates with `#N` suffixes). Flag the
+        # divergence explicitly so the operator can fix it before it ships.
+        from collections import Counter
+
+        fallback_counts = Counter(fallback_datasets)
+        duplicates_in_fallback = {k: v for k, v in fallback_counts.items() if v > 1}
+        if duplicates_in_fallback:
+            dup_preview = dict(list(duplicates_in_fallback.items())[:10])
+            logger.warning(
+                "%d fallback-keyed repo_id values appear in the mixture more "
+                "than once. Fit-time POOLS these under one shared head per "
+                "repo_id, but training (via `_make_dataset_names`'s `#N` dedup) "
+                "keeps them as separate singleton heads -- the fit-time "
+                "normalization will diverge from training. Set "
+                "`DatasetConfig.robot_type` / `DatasetConfig.control_mode` on "
+                "each entry, or deduplicate the mixture, to close the gap. "
+                "Duplicates (repo_id -> count): %s",
+                len(duplicates_in_fallback),
+                dup_preview,
+            )
 
     # Restore the over-dim warning from the global path: datasets whose
     # native action dim exceeds --action-dim will have high dims silently
