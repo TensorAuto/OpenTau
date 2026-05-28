@@ -13,7 +13,7 @@
         "n_obs_steps": 1,
         "normalization_mapping": {
             "VISUAL": "IDENTITY",
-            "STATE": "MEAN_STD"
+            "STATE": "IDENTITY"
         },
         "input_features": {
             "state": {"type": "STATE", "shape": [32]},

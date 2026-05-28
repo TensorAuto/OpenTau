@@ -211,13 +211,21 @@ def benchmark_main(cfg: TrainPipelineConfig):
     policy.eval()
     policy.reset()
 
-    # Compile + verify.
+    # Compile + verify. We rebind ``policy.model.sample_actions`` on the
+    # instance so the outer ``policy.sample_actions`` wrapper (which calls
+    # ``self.model.sample_actions(...)`` at attribute-access time) picks up the
+    # compiled callable; the assert below catches any code path that might
+    # still hold a pre-compile bound reference.
     compile_status = "no-compile"
     if not no_compile:
         torch._dynamo.reset()
         compiled = torch.compile(policy.model.sample_actions, mode=compile_mode, fullgraph=False)
         _verify_compile(compiled)
         policy.model.sample_actions = compiled
+        assert policy.model.sample_actions is compiled, (
+            "rebinding model.sample_actions did not stick — outer policy.sample_actions "
+            "would call the eager version, which would silently invalidate the benchmark."
+        )
         compile_status = f"compiled:{compile_mode}"
         logging.info(f"torch.compile attached: mode={compile_mode}")
 
@@ -261,7 +269,7 @@ def benchmark_main(cfg: TrainPipelineConfig):
     summary = _summarize(times_ms)
     logging.info(
         f"Inference (ms): mean={summary['mean_ms']:.2f} std={summary['std_ms']:.2f} "
-        f"p50={summary['p50_ms']:.2f} p95={summary['p95_ms']:.2f} "
+        f"p50={summary['p50_ms']:.2f} p95={summary['p95_ms']:.2f} p99={summary['p99_ms']:.2f} "
         f"min={summary['min_ms']:.2f} max={summary['max_ms']:.2f}"
     )
 

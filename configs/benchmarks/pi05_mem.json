@@ -14,8 +14,8 @@
         "history_interval": 1,
         "normalization_mapping": {
             "VISUAL": "IDENTITY",
-            "STATE": "MEAN_STD",
-            "ACTION": "MEAN_STD"
+            "STATE": "IDENTITY",
+            "ACTION": "IDENTITY"
         },
         "input_features": {
             "state": {"type": "STATE", "shape": [32]},
