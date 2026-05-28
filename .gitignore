@@ -178,3 +178,6 @@ cython_debug/
 # Cursor configuration
 .cursorignore
 .cursorindexingignore
+
+# Inference benchmark run artifacts (per-host JSONs, dmon traces, diagnostic dumps)
+benchmark_results/
