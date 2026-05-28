@@ -48,7 +48,7 @@ from opentau.policies.pi07_paligemma.low_level.configuration_pi07_low_level impo
     PI07PaligemmaLowLevelConfig,
 )
 from opentau.policies.pretrained import PreTrainedPolicy, T
-from opentau.policies.utils import make_action_dim_mask
+from opentau.policies.utils import flow_matching_masked_mse
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
 
@@ -2036,35 +2036,15 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         v_t = self.action_out_proj(suffix_out)
         v_t = v_t.to(dtype=torch.float32)
 
-        mse_loss = F.mse_loss(u_t, v_t, reduction="none")
-
-        # mask out frozen actions and padded actions
-        postfix_mask = rearrange(
-            torch.logical_not(prefix_mask), "b c -> b c 1"
-        )  # 0 for frozen actions, 1 for non-frozen actions
-
-        if actions_is_pad is not None:
-            in_episode_bound = ~actions_is_pad
-            in_episode_bound = rearrange(
-                in_episode_bound, "b c -> b c 1"
-            )  # 0 for padded actions, 1 for non-padded actions
-            postfix_mask = torch.logical_and(postfix_mask, in_episode_bound)
-
-        # Remove dim padding
-        mse_loss = mse_loss[:, :, : self.config.max_action_dim]
-
-        # Per-dim mask (B, 1, D) — True for real action dims; all-True fallback
-        # when `real_action_dim` is absent keeps single-dataset behavior unchanged.
-        dim_mask = make_action_dim_mask(
-            real_action_dim,
-            self.config.max_action_dim,
-            batch_size=mse_loss.shape[0],
-            device=mse_loss.device,
+        # Shared masked-MSE reduction; see pi05 for the rationale.
+        mse_loss = flow_matching_masked_mse(
+            u_t=u_t,
+            v_t=v_t,
+            max_action_dim=self.config.max_action_dim,
+            prefix_mask=prefix_mask,
+            actions_is_pad=actions_is_pad,
+            real_action_dim=real_action_dim,
         )
-        full_mask = postfix_mask & rearrange(dim_mask, "b d -> b 1 d")  # (B, chunk, D)
-
-        # Do not include frozen, timestep-padded, or dim-padded entries in the mean.
-        mse_loss = (mse_loss * full_mask).sum() / (full_mask.sum() + 1e-8)
 
         # compute cross entropy loss for discrete actions
         batch_size, seq_len = discrete_actions.shape

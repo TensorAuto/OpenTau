@@ -18,8 +18,7 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 from einops import rearrange
 
-from opentau.policies.pi06.modeling_pi06 import flow_matching_masked_mse
-from opentau.policies.utils import make_action_dim_mask
+from opentau.policies.utils import flow_matching_masked_mse, make_action_dim_mask
 
 
 def _reference_dense_mse(u_t: torch.Tensor, v_t: torch.Tensor, action_is_pad: torch.Tensor) -> torch.Tensor:
@@ -66,7 +65,12 @@ def test_flow_matching_masked_mse_excludes_padded_dims():
     real_action_dim = torch.tensor([3, 5], dtype=torch.long)
 
     loss = flow_matching_masked_mse(
-        u_t, v_t, prefix_mask, actions_is_pad, max_action_dim=dim, real_action_dim=real_action_dim
+        u_t,
+        v_t,
+        max_action_dim=dim,
+        prefix_mask=prefix_mask,
+        actions_is_pad=actions_is_pad,
+        real_action_dim=real_action_dim,
     )
 
     # Manually compute the expected loss over the unmasked slots only.
@@ -87,7 +91,12 @@ def test_flow_matching_masked_mse_none_action_dim_matches_old_behavior():
     actions_is_pad = torch.zeros(bsz, chunk, dtype=torch.bool)
 
     new = flow_matching_masked_mse(
-        u_t, v_t, prefix_mask, actions_is_pad, max_action_dim=dim, real_action_dim=None
+        u_t,
+        v_t,
+        max_action_dim=dim,
+        prefix_mask=prefix_mask,
+        actions_is_pad=actions_is_pad,
+        real_action_dim=None,
     )
     old = _reference_dense_mse(u_t, v_t, actions_is_pad)
     torch.testing.assert_close(new, old)
@@ -105,7 +114,12 @@ def test_flow_matching_masked_mse_action_dim_at_max_matches_old_behavior():
     real_action_dim = torch.full((bsz,), dim, dtype=torch.long)
 
     new = flow_matching_masked_mse(
-        u_t, v_t, prefix_mask, actions_is_pad, max_action_dim=dim, real_action_dim=real_action_dim
+        u_t,
+        v_t,
+        max_action_dim=dim,
+        prefix_mask=prefix_mask,
+        actions_is_pad=actions_is_pad,
+        real_action_dim=real_action_dim,
     )
     old = _reference_dense_mse(u_t, v_t, actions_is_pad)
     torch.testing.assert_close(new, old)
@@ -125,7 +139,12 @@ def test_flow_matching_masked_mse_combines_with_timestep_pad():
     real_action_dim = torch.tensor([4, 2], dtype=torch.long)
 
     loss = flow_matching_masked_mse(
-        u_t, v_t, prefix_mask, actions_is_pad, max_action_dim=dim, real_action_dim=real_action_dim
+        u_t,
+        v_t,
+        max_action_dim=dim,
+        prefix_mask=prefix_mask,
+        actions_is_pad=actions_is_pad,
+        real_action_dim=real_action_dim,
     )
 
     # Sample 0: 2 real timesteps * 4 real dims = 8 unmasked slots, each contributing 1.
@@ -147,7 +166,12 @@ def test_action_dim_zero_yields_zero_loss():
     real_action_dim = torch.tensor([0, 0], dtype=torch.long)
 
     loss = flow_matching_masked_mse(
-        u_t, v_t, prefix_mask, actions_is_pad, max_action_dim=dim, real_action_dim=real_action_dim
+        u_t,
+        v_t,
+        max_action_dim=dim,
+        prefix_mask=prefix_mask,
+        actions_is_pad=actions_is_pad,
+        real_action_dim=real_action_dim,
     )
     # Numerator and denominator both 0 → loss = 0 / (0 + eps) ≈ 0.
     assert loss.item() == pytest.approx(0.0, abs=1e-6)
@@ -159,6 +183,55 @@ def test_helper_raises_on_action_dim_batch_size_mismatch():
     real_action_dim = torch.tensor([3, 5, 7], dtype=torch.long)
     with pytest.raises(ValueError, match="does not match batch_size"):
         make_action_dim_mask(real_action_dim, max_action_dim=8, batch_size=2, device=torch.device("cpu"))
+
+
+def test_flow_matching_masked_mse_prefix_mask_default_none():
+    """``prefix_mask=None`` (item 7 from the review): non-RTI policies (e.g. pi0)
+    don't have a frozen-prefix concept, so the helper must accept ``None`` and
+    build an all-False prefix mask internally. Equivalent to passing an
+    explicit all-zeros tensor; supervises every step."""
+    torch.manual_seed(3)
+    bsz, chunk, dim = 2, 4, 6
+    u_t = torch.randn(bsz, chunk, dim)
+    v_t = torch.randn(bsz, chunk, dim)
+    actions_is_pad = torch.zeros(bsz, chunk, dtype=torch.bool)
+    real_action_dim = torch.tensor([3, 5], dtype=torch.long)
+
+    loss_default = flow_matching_masked_mse(
+        u_t,
+        v_t,
+        max_action_dim=dim,
+        actions_is_pad=actions_is_pad,
+        real_action_dim=real_action_dim,
+    )
+    loss_explicit = flow_matching_masked_mse(
+        u_t,
+        v_t,
+        max_action_dim=dim,
+        prefix_mask=torch.zeros(bsz, chunk, dtype=torch.bool),
+        actions_is_pad=actions_is_pad,
+        real_action_dim=real_action_dim,
+    )
+    torch.testing.assert_close(loss_default, loss_explicit)
+
+
+def test_flow_matching_masked_mse_actions_is_pad_default_none():
+    """``actions_is_pad=None`` (also part of the cleaner API): every timestep
+    is treated as real. Equivalent to passing an explicit all-False tensor."""
+    torch.manual_seed(11)
+    bsz, chunk, dim = 2, 3, 4
+    u_t = torch.randn(bsz, chunk, dim)
+    v_t = torch.randn(bsz, chunk, dim)
+
+    loss_default = flow_matching_masked_mse(u_t, v_t, max_action_dim=dim)
+    loss_explicit = flow_matching_masked_mse(
+        u_t,
+        v_t,
+        max_action_dim=dim,
+        prefix_mask=torch.zeros(bsz, chunk, dtype=torch.bool),
+        actions_is_pad=torch.zeros(bsz, chunk, dtype=torch.bool),
+    )
+    torch.testing.assert_close(loss_default, loss_explicit)
 
 
 def test_helper_is_total_when_action_dim_exceeds_max():

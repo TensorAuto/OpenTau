@@ -490,6 +490,16 @@ class PI0Policy(PreTrainedPolicy):
 
         losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
 
+        # NB: pi0 keeps the masked reduction inline rather than routing through
+        # `opentau.policies.utils.flow_matching_masked_mse` (which pi05 / pi05_mem /
+        # pi06 / pi07*/low_level share). Two reasons:
+        #   - no RTI-style frozen prefix (the shared helper's `prefix_mask` would
+        #     always default to None here, which is fine, but…)
+        #   - AWR weighting (`use_awr`) needs to apply between the masking and the
+        #     reduction, and the shared helper reduces internally — so pi0 would
+        #     need an extra `sample_weights` knob in the helper signature just for
+        #     this one call site. Keeping it inline preserves the shared helper's
+        #     minimal API.
         # Crop to max_action_dim before masking so the shapes are well-defined when
         # the model's velocity head emits extra trailing dims.
         losses = losses[:, :, : self.config.max_action_dim]

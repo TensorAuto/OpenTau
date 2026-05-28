@@ -279,7 +279,7 @@ def test_cross_dataset_batch_routes_action_dim_into_loss(
     covers the loss math with a synthetic ``action_dim`` tensor; this test
     closes the dataset → policy boundary by actually collating real
     standardized items."""
-    from opentau.policies.pi06.modeling_pi06 import flow_matching_masked_mse
+    from opentau.policies.utils import flow_matching_masked_mse
 
     common = {
         "lerobot_dataset_factory": lerobot_dataset_factory,
@@ -309,9 +309,9 @@ def test_cross_dataset_batch_routes_action_dim_into_loss(
     loss = flow_matching_masked_mse(
         u_t,
         v_t,
-        prefix_mask,
-        actions_is_pad,
         max_action_dim=max_action_dim,
+        prefix_mask=prefix_mask,
+        actions_is_pad=actions_is_pad,
         real_action_dim=batch["real_action_dim"],
     )
     # Sample 0 contributes chunk * 4 slots; sample 1 contributes chunk * 9.

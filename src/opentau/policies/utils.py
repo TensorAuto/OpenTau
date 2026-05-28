@@ -26,6 +26,7 @@ import logging
 from collections import deque
 
 import torch
+import torch.nn.functional as F  # noqa: N812
 from einops import rearrange
 from torch import Tensor, nn
 
@@ -153,6 +154,63 @@ def make_action_dim_mask(
         )
     arange = torch.arange(max_action_dim, device=device)
     return rearrange(arange, "d -> 1 d") < rearrange(real_action_dim.to(device=device), "b -> b 1")
+
+
+def flow_matching_masked_mse(
+    u_t: Tensor,
+    v_t: Tensor,
+    *,
+    max_action_dim: int,
+    prefix_mask: Tensor | None = None,
+    actions_is_pad: Tensor | None = None,
+    real_action_dim: Tensor | None = None,
+) -> Tensor:
+    """Masked MSE for flow-matching velocity-field training.
+
+    Shared across pi05, pi05_mem, pi06, pi07 (low_level), and pi07_paligemma
+    (low_level). Builds a `(B, chunk_size, max_action_dim)` mask that AND-s
+    together up to three conditions and reduces ``F.mse_loss(u_t, v_t)``
+    over the unmasked slots:
+
+      1. **Frozen-prefix (RTI delay):** ``~prefix_mask`` — False where the
+         model isn't asked to predict (the action prefix is the actually
+         executed action from a previous inference, frozen as ground truth).
+         Pass ``None`` to disable (non-RTI policies); the helper builds an
+         all-False prefix mask internally so every step is supervised.
+      2. **Per-timestep chunk padding:** ``~actions_is_pad`` — False where
+         the action chunk extends past episode end. Pass ``None`` to skip.
+         Also covers VQA-style items (``actions_is_pad`` all-True ⇒ loss = 0).
+      3. **Per-sample real action dim:** built from ``real_action_dim`` via
+         :func:`make_action_dim_mask`. False on the zero-pad tail dims of
+         each sample. Pass ``None`` to score all ``max_action_dim`` columns.
+
+    Args:
+        u_t: Target velocity field, shape ``(B, chunk_size, D)`` (D ≥ max_action_dim).
+        v_t: Predicted velocity field, same shape as ``u_t``.
+        max_action_dim: Number of leading action dims to score against; trailing
+            dims are dropped before reduction. Keyword-only.
+        prefix_mask: Optional bool ``(B, chunk_size)`` — True where the step is
+            frozen (RTI delay). ``None`` ⇒ all-False (non-RTI behavior).
+        actions_is_pad: Optional bool ``(B, chunk_size)`` — True where the
+            action chunk is padded (no real action target). ``None`` ⇒ all-False.
+        real_action_dim: Optional long ``(B,)`` — real (pre-pad) action dim per
+            sample. ``None`` ⇒ all-True (every dim is real).
+
+    Returns:
+        Scalar tensor: masked mean of ``(u_t - v_t)**2`` over the unmasked slots.
+    """
+    mse_loss = F.mse_loss(u_t, v_t, reduction="none")
+    bsz, chunk_size = u_t.shape[:2]
+    if prefix_mask is None:
+        prefix_mask = torch.zeros((bsz, chunk_size), dtype=torch.bool, device=u_t.device)
+    postfix_mask = rearrange(torch.logical_not(prefix_mask), "b c -> b c 1")
+    if actions_is_pad is not None:
+        in_episode_bound = rearrange(~actions_is_pad, "b c -> b c 1")
+        postfix_mask = torch.logical_and(postfix_mask, in_episode_bound)
+    mse_loss = mse_loss[:, :, :max_action_dim]
+    dim_mask = make_action_dim_mask(real_action_dim, max_action_dim, batch_size=bsz, device=u_t.device)
+    full_mask = postfix_mask & rearrange(dim_mask, "b d -> b 1 d")
+    return (mse_loss * full_mask).sum() / (full_mask.sum() + 1e-8)
 
 
 def log_model_loading_keys(missing_keys: list[str], unexpected_keys: list[str]) -> None:
