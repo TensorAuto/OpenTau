@@ -41,13 +41,19 @@ Pipeline (all CPU):
        resampled to ``mixture.action_freq`` (or to each dataset's native
        fps when ``action_freq is None`` -- mixed-frequency mixtures) and
        right-padded to ``max_action_dim``.
-    4. Min-max-normalize each chunk to ``[-1, 1]`` using
-       ``mixture.meta.aggregated_action_stats()`` -- the same global
-       min/max the BPE codec is fit over. (The training policy itself
-       normalizes per-dataset via
-       ``Normalize({"ACTION": NormalizationMode.MIN_MAX})``; the
-       tokenizer collapses to one global range so the discrete vocab
-       is shared across the mixture.)
+    4. Min-max-normalize each chunk to ``[-1, 1]`` using the per-
+       ``(robot_type, control_mode)`` norm-head stats by default
+       (``--per-head-norm``) -- the same stats the training policy
+       applies via ``Normalize({"ACTION": NormalizationMode.MIN_MAX})``
+       with per-head stacked buffers (PR #347). Pass
+       ``--no-per-head-norm`` for the legacy global aggregate path,
+       which is what older fits (pre-#347) used; the global path
+       under-spreads each head's distribution and produces shorter
+       fit-time chunks than the policy actually feeds the tokenizer
+       at training, so token-length analysis on the global fit
+       systematically underestimates the truncation rate. The
+       ``--use-mixture-dataloader`` path only supports global
+       normalization for now.
     5. Call ``UniversalActionProcessor.fit(...)`` (DCT + Rust BpeTrainer)
        and ``save_pretrained`` the result. The upstream remote-code
        source ``processing_action_tokenizer.py`` is copied alongside so
@@ -63,7 +69,8 @@ Usage:
         --chunk-size 50 \\
         [--total-chunks 1000000] [--action-dim 32] \\
         [--vocab-size 2048] [--scale 10] [--seed 0] [--num-workers 8] \\
-        [--dataloader-batch-size 256] [--pilot]
+        [--dataloader-batch-size 256] [--pilot] \\
+        [--no-per-head-norm]  # legacy global normalization (default: per-head)
 
 The mixture JSON may use ``$ref`` includes -- see
 ``opentau.configs.refs.resolve_refs``.
@@ -88,6 +95,7 @@ import numpy as np
 
 from opentau.configs.default import DatasetMixtureConfig
 from opentau.configs.refs import resolve_refs_to_tempfile
+from opentau.datasets.dataset_mixture import compute_norm_key
 
 logger = logging.getLogger(__name__)
 
@@ -199,6 +207,23 @@ def parse_args() -> argparse.Namespace:
             "native fps when mixture.action_freq is None (mixed-frequency "
             "mode). Both paths respect the mixture's weights and the same "
             "fps convention."
+        ),
+    )
+    p.add_argument(
+        "--per-head-norm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Normalize each chunk to [-1, 1] using its own "
+            "(robot_type, control_mode) norm head's pooled min/max -- "
+            "matches what the policy does at training time after PR #347. "
+            "Pass --no-per-head-norm to fall back to the legacy global "
+            "aggregate (only correct for single-head mixtures). The "
+            "global path systematically under-spreads each head's "
+            "distribution, so fit-time token-length analysis "
+            "underestimates the actual policy-side truncation rate. "
+            "Only supported on the default (manual sampler) path; "
+            "--use-mixture-dataloader still uses global normalization."
         ),
     )
     p.add_argument(
@@ -392,6 +417,227 @@ def _aggregate_stats_manual(
         n_fail,
     )
     return action_min, action_max, per_dataset
+
+
+def _load_dataset_info_and_stats(
+    item: tuple[int, Any],
+) -> tuple[int, str, dict[str, Any], dict[str, np.ndarray] | None, str | None]:
+    """Worker for per-head aggregation. Returns
+    ``(idx, repo_id, info_after_overrides, stats_or_None, err_or_None)``.
+
+    Loads the same action stats as ``_load_dataset_stats`` and additionally
+    returns ``meta.info`` with ``DatasetConfig.{robot_type,control_mode}``
+    overrides applied (mirrors ``factory._apply_metadata_overrides``), so the
+    caller can derive the per-dataset norm key the same way the training
+    policy does.
+    """
+    idx, cfg = item
+    try:
+        from opentau.datasets.lerobot_dataset import LeRobotDatasetMetadata
+
+        meta = LeRobotDatasetMetadata(cfg.repo_id, root=cfg.root, revision=cfg.revision)
+        info = dict(getattr(meta, "info", {}) or {})
+        if cfg.robot_type is not None:
+            info["robot_type"] = cfg.robot_type
+        if cfg.control_mode is not None:
+            info["control_mode"] = cfg.control_mode
+        key = _resolve_native_action_key(
+            cfg.repo_id,
+            cfg.data_features_name_mapping,
+            available_keys=set(meta.stats or []),
+        )
+        if not meta.stats or key not in meta.stats:
+            return (
+                idx,
+                cfg.repo_id,
+                info,
+                None,
+                f"key {key!r} missing from stats (keys={sorted(meta.stats or [])})",
+            )
+        s = meta.stats[key]
+        return (
+            idx,
+            cfg.repo_id,
+            info,
+            {
+                "min": np.asarray(s["min"], dtype=np.float64).ravel(),
+                "max": np.asarray(s["max"], dtype=np.float64).ravel(),
+            },
+            None,
+        )
+    except Exception as e:  # noqa: BLE001
+        return idx, cfg.repo_id, {}, None, f"{type(e).__name__}: {e}"
+
+
+def _aggregate_stats_per_head(
+    mixture_cfg: DatasetMixtureConfig, action_dim: int, num_workers: int
+) -> tuple[list[np.ndarray], list[np.ndarray], list[str | None]]:
+    """Aggregate per-``(robot_type, control_mode)`` action stats.
+
+    Mirrors what ``DatasetMixtureMetadata._build_norm_heads`` does for the
+    actions stat at training time: each dataset gets the pooled min/max of
+    its norm head, so chunks normalized at fit time match what
+    ``Normalize({"ACTION": NormalizationMode.MIN_MAX})`` produces from the
+    same data at training time. The pooling for min/max is straight
+    ``nanmin``/``nanmax`` across head members -- count-weighted aggregation
+    (which ``aggregate_stats`` does in dataset_mixture) only matters for
+    ``mean``/``std`` and is a no-op for ``min``/``max``.
+
+    Datasets whose ``compute_norm_key`` returns fallback (empty / "unknown"
+    robot_type or control_mode) get their own singleton head, normalized
+    with their own stats -- matching the policy's behaviour for fallback
+    keys. Datasets whose action stats fail to load entirely fall back to
+    ``[-1, 1]`` (same sentinel as the global path); a warning is logged.
+
+    Args:
+        mixture_cfg: Mixture config.
+        action_dim: Padded action dim (chunks are padded to this width
+            before normalization, so the returned ``min``/``max`` arrays
+            are sized ``(action_dim,)``).
+        num_workers: ProcessPool size for parallel stats loading.
+
+    Returns:
+        ``(per_ds_min, per_ds_max, per_ds_key)``:
+
+        - ``per_ds_min[i]``/``per_ds_max[i]``: ``(action_dim,)`` float32
+          arrays for dataset ``i`` (the i-th entry in
+          ``mixture_cfg.datasets``). Datasets sharing a non-fallback
+          ``(robot_type, control_mode)`` get identical pooled arrays.
+        - ``per_ds_key[i]``: the norm key for dataset ``i`` (or ``None``
+          if the dataset's stats failed to load).
+    """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    n = len(mixture_cfg.datasets)
+    raw_min: list[np.ndarray | None] = [None] * n
+    raw_max: list[np.ndarray | None] = [None] * n
+    per_ds_key: list[str | None] = [None] * n
+    n_ok = 0
+    n_fail = 0
+
+    logger.info(
+        "Loading per-(rt, cm) action stats for %d datasets (workers=%d)",
+        n,
+        num_workers,
+    )
+    t0 = time.perf_counter()
+    work = list(enumerate(mixture_cfg.datasets))
+    with ProcessPoolExecutor(max_workers=num_workers) as ex:
+        futs = {ex.submit(_load_dataset_info_and_stats, item): item[0] for item in work}
+        for fut in as_completed(futs):
+            idx, repo_id, info, stats, err = fut.result()
+            if stats is None:
+                n_fail += 1
+                logger.warning("Dataset %d (%s): no stats -- %s", idx, repo_id, err)
+                continue
+            n_ok += 1
+            native_dim = int(stats["min"].shape[0])
+            mn = np.full(action_dim, np.nan, dtype=np.float64)
+            mx = np.full(action_dim, np.nan, dtype=np.float64)
+            clip = min(action_dim, native_dim)
+            mn[:clip] = stats["min"][:clip]
+            mx[:clip] = stats["max"][:clip]
+            raw_min[idx] = mn
+            raw_max[idx] = mx
+            key, _ = compute_norm_key(
+                info.get("robot_type"),
+                info.get("control_mode"),
+                mixture_cfg.datasets[idx].repo_id,
+            )
+            per_ds_key[idx] = key
+
+    per_ds_min, per_ds_max, per_head_min = _pool_per_head_stats(raw_min, raw_max, per_ds_key, action_dim)
+    logger.info(
+        "Per-(rt, cm) stats aggregated in %.1fs: %d heads across %d ok / %d fail datasets.",
+        time.perf_counter() - t0,
+        len(per_head_min),
+        n_ok,
+        n_fail,
+    )
+    return per_ds_min, per_ds_max, per_ds_key
+
+
+def _pool_per_head_stats(
+    raw_min: list[np.ndarray | None],
+    raw_max: list[np.ndarray | None],
+    per_ds_key: list[str | None],
+    action_dim: int,
+) -> tuple[list[np.ndarray], list[np.ndarray], dict[str, np.ndarray]]:
+    """Pure pooling: aggregate per-dataset raw (min, max) into per-head stats,
+    then broadcast back per-dataset so each dataset gets the stats of its
+    head. Datasets whose ``per_ds_key[i]`` is ``None`` or whose raw stats are
+    ``None`` fall back to ``[-1, 1]`` -- the same sentinel the global path
+    uses for the "NaN across the entire mixture" branch. Fallback keys (a
+    dataset's repo_id used in lieu of a real ``(rt, cm)`` pair) are
+    singletons by construction, so they get their own stats verbatim.
+
+    Pooling for ``min``/``max`` is ``nanmin``/``nanmax`` across the head's
+    members; for those two fields ``aggregate_stats``'s count-weighted
+    aggregation reduces to the unweighted nanmin/nanmax (the weights only
+    matter for ``mean``/``std``). NaN dims after pooling -- a dim no member
+    has stats for -- are filled with ``[-1, 1]``.
+
+    Returns ``(per_ds_min, per_ds_max, per_head_min)`` where the third
+    element is the deduplicated per-head ``min`` map (for diagnostics).
+    """
+    n = len(per_ds_key)
+    from collections import defaultdict
+
+    key_to_indices: dict[str, list[int]] = defaultdict(list)
+    for i, k in enumerate(per_ds_key):
+        if k is not None and raw_min[i] is not None:
+            key_to_indices[k].append(i)
+
+    per_head_min: dict[str, np.ndarray] = {}
+    per_head_max: dict[str, np.ndarray] = {}
+    for key, indices in key_to_indices.items():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            mn = np.nanmin(np.stack([raw_min[i] for i in indices]), axis=0)
+            mx = np.nanmax(np.stack([raw_max[i] for i in indices]), axis=0)
+        nan_dims = np.where(~np.isfinite(mn) | ~np.isfinite(mx))[0]
+        if nan_dims.size > 0:
+            mn[nan_dims] = -1.0
+            mx[nan_dims] = 1.0
+        per_head_min[key] = mn
+        per_head_max[key] = mx
+
+    per_ds_min: list[np.ndarray] = []
+    per_ds_max: list[np.ndarray] = []
+    for i in range(n):
+        if per_ds_key[i] is not None and per_ds_key[i] in per_head_min:
+            per_ds_min.append(per_head_min[per_ds_key[i]].astype(np.float32))
+            per_ds_max.append(per_head_max[per_ds_key[i]].astype(np.float32))
+        else:
+            per_ds_min.append(np.full(action_dim, -1.0, dtype=np.float32))
+            per_ds_max.append(np.full(action_dim, 1.0, dtype=np.float32))
+    return per_ds_min, per_ds_max, per_head_min
+
+
+def _normalize_chunks_per_head(
+    stacked: np.ndarray,
+    per_dataset_chunks: list[int],
+    per_ds_min: list[np.ndarray],
+    per_ds_max: list[np.ndarray],
+) -> np.ndarray:
+    """Apply per-dataset min/max to chunks in dataset-config order.
+
+    ``_sample_via_manual`` concatenates per-dataset chunk buckets in
+    mixture-config order, so a cumulative sum over ``per_dataset_chunks``
+    tells us which slice of ``stacked`` belongs to each dataset. Each slice
+    gets normalized with its own ``(min, max)``; datasets that share a norm
+    head get identical stats by construction (see ``_aggregate_stats_per_head``).
+    """
+    out = np.zeros_like(stacked)
+    offset = 0
+    for i, count in enumerate(per_dataset_chunks):
+        if count <= 0:
+            continue
+        out[offset : offset + count] = _normalize_chunks(
+            stacked[offset : offset + count], per_ds_min[i], per_ds_max[i]
+        )
+        offset += count
+    return out
 
 
 def _compute_budgets_weighted(mixture_cfg: DatasetMixtureConfig, total_chunks: int) -> list[int]:
@@ -1016,6 +1262,19 @@ def main() -> int:
     args = parse_args()
     _setup_logging(args.log_level)
 
+    # The --use-mixture-dataloader path uses ``_extract_action_stats(mixture.meta, ...)``
+    # which returns global aggregates; threading per-head normalization through
+    # the dataloader-drained chunks would need per-sample dataset_index from
+    # the batch and isn't done yet. Surface the gap loudly rather than silently
+    # falling back.
+    if args.use_mixture_dataloader and args.per_head_norm:
+        raise ValueError(
+            "--per-head-norm is not yet supported on the --use-mixture-dataloader "
+            "path; pass --no-per-head-norm to use the legacy global normalization, "
+            "or drop --use-mixture-dataloader to use the default manual sampler "
+            "(which does support per-head)."
+        )
+
     out_dir = args.out_dir
     if args.pilot:
         out_dir = out_dir / "pilot"
@@ -1048,6 +1307,9 @@ def main() -> int:
     build_time = 0.0
     sample_errors: dict[int, str] = {}
     per_dataset_chunks: list[int] = [0] * len(mixture_cfg.datasets)
+    action_min: np.ndarray | None = None
+    action_max: np.ndarray | None = None
+    per_ds_norm_keys: list[str | None] | None = None
     if args.use_mixture_dataloader:
         # Slow path: full WeightedDatasetMixture dataloader.
         logger.info(
@@ -1089,11 +1351,18 @@ def main() -> int:
         # Use mixture-computed stats.
         action_min, action_max = _extract_action_stats(mixture.meta, args.action_dim)
     else:
-        # Fast path: aggregate stats manually, sample chunks per-dataset with
-        # scipy interp for FPS resampling.
-        action_min, action_max, _ = _aggregate_stats_manual(mixture_cfg, args.action_dim, args.num_workers)
-        logger.info("Global action_min: %s", np.round(action_min, 3).tolist())
-        logger.info("Global action_max: %s", np.round(action_max, 3).tolist())
+        # Fast path: aggregate stats manually (per-head or global), sample
+        # chunks per-dataset with scipy interp for FPS resampling.
+        if args.per_head_norm:
+            per_ds_min, per_ds_max, per_ds_norm_keys = _aggregate_stats_per_head(
+                mixture_cfg, args.action_dim, args.num_workers
+            )
+        else:
+            action_min, action_max, _ = _aggregate_stats_manual(
+                mixture_cfg, args.action_dim, args.num_workers
+            )
+            logger.info("Global action_min: %s", np.round(action_min, 3).tolist())
+            logger.info("Global action_max: %s", np.round(action_max, 3).tolist())
         t_drain0 = time.perf_counter()
         raw_chunks, per_dataset_chunks, sample_errors = _sample_via_manual(
             mixture_cfg,
@@ -1124,12 +1393,16 @@ def main() -> int:
         for i, c in enumerate(raw_chunks):
             clip = min(c.shape[1], dim)
             stacked[i, :, :clip] = c[:, :clip]
-        all_chunks = _normalize_chunks(stacked, action_min, action_max)
+        if args.per_head_norm:
+            all_chunks = _normalize_chunks_per_head(stacked, per_dataset_chunks, per_ds_min, per_ds_max)
+        else:
+            all_chunks = _normalize_chunks(stacked, action_min, action_max)
         drain_time = time.perf_counter() - t_drain0
         logger.info(
-            "Manual path: %d chunks normalized in %.1fs",
+            "Manual path: %d chunks normalized in %.1fs (norm=%s)",
             all_chunks.shape[0],
             drain_time,
+            "per_head" if args.per_head_norm else "global",
         )
 
     fit_time = 0.0
@@ -1168,10 +1441,15 @@ def main() -> int:
         "dataloader_batch_size": args.dataloader_batch_size,
         "num_workers": args.num_workers,
         "sampler": "mixture_dataloader" if args.use_mixture_dataloader else "manual_parquet_interp",
+        "normalization": "per_robot_type_control_mode" if args.per_head_norm else "global",
         "per_dataset_chunks": per_dataset_chunks,
         "sample_errors": sample_errors,
-        "global_action_min": action_min.tolist(),
-        "global_action_max": action_max.tolist(),
+        "global_action_min": action_min.tolist() if action_min is not None else None,
+        "global_action_max": action_max.tolist() if action_max is not None else None,
+        "per_dataset_norm_keys": per_ds_norm_keys,
+        "n_norm_heads": (
+            len({k for k in per_ds_norm_keys if k is not None}) if per_ds_norm_keys is not None else None
+        ),
         "timings_seconds": {
             "build_mixture": build_time,
             "drain": drain_time,
