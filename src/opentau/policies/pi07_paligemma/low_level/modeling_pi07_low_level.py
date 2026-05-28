@@ -43,6 +43,7 @@ from opentau.policies.pi05.paligemma_with_expert import (
     PaliGemmaWithExpertConfig,
     PaliGemmaWithExpertModel,
 )
+from opentau.policies.pi07.low_level.modeling_pi07_low_level import _global_or_branch_decisions
 from opentau.policies.pi07.video_encoder import SpaceTimeSiglipVideoEncoder
 from opentau.policies.pi07_paligemma.low_level.configuration_pi07_low_level import (
     PI07PaligemmaLowLevelConfig,
@@ -1752,12 +1753,20 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
           all-True per-rank), never per-sample data that can diverge
           across ranks — otherwise DDP with
           ``find_unused_parameters=False`` will deadlock.
+        - ``image``: subgoal image through PaliGemma's image tower. Same
+          skip-and-emit-zeros efficiency win as ``video``, but the
+          ``pad_mask`` here *is* per-sample data (``subgoal_is_pad`` can
+          diverge across ranks), so the run/skip decision is OR-reduced
+          across ranks via :func:`_global_or_branch_decisions` to keep the
+          DDP invariant. The skip is bypassed (tower runs unconditionally)
+          under ``torch.compile`` / ONNX export.
         - ``action``: noisy-action projection (suffix only).
 
         The pad mask is broadcast/expanded so the returned mask matches
         the embedded sequence length: per-sample ``(B,)`` is allowed for
-        ``video`` and is expanded to ``(B, num_video_tokens)``; all other
-        types pass through ``(B, L)`` unchanged.
+        ``video`` (expanded to ``(B, num_video_tokens)``) and ``image``
+        (expanded to ``(B, num_image_tokens)``); all other types pass
+        through ``(B, L)`` unchanged.
         """
         t = item.item_type
         if t == "text":
@@ -1776,16 +1785,50 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         if t == "image":
             # Subgoal images: 4-D (B, C, H, W) in [-1, 1] through the VLM's
             # image tower (byte-identical to embed_video at T=1 on the shared
-            # tower). Run unconditionally so all ranks stay in lockstep — no
-            # data-dependent skip; the per-sample mask zeros padded slots
-            # downstream.
+            # tower). When no sample on ANY rank needs this subgoal, the image
+            # tower is skipped and zeros are emitted instead — a strict
+            # efficiency win (the per-sample mask zeros the slot regardless),
+            # e.g. at inference or whenever every rank's subgoal_is_pad is True.
+            #
+            # The skip is data-dependent: unlike the config-determined video
+            # mask, per-sample subgoal_is_pad can differ across ranks, so each
+            # rank's local ``.any()`` may diverge. Running the tower on some
+            # ranks but not others would desync DDP / FSDP collective counts and
+            # hang at NCCL (CLAUDE.md hard rule 5), so the run/skip decision is
+            # OR-reduced across ranks first via ``_global_or_branch_decisions``
+            # — presence is structurally True here (the image item is in the
+            # prefix on every rank by config), so only the ``.any()`` is
+            # reduced. Under torch.compile / ONNX export the all-reduce and the
+            # Python branch can't be traced (and export must bake in the tower
+            # so the exported graph can encode real subgoals), so run
+            # unconditionally.
             image = item.data
             per_sample_mask = item.pad_mask
             if per_sample_mask.ndim != 1:
                 raise ValueError(
                     f"image pad_mask must be (B,) per-sample; got shape {tuple(per_sample_mask.shape)}."
                 )
-            emb = self.paligemma_with_expert.embed_image(image).to(dtype=_preferred_dtype())
+            dtype = _preferred_dtype()
+            if torch.compiler.is_compiling() or torch.onnx.is_in_onnx_export():
+                run_image_tower = True
+            else:
+                (run_image_tower,) = _global_or_branch_decisions(
+                    presence_locals=(True,),
+                    any_locals=(bool(per_sample_mask.any()),),
+                    field_names=("subgoal_image",),
+                    device=image.device,
+                )
+            if run_image_tower:
+                emb = self.paligemma_with_expert.embed_image(image).to(dtype=dtype)
+            else:
+                pg_text_cfg = self.paligemma_with_expert.config.paligemma_config.text_config
+                emb = torch.zeros(
+                    image.shape[0],
+                    pg_text_cfg.num_image_tokens,
+                    pg_text_cfg.hidden_size,
+                    device=image.device,
+                    dtype=dtype,
+                )
             expanded = per_sample_mask[:, None].expand(emb.shape[0], emb.shape[1])
             return emb, expanded
         if t == "video":
