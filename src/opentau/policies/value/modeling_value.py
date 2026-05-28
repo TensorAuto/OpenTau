@@ -189,10 +189,19 @@ class ValueFunction(PreTrainedPolicy):
             )
             self.config.dataset_names = kept
             self._norm_key_to_index = {name: i for i, name in enumerate(kept)}
-            # Restrict the dataset->norm-row map to the surviving keys; if
-            # the persisted config didn't carry one, fall back to identity.
+            # Truncating to a single row means the surviving row is row 0
+            # (we kept `dataset_names[:1]`), so the surviving dataset->row
+            # entries are exactly those that pointed at 0. Filter the
+            # persisted map down to those.
             persisted = getattr(self.config, "dataset_to_norm_index", None) or {}
-            self._dataset_to_norm_index = {k: v for k, v in persisted.items() if v == 0} or {kept[0]: 0}
+            surviving = {k: v for k, v in persisted.items() if v == 0}
+            # Two distinct cases reach the fallback `{kept[0]: 0}`:
+            #   - persisted map was empty (legacy config without the
+            #     field, or freshly built value policy);
+            #   - persisted map had entries but none pointed at row 0
+            #     (would be a malformed config — defensive).
+            # Both want the identity mapping for the kept name.
+            self._dataset_to_norm_index = surviving or {kept[0]: 0}
         num_datasets = 1
         self.normalize_inputs = Normalize(
             config.input_features,

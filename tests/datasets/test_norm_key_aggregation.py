@@ -71,6 +71,23 @@ class TestComputeNormKey:
         assert key == "franka_arm::joint"
         assert fallback is False
 
+    def test_robot_type_unknown_falls_back(self):
+        # Symmetric with control_mode: `robot_type="unknown"` is the
+        # common stand-in for missing info.json["robot_type"] and must
+        # not silently anchor an "unknown::<mode>" shared head.
+        key, fallback = compute_norm_key("unknown", "joint", "foo/bar")
+        assert key == "foo/bar"
+        assert fallback is True
+
+    def test_unknown_is_case_insensitive(self):
+        for variant in ("Unknown", "UNKNOWN", "uNkNoWn"):
+            key, fallback = compute_norm_key("franka", variant, "foo/bar")
+            assert key == "foo/bar"
+            assert fallback is True
+            key, fallback = compute_norm_key(variant, "joint", "foo/bar")
+            assert key == "foo/bar"
+            assert fallback is True
+
 
 # -- DatasetMixtureMetadata fixtures ---------------------------------------
 
@@ -270,6 +287,75 @@ class TestDatasetMixtureMetadataNormAggregation:
         # min/max are the global element-wise min/max.
         np.testing.assert_allclose(head["state"]["min"][0], m1_val - 5.0, atol=1e-6)
         np.testing.assert_allclose(head["state"]["max"][0], m2_val + 5.0, atol=1e-6)
+
+    def test_pooled_stats_closed_form_three_datasets(self):
+        """3-dataset pooling with mismatched per-dataset counts. Catches
+        any off-by-one in the weights-wiring path that 2-dataset cases
+        would not expose (e.g. dropping a dataset's contribution silently).
+        """
+        _patch_name_mapping(["repo/a", "repo/b", "repo/c"])
+        cfg = _make_cfg(max_state_dim=4, max_action_dim=4)
+        # Mismatched counts on purpose so the weighted pool is sensitive
+        # to each contributor's weight; means / stds are also distinct.
+        params = [
+            {"n": 100, "mean": 0.0, "std": 0.25},
+            {"n": 250, "mean": 4.0, "std": 0.5},
+            {"n": 650, "mean": -1.0, "std": 1.5},
+        ]
+
+        def stats_for(mean: float, std: float, n: int) -> dict:
+            return {
+                "state": {
+                    "mean": np.full((4,), mean, dtype=np.float32),
+                    "std": np.full((4,), std, dtype=np.float32),
+                    "min": np.full((4,), mean - 5.0, dtype=np.float32),
+                    "max": np.full((4,), mean + 5.0, dtype=np.float32),
+                    "count": np.array([n], dtype=np.int64),
+                },
+                "actions": {
+                    "mean": np.full((4,), mean, dtype=np.float32),
+                    "std": np.full((4,), std, dtype=np.float32),
+                    "min": np.full((4,), mean - 5.0, dtype=np.float32),
+                    "max": np.full((4,), mean + 5.0, dtype=np.float32),
+                    "count": np.array([n], dtype=np.int64),
+                },
+                "camera0": {
+                    "mean": np.full((3, 1, 1), mean * 0.01, dtype=np.float32),
+                    "std": np.full((3, 1, 1), std, dtype=np.float32),
+                    "min": np.zeros((3, 1, 1), dtype=np.float32),
+                    "max": np.ones((3, 1, 1), dtype=np.float32),
+                    "count": np.array([n], dtype=np.int64),
+                },
+            }
+
+        metadatas = [
+            _make_metadata(
+                f"repo/{name}",
+                info={
+                    "robot_type": "franka",
+                    "control_mode": "joint",
+                    "total_frames": p["n"],
+                },
+                stats=stats_for(p["mean"], p["std"], p["n"]),
+            )
+            for name, p in zip("abc", params, strict=True)
+        ]
+        meta = DatasetMixtureMetadata(
+            cfg,
+            metadatas,
+            dataset_weights=[1 / 3, 1 / 3, 1 / 3],
+            dataset_names=["repo/a", "repo/b", "repo/c"],
+        )
+        assert meta.norm_keys == ["franka::joint"]
+        head = meta.per_norm_key_stats[0]
+
+        n_total = sum(p["n"] for p in params)
+        expected_mean = sum(p["n"] * p["mean"] for p in params) / n_total
+        expected_var = (
+            sum(p["n"] * (p["std"] ** 2 + (p["mean"] - expected_mean) ** 2) for p in params) / n_total
+        )
+        np.testing.assert_allclose(head["state"]["mean"][0], expected_mean, atol=1e-5)
+        np.testing.assert_allclose(head["state"]["std"][0], np.sqrt(expected_var), atol=1e-5)
 
     def test_norm_head_summary_logged(self, caplog):
         _patch_name_mapping(["repo/a", "repo/b", "repo/c"])

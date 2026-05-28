@@ -155,13 +155,17 @@ def pad_vector(vector: np.ndarray, new_dim: int) -> np.ndarray:
     return new_vector
 
 
-# Values that mean "no usable label" when resolving the
-# (robot_type, control_mode) norm key:
+# Case-insensitive sentinels that mean "no usable label" when resolving
+# the (robot_type, control_mode) norm key:
 #   - None: field absent from info.json.
 #   - "" / whitespace-only: explicit clear via `DatasetConfig.{robot_type,control_mode}=""`.
-#   - "unknown": the `LeRobotDatasetMetadata.control_mode` default for
-#     missing `info.json` field — not an explicit user-supplied tag.
-_NORM_KEY_MISSING_CONTROL_MODES: frozenset[str] = frozenset({"unknown"})
+#   - "unknown" (any casing): the `LeRobotDatasetMetadata.control_mode`
+#     default for missing `info.json["control_mode"]`, and a common stand-in
+#     for missing `info.json["robot_type"]` — not an explicit user-supplied tag.
+# Both fields share the same sentinel set so a dataset labeled
+# `robot_type="unknown"` doesn't silently anchor a `"unknown::<mode>"` head
+# that pools across unrelated embodiments.
+_NORM_KEY_MISSING_VALUES: frozenset[str] = frozenset({"unknown"})
 
 
 def compute_norm_key(
@@ -176,6 +180,12 @@ def compute_norm_key(
     name so the dataset still gets a head — it just won't share one with
     anything else.
 
+    A value is treated as missing when it is `None`, empty after
+    `strip()`, or matches `"unknown"` case-insensitively (the sentinel
+    that `LeRobotDatasetMetadata.control_mode` returns when
+    `info.json["control_mode"]` is absent — and the typical stand-in for
+    missing `robot_type`).
+
     Args:
         robot_type: From `meta.info["robot_type"]` (after overrides).
         control_mode: From `meta.info["control_mode"]` (after overrides).
@@ -184,13 +194,15 @@ def compute_norm_key(
 
     Returns:
         A `(norm_key, fallback_fired)` pair. `norm_key` is
-        `"<robot_type>::<control_mode>"` on the happy path and
-        `fallback_name` otherwise; `fallback_fired` is True iff the
-        fallback path was taken.
+        `"<robot_type>::<control_mode>"` (preserving the original casing
+        of each tag) on the happy path and `fallback_name` otherwise;
+        `fallback_fired` is True iff the fallback path was taken.
     """
     rt = (robot_type or "").strip()
     cm = (control_mode or "").strip()
-    if not rt or not cm or cm in _NORM_KEY_MISSING_CONTROL_MODES:
+    if not rt or not cm:
+        return fallback_name, True
+    if rt.casefold() in _NORM_KEY_MISSING_VALUES or cm.casefold() in _NORM_KEY_MISSING_VALUES:
         return fallback_name, True
     return f"{rt}::{cm}", False
 

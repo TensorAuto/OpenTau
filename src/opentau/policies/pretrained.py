@@ -374,20 +374,23 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
            from those keys would silently route random samples to wrong
            heads.
 
-        2. **Inference by repo id.** ``batch["dataset_repo_id"]`` (a
-           single ``str`` or ``list[str]`` of length B) is mapped through
-           ``self._dataset_to_norm_index`` (training-time dataset name →
-           norm-head row). Works on legacy checkpoints too because the
-           policy synthesizes the identity mapping when the persisted
-           ``dataset_to_norm_index`` is ``None``.
-
-        3. **Inference by (robot_type, control_mode).** Both
+        2. **Inference by (robot_type, control_mode).** Both
            ``batch["robot_type"]`` and ``batch["control_mode"]`` are
            ``list[str]`` of length B (or single strings). Each sample's
            norm key is computed via :func:`~opentau.datasets.dataset_mixture.compute_norm_key`
            with an empty fallback name (so a missing pair raises rather
            than silently picking the wrong row) and looked up in
-           ``self._norm_key_to_index``.
+           ``self._norm_key_to_index``. Checked before ``dataset_repo_id``
+           so the "precedence when both are present" invariant documented
+           on ``EvalConfig`` / ``ServerConfig`` holds even for callers
+           that bypass the eval / gRPC scripts.
+
+        3. **Inference by repo id.** ``batch["dataset_repo_id"]`` (a
+           single ``str`` or ``list[str]`` of length B) is mapped through
+           ``self._dataset_to_norm_index`` (training-time dataset name →
+           norm-head row). Works on legacy checkpoints too because the
+           policy synthesizes the identity mapping when the persisted
+           ``dataset_to_norm_index`` is ``None``.
 
         4. **Single-row fallback.** When the batch lacks all of the above
            AND the buffer has at most one row, default to zeros. Lets
@@ -417,25 +420,6 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
             # is unambiguous and matches where Normalize's buffers actually
             # live.
             return idx.to(dtype=torch.long, device=self._model_device())
-
-        if "dataset_repo_id" in batch:
-            if self._dataset_to_norm_index is None:
-                raise RuntimeError(
-                    "Policy was loaded without `dataset_names`; cannot resolve "
-                    "`dataset_repo_id` strings. Either pass `batch['dataset_index']` "
-                    "directly or rebuild the policy via `make_policy(cfg, ds_meta=...)`."
-                )
-            raw = batch["dataset_repo_id"]
-            batch_size, device = self._infer_batch_size_and_device(batch)
-            names = [raw] * (batch_size or 1) if isinstance(raw, str) else list(raw)
-            try:
-                indices = [self._dataset_to_norm_index[n] for n in names]
-            except KeyError as e:
-                raise ValueError(
-                    f"dataset_repo_id {e.args[0]!r} not in this policy's "
-                    f"training set {list(self._dataset_to_norm_index)}"
-                ) from None
-            return torch.tensor(indices, dtype=torch.long, device=device)
 
         if "robot_type" in batch and "control_mode" in batch:
             if self._norm_key_to_index is None:
@@ -472,6 +456,25 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                     f"norm key {e.args[0]!r} (derived from `(robot_type, "
                     "control_mode)`) not in this policy's training set "
                     f"{list(self._norm_key_to_index)}"
+                ) from None
+            return torch.tensor(indices, dtype=torch.long, device=device)
+
+        if "dataset_repo_id" in batch:
+            if self._dataset_to_norm_index is None:
+                raise RuntimeError(
+                    "Policy was loaded without `dataset_names`; cannot resolve "
+                    "`dataset_repo_id` strings. Either pass `batch['dataset_index']` "
+                    "directly or rebuild the policy via `make_policy(cfg, ds_meta=...)`."
+                )
+            raw = batch["dataset_repo_id"]
+            batch_size, device = self._infer_batch_size_and_device(batch)
+            names = [raw] * (batch_size or 1) if isinstance(raw, str) else list(raw)
+            try:
+                indices = [self._dataset_to_norm_index[n] for n in names]
+            except KeyError as e:
+                raise ValueError(
+                    f"dataset_repo_id {e.args[0]!r} not in this policy's "
+                    f"training set {list(self._dataset_to_norm_index)}"
                 ) from None
             return torch.tensor(indices, dtype=torch.long, device=device)
 

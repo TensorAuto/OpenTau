@@ -328,6 +328,28 @@ class TestResolveDatasetIndex:
         )
         assert torch.equal(idx.cpu(), torch.tensor([1, 0], dtype=torch.long))
 
+    def test_robot_type_control_mode_takes_precedence_over_dataset_repo_id(self):
+        """When both inference keys are supplied (e.g. by a caller that
+        bypasses the eval / gRPC scripts and hands-builds a batch),
+        `(robot_type, control_mode)` wins — matches the precedence
+        documented on `EvalConfig` / `ServerConfig`."""
+        policy = _make_policy_with_normalize(
+            ["franka::joint", "ur5::ee"],
+            # Crafted so the two routes resolve to different rows: the
+            # repo_id would say row 0, the (robot, control) pair says row 1.
+            {"franka_repo": 0, "ur5_repo": 1},
+            num_rows=2,
+        )
+        idx = policy._resolve_dataset_index(
+            {
+                "dataset_repo_id": ["franka_repo"],
+                "robot_type": ["ur5"],
+                "control_mode": ["ee"],
+                "observation.state": torch.zeros(1, 2),
+            }
+        )
+        assert torch.equal(idx.cpu(), torch.tensor([1], dtype=torch.long))
+
     def test_multirow_unidentified_batch_raises(self):
         policy = _make_policy_with_normalize(
             ["franka::joint", "ur5::ee"],
