@@ -215,44 +215,67 @@ def make_policy(
     policy_cls = get_policy_class(cfg.type)
 
     kwargs = {}
-    per_dataset_stats: list[dict[str, dict[str, np.ndarray]]] | None = None
-    dataset_names: list[str] | None = None
+    # Per-NORM-HEAD stats; one entry per row of the policy's stacked
+    # Normalize/Unnormalize buffer. Built from the mixture's pooled
+    # `(robot_type, control_mode)` aggregation when available, else from a
+    # single dataset, else from caller-supplied opaque stats.
+    per_norm_key_stats: list[dict[str, dict[str, np.ndarray]]] | None = None
+    norm_keys: list[str] | None = None
+    dataset_to_norm_index: dict[str, int] | None = None
 
     if ds_meta is not None:
         features = dataset_to_policy_features(ds_meta.features)
-        # `DatasetMixtureMetadata` exposes per-dataset stats + names; a bare
-        # `LeRobotDatasetMetadata` (single-dataset path, e.g. some scripts /
-        # tests) exposes only `.stats` — wrap it into a singleton list so the
-        # policy ctor sees a uniform shape.
-        if hasattr(ds_meta, "per_dataset_stats") and hasattr(ds_meta, "dataset_names"):
-            per_dataset_stats = list(ds_meta.per_dataset_stats)
-            dataset_names = list(ds_meta.dataset_names)
+        # `DatasetMixtureMetadata` (new attrs) provides per-norm-head stats
+        # already pooled across datasets sharing a (robot_type, control_mode).
+        # A bare `LeRobotDatasetMetadata` exposes only `.stats`; treat it as
+        # a singleton head, deriving the key from its info.
+        if hasattr(ds_meta, "per_norm_key_stats") and hasattr(ds_meta, "norm_keys"):
+            per_norm_key_stats = list(ds_meta.per_norm_key_stats)
+            norm_keys = list(ds_meta.norm_keys)
+            dataset_to_norm_index = dict(ds_meta.dataset_to_norm_index)
         else:
-            per_dataset_stats = [ds_meta.stats]
-            dataset_names = [getattr(ds_meta, "repo_id", "default")]
+            # Inline import keeps `make_policy` from pulling
+            # `dataset_mixture` (and transitively LeRobot) at module load.
+            from opentau.datasets.dataset_mixture import compute_norm_key
+
+            repo_id = getattr(ds_meta, "repo_id", "default")
+            info = getattr(ds_meta, "info", {}) or {}
+            norm_key, _ = compute_norm_key(info.get("robot_type"), info.get("control_mode"), repo_id)
+            per_norm_key_stats = [ds_meta.stats]
+            norm_keys = [norm_key]
+            dataset_to_norm_index = {repo_id: 0}
 
     if not features_already_set:
         cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
         cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
 
     if stats is not None:
-        # External per-dataset stats override. Accept either a single
-        # dict-of-features (wrapped into a singleton list) or an already-
-        # listed `per_dataset_stats`.
+        # External opaque stats override. Accept either a single
+        # dict-of-features (wrapped into a singleton list) or an
+        # already-listed per-norm-head sequence. We leave `dataset_to_norm_index`
+        # as None here — the caller passed stats without identity context,
+        # so we can't synthesize a dataset_repo_id -> row mapping; inference
+        # must use `dataset_index` or `dataset_names` directly.
         if isinstance(stats, dict):
-            per_dataset_stats = [stats]
-            dataset_names = dataset_names or ["external"]
+            per_norm_key_stats = [stats]
+            norm_keys = norm_keys or ["external"]
         else:
-            per_dataset_stats = list(stats)
-            dataset_names = dataset_names or [f"external_{i}" for i in range(len(per_dataset_stats))]
+            per_norm_key_stats = list(stats)
+            norm_keys = norm_keys or [f"external_{i}" for i in range(len(per_norm_key_stats))]
 
-    if per_dataset_stats is not None:
-        kwargs["per_dataset_stats"] = per_dataset_stats
-        kwargs["dataset_names"] = dataset_names
-        # Persist the ordered name list into the policy config so it survives
-        # save -> load. Inference-time `batch["dataset_repo_id"]` strings are
-        # resolved against this list.
-        cfg.dataset_names = list(dataset_names)
+    if per_norm_key_stats is not None:
+        # The Normalize / Unnormalize kwargs are named `per_dataset_stats` /
+        # `dataset_names` for back-compat — the values are now per-norm-head.
+        kwargs["per_dataset_stats"] = per_norm_key_stats
+        kwargs["dataset_names"] = norm_keys
+        # Persist into the policy config so the checkpoint round-trip
+        # preserves identity:
+        #   - `dataset_names` = the norm-head identifiers (one per buffer row)
+        #   - `dataset_to_norm_index` = training dataset name -> row, so
+        #     inference can resolve a `dataset_repo_id` even when multiple
+        #     datasets share a head.
+        cfg.dataset_names = list(norm_keys)
+        cfg.dataset_to_norm_index = dict(dataset_to_norm_index) if dataset_to_norm_index is not None else None
 
     if execution_target is not None:
         kwargs["execution_target"] = execution_target
@@ -274,8 +297,8 @@ def make_policy(
     # buffers loaded back as +inf — repopulate from the caller's stats if we
     # have them, otherwise raise a clear error rather than letting the first
     # forward fail mid-step.
-    if cfg.pretrained_path and per_dataset_stats is not None:
-        policy._inject_stats(per_dataset_stats, dataset_names=dataset_names)
+    if cfg.pretrained_path and per_norm_key_stats is not None:
+        policy._inject_stats(per_norm_key_stats, dataset_names=norm_keys)
     elif cfg.pretrained_path:
         policy._check_norm_stats_loaded()
 

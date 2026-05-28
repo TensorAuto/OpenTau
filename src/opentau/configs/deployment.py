@@ -50,13 +50,19 @@ class ServerConfig:
     max_workers: int = 4
     max_send_message_length_mb: int = 100
     max_receive_message_length_mb: int = 100
-    # Which training-time dataset's normalization stats to use for inference
-    # requests. ``None`` (default) falls through to the policy's
-    # `_resolve_dataset_index` single-dataset fallback (works for any
-    # checkpoint trained on exactly one dataset). Set this to one of the
-    # strings in `policy.config.dataset_names` when serving a multi-dataset
-    # checkpoint, otherwise the inference call will raise `KeyError`.
+    # Which training-time norm head to use for inference requests. Either:
+    #   - set both `robot_type` and `control_mode` to address the head by
+    #     `(robot_type, control_mode)` (preferred for multi-head checkpoints),
+    #   - or set `dataset_repo_id` to a training-time dataset name (the
+    #     policy maps it via its persisted `dataset_to_norm_index`;
+    #     back-compat path that also works on legacy per-dataset checkpoints).
+    # When all three are ``None`` (default), single-head policies fall back
+    # to the `_resolve_dataset_index` zero-default; multi-head ones raise.
+    # The robot_type / control_mode pair takes precedence over
+    # `dataset_repo_id` when both are set.
     dataset_repo_id: str | None = None
+    robot_type: str | None = None
+    control_mode: str | None = None
 
     def __post_init__(self):
         """Validate server configuration parameters."""

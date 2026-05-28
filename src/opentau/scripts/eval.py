@@ -164,13 +164,19 @@ def rollout(
         if return_observations:
             all_observations.append(deepcopy(observation))
 
-        # Tag the observation with which training-time dataset's stats to
-        # use for per-sample Normalize/Unnormalize. `EvalConfig.dataset_repo_id`
-        # is `None` by default, in which case the policy's
-        # `_resolve_dataset_index` single-dataset fallback handles things —
-        # required only for multi-dataset checkpoints.
+        # Tag the observation with the training-time norm head to use for
+        # per-sample Normalize/Unnormalize. Prefer the
+        # `(robot_type, control_mode)` pair when both are configured (new
+        # per-`(robot_type, control_mode)` aggregation route); else use
+        # `dataset_repo_id`. When all are `None` (default), the policy's
+        # `_resolve_dataset_index` single-head fallback handles things.
+        eval_robot_type = getattr(cfg.eval, "robot_type", None)
+        eval_control_mode = getattr(cfg.eval, "control_mode", None)
         eval_dataset_repo_id = getattr(cfg.eval, "dataset_repo_id", None)
-        if eval_dataset_repo_id is not None:
+        if eval_robot_type is not None and eval_control_mode is not None:
+            observation["robot_type"] = eval_robot_type
+            observation["control_mode"] = eval_control_mode
+        elif eval_dataset_repo_id is not None:
             observation["dataset_repo_id"] = eval_dataset_repo_id
 
         with torch.inference_mode():

@@ -81,7 +81,7 @@ from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAP
 
 
 class _TaggedDataset(Dataset):
-    """Wraps a ``BaseDataset`` so every sample carries its mixture-level identity.
+    """Wraps a ``BaseDataset`` so every sample carries its norm-head identity.
 
     The wrapped sample dict gains two keys:
 
@@ -89,12 +89,20 @@ class _TaggedDataset(Dataset):
         (matches an entry in ``DatasetMixtureMetadata.dataset_names``).
         Default PyTorch collate batches a per-sample ``str`` into a
         ``list[str]`` of length B.
-      - ``"dataset_index"``: ``torch.long`` scalar — the position of this
-        dataset in ``DatasetMixtureMetadata.dataset_names``. Default collate
-        stacks into a ``(B,)`` long tensor.
+      - ``"dataset_index"``: ``torch.long`` scalar — the policy's
+        **norm-head row** for this dataset (i.e.
+        ``DatasetMixtureMetadata.dataset_to_norm_index[dataset_repo_id]``).
+        Default collate stacks into a ``(B,)`` long tensor. Note: the field
+        name is retained for back-compat, but the value indexes the
+        norm-head axis, not the per-dataset enumerate axis — two datasets
+        sharing a ``(robot_type, control_mode)`` get the same value here.
 
     Policies read either key via ``PreTrainedPolicy._resolve_dataset_index``
     and route per-sample into the stacked Normalize/Unnormalize buffers.
+    The training path always uses ``dataset_index`` (immune to the
+    optional-key dropout that ``robot_type`` / ``control_mode`` undergo);
+    inference can additionally supply ``dataset_repo_id`` or
+    ``(robot_type, control_mode)``.
 
     The wrapper exposes the underlying dataset's ``.meta`` so callers of
     ``WeightedDatasetMixture`` (e.g. metadata validation, per-dataset val
@@ -147,6 +155,46 @@ def pad_vector(vector: np.ndarray, new_dim: int) -> np.ndarray:
     return new_vector
 
 
+# Values that mean "no usable label" when resolving the
+# (robot_type, control_mode) norm key:
+#   - None: field absent from info.json.
+#   - "" / whitespace-only: explicit clear via `DatasetConfig.{robot_type,control_mode}=""`.
+#   - "unknown": the `LeRobotDatasetMetadata.control_mode` default for
+#     missing `info.json` field — not an explicit user-supplied tag.
+_NORM_KEY_MISSING_CONTROL_MODES: frozenset[str] = frozenset({"unknown"})
+
+
+def compute_norm_key(
+    robot_type: str | None, control_mode: str | None, fallback_name: str
+) -> tuple[str, bool]:
+    """Compute the normalization-head key for a dataset.
+
+    Datasets that share the same `(robot_type, control_mode)` are
+    expected to share normalization stats because they share the units,
+    axis count, and physical ranges of the proprio / action vectors.
+    When either tag is missing, fall back to keying by the dataset's own
+    name so the dataset still gets a head — it just won't share one with
+    anything else.
+
+    Args:
+        robot_type: From `meta.info["robot_type"]` (after overrides).
+        control_mode: From `meta.info["control_mode"]` (after overrides).
+        fallback_name: The dataset's deduplicated mixture-level name,
+            used as the head key when fallback fires.
+
+    Returns:
+        A `(norm_key, fallback_fired)` pair. `norm_key` is
+        `"<robot_type>::<control_mode>"` on the happy path and
+        `fallback_name` otherwise; `fallback_fired` is True iff the
+        fallback path was taken.
+    """
+    rt = (robot_type or "").strip()
+    cm = (control_mode or "").strip()
+    if not rt or not cm or cm in _NORM_KEY_MISSING_CONTROL_MODES:
+        return fallback_name, True
+    return f"{rt}::{cm}", False
+
+
 def _apply_data_feature_name_mapping_overrides(
     worker_id: int, mapping_overrides: dict[str, dict[str, str]]
 ) -> None:
@@ -160,23 +208,43 @@ def _apply_data_feature_name_mapping_overrides(
 
 
 class DatasetMixtureMetadata:
-    """Per-dataset metadata for a mixture (no cross-dataset stat aggregation).
+    """Per-(robot_type, control_mode) normalization metadata for a mixture.
 
     Each underlying dataset's stats are normalised into the standard data
     format (feature renaming, state/action padding to ``cfg.max_state_dim`` /
-    ``cfg.max_action_dim``, missing-camera zero placeholders) and kept
-    *separate* on ``self.per_dataset_stats``. The policy's Normalize /
-    Unnormalize layers stack these along a new leading dim and use a
-    per-sample ``dataset_index`` to select the right row.
+    ``cfg.max_action_dim``, missing-camera zero placeholders). Datasets
+    sharing the same ``(robot_type, control_mode)`` are then grouped into a
+    single **norm head** whose stats are sample-count-pooled via
+    :func:`~opentau.datasets.compute_stats.aggregate_stats`. The policy's
+    ``Normalize`` / ``Unnormalize`` layers stack one row per norm head and
+    use a per-sample index (chosen via ``dataset_to_norm_index``) to select
+    the right row.
+
+    Datasets whose ``(robot_type, control_mode)`` pair is missing — empty,
+    ``None``, whitespace, or the ``"unknown"`` sentinel — fall back to
+    keying by the dataset's own deduplicated mixture name, giving them a
+    private head. See :func:`compute_norm_key`.
 
     Attributes:
-        per_dataset_stats: ``list[dict[str, dict[str, np.ndarray]]]`` ordered
-            to match ``dataset_names``. ``per_dataset_stats[i]`` is the
-            standardised stats dict for dataset ``dataset_names[i]``.
+        per_dataset_stats: One entry per underlying dataset, parallel to
+            ``dataset_names``. Used by ``aggregated_action_stats()`` and
+            kept for diagnostic / back-compat consumers.
         dataset_names: Ordered deduplicated mixture-level names (matches
             ``WeightedDatasetMixture._make_dataset_names`` output).
-        dataset_name_to_index: ``{name: i}`` reverse lookup for O(1)
-            inference-time resolution.
+        dataset_name_to_index: ``{name: i}`` reverse lookup over
+            ``dataset_names`` (per-dataset axis, NOT the norm-head axis).
+        per_norm_key_stats: One entry per unique norm head, parallel to
+            ``norm_keys``. This is what the policy's stacked
+            Normalize / Unnormalize buffers consume.
+        norm_keys: Ordered deduplicated norm-head identifiers
+            (``"<robot_type>::<control_mode>"`` or fallback dataset name).
+        norm_key_to_index: ``{norm_key: row}`` reverse lookup over
+            ``norm_keys`` — the norm-head axis on the policy.
+        dataset_to_norm_index: ``{dataset_name: norm_head_row}`` —
+            the per-sample mapping consumed by ``_TaggedDataset`` at
+            training time and by the policy at inference.
+        norm_key_to_dataset_names: ``{norm_key: [dataset_name, ...]}`` —
+            operator diagnostic showing which datasets share each head.
     """
 
     def __init__(
@@ -189,12 +257,27 @@ class DatasetMixtureMetadata:
         self.cfg = cfg
         self._dataset_weights = list(dataset_weights)
 
+        # Snapshot raw state / action dims BEFORE `_to_standard_data_format`
+        # pads the standardized stats. Used to surface incompatible-dim
+        # configurations (two datasets sharing a (robot_type, control_mode)
+        # but with mismatched proprio / action widths). Done up front because
+        # the standardize loop below clobbers `metadata.stats`.
+        raw_dims: list[tuple[int, int]] = []
+        for m in metadatas:
+            name_map = DATA_FEATURES_NAME_MAPPING[m.repo_id]
+            raw_dims.append(
+                (
+                    int(m.stats[name_map["state"]]["mean"].shape[-1]),
+                    int(m.stats[name_map["actions"]]["mean"].shape[-1]),
+                )
+            )
+
         # convert each metadata stats to the standard data format
         for metadata in metadatas:
             metadata.stats = self._to_standard_data_format(metadata.repo_id, metadata.stats)
 
-        # Per-dataset stats (no cross-dataset aggregation). Policies stack
-        # these along a leading axis and index per-sample.
+        # Per-dataset stats kept for diagnostic / back-compat consumers
+        # (e.g. `aggregated_action_stats` for the BPE codec).
         self.per_dataset_stats: list[dict[str, dict[str, np.ndarray]]] = [m.stats for m in metadatas]
 
         # Names default to repo_id when WeightedDatasetMixture didn't supply
@@ -214,6 +297,137 @@ class DatasetMixtureMetadata:
             )
         self.dataset_names: list[str] = list(dataset_names)
         self.dataset_name_to_index: dict[str, int] = {n: i for i, n in enumerate(self.dataset_names)}
+
+        # Compute per-dataset norm keys and group into norm heads.
+        (
+            self.norm_keys,
+            self.per_norm_key_stats,
+            self.norm_key_to_index,
+            self.dataset_to_norm_index,
+            self.norm_key_to_dataset_names,
+        ) = self._build_norm_heads(metadatas, raw_dims)
+
+    def _build_norm_heads(
+        self,
+        metadatas: List[DatasetMetadata],
+        raw_dims: list[tuple[int, int]],
+    ) -> tuple[
+        list[str],
+        list[dict[str, dict[str, np.ndarray]]],
+        dict[str, int],
+        dict[str, int],
+        dict[str, list[str]],
+    ]:
+        """Aggregate per-dataset stats into per-(robot_type, control_mode) heads.
+
+        See the class docstring for the full contract on the returned
+        structures.
+        """
+        per_dataset_norm_keys: list[str] = []
+        fallback_dataset_names: list[str] = []
+        for ds_name, meta in zip(self.dataset_names, metadatas, strict=True):
+            info = getattr(meta, "info", {}) or {}
+            key, fallback_fired = compute_norm_key(info.get("robot_type"), info.get("control_mode"), ds_name)
+            per_dataset_norm_keys.append(key)
+            if fallback_fired:
+                fallback_dataset_names.append(ds_name)
+
+        # Insertion-order-preserving dedup; one head per unique key.
+        norm_keys: list[str] = list(dict.fromkeys(per_dataset_norm_keys))
+        norm_key_to_index: dict[str, int] = {k: i for i, k in enumerate(norm_keys)}
+        dataset_to_norm_index: dict[str, int] = {
+            ds_name: norm_key_to_index[k]
+            for ds_name, k in zip(self.dataset_names, per_dataset_norm_keys, strict=True)
+        }
+        norm_key_to_dataset_names: dict[str, list[str]] = {k: [] for k in norm_keys}
+        for ds_name, k in zip(self.dataset_names, per_dataset_norm_keys, strict=True):
+            norm_key_to_dataset_names[k].append(ds_name)
+
+        # Dimensional incompatibility check: two datasets sharing a
+        # non-fallback (robot_type, control_mode) pair MUST have the same
+        # raw state and action widths. Fallback-keyed groups are singletons
+        # by construction (each fallback dataset is its own norm key) so
+        # they cannot trip this check.
+        for k in norm_keys:
+            member_indices = [i for i, dnk in enumerate(per_dataset_norm_keys) if dnk == k]
+            if len(member_indices) <= 1:
+                continue
+            # Fallback rows are singletons (a fallback key == the unique
+            # dataset name), so a key with >1 member is necessarily a real
+            # (robot_type, control_mode) pair.
+            unique_dims = {raw_dims[i] for i in member_indices}
+            if len(unique_dims) > 1:
+                offenders = [
+                    f"{self.dataset_names[i]} (state_dim={raw_dims[i][0]}, action_dim={raw_dims[i][1]})"
+                    for i in member_indices
+                ]
+                raise ValueError(
+                    f"Datasets sharing norm key {k!r} have incompatible raw "
+                    "(pre-padding) state/action dims, so their normalization "
+                    "stats cannot be pooled. Override `DatasetConfig.robot_type` "
+                    "or `DatasetConfig.control_mode` to split them into "
+                    f"distinct heads. Offenders: {offenders}"
+                )
+
+        # Per-norm-head stats. Singletons reuse the dataset's standardized
+        # stats verbatim; multi-member groups go through
+        # `aggregate_stats` weighted by each contributor's `info["total_frames"]`
+        # (true sample-count pooling — passing `weights=` replaces the
+        # internal `count` field, so we use total_frames rather than the
+        # mixture sampling weights, which would conflate distributional
+        # pooling with training-time prevalence).
+        per_norm_key_stats: list[dict[str, dict[str, np.ndarray]]] = []
+        for k in norm_keys:
+            member_indices = [i for i, dnk in enumerate(per_dataset_norm_keys) if dnk == k]
+            if len(member_indices) == 1:
+                per_norm_key_stats.append(self.per_dataset_stats[member_indices[0]])
+                continue
+            member_stats = [self.per_dataset_stats[i] for i in member_indices]
+            member_weights = [
+                float(getattr(metadatas[i], "info", {}).get("total_frames", 1) or 1) for i in member_indices
+            ]
+            per_norm_key_stats.append(aggregate_stats(member_stats, weights=member_weights))
+
+        # One aggregated warning for fallback datasets, capped at 10 names
+        # so a 30-dataset mixture without tags doesn't spam the log.
+        if fallback_dataset_names:
+            shown = fallback_dataset_names[:10]
+            suffix = (
+                f", ... and {len(fallback_dataset_names) - 10} more"
+                if len(fallback_dataset_names) > 10
+                else ""
+            )
+            logging.warning(
+                "DatasetMixtureMetadata: %d dataset(s) lack a usable "
+                "(robot_type, control_mode) pair; falling back to "
+                "dataset-name keying for their normalization heads. "
+                "Set DatasetConfig.robot_type / control_mode (or fix "
+                "info.json) to enable cross-dataset stat sharing. "
+                "Fallback datasets: %s%s",
+                len(fallback_dataset_names),
+                shown,
+                suffix,
+            )
+
+        # Operator diagnostic: log {norm_key: [dataset_repo_ids]} so the
+        # train log shows exactly which datasets share each head.
+        summary_lines = [
+            f"Norm-head aggregation: {len(norm_keys)} heads over {len(self.dataset_names)} datasets."
+        ]
+        for k in sorted(norm_keys):
+            ds_list = norm_key_to_dataset_names[k]
+            shown_ds = ds_list[:10]
+            ds_suffix = f", ... and {len(ds_list) - 10} more" if len(ds_list) > 10 else ""
+            summary_lines.append(f"  - {k}: {shown_ds}{ds_suffix}")
+        logging.info("\n".join(summary_lines))
+
+        return (
+            norm_keys,
+            per_norm_key_stats,
+            norm_key_to_index,
+            dataset_to_norm_index,
+            norm_key_to_dataset_names,
+        )
 
     def aggregated_action_stats(self) -> dict[str, np.ndarray]:
         """Single mixture-wide action stats (mean/std/min/max/count).
@@ -497,14 +711,25 @@ class WeightedDatasetMixture:
         if not all(hasattr(ds, "meta") and ds.meta is not None for ds in datasets):
             raise ValueError("All datasets must have a 'meta' attribute with valid metadata.")
 
+        # Build the norm-head mapping FIRST so `_TaggedDataset` can tag each
+        # sample with its norm-head row, not the per-dataset enumerate index.
+        # `DatasetMixtureMetadata` clobbers `metadata.stats` via
+        # `_to_standard_data_format`; this must run before any downstream
+        # consumer that reads the raw per-feature stats.
+        self.meta = DatasetMixtureMetadata(
+            cfg,
+            [ds.meta for ds in datasets],
+            dataset_weights,
+            dataset_names=self.dataset_names,
+        )
+
         # Wrap every underlying dataset so __getitem__ injects
-        # `dataset_repo_id: str` and `dataset_index: torch.long`. The policy's
-        # Normalize/Unnormalize uses these to gather per-sample stats.
-        # `_TaggedDataset` preserves `.meta` so `get_per_dataset_dataloaders`
-        # and other consumers keep working.
+        # `dataset_repo_id: str` and `dataset_index: torch.long`. The
+        # `dataset_index` value is the norm-head row index (datasets sharing
+        # a `(robot_type, control_mode)` get the same value).
         self.datasets = [
-            _TaggedDataset(ds, name, idx)
-            for idx, (ds, name) in enumerate(zip(datasets, self.dataset_names, strict=True))
+            _TaggedDataset(ds, name, self.meta.dataset_to_norm_index[name])
+            for ds, name in zip(datasets, self.dataset_names, strict=True)
         ]
 
         logging.info("Initializing WeightedDatasetMixture...")
@@ -522,13 +747,6 @@ class WeightedDatasetMixture:
                 f"must match concatenated_dataset length ({len(self.concatenated_dataset)})."
             )
         logging.info("-" * 30)
-
-        self.meta = DatasetMixtureMetadata(
-            cfg,
-            [ds.meta for ds in datasets],
-            dataset_weights,
-            dataset_names=self.dataset_names,
-        )
 
     @staticmethod
     def _make_dataset_names(cfg: TrainPipelineConfig, datasets: List[BaseDataset]) -> List[str]:

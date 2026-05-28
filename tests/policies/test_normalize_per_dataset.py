@@ -167,3 +167,172 @@ def test_per_dataset_stats_length_mismatch_raises():
     per_dataset_stats = _build_per_dataset_stats(2)
     with pytest.raises(ValueError, match="must have the same length"):
         Normalize(features, norm_map, per_dataset_stats=per_dataset_stats, dataset_names=["only-one"])
+
+
+# -- _resolve_dataset_index dispatch ---------------------------------------
+
+
+class _TinyConfig:
+    """Stand-in for `PreTrainedConfig` exposing only what
+    `PreTrainedPolicy.__init__` reads. Real configs are dataclasses; this
+    avoids pulling a concrete subclass (and its policy class wiring) into
+    a normalize-only test."""
+
+    def __init__(self, dataset_names, dataset_to_norm_index=None):
+        self.dataset_names = dataset_names
+        self.dataset_to_norm_index = dataset_to_norm_index
+
+
+def _make_policy_with_normalize(dataset_names, dataset_to_norm_index, *, num_rows):
+    """Build a minimal `nn.Module` carrying the policy's name maps plus
+    one `Normalize` so `_resolve_dataset_index` has a buffer to sniff
+    (`_stacked_num_datasets`).
+    """
+    from opentau.configs.policies import PreTrainedConfig
+    from opentau.policies.pretrained import PreTrainedPolicy
+
+    class _DummyConfig(PreTrainedConfig):
+        @property
+        def observation_delta_indices(self):
+            return None
+
+        @property
+        def action_delta_indices(self):
+            return None
+
+        @property
+        def reward_delta_indices(self):
+            return None
+
+        def get_optimizer_preset(self):
+            raise NotImplementedError
+
+        def get_scheduler_preset(self):
+            return None
+
+        def validate_features(self):
+            return None
+
+    class _DummyPolicy(PreTrainedPolicy):
+        config_class = _DummyConfig
+        name = "dummy-test-policy"
+
+        def __init__(self, config):
+            super().__init__(config)
+            features = {
+                "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(2,)),
+            }
+            norm_map = {"STATE": NormalizationMode.MEAN_STD}
+            stats = [
+                {
+                    "observation.state": {
+                        "mean": torch.full((2,), float(i)),
+                        "std": torch.ones(2),
+                    }
+                }
+                for i in range(num_rows)
+            ]
+            self.normalize_inputs = Normalize(
+                features, norm_map, per_dataset_stats=stats, dataset_names=dataset_names
+            )
+
+        def get_optim_params(self):
+            return {}
+
+        def reset(self):
+            pass
+
+        def forward(self, batch):
+            raise NotImplementedError
+
+        def select_action(self, batch):
+            raise NotImplementedError
+
+    cfg = _DummyConfig()
+    cfg.dataset_names = list(dataset_names)
+    cfg.dataset_to_norm_index = dict(dataset_to_norm_index) if dataset_to_norm_index is not None else None
+    return _DummyPolicy(cfg)
+
+
+class TestResolveDatasetIndex:
+    """`_resolve_dataset_index`: training, repo-id, and (robot,control) routes."""
+
+    def test_dataset_index_passthrough(self):
+        policy = _make_policy_with_normalize(
+            ["franka::joint", "ur5::ee"],
+            {"franka_repo": 0, "ur5_repo": 1},
+            num_rows=2,
+        )
+        idx = policy._resolve_dataset_index({"dataset_index": torch.tensor([0, 1], dtype=torch.long)})
+        assert torch.equal(idx.cpu(), torch.tensor([0, 1], dtype=torch.long))
+
+    def test_dataset_repo_id_maps_via_dataset_to_norm_index(self):
+        policy = _make_policy_with_normalize(
+            ["franka::joint", "ur5::ee"],
+            # Two dataset names route to the same head; another to a
+            # different head — exercises the new mapping faithfully.
+            {"franka_repo_a": 0, "franka_repo_b": 0, "ur5_repo": 1},
+            num_rows=2,
+        )
+        idx = policy._resolve_dataset_index(
+            {
+                "dataset_repo_id": ["franka_repo_a", "franka_repo_b", "ur5_repo"],
+                "observation.state": torch.zeros(3, 2),
+            }
+        )
+        assert torch.equal(idx.cpu(), torch.tensor([0, 0, 1], dtype=torch.long))
+
+    def test_robot_type_control_mode_route(self):
+        policy = _make_policy_with_normalize(
+            ["franka::joint", "ur5::ee"],
+            {"franka_repo": 0, "ur5_repo": 1},
+            num_rows=2,
+        )
+        idx = policy._resolve_dataset_index(
+            {
+                "robot_type": ["franka", "ur5"],
+                "control_mode": ["joint", "ee"],
+                "observation.state": torch.zeros(2, 2),
+            }
+        )
+        assert torch.equal(idx.cpu(), torch.tensor([0, 1], dtype=torch.long))
+
+    def test_robot_type_control_mode_unknown_raises(self):
+        policy = _make_policy_with_normalize(
+            ["franka::joint", "ur5::ee"],
+            {"franka_repo": 0, "ur5_repo": 1},
+            num_rows=2,
+        )
+        # "unknown" triggers fallback to "", which is not in
+        # `_norm_key_to_index` — raises rather than silently routing.
+        with pytest.raises(ValueError, match="not in this policy's training"):
+            policy._resolve_dataset_index(
+                {
+                    "robot_type": ["franka"],
+                    "control_mode": ["unknown"],
+                    "observation.state": torch.zeros(1, 2),
+                }
+            )
+
+    def test_legacy_config_without_dataset_to_norm_index(self):
+        """Old checkpoint: only `dataset_names` is persisted. The policy
+        synthesizes the identity mapping so dataset_repo_id lookups still
+        resolve."""
+        policy = _make_policy_with_normalize(
+            ["repo/foo", "repo/bar"],
+            dataset_to_norm_index=None,  # legacy
+            num_rows=2,
+        )
+        idx = policy._resolve_dataset_index(
+            {"dataset_repo_id": ["repo/bar", "repo/foo"], "observation.state": torch.zeros(2, 2)}
+        )
+        assert torch.equal(idx.cpu(), torch.tensor([1, 0], dtype=torch.long))
+
+    def test_multirow_unidentified_batch_raises(self):
+        policy = _make_policy_with_normalize(
+            ["franka::joint", "ur5::ee"],
+            {"franka_repo": 0, "ur5_repo": 1},
+            num_rows=2,
+        )
+        with pytest.raises(KeyError, match="requires one of"):
+            policy._resolve_dataset_index({"observation.state": torch.zeros(1, 2)})
