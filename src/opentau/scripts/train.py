@@ -186,6 +186,36 @@ def _observe_optional(
     setattr(tracker, key, value)
 
 
+def _commit_wandb_step(accelerator: accelerate.Accelerator, step: int) -> None:
+    """Seal + flush the pending wandb row for ``step`` immediately.
+
+    OpenTau logs every metric with an explicit ``step=``, so wandb keeps row N
+    open as the "pending" row (letting the many per-step ``accelerator.log(...)``
+    calls accumulate into it) and only seals + uploads it when it next sees a
+    ``log(step > N)`` -- i.e. when step N+1 first logs. That makes the newest
+    point (especially a just-finished eval and its videos) lag one logging
+    interval on the dashboard, and risks losing the last pending row on an
+    ungraceful kill.
+
+    Calling this once, after every training / validation / eval log for
+    ``step``, forces the seal now. ``accelerator.log(values, step, log_kwargs)``
+    forwards ``log_kwargs["wandb"]`` straight to ``wandb.run.log`` (other
+    trackers only see kwargs keyed to their own name), so ``commit=True`` is
+    tracker-safe; an empty ``values`` dict flushes the accumulated row without
+    adding keys.
+
+    Must be the LAST wandb write for ``step``: wandb requires monotonically
+    increasing steps and warns-and-drops any ``log(step=N)`` issued after N is
+    sealed.
+
+    Args:
+        accelerator: The active accelerate ``Accelerator`` (caller must already
+            be on the main process, where the trackers live).
+        step: The training step whose pending wandb row should be sealed.
+    """
+    accelerator.log({}, step=step, log_kwargs={"wandb": {"commit": True}})
+
+
 def _mixture_weighted_aggregate(
     per_dataset_trackers: dict[str, MetricsTracker],
     name_to_weight: dict[str, float],
@@ -918,6 +948,15 @@ def train(cfg: TrainPipelineConfig):
                             s["post_resv"],
                             s["post_alloc"] - s["pre_alloc"],
                         )
+
+        # Seal this step's wandb row as soon as all of its logging (training /
+        # validation / eval scalars + eval videos) is done, instead of waiting
+        # for the next logging step to auto-commit it. Guarded on the same
+        # conditions that gate the logging blocks above, so we only commit on
+        # steps that actually logged, and only on main where the trackers live.
+        # See issue #353.
+        if accelerator.is_main_process and (is_log_step or is_val_step or (is_eval_step and eval_envs)):
+            _commit_wandb_step(accelerator, step)
 
     if cfg.eval_freq > 0 and eval_envs:
         close_envs(eval_envs)

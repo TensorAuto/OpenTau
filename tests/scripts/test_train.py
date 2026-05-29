@@ -29,6 +29,7 @@ import accelerate
 import pytest
 
 from opentau.scripts.train import (
+    _commit_wandb_step,
     _find_unused_params_from_env,
     _mixture_weighted_aggregate,
     _sync_deepspeed_gradient_accumulation_steps,
@@ -258,6 +259,26 @@ class TestMixtureWeightedAggregate:
         assert agg["loss"] == pytest.approx(0.25 * 1.0 + 0.75 * 5.0)
         assert agg["mse_loss"] == pytest.approx(0.25 * 2.0 + 0.75 * 6.0)
         assert agg["ce_loss"] == pytest.approx(0.25 * 3.0 + 0.75 * 7.0)
+
+
+class TestCommitWandbStep:
+    """``_commit_wandb_step`` issues exactly one empty, commit-tagged log."""
+
+    def test_emits_empty_commit_log_at_step(self):
+        # The fix relies on three properties of the emitted call: an empty
+        # ``values`` dict (flush the accumulated row, add no keys), the explicit
+        # ``step`` (seal that row, not some other), and ``commit=True`` routed
+        # only under the ``"wandb"`` key (tracker-safe; other trackers never see
+        # it). Assert the exact call shape to pin all three.
+        calls = []
+
+        def _log(values, step=None, log_kwargs=None):
+            calls.append((values, step, log_kwargs))
+
+        accelerator = SimpleNamespace(log=_log)
+        _commit_wandb_step(accelerator, 1234)
+
+        assert calls == [({}, 1234, {"wandb": {"commit": True}})]
 
 
 if __name__ == "__main__":
