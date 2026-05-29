@@ -150,9 +150,13 @@ libero = { git = "https://github.com/shuheng-liu/LIBERO" , branch = "master" }  
 egl-probe = { git = "https://github.com/shuheng-liu/egl_probe", tag = "v1.0.1-cmake4" }
 
 [tool.uv]
-# Pin a uv floor so the team resolves against the same lockfile format and
-# `[tool.uv]` feature set. Bump only alongside a corresponding `uv lock` refresh.
+# `extra-build-dependencies` injects a cmake wheel into egl-probe's PEP 517 build
+# isolation so `uv sync --extra libero` builds the egl_probe sdist without a system
+# cmake (a C/C++ toolchain is still required). egl_probe's CMakeLists floor was
+# raised to 3.5 in the fork, so the injected cmake is free to be 4.x. This key is
+# only honored by uv >= 0.8.4, which `required-version` enforces.
 required-version = ">=0.8.4"
+extra-build-dependencies = { egl-probe = ["cmake"] }
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -66,10 +66,11 @@ We recommend using `uv <https://docs.astral.sh/uv/>`_ (>= 0.8.4) for fast and si
 
 1. **Install uv**
    Follow the `official uv installation instructions <https://docs.astral.sh/uv/getting-started/installation/>`_.
-   OpenTau pins **uv >= 0.8.4** via ``required-version`` in ``[tool.uv]`` so
-   everyone resolves against the same lockfile format and ``[tool.uv]`` feature
-   set; older ``uv`` is rejected loudly rather than silently producing a
-   divergent lock. Bump this floor only alongside a ``uv lock`` refresh.
+   OpenTau requires **uv >= 0.8.4** because ``pyproject.toml`` uses
+   ``[tool.uv].extra-build-dependencies`` (introduced in 0.8.4) to inject
+   ``cmake`` into the PEP 517 build isolation of ``egl-probe`` (a ``libero``
+   extra dependency), so its sdist builds without a system ``cmake`` and on
+   CMake 4. Older ``uv`` is rejected via ``required-version``.
 
 2. **Install dependencies**
    Sync all required dependencies. To install all extras:
