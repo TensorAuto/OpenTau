@@ -876,9 +876,17 @@ def train(cfg: TrainPipelineConfig):
                 # overall metrics (suite-agnostic)
                 aggregated = eval_info["overall"]
 
-                # optional: per-suite logging
-                for suite, suite_info in eval_info.items():
-                    logging.info("Suite %s aggregated: %s", suite, suite_info)
+                # compact per-group + overall summary (drop verbose video_paths)
+                def _fmt(m: dict) -> str:
+                    return (
+                        f"success={m.get('pc_success', float('nan')):.1f}% "
+                        f"∑rwrd={m.get('avg_sum_reward', float('nan')):.3f} "
+                        f"n={m.get('n_episodes', 0)}"
+                    )
+
+                for group, v in eval_info["per_group"].items():
+                    logging.info("eval[%s]: %s", group, _fmt(v))
+                logging.info("eval[overall]: %s", _fmt(aggregated))
 
                 # meters/tracker
                 eval_metrics = {
