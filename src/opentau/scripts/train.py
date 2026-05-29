@@ -879,9 +879,7 @@ def train(cfg: TrainPipelineConfig):
                 # compact per-group + overall summary (drop verbose video_paths)
                 def _fmt(m: dict) -> str:
                     return (
-                        f"success={m.get('pc_success', float('nan')):.1f}% "
-                        f"∑rwrd={m.get('avg_sum_reward', float('nan')):.3f} "
-                        f"n={m.get('n_episodes', 0)}"
+                        f"success={m['pc_success']:.1f}% ∑rwrd={m['avg_sum_reward']:.3f} n={m['n_episodes']}"
                     )
 
                 for group, v in eval_info["per_group"].items():
