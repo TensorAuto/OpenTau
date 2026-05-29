@@ -119,24 +119,21 @@ dev = ["pre-commit>=3.7.0",
     "myst-parser>=4.0.0",
 ]
 libero = [
-    "cmake<4",
     "ninja",
     "bddl==1.0.1",
     "easydict==1.9",
     "future==0.18.2",
     "matplotlib>=3.5.3",
+    "egl-probe",
     "robomimic==0.2.0",
     "robosuite==1.4.0",
     "thop==0.1.1.post2209072238",
     "mujoco>=3.3.5",
     "PyOpenGL==3.1.7",
     "libero",
-    "numpy<2",
-    "gym>=0.25,<0.27",
     "pyopengl-accelerate==3.1.7 ; sys_platform == 'linux'",
     "mujoco>=3.1.6 ; sys_platform == 'linux'",
     "pyopengl==3.1.7 ; sys_platform == 'linux'",
-    "numpy==1.26.4 ; sys_platform == 'linux'",
 ]
 urdf = [
     "rerun-sdk>=0.28.2",
@@ -147,27 +144,19 @@ trt = [
 
 [tool.uv.sources]
 libero = { git = "https://github.com/shuheng-liu/LIBERO" , branch = "master" }  # the official libero repo is misconfigured for pip install with git
+# robomimic's egl_probe ships a CMakeLists with cmake_minimum_required(VERSION 2.8.12),
+# which CMake >= 4 rejects. This fork raises the floor to 3.5 so it builds on CMake 4
+# without pinning the build's cmake; the tag keeps the source reproducible.
+egl-probe = { git = "https://github.com/shuheng-liu/egl_probe", tag = "v1.0.1-cmake4" }
 
-# libero depends on gym, which depends on numpy 1.x, while rerun only supports urdf in v0.28 which requires numpy 2.x
 [tool.uv]
-# `extra-build-dependencies` (used below for egl-probe's CMake pin) is only
-# honored by uv >= 0.8.4. Without this guard, older uv silently ignores the key
-# and the build regresses to the original CMake 4 failure with a confusing
-# message. Bumping this floor errors loudly with a clear pointer instead.
+# `extra-build-dependencies` injects a cmake wheel into egl-probe's PEP 517 build
+# isolation so `uv sync --extra libero` builds the egl_probe sdist without a system
+# cmake (a C/C++ toolchain is still required). egl_probe's CMakeLists floor was
+# raised to 3.5 in the fork, so the injected cmake is free to be 4.x. This key is
+# only honored by uv >= 0.8.4, which `required-version` enforces.
 required-version = ">=0.8.4"
-conflicts = [
-  [
-    { extra = "libero" },
-    { extra = "urdf" },
-  ],
-]
-# egl-probe (transitive via robomimic in the libero extra) ships an sdist whose
-# CMakeLists declares cmake_minimum_required(VERSION 2.8.12). CMake 4.0 dropped
-# pre-3.5 compatibility, so the build aborts on systems where the build's `cmake`
-# resolves to a 4.x binary. Pin cmake<4 in egl-probe's PEP 517 build isolation:
-# uv puts the build venv's bin at the front of PATH for the build subprocess,
-# so the bundled 3.x cmake wins regardless of what's installed system-wide.
-extra-build-dependencies = { egl-probe = ["cmake<4"] }
+extra-build-dependencies = { egl-probe = ["cmake"] }
 
 [tool.setuptools.packages.find]
 where = ["src"]

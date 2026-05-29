@@ -38,17 +38,17 @@ OpenTau is Tensor's open-source PyTorch training toolchain for vision-language-a
 
 ## Environment & install
 
-Dependency management is **`uv` (>= 0.8.4) only** — `pyproject.toml`/`uv.lock` are authoritative; do not edit `requirements.txt` (none exists) or call `pip install` against the env. The `>= 0.8.4` floor is enforced by `required-version` in `[tool.uv]` and is needed because `[tool.uv].extra-build-dependencies` (which pins `cmake<4` inside `egl-probe`'s PEP 517 build isolation) is only honored by uv 0.8.4+.
+Dependency management is **`uv` (>= 0.8.4) only** — `pyproject.toml`/`uv.lock` are authoritative; do not edit `requirements.txt` (none exists) or call `pip install` against the env. The `>= 0.8.4` floor is enforced by `required-version` in `[tool.uv]` and is needed because `[tool.uv].extra-build-dependencies` (which injects `cmake` into `egl-probe`'s PEP 517 build isolation so its sdist builds without a system cmake, on CMake 4) is only honored by uv 0.8.4+.
 
 ```bash
 uv sync --extra dev --extra libero          # standard dev setup (matches CI)
-uv sync --all-extras                         # everything (note: libero + urdf are mutually exclusive — see [tool.uv].conflicts)
+uv sync --all-extras                         # everything (libero + urdf now co-install on numpy 2.x)
 source .venv/bin/activate
 ```
 
 Re-run `uv sync` whenever `pyproject.toml`/`uv.lock` change. Add deps with `uv add <pkg>`; lock with `uv lock`.
 
-Installable extras: `dev` (pre-commit, sphinx, pytest), `libero` (sim env — pulls a forked LIBERO from `shuheng-liu/LIBERO`, pins numpy<2), `urdf` (rerun ≥0.28, requires numpy 2.x — incompatible with `libero`), `trt` (TensorRT, Linux/Win x86_64 only).
+Installable extras: `dev` (pre-commit, sphinx, pytest), `libero` (sim env — pulls a forked LIBERO from `shuheng-liu/LIBERO`, runs on numpy 2.x + gymnasium), `urdf` (rerun ≥0.28, numpy 2.x), `trt` (TensorRT, Linux/Win x86_64 only).
 
 ## Common commands
 
