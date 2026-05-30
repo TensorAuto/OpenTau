@@ -281,7 +281,11 @@ def _build_tasks(args: Args) -> tuple[list[dict], dict, list[str]]:
     from opentau.configs.default import DatasetMixtureConfig
     from opentau.configs.refs import resolve_refs_to_tempfile
     from opentau.datasets.dataset_mixture import DatasetMixtureMetadata, WeightedDatasetMixture
-    from opentau.datasets.lerobot_dataset import LeRobotDatasetMetadata
+    from opentau.datasets.lerobot_dataset import (
+        LeRobotDatasetMetadata,
+        aggregate_selected_stats,
+        resolve_selected_episodes,
+    )
     from opentau.datasets.standard_data_format_mapping import resolve_feature_mapping
 
     tmp = resolve_refs_to_tempfile(args.config)
@@ -300,6 +304,14 @@ def _build_tasks(args: Args) -> tuple[list[dict], dict, list[str]]:
             meta.info["robot_type"] = dc.robot_type
         if dc.control_mode is not None:
             meta.info["control_mode"] = dc.control_mode
+        # Mirror training: pool norm stats over the SELECTED episodes only, so
+        # the diagnostic reflects the policy's actual normalization (honors
+        # `episodes` + `excluded_episodes`).
+        try:
+            meta.stats = aggregate_selected_stats(meta, dc.episodes, dc.excluded_episodes)
+        except ValueError as e:
+            logger.warning("episode selection emptied %s, skipping: %r", dc.repo_id, e)
+            continue
         metadatas.append(meta)
         kept_cfgs.append(dc)
         kept_w.append(w)
@@ -335,7 +347,9 @@ def _build_tasks(args: Args) -> tuple[list[dict], dict, list[str]]:
     tasks: list[dict] = []
     for dc, m, name, (scol, acol), (sdim, adim) in zip(kept_cfgs, metadatas, names, cols, dims, strict=True):
         head_key = mm.norm_keys[mm.dataset_to_norm_index[name]]
-        episodes = list(dc.episodes) if dc.episodes is not None else list(m.episodes)
+        episodes = resolve_selected_episodes(m.episodes, dc.episodes, dc.excluded_episodes) or list(
+            m.episodes
+        )
         if args.max_episodes_per_dataset is not None:
             episodes = episodes[: args.max_episodes_per_dataset]
         parquet_paths = [str(m.root / m.get_data_file_path(ep)) for ep in episodes]
