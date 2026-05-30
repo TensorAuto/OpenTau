@@ -37,6 +37,8 @@ from transformers import (
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
 
+from opentau.policies import flash_attn_cuda
+
 
 def _preferred_dtype():
     return torch.float32 if torch.onnx.is_in_onnx_export() else torch.bfloat16
@@ -214,10 +216,10 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
                 "You set `freeze_vision_encoder=False` and `train_expert_only=True` which are not compatible."
             )
 
-        if self.attention_implementation not in ["eager", "sdpa", "fa2"]:
+        if self.attention_implementation not in ["eager", "sdpa", "fa2", "flash_cuda"]:
             raise ValueError(
                 f"Wrong value provided for `attention_implementation` ({self.attention_implementation}). "
-                "Expected 'eager', 'sdpa', or 'fa2'."
+                "Expected 'eager', 'sdpa', 'fa2', or 'flash_cuda'."
             )
         if self.attention_implementation == "fa2":
             # "fa2" has been accepted by the validator historically but never
@@ -375,11 +377,17 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         use_cache: bool | None = None,
         fill_kv_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
+        attention_block_ids: tuple[torch.Tensor, ...] | None = None,
     ) -> tuple[list[torch.FloatTensor | None], list[torch.FloatTensor] | Cache | None]:
         """Forward pass of the model.
 
         Args:
-            attention_mask: Attention mask tensor.
+            attention_mask: Dense bool attention mask (B, Sq, Sk), True=attend.
+                Used by the eager/sdpa backends. ``None`` when the ``flash_cuda``
+                backend is active (the mask is reconstructed in-kernel instead).
+            attention_block_ids: Compact ``(q_blk, k_blk, q_valid, k_valid)``
+                block-id representation for the ``flash_cuda`` backend (see
+                ``flash_attn_cuda.make_att_block_ids``). ``None`` for eager/sdpa.
             position_ids: Position IDs tensor.
             past_key_values: Past key values for caching.
             inputs_embeds: List of input embeddings for the different model parts.
@@ -443,6 +451,7 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
                     adarms_cond,
                     batch_size,
                     head_dim,
+                    attention_block_ids,
                     use_reentrant=False,
                 )
             else:
@@ -458,6 +467,7 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
                     adarms_cond,
                     batch_size,
                     head_dim,
+                    attention_block_ids,
                 )
 
         # final norm
@@ -484,6 +494,7 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         adarms_cond: list[torch.Tensor | None],
         batch_size: int,
         head_dim: int,
+        attention_block_ids: tuple[torch.Tensor, ...] | None = None,
     ) -> list[torch.FloatTensor | None]:
         """Run a single layer of the dual-tower decoder loop.
 
@@ -565,10 +576,16 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
                 "value_states": value_states[:, :n_cross_att_tokens, :, :],
             }
 
-        attention_interface = self.get_attention_interface()
-        att_output = attention_interface(
-            attention_mask, batch_size, head_dim, query_states, key_states, value_states
-        )
+        if attention_block_ids is not None:
+            # flash_cuda backend: mask reconstructed in-kernel from block-ids.
+            att_output = self.flash_attention_forward(
+                attention_block_ids, batch_size, head_dim, query_states, key_states, value_states
+            )
+        else:
+            attention_interface = self.get_attention_interface()
+            att_output = attention_interface(
+                attention_mask, batch_size, head_dim, query_states, key_states, value_states
+            )
         att_output = att_output.to(dtype=_preferred_dtype())
 
         # first part of att_output is prefix (up to sequence length, [:, 0:prefix_seq_len])
@@ -618,16 +635,58 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             sequence length.
           - ``"fa2"``: accepted for backward compatibility; falls back to
             eager with a warning emitted at config validation time.
+          - ``"flash_cuda"``: custom block-causal CUDA flash kernel. The fast
+            path is taken in ``_run_layer`` when ``attention_block_ids`` is
+            supplied; this method returns ``sdpa`` as the fallback used when the
+            kernel is unavailable (no block-ids reach this interface then).
 
         Returns:
             callable: The attention function to use.
         """
         impl = self.config.attention_implementation
-        if impl == "sdpa":
+        if impl in ("sdpa", "flash_cuda"):
             return self.sdpa_attention_forward
         # "eager" and legacy "fa2" both land here; "fa2" already warned
         # during __post_init__.
         return self.eager_attention_forward
+
+    def flash_attention_forward(
+        self,
+        attention_block_ids: tuple[torch.Tensor, ...],
+        batch_size: int,
+        head_dim: int,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Custom block-causal CUDA flash attention forward.
+
+        Unlike the eager/sdpa interfaces this consumes the compact block-id
+        representation (``q_blk, k_blk, q_valid, k_valid``) and reconstructs the
+        block-causal mask inside the kernel, so the dense (B, Sq, Sk) mask is
+        never materialized. GQA/MQA is handled natively (no K/V expansion), and
+        the kernel runs both matmuls on Tensor Cores (fp16/bf16) with fp32
+        accumulation, matching ``eager``/``sdpa`` outputs within fp/bf16 noise.
+
+        Args:
+            attention_block_ids: ``(q_blk, k_blk, q_valid, k_valid)`` from
+                ``flash_attn_cuda.make_att_block_ids``.
+            batch_size: Batch size.
+            head_dim: Per-head dimension.
+            query_states: ``(B, Sq, num_attention_heads, head_dim)``.
+            key_states: ``(B, Sk, num_key_value_heads, head_dim)``.
+            value_states: ``(B, Sk, num_key_value_heads, head_dim)``.
+
+        Returns:
+            torch.Tensor: ``(B, Sq, num_attention_heads * head_dim)`` output,
+            matching the eager/sdpa interfaces.
+        """
+        q_blk, k_blk, q_valid, k_valid = attention_block_ids
+        att_output = flash_attn_cuda.flash_attn_blockmask(
+            query_states, key_states, value_states, q_blk, k_blk, q_valid, k_valid, head_dim**-0.5
+        )
+        # (B, Sq, H, head_dim) -> (B, Sq, H * head_dim) to match eager/sdpa.
+        return att_output.reshape(batch_size, att_output.shape[1], -1)
 
     def eager_attention_forward(
         self,
