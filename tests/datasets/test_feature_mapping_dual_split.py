@@ -45,6 +45,19 @@ def _restore_global_mapping():
         DATA_FEATURES_NAME_MAPPING.update(snapshot)
 
 
+def test_missing_control_mode_sentinels_stay_in_sync():
+    """Column resolution (`feature_mapping_key`) and the norm-head split
+    (`compute_norm_key`) must agree on what counts as "no control mode". If the
+    two sentinel sets drift, the column the data is read from and the head its
+    stats land in can silently disagree -- re-opening exactly the dual-split
+    collision this fixes. The sets are hand-mirrored across modules, so guard it.
+    """
+    from opentau.datasets.dataset_mixture import _NORM_KEY_MISSING_VALUES
+    from opentau.datasets.standard_data_format_mapping import _MISSING_CONTROL_MODE_VALUES
+
+    assert _MISSING_CONTROL_MODE_VALUES == _NORM_KEY_MISSING_VALUES
+
+
 class TestFeatureMappingKey:
     """`feature_mapping_key`: composite key construction + sentinels."""
 

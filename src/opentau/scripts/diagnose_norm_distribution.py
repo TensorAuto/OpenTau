@@ -267,7 +267,15 @@ def _process_dataset(task: dict) -> dict:
 def _build_tasks(args: Args) -> tuple[list[dict], dict, list[str]]:
     """Returns (tasks, head_meta_stats, norm_keys). Reuses the real
     DatasetMixtureMetadata so per-(robot_type, control_mode) head stats and the
-    dual-split column resolution match training exactly."""
+    dual-split column resolution match training exactly.
+
+    NOTE: this is intentionally coupled to ``DatasetMixtureMetadata`` internals
+    (``per_norm_key_stats``, ``norm_key_to_index``, ``dataset_to_norm_index``,
+    ``norm_key_to_dataset_names``) so it mirrors the policy's normalization
+    wiring without building full (video-backed) datasets. If those attributes
+    are renamed this must be updated. The accumulator/worker math is unit-tested;
+    this metadata-wiring half is exercised by running the script end-to-end.
+    """
     from types import SimpleNamespace
 
     from opentau.configs.default import DatasetMixtureConfig
