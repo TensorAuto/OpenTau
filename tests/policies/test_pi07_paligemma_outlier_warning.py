@@ -23,8 +23,8 @@ import logging
 import pytest
 import torch
 
-import opentau.policies.pi07_paligemma.low_level.modeling_pi07_low_level as pg_ll_modeling
 from opentau.policies.pi07_paligemma.low_level.modeling_pi07_low_level import (
+    _WARNED_OUTLIER_KEYS,
     _warn_state_action_outliers,
 )
 
@@ -34,9 +34,9 @@ class TestWarnStateActionOutliers:
     def _clear_seen(self):
         # The warn-once dedup set is module-global and persists across the
         # process; clear it around every test so cases are order-independent.
-        pg_ll_modeling._WARNED_OUTLIER_KEYS.clear()
+        _WARNED_OUTLIER_KEYS.clear()
         yield
-        pg_ll_modeling._WARNED_OUTLIER_KEYS.clear()
+        _WARNED_OUTLIER_KEYS.clear()
 
     def test_warns_above_threshold_state_only(self, caplog):
         batch = {"state": torch.zeros(2, 8), "actions": torch.zeros(2, 4, 8)}
