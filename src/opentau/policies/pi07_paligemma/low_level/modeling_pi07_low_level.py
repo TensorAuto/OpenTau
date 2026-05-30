@@ -31,7 +31,7 @@ from typing import Literal
 import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
-from einops import rearrange
+from einops import rearrange, reduce
 from torch import Tensor, nn
 from transformers import AutoProcessor, AutoTokenizer
 
@@ -288,6 +288,108 @@ def pad_discrete_tokens(tokens: list[list[int]], max_length: int) -> tuple[np.nd
             )
             discrete_action_tokens.append(np.pad(token, (0, max_length - len(token)), constant_values=0))
     return np.array(discrete_action_tokens), np.array(discrete_action_masks)
+
+
+# Process-local set of ``(source, key, dim)`` outlier offenders already warned
+# about, so ``_warn_state_action_outliers`` fires at most once per offender per
+# run instead of every training step. Under DDP each rank keeps its own set and
+# logs its own first occurrence (no cross-rank coordination — keeps the helper
+# rule-5 safe). Tests clear this between cases.
+_WARNED_OUTLIER_KEYS: set[tuple[object, str, int]] = set()
+
+
+def _warn_state_action_outliers(batch: dict[str, Tensor], threshold: float | None) -> None:
+    """Warn when a normalized state/action feature dim exceeds ``threshold``.
+
+    A normalized value far from unit scale almost always means bad
+    normalization stats (e.g. near-zero std on a constant dim) or corrupt
+    data. This logs a concise ``logging.warning`` naming the offending
+    ``source`` / ``episode_index`` / ``frame_index`` when those provenance
+    fields are present in the batch (they are emitted by the dataset's standard
+    data format), so a poorly-normalized dim can be traced back to the
+    dataset/frame to inspect.
+
+    To avoid drowning the log when a dim is persistently out of range, each
+    ``(source, key, dim)`` offender is warned about at most once per process
+    (tracked in ``_WARNED_OUTLIER_KEYS``); a fresh offender later in the run
+    still gets its own line.
+
+    Pure and log-only: it reads ``batch`` without mutating it and MUST NOT gate
+    any model call on its result. Keeping it log-only keeps the ``forward``
+    graph — and therefore the collective counts under FSDP / ZeRO — identical
+    across ranks regardless of what any rank's local data contains (CLAUDE.md
+    rule 5).
+
+    Args:
+        batch: Training batch *after* input/target normalization. Reads
+            ``state`` ``(B, [T,] D)`` and ``actions`` ``(B, chunk, D)``; the
+            zero-padded tail dims never trigger.
+        threshold: Absolute-value ceiling. ``None`` or ``<= 0`` disables the
+            check entirely (early return, no device sync).
+    """
+    if threshold is None or threshold <= 0:
+        return
+    per_key: dict[str, tuple[Tensor, Tensor]] = {}
+    for key in ("state", "actions"):
+        t = batch.get(key)
+        if t is None:
+            continue
+        # (B, [T|chunk,] D) -> (B, D): max |value| per feature dim. The
+        # ``b ... d`` pattern absorbs the optional middle axis (2-D state, 3-D
+        # state history, 3-D action chunk) in a single expression.
+        per_dim_max = reduce(t.detach().abs().float(), "b ... d -> b d", "max")
+        per_key[key] = (per_dim_max, per_dim_max > threshold)
+    if not per_key:
+        return
+    # One device->host sync covering both tensors; skip the rest on the common
+    # (no-outlier) path.
+    if not bool(torch.cat([viol.flatten() for _, viol in per_key.values()]).any()):
+        return
+
+    src = batch.get("source")
+    ep = batch.get("episode_index")
+    fr = batch.get("frame_index")
+
+    def _per_sample(value: object, i: int) -> object:
+        if isinstance(value, list):
+            return value[i]
+        if torch.is_tensor(value):
+            return int(value[i])
+        return value
+
+    for key, (per_dim_max, viol) in per_key.items():
+        # (sample, dim) coordinates of every violating entry this step.
+        coords = torch.nonzero(viol, as_tuple=False).tolist()
+        if not coords:
+            continue
+        # Index on CPU once so the per-offender lookups below don't each sync.
+        pdm = per_dim_max.detach().cpu()
+        # Keep only offenders not yet warned about, deduped per (source, key, dim).
+        fresh = []
+        for s_i, d in coords:
+            tup = (_per_sample(src, s_i), key, d)
+            if tup not in _WARNED_OUTLIER_KEYS:
+                _WARNED_OUTLIER_KEYS.add(tup)
+                fresh.append((s_i, d))
+        if not fresh:
+            continue
+        # Report the worst (largest |value|) among the newly-seen offenders.
+        worst_s, worst_d = max(fresh, key=lambda sd: pdm[sd[0], sd[1]].item())
+        fresh_dims = sorted({d for _, d in fresh})
+        logging.warning(
+            "Outlier normalized %s: %d new (source,dim) offender(s) exceed |%.1f|; "
+            "new dims=%s; worst dim=%d max=%.2f (source=%s episode=%s frame=%s). "
+            "Repeat warnings for these (source,dim) pairs are suppressed.",
+            key,
+            len(fresh),
+            threshold,
+            fresh_dims,
+            worst_d,
+            float(pdm[worst_s, worst_d]),
+            _per_sample(src, worst_s),
+            _per_sample(ep, worst_s),
+            _per_sample(fr, worst_s),
+        )
 
 
 class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
@@ -1044,6 +1146,11 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         batch = self.normalize_inputs(batch, dataset_index)
         batch["discrete_actions"] = self.normalize_discrete_actions(dict(batch), dataset_index)["actions"]
         batch = self.normalize_targets(batch, dataset_index)
+
+        # Debug aid (log-only; never gates the forward — see CLAUDE.md rule 5):
+        # flag poorly-normalized state/action dims so they can be traced to the
+        # offending dataset/frame.
+        _warn_state_action_outliers(batch, self.config.warn_outlier_threshold)
 
         self._hydrate_optional_conditioning_batch(batch)
 

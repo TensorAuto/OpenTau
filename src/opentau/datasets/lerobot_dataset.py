@@ -908,6 +908,21 @@ class BaseDataset(torch.utils.data.Dataset):
             if isinstance(value, torch.Tensor) and value.dtype.is_floating_point:
                 standard_item[key] = value.to(dtype=torch.bfloat16)
 
+        # Provenance fields (part of the standard data format). `source` is the
+        # dataset's identity (repo_id for LeRobotDataset, the dataset key for
+        # VQA), so a sample's origin survives into the training batch — useful
+        # for debugging which dataset/frame produced an outlier. `episode_index`
+        # / `frame_index` are plain ints (default-collate to a (B,) int64
+        # tensor); VQA / missing values emit the sentinel -1 so a heterogeneous
+        # LeRobot+VQA batch stays schema-aligned under default collation.
+        standard_item["source"] = self._get_feature_mapping_key()
+        ep = item.get("episode_index")
+        standard_item["episode_index"] = (
+            int(ep.item() if torch.is_tensor(ep) else ep) if ep is not None else -1
+        )
+        fr = item.get("frame_index")
+        standard_item["frame_index"] = int(fr.item() if torch.is_tensor(fr) else fr) if fr is not None else -1
+
         return standard_item
 
     def _emit_optional_keys(self, item: dict, standard_item: dict) -> None:
@@ -2192,6 +2207,12 @@ class LeRobotDataset(BaseDataset):
             # BaseDataset._emit_optional_keys can apply dropout uniformly.
             ep_start = int(self.episode_data_index["from"][self.epi2idx[ep_idx]].item())
             frame_in_ep = idx - ep_start
+            # Stash the within-episode frame offset (idx - ep_start) under
+            # `frame_index` so `_to_standard_data_format` can emit it as
+            # provenance. The raw hf row also carries a `frame_index` column;
+            # we deliberately use the recomputed offset, which stays correct
+            # even if that column is malformed.
+            item["frame_index"] = frame_in_ep
             if "memory" in item:
                 item["memory_raw"] = str(item["memory"])
             if "mistake" in item:

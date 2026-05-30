@@ -168,6 +168,15 @@ class PI07PaligemmaLowLevelConfig(PreTrainedConfig):
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
 
+    # Debug aid: during the training forward, emit a logging.warning when any
+    # individual NORMALIZED state/action feature dim (after taking abs) exceeds
+    # this value — a symptom of bad normalization stats (e.g. near-zero std on a
+    # constant dim) or corrupt data. The warning names the offending
+    # source/episode/frame when those batch fields are present, to point at the
+    # dataset/frame to inspect. Set to 0.0 (or negative) to disable entirely and
+    # skip the per-step device sync.
+    warn_outlier_threshold: float = 10.0
+
     @property
     def obs_buffer_size(self) -> int:
         """Total raw frames the state history buffer must keep.
