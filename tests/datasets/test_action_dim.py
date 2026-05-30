@@ -159,6 +159,43 @@ def test_action_dim_reflects_pre_pad_shape(
     assert item["actions"].shape == (dataset.cfg.action_chunk, dataset.cfg.max_action_dim)
 
 
+def test_provenance_fields_in_standard_format(
+    lerobot_dataset_factory,
+    info_factory,
+    hf_dataset_factory,
+    tasks_factory,
+    episodes_factory,
+    stats_factory,
+    episodes_stats_factory,
+    tmp_path,
+):
+    """Every standardized sample carries provenance: ``source`` (the repo id)
+    plus int ``episode_index`` / ``frame_index``. ``frame_index`` is emitted as
+    the within-episode offset (``idx - ep_start``), so it's checked against the
+    fixture's independently-built ``frame_index`` column to catch an off-by-one.
+    """
+    dataset = _make_dataset(
+        lerobot_dataset_factory,
+        info_factory,
+        hf_dataset_factory,
+        tasks_factory,
+        episodes_factory,
+        stats_factory,
+        episodes_stats_factory,
+        tmp_path,
+        real_action_dim=4,
+        suffix="provenance",
+    )
+    idx = 25
+    raw = dataset.hf_dataset[idx]
+    item = dataset[idx]
+    assert item["source"] == dataset.repo_id
+    assert isinstance(item["episode_index"], int)
+    assert isinstance(item["frame_index"], int)
+    assert item["episode_index"] == int(raw["episode_index"].item())
+    assert item["frame_index"] == int(raw["frame_index"].item())
+
+
 def test_action_dim_default_dataloader_collation(
     lerobot_dataset_factory,
     info_factory,
@@ -299,6 +336,16 @@ def test_cross_dataset_batch_routes_action_dim_into_loss(
     batch = torch.utils.data.default_collate([ds_a[0], ds_b[0]])
     assert batch["real_action_dim"].tolist() == [4, 9]
     assert batch["actions"].shape == (2, chunk, max_action_dim)
+
+    # Provenance fields survive default collation across two datasets: `source`
+    # stays a list[str] (one entry per sample, never stacked into a tensor),
+    # while the int episode/frame indices stack into (B,) int64 tensors. Both
+    # `ds_a[0]` and `ds_b[0]` are the first frame of episode 0.
+    assert isinstance(batch["source"], list)
+    assert batch["source"] == [ds_a.repo_id, ds_b.repo_id]
+    assert batch["episode_index"].dtype == torch.int64
+    assert batch["episode_index"].tolist() == [0, 0]
+    assert batch["frame_index"].tolist() == [0, 0]
 
     # Hand-crafted velocity tensors: u_t - v_t = 1 everywhere → per-element MSE = 1.
     # No frozen prefix, no timestep padding — isolates the action_dim contribution.
