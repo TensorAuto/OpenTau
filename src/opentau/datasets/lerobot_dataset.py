@@ -1531,7 +1531,11 @@ class LeRobotDataset(BaseDataset):
             # normalization std. The ImageNet camera override in
             # datasets/factory.py runs afterward and layers onto this same dict.
             # (v2.0 datasets have no per-episode stats, so this block is skipped
-            # and meta.stats stays the global aggregate.)
+            # and meta.stats stays the global aggregate.) This intentionally
+            # aliases `self.stats` and `self.meta.stats` to one object; nothing
+            # reads the `LeRobotDataset.stats` attribute for normalization, so
+            # the shared reference (later padded in place by the mixture) is
+            # benign.
             self.meta.stats = self.stats
 
         if self.episodes is None:

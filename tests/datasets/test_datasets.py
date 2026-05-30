@@ -306,6 +306,9 @@ def test_resolve_selected_episodes_precedence_and_none():
     assert resolve_selected_episodes([0, 1, 2, 3], [0, 1, 2], [1]) == [0, 2]
     # excluding an index absent from the base is a no-op.
     assert resolve_selected_episodes([0, 1, 2], [0, 1], [99]) == [0, 1]
+    # an empty denylist behaves like None (no-op), preserving the episodes arg.
+    assert resolve_selected_episodes([0, 1, 2], [0, 1], []) == [0, 1]
+    assert resolve_selected_episodes([0, 1, 2], None, []) is None
 
 
 def test_resolve_selected_episodes_empty_raises():

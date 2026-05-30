@@ -347,6 +347,9 @@ def _build_tasks(args: Args) -> tuple[list[dict], dict, list[str]]:
     tasks: list[dict] = []
     for dc, m, name, (scol, acol), (sdim, adim) in zip(kept_cfgs, metadatas, names, cols, dims, strict=True):
         head_key = mm.norm_keys[mm.dataset_to_norm_index[name]]
+        # Cannot raise here: datasets whose selection the denylist empties were
+        # already dropped by the `aggregate_selected_stats` call in the metadata
+        # loop above, so every dataset reaching this point resolves non-empty.
         episodes = resolve_selected_episodes(m.episodes, dc.episodes, dc.excluded_episodes) or list(
             m.episodes
         )
