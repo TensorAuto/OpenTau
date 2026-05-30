@@ -43,7 +43,10 @@ Run (where the parquet data lives, e.g. a training node)::
 ``--config`` is a ``DatasetMixtureConfig`` JSON (``$ref`` includes are
 resolved). ``pyarrow`` is already a (transitive) dependency; plotting also needs
 ``matplotlib`` (e.g. ``uv sync --extra libero``) — without it the JSON/CSV
-reports are still written and only the figures are skipped.
+reports are still written and only the figures are skipped. The figures are one
+per-head grid (``head__<robot>__<mode>.png``) of per-dim normalized-value
+histograms overlaid with the ideal ``N(0, 1)``, plus a global ``z_std`` health
+summary (``summary_zstd_distribution.png``).
 """
 
 from __future__ import annotations
@@ -443,6 +446,111 @@ def _emit_corrected_stats(merged: dict, norm_keys: list[str], path: Path) -> Non
     path.write_text(json.dumps(out, indent=2))
 
 
+def _gaussian_pdf(x: np.ndarray) -> np.ndarray:
+    """Standard-normal density — the shape a correctly-normalized dim should match."""
+    return np.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+
+def _plot_head_histograms(key: str, feats: list, geom: tuple, out_dir: Path, plt) -> None:
+    """One figure per ``(robot_type, control_mode)`` head: a small-multiple grid of
+    per-dim histograms of the *normalized* values (red), each overlaid with the ideal
+    ``N(0, 1)`` (green). A healthy dim hugs the curve; a stale-stats dim is a thin
+    spike at 0 (``z_std << 1``); a heavy-tailed dim is too wide. The x-axis is in true
+    std units (symlog once a dim's extremes exceed 10), unlike the old bin-index
+    heatmap; the two open overflow bins are excluded and reported as ``>bins=%``.
+    """
+    fin, width, centers = geom
+    panels = []  # (label, acc, dim, z_std) across both features, skipping empty dims
+    for feat, acc in feats:
+        zstd = acc.z_std()
+        panels += [(f"{feat[:3]}[{d}]", acc, d, float(zstd[d])) for d in range(acc.D) if acc.count[d] > 0]
+    if not panels:
+        return
+    ncol = 6
+    nrow = math.ceil(len(panels) / ncol)
+    fig, axs = plt.subplots(nrow, ncol, figsize=(2.7 * ncol, 2.0 * nrow), squeeze=False)
+    xg = np.linspace(-5.0, 5.0, 240)
+    ref = _gaussian_pdf(xg)
+    for i, (label, acc, d, zstd_d) in enumerate(panels):
+        ax = axs[i // ncol][i % ncol]
+        counts = acc.hist[d].astype(np.float64)
+        n = counts.sum()
+        dens = np.zeros_like(counts)
+        if n > 0:
+            dens[fin] = counts[fin] / (n * width[fin])
+        ax.bar(centers[fin], dens[fin], width=width[fin], color="#cc6677", linewidth=0.0)
+        ax.plot(xg, ref, "g-", lw=1.0)
+        zabs = max(abs(float(acc.zmin[d])), abs(float(acc.zmax[d])))
+        xhi = max(4.0, min(1.2 * zabs, 1e3)) if np.isfinite(zabs) else 4.0
+        if xhi > 10.0:
+            ax.set_xscale("symlog", linthresh=2.0)
+        ax.set_xlim(-xhi, xhi)
+        ax.set_yscale("log")
+        ax.set_ylim(1e-4, None)
+        tail = float(counts[~fin].sum() / n) if n > 0 else 0.0
+        title = f"{label}  z_std={zstd_d:.2f}"
+        if tail > 1e-4:
+            title += f"  >bins={100 * tail:.1f}%"
+        ax.set_title(title, fontsize=7)
+        ax.tick_params(labelsize=6)
+    for i in range(len(panels), nrow * ncol):
+        axs[i // ncol][i % ncol].axis("off")
+    fig.suptitle(f"{key}  —  normalized-value histograms (red) vs ideal N(0,1) (green)", fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.99))
+    safe = key.replace("/", "_").replace("::", "__")
+    fig.savefig(out_dir / f"head__{safe}.png", dpi=110)
+    plt.close(fig)
+
+
+def _plot_summary(rows: list[dict], out_dir: Path, plt) -> None:
+    """One global figure: the distribution of realized ``z_std`` over all dims (ideal
+    1; a spike near 0 = under-normalized stale stats), the same split by feature, the
+    staleness-vs-``z_std`` map that separates the two failure modes, and the heavy-tail
+    mass."""
+    zstd = np.array([r["z_std"] for r in rows], dtype=np.float64)
+    feat = np.array([r["feature"] for r in rows])
+    frac10 = np.array([r["frac_gt10"] for r in rows], dtype=np.float64)
+    logr = np.array([r["log10_meta_over_data_max"] for r in rows], dtype=np.float64)
+    fig, ax = plt.subplots(2, 2, figsize=(13, 9))
+    b = np.linspace(0.0, 2.0, 41)
+    ax[0, 0].hist(np.clip(zstd, 0, 2), bins=b, color="#4477aa", edgecolor="white")
+    ax[0, 0].axvline(1.0, color="green", lw=2, label="ideal (z_std=1)")
+    ax[0, 0].axvspan(0, 0.5, color="red", alpha=0.08, label="under-normalized")
+    ax[0, 0].axvspan(1.5, 2.0, color="orange", alpha=0.08, label="over-norm / heavy tail")
+    ax[0, 0].set_yscale("log")
+    ax[0, 0].set_xlabel("realized z_std")
+    ax[0, 0].set_ylabel("# dims (log)")
+    ax[0, 0].set_title(f"Realized normalized-std over all {len(rows)} dims")
+    ax[0, 0].legend(fontsize=8)
+    for f, c in (("state", "#4477aa"), ("actions", "#cc6677")):
+        ax[0, 1].hist(np.clip(zstd[feat == f], 0, 2), bins=b, alpha=0.6, label=f, color=c)
+    ax[0, 1].axvline(1.0, color="green", lw=2)
+    ax[0, 1].set_yscale("log")
+    ax[0, 1].set_xlabel("realized z_std")
+    ax[0, 1].set_ylabel("# dims (log)")
+    ax[0, 1].set_title("realized z_std by feature")
+    ax[0, 1].legend()
+    sc = ax[1, 0].scatter(logr, zstd, c=np.clip(frac10, 0, 0.05), cmap="viridis", s=10)
+    ax[1, 0].axhline(1.0, color="green", lw=1, ls="--")
+    ax[1, 0].set_xlabel("log10(meta_max / data_max)  ->  staleness")
+    ax[1, 0].set_ylabel("realized z_std")
+    ax[1, 0].set_ylim(0, min(6.0, float(zstd.max()) * 1.05) if len(zstd) else 1.0)
+    ax[1, 0].set_title("two failure modes: stale-stats (right, low z_std)\nvs heavy-tail (high z_std)")
+    fig.colorbar(sc, ax=ax[1, 0], label="frac |z|>10")
+    nz = frac10[frac10 > 0]
+    if len(nz):
+        ax[1, 1].hist(nz, bins=np.linspace(0, max(0.05, float(nz.max())), 30), color="#aa3377")
+        ax[1, 1].set_yscale("log")
+    else:
+        ax[1, 1].text(0.5, 0.5, "no dims with |z|>10", ha="center", va="center", transform=ax[1, 1].transAxes)
+    ax[1, 1].set_xlabel("frac |z|>10 (per dim)")
+    ax[1, 1].set_ylabel("# dims")
+    ax[1, 1].set_title(f"heavy-tail mass ({len(nz)} dims with any |z|>10)")
+    fig.tight_layout()
+    fig.savefig(out_dir / "summary_zstd_distribution.png", dpi=110)
+    plt.close(fig)
+
+
 def _plot(merged: dict, head_info: dict, norm_keys: list[str], rows: list[dict], out_dir: Path) -> None:
     try:
         import matplotlib
@@ -453,47 +561,18 @@ def _plot(merged: dict, head_info: dict, norm_keys: list[str], rows: list[dict],
         logger.warning("matplotlib not installed; skipping plots (e.g. `uv sync --extra libero`).")
         return
 
+    left, right = BIN_EDGES[:-1], BIN_EDGES[1:]
+    fin = np.isfinite(left) & np.isfinite(right)  # the two ±inf overflow bins are not plottable
+    geom = (fin, np.where(fin, right - left, 1.0), np.where(fin, 0.5 * (left + right), 0.0))
+
     for key in norm_keys:
         feats = [(f, merged.get((key, f))) for f in ("state", "actions")]
         feats = [(f, a) for f, a in feats if a is not None and a.count.sum() > 0]
-        if not feats:
-            continue
-        fig, axes = plt.subplots(1, len(feats), figsize=(7 * len(feats), 5), squeeze=False)
-        for ax, (feat, acc) in zip(axes[0], feats, strict=False):
-            dens = acc.hist / np.clip(acc.hist.sum(axis=1, keepdims=True), 1, None)
-            im = ax.imshow(np.log10(dens + 1e-6), aspect="auto", origin="lower", cmap="magma")
-            ax.set_title(f"{key}  {feat}  (D={acc.D})")
-            ax.set_xlabel("normalized z (std units)")
-            ax.set_ylabel("dim")
-            zero_bin = int(np.searchsorted(BIN_EDGES, 0.0, side="right") - 1)
-            ax.axvline(zero_bin, color="cyan", lw=0.5, alpha=0.6)
-            fig.colorbar(im, ax=ax, label="log10 density")
-        fig.tight_layout()
-        safe = key.replace("/", "_").replace("::", "__")
-        fig.savefig(out_dir / f"head__{safe}.png", dpi=120)
-        plt.close(fig)
+        if feats:
+            _plot_head_histograms(key, feats, geom, out_dir, plt)
 
-    # Global health heatmap: rows = worst dims, cols = staleness metrics.
     if rows:
-        ranked = sorted(
-            rows,
-            key=lambda r: -max(abs(r["z_std"] - 1.0), r["frac_gt10"], abs(r["log10_meta_over_data_max"])),
-        )
-        top = ranked[: min(60, len(ranked))]
-        labels = [f"{r['robot_type']}::{r['control_mode']}|{r['feature'][:3]}{r['dim']}" for r in top]
-        cols = ["z_std", "frac_gt10", "log10(meta/data max)", "z_max"]
-        mat = np.array(
-            [[r["z_std"], r["frac_gt10"], r["log10_meta_over_data_max"], min(r["z_max"], 50)] for r in top]
-        )
-        fig, ax = plt.subplots(figsize=(8, max(4, len(top) * 0.25)))
-        im = ax.imshow(mat, aspect="auto", cmap="coolwarm")
-        ax.set_xticks(range(len(cols)), cols, rotation=30, ha="right")
-        ax.set_yticks(range(len(top)), labels, fontsize=6)
-        ax.set_title("Staleness / health (top dims)")
-        fig.colorbar(im, ax=ax)
-        fig.tight_layout()
-        fig.savefig(out_dir / "health_heatmap.png", dpi=120)
-        plt.close(fig)
+        _plot_summary(rows, out_dir, plt)
 
 
 def main(args: Args) -> None:

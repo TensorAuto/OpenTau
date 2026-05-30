@@ -156,3 +156,29 @@ def test_worker_parquet_roundtrip(tmp_path):
     # normalizing by the data's own mean/std => z ~ mean 0, std 1
     np.testing.assert_allclose(sacc.z_mean(), 0.0, atol=1e-6)
     np.testing.assert_allclose(sacc.z_std(), 1.0, atol=1e-6)
+
+
+@pytest.mark.slow
+def test_plot_writes_histograms_and_summary(tmp_path):
+    """The figures are one per-head histogram grid + a global z_std summary (no more
+    heatmap). Smoke-test that both land on disk for a synthetic one-head mixture."""
+    pytest.importorskip("matplotlib")
+
+    from opentau.scripts.diagnose_norm_distribution import _finalize_report, _plot
+
+    rng = np.random.default_rng(3)
+    merged, meta = {}, {}
+    for feat, dim in (("state", 3), ("actions", 2)):
+        x = rng.normal(size=(200, dim))
+        stat = {"mean": x.mean(0), "std": x.std(0), "min": x.min(0), "max": x.max(0)}
+        acc = DimStats(dim)
+        acc.update(x, _normalize(x, stat, "MEAN_STD"))
+        merged[("franka::ee", feat)] = acc
+        meta[feat] = stat
+    head_info = {"franka::ee": {"robot_type": "franka", "control_mode": "ee", "meta": meta}}
+
+    rows = _finalize_report(merged, head_info, ["franka::ee"])["rows"]
+    _plot(merged, head_info, ["franka::ee"], rows, tmp_path)
+
+    assert (tmp_path / "head__franka__ee.png").exists()
+    assert (tmp_path / "summary_zstd_distribution.png").exists()
