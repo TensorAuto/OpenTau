@@ -294,6 +294,8 @@ def _resolve_native_action_key(
 
     if override_mapping is not None and "actions" in override_mapping:
         return override_mapping["actions"]
+    # TODO: dual-split repos (same repo_id, joint vs ee) share this repo_id key; thread
+    # control_mode through `resolve_feature_mapping` for a precise per-mode action column.
     mapping = DATA_FEATURES_NAME_MAPPING.get(repo_id, {}) if repo_id else {}
     if "actions" in mapping:
         return mapping["actions"]

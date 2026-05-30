@@ -117,7 +117,7 @@ from opentau.datasets.speed_percentiles import (
     episode_to_task_index_from_hf_dataset,
     load_or_compute_speed_percentiles,
 )
-from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
+from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING, feature_mapping_key
 from opentau.datasets.utils import (
     DEFAULT_FEATURES,
     DEFAULT_IMAGE_PATH,
@@ -2245,7 +2245,13 @@ class LeRobotDataset(BaseDataset):
         return item
 
     def _get_feature_mapping_key(self) -> str:
-        return self.repo_id
+        # Control-mode-aware key so two entries sharing a repo_id but different
+        # action columns (joint vs ee) resolve to their own mapping rather than
+        # colliding on repo_id. Falls back to the plain repo_id key when no
+        # per-control-mode entry is registered (built-in defaults / single-mode
+        # datasets). See `feature_mapping_key`.
+        key = feature_mapping_key(self.repo_id, self.control_mode)
+        return key if key in DATA_FEATURES_NAME_MAPPING else self.repo_id
 
     def __repr__(self):
         feature_keys = list(self.features)

@@ -153,11 +153,24 @@ class DatasetConfig:
                 f"got {self.tolerance_s} for {self.repo_id or self.vqa}."
             )
 
-        # If data_features_name_mapping is provided, upsert it into the global DATA_FEATURES_NAME_MAPPING
+        # If data_features_name_mapping is provided, upsert it into the global
+        # DATA_FEATURES_NAME_MAPPING. Register under the plain repo_id (back-compat
+        # fallback, last-wins) AND, when this entry carries a real control mode,
+        # under the composite `repo_id::control_mode` key. The composite key lets
+        # two entries that share a repo_id but use different action columns
+        # (e.g. control_mode="joint" -> action_joint vs control_mode="ee" ->
+        # action_ee) coexist instead of the second silently clobbering the first.
         if self.data_features_name_mapping is not None:
-            from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
+            from opentau.datasets.standard_data_format_mapping import (
+                DATA_FEATURES_NAME_MAPPING,
+                feature_mapping_key,
+            )
 
             DATA_FEATURES_NAME_MAPPING[self.repo_id] = self.data_features_name_mapping
+            if self.repo_id is not None:
+                key = feature_mapping_key(self.repo_id, self.control_mode)
+                if key != self.repo_id:
+                    DATA_FEATURES_NAME_MAPPING[key] = self.data_features_name_mapping
 
 
 @dataclass

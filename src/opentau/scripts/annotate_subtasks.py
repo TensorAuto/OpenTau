@@ -422,6 +422,8 @@ def _resolve_camera0_video_key(info: dict, ds_cfg: dict) -> str | None:
     repo_id = ds_cfg.get("repo_id")
     inline_map = ds_cfg.get("data_features_name_mapping") or {}
     inline = inline_map.get("camera0")
+    # TODO: dual-split repos share this repo_id key; camera0 is identical across control
+    # modes, so the plain repo_id entry is fine here (see resolve_feature_mapping).
     global_map = DATA_FEATURES_NAME_MAPPING.get(repo_id, {}) if repo_id else {}
     mapped = inline if inline is not None else global_map.get("camera0")
 

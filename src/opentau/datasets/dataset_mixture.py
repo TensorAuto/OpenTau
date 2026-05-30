@@ -77,7 +77,7 @@ from torch.utils.data import ConcatDataset, DataLoader, Dataset, Sampler
 from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.compute_stats import aggregate_stats
 from opentau.datasets.lerobot_dataset import BaseDataset, DatasetMetadata
-from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
+from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING, feature_mapping_key
 
 
 class _TaggedDataset(Dataset):
@@ -276,7 +276,8 @@ class DatasetMixtureMetadata:
         # the standardize loop below clobbers `metadata.stats`.
         raw_dims: list[tuple[int, int]] = []
         for m in metadatas:
-            name_map = DATA_FEATURES_NAME_MAPPING[m.repo_id]
+            key = feature_mapping_key(m.repo_id, getattr(m, "info", {}).get("control_mode"))
+            name_map = DATA_FEATURES_NAME_MAPPING[key if key in DATA_FEATURES_NAME_MAPPING else m.repo_id]
             raw_dims.append(
                 (
                     int(m.stats[name_map["state"]]["mean"].shape[-1]),
@@ -286,7 +287,9 @@ class DatasetMixtureMetadata:
 
         # convert each metadata stats to the standard data format
         for metadata in metadatas:
-            metadata.stats = self._to_standard_data_format(metadata.repo_id, metadata.stats)
+            metadata.stats = self._to_standard_data_format(
+                metadata.repo_id, metadata.stats, getattr(metadata, "info", {}).get("control_mode")
+            )
 
         # Per-dataset stats kept for diagnostic / back-compat consumers
         # (e.g. `aggregated_action_stats` for the BPE codec).
@@ -472,7 +475,7 @@ class DatasetMixtureMetadata:
         return agg["actions"]
 
     def _to_standard_data_format(
-        self, repo_id: str, stats: dict[str, dict[str, np.ndarray]]
+        self, repo_id: str, stats: dict[str, dict[str, np.ndarray]], control_mode: str | None = None
     ) -> dict[str, dict[str, np.ndarray]]:
         """Convert statistics to the standard data format.
 
@@ -482,6 +485,10 @@ class DatasetMixtureMetadata:
         Args:
             repo_id: Repository ID used to look up feature name mapping.
             stats: Statistics dictionary with dataset-specific feature names.
+            control_mode: Control mode used (with ``repo_id``) to resolve the
+                feature-name mapping, so dual-split entries (joint vs ee) pick
+                their own action column. ``None`` falls back to the plain
+                ``repo_id`` entry.
 
         Returns:
             Statistics dictionary with standard feature names and padded vectors.
@@ -490,7 +497,8 @@ class DatasetMixtureMetadata:
             KeyError: If a required feature is missing from stats or if required
                 statistics (mean, std, min, max) are missing.
         """
-        name_map = DATA_FEATURES_NAME_MAPPING[repo_id]
+        key = feature_mapping_key(repo_id, control_mode)
+        name_map = DATA_FEATURES_NAME_MAPPING[key if key in DATA_FEATURES_NAME_MAPPING else repo_id]
         features_without_stats = ["prompt", "response", "advantage"]
 
         standard_stats = {}
@@ -854,11 +862,20 @@ class WeightedDatasetMixture:
         return torch.DoubleTensor(all_sample_weights)
 
     def _get_worker_name_mapping_overrides(self) -> dict[str, dict[str, str]]:
-        """Collect per-dataset mapping overrides from config for worker init."""
-        overrides = {}
+        """Collect per-dataset mapping overrides from config for worker init.
+
+        Emits both the plain ``repo_id`` key (back-compat fallback) and the
+        control-mode-aware ``repo_id::control_mode`` key, so that after a
+        ``spawn`` each worker can resolve dual-split entries (joint vs ee) to
+        their own action column instead of last-wins on ``repo_id``.
+        """
+        overrides: dict[str, dict[str, str]] = {}
         for dataset_cfg in self.cfg.dataset_mixture.datasets:
             if dataset_cfg.repo_id and dataset_cfg.data_features_name_mapping is not None:
                 overrides[dataset_cfg.repo_id] = dataset_cfg.data_features_name_mapping
+                key = feature_mapping_key(dataset_cfg.repo_id, dataset_cfg.control_mode)
+                if key != dataset_cfg.repo_id:
+                    overrides[key] = dataset_cfg.data_features_name_mapping
         return overrides
 
     def get_dataloader(self) -> DataLoader:

@@ -192,6 +192,9 @@ class LiberoLastFrameSubgoalGenerator:
                 f"LiberoLastFrameSubgoalGenerator: repo_id {repo_id!r} has no entry in "
                 f"DATA_FEATURES_NAME_MAPPING; cannot resolve camera{{k}} -> raw key."
             )
+        # TODO: thread control_mode and use `resolve_feature_mapping(repo_id, control_mode)`
+        # for dual-split repos; cameras are identical across control modes so the plain
+        # repo_id entry is correct here today.
         name_map = DATA_FEATURES_NAME_MAPPING[repo_id]
 
         # Resolve camera slots to the raw feature keys the dataset

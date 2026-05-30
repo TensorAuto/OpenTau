@@ -82,7 +82,7 @@ from opentau.datasets.lerobot_dataset import (
     LeRobotDatasetMetadata,
     suppress_control_mode_warning,
 )
-from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
+from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING, feature_mapping_key
 from opentau.datasets.transforms import ImageTransforms
 from opentau.datasets.utils import DeltaTimestampInfo
 
@@ -140,7 +140,11 @@ def resolve_delta_timestamps(
 
     if dataset_cfg.repo_id is None:
         raise ValueError("dataset_cfg.repo_id must not be None when resolving delta timestamps.")
-    name_map = DATA_FEATURES_NAME_MAPPING[dataset_cfg.repo_id]
+    # Runs before `_apply_metadata_overrides`, so prefer the config's control_mode
+    # override, falling back to the on-disk value, to resolve dual-split columns.
+    control_mode = dataset_cfg.control_mode if dataset_cfg.control_mode is not None else ds_meta.control_mode
+    mkey = feature_mapping_key(dataset_cfg.repo_id, control_mode)
+    name_map = DATA_FEATURES_NAME_MAPPING[mkey if mkey in DATA_FEATURES_NAME_MAPPING else dataset_cfg.repo_id]
     reverse_name_map = {v: k for k, v in name_map.items()}
     for key in ds_meta.features:
         if key not in reverse_name_map:

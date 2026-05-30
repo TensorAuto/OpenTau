@@ -232,3 +232,49 @@ DATA_FEATURES_NAME_MAPPING = {
         "response": "response",
     },
 }
+
+
+# Case-insensitive sentinels that mean "no control-mode discriminator", mirroring
+# `opentau.datasets.dataset_mixture._NORM_KEY_MISSING_VALUES` so that the column
+# resolution here and the norm-head split there agree on what counts as a real
+# control mode.
+_MISSING_CONTROL_MODE_VALUES: frozenset[str] = frozenset({"unknown"})
+
+
+def feature_mapping_key(repo_id: str, control_mode: str | None) -> str:
+    """Return the ``DATA_FEATURES_NAME_MAPPING`` key for a dataset entry.
+
+    Two mixture entries can share a ``repo_id`` while declaring different
+    ``data_features_name_mapping`` values — e.g. the same robot exposed as
+    ``control_mode="joint"`` (``actions -> action_joint``) and
+    ``control_mode="ee"`` (``actions -> action_ee``). Keying the global mapping
+    by ``repo_id`` alone makes the second registration clobber the first, so the
+    "joint" entry would silently read the end-effector column. Disambiguating by
+    ``control_mode`` lets both coexist.
+
+    Returns ``"<repo_id>::<control_mode>"`` when ``control_mode`` is a real,
+    non-empty label, and the plain ``repo_id`` otherwise (missing / whitespace /
+    ``"unknown"``) — so built-in defaults and single-mode datasets keep their
+    existing ``repo_id`` keys.
+    """
+    cm = (control_mode or "").strip()
+    if cm and cm.casefold() not in _MISSING_CONTROL_MODE_VALUES:
+        return f"{repo_id}::{cm}"
+    return repo_id
+
+
+def resolve_feature_mapping(repo_id: str, control_mode: str | None = None) -> dict[str, str]:
+    """Look up a dataset's feature-name mapping, control-mode-aware.
+
+    Prefers the precise ``"<repo_id>::<control_mode>"`` entry and falls back to
+    the plain ``repo_id`` entry (built-in defaults / single-mode datasets /
+    back-compat). Raises ``KeyError`` if neither is registered.
+    """
+    mapping = DATA_FEATURES_NAME_MAPPING.get(feature_mapping_key(repo_id, control_mode))
+    if mapping is None:
+        mapping = DATA_FEATURES_NAME_MAPPING.get(repo_id)
+    if mapping is None:
+        raise KeyError(
+            f"No feature mapping registered for repo_id={repo_id!r} (control_mode={control_mode!r})."
+        )
+    return mapping
