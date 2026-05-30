@@ -317,13 +317,15 @@ def _load_metadata_stats_and_info(
     ``info_with_overrides`` is a copy of ``meta.info`` with
     ``DatasetConfig.{robot_type,control_mode}`` overrides applied -- mirrors
     ``factory._apply_metadata_overrides`` so the caller can derive the same
-    norm key the training policy does. On full construction failure, the
-    returned ``info`` is empty.
+    norm key the training policy does. The action stats are aggregated over the
+    SELECTED episodes (``DatasetConfig.{episodes,excluded_episodes}``) so the
+    codec range matches training-time normalization. On full construction
+    failure, the returned ``info`` is empty.
     """
     idx, cfg = item
     repo_id = cfg.repo_id or "<no-repo-id>"
     try:
-        from opentau.datasets.lerobot_dataset import LeRobotDatasetMetadata
+        from opentau.datasets.lerobot_dataset import LeRobotDatasetMetadata, aggregate_selected_stats
 
         meta = LeRobotDatasetMetadata(cfg.repo_id, root=cfg.root, revision=cfg.revision)
         info = dict(getattr(meta, "info", {}) or {})
@@ -331,20 +333,23 @@ def _load_metadata_stats_and_info(
             info["robot_type"] = cfg.robot_type
         if cfg.control_mode is not None:
             info["control_mode"] = cfg.control_mode
+        # Fit the codec over the SELECTED-episode action range so it matches the
+        # episodes the policy trains on (honors `episodes` + `excluded_episodes`).
+        stats = aggregate_selected_stats(meta, cfg.episodes, cfg.excluded_episodes)
         key = _resolve_native_action_key(
             cfg.repo_id,
             cfg.data_features_name_mapping,
-            available_keys=set(meta.stats or []),
+            available_keys=set(stats or []),
         )
-        if not meta.stats or key not in meta.stats:
+        if not stats or key not in stats:
             return (
                 idx,
                 repo_id,
                 info,
                 None,
-                f"key {key!r} missing from stats (keys={sorted(meta.stats or [])})",
+                f"key {key!r} missing from stats (keys={sorted(stats or [])})",
             )
-        s = meta.stats[key]
+        s = stats[key]
         return (
             idx,
             repo_id,

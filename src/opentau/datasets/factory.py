@@ -230,6 +230,7 @@ def make_dataset(
             cfg.repo_id,
             root=cfg.root,
             episodes=cfg.episodes,
+            excluded_episodes=cfg.excluded_episodes,
             delta_timestamps=dt_mean,
             delta_timestamps_std=dt_std,
             delta_timestamps_lower=dt_lower,

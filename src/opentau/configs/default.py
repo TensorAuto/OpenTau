@@ -61,6 +61,12 @@ class DatasetConfig:
             Defaults to None.
         episodes: List of episode indices to use from the dataset. If None, all
             episodes are used. Defaults to None.
+        excluded_episodes: List of episode indices to drop from this dataset.
+            Takes precedence over `episodes`: an index present in both is
+            excluded. If None (default), no episodes are excluded. Note: on
+            legacy v2.0 datasets (no per-episode stats) the listed episodes are
+            dropped from training, but normalization stats stay the global
+            (all-episode) aggregate — only v2.1+ can recompute them.
         image_transforms: Configuration for image transformations. Defaults to
             ImageTransformsConfig().
         revision: Git revision of the dataset repository to use. Defaults to None.
@@ -109,6 +115,7 @@ class DatasetConfig:
     # Root directory where the dataset will be stored (e.g. 'dataset/path').
     root: str | None = None
     episodes: list[int] | None = None
+    excluded_episodes: list[int] | None = None
     image_transforms: ImageTransformsConfig = field(default_factory=ImageTransformsConfig)
     revision: str | None = None
     use_imagenet_stats: bool = True

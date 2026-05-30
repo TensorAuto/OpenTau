@@ -30,6 +30,7 @@ from opentau.datasets.dataset_mixture import (
     pad_vector,
 )
 from opentau.datasets.factory import make_dataset
+from tests.fixtures.constants import DUMMY_REPO_ID
 from tests.utils import retry_on_hf_flakiness
 
 
@@ -485,6 +486,36 @@ class TestWeightedDatasetMixtureIntegration:
         assert "actions" in features
         assert f"camera{train_pipeline_config.num_cams - 1}" in features
         assert f"camera{train_pipeline_config.num_cams}" not in features
+
+    @pytest.mark.slow
+    def test_norm_head_stats_use_selected_episodes(
+        self, train_pipeline_config, info_factory, episodes_stats_factory, lerobot_dataset_factory, tmp_path
+    ):
+        """per_norm_key_stats must pool SELECTED-episode stats, not the full on-disk set.
+
+        A corrupt episode left out of `episodes` would otherwise inflate the
+        norm-head std and under-scale every real channel of that head.
+        """
+        info = info_factory(total_episodes=3, total_frames=150, total_tasks=1)
+        episodes_stats = episodes_stats_factory(features=info["features"], total_episodes=3)
+        corrupt = episodes_stats[0]["stats"]["state"]["std"]
+        episodes_stats[0]["stats"]["state"]["std"] = [1000.0] * len(corrupt)
+
+        dataset = lerobot_dataset_factory(
+            root=tmp_path / "corrupt",
+            repo_id=DUMMY_REPO_ID,
+            total_episodes=3,
+            total_frames=150,
+            info=info,
+            episodes_stats=episodes_stats,
+            episodes=[1, 2],  # episode 0 (corrupt) is excluded from training
+        )
+        mixture = WeightedDatasetMixture(train_pipeline_config, [dataset], [1.0], 30.0)
+
+        # Real state dim is 6 (DUMMY_MOTOR_FEATURES); the mixture zero-pads the
+        # tail to max_state_dim, so compare only the real channels.
+        state_std = np.asarray(mixture.meta.per_norm_key_stats[0]["state"]["std"])
+        assert np.allclose(state_std[:6], 0.25)
 
     @pytest.mark.slow  # 3 sec
     def test_integration_large_dataset_mixture(self, train_pipeline_config, datasets_factory):

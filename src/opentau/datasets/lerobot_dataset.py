@@ -90,6 +90,7 @@ import math
 import shutil
 import traceback
 from abc import abstractmethod
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable
@@ -1127,6 +1128,58 @@ class BaseDataset(torch.utils.data.Dataset):
         return new_vector
 
 
+def resolve_selected_episodes(
+    all_episodes: Iterable[int],
+    episodes: list[int] | None,
+    excluded_episodes: list[int] | None,
+    repo_id: str = "",
+) -> list[int] | None:
+    """Resolve the effective episode list for a dataset selection.
+
+    The selection is ``(episodes if not None else all_episodes)`` minus
+    ``excluded_episodes``. ``excluded_episodes`` takes precedence: an index
+    present in both is dropped. Returns a sorted list, or ``None`` when no
+    selection is active (``episodes`` is None and ``excluded_episodes`` is
+    empty), meaning "use every episode".
+
+    Raises:
+        ValueError: if the denylist removes every selected episode.
+    """
+    if not excluded_episodes:
+        return sorted(episodes) if episodes is not None else None
+    excluded = set(excluded_episodes)
+    base = list(episodes) if episodes is not None else list(all_episodes)
+    kept = sorted(e for e in base if e not in excluded)
+    if not kept:
+        raise ValueError(
+            f"excluded_episodes removed every episode from {repo_id!r} "
+            f"(base={len(base)} episodes, excluded={sorted(excluded)})."
+        )
+    return kept
+
+
+def aggregate_selected_stats(
+    meta: "LeRobotDatasetMetadata",
+    episodes: list[int] | None = None,
+    excluded_episodes: list[int] | None = None,
+) -> dict[str, dict[str, np.ndarray]]:
+    """Per-feature stats aggregated over the SELECTED episodes.
+
+    Falls back to ``meta.stats`` (the full-dataset aggregate) when no selection
+    is active, or when the dataset predates per-episode stats (v2.0, which has
+    nothing to recompute from). Mirrors the propagation done in
+    ``LeRobotDataset.__init__`` so off-line consumers (the FAST/BPE tokenizer
+    fit, the norm-distribution diagnostic) normalize over the same episodes the
+    policy trains on.
+    """
+    selected = resolve_selected_episodes(
+        meta.episodes, episodes, excluded_episodes, getattr(meta, "repo_id", "")
+    )
+    if selected is None or meta._version < packaging.version.parse("v2.1"):
+        return meta.stats
+    return aggregate_stats([meta.episodes_stats[ep_idx] for ep_idx in selected])
+
+
 class LeRobotDataset(BaseDataset):
     """Main dataset class for loading and managing robot learning data.
 
@@ -1195,6 +1248,7 @@ class LeRobotDataset(BaseDataset):
         repo_id: str,
         root: str | Path | None = None,
         episodes: list[int] | None = None,
+        excluded_episodes: list[int] | None = None,
         image_transforms: Callable | None = None,
         delta_timestamps: dict[str, np.ndarray | list[float]] | None = None,
         delta_timestamps_std: dict[str, np.ndarray | list[float]] | None = None,
@@ -1297,6 +1351,9 @@ class LeRobotDataset(BaseDataset):
                 '~/.cache/huggingface/opentau'.
             episodes (list[int] | None, optional): If specified, this will only load episodes specified by
                 their episode_index in this list. Defaults to None.
+            excluded_episodes (list[int] | None, optional): Episode indices to drop. Takes precedence over
+                ``episodes`` (an index present in both is excluded); when ``episodes`` is None the denylist
+                is applied to the full episode list. Defaults to None.
             image_transforms (Callable | None, optional): You can pass standard v2 image transforms from
                 torchvision.transforms.v2 here which will be applied to visual modalities (whether they come
                 from videos or images). Defaults to None.
@@ -1452,9 +1509,34 @@ class LeRobotDataset(BaseDataset):
                 self.repo_id,
             )
 
+        # Resolve the effective episode set: `(episodes or all) - excluded`,
+        # with `excluded_episodes` taking precedence (see
+        # `resolve_selected_episodes`). Done before the stats block below so the
+        # selected-episode aggregate — and the frames actually loaded — exclude
+        # the denied set.
+        selected = resolve_selected_episodes(
+            self.meta.episodes, self.episodes, excluded_episodes, self.repo_id
+        )
+        if selected is not None:
+            self.episodes = selected
+            # An explicit subset now exists, so download only the kept episodes.
+            self._episodes_were_specified = True
+
         if self.episodes is not None and self.meta._version >= packaging.version.parse("v2.1"):
-            episodes_stats = [self.meta.episodes_stats[ep_idx] for ep_idx in self.episodes]
-            self.stats = aggregate_stats(episodes_stats)
+            self.stats = aggregate_stats([self.meta.episodes_stats[ep_idx] for ep_idx in self.episodes])
+            # Propagate the selected-episode aggregate onto the metadata so the
+            # mixture normalizer (which pools `ds.meta.stats`) reflects the
+            # episodes actually trained on, not the full on-disk dataset.
+            # Out-of-selection / denylisted episodes otherwise poison the
+            # normalization std. The ImageNet camera override in
+            # datasets/factory.py runs afterward and layers onto this same dict.
+            # (v2.0 datasets have no per-episode stats, so this block is skipped
+            # and meta.stats stays the global aggregate.) This intentionally
+            # aliases `self.stats` and `self.meta.stats` to one object; nothing
+            # reads the `LeRobotDataset.stats` attribute for normalization, so
+            # the shared reference (later padded in place by the mixture) is
+            # benign.
+            self.meta.stats = self.stats
 
         if self.episodes is None:
             self.episodes = list(self.meta.episodes)

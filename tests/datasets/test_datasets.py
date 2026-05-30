@@ -22,6 +22,7 @@ from importlib import import_module
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import packaging.version
 import pytest
 import torch
 from PIL import Image
@@ -143,6 +144,228 @@ def test_dataset_no_episodes_loads_all(tmp_path, lerobot_dataset_factory):
     )
     assert dataset.episodes == [0, 1, 2, 3]
     _assert_episode_row_alignment(dataset)
+
+
+# ---------------------------------------------------------------------------
+# excluded_episodes denylist + selected-episode normalization stats
+# ---------------------------------------------------------------------------
+
+
+def test_excluded_episodes_trims_from_full_set(tmp_path, lerobot_dataset_factory):
+    """excluded_episodes with episodes=None drops the denied indices from the full list."""
+    dataset = lerobot_dataset_factory(
+        root=tmp_path / "test",
+        repo_id=DUMMY_REPO_ID,
+        total_episodes=5,
+        total_frames=250,
+        excluded_episodes=[1, 3],
+    )
+    assert dataset.episodes == [0, 2, 4]
+    # An explicit subset now exists, so subsequent downloads target only the kept set.
+    assert dataset._episodes_were_specified is True
+    _assert_episode_row_alignment(dataset)
+
+
+def test_excluded_episodes_takes_precedence_over_episodes(tmp_path, lerobot_dataset_factory):
+    """An index present in both `episodes` and `excluded_episodes` is excluded."""
+    dataset = lerobot_dataset_factory(
+        root=tmp_path / "test",
+        repo_id=DUMMY_REPO_ID,
+        total_episodes=5,
+        total_frames=250,
+        episodes=[0, 1, 2],
+        excluded_episodes=[1],
+    )
+    assert dataset.episodes == [0, 2]
+    _assert_episode_row_alignment(dataset)
+
+
+def test_excluded_episodes_none_is_noop(tmp_path, lerobot_dataset_factory):
+    """excluded_episodes=None leaves the selection untouched."""
+    dataset = lerobot_dataset_factory(
+        root=tmp_path / "test",
+        repo_id=DUMMY_REPO_ID,
+        total_episodes=4,
+        total_frames=200,
+        episodes=[1, 2],
+        excluded_episodes=None,
+    )
+    assert dataset.episodes == [1, 2]
+
+
+def test_excluded_episodes_emptying_selection_raises(tmp_path, lerobot_dataset_factory):
+    """Denylisting every selected episode is a config error, not a silent empty dataset."""
+    with pytest.raises(ValueError, match="excluded_episodes removed every episode"):
+        lerobot_dataset_factory(
+            root=tmp_path / "test",
+            repo_id=DUMMY_REPO_ID,
+            total_episodes=4,
+            total_frames=200,
+            episodes=[0, 1],
+            excluded_episodes=[0, 1],
+        )
+
+
+def _corrupt_state_std(episodes_stats: dict, ep_idx: int, value: float = 1000.0) -> None:
+    """Inflate one episode's ``state`` std in-place to simulate a corrupt episode."""
+    std = episodes_stats[ep_idx]["stats"]["state"]["std"]
+    episodes_stats[ep_idx]["stats"]["state"]["std"] = [float(value)] * len(std)
+
+
+def test_out_of_selection_corrupt_episode_excluded_from_norm_stats(
+    tmp_path, info_factory, episodes_stats_factory, lerobot_dataset_factory
+):
+    """A corrupt episode OUTSIDE ``episodes`` must not poison the normalization stats.
+
+    Regression for the norm-head bug: the policy normalizer pools ``ds.meta.stats``,
+    which must reflect the SELECTED-episode aggregate, not the full on-disk set.
+    """
+    info = info_factory(total_episodes=3, total_frames=150, total_tasks=1)
+    episodes_stats = episodes_stats_factory(features=info["features"], total_episodes=3)
+    _corrupt_state_std(episodes_stats, ep_idx=0)  # episode 0 is out of the selection below
+
+    dataset = lerobot_dataset_factory(
+        root=tmp_path / "test",
+        repo_id=DUMMY_REPO_ID,
+        total_episodes=3,
+        total_frames=150,
+        info=info,
+        episodes_stats=episodes_stats,
+        episodes=[1, 2],
+    )
+
+    # Selected-episode aggregate is clean (stats_factory uses std=0.25) ...
+    assert np.allclose(dataset.meta.stats["state"]["std"], 0.25)
+    # ... and that selected aggregate is the exact object the mixture will read.
+    assert dataset.stats is dataset.meta.stats
+
+
+def test_corrupt_episode_inside_selection_is_inflated_without_exclusion(
+    tmp_path, info_factory, episodes_stats_factory, lerobot_dataset_factory
+):
+    """Negative control: a corrupt episode INSIDE the selection DOES inflate the std.
+
+    Guards against a false pass in the test above by proving the fixture really
+    injects a poisoned episode that aggregation would otherwise propagate.
+    """
+    info = info_factory(total_episodes=3, total_frames=150, total_tasks=1)
+    episodes_stats = episodes_stats_factory(features=info["features"], total_episodes=3)
+    _corrupt_state_std(episodes_stats, ep_idx=0)
+
+    dataset = lerobot_dataset_factory(
+        root=tmp_path / "test",
+        repo_id=DUMMY_REPO_ID,
+        total_episodes=3,
+        total_frames=150,
+        info=info,
+        episodes_stats=episodes_stats,
+        episodes=[0, 1, 2],
+    )
+    assert np.max(dataset.meta.stats["state"]["std"]) > 1.0
+
+
+def test_excluded_episodes_removes_corrupt_in_selection_from_norm_stats(
+    tmp_path, info_factory, episodes_stats_factory, lerobot_dataset_factory
+):
+    """A corrupt episode inside ``episodes`` can be denylisted to clean the norm stats.
+
+    This is the OpenTau-side mechanism for dropping corrupt-in-selection episodes
+    without editing the data-side episode selection.
+    """
+    info = info_factory(total_episodes=3, total_frames=150, total_tasks=1)
+    episodes_stats = episodes_stats_factory(features=info["features"], total_episodes=3)
+    _corrupt_state_std(episodes_stats, ep_idx=0)
+
+    dataset = lerobot_dataset_factory(
+        root=tmp_path / "test",
+        repo_id=DUMMY_REPO_ID,
+        total_episodes=3,
+        total_frames=150,
+        info=info,
+        episodes_stats=episodes_stats,
+        episodes=[0, 1, 2],
+        excluded_episodes=[0],
+    )
+    assert dataset.episodes == [1, 2]
+    assert np.allclose(dataset.meta.stats["state"]["std"], 0.25)
+
+
+# --- shared selection helpers (also used by fit_fast_tokenizer / diagnose_norm_distribution) ---
+
+
+def test_resolve_selected_episodes_precedence_and_none():
+    from opentau.datasets.lerobot_dataset import resolve_selected_episodes
+
+    # No selection at all -> None ("use everything").
+    assert resolve_selected_episodes([0, 1, 2], None, None) is None
+    # episodes only -> sorted copy.
+    assert resolve_selected_episodes([0, 1, 2, 3], [3, 1], None) == [1, 3]
+    # excluded_episodes only -> full set minus denylist.
+    assert resolve_selected_episodes([0, 1, 2, 3], None, [1, 3]) == [0, 2]
+    # both -> excluded wins on overlap.
+    assert resolve_selected_episodes([0, 1, 2, 3], [0, 1, 2], [1]) == [0, 2]
+    # excluding an index absent from the base is a no-op.
+    assert resolve_selected_episodes([0, 1, 2], [0, 1], [99]) == [0, 1]
+    # an empty denylist behaves like None (no-op), preserving the episodes arg.
+    assert resolve_selected_episodes([0, 1, 2], [0, 1], []) == [0, 1]
+    assert resolve_selected_episodes([0, 1, 2], None, []) is None
+
+
+def test_resolve_selected_episodes_empty_raises():
+    from opentau.datasets.lerobot_dataset import resolve_selected_episodes
+
+    with pytest.raises(ValueError, match="excluded_episodes removed every episode"):
+        resolve_selected_episodes([0, 1], [0, 1], [0, 1], repo_id="x/y")
+
+
+class _StubMeta:
+    """Minimal duck-typed stand-in for LeRobotDatasetMetadata."""
+
+    def __init__(self, version: str, episodes_stats: dict, stats: dict, repo_id: str = "stub/repo"):
+        self.repo_id = repo_id
+        self.episodes_stats = episodes_stats
+        self.episodes = list(episodes_stats)
+        self.stats = stats
+        self._version = packaging.version.parse(version)
+
+
+def _state_stat(std: float, dim: int = 2) -> dict:
+    return {
+        "state": {
+            "min": np.zeros(dim, dtype=np.float32),
+            "max": np.ones(dim, dtype=np.float32),
+            "mean": np.full(dim, 0.5, dtype=np.float32),
+            "std": np.full(dim, float(std), dtype=np.float32),
+            "count": np.array([10]),
+        }
+    }
+
+
+def test_aggregate_selected_stats_v21_excludes_unselected():
+    from opentau.datasets.lerobot_dataset import aggregate_selected_stats
+
+    ep_stats = {0: _state_stat(1000.0), 1: _state_stat(0.25), 2: _state_stat(0.25)}
+    meta = _StubMeta("v2.1", ep_stats, stats=_state_stat(999.0))  # global stats poisoned
+    out = aggregate_selected_stats(meta, episodes=[1, 2])
+    assert np.allclose(out["state"]["std"], 0.25)
+
+
+def test_aggregate_selected_stats_no_selection_returns_meta_stats():
+    from opentau.datasets.lerobot_dataset import aggregate_selected_stats
+
+    sentinel = _state_stat(0.5)
+    meta = _StubMeta("v2.1", {0: _state_stat(0.25)}, stats=sentinel)
+    # No selection -> the global aggregate object is returned verbatim (no recompute).
+    assert aggregate_selected_stats(meta, episodes=None, excluded_episodes=None) is sentinel
+
+
+def test_aggregate_selected_stats_v20_falls_back_to_meta_stats():
+    from opentau.datasets.lerobot_dataset import aggregate_selected_stats
+
+    sentinel = _state_stat(0.5)
+    # v2.0 has no usable per-episode stats; a selection cannot recompute -> fallback.
+    meta = _StubMeta("v2.0", {0: _state_stat(1000.0), 1: _state_stat(0.25)}, stats=sentinel)
+    assert aggregate_selected_stats(meta, episodes=[1]) is sentinel
 
 
 def test_download_files_skips_present_files(tmp_path, lerobot_dataset_factory):
