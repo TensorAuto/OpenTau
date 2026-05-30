@@ -129,11 +129,15 @@ libero = [
     "robosuite==1.4.0",
     "thop==0.1.1.post2209072238",
     "mujoco>=3.3.5",
-    "PyOpenGL==3.1.7",
+    # pyopengl-accelerate ships a Cython C-extension compiled against a specific
+    # numpy ABI: the 3.1.7 wheels are numpy-1 only and crash with "numpy.dtype
+    # size changed" under numpy 2.x (hit on the libero osmesa render path). 3.1.9+
+    # ship wheels rebuilt against numpy 2; keep PyOpenGL pinned in lockstep.
+    "PyOpenGL==3.1.10",
     "libero",
-    "pyopengl-accelerate==3.1.7 ; sys_platform == 'linux'",
+    "pyopengl-accelerate==3.1.10 ; sys_platform == 'linux'",
     "mujoco>=3.1.6 ; sys_platform == 'linux'",
-    "pyopengl==3.1.7 ; sys_platform == 'linux'",
+    "pyopengl==3.1.10 ; sys_platform == 'linux'",
 ]
 urdf = [
     "rerun-sdk>=0.28.2",
