@@ -195,29 +195,61 @@ def test_backward_matches_autograd_reference(pattern, head_dim):
     torch.testing.assert_close(dv * kmask, vr.grad * kmask, atol=1e-3, rtol=1e-3)
 
 
-@require_cuda
-@pytest.mark.gpu
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_bf16_fp16_matches_sdpa(dtype):
-    if not flash_attn_cuda.is_available():
-        pytest.skip(f"flash_cuda kernel unavailable: {flash_attn_cuda.load_error()}")
-    torch.manual_seed(0)
-    b, sq, h, hkv, d = 2, 64, 8, 1, 256
-    q_blk, k_blk, q_valid, k_valid = _make_blocks(b, sq, "cuda", "prefixlm")
-    scale = d**-0.5
-    q = torch.randn(b, sq, h, d, device="cuda", dtype=dtype)
-    k = torch.randn(b, sq, hkv, d, device="cuda", dtype=dtype)
-    v = torch.randn(b, sq, hkv, d, device="cuda", dtype=dtype)
-
-    out = flash_attn_blockmask(q, k, v, q_blk, k_blk, q_valid, k_valid, scale).float()
-    # sdpa reference with the same dense mask + GQA expansion
+def _sdpa_ref(q, k, v, q_blk, k_blk, q_valid, k_valid, scale):
+    h, hkv = q.shape[2], k.shape[2]
     mask = _dense_mask(q_blk, k_blk, q_valid, k_valid)[:, None]
     qf = q.permute(0, 2, 1, 3)
     kf = k.permute(0, 2, 1, 3).repeat_interleave(h // hkv, dim=1)
     vf = v.permute(0, 2, 1, 3).repeat_interleave(h // hkv, dim=1)
     ref = torch.nn.functional.scaled_dot_product_attention(qf, kf, vf, attn_mask=mask, scale=scale)
-    ref = ref.permute(0, 2, 1, 3).float()
-    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+    return ref.permute(0, 2, 1, 3).float()
+
+
+# Exercise the Tensor Core (WMMA) path (fp16/bf16) across head dims, GQA/MQA,
+# every mask pattern, and padding — the fp32 path uses a different (reference)
+# kernel, so WMMA needs its own coverage.
+@require_cuda
+@pytest.mark.gpu
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("pattern", ["causal", "prefixlm", "multiblock", "bidir"])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("hkv", [1, 2])
+def test_wmma_matches_sdpa(dtype, pattern, head_dim, hkv):
+    if not flash_attn_cuda.is_available():
+        pytest.skip(f"flash_cuda kernel unavailable: {flash_attn_cuda.load_error()}")
+    torch.manual_seed(0)
+    b, sq, h = 2, 70, 4
+    q_blk, k_blk, q_valid, k_valid = _make_blocks(b, sq, "cuda", pattern, pad_tail=5)
+    scale = head_dim**-0.5
+    q = torch.randn(b, sq, h, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(b, sq, hkv, head_dim, device="cuda", dtype=dtype)
+    v = torch.randn(b, sq, hkv, head_dim, device="cuda", dtype=dtype)
+
+    out = flash_attn_blockmask(q, k, v, q_blk, k_blk, q_valid, k_valid, scale).float()
+    ref = _sdpa_ref(q, k, v, q_blk, k_blk, q_valid, k_valid, scale)
+    vr = q_valid[:, :, None, None].float()
+    torch.testing.assert_close(out * vr, ref * vr, atol=2e-2, rtol=2e-2)
+
+
+@require_cuda
+@pytest.mark.gpu
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_wmma_cross_attention_non_square_matches_sdpa(dtype):
+    """Tensor Core path on the non-square expert/cross-attention layout."""
+    if not flash_attn_cuda.is_available():
+        pytest.skip(f"flash_cuda kernel unavailable: {flash_attn_cuda.load_error()}")
+    torch.manual_seed(2)
+    b, sq, h, hkv, d, cross = 2, 50, 8, 1, 256, 37
+    q_blk, k_blk, q_valid, k_valid = _make_blocks(b, sq, "cuda", "causal", cross=cross)
+    sk = cross + sq
+    scale = d**-0.5
+    q = torch.randn(b, sq, h, d, device="cuda", dtype=dtype)
+    k = torch.randn(b, sk, hkv, d, device="cuda", dtype=dtype)
+    v = torch.randn(b, sk, hkv, d, device="cuda", dtype=dtype)
+    out = flash_attn_blockmask(q, k, v, q_blk, k_blk, q_valid, k_valid, scale).float()
+    ref = _sdpa_ref(q, k, v, q_blk, k_blk, q_valid, k_valid, scale)
+    vr = q_valid[:, :, None, None].float()
+    torch.testing.assert_close(out * vr, ref * vr, atol=2e-2, rtol=2e-2)
 
 
 # --------------------------------------------------------------------------- #
