@@ -290,16 +290,29 @@ def pad_discrete_tokens(tokens: list[list[int]], max_length: int) -> tuple[np.nd
     return np.array(discrete_action_tokens), np.array(discrete_action_masks)
 
 
+# Process-local set of ``(source, key, dim)`` outlier offenders already warned
+# about, so ``_warn_state_action_outliers`` fires at most once per offender per
+# run instead of every training step. Under DDP each rank keeps its own set and
+# logs its own first occurrence (no cross-rank coordination — keeps the helper
+# rule-5 safe). Tests clear this between cases.
+_WARNED_OUTLIER_KEYS: set[tuple[object, str, int]] = set()
+
+
 def _warn_state_action_outliers(batch: dict[str, Tensor], threshold: float | None) -> None:
     """Warn when a normalized state/action feature dim exceeds ``threshold``.
 
     A normalized value far from unit scale almost always means bad
     normalization stats (e.g. near-zero std on a constant dim) or corrupt
-    data. This logs one concise ``logging.warning`` per offending tensor,
-    naming the offending ``source`` / ``episode_index`` / ``frame_index`` when
-    those provenance fields are present in the batch (they are emitted by the
-    dataset's standard data format), so a poorly-normalized dim can be traced
-    back to the dataset/frame to inspect.
+    data. This logs a concise ``logging.warning`` naming the offending
+    ``source`` / ``episode_index`` / ``frame_index`` when those provenance
+    fields are present in the batch (they are emitted by the dataset's standard
+    data format), so a poorly-normalized dim can be traced back to the
+    dataset/frame to inspect.
+
+    To avoid drowning the log when a dim is persistently out of range, each
+    ``(source, key, dim)`` offender is warned about at most once per process
+    (tracked in ``_WARNED_OUTLIER_KEYS``); a fresh offender later in the run
+    still gets its own line.
 
     Pure and log-only: it reads ``batch`` without mutating it and MUST NOT gate
     any model call on its result. Keeping it log-only keeps the ``forward``
@@ -336,24 +349,46 @@ def _warn_state_action_outliers(batch: dict[str, Tensor], threshold: float | Non
     src = batch.get("source")
     ep = batch.get("episode_index")
     fr = batch.get("frame_index")
+
+    def _per_sample(value: object, i: int) -> object:
+        if isinstance(value, list):
+            return value[i]
+        if torch.is_tensor(value):
+            return int(value[i])
+        return value
+
     for key, (per_dim_max, viol) in per_key.items():
-        n = int(viol.any(dim=-1).sum().item())
-        if n == 0:
+        # (sample, dim) coordinates of every violating entry this step.
+        coords = torch.nonzero(viol, as_tuple=False).tolist()
+        if not coords:
             continue
-        worst = int(per_dim_max.amax(dim=-1).argmax().item())
-        worst_dims = torch.nonzero(viol[worst], as_tuple=False).flatten().tolist()
+        # Index on CPU once so the per-offender lookups below don't each sync.
+        pdm = per_dim_max.detach().cpu()
+        # Keep only offenders not yet warned about, deduped per (source, key, dim).
+        fresh = []
+        for s_i, d in coords:
+            tup = (_per_sample(src, s_i), key, d)
+            if tup not in _WARNED_OUTLIER_KEYS:
+                _WARNED_OUTLIER_KEYS.add(tup)
+                fresh.append((s_i, d))
+        if not fresh:
+            continue
+        # Report the worst (largest |value|) among the newly-seen offenders.
+        worst_s, worst_d = max(fresh, key=lambda sd: pdm[sd[0], sd[1]].item())
+        fresh_dims = sorted({d for _, d in fresh})
         logging.warning(
-            "Outlier normalized %s: %d/%d samples exceed |%.1f|; worst sample "
-            "dims=%s max=%.2f (source=%s episode=%s frame=%s)",
+            "Outlier normalized %s: %d new (source,dim) offender(s) exceed |%.1f|; "
+            "new dims=%s; worst dim=%d max=%.2f (source=%s episode=%s frame=%s). "
+            "Repeat warnings for these (source,dim) pairs are suppressed.",
             key,
-            n,
-            viol.shape[0],
+            len(fresh),
             threshold,
-            worst_dims,
-            float(per_dim_max[worst].max().item()),
-            src[worst] if isinstance(src, list) else src,
-            int(ep[worst]) if torch.is_tensor(ep) else ep,
-            int(fr[worst]) if torch.is_tensor(fr) else fr,
+            fresh_dims,
+            worst_d,
+            float(pdm[worst_s, worst_d]),
+            _per_sample(src, worst_s),
+            _per_sample(ep, worst_s),
+            _per_sample(fr, worst_s),
         )
 
 

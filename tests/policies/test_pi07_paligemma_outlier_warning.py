@@ -23,12 +23,21 @@ import logging
 import pytest
 import torch
 
+import opentau.policies.pi07_paligemma.low_level.modeling_pi07_low_level as pg_ll_modeling
 from opentau.policies.pi07_paligemma.low_level.modeling_pi07_low_level import (
     _warn_state_action_outliers,
 )
 
 
 class TestWarnStateActionOutliers:
+    @pytest.fixture(autouse=True)
+    def _clear_seen(self):
+        # The warn-once dedup set is module-global and persists across the
+        # process; clear it around every test so cases are order-independent.
+        pg_ll_modeling._WARNED_OUTLIER_KEYS.clear()
+        yield
+        pg_ll_modeling._WARNED_OUTLIER_KEYS.clear()
+
     def test_warns_above_threshold_state_only(self, caplog):
         batch = {"state": torch.zeros(2, 8), "actions": torch.zeros(2, 4, 8)}
         batch["state"][1, 3] = 50.0  # one outlier dim in the state
@@ -97,3 +106,31 @@ class TestWarnStateActionOutliers:
         msg = "\n".join(r.getMessage() for r in caplog.records if "Outlier" in r.getMessage())
         assert "state" in msg
         assert "dims=[7]" in msg
+
+    def test_warns_once_per_source_key_dim(self, caplog):
+        # The same (source, key, dim) offender on a later step is suppressed.
+        batch = {"state": torch.zeros(2, 8), "actions": torch.zeros(2, 4, 8)}
+        batch["state"][1, 3] = 50.0
+        with caplog.at_level(logging.WARNING):
+            _warn_state_action_outliers(batch, 10.0)
+        assert sum("Outlier" in r.getMessage() for r in caplog.records) == 1
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            _warn_state_action_outliers(batch, 10.0)
+        assert not any("Outlier" in r.getMessage() for r in caplog.records)
+
+    def test_fresh_offender_still_warns(self, caplog):
+        # A previously-unseen dim warns even after another dim was already seen.
+        batch = {"state": torch.zeros(2, 8), "actions": torch.zeros(2, 4, 8)}
+        batch["state"][1, 3] = 50.0
+        with caplog.at_level(logging.WARNING):
+            _warn_state_action_outliers(batch, 10.0)
+        caplog.clear()
+        batch["state"][1, 3] = 0.0  # old offender resolved
+        batch["state"][0, 5] = 77.0  # new offender appears
+        with caplog.at_level(logging.WARNING):
+            _warn_state_action_outliers(batch, 10.0)
+        msgs = [r.getMessage() for r in caplog.records if "Outlier" in r.getMessage()]
+        assert len(msgs) == 1
+        assert "dims=[5]" in msgs[0]
+        assert "dims=[3]" not in msgs[0]

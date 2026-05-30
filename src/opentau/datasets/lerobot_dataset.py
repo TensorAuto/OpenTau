@@ -2207,9 +2207,11 @@ class LeRobotDataset(BaseDataset):
             # BaseDataset._emit_optional_keys can apply dropout uniformly.
             ep_start = int(self.episode_data_index["from"][self.epi2idx[ep_idx]].item())
             frame_in_ep = idx - ep_start
-            # Stash the within-episode frame index so `_to_standard_data_format`
-            # can emit it as provenance (the raw item carries `episode_index`
-            # already, but not the within-episode `frame_index`).
+            # Stash the within-episode frame offset (idx - ep_start) under
+            # `frame_index` so `_to_standard_data_format` can emit it as
+            # provenance. The raw hf row also carries a `frame_index` column;
+            # we deliberately use the recomputed offset, which stays correct
+            # even if that column is malformed.
             item["frame_index"] = frame_in_ep
             if "memory" in item:
                 item["memory_raw"] = str(item["memory"])
