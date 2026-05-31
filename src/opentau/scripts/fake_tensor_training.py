@@ -44,12 +44,18 @@ def main(args: Args):
     # ---------------------------------------------------------------
     # Everything inside this context will use FakeTensorMode
     with FakeTensorContext():
-        # Create a model in FakeTensorContext shouldn't cost real memory for model parameters.
+        # Build the layers directly on `device` rather than constructing on CPU and calling
+        # `.to(device)` afterwards. Modern torch routes Module.to() for FakeTensor params through
+        # torch.utils.swap_tensors, which rejects them ("Cannot swap t1 because it has weakref
+        # associated with it") — and it hardcodes that swap path for FakeTensors, so the
+        # set_{overwrite,swap}_module_params_on_conversion flags can't avoid it. Creating the
+        # params on `device` inside FakeTensorMode keeps them symbolic, so the huge
+        # `large_hidden_dim` weights still cost no real memory.
         model = torch.nn.Sequential(
-            torch.nn.Linear(args.dim_in, args.large_hidden_dim),
-            torch.nn.Linear(args.large_hidden_dim, args.large_hidden_dim),
-            torch.nn.Linear(args.large_hidden_dim, args.dim_out),
-        ).to(device)
+            torch.nn.Linear(args.dim_in, args.large_hidden_dim, device=device),
+            torch.nn.Linear(args.large_hidden_dim, args.large_hidden_dim, device=device),
+            torch.nn.Linear(args.large_hidden_dim, args.dim_out, device=device),
+        )
         optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
     # End of FakeTensorContext
     # ---------------------------------------------------------------
