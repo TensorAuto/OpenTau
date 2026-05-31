@@ -175,7 +175,7 @@ class PI07PaligemmaLowLevelConfig(PreTrainedConfig):
     # source/episode/frame when those batch fields are present, to point at the
     # dataset/frame to inspect. Set to 0.0 (or negative) to disable entirely and
     # skip the per-step device sync.
-    warn_outlier_threshold: float = 10.0
+    warn_outlier_threshold: float = 32.0
 
     @property
     def obs_buffer_size(self) -> int:
