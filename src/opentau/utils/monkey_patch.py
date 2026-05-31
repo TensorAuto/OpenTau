@@ -134,12 +134,21 @@ def torch_full_patch():
 
 @_run_once_only
 def torch_fake_tensor_module_to_patch():
-    """Fix torch.nn.Module.to(device) behavior in FakeTensorMode.
+    """Prefer overwriting (not in-place updating) module params on `.to()` conversion.
 
-    Without this patch, Module.to(device) is a no-op in FakeTensorMode, leading
-    to device mismatch errors. This patch enables proper device conversion.
+    Historically this flag made ``Module.to(device)`` behave sensibly in FakeTensorMode
+    (see https://github.com/pytorch/pytorch/issues/119665). On modern torch (confirmed on
+    the locked 2.10) it is no longer sufficient: ``nn.Module._apply`` hardcodes the
+    ``torch.utils.swap_tensors`` path for any ``FakeTensor`` param
+    (``... or isinstance(param, FakeTensor)``), and ``swap_tensors`` rejects them because
+    ``FakeTensorMode`` tracks them with weakrefs — neither this flag nor
+    ``set_swap_module_params_on_conversion`` can steer around it. So the supported pattern
+    is to construct modules directly on the target device inside FakeTensorMode
+    (``nn.Linear(..., device=device)``) rather than building on CPU and calling
+    ``.to(device)`` afterwards.
 
-    See https://github.com/pytorch/pytorch/issues/119665 for more details.
+    The flag is retained as a harmless, defensive default (it is a no-op for FakeTensor
+    params); it only affects the now-unused ``Module._apply`` conversion path.
     """
     torch.__future__.set_overwrite_module_params_on_conversion(True)
 
