@@ -480,3 +480,21 @@ class TestSnapWarning:
             norm({"observation.state": torch.full((1, 4), 100.0)}, idx)  # large value, but std > 0
         assert not any("zero-variance guard" in r.getMessage() for r in caplog.records)
         assert norm._snapping_possible() is False
+
+    def test_rewarns_only_on_larger_deviation(self, caplog):
+        m = 0.761
+        norm = self._norm([0.0, 0.0, 0.0, m], [1.0, 1.0, 1.0, 0.0])
+        idx = torch.zeros(1, dtype=torch.long)
+        with caplog.at_level(logging.WARNING):
+            norm({"observation.state": torch.zeros(1, 4)}, idx)  # |0 - m| = m
+        assert sum("zero-variance guard" in r.getMessage() for r in caplog.records) == 1
+        caplog.clear()
+        bigger = torch.zeros(1, 4)
+        bigger[0, 3] = -10.0  # |-10 - m| ~ 10.76 > m -> re-warns
+        with caplog.at_level(logging.WARNING):
+            norm({"observation.state": bigger}, idx)
+        assert sum("zero-variance guard" in r.getMessage() for r in caplog.records) == 1
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            norm({"observation.state": torch.zeros(1, 4)}, idx)  # |dev|=m < 10.76 -> suppressed
+        assert not any("zero-variance guard" in r.getMessage() for r in caplog.records)

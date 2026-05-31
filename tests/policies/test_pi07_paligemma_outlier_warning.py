@@ -183,3 +183,23 @@ class TestWarnStateActionOutliers:
         with caplog.at_level(logging.WARNING):
             _warn_state_action_outliers(batch, 10.0)
         assert not any("Outlier" in r.getMessage() for r in caplog.records)
+
+    # -- re-warn on a larger magnitude, not just the first occurrence ------------
+
+    def test_rewarns_only_on_larger_magnitude(self, caplog):
+        batch = {"state": torch.zeros(2, 8), "actions": torch.zeros(2, 4, 8)}
+        batch["state"][1, 3] = 50.0
+        with caplog.at_level(logging.WARNING):
+            _warn_state_action_outliers(batch, 10.0)
+        assert sum("Outlier" in r.getMessage() for r in caplog.records) == 1
+        caplog.clear()
+        batch["state"][1, 3] = 120.0  # larger than the last warned (50) -> re-warns
+        with caplog.at_level(logging.WARNING):
+            _warn_state_action_outliers(batch, 10.0)
+        msgs = [r.getMessage() for r in caplog.records if "Outlier" in r.getMessage()]
+        assert len(msgs) == 1 and "max=120.00" in msgs[0]
+        caplog.clear()
+        batch["state"][1, 3] = 60.0  # smaller than the last warned (120) -> suppressed
+        with caplog.at_level(logging.WARNING):
+            _warn_state_action_outliers(batch, 10.0)
+        assert not any("Outlier" in r.getMessage() for r in caplog.records)

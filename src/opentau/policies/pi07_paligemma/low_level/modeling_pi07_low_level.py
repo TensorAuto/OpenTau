@@ -290,12 +290,12 @@ def pad_discrete_tokens(tokens: list[list[int]], max_length: int) -> tuple[np.nd
     return np.array(discrete_action_tokens), np.array(discrete_action_masks)
 
 
-# Process-local set of ``(source, key, dim)`` outlier offenders already warned
-# about, so ``_warn_state_action_outliers`` fires at most once per offender per
-# run instead of every training step. Under DDP each rank keeps its own set and
-# logs its own first occurrence (no cross-rank coordination — keeps the helper
-# rule-5 safe). Tests clear this between cases.
-_WARNED_OUTLIER_KEYS: set[tuple[object, str, int]] = set()
+# Process-local map of ``(source, key, dim)`` outlier offender -> the largest normalized
+# |value| already warned about. A pair is warned the first time it exceeds ``threshold`` and
+# again only when a strictly larger magnitude appears, so a dim that keeps getting worse is
+# resurfaced while a steady offender doesn't spam every step. Under DDP each rank keeps its own
+# map (no cross-rank coordination — keeps the helper rule-5 safe). Tests clear this between cases.
+_WARNED_OUTLIER_KEYS: dict[tuple[object, str, int], float] = {}
 
 
 def _attended_steps_mask(key: str, t: Tensor, batch: dict[str, Tensor]) -> Tensor | None:
@@ -337,7 +337,8 @@ def _warn_state_action_outliers(batch: dict[str, Tensor], threshold: float | Non
     dataset/frame to inspect.
 
     To avoid drowning the log when a dim is persistently out of range, each
-    ``(source, key, dim)`` offender is warned about at most once per process
+    ``(source, key, dim)`` offender is warned the first time it exceeds
+    ``threshold`` and again only when a strictly larger magnitude appears
     (tracked in ``_WARNED_OUTLIER_KEYS``); a fresh offender later in the run
     still gets its own line.
 
@@ -400,28 +401,36 @@ def _warn_state_action_outliers(batch: dict[str, Tensor], threshold: float | Non
             continue
         # Index on CPU once so the per-offender lookups below don't each sync.
         pdm = per_dim_max.detach().cpu()
-        # Keep only offenders not yet warned about, deduped per (source, key, dim).
-        fresh = []
+        # Aggregate to the worst |value| per (source, key, dim) in this batch (a batch can hold
+        # several samples from the same source/dim), then warn a pair the first time it trips and
+        # again only when its magnitude exceeds the largest already warned for it.
+        worst_per_tup: dict[tuple[object, str, int], tuple[float, int]] = {}
         for s_i, d in coords:
             tup = (_per_sample(src, s_i), key, d)
-            if tup not in _WARNED_OUTLIER_KEYS:
-                _WARNED_OUTLIER_KEYS.add(tup)
-                fresh.append((s_i, d))
+            val = pdm[s_i, d].item()
+            if tup not in worst_per_tup or val > worst_per_tup[tup][0]:
+                worst_per_tup[tup] = (val, s_i)
+        fresh = []  # (sample_idx, dim, value) — newly-seen or worsened offenders
+        for tup, (val, s_i) in worst_per_tup.items():
+            prev = _WARNED_OUTLIER_KEYS.get(tup)
+            if prev is None or val > prev:
+                _WARNED_OUTLIER_KEYS[tup] = val
+                fresh.append((s_i, tup[2], val))
         if not fresh:
             continue
-        # Report the worst (largest |value|) among the newly-seen offenders.
-        worst_s, worst_d = max(fresh, key=lambda sd: pdm[sd[0], sd[1]].item())
-        fresh_dims = sorted({d for _, d in fresh})
+        # Report the worst (largest |value|) among the new/worsened offenders.
+        worst_s, worst_d, worst_val = max(fresh, key=lambda x: x[2])
+        fresh_dims = sorted({d for _, d, _ in fresh})
         logging.warning(
-            "Outlier normalized %s: %d new (source,dim) offender(s) exceed |%.1f|; "
-            "new dims=%s; worst dim=%d max=%.2f (source=%s episode=%s frame=%s). "
-            "Repeat warnings for these (source,dim) pairs are suppressed.",
+            "Outlier normalized %s: %d new/worsened (source,dim) offender(s) exceed |%.1f|; "
+            "dims=%s; worst dim=%d max=%.2f (source=%s episode=%s frame=%s). "
+            "Re-warned only when a (source,dim) pair's magnitude exceeds its last warned value.",
             key,
             len(fresh),
             threshold,
             fresh_dims,
             worst_d,
-            float(pdm[worst_s, worst_d]),
+            worst_val,
             _per_sample(src, worst_s),
             _per_sample(ep, worst_s),
             _per_sample(fr, worst_s),

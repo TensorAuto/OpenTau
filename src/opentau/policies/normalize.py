@@ -40,9 +40,10 @@ EPS = 1e-8  # Small epsilon value for numerical stability in normalization
 # right, every value equals the mean, the deviation is 0, and the snap is a no-op.
 _SNAP_WARN_TOL = 1e-2  # raw-unit |value - mean| above this at a snapped dim => real deviation => warn.
 
-# ``(feature_key, dim)`` offenders already warned about, so each fires once per process
+# ``(feature_key, dim)`` snap offender -> the largest raw deviation already warned about, so a
+# pair is warned the first time it snaps and again only when a strictly larger deviation appears
 # (mirrors ``_WARNED_OUTLIER_KEYS`` in the pi07_paligemma policy).
-_WARNED_SNAP_KEYS: set[tuple[str, int]] = set()
+_WARNED_SNAP_KEYS: dict[tuple[str, int], float] = {}
 
 
 def _warn_snapped_deviation(
@@ -52,7 +53,7 @@ def _warn_snapped_deviation(
     dataset_index: Tensor,
     dataset_names: list[str] | None,
 ) -> None:
-    """Loudly warn (once per ``(key, dim)``) when the zero-variance guard changed the result.
+    """Loudly warn when the zero-variance guard changed the result (a real deviation).
 
     The guard snaps a ``std`` (or ``max - min``) of ~0 to 1. That only changes the output when
     the input *deviates* from the dim's constant ``mean`` (resp. ``min``): a genuinely-constant
@@ -75,23 +76,29 @@ def _warn_snapped_deviation(
     trigger = zero_var_mask & (deviation.abs() > _SNAP_WARN_TOL)
     if not bool(trigger.any()):
         return
-    # Collapse every axis except the trailing feature axis to get per-dim offenders. The
-    # inserted-axis count is data-dependent (see ``_gather_and_broadcast``), so a computed
-    # dim tuple is clearer here than a fixed einops pattern.
-    feat_axes = tuple(range(trigger.ndim - 1))
-    per_dim = trigger.any(dim=feat_axes) if feat_axes else trigger
-    dims = torch.nonzero(per_dim, as_tuple=False).flatten().tolist()
-    fresh = [d for d in dims if (key, d) not in _WARNED_SNAP_KEYS]
+    # Per-dim max deviation magnitude. The inserted-axis count is data-dependent (see
+    # ``_gather_and_broadcast``), so a computed dim tuple is clearer than a fixed einops pattern.
+    magnitude = deviation.abs() * trigger
+    feat_axes = tuple(range(magnitude.ndim - 1))
+    per_dim_mag = magnitude.amax(dim=feat_axes) if feat_axes else magnitude  # (dim,)
+    dims = torch.nonzero(per_dim_mag > 0, as_tuple=False).flatten().tolist()
+    # Warn a (feature, dim) the first time it snaps and again only when its deviation exceeds
+    # the largest already warned for it.
+    fresh = []
+    for d in dims:
+        val = float(per_dim_mag[d])
+        prev = _WARNED_SNAP_KEYS.get((key, d))
+        if prev is None or val > prev:
+            _WARNED_SNAP_KEYS[(key, d)] = val
+            fresh.append(d)
     if not fresh:
         return
-    for d in fresh:
-        _WARNED_SNAP_KEYS.add((key, d))
-    # Provenance: the sample with the largest deviation among the triggers.
-    magnitude = deviation.abs() * trigger
-    sample_axes = tuple(range(1, magnitude.ndim))
-    per_sample = magnitude.amax(dim=sample_axes) if sample_axes else magnitude
-    worst_sample = int(torch.argmax(per_sample))
-    worst_val = float(magnitude.max())
+    # Provenance: the worst fresh dim and the sample carrying the largest deviation there.
+    worst_d = max(fresh, key=lambda d: float(per_dim_mag[d]))
+    worst_val = float(per_dim_mag[worst_d])
+    col = magnitude.select(-1, worst_d)
+    sample_axes = tuple(range(1, col.ndim))
+    worst_sample = int(torch.argmax(col.amax(dim=sample_axes) if sample_axes else col))
     ds = None
     if dataset_names is not None:
         idx = int(dataset_index[worst_sample])
@@ -102,7 +109,7 @@ def _warn_snapped_deviation(
         "deviates from the constant by up to %.3g (raw units, dataset=%s). std was snapped to 1 "
         "so only the mean is subtracted (no ~1e8 blow-up), but this almost always means stale "
         "normalization stats or a value zeroed upstream — inspect this feature's stats. "
-        "Repeats for these (feature,dim) pairs are suppressed.",
+        "Re-warned only when a (feature,dim) pair's deviation exceeds its last warned value.",
         key,
         fresh,
         worst_val,
