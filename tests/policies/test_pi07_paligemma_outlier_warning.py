@@ -203,3 +203,19 @@ class TestWarnStateActionOutliers:
         with caplog.at_level(logging.WARNING):
             _warn_state_action_outliers(batch, 10.0)
         assert not any("Outlier" in r.getMessage() for r in caplog.records)
+
+    def test_no_mask_3d_state_scans_current_frame_only(self, caplog):
+        # With no obs_history_is_pad, the model attends the current (last) frame only, so a value
+        # in a non-current history slot is not scanned, while one in the current frame still warns.
+        batch = {"state": torch.zeros(2, 3, 8)}
+        batch["state"][0, 0, 4] = 1e6  # history slot 0 (not current), no pad mask
+        with caplog.at_level(logging.WARNING):
+            _warn_state_action_outliers(batch, 10.0)
+        assert not any("Outlier" in r.getMessage() for r in caplog.records)
+        caplog.clear()
+        batch["state"][0, 0, 4] = 0.0
+        batch["state"][1, 2, 6] = 40.0  # current (last) slot -> still warns
+        with caplog.at_level(logging.WARNING):
+            _warn_state_action_outliers(batch, 10.0)
+        msgs = [r.getMessage() for r in caplog.records if "Outlier" in r.getMessage()]
+        assert any("state" in m and "dims=[6]" in m for m in msgs)

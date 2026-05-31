@@ -301,20 +301,25 @@ _WARNED_OUTLIER_KEYS: dict[tuple[object, str, int], float] = {}
 def _attended_steps_mask(key: str, t: Tensor, batch: dict[str, Tensor]) -> Tensor | None:
     """``(B, T)`` bool of timesteps the model attends to for ``key``, or ``None`` to scan all.
 
-    Mirrors :meth:`_build_prefix_items`: ``state`` keeps the current (last) frame even when
-    ``obs_history_is_pad`` marks everything padded (the ``history_state_drop`` case, where the
-    masked history is zeroed *after* normalization downstream); ``actions`` follows
-    ``action_is_pad``. Returns ``None`` for a 2-D tensor or a missing / shape-mismatched mask,
-    so the legacy "scan every timestep" behaviour — and every existing caller/test — is
-    unchanged.
+    Mirrors :meth:`_build_prefix_items`. For ``state`` the current (last) frame is always
+    attended — including when ``obs_history_is_pad`` marks everything padded (the
+    ``history_state_drop`` case, where the masked history is zeroed *after* normalization
+    downstream) and when the mask is *absent*, where the model attends the last frame only
+    (``state_mask = zeros; [:, -1] = True``). ``actions`` follows ``action_is_pad``. Returns
+    ``None`` (scan every timestep) for a 2-D tensor, a shape-mismatched mask, or ``actions``
+    without ``action_is_pad`` — keeping every existing caller/test unchanged.
     """
     if t.ndim < 3:
         return None
     if key == "state":
         pad = batch.get("obs_history_is_pad")
-        if pad is None or pad.ndim != 2 or pad.shape[1] != t.shape[1]:
-            return None
-        keep = ~pad.bool()
+        if pad is not None and (pad.ndim != 2 or pad.shape[1] != t.shape[1]):
+            return None  # shape mismatch -> scan all (back-compat; shouldn't happen in practice)
+        if pad is None:
+            # No mask: the model attends the current frame only, so the warning must too.
+            keep = torch.zeros(t.shape[0], t.shape[1], dtype=torch.bool, device=t.device)
+        else:
+            keep = ~pad.bool()
         keep[:, -1] = True  # the current frame is always attended
         return keep
     if key == "actions":

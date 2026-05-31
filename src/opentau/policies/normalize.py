@@ -38,7 +38,12 @@ EPS = 1e-8  # Small epsilon value for numerical stability in normalization
 # that *deviates* from that "constant" can't divide by ~EPS and blow up to ~1e8 (the
 # "Outlier normalized state" failure). When the dim is truly constant and its stats are
 # right, every value equals the mean, the deviation is 0, and the snap is a no-op.
-_SNAP_WARN_TOL = 1e-2  # raw-unit |value - mean| above this at a snapped dim => real deviation => warn.
+#
+# ``_SNAP_WARN_TOL`` is the raw-unit |value - mean| above which a snapped dim counts as a real
+# deviation worth warning about. Set it <= 0 to disable the snap warning (and skip its per-step
+# host sync) entirely — mirroring the pi07_paligemma outlier warning's ``threshold <= 0``
+# off-switch. The snap itself always runs, so disabling the warning never weakens the guard.
+_SNAP_WARN_TOL = 1e-2
 
 # ``(feature_key, dim)`` snap offender -> the largest raw deviation already warned about, so a
 # pair is warned the first time it snaps and again only when a strictly larger deviation appears
@@ -381,9 +386,14 @@ class Normalize(nn.Module):
     def _snapping_possible(self) -> bool:
         """Whether any stat buffer has a zero-variance dim, so the guard could ever snap.
 
-        Cached after the first call. Lets ``forward`` skip the per-step deviation check
+        Cached after the first ``forward``. Lets ``forward`` skip the per-step deviation check
         (and its host sync) entirely on the common healthy path where no dim is constant —
         only a model that actually has a constant dim pays for the warning bookkeeping.
+
+        The cache assumes stats are finalized before the first ``forward`` (OpenTau's
+        load-then-train order); a zero-variance dim introduced by a *later* ``_inject_stats`` /
+        ``load_state_dict`` would not flip the cached value. That only affects the warning — the
+        snap itself runs unconditionally every ``forward``, so numerical safety never depends on it.
         """
         cached = getattr(self, "_snap_active", None)
         if cached is not None:
@@ -446,11 +456,13 @@ class Normalize(nn.Module):
                 std = torch.where(std_is_zero, torch.ones_like(std), std)
                 deviation = batch_val - mean
                 batch[key] = deviation / (std + EPS)
-                # Loud, once-per-(feature,dim) warning, but only when the snap actually changed
-                # the output (a real deviation from a "constant" dim). Short-circuits before the
-                # precheck under compile/ONNX so neither adds a data-dependent op to the trace.
+                # Loud warning (deduped per (feature,dim), re-fired on a larger deviation), but
+                # only when the snap actually changed the output (a real deviation from a
+                # "constant" dim). The _SNAP_WARN_TOL>0 / compile / ONNX checks short-circuit before
+                # the precheck so a disabled or traced forward adds no data-dependent op / sync.
                 if (
-                    not (torch.compiler.is_compiling() or torch.onnx.is_in_onnx_export())
+                    _SNAP_WARN_TOL > 0
+                    and not (torch.compiler.is_compiling() or torch.onnx.is_in_onnx_export())
                     and self._snapping_possible()
                 ):
                     _warn_snapped_deviation(key, std_is_zero, deviation, dataset_index, self.dataset_names)
@@ -468,7 +480,8 @@ class Normalize(nn.Module):
                 # normalize to [-1, 1]
                 batch[key] = batch[key] * 2 - 1
                 if (
-                    not (torch.compiler.is_compiling() or torch.onnx.is_in_onnx_export())
+                    _SNAP_WARN_TOL > 0
+                    and not (torch.compiler.is_compiling() or torch.onnx.is_in_onnx_export())
                     and self._snapping_possible()
                 ):
                     _warn_snapped_deviation(key, denom_is_zero, deviation, dataset_index, self.dataset_names)
