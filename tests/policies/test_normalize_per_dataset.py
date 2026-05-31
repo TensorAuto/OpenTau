@@ -7,11 +7,13 @@
 
 """Per-dataset Normalize / Unnormalize: stacked buffers indexed per sample."""
 
+import logging
+
 import pytest
 import torch
 
 from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
-from opentau.policies.normalize import EPS, Normalize, Unnormalize
+from opentau.policies.normalize import _WARNED_SNAP_KEYS, EPS, Normalize, Unnormalize
 
 
 def _build_per_dataset_stats(num_datasets: int) -> list[dict[str, dict[str, torch.Tensor]]]:
@@ -358,3 +360,123 @@ class TestResolveDatasetIndex:
         )
         with pytest.raises(KeyError, match="requires one of"):
             policy._resolve_dataset_index({"observation.state": torch.zeros(1, 2)})
+
+
+# -- zero-variance guard ----------------------------------------------------
+
+
+class TestZeroVarianceGuard:
+    """The std-snap guard keeps a value deviating from a constant (std=0) dim finite,
+    stays bit-identical for std>0 dims, and preserves the Normalize/Unnormalize round-trip."""
+
+    features = {"observation.state": PolicyFeature(type=FeatureType.STATE, shape=(4,))}
+    norm_map = {"STATE": NormalizationMode.MEAN_STD}
+
+    @staticmethod
+    def _stats(mean, std):
+        return [{"observation.state": {"mean": torch.tensor(mean), "std": torch.tensor(std)}}]
+
+    def test_deviating_value_is_bounded_not_exploded(self):
+        m = 0.761
+        norm = Normalize(
+            self.features,
+            self.norm_map,
+            per_dataset_stats=self._stats([0.0, 0.0, 0.0, m], [1.0, 1.0, 1.0, 0.0]),
+        )
+        idx = torch.zeros(1, dtype=torch.long)
+        # dim 3 is "constant" (std=0) but the fed value is 0 — i.e. it deviates from mean=m.
+        out = norm({"observation.state": torch.zeros(1, 4)}, idx)["observation.state"]
+        # Snapped: (0 - m)/(1+EPS) ~ -m, bounded. Without the guard it would be -m/EPS ~ -7.6e7.
+        torch.testing.assert_close(out[0, 3], torch.tensor(-m), atol=1e-3, rtol=0.0)
+        assert out[0, 3].abs().item() < 1.0
+        torch.testing.assert_close(out[0, :3], torch.zeros(3))
+
+    def test_matching_value_normalizes_to_zero(self):
+        m = 0.761
+        norm = Normalize(
+            self.features,
+            self.norm_map,
+            per_dataset_stats=self._stats([0.0, 0.0, 0.0, m], [1.0, 1.0, 1.0, 0.0]),
+        )
+        idx = torch.zeros(1, dtype=torch.long)
+        # The dim is genuinely constant: the fed value equals the mean -> maps to 0 (snap is a no-op).
+        out = norm({"observation.state": torch.tensor([[0.0, 0.0, 0.0, m]])}, idx)["observation.state"]
+        torch.testing.assert_close(out[0, 3], torch.tensor(0.0), atol=1e-6, rtol=0.0)
+
+    def test_nonzero_std_is_bit_identical_to_legacy(self):
+        mean = [0.0, 1.0, 2.0, 3.0]
+        std = [1.0, 2.0, 3.0, 4.0]
+        norm = Normalize(self.features, self.norm_map, per_dataset_stats=self._stats(mean, std))
+        idx = torch.zeros(2, dtype=torch.long)
+        x = torch.randn(2, 4)
+        out = norm({"observation.state": x}, idx)["observation.state"]
+        legacy = (x - torch.tensor(mean)) / (torch.tensor(std) + EPS)
+        assert torch.equal(out, legacy)  # the guard is a strict no-op for std >= EPS
+
+    def test_unnormalize_round_trips_on_zero_std_dim(self):
+        m = 0.761
+        stats = self._stats([0.0, 1.0, 2.0, m], [1.0, 2.0, 3.0, 0.0])
+        norm = Normalize(self.features, self.norm_map, per_dataset_stats=stats)
+        unnorm = Unnormalize(self.features, self.norm_map, per_dataset_stats=stats)
+        idx = torch.zeros(1, dtype=torch.long)
+        original = torch.tensor([[1.0, 2.0, 3.0, 0.5]])  # dim 3 deviates from the "constant" m
+        z = norm({"observation.state": original}, idx)["observation.state"]
+        rec = unnorm({"observation.state": z}, idx)["observation.state"]
+        torch.testing.assert_close(rec, original, atol=1e-5, rtol=1e-4)
+
+
+class TestSnapWarning:
+    """The guard warns loudly — but only when the snap actually changed the result
+    (a value deviating from a dim the stats call constant). A truly-constant dim is silent."""
+
+    features = {"observation.state": PolicyFeature(type=FeatureType.STATE, shape=(4,))}
+    norm_map = {"STATE": NormalizationMode.MEAN_STD}
+
+    @pytest.fixture(autouse=True)
+    def _clear_snap_warned(self):
+        # The once-per-process dedup set is module-global; clear it around each case.
+        _WARNED_SNAP_KEYS.clear()
+        yield
+        _WARNED_SNAP_KEYS.clear()
+
+    def _norm(self, mean, std):
+        stats = [{"observation.state": {"mean": torch.tensor(mean), "std": torch.tensor(std)}}]
+        return Normalize(self.features, self.norm_map, per_dataset_stats=stats)
+
+    def test_silent_when_value_matches_constant(self, caplog):
+        m = 0.761
+        norm = self._norm([0.0, 0.0, 0.0, m], [1.0, 1.0, 1.0, 0.0])
+        idx = torch.zeros(1, dtype=torch.long)
+        with caplog.at_level(logging.WARNING):
+            norm({"observation.state": torch.tensor([[0.0, 0.0, 0.0, m]])}, idx)
+        assert not any("zero-variance guard" in r.getMessage() for r in caplog.records)
+
+    def test_warns_once_on_deviation(self, caplog):
+        m = 0.761
+        norm = self._norm([0.0, 0.0, 0.0, m], [1.0, 1.0, 1.0, 0.0])
+        idx = torch.zeros(1, dtype=torch.long)
+        with caplog.at_level(logging.WARNING):
+            norm({"observation.state": torch.zeros(1, 4)}, idx)  # dim 3 deviates from m
+        msgs = [r.getMessage() for r in caplog.records if "zero-variance guard" in r.getMessage()]
+        assert len(msgs) == 1
+        assert "observation.state" in msgs[0]
+        assert "dim(s)=[3]" in msgs[0]
+
+    def test_deduped_across_steps(self, caplog):
+        m = 0.761
+        norm = self._norm([0.0, 0.0, 0.0, m], [1.0, 1.0, 1.0, 0.0])
+        idx = torch.zeros(1, dtype=torch.long)
+        with caplog.at_level(logging.WARNING):
+            norm({"observation.state": torch.zeros(1, 4)}, idx)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            norm({"observation.state": torch.zeros(1, 4)}, idx)  # same (feature,dim) offender again
+        assert not any("zero-variance guard" in r.getMessage() for r in caplog.records)
+
+    def test_silent_when_no_zero_variance_dim(self, caplog):
+        norm = self._norm([0.0, 1.0, 2.0, 3.0], [1.0, 2.0, 3.0, 4.0])
+        idx = torch.zeros(1, dtype=torch.long)
+        with caplog.at_level(logging.WARNING):
+            norm({"observation.state": torch.full((1, 4), 100.0)}, idx)  # large value, but std > 0
+        assert not any("zero-variance guard" in r.getMessage() for r in caplog.records)
+        assert norm._snapping_possible() is False

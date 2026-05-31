@@ -298,6 +298,33 @@ def pad_discrete_tokens(tokens: list[list[int]], max_length: int) -> tuple[np.nd
 _WARNED_OUTLIER_KEYS: set[tuple[object, str, int]] = set()
 
 
+def _attended_steps_mask(key: str, t: Tensor, batch: dict[str, Tensor]) -> Tensor | None:
+    """``(B, T)`` bool of timesteps the model attends to for ``key``, or ``None`` to scan all.
+
+    Mirrors :meth:`_build_prefix_items`: ``state`` keeps the current (last) frame even when
+    ``obs_history_is_pad`` marks everything padded (the ``history_state_drop`` case, where the
+    masked history is zeroed *after* normalization downstream); ``actions`` follows
+    ``action_is_pad``. Returns ``None`` for a 2-D tensor or a missing / shape-mismatched mask,
+    so the legacy "scan every timestep" behaviour — and every existing caller/test — is
+    unchanged.
+    """
+    if t.ndim < 3:
+        return None
+    if key == "state":
+        pad = batch.get("obs_history_is_pad")
+        if pad is None or pad.ndim != 2 or pad.shape[1] != t.shape[1]:
+            return None
+        keep = ~pad.bool()
+        keep[:, -1] = True  # the current frame is always attended
+        return keep
+    if key == "actions":
+        pad = batch.get("action_is_pad")
+        if pad is None or pad.ndim != 2 or pad.shape[1] != t.shape[1]:
+            return None
+        return ~pad.bool()
+    return None
+
+
 def _warn_state_action_outliers(batch: dict[str, Tensor], threshold: float | None) -> None:
     """Warn when a normalized state/action feature dim exceeds ``threshold``.
 
@@ -323,7 +350,10 @@ def _warn_state_action_outliers(batch: dict[str, Tensor], threshold: float | Non
     Args:
         batch: Training batch *after* input/target normalization. Reads
             ``state`` ``(B, [T,] D)`` and ``actions`` ``(B, chunk, D)``; the
-            zero-padded tail dims never trigger.
+            zero-padded tail dims never trigger. Timesteps the model does not
+            attend to (padded history via ``obs_history_is_pad`` / padded action
+            steps via ``action_is_pad``) are excluded so a masked-out frame can't
+            trip the check — the current state frame is always kept.
         threshold: Absolute-value ceiling. ``None`` or ``<= 0`` disables the
             check entirely (early return, no device sync).
     """
@@ -334,10 +364,16 @@ def _warn_state_action_outliers(batch: dict[str, Tensor], threshold: float | Non
         t = batch.get(key)
         if t is None:
             continue
-        # (B, [T|chunk,] D) -> (B, D): max |value| per feature dim. The
-        # ``b ... d`` pattern absorbs the optional middle axis (2-D state, 3-D
-        # state history, 3-D action chunk) in a single expression.
-        per_dim_max = reduce(t.detach().abs().float(), "b ... d -> b d", "max")
+        t = t.detach().abs().float()
+        # Ignore timesteps the model never attends to (padded history / padded action steps):
+        # zero them so a masked-out frame can't trip the warning. The current state frame is
+        # always kept (mirrors `_build_prefix_items`'s `state_mask[:, -1] = True`).
+        keep = _attended_steps_mask(key, t, batch)
+        if keep is not None:
+            t = t * rearrange(keep, "b t -> b t 1").to(t.dtype)
+        # (B, [T|chunk,] D) -> (B, D): max |value| per feature dim. The ``b ... d`` pattern
+        # absorbs the optional middle axis (2-D state, 3-D state history, 3-D action chunk).
+        per_dim_max = reduce(t, "b ... d -> b d", "max")
         per_key[key] = (per_dim_max, per_dim_max > threshold)
     if not per_key:
         return

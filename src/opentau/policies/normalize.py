@@ -22,6 +22,7 @@ datasets the policy was trained on. ``forward`` accepts a per-sample
 row per sample before broadcasting.
 """
 
+import logging
 import sys
 
 import numpy as np
@@ -31,6 +32,82 @@ from torch import Tensor, nn
 from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
 
 EPS = 1e-8  # Small epsilon value for numerical stability in normalization
+
+# A genuinely-zero std (|std| < EPS) marks a constant/padding feature dim. The guard in
+# ``Normalize`` / ``Unnormalize`` snaps such a std (or a zero MIN_MAX range) to 1 so a value
+# that *deviates* from that "constant" can't divide by ~EPS and blow up to ~1e8 (the
+# "Outlier normalized state" failure). When the dim is truly constant and its stats are
+# right, every value equals the mean, the deviation is 0, and the snap is a no-op.
+_SNAP_WARN_TOL = 1e-2  # raw-unit |value - mean| above this at a snapped dim => real deviation => warn.
+
+# ``(feature_key, dim)`` offenders already warned about, so each fires once per process
+# (mirrors ``_WARNED_OUTLIER_KEYS`` in the pi07_paligemma policy).
+_WARNED_SNAP_KEYS: set[tuple[str, int]] = set()
+
+
+def _warn_snapped_deviation(
+    key: str,
+    zero_var_mask: Tensor,
+    deviation: Tensor,
+    dataset_index: Tensor,
+    dataset_names: list[str] | None,
+) -> None:
+    """Loudly warn (once per ``(key, dim)``) when the zero-variance guard changed the result.
+
+    The guard snaps a ``std`` (or ``max - min``) of ~0 to 1. That only changes the output when
+    the input *deviates* from the dim's constant ``mean`` (resp. ``min``): a genuinely-constant
+    dim with correct stats has ``deviation == 0`` and stays silent. A non-trivial ``deviation``
+    means the stats are stale or the value was zeroed upstream (e.g. a dropped frame) — surface
+    the offending ``feature``/``dim`` so it can be traced.
+
+    Log-only and called behind ``Normalize._snapping_possible()``; reads tensors without
+    mutating them and fires no collective, so the ``forward`` graph stays identical across
+    ranks (CLAUDE.md rule 5).
+
+    Args:
+        key: Feature name (e.g. ``"observation.state"``).
+        zero_var_mask: Bool ``(B, *feat)`` — True where the gathered std/range was snapped.
+        deviation: ``batch_val - mean`` (MEAN_STD) or ``batch_val - min`` (MIN_MAX), the raw
+            pre-scale numerator; broadcasts against ``zero_var_mask`` onto the batch shape.
+        dataset_index: ``(B,)`` per-sample dataset row, used to name the offending dataset.
+        dataset_names: Ordered dataset names parallel to the buffer rows, or ``None``.
+    """
+    trigger = zero_var_mask & (deviation.abs() > _SNAP_WARN_TOL)
+    if not bool(trigger.any()):
+        return
+    # Collapse every axis except the trailing feature axis to get per-dim offenders. The
+    # inserted-axis count is data-dependent (see ``_gather_and_broadcast``), so a computed
+    # dim tuple is clearer here than a fixed einops pattern.
+    feat_axes = tuple(range(trigger.ndim - 1))
+    per_dim = trigger.any(dim=feat_axes) if feat_axes else trigger
+    dims = torch.nonzero(per_dim, as_tuple=False).flatten().tolist()
+    fresh = [d for d in dims if (key, d) not in _WARNED_SNAP_KEYS]
+    if not fresh:
+        return
+    for d in fresh:
+        _WARNED_SNAP_KEYS.add((key, d))
+    # Provenance: the sample with the largest deviation among the triggers.
+    magnitude = deviation.abs() * trigger
+    sample_axes = tuple(range(1, magnitude.ndim))
+    per_sample = magnitude.amax(dim=sample_axes) if sample_axes else magnitude
+    worst_sample = int(torch.argmax(per_sample))
+    worst_val = float(magnitude.max())
+    ds = None
+    if dataset_names is not None:
+        idx = int(dataset_index[worst_sample])
+        if 0 <= idx < len(dataset_names):
+            ds = dataset_names[idx]
+    logging.warning(
+        "Normalize zero-variance guard fired: feature '%s' dim(s)=%s have std≈0 but a value "
+        "deviates from the constant by up to %.3g (raw units, dataset=%s). std was snapped to 1 "
+        "so only the mean is subtracted (no ~1e8 blow-up), but this almost always means stale "
+        "normalization stats or a value zeroed upstream — inspect this feature's stats. "
+        "Repeats for these (feature,dim) pairs are suppressed.",
+        key,
+        fresh,
+        worst_val,
+        ds,
+    )
 
 
 def _materialize(tensor: Tensor) -> Tensor:
@@ -294,6 +371,35 @@ class Normalize(nn.Module):
         for key, buffer in stats_buffers.items():
             setattr(self, "buffer_" + key.replace(".", "_"), buffer)
 
+    def _snapping_possible(self) -> bool:
+        """Whether any stat buffer has a zero-variance dim, so the guard could ever snap.
+
+        Cached after the first call. Lets ``forward`` skip the per-step deviation check
+        (and its host sync) entirely on the common healthy path where no dim is constant —
+        only a model that actually has a constant dim pays for the warning bookkeeping.
+        """
+        cached = getattr(self, "_snap_active", None)
+        if cached is not None:
+            return cached
+        active = False
+        for key, ft in self.features.items():
+            norm_mode = self.norm_map.get(ft.type, NormalizationMode.IDENTITY)
+            buffer = getattr(self, "buffer_" + key.replace(".", "_"), None)
+            if buffer is None:
+                continue
+            if norm_mode is NormalizationMode.MEAN_STD:
+                std = _materialize(buffer["std"])
+                if bool((torch.isfinite(std) & (std.abs() < EPS)).any()):
+                    active = True
+                    break
+            elif norm_mode is NormalizationMode.MIN_MAX:
+                rng = _materialize(buffer["max"]) - _materialize(buffer["min"])
+                if bool((torch.isfinite(rng) & (rng.abs() < EPS)).any()):
+                    active = True
+                    break
+        self._snap_active = active
+        return active
+
     @torch.no_grad
     def forward(self, batch: dict[str, Tensor], dataset_index: Tensor) -> dict[str, Tensor]:
         """Normalizes the batch data per-sample.
@@ -327,15 +433,38 @@ class Normalize(nn.Module):
                 std = _gather_and_broadcast(_materialize(buffer["std"]), dataset_index, batch_val)
                 assert not torch.isinf(mean).any(), _no_stats_error_str("mean")
                 assert not torch.isinf(std).any(), _no_stats_error_str("std")
-                batch[key] = (batch_val - mean) / (std + EPS)
+                # Snap a genuinely-zero std (constant/padding dim) to 1 so a deviating value
+                # can't become (x - mean)/EPS ~ 1e8. std >= EPS dims stay bit-identical.
+                std_is_zero = std.abs() < EPS
+                std = torch.where(std_is_zero, torch.ones_like(std), std)
+                deviation = batch_val - mean
+                batch[key] = deviation / (std + EPS)
+                # Loud, once-per-(feature,dim) warning, but only when the snap actually changed
+                # the output (a real deviation from a "constant" dim). Short-circuits before the
+                # precheck under compile/ONNX so neither adds a data-dependent op to the trace.
+                if (
+                    not (torch.compiler.is_compiling() or torch.onnx.is_in_onnx_export())
+                    and self._snapping_possible()
+                ):
+                    _warn_snapped_deviation(key, std_is_zero, deviation, dataset_index, self.dataset_names)
             elif norm_mode is NormalizationMode.MIN_MAX:
                 min_ = _gather_and_broadcast(_materialize(buffer["min"]), dataset_index, batch_val)
                 max_ = _gather_and_broadcast(_materialize(buffer["max"]), dataset_index, batch_val)
                 assert not torch.isinf(min_).any(), _no_stats_error_str("min")
                 assert not torch.isinf(max_).any(), _no_stats_error_str("max")
-                batch[key] = (batch_val - min_) / (max_ - min_ + EPS)
+                # Snap a zero range (max == min: constant dim) to 1 — same blow-up class.
+                denom = max_ - min_
+                denom_is_zero = denom.abs() < EPS
+                denom = torch.where(denom_is_zero, torch.ones_like(denom), denom)
+                deviation = batch_val - min_
+                batch[key] = deviation / (denom + EPS)
                 # normalize to [-1, 1]
                 batch[key] = batch[key] * 2 - 1
+                if (
+                    not (torch.compiler.is_compiling() or torch.onnx.is_in_onnx_export())
+                    and self._snapping_possible()
+                ):
+                    _warn_snapped_deviation(key, denom_is_zero, deviation, dataset_index, self.dataset_names)
             else:
                 raise ValueError(norm_mode)
         return batch
@@ -402,6 +531,10 @@ class Unnormalize(nn.Module):
                 if not (torch.compiler.is_compiling() or torch.onnx.is_in_onnx_export()):
                     assert not torch.isinf(mean).any(), _no_stats_error_str("mean")
                     assert not torch.isinf(std).any(), _no_stats_error_str("std")
+                # Mirror Normalize's guard so Unnormalize(Normalize(x)) round-trips on a snapped
+                # dim: with std=1 the inverse x*(1+EPS)+mean recovers the deviation; the legacy
+                # x*EPS+mean would collapse it to ~mean. std >= EPS dims stay bit-identical.
+                std = torch.where(std.abs() < EPS, torch.ones_like(std), std)
                 batch[key] = batch_val * (std + EPS) + mean
             elif norm_mode is NormalizationMode.MIN_MAX:
                 min_ = _gather_and_broadcast(_materialize(buffer["min"]), dataset_index, batch_val)
@@ -409,8 +542,11 @@ class Unnormalize(nn.Module):
                 if not (torch.compiler.is_compiling() or torch.onnx.is_in_onnx_export()):
                     assert not torch.isinf(min_).any(), _no_stats_error_str("min")
                     assert not torch.isinf(max_).any(), _no_stats_error_str("max")
+                # Snap a zero range to 1 to mirror Normalize (keeps the round-trip exact).
+                denom = max_ - min_
+                denom = torch.where(denom.abs() < EPS, torch.ones_like(denom), denom)
                 batch[key] = (batch_val + 1) / 2
-                batch[key] = batch[key] * (max_ - min_ + EPS) + min_
+                batch[key] = batch[key] * (denom + EPS) + min_
             else:
                 raise ValueError(norm_mode)
         return batch
