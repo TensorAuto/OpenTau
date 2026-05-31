@@ -219,11 +219,16 @@ class DatasetMixtureConfig:
             ``history_interval`` attribute (defaults to 1 when the policy
             doesn't define one), so observations are sampled at timesteps
             :math:`t - (T-1)k,\; t - (T-2)k,\; \ldots,\; t`.
-        history_state_drop_prob: Probability of dropping historical frames and
-            ``observation.state`` together during a single ``__getitem__`` call
-            (zeros out ``state`` and historical camera frames; sets
-            ``obs_history_is_pad`` to all True). Must be in ``[0, 1]``. Defaults
-            to 0.3.
+        history_state_drop_prob: Probability of dropping the observation
+            *history* during a single ``__getitem__`` call. When it fires, the
+            historical steps are masked via ``obs_history_is_pad`` (set all True)
+            and the historical camera frames are zeroed; the current step —
+            current ``observation.state`` and current camera frame — is kept.
+            ``state`` is deliberately NOT zeroed here: it is MEAN_STD-normalized
+            downstream, so the dropped history is zeroed *after* normalization
+            inside the policy (zeroing a raw state pre-normalization would map
+            0 to ``-mean/std``, an out-of-distribution extreme). Must be in
+            ``[0, 1]``. Defaults to 0.3.
         subgoal_drop_prob: Probability of dropping all subgoal images during a
             single ``__getitem__`` call. Must be in ``[0, 1]``. Defaults to 0.75.
         subgoal_end_of_segment_prob: Probability of sampling the subgoal frame

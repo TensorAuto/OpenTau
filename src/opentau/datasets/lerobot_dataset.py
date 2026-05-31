@@ -951,8 +951,13 @@ class BaseDataset(torch.utils.data.Dataset):
         ``prepare_metadata`` falls through to its default-pad path).
 
         Dropout order:
-            1. ``history_state_drop_prob``: zero ``state`` and historical camera
-               frames; mark ``obs_history_is_pad`` all True.
+            1. ``history_state_drop_prob``: mark ``obs_history_is_pad`` all True
+               (the policy masks the historical steps) and zero the historical
+               camera frames. ``state`` is left intact here — the dropped history
+               is zeroed *after* normalization inside the policy's
+               ``embed_prefix``, since zeroing a raw ``state`` before MEAN_STD
+               normalization would map 0 to ``-mean/std``. The current step
+               (current state + current camera frame) is always kept.
             2. ``subgoal_drop_prob``: zero every ``subgoalK`` and set the
                single ``subgoal_is_pad`` flag to True (subgoals are all-or-none).
             3. ``response_drop_prob``: only when subgoals were NOT dropped, mask
@@ -983,10 +988,15 @@ class BaseDataset(torch.utils.data.Dataset):
                 return False
             return bool(torch.rand(()) < prob)
 
-        # (1) History + observation.state drop.
+        # (1) History drop. Mark the historical observation steps as padded via
+        # `obs_history_is_pad` (the policy masks them out) and zero the historical
+        # *camera* frames. We deliberately do NOT zero `state` here: state is
+        # MEAN_STD-normalized downstream, so zeroing a raw state would map
+        # 0 -> -mean/std (an out-of-distribution extreme). The dropped history is
+        # instead zeroed *after* normalization inside the policy's `embed_prefix`.
+        # The current step — current state and current camera frame — is kept.
         drop_hist = _roll(self.history_state_drop_prob)
         if drop_hist:
-            standard_item["state"] = torch.zeros_like(standard_item["state"])
             if self.n_obs_history is not None:
                 standard_item["obs_history_is_pad"] = torch.ones(self.n_obs_history, dtype=torch.bool)
                 if self.n_obs_history > 1:

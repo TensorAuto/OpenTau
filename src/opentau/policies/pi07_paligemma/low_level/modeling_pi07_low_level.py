@@ -921,6 +921,13 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         else:
             state_mask = torch.zeros(bsize, t_steps, dtype=torch.bool, device=device)
         state_mask[:, -1] = True
+        # Defense-in-depth: zero the (already-normalized) state at masked steps so
+        # no historical proprioception leaks even if the attention mask later
+        # regresses. The current step is preserved by `state_mask[:, -1] = True`.
+        # This runs AFTER normalize_inputs, so a masked slot becomes a clean
+        # post-norm zero — never the ill `-mean/std` that zeroing a *raw* state
+        # before normalization would produce.
+        state = state.masked_fill(rearrange(~state_mask, "b t -> b t 1"), 0.0)
         items.append(ContextItem(data=state, item_type="state", pad_mask=state_mask, attention="continue"))
 
         # Response block: gated by sample_has_response.

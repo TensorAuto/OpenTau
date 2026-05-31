@@ -196,11 +196,19 @@ class TestAllProbsZero:
 
 
 class TestForcedDropouts:
-    def test_history_drop_zeros_state(self):
+    def test_history_drop_marks_pad_keeps_state_content(self):
+        """history_state_drop marks the history padded but does NOT zero ``state``.
+
+        Zeroing a raw state would normalize to ``-mean/std`` downstream, so the
+        dropped history is instead zeroed *after* normalization inside the
+        policy. At the dataset level the state content is left intact and only
+        ``obs_history_is_pad`` flips to all-True.
+        """
         ds = _DummyBaseDataset(history_state_drop_prob=1.0)
         standard_item = _prepopulate_standard_item(ds)
+        original_state = standard_item["state"].clone()
         ds._emit_optional_keys(_raw_item(ds), standard_item)
-        assert torch.all(standard_item["state"] == 0)
+        assert torch.equal(standard_item["state"], original_state)
         assert standard_item["obs_history_is_pad"].all().item() is True
 
     def test_history_drop_zeros_historical_cameras_when_temporal(self):
@@ -225,6 +233,10 @@ class TestForcedDropouts:
             # Current frame is left intact.
             assert torch.all(standard_item[f"camera{k}"][-1] == 1)
         assert standard_item["obs_history_is_pad"].all().item() is True
+        # State is NOT zeroed at the dataset level (a raw zero would normalize to
+        # -mean/std); the dropped history is zeroed post-normalization in the
+        # policy. Every temporal state step stays intact here.
+        assert torch.all(standard_item["state"] == 1)
 
     def test_absent_subgoal_raw_marks_all_slots_padded(self):
         """If ``_load_subgoal_frames`` dropped (returned {}), every subgoal{k}

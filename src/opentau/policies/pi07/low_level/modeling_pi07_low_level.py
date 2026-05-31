@@ -1500,24 +1500,36 @@ class PI07LowLevelFlowMatching(nn.Module):
         # "State: " indicator is text → causal per paper §VI.B.
         att_masks += [1] * num_state_start_embs
 
-        # Project each timestep's state into a separate VLM token
-        # state: (B, T, max_state_dim) -> state_emb: (B, T, vlm_hidden_size)
-        state_emb = self.state_proj(state.to(dtype=_preferred_dtype()))
-        num_state_tokens = state_emb.shape[1]  # T
+        # Build the state pad mask first so masked (dropped / historical) steps
+        # can be zeroed *after* normalization but *before* projection.
+        # state: (B, T, max_state_dim); num_state_tokens == T.
+        num_state_tokens = state.shape[1]  # T
         if obs_history_is_pad is not None:
             state_mask = ~obs_history_is_pad  # (B, T) — `~` allocates a fresh tensor
         else:
             # Absent → assume all history is padded; only current step is real.
             state_mask = torch.zeros(bsize, num_state_tokens, dtype=torch.bool, device=state.device)
         # Current step (t = T-1) is ALWAYS real even when the dataset's
-        # history_state_drop_prob augmentation flips obs_history_is_pad to
-        # all-True. Without this override the policy would condition on no
-        # state at all, since attention to the current state token would be
-        # masked out — defeating the purpose of preserving the current frame.
-        # Both branches above produce fresh tensors (`~` allocates;
-        # `torch.zeros` allocates), so the `[:, -1] = True` write below does
-        # not reach the caller's `obs_history_is_pad`.
+        # history_state_drop_prob augmentation marks obs_history_is_pad all-True.
+        # Without this override the policy would condition on no state at all,
+        # since attention to the current state token would be masked out —
+        # defeating the purpose of preserving the current frame. Both branches
+        # above produce fresh tensors (`~` allocates; `torch.zeros` allocates),
+        # so the `[:, -1] = True` write below does not reach the caller's
+        # `obs_history_is_pad`.
         state_mask[:, -1] = True
+
+        # Defense-in-depth: zero the (already-normalized) state at masked steps so
+        # no historical proprioception leaks even if the attention mask later
+        # regresses. The current step is preserved by `state_mask[:, -1] = True`.
+        # This runs AFTER normalize_inputs and BEFORE state_proj, so a masked slot
+        # becomes a clean post-norm zero — never the ill `-mean/std` that zeroing a
+        # *raw* state before normalization would produce.
+        state = state.masked_fill(rearrange(~state_mask, "b t -> b t 1"), 0.0)
+
+        # Project each timestep's state into a separate VLM token
+        # state: (B, T, max_state_dim) -> state_emb: (B, T, vlm_hidden_size)
+        state_emb = self.state_proj(state.to(dtype=_preferred_dtype()))
 
         embs.append(state_emb)
         pad_masks.append(state_mask)

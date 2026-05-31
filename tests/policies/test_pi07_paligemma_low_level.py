@@ -851,6 +851,26 @@ class TestPI07PaligemmaLowLevelStateEmbedding:
         assert torch.all(state_mask[:, -1]), "current state token must be unmasked"
         assert not torch.all(state_slice[:, -1] == 0), "current state embedding should be non-zero"
 
+    def test_masked_history_state_zeroed_before_projection(self):
+        """Defense-in-depth: with history padded, the masked state steps are
+        zeroed *after* normalization and *before* ``state_proj``. The stub
+        projection has zero bias, so ``proj(0) == 0`` surfaces the masked
+        (historical) tokens as exactly-zero state embeddings while the current
+        token stays non-zero. Keeps dropped history from leaking even if the
+        attention mask regresses, and avoids the ``-mean/std`` that zeroing a
+        raw state *before* normalization would produce.
+        """
+        t = 4
+        pad = torch.ones(1, t, dtype=torch.bool)  # all-True: history_state_drop fired
+
+        (embs, _pad_masks, _att), meta = self._call_embed_prefix(n_obs_steps=t, obs_history_is_pad=pad)
+
+        state_slice = embs[:, meta["state_start"] : meta["state_end"]]
+        assert state_slice.shape == (1, t, meta["hidden_size"])
+        # Zero-bias stub proj: masked (historical) steps surface as exactly zero.
+        assert torch.all(state_slice[:, :-1] == 0), "masked history state must be zeroed pre-projection"
+        assert not torch.all(state_slice[:, -1] == 0), "current state embedding should be non-zero"
+
     def test_state_embedding_all_pad_true_matches_history_padded(self):
         """T>1 with all-True pad [True, True, True, True]: the last timestep is
         still forced unmasked by ``state_mask[:, -1] = True``, so the state mask

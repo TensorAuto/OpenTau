@@ -1657,6 +1657,44 @@ class TestStateMaskCurrentStepAlwaysReal:
             torch.tensor([[False, False, True, True], [False, True, True, True]]),
         )
 
+    def test_masked_state_zeroed_before_projection_current_preserved(self):
+        """Defense-in-depth: when history is padded, the (already-normalized)
+        state handed to ``state_proj`` is zeroed at the masked steps while the
+        current step (T-1) keeps its real value. Runs *after* normalization, so
+        a masked slot is a clean zero — never the ``-mean/std`` a pre-norm raw
+        zero would give — and dropped history cannot leak even if the attention
+        mask later regresses.
+        """
+        method = _embed_prefix_method()
+        fake = _make_fake_flow_matching()
+        bsize = 2
+        t_state = 4
+        kwargs = _build_default_inputs(batch_size=bsize, t_state=t_state)
+        # Distinct non-zero per-step values so the zeroing is observable.
+        state = torch.arange(1, bsize * t_state * 7 + 1, dtype=torch.float32).reshape(bsize, t_state, 7)
+        kwargs["state"] = state
+        kwargs["obs_history_is_pad"] = torch.ones(bsize, t_state, dtype=torch.bool)
+        kwargs["response_tokens"] = None
+        kwargs["response_masks"] = None
+        kwargs["metadata_tokens"] = None
+        kwargs["metadata_masks"] = None
+
+        # Spy on state_proj to capture the post-masking state it receives.
+        captured = {}
+
+        def _spy_state_proj(s):
+            captured["state"] = s.clone()
+            return torch.zeros(s.shape[0], s.shape[1], 4, dtype=torch.float32)
+
+        fake.state_proj = _spy_state_proj
+        method(fake, **kwargs)
+
+        seen = captured["state"]
+        # Historical steps (all but current) are zeroed post-normalization.
+        assert torch.all(seen[:, :-1] == 0)
+        # The current step keeps its real (normalized) value.
+        assert torch.equal(seen[:, -1], state[:, -1].to(seen.dtype))
+
     def test_state_mask_does_not_mutate_obs_history_is_pad(self):
         """The override path uses .clone() to avoid mutating the caller's
         ``obs_history_is_pad`` tensor (which is also threaded into

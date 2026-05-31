@@ -421,6 +421,35 @@ class TestStateMaskCurrentStepAlwaysReal:
             )
         assert (~state_mask[:, :-1]).all().item() is True
 
+    def test_masked_state_zeroed_before_projection_current_preserved(self):
+        """Defense-in-depth (pi05_mem): masked state steps are zeroed *after*
+        normalization but *before* ``state_proj``; the current step keeps its
+        real value, so dropped history cannot leak even if the attention mask
+        later regresses.
+        """
+        from opentau.policies.pi05_mem.modeling_pi05 import PI05MemFlowMatching
+
+        fake = _make_embed_prefix_stub()
+        bsize = 2
+        t_state = 4
+        kwargs = _embed_prefix_default_inputs(batch_size=bsize, t_state=t_state)
+        state = torch.arange(1, bsize * t_state * 7 + 1, dtype=torch.float32).reshape(bsize, t_state, 7)
+        kwargs["state"] = state
+        kwargs["obs_history_is_pad"] = torch.ones(bsize, t_state, dtype=torch.bool)
+
+        captured = {}
+
+        def _spy_state_proj(s):
+            captured["state"] = s.clone()
+            return torch.zeros(s.shape[0], s.shape[1], 4, dtype=torch.float32)
+
+        fake.state_proj = _spy_state_proj
+        PI05MemFlowMatching.embed_prefix(fake, **kwargs)
+
+        seen = captured["state"]
+        assert torch.all(seen[:, :-1] == 0)
+        assert torch.equal(seen[:, -1], state[:, -1].to(seen.dtype))
+
     def test_state_mask_none_branch_assumes_history_padded_keeps_current_real(self):
         """``obs_history_is_pad = None`` means the caller didn't tell us
         which slots are real. Post-fix: assume all history is padded so the
