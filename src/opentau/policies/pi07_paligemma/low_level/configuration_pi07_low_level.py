@@ -174,8 +174,11 @@ class PI07PaligemmaLowLevelConfig(PreTrainedConfig):
     # constant dim) or corrupt data. The warning names the offending
     # source/episode/frame when those batch fields are present, to point at the
     # dataset/frame to inspect. Set to 0.0 (or negative) to disable entirely and
-    # skip the per-step device sync.
-    warn_outlier_threshold: float = 10.0
+    # skip the per-step device sync. The default 32 is deliberately permissive: the failure it
+    # targets drives normalized values to ~1e8, so 32 flags those by a wide margin while
+    # tolerating benign large-but-finite dims (the zero-variance guard and pad-aware masking
+    # already remove the common false positives).
+    warn_outlier_threshold: float = 32.0
 
     @property
     def obs_buffer_size(self) -> int:

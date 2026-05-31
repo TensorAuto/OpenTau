@@ -290,12 +290,44 @@ def pad_discrete_tokens(tokens: list[list[int]], max_length: int) -> tuple[np.nd
     return np.array(discrete_action_tokens), np.array(discrete_action_masks)
 
 
-# Process-local set of ``(source, key, dim)`` outlier offenders already warned
-# about, so ``_warn_state_action_outliers`` fires at most once per offender per
-# run instead of every training step. Under DDP each rank keeps its own set and
-# logs its own first occurrence (no cross-rank coordination — keeps the helper
-# rule-5 safe). Tests clear this between cases.
-_WARNED_OUTLIER_KEYS: set[tuple[object, str, int]] = set()
+# Process-local map of ``(source, key, dim)`` outlier offender -> the largest normalized
+# |value| already warned about. A pair is warned the first time it exceeds ``threshold`` and
+# again only when a strictly larger magnitude appears, so a dim that keeps getting worse is
+# resurfaced while a steady offender doesn't spam every step. Under DDP each rank keeps its own
+# map (no cross-rank coordination — keeps the helper rule-5 safe). Tests clear this between cases.
+_WARNED_OUTLIER_KEYS: dict[tuple[object, str, int], float] = {}
+
+
+def _attended_steps_mask(key: str, t: Tensor, batch: dict[str, Tensor]) -> Tensor | None:
+    """``(B, T)`` bool of timesteps the model attends to for ``key``, or ``None`` to scan all.
+
+    Mirrors :meth:`_build_prefix_items`. For ``state`` the current (last) frame is always
+    attended — including when ``obs_history_is_pad`` marks everything padded (the
+    ``history_state_drop`` case, where the masked history is zeroed *after* normalization
+    downstream) and when the mask is *absent*, where the model attends the last frame only
+    (``state_mask = zeros; [:, -1] = True``). ``actions`` follows ``action_is_pad``. Returns
+    ``None`` (scan every timestep) for a 2-D tensor, a shape-mismatched mask, or ``actions``
+    without ``action_is_pad`` — keeping every existing caller/test unchanged.
+    """
+    if t.ndim < 3:
+        return None
+    if key == "state":
+        pad = batch.get("obs_history_is_pad")
+        if pad is not None and (pad.ndim != 2 or pad.shape[1] != t.shape[1]):
+            return None  # shape mismatch -> scan all (back-compat; shouldn't happen in practice)
+        if pad is None:
+            # No mask: the model attends the current frame only, so the warning must too.
+            keep = torch.zeros(t.shape[0], t.shape[1], dtype=torch.bool, device=t.device)
+        else:
+            keep = ~pad.bool()
+        keep[:, -1] = True  # the current frame is always attended
+        return keep
+    if key == "actions":
+        pad = batch.get("action_is_pad")
+        if pad is None or pad.ndim != 2 or pad.shape[1] != t.shape[1]:
+            return None
+        return ~pad.bool()
+    return None
 
 
 def _warn_state_action_outliers(batch: dict[str, Tensor], threshold: float | None) -> None:
@@ -310,7 +342,8 @@ def _warn_state_action_outliers(batch: dict[str, Tensor], threshold: float | Non
     dataset/frame to inspect.
 
     To avoid drowning the log when a dim is persistently out of range, each
-    ``(source, key, dim)`` offender is warned about at most once per process
+    ``(source, key, dim)`` offender is warned the first time it exceeds
+    ``threshold`` and again only when a strictly larger magnitude appears
     (tracked in ``_WARNED_OUTLIER_KEYS``); a fresh offender later in the run
     still gets its own line.
 
@@ -323,7 +356,10 @@ def _warn_state_action_outliers(batch: dict[str, Tensor], threshold: float | Non
     Args:
         batch: Training batch *after* input/target normalization. Reads
             ``state`` ``(B, [T,] D)`` and ``actions`` ``(B, chunk, D)``; the
-            zero-padded tail dims never trigger.
+            zero-padded tail dims never trigger. Timesteps the model does not
+            attend to (padded history via ``obs_history_is_pad`` / padded action
+            steps via ``action_is_pad``) are excluded so a masked-out frame can't
+            trip the check — the current state frame is always kept.
         threshold: Absolute-value ceiling. ``None`` or ``<= 0`` disables the
             check entirely (early return, no device sync).
     """
@@ -334,10 +370,16 @@ def _warn_state_action_outliers(batch: dict[str, Tensor], threshold: float | Non
         t = batch.get(key)
         if t is None:
             continue
-        # (B, [T|chunk,] D) -> (B, D): max |value| per feature dim. The
-        # ``b ... d`` pattern absorbs the optional middle axis (2-D state, 3-D
-        # state history, 3-D action chunk) in a single expression.
-        per_dim_max = reduce(t.detach().abs().float(), "b ... d -> b d", "max")
+        t = t.detach().abs().float()
+        # Ignore timesteps the model never attends to (padded history / padded action steps):
+        # zero them so a masked-out frame can't trip the warning. The current state frame is
+        # always kept (mirrors `_build_prefix_items`'s `state_mask[:, -1] = True`).
+        keep = _attended_steps_mask(key, t, batch)
+        if keep is not None:
+            t = t * rearrange(keep, "b t -> b t 1").to(t.dtype)
+        # (B, [T|chunk,] D) -> (B, D): max |value| per feature dim. The ``b ... d`` pattern
+        # absorbs the optional middle axis (2-D state, 3-D state history, 3-D action chunk).
+        per_dim_max = reduce(t, "b ... d -> b d", "max")
         per_key[key] = (per_dim_max, per_dim_max > threshold)
     if not per_key:
         return
@@ -364,28 +406,36 @@ def _warn_state_action_outliers(batch: dict[str, Tensor], threshold: float | Non
             continue
         # Index on CPU once so the per-offender lookups below don't each sync.
         pdm = per_dim_max.detach().cpu()
-        # Keep only offenders not yet warned about, deduped per (source, key, dim).
-        fresh = []
+        # Aggregate to the worst |value| per (source, key, dim) in this batch (a batch can hold
+        # several samples from the same source/dim), then warn a pair the first time it trips and
+        # again only when its magnitude exceeds the largest already warned for it.
+        worst_per_tup: dict[tuple[object, str, int], tuple[float, int]] = {}
         for s_i, d in coords:
             tup = (_per_sample(src, s_i), key, d)
-            if tup not in _WARNED_OUTLIER_KEYS:
-                _WARNED_OUTLIER_KEYS.add(tup)
-                fresh.append((s_i, d))
+            val = pdm[s_i, d].item()
+            if tup not in worst_per_tup or val > worst_per_tup[tup][0]:
+                worst_per_tup[tup] = (val, s_i)
+        fresh = []  # (sample_idx, dim, value) — newly-seen or worsened offenders
+        for tup, (val, s_i) in worst_per_tup.items():
+            prev = _WARNED_OUTLIER_KEYS.get(tup)
+            if prev is None or val > prev:
+                _WARNED_OUTLIER_KEYS[tup] = val
+                fresh.append((s_i, tup[2], val))
         if not fresh:
             continue
-        # Report the worst (largest |value|) among the newly-seen offenders.
-        worst_s, worst_d = max(fresh, key=lambda sd: pdm[sd[0], sd[1]].item())
-        fresh_dims = sorted({d for _, d in fresh})
+        # Report the worst (largest |value|) among the new/worsened offenders.
+        worst_s, worst_d, worst_val = max(fresh, key=lambda x: x[2])
+        fresh_dims = sorted({d for _, d, _ in fresh})
         logging.warning(
-            "Outlier normalized %s: %d new (source,dim) offender(s) exceed |%.1f|; "
-            "new dims=%s; worst dim=%d max=%.2f (source=%s episode=%s frame=%s). "
-            "Repeat warnings for these (source,dim) pairs are suppressed.",
+            "Outlier normalized %s: %d new/worsened (source,dim) offender(s) exceed |%.1f|; "
+            "dims=%s; worst dim=%d max=%.2f (source=%s episode=%s frame=%s). "
+            "Re-warned only when a (source,dim) pair's magnitude exceeds its last warned value.",
             key,
             len(fresh),
             threshold,
             fresh_dims,
             worst_d,
-            float(pdm[worst_s, worst_d]),
+            worst_val,
             _per_sample(src, worst_s),
             _per_sample(ep, worst_s),
             _per_sample(fr, worst_s),
