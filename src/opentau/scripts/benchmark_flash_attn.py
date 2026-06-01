@@ -23,11 +23,21 @@ but the fused kernel still completes.
 
 Honest summary of what to expect: ``flash_cuda`` reconstructs the block-causal
 mask in-kernel and never materializes the (B, H, S, S) scores/probs or the
-dense mask, so its peak attention memory is far below eager's. On raw latency it
-currently trails the cuBLAS/cuDNN-backed eager and sdpa paths at head_dim=256
-(the gap narrows at longer sequence) — closing it requires FlashAttention-2-class
-engineering (cp.async double-buffering + register-resident accumulation), tracked
-as follow-up.
+dense mask, so its peak attention memory is below eager's. Two important caveats:
+
+  * The per-op tables (forward / forward+backward) compare a SINGLE attention
+    call with NO gradient checkpointing on either side. Those large multipliers
+    are vs non-checkpointed eager, which is not the realistic training config.
+  * Realistic pi07_paligemma training uses ``gradient_checkpointing=True``,
+    which already frees eager's per-layer (B,H,S,S) scores (recomputed in
+    backward). The fair, decision-relevant comparison is the stacked-layer
+    section with checkpointing on both sides ("eager+ckpt vs flash+ckpt"), where
+    the advantage is ~2x, not 20-40x. flash composes with checkpointing too.
+
+On raw latency it currently trails the cuBLAS/cuDNN-backed eager and sdpa paths
+at head_dim=256 (the gap narrows at longer sequence) — closing it requires
+FlashAttention-2-class engineering (cp.async double-buffering + register-resident
+accumulation), tracked as follow-up.
 
 Usage:
     python -m opentau.scripts.benchmark_flash_attn
@@ -172,6 +182,56 @@ def oom_demo():
         )
 
 
+def stacked_memory_comparison(b=2, s=1024, h=8, hkv=1, d=256, layers=18):
+    """Fair full-model-style memory comparison: a stack of attention layers run
+    fwd+bwd, with and without ``torch.utils.checkpoint``, for eager vs flash.
+
+    This is the decision-relevant memory comparison (the per-op tables above
+    compare a single attention call with no checkpointing). Realistic
+    pi07_paligemma training uses ``gradient_checkpointing=True``, which already
+    frees eager's per-layer (B,H,S,S) scores by recomputing them in backward;
+    so the honest apples-to-apples is "eager+ckpt vs flash+ckpt".
+    """
+    import torch.utils.checkpoint as cp
+
+    device = "cuda"
+    (q_blk, k_blk, q_valid, k_valid), dense = _mask_and_blocks(b, s, device)
+    scale = d**-0.5
+
+    def eager_layer(x):
+        g = h // hkv
+        q = x.permute(0, 2, 1, 3).float()
+        k = x[:, :, :hkv].permute(0, 2, 1, 3).float().repeat_interleave(g, 1)
+        v = x[:, :, :hkv].permute(0, 2, 1, 3).float().repeat_interleave(g, 1)
+        aw = torch.where(dense[:, None], torch.matmul(q, k.transpose(-1, -2)) * scale, BIG_NEG)
+        return torch.matmul(torch.softmax(aw, -1), v).permute(0, 2, 1, 3).to(x.dtype)
+
+    def flash_layer(x):
+        return flash_attn_blockmask(
+            x, x[:, :, :hkv].contiguous(), x[:, :, :hkv].contiguous(), q_blk, k_blk, q_valid, k_valid, scale
+        )
+
+    def measure(layer, ckpt):
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        try:
+            x = torch.randn(b, s, h, d, device=device, dtype=torch.bfloat16, requires_grad=True)
+            for _ in range(layers):
+                x = (cp.checkpoint(layer, x, use_reentrant=False) if ckpt else layer(x)) + 1.0
+            x.sum().backward()
+            torch.cuda.synchronize()
+            return f"{torch.cuda.max_memory_allocated() / 1e9:.2f} GB"
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            return "OOM"
+
+    print(f"{layers} stacked attention layers, B{b} S{s} H{h} Hkv{hkv} D{d} bf16, fwd+bwd peak:")
+    print(f"  eager, no-ckpt : {measure(eager_layer, False)}")
+    print(f"  eager, +ckpt   : {measure(eager_layer, True)}   <- realistic training baseline")
+    print(f"  flash, no-ckpt : {measure(flash_layer, False)}")
+    print(f"  flash, +ckpt   : {measure(flash_layer, True)}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--oom-demo", action="store_true", help="run the eager-OOM-vs-flash demo")
@@ -188,6 +248,8 @@ def main():
     run(shapes, backward=False)
     print("\n=== Forward + backward ===")
     run(shapes, backward=True)
+    print("\n=== Stacked-layer memory: eager vs flash, with/without gradient checkpointing ===")
+    stacked_memory_comparison()
     if args.oom_demo:
         print("\n=== Eager-OOM vs flash (enabling win) ===")
         oom_demo()
