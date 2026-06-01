@@ -73,6 +73,18 @@ def _mask_and_blocks(b, s, device, pattern="prefixlm"):
     return (q_blk, k_blk, q_valid, k_valid), dense
 
 
+def _blocks_only(b, s, device, pattern="prefixlm"):
+    """Compact block-ids ONLY (no dense mask) — what the flash path actually uses."""
+    att = torch.zeros(b, s, dtype=torch.int32, device=device)
+    if pattern == "prefixlm":
+        att[:, s // 2] = 1
+        att[:, s // 2 + 1 :] = 1
+    elif pattern == "causal":
+        att[:] = 1
+    pad = torch.ones(b, s, dtype=torch.bool, device=device)
+    return make_att_block_ids(pad, att)
+
+
 def _eager(q, k, v, mask, scale):
     g = q.shape[2] // k.shape[2]
     qf = q.float().permute(0, 2, 1, 3)
@@ -259,20 +271,38 @@ def sdpa_backend_probe(b=1, s=4096, h=8, hkv=1, d=256):
         .repeat_interleave(g, 1)
     )
     mask = dense[:, None]
-    print(f"SDPA backend support for a block-causal bool mask (S={s}, D={d}):")
-    for name, backend in [
-        ("flash (FlashAttention)", SDPBackend.FLASH_ATTENTION),
-        ("mem-efficient", SDPBackend.EFFICIENT_ATTENTION),
-        ("math (== eager)", SDPBackend.MATH),
-    ]:
-        try:
-            with sdpa_kernel([backend]):
-                torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale)
-            torch.cuda.synchronize()
-            print(f"  {name:24s}: accepts the mask")
-        except Exception as e:  # noqa: BLE001
-            print(f"  {name:24s}: REJECTS the mask ({type(e).__name__})")
-    print("  note: every accepting backend still needs the dense (B,1,S,S) mask as input (O(S^2)).")
+    # Also build a NON-SQUARE cross-attention mask (expert pass: query len N,
+    # key len n_cross + N) — the shape pi07_paligemma's action expert uses.
+    n_cross = s // 2
+    qx = torch.randn(b, h, s, d, device=device, dtype=torch.bfloat16)
+    kx = torch.randn(b, h, n_cross + s, d, device=device, dtype=torch.bfloat16)
+    vx = torch.randn(b, h, n_cross + s, d, device=device, dtype=torch.bfloat16)
+    cross_mask = torch.ones(b, 1, s, n_cross + s, dtype=torch.bool, device=device)
+
+    def probe(qq, kk, vv, mm, label):
+        print(f"{label}:")
+        for name, backend in [
+            ("flash (FlashAttention)", SDPBackend.FLASH_ATTENTION),
+            ("mem-efficient", SDPBackend.EFFICIENT_ATTENTION),
+            ("math (== eager)", SDPBackend.MATH),
+        ]:
+            try:
+                with sdpa_kernel([backend]):
+                    torch.nn.functional.scaled_dot_product_attention(qq, kk, vv, attn_mask=mm, scale=scale)
+                torch.cuda.synchronize()
+                print(f"  {name:24s}: accepts the mask")
+            except Exception as e:  # noqa: BLE001
+                print(f"  {name:24s}: REJECTS ({type(e).__name__})")
+
+    probe(q, k, v, mask, f"SDPA backends for a SQUARE block-causal bool mask (S={s}, D={d})")
+    probe(
+        qx,
+        kx,
+        vx,
+        cross_mask,
+        f"SDPA backends for a NON-SQUARE cross-attn bool mask (Sq={s}, Sk={n_cross + s}, D={d})",
+    )
+    print("  note: every accepting backend still needs the dense (B,1,Sq,Sk) mask as input (O(Sq*Sk)).")
 
 
 def long_context_sweep(b=1, h=8, hkv=1, d=256, seqs=(4096, 8192, 16384, 32768, 65536, 98304)):
@@ -318,7 +348,7 @@ def long_context_sweep(b=1, h=8, hkv=1, d=256, seqs=(4096, 8192, 16384, 32768, 6
         q = torch.randn(b, s, h, d, device=device, dtype=torch.bfloat16)
         k = torch.randn(b, s, hkv, d, device=device, dtype=torch.bfloat16)
         v = torch.randn(b, s, hkv, d, device=device, dtype=torch.bfloat16)
-        (q_blk, k_blk, q_valid, k_valid), _ = _mask_and_blocks(b, s, device)  # compact (O(S))
+        q_blk, k_blk, q_valid, k_valid = _blocks_only(b, s, device)  # compact (O(S)), no dense mask
         mask_gb = b * s * s / 1e9  # dense bool mask bytes
 
         def eager_fn(q=q, k=k, v=v, s=s):
