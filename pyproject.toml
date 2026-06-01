@@ -165,6 +165,11 @@ extra-build-dependencies = { egl-probe = ["cmake"] }
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+# Ship the custom flash-attention CUDA source so the kernel can be JIT-compiled
+# from an installed wheel (not just an editable/source checkout).
+"opentau.policies.flash_attn_cuda" = ["_csrc/*.cu", "_csrc/*.cuh", "_csrc/*.cpp", "_csrc/*.h"]
+
 [tool.ruff]
 line-length = 110
 target-version = "py310"

@@ -189,6 +189,14 @@ class PI05MemConfig(PreTrainedConfig):
         if not isinstance(self.history_interval, int) or self.history_interval < 1:
             raise ValueError(f"`history_interval` must be a positive integer, got {self.history_interval}.")
 
+        if self.attention_implementation == "flash_cuda":
+            raise ValueError(
+                "attention_implementation='flash_cuda' is only supported by pi07_paligemma, "
+                "which builds the per-token block-ids the kernel requires. This policy does "
+                "not build them, so the kernel would hard-error at the first forward. "
+                "Use 'eager' or 'sdpa' instead."
+            )
+
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "

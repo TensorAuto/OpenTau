@@ -37,6 +37,7 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import NormalizationMode
+from opentau.policies.flash_attn_cuda import make_att_block_ids
 from opentau.policies.layers import PerGroupLinear
 from opentau.policies.normalize import Normalize, Unnormalize
 from opentau.policies.normalize import resolve_num_datasets as _num_datasets
@@ -222,6 +223,37 @@ def make_att_2d_masks(
         att_2d_masks = torch.cat((cross_att_mask, att_2d_masks), dim=2)
 
     return att_2d_masks
+
+
+def flash_cuda_active(attention_implementation: str) -> bool:
+    """True if the ``flash_cuda`` backend is selected.
+
+    No fallback: when ``flash_cuda`` is selected it is always used. If the custom
+    CUDA kernel cannot be JIT-compiled (no CUDA / no compiler), the kernel call
+    raises loudly rather than silently degrading to eager/sdpa.
+    """
+    return attention_implementation == "flash_cuda"
+
+
+def build_attention_inputs(
+    use_flash: bool,
+    pad_masks: Tensor,
+    att_masks: Tensor,
+    n_cross_att_tokens: int | None = None,
+    cross_att_pad_masks: Tensor | None = None,
+) -> tuple[Tensor | None, tuple[Tensor, ...] | None]:
+    """Return ``(attention_mask, attention_block_ids)`` for the active backend.
+
+    For the ``flash_cuda`` backend (``use_flash=True``) this builds the compact
+    block-id representation and returns ``attention_mask=None`` so the dense
+    (B, Sq, Sk) mask is never materialized. Otherwise it builds the dense mask
+    via :func:`make_att_2d_masks` and returns ``attention_block_ids=None``.
+    """
+    if use_flash:
+        block_ids = make_att_block_ids(pad_masks, att_masks, n_cross_att_tokens, cross_att_pad_masks)
+        return None, block_ids
+    mask = make_att_2d_masks(pad_masks, att_masks, n_cross_att_tokens, cross_att_pad_masks)
+    return mask, None
 
 
 def resize_with_pad(img: Tensor, width: int, height: int, pad_value: int = -1) -> Tensor:
@@ -2161,7 +2193,10 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
             prefix_items, group_index=group_index
         )
 
-        vlm_2d_attention_mask = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        use_flash = flash_cuda_active(self.config.attention_implementation)
+        vlm_2d_attention_mask, vlm_block_ids = build_attention_inputs(
+            use_flash, prefix_pad_masks, prefix_att_masks
+        )
         vlm_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
         (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
@@ -2172,6 +2207,7 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
             n_cross_att_tokens=num_cross_att_tokens,
             use_cache=False,
             fill_kv_cache=True,
+            attention_block_ids=vlm_block_ids,
         )
 
         # Now run action expert
@@ -2201,7 +2237,8 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
             suffix_items, time, group_index=group_index
         )
 
-        action_expert_2d_attention_mask = make_att_2d_masks(
+        action_expert_2d_attention_mask, action_expert_block_ids = build_attention_inputs(
+            use_flash,
             suffix_pad_masks,
             suffix_att_masks,
             n_cross_att_tokens=num_cross_att_tokens,
@@ -2226,6 +2263,7 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
             use_cache=True,
             fill_kv_cache=False,
             adarms_cond=[None, adarms_cond],
+            attention_block_ids=action_expert_block_ids,
         )
 
         # compute mse loss for velocity
@@ -2326,7 +2364,10 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        use_flash = flash_cuda_active(self.config.attention_implementation)
+        prefix_att_2d_masks, prefix_block_ids = build_attention_inputs(
+            use_flash, prefix_pad_masks, prefix_att_masks
+        )
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
         # Compute image and language key value cache
@@ -2338,6 +2379,7 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
             n_cross_att_tokens=num_cross_att_tokens,
             use_cache=False,
             fill_kv_cache=True,
+            attention_block_ids=prefix_block_ids,
         )
 
         # perform denoising steps to get the action
@@ -2391,7 +2433,9 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         )
 
         num_cross_att_tokens = prefix_pad_masks.shape[1]
-        action_expert_2d_attention_mask = make_att_2d_masks(
+        use_flash = flash_cuda_active(self.config.attention_implementation)
+        action_expert_2d_attention_mask, action_expert_block_ids = build_attention_inputs(
+            use_flash,
             suffix_pad_masks,
             suffix_att_masks,
             n_cross_att_tokens=num_cross_att_tokens,
@@ -2410,6 +2454,7 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
             use_cache=True,
             fill_kv_cache=False,
             adarms_cond=[None, adarms_cond],
+            attention_block_ids=action_expert_block_ids,
         )
         suffix_out = outputs_embeds[1]
         # Denoise the full chunk_size chunk so v_t matches x_t in the Euler step.

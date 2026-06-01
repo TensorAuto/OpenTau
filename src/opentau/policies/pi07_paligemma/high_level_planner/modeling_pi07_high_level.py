@@ -43,6 +43,10 @@ from opentau.policies.pi05.paligemma_with_expert import (
 from opentau.policies.pi07_paligemma.high_level_planner.configuration_pi07_high_level import (
     PI07HighLevelPlannerConfig,
 )
+from opentau.policies.pi07_paligemma.low_level.modeling_pi07_low_level import (
+    build_attention_inputs,
+    flash_cuda_active,
+)
 from opentau.policies.pretrained import PreTrainedPolicy, T
 from opentau.utils.accelerate_utils import get_proc_accelerator
 
@@ -1137,7 +1141,10 @@ class PI07HighLevelPlannerModel(nn.Module):
             metadata_masks,
         )
 
-        vlm_2d_attention_mask = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        use_flash = flash_cuda_active(self.config.attention_implementation)
+        vlm_2d_attention_mask, vlm_block_ids = build_attention_inputs(
+            use_flash, prefix_pad_masks, prefix_att_masks
+        )
         vlm_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
         # avoids using discrete action for predicting continuous flow matching action
@@ -1151,6 +1158,7 @@ class PI07HighLevelPlannerModel(nn.Module):
             n_cross_att_tokens=num_cross_att_tokens,
             use_cache=False,
             fill_kv_cache=True,
+            attention_block_ids=vlm_block_ids,
         )
 
         batch_size, seq_len = response_tokens.shape
@@ -1257,7 +1265,10 @@ class PI07HighLevelPlannerModel(nn.Module):
             metadata_tokens=metadata_tokens,
             metadata_masks=metadata_masks,
         )
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        use_flash = flash_cuda_active(self.config.attention_implementation)
+        prefix_att_2d_masks, prefix_block_ids = build_attention_inputs(
+            use_flash, prefix_pad_masks, prefix_att_masks
+        )
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None] - 1
@@ -1273,6 +1284,7 @@ class PI07HighLevelPlannerModel(nn.Module):
             n_cross_att_tokens=num_cross_att_tokens,
             use_cache=False,
             fill_kv_cache=True,
+            attention_block_ids=prefix_block_ids,
         )
 
         # initialize memory tokens to empty tensor for storing memory tokens during inference
@@ -1321,7 +1333,8 @@ class PI07HighLevelPlannerModel(nn.Module):
             prefix_pad_masks = torch.cat([prefix_pad_masks, pad_row], dim=1)
             prefix_att_masks = torch.cat([prefix_att_masks, new_att], dim=1)
             num_cross = prefix_pad_masks.shape[1]
-            att_2d_masks = make_att_2d_masks(
+            att_2d_masks, att_block_ids = build_attention_inputs(
+                flash_cuda_active(self.config.attention_implementation),
                 pad_row,
                 new_att,
                 n_cross_att_tokens=num_cross - 1,
@@ -1336,6 +1349,7 @@ class PI07HighLevelPlannerModel(nn.Module):
                 n_cross_att_tokens=num_cross,
                 use_cache=True,
                 fill_kv_cache=True,
+                attention_block_ids=att_block_ids,
             )
 
         # initialize response tokens to empty tensor for storing response tokens during inference
@@ -1457,7 +1471,8 @@ class PI07HighLevelPlannerModel(nn.Module):
 
         num_cross_att_tokens = prefix_pad_masks.shape[1]
         # create the attention mask for the response tokens
-        att_2d_masks = make_att_2d_masks(
+        att_2d_masks, att_block_ids = build_attention_inputs(
+            flash_cuda_active(self.config.attention_implementation),
             pad_masks,
             att_masks,
             n_cross_att_tokens=num_cross_att_tokens - 1,
@@ -1475,6 +1490,7 @@ class PI07HighLevelPlannerModel(nn.Module):
             n_cross_att_tokens=num_cross_att_tokens,
             use_cache=True,
             fill_kv_cache=True,
+            attention_block_ids=att_block_ids,
         )
 
         return (

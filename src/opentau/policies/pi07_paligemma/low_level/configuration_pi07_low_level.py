@@ -64,10 +64,15 @@ class PI07PaligemmaLowLevelConfig(PreTrainedConfig):
             normalization-head grouping). Defaults to False.
         dropout: Dropout rate. Defaults to 0.1.
         num_steps: Number of flow matching steps for decoding. Defaults to 10.
-        attention_implementation: Attention implementation to use ("eager", "sdpa", or "fa2").
-            Defaults to "eager". "sdpa" dispatches to ``torch.nn.functional.scaled_dot_product_attention``
-            (frees ~5.6 GiB on forward at the bs ceiling tested; see PR #182). "fa2" is accepted for
-            backward compatibility but logs a warning and falls back to "eager".
+        attention_implementation: Attention implementation to use ("eager", "sdpa", "fa2", or
+            "flash_cuda"). Defaults to "eager". "sdpa" dispatches to
+            ``torch.nn.functional.scaled_dot_product_attention`` (frees ~5.6 GiB on forward at the bs
+            ceiling tested; see PR #182). "fa2" is accepted for backward compatibility but logs a
+            warning and falls back to "eager". "flash_cuda" uses the custom block-causal CUDA flash
+            kernel (``opentau.policies.flash_attn_cuda``, Tensor Core forward + backward): the SxS
+            attention mask is reconstructed in-kernel from compact block-ids so it is never
+            materialized. There is no fallback — if the kernel cannot be JIT-compiled (no
+            CUDA/compiler) the forward raises rather than silently using sdpa/eager.
         freeze_vision_encoder: Whether to freeze the vision encoder during fine-tuning. Defaults to True.
         train_expert_only: Whether to train only the expert module. Defaults to False.
         optimizer_lr: Learning rate for the optimizer. Defaults to 2.5e-5.

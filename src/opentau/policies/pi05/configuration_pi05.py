@@ -184,6 +184,14 @@ class PI05Config(PreTrainedConfig):
         if self.state_type not in ("discrete", "continuous"):
             raise ValueError(f"state_type must be 'discrete' or 'continuous', got '{self.state_type}'")
 
+        if self.attention_implementation == "flash_cuda":
+            raise ValueError(
+                "attention_implementation='flash_cuda' is only supported by pi07_paligemma, "
+                "which builds the per-token block-ids the kernel requires. This policy does "
+                "not build them, so the kernel would hard-error at the first forward. "
+                "Use 'eager' or 'sdpa' instead."
+            )
+
         if self.max_delay > self.chunk_size:
             raise ValueError(
                 f"The max delay must be less than or equal to the chunk size. Got {self.max_delay} for `max_delay` and {self.chunk_size} for `chunk_size`."
