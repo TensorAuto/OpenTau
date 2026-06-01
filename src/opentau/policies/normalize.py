@@ -41,13 +41,13 @@ EPS = 1e-8  # Small epsilon value for numerical stability in normalization
 #
 # ``_SNAP_WARN_TOL`` is the raw-unit |value - mean| above which a snapped dim counts as a real
 # deviation worth warning about. Set it <= 0 to disable the snap warning (and skip its per-step
-# host sync) entirely — mirroring the pi07_paligemma outlier warning's ``threshold <= 0``
+# host sync) entirely — mirroring the state/action outlier warning's ``threshold <= 0``
 # off-switch. The snap itself always runs, so disabling the warning never weakens the guard.
 _SNAP_WARN_TOL = 1e-2
 
 # ``(feature_key, dim)`` snap offender -> the largest raw deviation already warned about, so a
 # pair is warned the first time it snaps and again only when a strictly larger deviation appears
-# (mirrors ``_WARNED_OUTLIER_KEYS`` in the pi07_paligemma policy).
+# (mirrors ``_WARNED_OUTLIER_KEYS`` in ``opentau.scripts.train``).
 _WARNED_SNAP_KEYS: dict[tuple[str, int], float] = {}
 
 

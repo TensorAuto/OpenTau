@@ -492,7 +492,7 @@ class TestPI07PaligemmaLowLevelIntegration:
         assert isinstance(loss, dict)
         assert "MSE" in loss
         assert "CE" in loss
-        assert all(v.isfinite() for v in loss.values())
+        assert all(v.isfinite() for v in loss.values() if torch.is_tensor(v))
 
         # Reset and check queue cleared.
         policy.reset()

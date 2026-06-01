@@ -509,7 +509,7 @@ class TestPI07LowLevelIntegration:
         assert isinstance(loss, dict)
         assert "MSE" in loss
         assert "CE" in loss
-        assert all(v.isfinite() for v in loss.values())
+        assert all(v.isfinite() for v in loss.values() if torch.is_tensor(v))
 
         # Reset and check queue cleared.
         policy.reset()
@@ -700,7 +700,7 @@ class TestPI07LowLevelIntegration:
         # the no-optionals layout (cross-attention offsets and position IDs both
         # consistent with the collapsed prefix).
         assert isinstance(loss, dict)
-        assert all(v.isfinite() for v in loss.values())
+        assert all(v.isfinite() for v in loss.values() if torch.is_tensor(v))
 
         # Pin the collapsed prefix length: VIDEO + LANG + state-block (state_lead
         # + N_OBS_STEPS + state-end-no-opt) + Action: + DISCRETE — no response,

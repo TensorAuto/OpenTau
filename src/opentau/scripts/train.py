@@ -42,6 +42,7 @@ from opentau.envs.utils import close_envs
 from opentau.optim.factory import make_optimizer_and_scheduler
 from opentau.optim.master_weights import MasterWeightOptimizer
 from opentau.policies.factory import make_policy
+from opentau.policies.outlier_utils import OutlierRecord
 from opentau.policies.pretrained import PreTrainedPolicy, is_norm_buffer_key
 from opentau.scripts.eval import (
     collect_grid_summary_videos,
@@ -81,6 +82,7 @@ def update_policy(
 ) -> tuple[MetricsTracker, dict]:
     policy.train()
     losses = policy.forward(batch)
+    outlier_records = losses.pop("outlier_records", [])
     loss = (
         train_config.loss_weighting["MSE"] * losses["MSE"] + train_config.loss_weighting["CE"] * losses["CE"]
     )
@@ -133,6 +135,12 @@ def update_policy(
         if "Accuracy" in losses
         else None
     )
+    # Surface the state/action outlier warning on rank 0 (and thus wandb) regardless of which rank
+    # held the offending sample. Runs on every rank (it gathers internally); gated on a rank-uniform
+    # config check so policies without the field (pi0/pi05/pi06) skip it without an NCCL mismatch.
+    outlier_threshold = getattr(accelerator.unwrap_model(policy).config, "warn_outlier_threshold", None)
+    if outlier_threshold is not None and outlier_threshold > 0:
+        log_outlier_records_distributed(accelerator, outlier_records, outlier_threshold)
     # This actually calls `.update` method of the `AverageMeter` class. This operation is not idempotent.
     # See MetricsTracker.__setattr__ for more details.
     # In other words, setting `train_metrics.loss = 1` and `train_metrics.loss = 2` consecutively results in
@@ -184,6 +192,91 @@ def _observe_optional(
     if key not in tracker.metrics:
         tracker.metrics[key] = AverageMeter(display_name, fmt)
     setattr(tracker, key, value)
+
+
+# Global cross-step dedup for the state/action outlier warning. The logger below runs the actual
+# ``logging.warning`` on rank 0 only, so this is a single GLOBAL map (``(source, key, dim)`` ->
+# largest ``|value|`` already warned) rather than the per-rank map the detector used to keep —
+# strictly better: a dim that bounces between ranks across epochs is warned once, not once per
+# rank. A pair is warned the first time it exceeds the threshold and again only when a strictly
+# larger magnitude appears.
+_WARNED_OUTLIER_KEYS: dict[tuple[object, str, int], float] = {}
+
+
+def log_outlier_records_distributed(
+    accelerator: accelerate.Accelerator,
+    local_records: list[OutlierRecord],
+    threshold: float,
+) -> None:
+    """Gather per-rank outlier records, dedup globally, and warn on rank 0.
+
+    The detector (``detect_state_action_outliers``) runs inside ``forward`` on
+    every rank but only finds offenders in that rank's local data shard. Because
+    ``wandb.init`` runs on rank 0 only and wandb captures just rank-0's console, a
+    warning logged on any other rank never reaches wandb. This collects every
+    rank's records onto rank 0 and logs there, so the warning always reaches
+    wandb regardless of which rank held the offending sample.
+
+    Rule-5 safe: the only collectives are (1) a SUM reduction of the per-rank
+    record *count* and (2) a ``gather_object`` of the records, BOTH gated on the
+    globally-reduced count so every rank takes the same branch. They run OUTSIDE
+    the ``forward`` graph (here in the training / validation loop), mirroring the
+    existing ``gather_for_metrics`` / ``gather_object`` calls.
+
+    Args:
+        accelerator: the run's ``Accelerator`` (provides the gathers + rank info).
+        local_records: this rank's outlier records for the current batch.
+        threshold: the ``|value|`` ceiling, printed in the warning message.
+    """
+    # (1) Cheap, always-run reduction so every rank agrees whether to gather. ``gather_for_metrics``
+    # all-gathers under the hood and returns the same tensor on every rank, so ``n_total`` is
+    # identical across ranks -> the branch below is rank-aligned (no NCCL mismatch).
+    n_total = int(
+        accelerator.gather_for_metrics(torch.tensor(len(local_records), device=accelerator.device))
+        .sum()
+        .item()
+    )
+    if n_total == 0:
+        return  # all ranks agree -> nobody calls gather_object -> rank-aligned
+
+    # (2) Heavier gather, only on the rare steps that actually carry an outlier. ``gather_object``
+    # concatenates every rank's list into one flat list (and returns the input unchanged when not
+    # distributed), so ``gathered`` is the union of all ranks' records.
+    gathered: list[OutlierRecord] = gather_object(local_records)
+    if not accelerator.is_main_process:
+        return
+
+    # Merge to the worst |value| per (source, key, dim) (a sample can surface on several ranks),
+    # then apply the cross-step dedup so a steady offender doesn't spam.
+    merged: dict[tuple[object, str, int], OutlierRecord] = {}
+    for rec in gathered:
+        tup = (rec["source"], rec["key"], rec["dim"])
+        if tup not in merged or rec["value"] > merged[tup]["value"]:
+            merged[tup] = rec
+    fresh_by_key: dict[str, list[OutlierRecord]] = {}
+    for tup, rec in merged.items():
+        prev = _WARNED_OUTLIER_KEYS.get(tup)
+        if prev is None or rec["value"] > prev:
+            _WARNED_OUTLIER_KEYS[tup] = rec["value"]
+            fresh_by_key.setdefault(rec["key"], []).append(rec)
+    for key, fresh in fresh_by_key.items():
+        # Report the worst (largest |value|) among the new/worsened offenders for this key.
+        worst = max(fresh, key=lambda r: r["value"])
+        fresh_dims = sorted({r["dim"] for r in fresh})
+        logging.warning(
+            "Outlier normalized %s: %d new/worsened (source,dim) offender(s) exceed |%.1f|; "
+            "dims=%s; worst dim=%d max=%.2f (source=%s episode=%s frame=%s). "
+            "Re-warned only when a (source,dim) pair's magnitude exceeds its last warned value.",
+            key,
+            len(fresh),
+            threshold,
+            fresh_dims,
+            worst["dim"],
+            worst["value"],
+            worst["source"],
+            worst["episode"],
+            worst["frame"],
+        )
 
 
 def _commit_wandb_step(accelerator: accelerate.Accelerator, step: int) -> None:
@@ -774,6 +867,7 @@ def train(cfg: TrainPipelineConfig):
                     ds_tracker = per_dataset_trackers[ds_name]
                     for batch in ds_loader:
                         losses = policy.forward(batch)
+                        outlier_records = losses.pop("outlier_records", [])
                         loss = (
                             cfg.loss_weighting["MSE"] * losses["MSE"]
                             + cfg.loss_weighting["CE"] * losses["CE"]
@@ -805,6 +899,14 @@ def train(cfg: TrainPipelineConfig):
                             if "Accuracy" in losses
                             else None
                         )
+
+                        # Warn about outliers on rank 0 too during eval (parity with training); see
+                        # ``update_policy`` for the rank-uniform gating rationale.
+                        outlier_threshold = getattr(
+                            accelerator.unwrap_model(policy).config, "warn_outlier_threshold", None
+                        )
+                        if outlier_threshold is not None and outlier_threshold > 0:
+                            log_outlier_records_distributed(accelerator, outlier_records, outlier_threshold)
 
                         if accelerator.is_main_process:
                             ds_tracker.loss = loss

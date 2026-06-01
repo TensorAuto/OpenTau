@@ -53,6 +53,7 @@ from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import NormalizationMode
 from opentau.policies.normalize import Normalize, Unnormalize
 from opentau.policies.normalize import resolve_num_datasets as _num_datasets
+from opentau.policies.outlier_utils import detect_state_action_outliers
 from opentau.policies.pi07.gemma3_with_expert import (
     Gemma3WithExpertModel,
 )
@@ -801,11 +802,13 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
 
     def forward(
         self, batch: dict[str, Tensor], noise: Tensor | None = None, time: Tensor | None = None
-    ) -> dict[str, Tensor]:
+    ) -> dict[str, Tensor | list]:
         """Training forward pass: normalize, prepare modalities, and compute losses.
 
         Returns a dict with ``"MSE"`` (flow-matching velocity loss) and
-        ``"CE"`` (discrete action cross-entropy loss).
+        ``"CE"`` (discrete action cross-entropy loss). When the
+        ``warn_outlier_threshold`` check finds offending dims, a non-empty
+        ``"outlier_records"`` list is also included for the training loop to log.
 
         Args:
             batch: Training batch dict with observations, actions, and prompts.
@@ -819,6 +822,11 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
         batch = self.normalize_inputs(batch, dataset_index)
         batch["discrete_actions"] = self.normalize_discrete_actions(dict(batch), dataset_index)["actions"]
         batch = self.normalize_targets(batch, dataset_index)
+
+        # Debug aid: detection is pure / collective-free (CLAUDE.md rule 5); the records are
+        # gathered to rank 0 and logged by the training loop so the warning always reaches wandb
+        # regardless of which rank held the offending sample.
+        outlier_records = detect_state_action_outliers(batch, self.config.warn_outlier_threshold)
 
         obs_history_is_pad = batch.get("obs_history_is_pad")
         if obs_history_is_pad is None:
@@ -861,7 +869,10 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
         mse_loss = losses["MSE"]
         ce_loss = losses["CE"]
 
-        return {"MSE": mse_loss, "CE": ce_loss}
+        out: dict[str, Tensor | list] = {"MSE": mse_loss, "CE": ce_loss}
+        if outlier_records:
+            out["outlier_records"] = outlier_records
+        return out
 
     def prepare_state(self, batch: dict[str, Tensor]) -> Tensor:
         """Prepares the temporal state tensor, padding or truncating to max_state_dim.
