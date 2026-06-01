@@ -180,6 +180,14 @@ class PI0Config(PreTrainedConfig):
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
 
+        if self.attention_implementation == "flash_cuda":
+            raise ValueError(
+                "attention_implementation='flash_cuda' is only supported by pi07_paligemma, "
+                "which builds the per-token block-ids the kernel requires. This policy does "
+                "not build them, so the kernel would hard-error at the first forward. "
+                "Use 'eager' or 'sdpa' instead."
+            )
+
         if self.n_action_steps < self.chunk_size and self.safety_buffer != 0:
             raise ValueError(
                 "A shortened execution horizon (n_action_steps < chunk_size) is not yet "
