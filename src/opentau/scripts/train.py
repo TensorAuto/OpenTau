@@ -228,13 +228,15 @@ def log_outlier_records_distributed(
         local_records: this rank's outlier records for the current batch.
         threshold: the ``|value|`` ceiling, printed in the warning message.
     """
-    # (1) Cheap, always-run reduction so every rank agrees whether to gather. ``gather_for_metrics``
-    # all-gathers under the hood and returns the same tensor on every rank, so ``n_total`` is
-    # identical across ranks -> the branch below is rank-aligned (no NCCL mismatch).
+    # (1) Cheap, always-run all-reduce so every rank agrees whether to gather. ``reduce`` returns
+    # the summed value to every rank, so ``n_total`` is identical across ranks -> the branch below
+    # is rank-aligned (no NCCL mismatch). ``reduce`` rather than ``gather_for_metrics`` on purpose:
+    # the latter trims dataloader-padding samples at end-of-loop, which could shave a per-step
+    # scalar count (harmless for alignment, but would drop the warning on the last val batch).
     n_total = int(
-        accelerator.gather_for_metrics(torch.tensor(len(local_records), device=accelerator.device))
-        .sum()
-        .item()
+        accelerator.reduce(
+            torch.tensor(len(local_records), device=accelerator.device), reduction="sum"
+        ).item()
     )
     if n_total == 0:
         return  # all ranks agree -> nobody calls gather_object -> rank-aligned
