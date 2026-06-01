@@ -232,9 +232,117 @@ def stacked_memory_comparison(b=2, s=1024, h=8, hkv=1, d=256, layers=18):
     print(f"  flash, +ckpt   : {measure(flash_layer, True)}")
 
 
+def sdpa_backend_probe(b=1, s=4096, h=8, hkv=1, d=256):
+    """Show which torch SDPA backends accept a *block-causal* attn_mask.
+
+    PyTorch's fused FlashAttention backend only supports ``is_causal`` or no
+    mask; an arbitrary block-causal mask is rejected, leaving the
+    memory-efficient or math backend. Crucially, both of those still take the
+    dense ``(B, 1, S, S)`` mask as input — O(S²) memory — whereas flash_cuda
+    reconstructs the mask from compact block-ids (O(S)).
+    """
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    device = "cuda"
+    (q_blk, k_blk, q_valid, k_valid), dense = _mask_and_blocks(b, s, device)
+    scale = d**-0.5
+    g = h // hkv
+    q = torch.randn(b, s, h, d, device=device, dtype=torch.bfloat16).permute(0, 2, 1, 3)
+    k = (
+        torch.randn(b, s, hkv, d, device=device, dtype=torch.bfloat16)
+        .permute(0, 2, 1, 3)
+        .repeat_interleave(g, 1)
+    )
+    v = (
+        torch.randn(b, s, hkv, d, device=device, dtype=torch.bfloat16)
+        .permute(0, 2, 1, 3)
+        .repeat_interleave(g, 1)
+    )
+    mask = dense[:, None]
+    print(f"SDPA backend support for a block-causal bool mask (S={s}, D={d}):")
+    for name, backend in [
+        ("flash (FlashAttention)", SDPBackend.FLASH_ATTENTION),
+        ("mem-efficient", SDPBackend.EFFICIENT_ATTENTION),
+        ("math (== eager)", SDPBackend.MATH),
+    ]:
+        try:
+            with sdpa_kernel([backend]):
+                torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale)
+            torch.cuda.synchronize()
+            print(f"  {name:24s}: accepts the mask")
+        except Exception as e:  # noqa: BLE001
+            print(f"  {name:24s}: REJECTS the mask ({type(e).__name__})")
+    print("  note: every accepting backend still needs the dense (B,1,S,S) mask as input (O(S^2)).")
+
+
+def long_context_sweep(b=1, h=8, hkv=1, d=256, seqs=(4096, 8192, 16384, 32768, 65536, 98304)):
+    """Forward peak-memory + latency vs sequence length for eager / sdpa / flash.
+
+    Demonstrates the regime flash_cuda uniquely serves: eager materializes the
+    O(S²) scores and sdpa needs the O(S²) dense mask, so both OOM as S grows;
+    flash uses compact block-ids (O(S)) and keeps running. Block-causal
+    (prefix-LM) mask, bf16.
+    """
+    device = "cuda"
+    scale = d**-0.5
+    print(f"Forward, B{b} H{h} Hkv{hkv} D{d} bf16, prefix-LM block-causal mask.")
+    print(f"{'S':>8s} {'dense mask':>10s} | {'eager':>16s} | {'sdpa':>16s} | {'flash_cuda':>16s}")
+    print(
+        f"{'':>8s} {'(B,S,S)':>10s} | {'ms / peak GB':>16s} | {'ms / peak GB':>16s} | {'ms / peak GB':>16s}"
+    )
+    print("-" * 80)
+
+    def timed(fn):
+        # returns "ms / GB" or "OOM"
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            for _ in range(2):
+                fn()
+            torch.cuda.synchronize()
+            e0 = torch.cuda.Event(enable_timing=True)
+            e1 = torch.cuda.Event(enable_timing=True)
+            e0.record()
+            for _ in range(5):
+                fn()
+            e1.record()
+            torch.cuda.synchronize()
+            ms = e0.elapsed_time(e1) / 5
+            gb = torch.cuda.max_memory_allocated() / 1e9
+            return f"{ms:7.1f} / {gb:5.1f}"
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            return "       OOM      "
+
+    for s in seqs:
+        q = torch.randn(b, s, h, d, device=device, dtype=torch.bfloat16)
+        k = torch.randn(b, s, hkv, d, device=device, dtype=torch.bfloat16)
+        v = torch.randn(b, s, hkv, d, device=device, dtype=torch.bfloat16)
+        (q_blk, k_blk, q_valid, k_valid), _ = _mask_and_blocks(b, s, device)  # compact (O(S))
+        mask_gb = b * s * s / 1e9  # dense bool mask bytes
+
+        def eager_fn(q=q, k=k, v=v, s=s):
+            _, dense = _mask_and_blocks(b, s, device)  # build dense mask here (counts against eager)
+            _eager(q, k, v, dense, scale)
+
+        def sdpa_fn(q=q, k=k, v=v, s=s):
+            _, dense = _mask_and_blocks(b, s, device)
+            _sdpa(q, k, v, dense, scale)
+
+        def flash_fn(q=q, k=k, v=v, q_blk=q_blk, k_blk=k_blk, q_valid=q_valid, k_valid=k_valid):
+            flash_attn_blockmask(q, k, v, q_blk, k_blk, q_valid, k_valid, scale)
+
+        e_res, s_res, f_res = timed(eager_fn), timed(sdpa_fn), timed(flash_fn)
+        del q, k, v
+        print(f"{s:>8d} {mask_gb:8.2f}GB | {e_res:>16s} | {s_res:>16s} | {f_res:>16s}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--oom-demo", action="store_true", help="run the eager-OOM-vs-flash demo")
+    parser.add_argument(
+        "--long-context", action="store_true", help="run the long-context sweep + SDPA backend probe"
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -253,6 +361,11 @@ def main():
     if args.oom_demo:
         print("\n=== Eager-OOM vs flash (enabling win) ===")
         oom_demo()
+    if args.long_context:
+        print("\n=== SDPA backend probe (block-causal mask) ===")
+        sdpa_backend_probe()
+        print("\n=== Long-context forward sweep: eager vs sdpa vs flash ===")
+        long_context_sweep()
 
 
 if __name__ == "__main__":
