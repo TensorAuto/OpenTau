@@ -1044,6 +1044,19 @@ std::vector<at::Tensor> flash_fwd(
   } else {
     // fp16/bf16: Tensor Core (WMMA) kernel. NW warps/block share the K/V tile.
     const size_t smem = fwd_wmma_smem(D);
+    // The WMMA forward uses a fixed NW=3 tiling whose opt-in smem (~93 KB at
+    // head_dim=256) fits sm_80/sm_86/A100 but exceeds the cap on older arches
+    // (sm_70/sm_75 = 64 KB). Check the device's opt-in limit up front so an
+    // unsupported arch raises an actionable error instead of failing opaquely
+    // at kernel launch (cudaFuncSetAttribute would silently no-op there).
+    int max_smem = 0;
+    cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, q.device().index());  // spellchecker:disable-line
+    TORCH_CHECK(
+        (int)smem <= max_smem,
+        "flash_cuda WMMA forward needs ", smem, " bytes of opt-in shared memory at head_dim=", D,
+        " but this device caps opt-in shared memory at ", max_smem,
+        " bytes. The flash_cuda forward requires sm_80+ (A100/sm_80, RTX 30xx/sm_86); "
+        "use attention_implementation='sdpa' on older arches.");
     const int rows_per_block = NW * BR_W;
     dim3 grid((Sq + rows_per_block - 1) / rows_per_block, H, B);
     dim3 block(NW * WARP);

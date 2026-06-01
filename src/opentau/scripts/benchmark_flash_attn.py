@@ -256,7 +256,7 @@ def sdpa_backend_probe(b=1, s=4096, h=8, hkv=1, d=256):
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
     device = "cuda"
-    (q_blk, k_blk, q_valid, k_valid), dense = _mask_and_blocks(b, s, device)
+    _, dense = _mask_and_blocks(b, s, device)
     scale = d**-0.5
     g = h // hkv
     q = torch.randn(b, s, h, d, device=device, dtype=torch.bfloat16).permute(0, 2, 1, 3)
