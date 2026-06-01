@@ -69,6 +69,16 @@ def is_norm_buffer_key(key: str) -> bool:
     return any(key.startswith(prefix) for prefix in NORM_BUFFER_PREFIXES)
 
 
+class ProjectionRemapError(ValueError):
+    """Raised when a per-(robot_type, control_mode) projection weight in a
+    checkpoint cannot be reconciled with the policy's current group set
+    (e.g. a per-group checkpoint loaded into a non-per-group policy, or a
+    multi-group source whose group ordering is unknown). Subclasses
+    ``ValueError`` so existing ``except ValueError`` handlers still catch it,
+    but is distinct so the load path can re-raise it past the broad
+    ``except Exception`` that otherwise swallows load errors into a warning."""
+
+
 DEFAULT_POLICY_CARD = """
 ---
 # For reference on model card metadata, see the spec: https://github.com/huggingface/hub-docs/blob/main/modelcard.md?plain=1
@@ -97,6 +107,15 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
 
     name: None
     """The name of the policy. Must be defined in subclasses."""
+
+    _PER_GROUP_PROJECTION_PREFIXES: tuple[str, ...] = ()
+    """State-dict key prefixes for per-(robot_type, control_mode) projection
+    weights (``PerGroupLinear``: ``<prefix>weight`` shaped ``(G, out, in)`` and
+    ``<prefix>bias`` shaped ``(G, out)``). Empty by default so policies without
+    per-group projections are untouched; a subclass that opts in sets the
+    prefixes of its grouped projections and the load path then reconciles a
+    checkpoint's projection rows with the policy's current group set via
+    :meth:`_remap_per_group_projection_weights_in_state_dict`."""
 
     def __init__(self, config: PreTrainedConfig, *inputs, **kwargs):
         """Initializes the PreTrainedPolicy.
@@ -654,6 +673,130 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                 len(promoted),
                 promoted[:3],
             )
+
+    def _remap_per_group_projection_weights_in_state_dict(
+        self,
+        state_dict_to_load: dict,
+        old_dataset_names: list[str] | None,
+    ) -> None:
+        """Reconcile per-(robot_type, control_mode) projection weights with the
+        policy's current group set, in place.
+
+        Analogous to :meth:`_promote_legacy_norm_buffers_in_state_dict` but for
+        *learned* projection weights (``PerGroupLinear``), which must be
+        duplicated / name-remapped rather than recomputed. Only keys under
+        :attr:`_PER_GROUP_PROJECTION_PREFIXES` are touched, so policies that do
+        not declare any (the default) are unaffected.
+
+        For each matching ``*.weight`` / ``*.bias`` key, given the loaded tensor
+        and the in-memory target with ``D`` group rows and per-group trailing
+        shape ``feat``:
+
+        - **Target is plain (feature off):** an exactly-matching tensor loads
+          as-is; a tensor carrying an extra leading (group) axis is a per-group
+          checkpoint loaded into a non-per-group policy — raise
+          :class:`ProjectionRemapError` (no silent collapse).
+        - **Target is per-group (feature on):**
+            * legacy single ``nn.Linear`` (rank-shy) or a single group row →
+              promote (if needed) and tile to ``D`` identical rows (duplicate).
+            * ``D`` rows with the same group ordering → load as-is.
+            * a different ordering / count with a known old ordering → build the
+              ``D`` rows by name (existing groups copied by name; a group new to
+              the checkpoint duplicates row 0).
+            * a multi-row source with an unknown old ordering, or a trailing
+              shape mismatch → raise :class:`ProjectionRemapError`.
+
+        Args:
+            state_dict_to_load: state dict about to be loaded; mutated in place.
+            old_dataset_names: the checkpoint's own ``config.dataset_names`` (its
+                group ordering), or ``None`` for legacy / unknown checkpoints.
+        """
+        prefixes = self._PER_GROUP_PROJECTION_PREFIXES
+        if not prefixes:
+            return
+        own_state = dict(self.state_dict())
+        new_names = getattr(self.config, "dataset_names", None)
+        remapped: list[str] = []
+        for key in list(state_dict_to_load):
+            if not any(key.startswith(p) for p in prefixes):
+                continue
+            target = own_state.get(key)
+            if target is None:
+                continue
+            loaded = state_dict_to_load[key]
+            new_tensor = self._reconcile_projection_tensor(key, loaded, target, old_dataset_names, new_names)
+            if new_tensor is not loaded:
+                state_dict_to_load[key] = new_tensor
+                remapped.append(key)
+        if remapped:
+            logging.info(
+                "Reconciled %d per-group projection tensor(s) to the policy's %s group(s). Sample keys: %s",
+                len(remapped),
+                len(new_names) if new_names else "?",
+                remapped[:3],
+            )
+
+    @staticmethod
+    def _reconcile_projection_tensor(
+        key: str,
+        loaded: Tensor,
+        target: Tensor,
+        old_names: list[str] | None,
+        new_names: list[str] | None,
+    ) -> Tensor:
+        """Return the tensor to load for one per-group projection key.
+
+        See :meth:`_remap_per_group_projection_weights_in_state_dict` for the
+        full case table. Returns ``loaded`` unchanged when no surgery is needed.
+        """
+        # Plain-Linear param rank: weight -> 2 (out, in), bias -> 1 (out,). A
+        # per-group target carries one extra leading (group) axis on top.
+        plain_rank = 2 if key.endswith(".weight") else 1
+        is_per_group_target = target.ndim == plain_rank + 1
+
+        if not is_per_group_target:
+            if loaded.ndim > target.ndim:
+                raise ProjectionRemapError(
+                    f"Projection key {key!r}: checkpoint carries a per-group axis "
+                    f"(shape {tuple(loaded.shape)}) but this policy has a single shared "
+                    f"projection (shape {tuple(target.shape)}). Set `per_group_projection=True` "
+                    "to keep the per-group heads, or load a non-per-group checkpoint."
+                )
+            return loaded
+
+        num_groups = target.shape[0]
+        feat = tuple(target.shape[1:])
+
+        # Legacy single nn.Linear (no group axis): promote then duplicate to all.
+        if loaded.ndim == target.ndim - 1 and tuple(loaded.shape) == feat:
+            return loaded.unsqueeze(0).expand(num_groups, *feat).contiguous()
+
+        if loaded.ndim != target.ndim or tuple(loaded.shape[1:]) != feat:
+            raise ProjectionRemapError(
+                f"Projection key {key!r}: checkpoint shape {tuple(loaded.shape)} is "
+                f"incompatible with target shape {tuple(target.shape)}."
+            )
+
+        num_loaded = loaded.shape[0]
+        if num_loaded == 1:
+            # Single trained head duplicated into every group (compat #1).
+            return loaded.expand(num_groups, *feat).contiguous()
+
+        if old_names is not None and new_names is not None:
+            if list(old_names) == list(new_names):
+                return loaded  # identical group set & order (compat #3 round-trip)
+            # Name-based remap (compat #5): existing groups carried by name, a
+            # group new to the checkpoint duplicates the reference row 0.
+            old_index = {name: i for i, name in enumerate(old_names)}
+            rows = [loaded[old_index[name]] if name in old_index else loaded[0] for name in new_names]
+            return torch.stack(rows, dim=0).contiguous()
+
+        raise ProjectionRemapError(
+            f"Projection key {key!r}: checkpoint has {num_loaded} group rows but the policy "
+            f"expects {num_groups}, and the checkpoint's group ordering is unknown (no "
+            "dataset_names in its config). Rebuild via make_policy(cfg, ds_meta=...) or re-save "
+            "the source checkpoint with dataset_names."
+        )
 
     @classmethod
     def _strip_normalization_buffers_from_state_dict(
