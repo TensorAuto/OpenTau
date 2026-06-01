@@ -17,9 +17,9 @@
 The extension is compiled on first use via :func:`torch.utils.cpp_extension.load`
 and cached process-wide. Compilation is intentionally lazy (not at import time)
 so importing this package on a CPU-only box, or in the CPU CI subset, never
-triggers ``nvcc``. Any failure (no CUDA, no compiler, build error) is swallowed
-and surfaced as :func:`is_available` returning ``False`` so callers can fall back
-to ``sdpa``/``eager``.
+triggers ``nvcc``. :func:`is_available` reports whether the kernel compiled (used
+by tests to skip GPU cases); the ``flash_cuda`` attention pathway does **not**
+fall back to sdpa/eager — if the kernel is unavailable, calling it raises.
 """
 
 from __future__ import annotations
@@ -82,11 +82,11 @@ def get_extension():
         try:
             _ext = _do_load()
             logger.info("Compiled custom flash-attention CUDA kernel (opentau_flash_blockmask).")
-        except Exception as e:  # noqa: BLE001 - any build/runtime failure -> fallback
+        except Exception as e:  # noqa: BLE001 - record any build/runtime failure
             _load_error = str(e)
             logger.warning(
-                "Custom flash-attention CUDA kernel unavailable (%s); "
-                "callers should fall back to sdpa/eager.",
+                "Custom flash-attention CUDA kernel failed to compile (%s); "
+                "selecting attention_implementation='flash_cuda' will now raise.",
                 _load_error,
             )
             _ext = None

@@ -37,7 +37,6 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import NormalizationMode
-from opentau.policies import flash_attn_cuda
 from opentau.policies.flash_attn_cuda import make_att_block_ids
 from opentau.policies.normalize import Normalize, Unnormalize
 from opentau.policies.normalize import resolve_num_datasets as _num_datasets
@@ -225,12 +224,13 @@ def make_att_2d_masks(
 
 
 def flash_cuda_active(attention_implementation: str) -> bool:
-    """True if the ``flash_cuda`` backend is selected and its kernel compiled.
+    """True if the ``flash_cuda`` backend is selected.
 
-    Falls back gracefully: returns ``False`` (use the dense-mask eager/sdpa
-    path) when the custom CUDA kernel is unavailable (no CUDA, no compiler, etc.).
+    No fallback: when ``flash_cuda`` is selected it is always used. If the custom
+    CUDA kernel cannot be JIT-compiled (no CUDA / no compiler), the kernel call
+    raises loudly rather than silently degrading to eager/sdpa.
     """
-    return attention_implementation == "flash_cuda" and flash_attn_cuda.is_available()
+    return attention_implementation == "flash_cuda"
 
 
 def build_attention_inputs(

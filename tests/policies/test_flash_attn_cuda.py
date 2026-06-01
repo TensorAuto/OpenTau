@@ -195,6 +195,76 @@ def test_backward_matches_autograd_reference(pattern, head_dim):
     torch.testing.assert_close(dv * kmask, vr.grad * kmask, atol=1e-3, rtol=1e-3)
 
 
+# The Tensor Core (WMMA) backward (fp16/bf16) is a separate code path from the
+# fp32 reference backward above; validate dQ/dK/dV across head dims, GQA/MQA,
+# every mask pattern, padding, and non-square cross-attention against the fp32
+# autograd reference.
+@require_cuda
+@pytest.mark.gpu
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("pattern", ["causal", "prefixlm", "multiblock", "bidir"])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("hkv", [1, 2])
+def test_wmma_backward_matches_reference(dtype, pattern, head_dim, hkv):
+    if not flash_attn_cuda.is_available():
+        pytest.skip(f"flash_cuda kernel unavailable: {flash_attn_cuda.load_error()}")
+    torch.manual_seed(0)
+    b, sq, h = 2, 70, 4
+    q_blk, k_blk, q_valid, k_valid = _make_blocks(b, sq, "cuda", pattern, pad_tail=5)
+    scale = head_dim**-0.5
+    q = torch.randn(b, sq, h, head_dim, device="cuda", dtype=dtype, requires_grad=True)
+    k = torch.randn(b, sq, hkv, head_dim, device="cuda", dtype=dtype, requires_grad=True)
+    v = torch.randn(b, sq, hkv, head_dim, device="cuda", dtype=dtype, requires_grad=True)
+    grad_out = torch.randn(b, sq, h, head_dim, device="cuda", dtype=dtype)
+
+    flash_attn_blockmask(q, k, v, q_blk, k_blk, q_valid, k_valid, scale).backward(grad_out)
+    dq, dk, dv = q.grad.float(), k.grad.float(), v.grad.float()
+
+    qr = q.detach().float().clone().requires_grad_(True)
+    kr = k.detach().float().clone().requires_grad_(True)
+    vr = v.detach().float().clone().requires_grad_(True)
+    ref, _ = _reference_attention(qr, kr, vr, q_blk, k_blk, q_valid, k_valid, scale)
+    ref.backward(grad_out.float())
+
+    qmask = q_valid[:, :, None, None].float()
+    kmask = k_valid[:, :, None, None].float()
+    tol = 5e-2 if dtype == torch.bfloat16 else 1e-2
+    torch.testing.assert_close(dq * qmask, qr.grad * qmask, atol=tol, rtol=tol)
+    torch.testing.assert_close(dk * kmask, kr.grad * kmask, atol=tol, rtol=tol)
+    torch.testing.assert_close(dv * kmask, vr.grad * kmask, atol=tol, rtol=tol)
+
+
+@require_cuda
+@pytest.mark.gpu
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_wmma_backward_cross_attention_non_square(dtype):
+    """Tensor Core backward on the non-square expert/cross-attention layout."""
+    if not flash_attn_cuda.is_available():
+        pytest.skip(f"flash_cuda kernel unavailable: {flash_attn_cuda.load_error()}")
+    torch.manual_seed(3)
+    b, sq, h, hkv, d, cross = 2, 50, 8, 1, 256, 37
+    q_blk, k_blk, q_valid, k_valid = _make_blocks(b, sq, "cuda", "causal", cross=cross)
+    sk = cross + sq
+    scale = d**-0.5
+    q = torch.randn(b, sq, h, d, device="cuda", dtype=dtype, requires_grad=True)
+    k = torch.randn(b, sk, hkv, d, device="cuda", dtype=dtype, requires_grad=True)
+    v = torch.randn(b, sk, hkv, d, device="cuda", dtype=dtype, requires_grad=True)
+    go = torch.randn(b, sq, h, d, device="cuda", dtype=dtype)
+    flash_attn_blockmask(q, k, v, q_blk, k_blk, q_valid, k_valid, scale).backward(go)
+    dq, dk, dv = q.grad.float(), k.grad.float(), v.grad.float()
+    qr = q.detach().float().clone().requires_grad_(True)
+    kr = k.detach().float().clone().requires_grad_(True)
+    vr = v.detach().float().clone().requires_grad_(True)
+    ref, _ = _reference_attention(qr, kr, vr, q_blk, k_blk, q_valid, k_valid, scale)
+    ref.backward(go.float())
+    qmask = q_valid[:, :, None, None].float()
+    kmask = k_valid[:, :, None, None].float()
+    tol = 5e-2 if dtype == torch.bfloat16 else 1e-2
+    torch.testing.assert_close(dq * qmask, qr.grad * qmask, atol=tol, rtol=tol)
+    torch.testing.assert_close(dk * kmask, kr.grad * kmask, atol=tol, rtol=tol)
+    torch.testing.assert_close(dv * kmask, vr.grad * kmask, atol=tol, rtol=tol)
+
+
 def _sdpa_ref(q, k, v, q_blk, k_blk, q_valid, k_valid, scale):
     h, hkv = q.shape[2], k.shape[2]
     mask = _dense_mask(q_blk, k_blk, q_valid, k_valid)[:, None]

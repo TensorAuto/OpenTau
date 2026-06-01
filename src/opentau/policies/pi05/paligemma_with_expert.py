@@ -635,16 +635,28 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             sequence length.
           - ``"fa2"``: accepted for backward compatibility; falls back to
             eager with a warning emitted at config validation time.
-          - ``"flash_cuda"``: custom block-causal CUDA flash kernel. The fast
-            path is taken in ``_run_layer`` when ``attention_block_ids`` is
-            supplied; this method returns ``sdpa`` as the fallback used when the
-            kernel is unavailable (no block-ids reach this interface then).
+          - ``"flash_cuda"``: custom block-causal CUDA flash kernel, dispatched
+            in ``_run_layer`` via ``flash_attention_forward`` whenever
+            ``attention_block_ids`` is supplied. There is **no** silent fallback:
+            if this method is ever reached under ``flash_cuda`` it means a caller
+            failed to thread the block-ids, which is a bug, so it raises.
 
         Returns:
             callable: The attention function to use.
+
+        Raises:
+            RuntimeError: If ``attention_implementation == "flash_cuda"`` (the
+                flash path must go through ``flash_attention_forward`` with
+                block-ids, not this interface).
         """
         impl = self.config.attention_implementation
-        if impl in ("sdpa", "flash_cuda"):
+        if impl == "flash_cuda":
+            raise RuntimeError(
+                "flash_cuda must be dispatched via flash_attention_forward with "
+                "attention_block_ids; get_attention_interface reached instead "
+                "(block-ids were not threaded to this forward)."
+            )
+        if impl == "sdpa":
             return self.sdpa_attention_forward
         # "eager" and legacy "fa2" both land here; "fa2" already warned
         # during __post_init__.

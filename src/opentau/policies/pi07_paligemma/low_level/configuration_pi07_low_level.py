@@ -66,9 +66,10 @@ class PI07PaligemmaLowLevelConfig(PreTrainedConfig):
             ``torch.nn.functional.scaled_dot_product_attention`` (frees ~5.6 GiB on forward at the bs
             ceiling tested; see PR #182). "fa2" is accepted for backward compatibility but logs a
             warning and falls back to "eager". "flash_cuda" uses the custom block-causal CUDA flash
-            kernel (``opentau.policies.flash_attn_cuda``): the SxS attention mask is reconstructed
-            in-kernel from compact block-ids so it is never materialized (large memory savings), and
-            it gracefully falls back to "sdpa" when the kernel cannot be JIT-compiled (no CUDA/compiler).
+            kernel (``opentau.policies.flash_attn_cuda``, Tensor Core forward + backward): the SxS
+            attention mask is reconstructed in-kernel from compact block-ids so it is never
+            materialized. There is no fallback — if the kernel cannot be JIT-compiled (no
+            CUDA/compiler) the forward raises rather than silently using sdpa/eager.
         freeze_vision_encoder: Whether to freeze the vision encoder during fine-tuning. Defaults to True.
         train_expert_only: Whether to train only the expert module. Defaults to False.
         optimizer_lr: Learning rate for the optimizer. Defaults to 2.5e-5.

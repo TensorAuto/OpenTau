@@ -634,7 +634,357 @@ __global__ void flash_fwd_wmma_kernel(
   }
 }
 
+// =========================================================================
+// Tensor Core backward (fp16/bf16). Two kernels, FlashAttention-2 style, both
+// recomputing S = QK^T and P = exp(scale*S - L) (no online softmax — L is given).
+// All five matmuls run on WMMA tensor cores with fp32 accumulation.
+//
+//   dQ kernel (parallel over query slabs): dP = dO V^T; dS = P*(dP - delta);
+//     dQ += scale * dS K. dQ accumulator persists in shared memory.
+//   dK/dV kernel (parallel over key slabs, looping the GQA query-head group):
+//     dV += P^T dO; dK += scale * dS^T Q. No atomics (each key slab owned by one
+//     warp; the head-group sum is internal).
+//
+// nw (warps/block) is chosen at launch from the device's opt-in shared memory so
+// the per-warp slabs + fp32 accumulators fit (smaller than the forward because
+// the backward keeps full (slab x D) fp32 accumulators).
+// =========================================================================
+
+__host__ inline size_t bwd_dq_smem(int D, int nw) {
+  size_t bf16 = (size_t)nw * (2 * BR_W * D + BR_W * BC_W) + (size_t)2 * BC_W * D;  // Qs,dOs,dSs;Ks,Vs
+  size_t f32 = (size_t)nw * (BR_W * D + 2 * BR_W * BC_W + 2 * BR_W);  // dQacc,Ss,dPs,Li,delta
+  size_t i32 = (size_t)nw * BR_W + BC_W;
+  size_t c8 = (size_t)nw * BR_W + BC_W;
+  return bf16 * 2 + f32 * 4 + i32 * 4 + c8;
+}
+
+__host__ inline size_t bwd_dkv_smem(int D, int nw) {
+  size_t bf16 = (size_t)nw * (2 * BR_W * D + 2 * BR_W * BR_W) + (size_t)2 * BR_W * D;  // Ks,Vs,Ps,dSs;Qs,dOs
+  size_t f32 = (size_t)nw * (2 * BR_W * D + 2 * BR_W * BR_W) + (size_t)2 * BR_W;  // dKacc,dVacc,ss,dp;Li,delta
+  size_t i32 = (size_t)nw * BR_W + BR_W;
+  size_t c8 = (size_t)nw * BR_W + BR_W;
+  return bf16 * 2 + f32 * 4 + i32 * 4 + c8;
+}
+
+template <typename scalar_t>
+__global__ void flash_bwd_dq_wmma_kernel(
+    const scalar_t* __restrict__ Q, const scalar_t* __restrict__ K, const scalar_t* __restrict__ V,
+    const scalar_t* __restrict__ dO, const float* __restrict__ L, const float* __restrict__ delta,
+    const int* __restrict__ q_blk, const int* __restrict__ k_blk,
+    const bool* __restrict__ q_valid, const bool* __restrict__ k_valid,
+    scalar_t* __restrict__ dQ, int B, int Sq, int Sk, int H, int Hkv, int D, float scale, int nw) {
+  using namespace nvcuda;
+  using wt = typename WmmaTraits<scalar_t>::wt;
+  auto f2w = WmmaTraits<scalar_t>::from_float;
+
+  extern __shared__ char smem_raw[];
+  wt* Qs = reinterpret_cast<wt*>(smem_raw);          // nw*BR*D
+  wt* dOs = Qs + (long)nw * BR_W * D;                // nw*BR*D
+  wt* dSs = dOs + (long)nw * BR_W * D;               // nw*BR*BC
+  wt* Ks = dSs + (long)nw * BR_W * BC_W;             // BC*D
+  wt* Vs = Ks + (long)BC_W * D;                      // BC*D
+  float* dQacc = reinterpret_cast<float*>(Vs + (long)BC_W * D);  // nw*BR*D
+  float* Ss = dQacc + (long)nw * BR_W * D;           // nw*BR*BC
+  float* dPs = Ss + (long)nw * BR_W * BC_W;          // nw*BR*BC
+  float* sLi = dPs + (long)nw * BR_W * BC_W;         // nw*BR
+  float* sdl = sLi + (long)nw * BR_W;                // nw*BR
+  int* sQblk = reinterpret_cast<int*>(sdl + (long)nw * BR_W);  // nw*BR
+  int* sKblk = sQblk + (long)nw * BR_W;              // BC
+  char* sQvalid = reinterpret_cast<char*>(sKblk + BC_W);  // nw*BR
+  char* sKvalid = sQvalid + (long)nw * BR_W;         // BC
+
+  const int warp = threadIdx.x / WARP;
+  const int lane = threadIdx.x % WARP;
+  const int b = blockIdx.z, h = blockIdx.y;
+  const int hk = h / (H / Hkv);
+  const long q0 = (long)blockIdx.x * (nw * BR_W) + (long)warp * BR_W;
+
+  wt* qW = Qs + (long)warp * BR_W * D;
+  wt* doW = dOs + (long)warp * BR_W * D;
+  wt* dsW = dSs + (long)warp * BR_W * BC_W;
+  float* dqW = dQacc + (long)warp * BR_W * D;
+  float* ssW = Ss + (long)warp * BR_W * BC_W;
+  float* dpW = dPs + (long)warp * BR_W * BC_W;
+  float* liW = sLi + (long)warp * BR_W;
+  float* dlW = sdl + (long)warp * BR_W;
+  int* qblkW = sQblk + (long)warp * BR_W;
+  char* qvalidW = sQvalid + (long)warp * BR_W;
+
+  for (int idx = lane; idx < BR_W * D; idx += WARP) dqW[idx] = 0.f;
+  for (int idx = lane; idx < BR_W * D; idx += WARP) {
+    const int i = idx / D, d = idx % D;
+    const long qi = q0 + i;
+    if (qi < Sq) {
+      qW[idx] = f2w(to_f(Q[idx_qkv(b, qi, h, d, Sq, H, D)]));
+      doW[idx] = f2w(to_f(dO[idx_qkv(b, qi, h, d, Sq, H, D)]));
+    } else { qW[idx] = f2w(0.f); doW[idx] = f2w(0.f); }
+  }
+  for (int i = lane; i < BR_W; i += WARP) {
+    const long qi = q0 + i;
+    if (qi < Sq) {
+      liW[i] = L[idx_lse(b, h, qi, H, Sq)]; dlW[i] = delta[idx_lse(b, h, qi, H, Sq)];
+      qblkW[i] = q_blk[b * Sq + qi]; qvalidW[i] = q_valid[b * Sq + qi] ? 1 : 0;
+    } else { liW[i] = 0.f; dlW[i] = 0.f; qblkW[i] = INT_MIN; qvalidW[i] = 0; }
+  }
+  __syncthreads();
+
+  int bmax = INT_MIN;
+  for (int i = 0; i < nw * BR_W; ++i)
+    if (sQvalid[i]) bmax = max(bmax, sQblk[i]);
+
+  const int n_tiles = (Sk + BC_W - 1) / BC_W;
+  for (int kt = 0; kt < n_tiles; ++kt) {
+    const long kc0 = (long)kt * BC_W;
+    for (int idx = threadIdx.x; idx < BC_W * D; idx += blockDim.x) {
+      const int j = idx / D, d = idx % D;
+      const long kj = kc0 + j;
+      if (kj < Sk) {
+        Ks[idx] = f2w(to_f(K[idx_qkv(b, kj, hk, d, Sk, Hkv, D)]));
+        Vs[idx] = f2w(to_f(V[idx_qkv(b, kj, hk, d, Sk, Hkv, D)]));
+      } else { Ks[idx] = f2w(0.f); Vs[idx] = f2w(0.f); }
+    }
+    for (int j = threadIdx.x; j < BC_W; j += blockDim.x) {
+      const long kj = kc0 + j;
+      sKblk[j] = (kj < Sk) ? k_blk[b * Sk + kj] : INT_MAX;
+      sKvalid[j] = (kj < Sk && k_valid[b * Sk + kj]) ? 1 : 0;
+    }
+    __syncthreads();
+
+    const bool unreachable = (sKblk[0] > bmax);
+    if (!unreachable) {
+      // S = Q K^T  and  dP = dO V^T  (Tensor Cores).
+      wmma::fragment<wmma::accumulator, WM, WN, WK, float> accS, accP;
+      wmma::fill_fragment(accS, 0.f);
+      wmma::fill_fragment(accP, 0.f);
+      for (int kk = 0; kk < D / WK; ++kk) {
+        wmma::fragment<wmma::matrix_a, WM, WN, WK, wt, wmma::row_major> aq, ado;
+        wmma::fragment<wmma::matrix_b, WM, WN, WK, wt, wmma::col_major> bk, bv;
+        wmma::load_matrix_sync(aq, qW + kk * WK, D);
+        wmma::load_matrix_sync(bk, Ks + kk * WK, D);
+        wmma::mma_sync(accS, aq, bk, accS);
+        wmma::load_matrix_sync(ado, doW + kk * WK, D);
+        wmma::load_matrix_sync(bv, Vs + kk * WK, D);
+        wmma::mma_sync(accP, ado, bv, accP);
+      }
+      wmma::store_matrix_sync(ssW, accS, BC_W, wmma::mem_row_major);
+      wmma::store_matrix_sync(dpW, accP, BC_W, wmma::mem_row_major);
+      __syncwarp();
+
+      // P = exp(scale*S - L); dS = P*(dP - delta); masked entries -> 0.
+      if (lane < BR_W) {
+        const int i = lane;
+        if (qvalidW[i]) {
+          const int qb = qblkW[i];
+          const float Li = liW[i], di = dlW[i];
+          for (int j = 0; j < BC_W; ++j) {
+            const long kj = kc0 + j;
+            const bool att = (kj < Sk) && sKvalid[j] && (sKblk[j] <= qb);
+            float ds = 0.f;
+            if (att) {
+              const float p = __expf(ssW[i * BC_W + j] * scale - Li);
+              ds = p * (dpW[i * BC_W + j] - di);
+            }
+            dsW[i * BC_W + j] = f2w(ds);
+          }
+        } else {
+          for (int j = 0; j < BC_W; ++j) dsW[i * BC_W + j] = f2w(0.f);
+        }
+      }
+      __syncwarp();
+
+      // dQ += dS @ K  (dS row_major [BR,BC] k=BC; K row_major [BC,D]).
+      for (int dn = 0; dn < D / WN; ++dn) {
+        wmma::fragment<wmma::accumulator, WM, WN, WK, float> acc;
+        wmma::load_matrix_sync(acc, dqW + dn * WN, D, wmma::mem_row_major);
+        wmma::fragment<wmma::matrix_a, WM, WN, WK, wt, wmma::row_major> ads;
+        wmma::fragment<wmma::matrix_b, WM, WN, WK, wt, wmma::row_major> bk;
+        wmma::load_matrix_sync(ads, dsW, BC_W);
+        wmma::load_matrix_sync(bk, Ks + dn * WN, D);
+        wmma::mma_sync(acc, ads, bk, acc);
+        wmma::store_matrix_sync(dqW + dn * WN, acc, D, wmma::mem_row_major);
+      }
+      __syncwarp();
+    }
+    __syncthreads();
+    if (unreachable) break;
+  }
+
+  if (lane < BR_W) {
+    const int i = lane;
+    const long qi = q0 + i;
+    if (qi < Sq)
+      for (int d = 0; d < D; ++d) dQ[idx_qkv(b, qi, h, d, Sq, H, D)] = from_f<scalar_t>(dqW[i * D + d] * scale);
+  }
+}
+
+template <typename scalar_t>
+__global__ void flash_bwd_dkv_wmma_kernel(
+    const scalar_t* __restrict__ Q, const scalar_t* __restrict__ K, const scalar_t* __restrict__ V,
+    const scalar_t* __restrict__ dO, const float* __restrict__ L, const float* __restrict__ delta,
+    const int* __restrict__ q_blk, const int* __restrict__ k_blk,
+    const bool* __restrict__ q_valid, const bool* __restrict__ k_valid,
+    scalar_t* __restrict__ dK, scalar_t* __restrict__ dV,
+    int B, int Sq, int Sk, int H, int Hkv, int D, float scale, int nw) {
+  using namespace nvcuda;
+  using wt = typename WmmaTraits<scalar_t>::wt;
+  auto f2w = WmmaTraits<scalar_t>::from_float;
+
+  extern __shared__ char smem_raw[];
+  wt* Ks = reinterpret_cast<wt*>(smem_raw);          // nw*BR*D (owned key slab)
+  wt* Vs = Ks + (long)nw * BR_W * D;                 // nw*BR*D
+  wt* Ps = Vs + (long)nw * BR_W * D;                 // nw*BR*BR
+  wt* dSs = Ps + (long)nw * BR_W * BR_W;             // nw*BR*BR
+  wt* Qs = dSs + (long)nw * BR_W * BR_W;             // BR*D (streamed)
+  wt* dOs = Qs + (long)BR_W * D;                     // BR*D
+  float* dKacc = reinterpret_cast<float*>(dOs + (long)BR_W * D);  // nw*BR*D
+  float* dVacc = dKacc + (long)nw * BR_W * D;        // nw*BR*D
+  float* Ss = dVacc + (long)nw * BR_W * D;           // nw*BR*BR
+  float* dPs = Ss + (long)nw * BR_W * BR_W;          // nw*BR*BR
+  float* sLi = dPs + (long)nw * BR_W * BR_W;         // BR
+  float* sdl = sLi + (long)BR_W;                     // BR
+  int* sKblk = reinterpret_cast<int*>(sdl + (long)BR_W);  // nw*BR (owned)
+  int* sQblk = sKblk + (long)nw * BR_W;              // BR (streamed)
+  char* sKvalid = reinterpret_cast<char*>(sQblk + (long)BR_W);  // nw*BR
+  char* sQvalid = sKvalid + (long)nw * BR_W;         // BR
+
+  const int warp = threadIdx.x / WARP;
+  const int lane = threadIdx.x % WARP;
+  const int b = blockIdx.z, hk = blockIdx.y;
+  const int group = H / Hkv;
+  const long k0 = (long)blockIdx.x * (nw * BR_W) + (long)warp * BR_W;  // this warp's key slab
+
+  wt* ksW = Ks + (long)warp * BR_W * D;
+  wt* vsW = Vs + (long)warp * BR_W * D;
+  wt* psW = Ps + (long)warp * BR_W * BR_W;
+  wt* dsW = dSs + (long)warp * BR_W * BR_W;
+  float* dkW = dKacc + (long)warp * BR_W * D;
+  float* dvW = dVacc + (long)warp * BR_W * D;
+  float* ssW = Ss + (long)warp * BR_W * BR_W;
+  float* dpW = dPs + (long)warp * BR_W * BR_W;
+  int* kblkW = sKblk + (long)warp * BR_W;
+  char* kvalidW = sKvalid + (long)warp * BR_W;
+
+  for (int idx = lane; idx < BR_W * D; idx += WARP) { dkW[idx] = 0.f; dvW[idx] = 0.f; }
+  for (int idx = lane; idx < BR_W * D; idx += WARP) {
+    const int j = idx / D, d = idx % D;
+    const long kj = k0 + j;
+    if (kj < Sk) {
+      ksW[idx] = f2w(to_f(K[idx_qkv(b, kj, hk, d, Sk, Hkv, D)]));
+      vsW[idx] = f2w(to_f(V[idx_qkv(b, kj, hk, d, Sk, Hkv, D)]));
+    } else { ksW[idx] = f2w(0.f); vsW[idx] = f2w(0.f); }
+  }
+  for (int j = lane; j < BR_W; j += WARP) {
+    const long kj = k0 + j;
+    kblkW[j] = (kj < Sk) ? k_blk[b * Sk + kj] : INT_MAX;
+    kvalidW[j] = (kj < Sk && k_valid[b * Sk + kj]) ? 1 : 0;
+  }
+  __syncthreads();
+
+  int block_min_kblk = INT_MAX;
+  for (int j = 0; j < nw * BR_W; ++j)
+    if (sKvalid[j]) block_min_kblk = min(block_min_kblk, sKblk[j]);
+
+  const int n_qtiles = (Sq + BR_W - 1) / BR_W;
+  for (int h = hk * group; h < (hk + 1) * group; ++h) {
+    for (int qt = 0; qt < n_qtiles; ++qt) {
+      const long qc0 = (long)qt * BR_W;
+      const long last_q = min((long)qc0 + BR_W - 1, (long)Sq - 1);
+      if (q_blk[b * Sq + last_q] < block_min_kblk) continue;  // uniform skip
+
+      for (int idx = threadIdx.x; idx < BR_W * D; idx += blockDim.x) {
+        const int q = idx / D, d = idx % D;
+        const long qi = qc0 + q;
+        if (qi < Sq) {
+          Qs[idx] = f2w(to_f(Q[idx_qkv(b, qi, h, d, Sq, H, D)]));
+          dOs[idx] = f2w(to_f(dO[idx_qkv(b, qi, h, d, Sq, H, D)]));
+        } else { Qs[idx] = f2w(0.f); dOs[idx] = f2w(0.f); }
+      }
+      for (int q = threadIdx.x; q < BR_W; q += blockDim.x) {
+        const long qi = qc0 + q;
+        if (qi < Sq) {
+          sLi[q] = L[idx_lse(b, h, qi, H, Sq)]; sdl[q] = delta[idx_lse(b, h, qi, H, Sq)];
+          sQblk[q] = q_blk[b * Sq + qi]; sQvalid[q] = q_valid[b * Sq + qi] ? 1 : 0;
+        } else { sLi[q] = 0.f; sdl[q] = 0.f; sQblk[q] = INT_MIN; sQvalid[q] = 0; }
+      }
+      __syncthreads();
+
+      // S = Q K^T  and  dP = dO V^T   (rows = streamed queries, cols = owned keys).
+      wmma::fragment<wmma::accumulator, WM, WN, WK, float> accS, accP;
+      wmma::fill_fragment(accS, 0.f);
+      wmma::fill_fragment(accP, 0.f);
+      for (int kk = 0; kk < D / WK; ++kk) {
+        wmma::fragment<wmma::matrix_a, WM, WN, WK, wt, wmma::row_major> aq, ado;
+        wmma::fragment<wmma::matrix_b, WM, WN, WK, wt, wmma::col_major> bk, bv;
+        wmma::load_matrix_sync(aq, Qs + kk * WK, D);
+        wmma::load_matrix_sync(bk, ksW + kk * WK, D);
+        wmma::mma_sync(accS, aq, bk, accS);
+        wmma::load_matrix_sync(ado, dOs + kk * WK, D);
+        wmma::load_matrix_sync(bv, vsW + kk * WK, D);
+        wmma::mma_sync(accP, ado, bv, accP);
+      }
+      wmma::store_matrix_sync(ssW, accS, BR_W, wmma::mem_row_major);
+      wmma::store_matrix_sync(dpW, accP, BR_W, wmma::mem_row_major);
+      __syncwarp();
+
+      // P (=softmax prob) and dS, with masking (lane q owns streamed query q).
+      if (lane < BR_W) {
+        const int q = lane;
+        const int qb = sQblk[q];
+        const float Li = sLi[q], di = sdl[q];
+        const bool qv = sQvalid[q];
+        for (int j = 0; j < BR_W; ++j) {
+          const long kj = k0 + j;
+          const bool att = qv && (kj < Sk) && kvalidW[j] && (kblkW[j] <= qb);
+          float p = 0.f, ds = 0.f;
+          if (att) {
+            p = __expf(ssW[q * BR_W + j] * scale - Li);
+            ds = p * (dpW[q * BR_W + j] - di);
+          }
+          psW[q * BR_W + j] = f2w(p);
+          dsW[q * BR_W + j] = f2w(ds);
+        }
+      }
+      __syncwarp();
+
+      // dV += P^T @ dO ;  dK += dS^T @ Q   (P,dS as col_major -> transpose).
+      for (int dn = 0; dn < D / WN; ++dn) {
+        wmma::fragment<wmma::accumulator, WM, WN, WK, float> accv, acck;
+        wmma::load_matrix_sync(accv, dvW + dn * WN, D, wmma::mem_row_major);
+        wmma::load_matrix_sync(acck, dkW + dn * WN, D, wmma::mem_row_major);
+        wmma::fragment<wmma::matrix_a, WM, WN, WK, wt, wmma::col_major> ap, ads;
+        wmma::fragment<wmma::matrix_b, WM, WN, WK, wt, wmma::row_major> bdo, bq;
+        wmma::load_matrix_sync(ap, psW, BR_W);
+        wmma::load_matrix_sync(bdo, dOs + dn * WN, D);
+        wmma::mma_sync(accv, ap, bdo, accv);
+        wmma::load_matrix_sync(ads, dsW, BR_W);
+        wmma::load_matrix_sync(bq, Qs + dn * WN, D);
+        wmma::mma_sync(acck, ads, bq, acck);
+        wmma::store_matrix_sync(dvW + dn * WN, accv, D, wmma::mem_row_major);
+        wmma::store_matrix_sync(dkW + dn * WN, acck, D, wmma::mem_row_major);
+      }
+      __syncthreads();  // streamed Qs/dOs reused next tile
+    }
+  }
+
+  if (lane < BR_W) {
+    const int j = lane;
+    const long kj = k0 + j;
+    if (kj < Sk)
+      for (int d = 0; d < D; ++d) {
+        dK[idx_qkv(b, kj, hk, d, Sk, Hkv, D)] = from_f<scalar_t>(dkW[j * D + d] * scale);
+        dV[idx_qkv(b, kj, hk, d, Sk, Hkv, D)] = from_f<scalar_t>(dvW[j * D + d]);
+      }
+  }
+}
+
 // ---- host launchers ------------------------------------------------------
+
+// Largest nw in [1, nw_max] whose kernel shared memory fits the device opt-in cap.
+int pick_nw(size_t (*smem_fn)(int, int), int D, int nw_max, int max_smem) {
+  for (int nw = nw_max; nw >= 1; --nw)
+    if ((int)smem_fn(D, nw) <= max_smem) return nw;
+  return 1;
+}
 
 int pick_tile(int D) {
   // Keep the two fp32 smem tiles near 64 KB (well under the 99 KB opt-in cap).
@@ -732,6 +1082,8 @@ std::vector<at::Tensor> flash_bwd(
   auto delta = at::empty({B, H, Sq}, q.options().dtype(at::kFloat));
 
   auto stream = at::cuda::getCurrentCUDAStream();
+  int max_smem = 0;
+  cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, q.device().index());  // spellchecker:disable-line
 
   // delta = rowsum(O * dO)
   {
@@ -745,42 +1097,71 @@ std::vector<at::Tensor> flash_bwd(
   }
 
   // dQ
-  {
+  if (q.scalar_type() == at::kFloat) {
+    // fp32: exact warp-per-row reference.
     const int BC = pick_tile(D);
     const size_t smem = (size_t)2 * BC * D * sizeof(float) + (size_t)BC * sizeof(int) + (size_t)BC;
     dim3 grid((Sq + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, H, B);
     dim3 block(WARPS_PER_BLOCK * WARP);
-    DISPATCH_FLOAT(q.scalar_type(), "flash_bwd_dq", [&] {
-      auto kernel = flash_bwd_dq_kernel<scalar_t>;
-      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-      kernel<<<grid, block, smem, stream>>>(
-          q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
-          dO.data_ptr<scalar_t>(), L.data_ptr<float>(), delta.data_ptr<float>(),
-          q_blk.data_ptr<int>(), k_blk.data_ptr<int>(), q_valid.data_ptr<bool>(),
-          k_valid.data_ptr<bool>(), dQ.data_ptr<scalar_t>(), B, Sq, Sk, H, Hkv, D, (float)scale, BC);
+    auto kernel = flash_bwd_dq_kernel<float>;
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    kernel<<<grid, block, smem, stream>>>(
+        q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(), dO.data_ptr<float>(),
+        L.data_ptr<float>(), delta.data_ptr<float>(), q_blk.data_ptr<int>(), k_blk.data_ptr<int>(),
+        q_valid.data_ptr<bool>(), k_valid.data_ptr<bool>(), dQ.data_ptr<float>(),
+        B, Sq, Sk, H, Hkv, D, (float)scale, BC);
+  } else {
+    const int nw = pick_nw(bwd_dq_smem, D, 3, max_smem);
+    const size_t smem = bwd_dq_smem(D, nw);
+    dim3 grid((Sq + nw * BR_W - 1) / (nw * BR_W), H, B);
+    dim3 block(nw * WARP);
+    DISPATCH_FLOAT(q.scalar_type(), "flash_bwd_dq_wmma", [&] {
+      if constexpr (!std::is_same_v<scalar_t, float>) {
+        auto kernel = flash_bwd_dq_wmma_kernel<scalar_t>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        kernel<<<grid, block, smem, stream>>>(
+            q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
+            dO.data_ptr<scalar_t>(), L.data_ptr<float>(), delta.data_ptr<float>(),
+            q_blk.data_ptr<int>(), k_blk.data_ptr<int>(), q_valid.data_ptr<bool>(),
+            k_valid.data_ptr<bool>(), dQ.data_ptr<scalar_t>(), B, Sq, Sk, H, Hkv, D, (float)scale, nw);
+      }
     });
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   // dK, dV
-  {
+  if (q.scalar_type() == at::kFloat) {
     const int BQ = pick_tile(D);
     const size_t smem = (size_t)2 * BQ * D * sizeof(float) + (size_t)2 * BQ * sizeof(float) +
                         (size_t)BQ * sizeof(int) + (size_t)BQ;
     dim3 grid((Sk + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, Hkv, B);
     dim3 block(WARPS_PER_BLOCK * WARP);
-    DISPATCH_FLOAT(q.scalar_type(), "flash_bwd_dkv", [&] {
-      auto kernel = flash_bwd_dkv_kernel<scalar_t>;
-      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-      kernel<<<grid, block, smem, stream>>>(
-          q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
-          dO.data_ptr<scalar_t>(), L.data_ptr<float>(), delta.data_ptr<float>(),
-          q_blk.data_ptr<int>(), k_blk.data_ptr<int>(), q_valid.data_ptr<bool>(),
-          k_valid.data_ptr<bool>(), dK.data_ptr<scalar_t>(), dV.data_ptr<scalar_t>(),
-          B, Sq, Sk, H, Hkv, D, (float)scale, BQ);
+    auto kernel = flash_bwd_dkv_kernel<float>;
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    kernel<<<grid, block, smem, stream>>>(
+        q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(), dO.data_ptr<float>(),
+        L.data_ptr<float>(), delta.data_ptr<float>(), q_blk.data_ptr<int>(), k_blk.data_ptr<int>(),
+        q_valid.data_ptr<bool>(), k_valid.data_ptr<bool>(), dK.data_ptr<float>(), dV.data_ptr<float>(),
+        B, Sq, Sk, H, Hkv, D, (float)scale, BQ);
+  } else {
+    const int nw = pick_nw(bwd_dkv_smem, D, 2, max_smem);
+    const size_t smem = bwd_dkv_smem(D, nw);
+    dim3 grid((Sk + nw * BR_W - 1) / (nw * BR_W), Hkv, B);
+    dim3 block(nw * WARP);
+    DISPATCH_FLOAT(q.scalar_type(), "flash_bwd_dkv_wmma", [&] {
+      if constexpr (!std::is_same_v<scalar_t, float>) {
+        auto kernel = flash_bwd_dkv_wmma_kernel<scalar_t>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        kernel<<<grid, block, smem, stream>>>(
+            q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
+            dO.data_ptr<scalar_t>(), L.data_ptr<float>(), delta.data_ptr<float>(),
+            q_blk.data_ptr<int>(), k_blk.data_ptr<int>(), q_valid.data_ptr<bool>(),
+            k_valid.data_ptr<bool>(), dK.data_ptr<scalar_t>(), dV.data_ptr<scalar_t>(),
+            B, Sq, Sk, H, Hkv, D, (float)scale, nw);
+      }
     });
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   return {dQ, dK, dV};
 }
