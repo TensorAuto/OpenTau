@@ -958,14 +958,20 @@ def train(cfg: TrainPipelineConfig):
                             device=accelerator.device,
                             dtype=torch.long,
                         )
-                        gathered = {
-                            "mse_sum": accelerator.gather_for_metrics(mse_ps.sum.to(dtype=torch.float32)),
-                            "mse_count": accelerator.gather_for_metrics(mse_ps.count.to(dtype=torch.float32)),
-                            "ce_sum": accelerator.gather_for_metrics(ce_ps.sum.to(dtype=torch.float32)),
-                            "ce_count": accelerator.gather_for_metrics(ce_ps.count.to(dtype=torch.float32)),
-                            "norm_index": accelerator.gather_for_metrics(norm_index),
-                            "source_index": accelerator.gather_for_metrics(source_index),
-                        }
+                        # Gather all per-sample tensors in a SINGLE call so accelerate applies
+                        # one identical ragged-last-batch de-pad to every entry: the per-sample
+                        # losses and their provenance indices stay row-aligned by construction,
+                        # rather than relying on six separate de-pads landing on the same trim.
+                        gathered = accelerator.gather_for_metrics(
+                            {
+                                "mse_sum": mse_ps.sum.to(dtype=torch.float32),
+                                "mse_count": mse_ps.count.to(dtype=torch.float32),
+                                "ce_sum": ce_ps.sum.to(dtype=torch.float32),
+                                "ce_count": ce_ps.count.to(dtype=torch.float32),
+                                "norm_index": norm_index,
+                                "source_index": source_index,
+                            }
+                        )
                     else:
                         loss = mse_w * losses["MSE"] + ce_w * losses["CE"]
                         loss_val = accelerator.gather_for_metrics(loss).to(dtype=torch.float32).mean().item()
