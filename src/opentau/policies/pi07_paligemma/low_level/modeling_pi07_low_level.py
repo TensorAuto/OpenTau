@@ -468,14 +468,19 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         # Now manually load and remap the state dict
         acc = get_proc_accelerator()
         is_main_process = acc.is_main_process if acc else True
-        # When per-group projections are on, read the checkpoint's own group
-        # ordering (its `dataset_names`) so projection rows can be remapped by
-        # name onto this policy's (possibly superset / reordered) groups. The
-        # continue-training path passes the *new* cfg, so the old ordering must
-        # be read from the source config explicitly. Best-effort: a legacy /
-        # unreadable config leaves it None (handled as single-group / unknown).
+        # When per-group projections are on, reconcile projection rows by group
+        # name. The checkpoint's own group ordering is its `dataset_names`; seed
+        # with the already-loaded `config.dataset_names` — which on an inference
+        # / resume round-trip *is* the checkpoint's ordering — so a transient
+        # failure of the source-config read below doesn't turn a loadable
+        # same-group checkpoint into a hard ProjectionRemapError. The explicit
+        # read still recovers the true old ordering for the continue-training
+        # path, where the passed cfg carries the *new* (superset / reordered)
+        # groups.
         old_dataset_names: list[str] | None = None
         if getattr(config, "per_group_projection", False):
+            seeded = getattr(config, "dataset_names", None)
+            old_dataset_names = list(seeded) if seeded else None
             try:
                 source_config = PreTrainedConfig.from_pretrained(
                     pretrained_name_or_path=pretrained_name_or_path,
@@ -487,12 +492,12 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
                     local_files_only=local_files_only,
                     revision=revision,
                 )
-                old_dataset_names = getattr(source_config, "dataset_names", None)
+                old_dataset_names = getattr(source_config, "dataset_names", None) or old_dataset_names
             except Exception as e:  # noqa: BLE001
                 if is_main_process:
                     logging.warning(
-                        "Could not read checkpoint dataset_names for per-group projection "
-                        "remap (%s); falling back to single-group / positional handling.",
+                        "Could not read checkpoint dataset_names for per-group projection remap "
+                        "(%s); falling back to the policy's current dataset_names ordering.",
                         e,
                     )
         # Populated inside the try block when skip_normalization_weights fires;
