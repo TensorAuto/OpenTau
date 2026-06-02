@@ -51,6 +51,7 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import NormalizationMode
+from opentau.policies.layers import PerGroupLinear
 from opentau.policies.normalize import Normalize, Unnormalize
 from opentau.policies.normalize import resolve_num_datasets as _num_datasets
 from opentau.policies.outlier_utils import detect_state_action_outliers
@@ -61,7 +62,7 @@ from opentau.policies.pi07.low_level.configuration_pi07_low_level import (
     PI07LowLevelConfig,
 )
 from opentau.policies.pi07.video_encoder import SpaceTimeSiglipVideoEncoder
-from opentau.policies.pretrained import PreTrainedPolicy, T
+from opentau.policies.pretrained import PreTrainedPolicy, ProjectionRemapError, T
 from opentau.policies.utils import flow_matching_masked_mse
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
@@ -317,6 +318,16 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
     config_class = PI07LowLevelConfig
     name = "pi07_low_level"
 
+    # Per-(robot_type, control_mode) projections live on the inner
+    # `self.model` (PerGroupLinear when `config.per_group_projection`), so their
+    # state-dict keys are `model.<proj>.weight` / `.bias`. The load path uses
+    # these to reconcile a checkpoint's projection rows with the policy's groups.
+    _PER_GROUP_PROJECTION_PREFIXES = (
+        "model.state_proj.",
+        "model.action_in_proj.",
+        "model.action_out_proj.",
+    )
+
     def __init__(
         self,
         config: PI07LowLevelConfig,
@@ -362,7 +373,9 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
             config.discrete_action_tokenizer_path, trust_remote_code=True
         )
         discrete_action_vocab_size = getattr(self.discrete_action_processor, "vocab_size", None)
-        self.model = PI07LowLevelFlowMatching(config, discrete_action_vocab_size=discrete_action_vocab_size)
+        self.model = PI07LowLevelFlowMatching(
+            config, discrete_action_vocab_size=discrete_action_vocab_size, num_datasets=num_datasets
+        )
 
         self.reset()
 
@@ -410,6 +423,38 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
 
         acc = get_proc_accelerator()
         is_main_process = acc.is_main_process if acc else True
+        # When per-group projections are on, reconcile projection rows by group
+        # name. The checkpoint's own group ordering is its `dataset_names`; seed
+        # with the already-loaded `config.dataset_names` — which on an inference
+        # / resume round-trip *is* the checkpoint's ordering — so a transient
+        # failure of the source-config read below doesn't turn a loadable
+        # same-group checkpoint into a hard ProjectionRemapError. The explicit
+        # read still recovers the true old ordering for the continue-training
+        # path, where the passed cfg carries the *new* (superset / reordered)
+        # groups.
+        old_dataset_names: list[str] | None = None
+        if getattr(config, "per_group_projection", False):
+            seeded = getattr(config, "dataset_names", None)
+            old_dataset_names = list(seeded) if seeded else None
+            try:
+                source_config = PreTrainedConfig.from_pretrained(
+                    pretrained_name_or_path=pretrained_name_or_path,
+                    force_download=force_download,
+                    resume_download=resume_download,
+                    proxies=proxies,
+                    token=token,
+                    cache_dir=cache_dir,
+                    local_files_only=local_files_only,
+                    revision=revision,
+                )
+                old_dataset_names = getattr(source_config, "dataset_names", None) or old_dataset_names
+            except Exception as e:  # noqa: BLE001
+                if is_main_process:
+                    logging.warning(
+                        "Could not read checkpoint dataset_names for per-group projection remap "
+                        "(%s); falling back to the policy's current dataset_names ordering.",
+                        e,
+                    )
         # Populated inside the try block when skip_normalization_weights fires;
         # used outside the try/except to gate the inf-buffer guard so the
         # ValueError is not swallowed by the broad except below.
@@ -467,6 +512,13 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
             # (outside the `if remap_count > 0` block) — promotion is needed
             # whether or not any other keys were renamed.
             model._promote_legacy_norm_buffers_in_state_dict(remapped_state_dict)
+            # Reconcile per-(robot_type, control_mode) projection rows with this
+            # policy's groups: tile a legacy single head to all groups, name-remap
+            # an existing multi-head onto the new ordering, etc. Raises
+            # ProjectionRemapError on an irreconcilable shape; re-raised below so
+            # the broad handler does not swallow it into a warning + broken model.
+            # No-op when the policy declares no per-group projection prefixes.
+            model._remap_per_group_projection_weights_in_state_dict(remapped_state_dict, old_dataset_names)
 
             # Strip saved normalize/unnormalize buffers when the user opted in
             # via config.skip_normalization_weights — see PreTrainedConfig and
@@ -499,6 +551,11 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
             if not unintended_missing and not unexpected_keys and is_main_process:
                 logging.info("All keys loaded successfully!")
 
+        except ProjectionRemapError:
+            # Deliberate, fatal incompatibility (e.g. a per-group checkpoint
+            # loaded into a non-per-group policy) — must not be swallowed into a
+            # warning + silently-broken model by the broad handler below.
+            raise
         except Exception as e:
             if is_main_process:
                 logging.warning("Could not remap state dict keys: %s", e)
@@ -789,6 +846,7 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
             response_tokens=response_tokens,
             response_masks=response_masks,
             obs_history_is_pad=obs_history_is_pad,
+            group_index=dataset_index,
         )
 
         action_feature = self.config.action_feature
@@ -864,6 +922,7 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
             response_tokens=response_tokens,
             response_masks=response_masks,
             real_action_dim=batch.get("real_action_dim"),
+            group_index=dataset_index,
         )
 
         mse_loss = losses["MSE"]
@@ -1261,9 +1320,26 @@ class PI07LowLevelFlowMatching(nn.Module):
     predict the velocity field.
     """
 
-    def __init__(self, config: PI07LowLevelConfig, discrete_action_vocab_size: int | None = None):
+    def __init__(
+        self,
+        config: PI07LowLevelConfig,
+        discrete_action_vocab_size: int | None = None,
+        num_datasets: int = 1,
+    ):
+        """Initializes the PI07LowLevelFlowMatching model.
+
+        Args:
+            config: Model configuration.
+            discrete_action_vocab_size: Size of the discrete action vocabulary.
+            num_datasets: Number of (robot_type, control_mode) groups — the
+                leading dim of the stacked Normalize/Unnormalize buffers. Used
+                as the number of per-group projection heads when
+                ``config.per_group_projection`` is set, so the projection axis
+                stays in lockstep with the norm-head axis. Defaults to 1.
+        """
         super().__init__()
         self.config = config
+        self.num_datasets = num_datasets
 
         self.config.vlm_config.discrete_action_vocab_size = discrete_action_vocab_size
         self.gemma3_with_expert = Gemma3WithExpertModel(self.config.vlm_config)
@@ -1286,11 +1362,22 @@ class PI07LowLevelFlowMatching(nn.Module):
             gradient_checkpointing=config.gradient_checkpointing,
         )
 
-        # Per-timestep state projection: each of the T state vectors becomes one token
-        self.state_proj = nn.Linear(self.config.max_state_dim, vlm_hidden_size)
+        # Per-(robot_type, control_mode) state/action projections share the
+        # norm-head grouping: when `per_group_projection` is on, each of the
+        # three projections holds one (weight, bias) per group, selected
+        # per-sample by the same index that picks the norm head. When off they
+        # are plain nn.Linear, byte-identical to the pre-flag model. time_mlp_*
+        # stay shared either way.
+        def _make_proj(in_features: int, out_features: int) -> nn.Module:
+            if self.config.per_group_projection:
+                return PerGroupLinear(in_features, out_features, num_groups=self.num_datasets)
+            return nn.Linear(in_features, out_features)
 
-        self.action_in_proj = nn.Linear(self.config.max_action_dim, self.config.proj_width)
-        self.action_out_proj = nn.Linear(self.config.proj_width, self.config.max_action_dim)
+        # Per-timestep state projection: each of the T state vectors becomes one token
+        self.state_proj = _make_proj(self.config.max_state_dim, vlm_hidden_size)
+
+        self.action_in_proj = _make_proj(self.config.max_action_dim, self.config.proj_width)
+        self.action_out_proj = _make_proj(self.config.proj_width, self.config.max_action_dim)
 
         self.time_mlp_in = nn.Linear(self.config.proj_width, self.config.proj_width)
         self.time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
@@ -1331,6 +1418,21 @@ class PI07LowLevelFlowMatching(nn.Module):
         """
         return self.video_encoder(video, obs_history_is_pad=obs_history_is_pad)
 
+    @staticmethod
+    def _apply_proj(proj: nn.Module, x: Tensor, group_index: Tensor | None) -> Tensor:
+        """Call a projection that may be a plain ``nn.Linear`` or a ``PerGroupLinear``.
+
+        Keeps the call sites uniform: a ``PerGroupLinear`` additionally receives
+        the per-sample ``group_index``; any other callable (plain ``nn.Linear``,
+        or the 1-arg lambda / ``nn.Identity`` stubs the unit tests inject) is
+        called as ``proj(x)`` and ignores the index. The dispatch is on module
+        *type* (a construction-time, rank-invariant property), not on batch
+        data, so it fires no collective (CLAUDE.md rule 5).
+        """
+        if isinstance(proj, PerGroupLinear):
+            return proj(x, group_index)
+        return proj(x)
+
     def embed_prefix(
         self,
         videos: list[Tensor],
@@ -1347,6 +1449,7 @@ class PI07LowLevelFlowMatching(nn.Module):
         obs_history_is_pad: Tensor | None = None,
         subgoal_images: list[Tensor] | None = None,
         subgoal_img_masks: list[Tensor] | None = None,
+        group_index: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Embed all prefix modalities and build the 1-D attention pattern.
 
@@ -1540,7 +1643,7 @@ class PI07LowLevelFlowMatching(nn.Module):
 
         # Project each timestep's state into a separate VLM token
         # state: (B, T, max_state_dim) -> state_emb: (B, T, vlm_hidden_size)
-        state_emb = self.state_proj(state.to(dtype=_preferred_dtype()))
+        state_emb = self._apply_proj(self.state_proj, state.to(dtype=_preferred_dtype()), group_index)
 
         embs.append(state_emb)
         pad_masks.append(state_mask)
@@ -1732,7 +1835,9 @@ class PI07LowLevelFlowMatching(nn.Module):
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, noisy_actions: Tensor, timestep: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    def embed_suffix(
+        self, noisy_actions: Tensor, timestep: Tensor, group_index: Tensor | None = None
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Embed noisy actions and flow-matching timestep for the action expert.
 
         Projects actions through ``action_in_proj`` and computes an
@@ -1763,7 +1868,7 @@ class PI07LowLevelFlowMatching(nn.Module):
         )
 
         noisy_actions = noisy_actions.to(dtype=dtype)
-        action_emb = self.action_in_proj(noisy_actions)
+        action_emb = self._apply_proj(self.action_in_proj, noisy_actions, group_index)
 
         def time_mlp_func(time_emb):
             x = self.time_mlp_in(time_emb)
@@ -1810,6 +1915,7 @@ class PI07LowLevelFlowMatching(nn.Module):
         response_tokens: Tensor | None = None,
         response_masks: Tensor | None = None,
         real_action_dim: Tensor | None = None,
+        group_index: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """Training forward pass: embed all modalities and compute losses.
 
@@ -1860,6 +1966,7 @@ class PI07LowLevelFlowMatching(nn.Module):
             obs_history_is_pad=obs_history_is_pad,
             subgoal_images=subgoal_images,
             subgoal_img_masks=subgoal_img_masks,
+            group_index=group_index,
         )
 
         vlm_2d_attention_mask = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
@@ -1900,7 +2007,9 @@ class PI07LowLevelFlowMatching(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+            x_t, time, group_index=group_index
+        )
 
         action_expert_2d_attention_mask = make_att_2d_masks(
             suffix_pad_masks,
@@ -1935,7 +2044,7 @@ class PI07LowLevelFlowMatching(nn.Module):
         # is the inference-time execution horizon only and must not truncate the
         # training target (chunk_size is the prediction horizon).
         suffix_out = suffix_out[:, -self.config.chunk_size :]
-        v_t = self.action_out_proj(suffix_out)
+        v_t = self._apply_proj(self.action_out_proj, suffix_out, group_index)
         v_t = v_t.to(dtype=torch.float32)
 
         # Shared masked-MSE reduction; see pi05 for the rationale.
@@ -1988,6 +2097,7 @@ class PI07LowLevelFlowMatching(nn.Module):
         response_tokens: Tensor | None = None,
         response_masks: Tensor | None = None,
         obs_history_is_pad: Tensor | None = None,
+        group_index: Tensor | None = None,
     ) -> Tensor:
         """Inference: iteratively denoise to produce a continuous action chunk.
 
@@ -2043,6 +2153,7 @@ class PI07LowLevelFlowMatching(nn.Module):
             subgoal_images=subgoal_images,
             subgoal_img_masks=subgoal_img_masks,
             obs_history_is_pad=obs_history_is_pad,
+            group_index=group_index,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -2074,6 +2185,7 @@ class PI07LowLevelFlowMatching(nn.Module):
                 past_key_values,
                 x_t,
                 masked_time,
+                group_index=group_index,
             )
 
             x_t += dt * v_t
@@ -2088,6 +2200,7 @@ class PI07LowLevelFlowMatching(nn.Module):
         past_key_values: list[dict[str, Tensor]],
         x_t: Tensor,
         time: Tensor,
+        group_index: Tensor | None = None,
     ) -> Tensor:
         """Run one action-expert forward pass to predict the velocity field.
 
@@ -2105,7 +2218,9 @@ class PI07LowLevelFlowMatching(nn.Module):
         Returns:
             Predicted velocity ``(B, n_action_steps, max_action_dim)``.
         """
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+            x_t, time, group_index=group_index
+        )
 
         num_cross_att_tokens = prefix_pad_masks.shape[1]
         action_expert_2d_attention_mask = make_att_2d_masks(
@@ -2132,6 +2247,6 @@ class PI07LowLevelFlowMatching(nn.Module):
         # n_action_steps (execution horizon) is applied later in select_action, not
         # at decode time.
         suffix_out = suffix_out[:, -self.config.chunk_size :]
-        v_t = self.action_out_proj(suffix_out)
+        v_t = self._apply_proj(self.action_out_proj, suffix_out, group_index)
         v_t = v_t.to(dtype=torch.float32)
         return v_t

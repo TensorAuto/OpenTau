@@ -764,12 +764,20 @@ def _make_fake_flow_matching(*, hidden: int = 4, n_video_tokens: int = 3):
         del obs_history_is_pad
         return torch.zeros(video.shape[0], n_video_tokens, hidden, dtype=torch.float32)
 
+    # The real `_apply_proj` static dispatch: with a plain-callable `state_proj`
+    # (not a PerGroupLinear) it routes to `proj(x)`, matching the pre-per-group
+    # behaviour while letting the real `embed_prefix` run against this fake.
+    from opentau.policies.pi07.low_level.modeling_pi07_low_level import (
+        PI07LowLevelFlowMatching,
+    )
+
     fake = types.SimpleNamespace(
         gemma3_with_expert=_FakeGemma3WithExpert(),
         language_tokenizer=_FakeTokenizer(),
         state_proj=_state_proj,
         embed_video=_embed_video,
         config=types.SimpleNamespace(discrete_action_max_length=2),
+        _apply_proj=PI07LowLevelFlowMatching._apply_proj,
     )
     return fake
 

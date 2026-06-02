@@ -94,6 +94,9 @@ class PI07LowLevelConfig(PreTrainedConfig):
             Gemma-v1 action expert's ``hidden_size`` so that suffix embeddings
             are compatible with the expert's transformer layers.  Defaults to
             1280 (the expert hidden size in ``Gemma3WithExpertConfig``).
+        per_group_projection: When True, use an independent state/action
+            projection per (robot_type, control_mode) group (shares the
+            normalization-head grouping). Defaults to False.
         dropout: Dropout rate. Defaults to 0.1.
         num_steps: Number of flow-matching denoising steps. Defaults to 5.
         max_delay: Maximum number of prefix action steps for real-time
@@ -176,6 +179,22 @@ class PI07LowLevelConfig(PreTrainedConfig):
 
     # Projector
     proj_width: int = 1280
+
+    # When True, give the continuous STATE/ACTION projections (state_proj,
+    # action_in_proj, action_out_proj) an independent (weight, bias) per
+    # (robot_type, control_mode) group — the same grouping the stacked
+    # Normalize/Unnormalize heads use, selected per-sample by
+    # `_resolve_dataset_index`. The number of groups is len(dataset_names)
+    # (falls back to 1 when dataset_names is unset). time_mlp_in/out stay
+    # shared. Defaults to False: when off the three projections are plain
+    # nn.Linear and the model is byte-identical to the pre-flag version (same
+    # params, same state_dict keys, same numerics). Flipping it on changes the
+    # param count and the projection state_dict shapes (leading group axis);
+    # legacy single-group checkpoints are promoted + duplicated on load, and a
+    # group new to the checkpoint gets a fresh row copied from row 0. Loading a
+    # per-group checkpoint with this flag off raises rather than silently
+    # collapsing the group axis.
+    per_group_projection: bool = False
 
     # Dropout
     dropout: float = 0.1
