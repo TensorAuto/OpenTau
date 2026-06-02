@@ -63,7 +63,7 @@ from opentau.policies.pi07.low_level.configuration_pi07_low_level import (
 )
 from opentau.policies.pi07.video_encoder import SpaceTimeSiglipVideoEncoder
 from opentau.policies.pretrained import PreTrainedPolicy, ProjectionRemapError, T
-from opentau.policies.utils import flow_matching_masked_mse
+from opentau.policies.utils import PerSampleLoss, ce_per_sample, flow_matching_masked_mse
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
 
@@ -859,8 +859,12 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
         return actions
 
     def forward(
-        self, batch: dict[str, Tensor], noise: Tensor | None = None, time: Tensor | None = None
-    ) -> dict[str, Tensor | list]:
+        self,
+        batch: dict[str, Tensor],
+        noise: Tensor | None = None,
+        time: Tensor | None = None,
+        return_per_sample: bool = False,
+    ) -> dict[str, Tensor | list | PerSampleLoss]:
         """Training forward pass: normalize, prepare modalities, and compute losses.
 
         Returns a dict with ``"MSE"`` (flow-matching velocity loss) and
@@ -872,9 +876,13 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
             batch: Training batch dict with observations, actions, and prompts.
             noise: Optional pre-sampled noise tensor.
             time: Optional pre-sampled flow-matching timesteps.
+            return_per_sample: When True, also returns per-sample
+                ``MSE_per_sample``/``CE_per_sample`` (:class:`PerSampleLoss`) for the
+                validation per-(dataset, control_mode) breakdown. Scalars unchanged.
 
         Returns:
-            Dict with ``"MSE"`` and ``"CE"`` scalar loss tensors.
+            Dict with ``"MSE"`` and ``"CE"`` scalar loss tensors (plus per-sample
+            entries when ``return_per_sample`` is True).
         """
         dataset_index = self._resolve_dataset_index(batch)
         batch = self.normalize_inputs(batch, dataset_index)
@@ -923,12 +931,16 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
             response_masks=response_masks,
             real_action_dim=batch.get("real_action_dim"),
             group_index=dataset_index,
+            return_per_sample=return_per_sample,
         )
 
         mse_loss = losses["MSE"]
         ce_loss = losses["CE"]
 
-        out: dict[str, Tensor | list] = {"MSE": mse_loss, "CE": ce_loss}
+        out: dict[str, Tensor | list | PerSampleLoss] = {"MSE": mse_loss, "CE": ce_loss}
+        if return_per_sample:
+            out["MSE_per_sample"] = losses["MSE_per_sample"]
+            out["CE_per_sample"] = losses["CE_per_sample"]
         if outlier_records:
             out["outlier_records"] = outlier_records
         return out
@@ -1916,7 +1928,8 @@ class PI07LowLevelFlowMatching(nn.Module):
         response_masks: Tensor | None = None,
         real_action_dim: Tensor | None = None,
         group_index: Tensor | None = None,
-    ) -> dict[str, Tensor]:
+        return_per_sample: bool = False,
+    ) -> dict[str, Tensor | PerSampleLoss]:
         """Training forward pass: embed all modalities and compute losses.
 
         Runs the VLM on the prefix (video, language, response, state, subgoal
@@ -2048,14 +2061,16 @@ class PI07LowLevelFlowMatching(nn.Module):
         v_t = v_t.to(dtype=torch.float32)
 
         # Shared masked-MSE reduction; see pi05 for the rationale.
-        mse_loss = flow_matching_masked_mse(
+        mse_result = flow_matching_masked_mse(
             u_t=u_t,
             v_t=v_t,
             max_action_dim=self.config.max_action_dim,
             prefix_mask=prefix_mask,
             actions_is_pad=actions_is_pad,
             real_action_dim=real_action_dim,
+            return_per_sample=return_per_sample,
         )
+        mse_loss, mse_per_sample = mse_result if return_per_sample else (mse_result, None)
 
         assert discrete_actions is not None
         assert discrete_action_masks is not None
@@ -2076,9 +2091,17 @@ class PI07LowLevelFlowMatching(nn.Module):
         discrete_action_is_pad = ~discrete_action_masks
         discrete_action_ce_loss = discrete_action_ce_loss * ~discrete_action_is_pad
 
+        ce_per_sample_loss = (
+            ce_per_sample(discrete_action_ce_loss, ~discrete_action_is_pad) if return_per_sample else None
+        )
+
         discrete_action_ce_loss = discrete_action_ce_loss.mean()
 
-        return {"MSE": mse_loss, "CE": discrete_action_ce_loss}
+        out: dict[str, Tensor | PerSampleLoss] = {"MSE": mse_loss, "CE": discrete_action_ce_loss}
+        if return_per_sample:
+            out["MSE_per_sample"] = mse_per_sample
+            out["CE_per_sample"] = ce_per_sample_loss
+        return out
 
     def sample_actions(
         self,

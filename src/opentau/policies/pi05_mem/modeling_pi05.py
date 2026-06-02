@@ -56,7 +56,7 @@ from opentau.policies.pi05.paligemma_with_expert import (
 from opentau.policies.pi05_mem.configuration_pi05 import PI05MemConfig
 from opentau.policies.pi07.video_encoder import SpaceTimeSiglipVideoEncoder
 from opentau.policies.pretrained import PreTrainedPolicy, T
-from opentau.policies.utils import flow_matching_masked_mse
+from opentau.policies.utils import PerSampleLoss, ce_per_sample, flow_matching_masked_mse
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
 
@@ -661,9 +661,19 @@ class PI05MemPolicy(PreTrainedPolicy):
         return actions
 
     def forward(
-        self, batch: dict[str, Tensor], noise: Tensor | None = None, time: Tensor | None = None
-    ) -> dict[str, Tensor]:
-        """Do a full training forward pass to compute the loss."""
+        self,
+        batch: dict[str, Tensor],
+        noise: Tensor | None = None,
+        time: Tensor | None = None,
+        return_per_sample: bool = False,
+    ) -> dict[str, Tensor | PerSampleLoss]:
+        """Do a full training forward pass to compute the loss.
+
+        When ``return_per_sample`` is True, also returns per-sample
+        ``MSE_per_sample``/``CE_per_sample`` (:class:`PerSampleLoss`) for the
+        validation per-(dataset, control_mode) breakdown; the scalar losses are
+        unchanged.
+        """
         dataset_index = self._resolve_dataset_index(batch)
         batch = self.normalize_inputs(batch, dataset_index)
         batch["discrete_actions"] = self.normalize_discrete_actions(dict(batch), dataset_index)["actions"]
@@ -696,12 +706,14 @@ class PI05MemPolicy(PreTrainedPolicy):
             discrete_action_masks,
             obs_history_is_pad=obs_history_is_pad,
             real_action_dim=batch.get("real_action_dim"),
+            return_per_sample=return_per_sample,
         )
 
-        mse_loss = losses["MSE"]
-        ce_loss = losses["CE"]
-
-        return {"MSE": mse_loss, "CE": ce_loss}
+        out: dict[str, Tensor | PerSampleLoss] = {"MSE": losses["MSE"], "CE": losses["CE"]}
+        if return_per_sample:
+            out["MSE_per_sample"] = losses["MSE_per_sample"]
+            out["CE_per_sample"] = losses["CE_per_sample"]
+        return out
 
     def prepare_state(self, batch: dict[str, Tensor]) -> Tensor:
         """Prepares the temporal state tensor, padding or truncating to max_state_dim.
@@ -1094,7 +1106,8 @@ class PI05MemFlowMatching(nn.Module):
         discrete_action_masks: Tensor | None = None,
         obs_history_is_pad: Tensor | None = None,
         real_action_dim: Tensor | None = None,
-    ) -> dict[str, Tensor]:
+        return_per_sample: bool = False,
+    ) -> dict[str, Tensor | PerSampleLoss]:
         """Do a full training forward pass and compute the loss."""
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             videos,
@@ -1178,14 +1191,16 @@ class PI05MemFlowMatching(nn.Module):
         v_t = v_t.to(dtype=torch.float32)
 
         # Shared masked-MSE reduction; see pi05 for the rationale.
-        mse_loss = flow_matching_masked_mse(
+        mse_result = flow_matching_masked_mse(
             u_t=u_t,
             v_t=v_t,
             max_action_dim=self.config.max_action_dim,
             prefix_mask=prefix_mask,
             actions_is_pad=actions_is_pad,
             real_action_dim=real_action_dim,
+            return_per_sample=return_per_sample,
         )
+        mse_loss, mse_per_sample = mse_result if return_per_sample else (mse_result, None)
 
         assert discrete_actions is not None
         assert discrete_action_masks is not None
@@ -1206,9 +1221,17 @@ class PI05MemFlowMatching(nn.Module):
         discrete_action_is_pad = ~discrete_action_masks
         discrete_action_ce_loss = discrete_action_ce_loss * ~discrete_action_is_pad
 
+        ce_per_sample_loss = (
+            ce_per_sample(discrete_action_ce_loss, ~discrete_action_is_pad) if return_per_sample else None
+        )
+
         discrete_action_ce_loss = discrete_action_ce_loss.mean()
 
-        return {"MSE": mse_loss, "CE": discrete_action_ce_loss}
+        out: dict[str, Tensor | PerSampleLoss] = {"MSE": mse_loss, "CE": discrete_action_ce_loss}
+        if return_per_sample:
+            out["MSE_per_sample"] = mse_per_sample
+            out["CE_per_sample"] = ce_per_sample_loss
+        return out
 
     def sample_actions(
         self,

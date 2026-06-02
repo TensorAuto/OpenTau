@@ -27,8 +27,10 @@ from types import SimpleNamespace
 
 import accelerate
 import pytest
+import torch
 
 from opentau.scripts.train import (
+    _bucket_per_sample,
     _commit_wandb_step,
     _find_unused_params_from_env,
     _mixture_weighted_aggregate,
@@ -259,6 +261,51 @@ class TestMixtureWeightedAggregate:
         assert agg["loss"] == pytest.approx(0.25 * 1.0 + 0.75 * 5.0)
         assert agg["mse_loss"] == pytest.approx(0.25 * 2.0 + 0.75 * 6.0)
         assert agg["ce_loss"] == pytest.approx(0.25 * 3.0 + 0.75 * 7.0)
+
+
+class TestBucketPerSample:
+    """``_bucket_per_sample`` disaggregates a *mixed* batch by integer group key —
+    the core of the per-(dataset, control_mode) validation breakdown (issue #373).
+    Grouping on the dropout-immune ``dataset_index`` is what makes a mixed batch
+    decomposable; this is pure CPU arithmetic with no accelerator."""
+
+    def test_disaggregates_mixed_batch_without_cross_contamination(self):
+        group = torch.tensor([0, 1, 0, 1, 2])
+        mse_sum = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0])
+        mse_count = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0])
+        ce_sum = torch.tensor([10.0, 20.0, 30.0, 40.0, 50.0])
+        ce_count = torch.tensor([2.0, 2.0, 2.0, 2.0, 2.0])
+        buckets = _bucket_per_sample(group, mse_sum, mse_count, ce_sum, ce_count)
+        assert set(buckets) == {0, 1, 2}
+        # group 0 = samples {0, 2}; groups 1/2 must not leak in.
+        assert buckets[0]["mse_sum"] == pytest.approx(4.0)
+        assert buckets[0]["mse_count"] == pytest.approx(2.0)
+        assert buckets[0]["ce_sum"] == pytest.approx(40.0)
+        assert buckets[0]["ce_count"] == pytest.approx(4.0)
+        assert buckets[1]["mse_sum"] == pytest.approx(6.0)
+        assert buckets[2]["mse_sum"] == pytest.approx(5.0)
+
+    def test_group_mean_is_sum_over_count_not_mean_of_means(self):
+        # Heterogeneous counts: the regrouped mean must be Σsum/Σcount, so a
+        # 3-slot sample outweighs a 1-slot sample (mean-of-means would not).
+        group = torch.tensor([0, 0])
+        s = torch.tensor([2.0, 9.0])
+        c = torch.tensor([1.0, 3.0])
+        buckets = _bucket_per_sample(group, s, c, s, c)
+        mean = buckets[0]["mse_sum"] / buckets[0]["mse_count"]
+        assert mean == pytest.approx(11.0 / 4.0)
+
+    def test_zero_count_group_carries_zeros_for_caller_guard(self):
+        # pi0 emits zero-count CE; the bucket keeps 0/0 and the caller's +1e-8
+        # turns it into a 0 mean (no NaN).
+        group = torch.tensor([0, 1])
+        mse = torch.tensor([1.0, 2.0])
+        cnt = torch.tensor([1.0, 1.0])
+        zeros = torch.tensor([0.0, 0.0])
+        buckets = _bucket_per_sample(group, mse, cnt, zeros, zeros)
+        assert buckets[0]["ce_sum"] == 0.0
+        assert buckets[0]["ce_count"] == 0.0
+        assert buckets[0]["ce_sum"] / (buckets[0]["ce_count"] + 1e-8) == pytest.approx(0.0)
 
 
 class TestCommitWandbStep:

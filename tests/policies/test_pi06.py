@@ -41,6 +41,7 @@ from opentau.policies.pi06.modeling_pi06 import (
     pad_discrete_tokens,
     resize_with_pad,
 )
+from opentau.policies.utils import PerSampleLoss, ce_per_sample
 
 # Block-causal attention mask (pi05 / π0.6 prefix-LM pattern)
 
@@ -237,6 +238,105 @@ class TestMSEMaskOnFullyPaddedActions:
 
 
 # PI06Config defaults + validators
+
+
+class TestFlowMatchingMaskedMsePerSample:
+    """``return_per_sample=True`` exposes per-sample ``(sum, count)`` without
+    perturbing the scalar — the contract the validation per-(dataset,
+    control_mode) breakdown relies on. Bit-identical scalars keep training
+    determinism intact (CLAUDE.md hard rule)."""
+
+    def test_scalar_is_bit_identical_to_default(self):
+        torch.manual_seed(0)
+        u_t = torch.randn(3, 8, 4)
+        v_t = torch.randn(3, 8, 4)
+        actions_is_pad = torch.zeros(3, 8, dtype=torch.bool)
+        scalar_only = flow_matching_masked_mse(
+            u_t=u_t, v_t=v_t, actions_is_pad=actions_is_pad, max_action_dim=4
+        )
+        scalar, ps = flow_matching_masked_mse(
+            u_t=u_t,
+            v_t=v_t,
+            actions_is_pad=actions_is_pad,
+            max_action_dim=4,
+            return_per_sample=True,
+        )
+        # Same float ops as the default path ⇒ exactly equal, not just close.
+        assert torch.equal(scalar, scalar_only)
+        assert ps.sum.shape == (3,)
+        assert ps.count.shape == (3,)
+
+    def test_regrouped_mean_matches_scalar(self):
+        torch.manual_seed(0)
+        u_t = torch.randn(3, 8, 4)
+        v_t = torch.randn(3, 8, 4)
+        actions_is_pad = torch.zeros(3, 8, dtype=torch.bool)
+        scalar, ps = flow_matching_masked_mse(
+            u_t=u_t,
+            v_t=v_t,
+            actions_is_pad=actions_is_pad,
+            max_action_dim=4,
+            return_per_sample=True,
+        )
+        # Σsum / Σcount over the whole batch reproduces the masked mean exactly.
+        assert torch.isclose(ps.sum.sum() / (ps.count.sum() + 1e-8), scalar, atol=1e-6)
+
+    def test_per_sample_count_excludes_padded_steps_and_dims(self):
+        torch.manual_seed(1)
+        u_t = torch.randn(2, 8, 6)
+        v_t = torch.randn(2, 8, 6)
+        # sample 0: all 8 steps real; sample 1: only first 4 steps real.
+        actions_is_pad = torch.tensor([[False] * 8, [False, False, False, False, True, True, True, True]])
+        # sample 0: 4 real action dims; sample 1: all 6.
+        real_action_dim = torch.tensor([4, 6], dtype=torch.long)
+        _, ps = flow_matching_masked_mse(
+            u_t=u_t,
+            v_t=v_t,
+            actions_is_pad=actions_is_pad,
+            max_action_dim=6,
+            real_action_dim=real_action_dim,
+            return_per_sample=True,
+        )
+        assert ps.count[0].item() == pytest.approx(8 * 4)
+        assert ps.count[1].item() == pytest.approx(4 * 6)
+        # Independent reference for sample 0's numerator (8 steps × dims [0:4]).
+        ref0 = ((u_t[0, :, :4] - v_t[0, :, :4]) ** 2).sum()
+        assert torch.isclose(ps.sum[0], ref0, atol=1e-5)
+
+    def test_fully_padded_sample_has_zero_sum_and_count(self):
+        torch.manual_seed(2)
+        u_t = torch.randn(2, 8, 4)
+        v_t = torch.randn(2, 8, 4)
+        actions_is_pad = torch.zeros(2, 8, dtype=torch.bool)
+        actions_is_pad[1] = True  # sample 1 fully padded ⇒ contributes nothing
+        _, ps = flow_matching_masked_mse(
+            u_t=u_t,
+            v_t=v_t,
+            actions_is_pad=actions_is_pad,
+            max_action_dim=4,
+            return_per_sample=True,
+        )
+        assert ps.sum[1].item() == 0.0
+        assert ps.count[1].item() == 0.0
+
+
+class TestCePerSample:
+    """``ce_per_sample`` / ``PerSampleLoss`` arithmetic used by the per-group CE."""
+
+    def test_sum_and_count_over_valid_tokens(self):
+        # (B=2, S=3): sample 0 has 2 valid tokens, sample 1 has 3.
+        ce = torch.tensor([[1.0, 2.0, 5.0], [0.5, 0.5, 1.0]])
+        valid = torch.tensor([[True, True, False], [True, True, True]])
+        ps = ce_per_sample(ce * valid, valid)
+        assert torch.equal(ps.sum, torch.tensor([3.0, 2.0]))
+        assert torch.equal(ps.count, torch.tensor([2.0, 3.0]))
+
+    def test_pooling_two_components_adds_sums_and_counts(self):
+        a = PerSampleLoss(sum=torch.tensor([1.0, 2.0]), count=torch.tensor([1.0, 1.0]))
+        b = PerSampleLoss(sum=torch.tensor([3.0, 4.0]), count=torch.tensor([2.0, 2.0]))
+        pooled = a + b
+        assert torch.equal(pooled.sum, torch.tensor([4.0, 6.0]))
+        assert torch.equal(pooled.count, torch.tensor([3.0, 3.0]))
 
 
 class TestPI06Config:

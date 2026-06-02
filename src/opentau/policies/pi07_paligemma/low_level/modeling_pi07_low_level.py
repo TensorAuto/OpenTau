@@ -52,7 +52,7 @@ from opentau.policies.pi07_paligemma.low_level.configuration_pi07_low_level impo
     PI07PaligemmaLowLevelConfig,
 )
 from opentau.policies.pretrained import PreTrainedPolicy, ProjectionRemapError, T
-from opentau.policies.utils import flow_matching_masked_mse
+from opentau.policies.utils import PerSampleLoss, ce_per_sample, flow_matching_masked_mse
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
 
@@ -1124,14 +1124,21 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         return actions
 
     def forward(
-        self, batch: dict[str, Tensor], noise: Tensor | None = None, time: Tensor | None = None
-    ) -> dict[str, Tensor | list]:
+        self,
+        batch: dict[str, Tensor],
+        noise: Tensor | None = None,
+        time: Tensor | None = None,
+        return_per_sample: bool = False,
+    ) -> dict[str, Tensor | list | PerSampleLoss]:
         """Do a full training forward pass to compute the loss.
 
         Args:
             batch: Batch of data containing environment observations, actions, and targets.
             noise: Optional noise tensor.
             time: Optional time tensor.
+            return_per_sample: When True, also returns per-sample
+                ``MSE_per_sample``/``CE_per_sample`` (:class:`PerSampleLoss`) for the
+                validation per-(dataset, control_mode) breakdown. Scalars unchanged.
 
         Returns:
             A dictionary containing the loss components ("MSE" and "CE"). When the
@@ -1170,12 +1177,16 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
             time=time,
             real_action_dim=batch.get("real_action_dim"),
             group_index=dataset_index,
+            return_per_sample=return_per_sample,
         )
 
         mse_loss = losses["MSE"]
         ce_loss = losses["CE"]
 
-        out: dict[str, Tensor | list] = {"MSE": mse_loss, "CE": ce_loss}
+        out: dict[str, Tensor | list | PerSampleLoss] = {"MSE": mse_loss, "CE": ce_loss}
+        if return_per_sample:
+            out["MSE_per_sample"] = losses["MSE_per_sample"]
+            out["CE_per_sample"] = losses["CE_per_sample"]
         if outlier_records:
             out["outlier_records"] = outlier_records
         return out
@@ -2174,7 +2185,8 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         time: Tensor | None = None,
         real_action_dim: Tensor | None = None,
         group_index: Tensor | None = None,
-    ) -> dict[str, Tensor]:
+        return_per_sample: bool = False,
+    ) -> dict[str, Tensor | PerSampleLoss]:
         """Do a full training forward pass and compute the loss.
 
         Args:
@@ -2281,14 +2293,16 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         v_t = v_t.to(dtype=torch.float32)
 
         # Shared masked-MSE reduction; see pi05 for the rationale.
-        mse_loss = flow_matching_masked_mse(
+        mse_result = flow_matching_masked_mse(
             u_t=u_t,
             v_t=v_t,
             max_action_dim=self.config.max_action_dim,
             prefix_mask=prefix_mask,
             actions_is_pad=actions_is_pad,
             real_action_dim=real_action_dim,
+            return_per_sample=return_per_sample,
         )
+        mse_loss, mse_per_sample = mse_result if return_per_sample else (mse_result, None)
 
         # compute cross entropy loss for discrete actions
         batch_size, seq_len = discrete_actions.shape
@@ -2310,10 +2324,18 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         discrete_action_is_pad = ~discrete_action_masks  # convert into format where value for pad is True
         discrete_action_ce_loss = discrete_action_ce_loss * ~discrete_action_is_pad
 
+        ce_per_sample_loss = (
+            ce_per_sample(discrete_action_ce_loss, ~discrete_action_is_pad) if return_per_sample else None
+        )
+
         # compute mean
         discrete_action_ce_loss = discrete_action_ce_loss.mean()
 
-        return {"MSE": mse_loss, "CE": discrete_action_ce_loss}
+        out: dict[str, Tensor | PerSampleLoss] = {"MSE": mse_loss, "CE": discrete_action_ce_loss}
+        if return_per_sample:
+            out["MSE_per_sample"] = mse_per_sample
+            out["CE_per_sample"] = ce_per_sample_loss
+        return out
 
     def _build_suffix_items(self, x_t: Tensor) -> list[ContextItem]:
         """Default suffix layout: a single ``"action"`` block for ``x_t``.

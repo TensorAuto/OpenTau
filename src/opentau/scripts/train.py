@@ -14,6 +14,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import inspect
 import json
 import logging
 import os
@@ -318,11 +319,11 @@ def _mixture_weighted_aggregate(
     """Mixture-weighted average of per-dataset validation metrics.
 
     Weights are taken from ``name_to_weight`` and renormalized over only the
-    names present in ``per_dataset_trackers`` (empty datasets are skipped
-    upstream by ``WeightedDatasetMixture.get_per_dataset_dataloaders`` and so
-    will be missing from the trackers). When the renormalization total is 0
-    -- empty trackers, or all selected datasets have weight 0 -- every metric
-    is returned as ``0.0``.
+    keys present in ``per_dataset_trackers`` (groups with no validation samples
+    in the combined pass are simply absent from the trackers). When the
+    renormalization total is 0 -- empty trackers, or all selected groups have
+    weight 0 -- every metric is returned as ``0.0``. Keys are generic: the
+    validation path keys both trackers and weights by norm-head ``norm_key``.
 
     The aggregated metric keys are derived from the first tracker's meters.
     All per-dataset trackers share the same meter set because they're all
@@ -331,11 +332,12 @@ def _mixture_weighted_aggregate(
     tracker's keys are representative.
 
     Args:
-        per_dataset_trackers: One ``MetricsTracker`` per non-empty validation
-            dataset, keyed by dataset name.
-        name_to_weight: Mapping from dataset name to its mixture weight (need
-            not be normalized; need not be a strict subset/superset of the
-            tracker keys, but must contain every tracker key).
+        per_dataset_trackers: One ``MetricsTracker`` per group present in the
+            validation pass, keyed by group identifier (the validation path keys
+            by norm-head ``norm_key``).
+        name_to_weight: Mapping from that same group identifier to its mixture
+            weight (need not be normalized; need not be a strict subset/superset
+            of the tracker keys, but must contain every tracker key).
 
     Returns:
         Dict mapping each metric name found on the trackers to its weighted
@@ -356,6 +358,39 @@ def _mixture_weighted_aggregate(
     return {
         k: sum((w / total) * per_dataset_dicts[name][k] for name, w in weights.items()) for k in metric_keys
     }
+
+
+def _bucket_per_sample(
+    group_index: torch.Tensor,
+    mse_sum: torch.Tensor,
+    mse_count: torch.Tensor,
+    ce_sum: torch.Tensor,
+    ce_count: torch.Tensor,
+) -> dict[int, dict[str, float]]:
+    """Bucket per-sample MSE/CE ``(sum, count)`` by an integer group key.
+
+    All inputs are 1-D tensors of equal length: ``group_index`` is the per-sample
+    integer group (norm-head row, or per-dataset enumerate index), and the others
+    are the per-sample numerator/denominator from the policies' ``PerSampleLoss``
+    outputs. Returns ``{group: {"mse_sum", "mse_count", "ce_sum", "ce_count"}}``
+    summed over the samples in each group; the masked mean for a group is then
+    ``Σsum / Σcount``.
+
+    Pure / CPU-only (no collectives), so the validation loop can call it on rank 0
+    after gathering, and it is unit-testable without an accelerator. Disjoint groups
+    never cross-contaminate, which is exactly what lets a *mixed* batch (the combined
+    val pass) be disaggregated by provenance.
+    """
+    buckets: dict[int, dict[str, float]] = {}
+    for g in torch.unique(group_index).tolist():
+        mask = group_index == g
+        buckets[int(g)] = {
+            "mse_sum": float(mse_sum[mask].sum()),
+            "mse_count": float(mse_count[mask].sum()),
+            "ce_sum": float(ce_sum[mask].sum()),
+            "ce_count": float(ce_count[mask].sum()),
+        }
+    return buckets
 
 
 def _find_unused_params_from_env() -> bool:
@@ -641,19 +676,18 @@ def train(cfg: TrainPipelineConfig):
 
     if cfg.val_freq > 0:
         train_dataloader = train_dataset.get_dataloader()
-        # One DataLoader per underlying val dataset so we can report per-dataset
-        # validation losses. The aggregate is computed by averaging across all.
-        per_dataset_val_dataloaders = val_dataset.get_per_dataset_dataloaders()
-        val_names = list(per_dataset_val_dataloaders.keys())
-        prepared = accelerator.prepare(
-            policy,
-            optimizer,
-            train_dataloader,
-            lr_scheduler,
-            *per_dataset_val_dataloaders.values(),
+        # A single combined validation pass over the whole mixture: under
+        # ``accelerator.prepare`` every rank's shard stays full even when individual
+        # subsets have fewer frames than ``world_size`` (the old one-loader-per-dataset
+        # path left most ranks idle on tiny subsets and stacked that idle time). The
+        # validation loop disaggregates metrics per (dataset, control_mode) from each
+        # sample's ``dataset_index`` / ``dataset_repo_id`` provenance instead.
+        val_dataloader = val_dataset.get_combined_val_dataloader()
+        policy, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            policy, optimizer, train_dataloader, lr_scheduler
         )
-        policy, optimizer, train_dataloader, lr_scheduler = prepared[:4]
-        per_dataset_val_dataloaders = dict(zip(val_names, prepared[4:], strict=True))
+        if val_dataloader is not None:
+            val_dataloader = accelerator.prepare(val_dataloader)
     else:
         train_dataloader = train_dataset.get_dataloader()
         policy, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -841,13 +875,10 @@ def train(cfg: TrainPipelineConfig):
 
             accelerator.wait_for_everyone()
 
-        if is_val_step:
+        if is_val_step and val_dataloader is not None:
             policy.eval()
 
             def _make_val_tracker(current_step: int = step) -> MetricsTracker:
-                # ``l1_loss`` and ``accuracy`` are populated lazily below iff the
-                # policy's ``forward`` returns ``"L1"`` / ``"Accuracy"``. See
-                # ``update_policy`` for the symmetric training-side pattern.
                 return MetricsTracker(
                     cfg.batch_size * accelerator.num_processes,
                     {
@@ -858,92 +889,191 @@ def train(cfg: TrainPipelineConfig):
                     initial_step=current_step,
                 )
 
-            per_dataset_trackers: dict[str, MetricsTracker] = {
-                name: _make_val_tracker() for name in per_dataset_val_dataloaders
+            # Per-(dataset, control_mode) breakdown needs per-sample losses. Action
+            # policies expose them via ``forward(..., return_per_sample=True)``; other
+            # policies (e.g. high-level planners) don't, so fall back to an
+            # aggregate-only pass for them. The single combined loader — and its
+            # full-shard parallelization — applies to every policy regardless.
+            unwrapped_policy = accelerator.unwrap_model(policy)
+            supports_per_sample = (
+                "return_per_sample" in inspect.signature(unwrapped_policy.forward).parameters
+            )
+            mse_w = cfg.loss_weighting["MSE"]
+            ce_w = cfg.loss_weighting["CE"]
+            outlier_threshold = getattr(unwrapped_policy.config, "warn_outlier_threshold", None)
+            name_to_index = val_dataset.meta.dataset_name_to_index
+
+            # Rank-0 accumulators across the whole pass. Per-sample tensors are gathered
+            # every batch (a collective on all ranks) but only retained on the main
+            # process, then bucketed once at the end.
+            ps_chunks: dict[str, list[torch.Tensor]] = {
+                "mse_sum": [],
+                "mse_count": [],
+                "ce_sum": [],
+                "ce_count": [],
+                "norm_index": [],
+                "source_index": [],
             }
+            agg_tracker = _make_val_tracker()  # only used on the fallback (no per-sample) path
+            optional_vals: dict[str, list[float]] = {"l1_loss": [], "accuracy": []}
 
             logging.info(f"Validation at step {step}...")
 
             with torch.no_grad():
-                for ds_name, ds_loader in per_dataset_val_dataloaders.items():
-                    ds_tracker = per_dataset_trackers[ds_name]
-                    for batch in ds_loader:
-                        losses = policy.forward(batch)
-                        outlier_records = losses.pop("outlier_records", [])
-                        loss = (
-                            cfg.loss_weighting["MSE"] * losses["MSE"]
-                            + cfg.loss_weighting["CE"] * losses["CE"]
-                        )
+                for batch in val_dataloader:
+                    losses = (
+                        policy.forward(batch, return_per_sample=True)
+                        if supports_per_sample
+                        else policy.forward(batch)
+                    )
+                    outlier_records = losses.pop("outlier_records", [])
 
-                        # Gather and average metrics across processes. ``L1`` /
-                        # ``Accuracy`` are optional — see ``update_policy`` for
-                        # the symmetric training-side gating rationale.
-                        loss = accelerator.gather_for_metrics(loss).mean().item()
-                        mse_loss = (
+                    # Optional value-head metrics (scalars); aggregate-level only. Gather
+                    # outside the per-sample branch so both paths handle them identically.
+                    l1_val = (
+                        accelerator.gather_for_metrics(losses["L1"]).to(dtype=torch.float32).mean().item()
+                        if "L1" in losses
+                        else None
+                    )
+                    accuracy_val = (
+                        accelerator.gather_for_metrics(losses["Accuracy"])
+                        .to(dtype=torch.float32)
+                        .mean()
+                        .item()
+                        if "Accuracy" in losses
+                        else None
+                    )
+
+                    if supports_per_sample:
+                        mse_ps = losses["MSE_per_sample"]
+                        ce_ps = losses["CE_per_sample"]
+                        # Per-sample provenance keys: ``dataset_index`` is the dropout-immune
+                        # norm-head row; ``source_index`` is the per-dataset enumerate index
+                        # recovered from the (also dropout-immune) ``dataset_repo_id``. Both
+                        # gathered as int tensors so the ragged last-batch de-pad stays
+                        # row-aligned with the loss tensors (``gather_object`` would not).
+                        norm_index = batch["dataset_index"].to(device=accelerator.device, dtype=torch.long)
+                        source_index = torch.tensor(
+                            [name_to_index[name] for name in batch["dataset_repo_id"]],
+                            device=accelerator.device,
+                            dtype=torch.long,
+                        )
+                        gathered = {
+                            "mse_sum": accelerator.gather_for_metrics(mse_ps.sum.to(dtype=torch.float32)),
+                            "mse_count": accelerator.gather_for_metrics(mse_ps.count.to(dtype=torch.float32)),
+                            "ce_sum": accelerator.gather_for_metrics(ce_ps.sum.to(dtype=torch.float32)),
+                            "ce_count": accelerator.gather_for_metrics(ce_ps.count.to(dtype=torch.float32)),
+                            "norm_index": accelerator.gather_for_metrics(norm_index),
+                            "source_index": accelerator.gather_for_metrics(source_index),
+                        }
+                    else:
+                        loss = mse_w * losses["MSE"] + ce_w * losses["CE"]
+                        loss_val = accelerator.gather_for_metrics(loss).to(dtype=torch.float32).mean().item()
+                        mse_val = (
                             accelerator.gather_for_metrics(losses["MSE"])
                             .to(dtype=torch.float32)
                             .mean()
                             .item()
                         )
-                        ce_loss = (
+                        ce_val = (
                             accelerator.gather_for_metrics(losses["CE"]).to(dtype=torch.float32).mean().item()
                         )
-                        l1_loss = (
-                            accelerator.gather_for_metrics(losses["L1"]).to(dtype=torch.float32).mean().item()
-                            if "L1" in losses
-                            else None
-                        )
-                        accuracy = (
-                            accelerator.gather_for_metrics(losses["Accuracy"])
-                            .to(dtype=torch.float32)
-                            .mean()
-                            .item()
-                            if "Accuracy" in losses
-                            else None
-                        )
 
-                        # Warn about outliers on rank 0 too during eval (parity with training); see
-                        # ``update_policy`` for the rank-uniform gating rationale.
-                        outlier_threshold = getattr(
-                            accelerator.unwrap_model(policy).config, "warn_outlier_threshold", None
-                        )
-                        if outlier_threshold is not None and outlier_threshold > 0:
-                            log_outlier_records_distributed(accelerator, outlier_records, outlier_threshold)
+                    # Warn about outliers on rank 0 too during eval (parity with training); see
+                    # ``update_policy`` for the rank-uniform gating rationale.
+                    if outlier_threshold is not None and outlier_threshold > 0:
+                        log_outlier_records_distributed(accelerator, outlier_records, outlier_threshold)
 
-                        if accelerator.is_main_process:
-                            ds_tracker.loss = loss
-                            ds_tracker.mse_loss = mse_loss
-                            ds_tracker.ce_loss = ce_loss
-                            _observe_optional(ds_tracker, "l1_loss", "val_l1_loss", ":.6f", l1_loss)
-                            _observe_optional(ds_tracker, "accuracy", "val_accuracy", ":.3f", accuracy)
+                    if accelerator.is_main_process:
+                        if supports_per_sample:
+                            for key, value in gathered.items():
+                                ps_chunks[key].append(value.cpu())
+                        else:
+                            agg_tracker.loss = loss_val
+                            agg_tracker.mse_loss = mse_val
+                            agg_tracker.ce_loss = ce_val
+                        if l1_val is not None:
+                            optional_vals["l1_loss"].append(l1_val)
+                        if accuracy_val is not None:
+                            optional_vals["accuracy"].append(accuracy_val)
 
             if accelerator.is_main_process:
-                for ds_name, ds_tracker in per_dataset_trackers.items():
-                    logging.info(f"Validation/{ds_name} {ds_tracker}")
-                    ds_dict = ds_tracker.to_dict(use_avg=True)
-                    accelerator.log({f"Validation/{ds_name}/Loss": ds_dict["loss"]}, step=step)
-                    accelerator.log({f"Validation/{ds_name}/MSE Loss": ds_dict["mse_loss"]}, step=step)
-                    accelerator.log({f"Validation/{ds_name}/CE Loss": ds_dict["ce_loss"]}, step=step)
-                    if "l1_loss" in ds_tracker.metrics:
-                        accelerator.log({f"Validation/{ds_name}/L1 Loss": ds_dict["l1_loss"]}, step=step)
-                    if "accuracy" in ds_tracker.metrics:
-                        accelerator.log({f"Validation/{ds_name}/Accuracy": ds_dict["accuracy"]}, step=step)
-
-                # Mixture-weighted aggregate across the per-dataset trackers, so the
-                # overall scalar reflects the training mixture rather than being
-                # implicitly dominated by whichever val subset has the most batches.
+                meta = val_dataset.meta
                 name_to_weight = dict(
                     zip(val_dataset.dataset_names, val_dataset.dataset_weights, strict=True)
                 )
-                agg = _mixture_weighted_aggregate(per_dataset_trackers, name_to_weight)
-                logging.info(f"Validation/aggregate {agg}")
-                accelerator.log({"Validation/Loss": agg["loss"]}, step=step)
-                accelerator.log({"Validation/MSE Loss": agg["mse_loss"]}, step=step)
-                accelerator.log({"Validation/CE Loss": agg["ce_loss"]}, step=step)
-                if "l1_loss" in agg:
-                    accelerator.log({"Validation/L1 Loss": agg["l1_loss"]}, step=step)
-                if "accuracy" in agg:
-                    accelerator.log({"Validation/Accuracy": agg["accuracy"]}, step=step)
+
+                if supports_per_sample and ps_chunks["norm_index"]:
+                    norm_index = torch.cat(ps_chunks["norm_index"])
+                    source_index = torch.cat(ps_chunks["source_index"])
+                    mse_sum = torch.cat(ps_chunks["mse_sum"])
+                    mse_count = torch.cat(ps_chunks["mse_count"])
+                    ce_sum = torch.cat(ps_chunks["ce_sum"])
+                    ce_count = torch.cat(ps_chunks["ce_count"])
+                    norm_groups = _bucket_per_sample(norm_index, mse_sum, mse_count, ce_sum, ce_count)
+                    source_groups = _bucket_per_sample(source_index, mse_sum, mse_count, ce_sum, ce_count)
+
+                    # Headline breakdown: one tracker per norm head (``robot::control_mode``
+                    # or a fallback dataset name), keyed by ``norm_key`` for the aggregate.
+                    per_normkey_trackers: dict[str, MetricsTracker] = {}
+                    for norm_row, group in norm_groups.items():
+                        norm_key = meta.norm_keys[norm_row]
+                        mse_mean = group["mse_sum"] / (group["mse_count"] + 1e-8)
+                        ce_mean = group["ce_sum"] / (group["ce_count"] + 1e-8)
+                        loss_mean = mse_w * mse_mean + ce_w * ce_mean
+                        tracker = _make_val_tracker()
+                        tracker.mse_loss = mse_mean
+                        tracker.ce_loss = ce_mean
+                        tracker.loss = loss_mean
+                        per_normkey_trackers[norm_key] = tracker
+                        logging.info(f"Validation/{norm_key} {tracker}")
+                        accelerator.log({f"Validation/{norm_key}/Loss": loss_mean}, step=step)
+                        accelerator.log({f"Validation/{norm_key}/MSE Loss": mse_mean}, step=step)
+                        accelerator.log({f"Validation/{norm_key}/CE Loss": ce_mean}, step=step)
+
+                    # Finer per-source-dataset breakdown (no info loss when datasets share
+                    # a norm head). Logged-only; the aggregate stays per-norm-head.
+                    for source_row, group in source_groups.items():
+                        ds_name = meta.dataset_names[source_row]
+                        mse_mean = group["mse_sum"] / (group["mse_count"] + 1e-8)
+                        ce_mean = group["ce_sum"] / (group["ce_count"] + 1e-8)
+                        loss_mean = mse_w * mse_mean + ce_w * ce_mean
+                        accelerator.log({f"Validation/by_dataset/{ds_name}/Loss": loss_mean}, step=step)
+                        accelerator.log({f"Validation/by_dataset/{ds_name}/MSE Loss": mse_mean}, step=step)
+                        accelerator.log({f"Validation/by_dataset/{ds_name}/CE Loss": ce_mean}, step=step)
+
+                    # Mixture-weighted aggregate over norm heads, so the overall scalar
+                    # reflects the training mixture rather than being dominated by whichever
+                    # head has the most val frames. Sum each head's member-dataset weights.
+                    norm_key_weight: dict[str, float] = {}
+                    for name, weight in name_to_weight.items():
+                        nk = meta.norm_keys[meta.dataset_to_norm_index[name]]
+                        norm_key_weight[nk] = norm_key_weight.get(nk, 0.0) + weight
+                    agg = _mixture_weighted_aggregate(per_normkey_trackers, norm_key_weight)
+                elif not supports_per_sample:
+                    # Fallback: the combined-pass batch-mean aggregate; no per-group breakdown.
+                    agg = agg_tracker.to_dict(use_avg=True)
+                else:
+                    agg = {}
+
+                if agg:
+                    logging.info(f"Validation/aggregate {agg}")
+                    accelerator.log({"Validation/Loss": agg["loss"]}, step=step)
+                    accelerator.log({"Validation/MSE Loss": agg["mse_loss"]}, step=step)
+                    accelerator.log({"Validation/CE Loss": agg["ce_loss"]}, step=step)
+                if optional_vals["l1_loss"]:
+                    accelerator.log(
+                        {"Validation/L1 Loss": sum(optional_vals["l1_loss"]) / len(optional_vals["l1_loss"])},
+                        step=step,
+                    )
+                if optional_vals["accuracy"]:
+                    accelerator.log(
+                        {
+                            "Validation/Accuracy": sum(optional_vals["accuracy"])
+                            / len(optional_vals["accuracy"])
+                        },
+                        step=step,
+                    )
 
             # This barrier is probably necessary to ensure
             # other processes wait for the main process to finish saving

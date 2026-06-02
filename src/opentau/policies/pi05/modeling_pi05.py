@@ -44,7 +44,7 @@ from opentau.policies.pi05.paligemma_with_expert import (
     PaliGemmaWithExpertModel,
 )
 from opentau.policies.pretrained import PreTrainedPolicy, T
-from opentau.policies.utils import flow_matching_masked_mse
+from opentau.policies.utils import PerSampleLoss, ce_per_sample, flow_matching_masked_mse
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
 
@@ -680,17 +680,26 @@ class PI05Policy(PreTrainedPolicy):
         return actions
 
     def forward(
-        self, batch: dict[str, Tensor], noise: Tensor | None = None, time: Tensor | None = None
-    ) -> dict[str, Tensor]:
+        self,
+        batch: dict[str, Tensor],
+        noise: Tensor | None = None,
+        time: Tensor | None = None,
+        return_per_sample: bool = False,
+    ) -> dict[str, Tensor | PerSampleLoss]:
         """Do a full training forward pass to compute the loss.
 
         Args:
             batch: Batch of data containing environment observations, actions, and targets.
             noise: Optional noise tensor.
             time: Optional time tensor.
+            return_per_sample: When True, additionally return per-sample ``MSE_per_sample``
+                / ``CE_per_sample`` (:class:`PerSampleLoss`) so the validation loop can
+                bucket the loss by ``(dataset, control_mode)`` provenance. The scalar
+                ``MSE``/``CE`` are unchanged, so the training path is unaffected.
 
         Returns:
-            A dictionary containing the loss components ("MSE" and "CE").
+            A dictionary with the loss components ("MSE" and "CE"), plus
+            "MSE_per_sample"/"CE_per_sample" when ``return_per_sample`` is True.
         """
         dataset_index = self._resolve_dataset_index(batch)
         batch = self.normalize_inputs(batch, dataset_index)
@@ -732,12 +741,14 @@ class PI05Policy(PreTrainedPolicy):
             discrete_action_masks,
             state=state,
             real_action_dim=batch.get("real_action_dim"),
+            return_per_sample=return_per_sample,
         )
 
-        mse_loss = losses["MSE"]
-        ce_loss = losses["CE"]
-
-        return {"MSE": mse_loss, "CE": ce_loss}
+        out: dict[str, Tensor | PerSampleLoss] = {"MSE": losses["MSE"], "CE": losses["CE"]}
+        if return_per_sample:
+            out["MSE_per_sample"] = losses["MSE_per_sample"]
+            out["CE_per_sample"] = losses["CE_per_sample"]
+        return out
 
     def prepare_state(self, batch: dict[str, Tensor]) -> Tensor:
         """Prepares the continuous state tensor, padding or truncating to max_state_dim.
@@ -1315,7 +1326,8 @@ class PI05FlowMatching(nn.Module):
         discrete_action_masks: Tensor | None = None,
         state: Tensor | None = None,
         real_action_dim: Tensor | None = None,
-    ) -> dict[str, Tensor]:
+        return_per_sample: bool = False,
+    ) -> dict[str, Tensor | PerSampleLoss]:
         """Do a full training forward pass and compute the loss.
 
         Args:
@@ -1438,14 +1450,16 @@ class PI05FlowMatching(nn.Module):
         # Shared masked-MSE reduction: AND-s frozen-prefix, timestep-pad, and
         # dim-pad masks together and divides by the unmasked-slot count. See
         # ``opentau.policies.utils.flow_matching_masked_mse`` for the full spec.
-        mse_loss = flow_matching_masked_mse(
+        mse_result = flow_matching_masked_mse(
             u_t=u_t,
             v_t=v_t,
             max_action_dim=self.config.max_action_dim,
             prefix_mask=prefix_mask,
             actions_is_pad=actions_is_pad,
             real_action_dim=real_action_dim,
+            return_per_sample=return_per_sample,
         )
+        mse_loss, mse_per_sample = mse_result if return_per_sample else (mse_result, None)
 
         # compute cross entropy loss for discrete actions
         batch_size, seq_len = discrete_actions.shape
@@ -1466,6 +1480,11 @@ class PI05FlowMatching(nn.Module):
         # remove pad tokens
         discrete_action_is_pad = ~discrete_action_masks  # convert into format where value for pad is True
         discrete_action_ce_loss = discrete_action_ce_loss * ~discrete_action_is_pad
+
+        # Per-sample CE numerator/denominator over valid tokens, for the val breakdown.
+        discrete_action_ce_per_sample = (
+            ce_per_sample(discrete_action_ce_loss, ~discrete_action_is_pad) if return_per_sample else None
+        )
 
         # compute mean
         discrete_action_ce_loss = discrete_action_ce_loss.mean()
@@ -1505,12 +1524,30 @@ class PI05FlowMatching(nn.Module):
             # helps to control loss for response tokens in case of robotic data and VQA data
             response_ce_loss = response_ce_loss * ~response_is_pad[:, response_slice]
 
+            # Per-sample response CE (valid tokens only) for the val breakdown.
+            response_ce_per_sample = (
+                ce_per_sample(response_ce_loss, ~response_is_pad[:, response_slice])
+                if return_per_sample
+                else None
+            )
+
             # compute mean
             response_ce_loss = response_ce_loss.mean()
         else:
             response_ce_loss = torch.tensor(0.0, device=mse_loss.device)
+            response_ce_per_sample = None
 
-        return {"MSE": mse_loss, "CE": discrete_action_ce_loss + response_ce_loss}
+        out: dict[str, Tensor | PerSampleLoss] = {
+            "MSE": mse_loss,
+            "CE": discrete_action_ce_loss + response_ce_loss,
+        }
+        if return_per_sample:
+            ce_ps = discrete_action_ce_per_sample
+            if response_ce_per_sample is not None:
+                ce_ps = ce_ps + response_ce_per_sample
+            out["MSE_per_sample"] = mse_per_sample
+            out["CE_per_sample"] = ce_ps
+        return out
 
     def sample_actions(
         self,

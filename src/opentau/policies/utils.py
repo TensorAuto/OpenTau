@@ -24,10 +24,11 @@ information.
 
 import logging
 from collections import deque
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F  # noqa: N812
-from einops import rearrange
+from einops import rearrange, reduce
 from torch import Tensor, nn
 
 
@@ -110,6 +111,29 @@ def get_output_shape(module: nn.Module, input_shape: tuple) -> tuple:
     return tuple(output.shape)
 
 
+@dataclass
+class PerSampleLoss:
+    """Per-sample decomposition of a masked loss, with the batch dim kept.
+
+    ``sum`` and ``count`` are both ``(B,)`` and hold, for each sample, the
+    summed unmasked loss and the number of unmasked slots that fed it. The
+    masked *mean* for any group of samples is ``Σsum / Σcount`` — carrying the
+    (numerator, denominator) pair rather than a per-sample mean is what lets a
+    caller (e.g. the validation loop) regroup samples by provenance and recover
+    an exact masked mean per group. Averaging per-sample means instead would
+    double-normalize and weight a 1-slot sample the same as a 200-slot one.
+    """
+
+    sum: Tensor
+    count: Tensor
+
+    def __add__(self, other: "PerSampleLoss") -> "PerSampleLoss":
+        # Pool several loss components (e.g. discrete-action CE + response CE)
+        # into one (numerator, denominator); the pooled per-slot mean is then
+        # Σ(sum_i) / Σ(count_i) over the pooled slots.
+        return PerSampleLoss(sum=self.sum + other.sum, count=self.count + other.count)
+
+
 def make_action_dim_mask(
     real_action_dim: Tensor | None,
     max_action_dim: int,
@@ -164,7 +188,8 @@ def flow_matching_masked_mse(
     prefix_mask: Tensor | None = None,
     actions_is_pad: Tensor | None = None,
     real_action_dim: Tensor | None = None,
-) -> Tensor:
+    return_per_sample: bool = False,
+) -> Tensor | tuple[Tensor, PerSampleLoss]:
     """Masked MSE for flow-matching velocity-field training.
 
     Shared across pi05, pi05_mem, pi06, pi07 (low_level), and pi07_paligemma
@@ -195,9 +220,17 @@ def flow_matching_masked_mse(
             action chunk is padded (no real action target). ``None`` ⇒ all-False.
         real_action_dim: Optional long ``(B,)`` — real (pre-pad) action dim per
             sample. ``None`` ⇒ all-True (every dim is real).
+        return_per_sample: When True, additionally return a :class:`PerSampleLoss`
+            holding the per-sample ``(Σ over masked slots, #masked slots)`` so the
+            caller can regroup the loss by provenance. The scalar is computed
+            exactly as in the default path (bit-identical), so toggling this flag
+            never perturbs the training reduction.
 
     Returns:
-        Scalar tensor: masked mean of ``(u_t - v_t)**2`` over the unmasked slots.
+        Scalar tensor (masked mean of ``(u_t - v_t)**2`` over the unmasked slots)
+        when ``return_per_sample`` is False; otherwise ``(scalar, PerSampleLoss)``
+        where the per-sample ``sum``/``count`` are over the same masked slots
+        (so each sample's mean is ``sum / count``).
     """
     mse_loss = F.mse_loss(u_t, v_t, reduction="none")
     bsz, chunk_size = u_t.shape[:2]
@@ -210,7 +243,44 @@ def flow_matching_masked_mse(
     mse_loss = mse_loss[:, :, :max_action_dim]
     dim_mask = make_action_dim_mask(real_action_dim, max_action_dim, batch_size=bsz, device=u_t.device)
     full_mask = postfix_mask & rearrange(dim_mask, "b d -> b 1 d")
-    return (mse_loss * full_mask).sum() / (full_mask.sum() + 1e-8)
+    masked = mse_loss * full_mask
+    scalar = masked.sum() / (full_mask.sum() + 1e-8)
+    if not return_per_sample:
+        return scalar
+    per_sample = PerSampleLoss(
+        sum=reduce(masked, "b c d -> b", "sum"),
+        count=reduce(full_mask.float(), "b c d -> b", "sum"),
+    )
+    return scalar, per_sample
+
+
+def ce_per_sample(masked_ce: Tensor, valid_mask: Tensor) -> PerSampleLoss:
+    """Per-sample numerator/denominator for a masked token cross-entropy.
+
+    Policies compute their CE as ``F.cross_entropy(..., reduction="none")``
+    reshaped to ``(B, S)`` and zeroed at pad positions, then reduce it with
+    ``.mean()`` to a scalar. This helper takes that same pad-zeroed ``(B, S)``
+    tensor plus the per-token validity mask and returns the per-sample
+    ``(Σ over valid tokens, #valid tokens)``, so a caller can pool CE per
+    provenance group as ``Σsum / Σcount`` — the mean cross-entropy per valid
+    token. Multiple CE components (e.g. discrete-action + response) pool by
+    adding their :class:`PerSampleLoss` objects.
+
+    Note this normalizes by *valid* token count, unlike the legacy scalar
+    ``.mean()`` which divides by the full ``B * S`` (pad slots included); the
+    per-group breakdown is therefore over valid tokens only.
+
+    Args:
+        masked_ce: ``(B, S)`` cross-entropy already zeroed at pad positions.
+        valid_mask: ``(B, S)`` bool, True at non-pad (scored) tokens.
+
+    Returns:
+        ``PerSampleLoss`` whose ``sum`` and ``count`` are ``(B,)``.
+    """
+    return PerSampleLoss(
+        sum=reduce(masked_ce, "b s -> b", "sum"),
+        count=reduce(valid_mask.float(), "b s -> b", "sum"),
+    )
 
 
 def log_model_loading_keys(missing_keys: list[str], unexpected_keys: list[str]) -> None:

@@ -25,7 +25,7 @@ from collections import deque
 
 import torch
 import torch.nn.functional as F  # noqa: N812
-from einops import rearrange
+from einops import rearrange, reduce
 from torch import Tensor, nn
 from transformers import AutoTokenizer
 
@@ -37,7 +37,7 @@ from opentau.policies.pi0.paligemma_with_expert import (
     PaliGemmaWithExpertModel,
 )
 from opentau.policies.pretrained import PreTrainedPolicy
-from opentau.policies.utils import log_model_loading_keys, make_action_dim_mask
+from opentau.policies.utils import PerSampleLoss, log_model_loading_keys, make_action_dim_mask
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
 
@@ -466,14 +466,22 @@ class PI0Policy(PreTrainedPolicy):
         return actions
 
     def forward(
-        self, batch: dict[str, Tensor], noise: Tensor | None = None, time: Tensor | None = None
-    ) -> dict[str, Tensor]:
+        self,
+        batch: dict[str, Tensor],
+        noise: Tensor | None = None,
+        time: Tensor | None = None,
+        return_per_sample: bool = False,
+    ) -> dict[str, Tensor | PerSampleLoss]:
         """Do a full training forward pass to compute the loss.
 
         Args:
             batch: Batch of data containing environment observations, actions, and targets.
             noise: Optional noise tensor.
             time: Optional time tensor.
+            return_per_sample: When True, also returns per-sample
+                ``MSE_per_sample``/``CE_per_sample`` (:class:`PerSampleLoss`) for the
+                validation per-(dataset, control_mode) breakdown. ``CE`` is a zero
+                stub for pi0, so ``CE_per_sample`` carries zero sum and count.
 
         Returns:
             A dictionary containing the loss components ("MSE" and "CE").
@@ -537,7 +545,21 @@ class PI0Policy(PreTrainedPolicy):
 
         loss = losses.sum() / (full_mask.sum() + 1e-8)
 
-        return {"MSE": loss, "CE": torch.zeros_like(loss, requires_grad=True)}
+        out: dict[str, Tensor | PerSampleLoss] = {
+            "MSE": loss,
+            "CE": torch.zeros_like(loss, requires_grad=True),
+        }
+        if return_per_sample:
+            # ``losses`` is already masked (and AWR-weighted, if enabled), matching
+            # the scalar reduction; reduce over (chunk, dim) keeping the batch axis.
+            out["MSE_per_sample"] = PerSampleLoss(
+                sum=reduce(losses, "b c d -> b", "sum"),
+                count=reduce(full_mask.float(), "b c d -> b", "sum"),
+            )
+            # pi0 has no CE term; emit zero sum/count so it forms no CE groups.
+            zeros = torch.zeros(losses.shape[0], device=losses.device)
+            out["CE_per_sample"] = PerSampleLoss(sum=zeros, count=zeros.clone())
+        return out
 
     def prepare_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
         """Apply Pi0 preprocessing to the images.

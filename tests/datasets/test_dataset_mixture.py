@@ -324,6 +324,34 @@ class TestWeightedDatasetMixture:
         assert dataloader.batch_size == train_pipeline_config.batch_size
         assert dataloader.num_workers == train_pipeline_config.num_workers
 
+    def test_get_combined_val_dataloader(self, train_pipeline_config, datasets_factory):
+        """One deterministic sequential loader over the whole mixture (the
+        validation path): every sample is scored exactly once, in order.
+
+        The loader serves ``concatenated_dataset`` — the same ``_TaggedDataset``-
+        wrapped mixture ``get_dataloader`` uses — so each sample carries the
+        ``dataset_index`` / ``dataset_repo_id`` provenance the validation loop
+        buckets on (the wrapper injection is covered by the integration tests
+        below). Coverage and order are asserted via the sampler (pure Python),
+        avoiding a fetch through the fake fixture's non-picklable worker dataset."""
+        datasets = datasets_factory(2)
+        mixture = WeightedDatasetMixture(train_pipeline_config, datasets, [0.7, 0.3], 30.0)
+
+        dataloader = mixture.get_combined_val_dataloader()
+
+        assert dataloader is not None
+        assert dataloader.batch_size == train_pipeline_config.dataloader_batch_size
+        # Serves the tagged concat mixture (so provenance keys ride along).
+        assert dataloader.dataset is mixture.concatenated_dataset
+        # Sequential + deterministic: no weighted/random sampler, nothing dropped.
+        assert isinstance(dataloader.sampler, torch.utils.data.SequentialSampler)
+        assert dataloader.drop_last is False
+
+        total = sum(len(ds) for ds in mixture.datasets)
+        assert len(dataloader.dataset) == total
+        # Every sample exactly once, in concat order — this is what the loader iterates.
+        assert list(dataloader.sampler) == list(range(total))
+
     @pytest.mark.slow  # 1 sec
     def test_get_dataloader_zero_weights_error(self, train_pipeline_config, datasets_factory):
         """Test dataloader creation with zero weights raises error."""

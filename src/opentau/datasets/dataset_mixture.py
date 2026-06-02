@@ -975,3 +975,46 @@ class WeightedDatasetMixture:
                 worker_init_fn=worker_init_fn,
             )
         return loaders
+
+    def get_combined_val_dataloader(self) -> DataLoader | None:
+        """Create one deterministic sequential DataLoader over the whole mixture.
+
+        Unlike :meth:`get_per_dataset_dataloaders` (one loader per dataset), this
+        returns a single loader over the concatenated mixture so that, under
+        ``accelerator.prepare``, every rank's shard is full even when individual
+        validation subsets have fewer frames than ``world_size`` — the per-dataset
+        loaders leave most ranks idle on tiny subsets and stack that idle time
+        across datasets. Each sample still carries its ``dataset_index`` /
+        ``dataset_repo_id`` provenance (injected by ``_TaggedDataset``), so the
+        validation loop can disaggregate metrics per ``(dataset, control_mode)``
+        from the batch rather than relying on homogeneous per-dataset loaders.
+        ``shuffle=False`` + ``drop_last=False`` make the pass order-deterministic
+        (seed-independent) and score every sample exactly once.
+
+        Returns:
+            A single ``DataLoader`` over the mixture, or ``None`` when the mixture
+            is empty (mirrors the empty-dataset skip in
+            :meth:`get_per_dataset_dataloaders`).
+        """
+        if len(self.concatenated_dataset) == 0:
+            logging.info("Combined validation DataLoader skipped: the mixture is empty.")
+            return None
+
+        worker_name_mapping_overrides = self._get_worker_name_mapping_overrides()
+        worker_init_fn = None
+        if worker_name_mapping_overrides:
+            worker_init_fn = functools.partial(
+                _apply_data_feature_name_mapping_overrides,
+                mapping_overrides=worker_name_mapping_overrides,
+            )
+
+        return DataLoader(
+            self.concatenated_dataset,
+            batch_size=self.cfg.dataloader_batch_size,
+            shuffle=False,
+            num_workers=self.cfg.num_workers,
+            pin_memory=torch.cuda.is_available(),
+            drop_last=False,
+            prefetch_factor=self.cfg.prefetch_factor,
+            worker_init_fn=worker_init_fn,
+        )

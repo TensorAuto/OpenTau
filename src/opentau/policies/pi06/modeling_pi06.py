@@ -51,7 +51,7 @@ from opentau.policies.pi06.gemma3_with_expert import (
     Gemma3WithExpertModel,
 )
 from opentau.policies.pretrained import PreTrainedPolicy, T
-from opentau.policies.utils import flow_matching_masked_mse
+from opentau.policies.utils import PerSampleLoss, ce_per_sample, flow_matching_masked_mse
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
 
@@ -587,9 +587,18 @@ class PI06Policy(PreTrainedPolicy):
         return actions
 
     def forward(
-        self, batch: dict[str, Tensor], noise: Tensor | None = None, time: Tensor | None = None
-    ) -> dict[str, Tensor]:
-        """Full training forward pass. Returns `{"MSE": ..., "CE": ...}`."""
+        self,
+        batch: dict[str, Tensor],
+        noise: Tensor | None = None,
+        time: Tensor | None = None,
+        return_per_sample: bool = False,
+    ) -> dict[str, Tensor | PerSampleLoss]:
+        """Full training forward pass. Returns `{"MSE": ..., "CE": ...}`.
+
+        When ``return_per_sample`` is True, also returns ``MSE_per_sample`` /
+        ``CE_per_sample`` (:class:`PerSampleLoss`) for the validation
+        per-(dataset, control_mode) breakdown; the scalar losses are unchanged.
+        """
         dataset_index = self._resolve_dataset_index(batch)
         batch = self.normalize_inputs(batch, dataset_index)
         batch["discrete_actions"] = self.normalize_discrete_actions(dict(batch), dataset_index)["actions"]
@@ -616,11 +625,14 @@ class PI06Policy(PreTrainedPolicy):
             discrete_actions,
             discrete_action_masks,
             real_action_dim=batch.get("real_action_dim"),
+            return_per_sample=return_per_sample,
         )
 
-        mse_loss = losses["MSE"]
-        ce_loss = losses["CE"]
-        return {"MSE": mse_loss, "CE": ce_loss}
+        out: dict[str, Tensor | PerSampleLoss] = {"MSE": losses["MSE"], "CE": losses["CE"]}
+        if return_per_sample:
+            out["MSE_per_sample"] = losses["MSE_per_sample"]
+            out["CE_per_sample"] = losses["CE_per_sample"]
+        return out
 
     # Preprocessing helpers (state discretization, image resize, etc.)
 
@@ -978,7 +990,8 @@ class PI06FlowMatching(nn.Module):
         discrete_actions: Tensor | None = None,
         discrete_action_masks: Tensor | None = None,
         real_action_dim: Tensor | None = None,
-    ) -> dict[str, Tensor]:
+        return_per_sample: bool = False,
+    ) -> dict[str, Tensor | PerSampleLoss]:
         """Full training forward pass. Returns `{"MSE": ..., "CE": ...}`."""
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images,
@@ -1061,14 +1074,16 @@ class PI06FlowMatching(nn.Module):
         v_t = self.action_out_proj(suffix_out)
         v_t = v_t.to(dtype=torch.float32)
 
-        mse_loss = flow_matching_masked_mse(
+        mse_result = flow_matching_masked_mse(
             u_t=u_t,
             v_t=v_t,
             prefix_mask=prefix_mask,
             actions_is_pad=actions_is_pad,
             max_action_dim=self.config.max_action_dim,
             real_action_dim=real_action_dim,
+            return_per_sample=return_per_sample,
         )
+        mse_loss, mse_per_sample = mse_result if return_per_sample else (mse_result, None)
 
         # Discrete-action cross-entropy (FAST tokens) via the dedicated head.
         batch_size_da, seq_len = discrete_actions.shape
@@ -1085,6 +1100,9 @@ class PI06FlowMatching(nn.Module):
         )
         discrete_action_is_pad = ~discrete_action_masks
         discrete_action_ce_loss = discrete_action_ce_loss * ~discrete_action_is_pad
+        discrete_action_ce_per_sample = (
+            ce_per_sample(discrete_action_ce_loss, ~discrete_action_is_pad) if return_per_sample else None
+        )
         discrete_action_ce_loss = discrete_action_ce_loss.mean()
 
         # Optional response-token cross-entropy (via Gemma 3's shared lm_head).
@@ -1105,11 +1123,27 @@ class PI06FlowMatching(nn.Module):
             )
             response_is_pad = ~response_masks
             response_ce_loss = response_ce_loss * ~response_is_pad[:, response_slice]
+            response_ce_per_sample = (
+                ce_per_sample(response_ce_loss, ~response_is_pad[:, response_slice])
+                if return_per_sample
+                else None
+            )
             response_ce_loss = response_ce_loss.mean()
         else:
             response_ce_loss = torch.tensor(0.0, device=mse_loss.device)
+            response_ce_per_sample = None
 
-        return {"MSE": mse_loss, "CE": discrete_action_ce_loss + response_ce_loss}
+        out: dict[str, Tensor | PerSampleLoss] = {
+            "MSE": mse_loss,
+            "CE": discrete_action_ce_loss + response_ce_loss,
+        }
+        if return_per_sample:
+            ce_ps = discrete_action_ce_per_sample
+            if response_ce_per_sample is not None:
+                ce_ps = ce_ps + response_ce_per_sample
+            out["MSE_per_sample"] = mse_per_sample
+            out["CE_per_sample"] = ce_ps
+        return out
 
     def _gemma3_lm_head(self):
         """Return the language-modeling head of the Gemma 3 backbone, regardless

@@ -33,7 +33,7 @@ from transformers import AutoTokenizer
 
 from opentau.policies.normalize import Normalize
 from opentau.policies.pretrained import PreTrainedPolicy
-from opentau.policies.utils import log_model_loading_keys
+from opentau.policies.utils import PerSampleLoss, ce_per_sample, log_model_loading_keys
 from opentau.policies.value.configuration_value import ValueConfig
 from opentau.policies.value.siglip_gemma import (
     SiglipGemmaValueConfig,
@@ -365,14 +365,22 @@ class ValueFunction(PreTrainedPolicy):
         logits = self.model.get_value(images, img_masks, lang_tokens, lang_masks)
         return self.calculate_value(logits)
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict[str, Tensor] | None]:
+    def forward(
+        self, batch: dict[str, Tensor], return_per_sample: bool = False
+    ) -> dict[str, Tensor | PerSampleLoss]:
         """Do a full training forward pass to compute the value loss.
 
         Args:
             batch: Dictionary containing observations and target values
+            return_per_sample: When True, also returns per-sample
+                ``MSE_per_sample``/``CE_per_sample`` (:class:`PerSampleLoss`) for the
+                validation per-(dataset, control_mode) breakdown. ``MSE`` is a zero
+                stub here, so ``MSE_per_sample`` carries zero sum and count; the CE
+                pools the value-bin and response-token terms per sample.
 
         Returns:
-            Tuple of (loss_dict, None) where loss_dict contains the MSE loss
+            Dict with "MSE"/"CE"/"L1"/"Accuracy" (plus per-sample CE/MSE entries
+            when ``return_per_sample`` is True).
         """
         # `ValueFunction` is a single-dataset policy (its `Normalize` was
         # built with `num_datasets=1`); `_resolve_dataset_index` defaults
@@ -400,6 +408,11 @@ class ValueFunction(PreTrainedPolicy):
         # Mask CE loss if all action_is_pad are true. This is used for VQA dataset where we don't have actions tokens.
         value_ce_loss = value_ce_loss * (~diff_mask).float()
 
+        # Per-sample value-bin CE (one scored token per robotic sample) for the val breakdown.
+        value_ce_per_sample = (
+            PerSampleLoss(sum=value_ce_loss, count=(~diff_mask).float()) if return_per_sample else None
+        )
+
         value_ce_loss = value_ce_loss.mean()
 
         l1_loss = F.l1_loss(values, batch["return_continuous"])
@@ -426,15 +439,31 @@ class ValueFunction(PreTrainedPolicy):
         # Mask response loss if all action_is_pad are true. This is used for Robotic dataset where we have at least one actions tokens.
         response_ce_loss = response_ce_loss * rearrange(diff_mask.float(), "b -> b 1")
 
+        # Per-sample response CE (valid VQA tokens) for the val breakdown.
+        response_ce_per_sample = (
+            ce_per_sample(
+                response_ce_loss,
+                (~response_is_pad[:, response_slice]) & rearrange(diff_mask, "b -> b 1"),
+            )
+            if return_per_sample
+            else None
+        )
+
         # compute mean
         response_ce_loss = response_ce_loss.mean()
 
-        return {
+        out: dict[str, Tensor | PerSampleLoss] = {
             "MSE": torch.zeros_like(value_ce_loss, requires_grad=False),
             "CE": value_ce_loss + response_ce_loss,
             "L1": l1_loss,
             "Accuracy": accuracy,
         }
+        if return_per_sample:
+            # MSE is a zero stub for the value head; emit zero sum/count.
+            zeros = torch.zeros(diff_mask.shape[0], device=diff_mask.device)
+            out["MSE_per_sample"] = PerSampleLoss(sum=zeros, count=zeros.clone())
+            out["CE_per_sample"] = value_ce_per_sample + response_ce_per_sample
+        return out
 
     def prepare_images(self, batch):
         """Preprocesses images for the model.
