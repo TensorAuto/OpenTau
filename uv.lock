@@ -7,6 +7,9 @@ resolution-markers = [
     "sys_platform == 'emscripten'",
 ]
 
+[manifest]
+overrides = [{ name = "mink", specifier = ">=0.0.10,<0.1" }]
+
 [[package]]
 name = "absl-py"
 version = "2.4.0"
@@ -480,6 +483,21 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/a9/95/a3dbbb5028f35eafb79008e7522a75244477d2838f38cbb722248dabc2a8/cycler-0.12.1.tar.gz", hash = "sha256:88bb128f02ba341da8ef447245a9e138fae777f6a23943da4540077d3601eb1c", size = 7615, upload-time = "2023-10-07T05:32:18.335Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e7/05/c19819d5e3d95294a6f5947fb9b9629efb316b96de511b418c53d245aae6/cycler-0.12.1-py3-none-any.whl", hash = "sha256:85cef7cff222d8644161529808465972e51340599459b8ac3ccbac5a854e0d30", size = 8321, upload-time = "2023-10-07T05:32:16.783Z" },
+]
+
+[[package]]
+name = "daqp"
+version = "0.8.7"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/91/2d/fd713bbd3660d5c5306599dd138a341ff70cff246c7ccffc7a8d586e7004/daqp-0.8.7.tar.gz", hash = "sha256:62cfd3208a9841ffb6a87d145bce930a0e87ecea802a5ffed5d0146c4b133a54", size = 37292, upload-time = "2026-05-19T17:21:44.084Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3c/00/97043ee6f2b13a63f0b59f776055dc199621ca8773f9d627fae3d2bfabe6/daqp-0.8.7-cp310-cp310-macosx_10_9_x86_64.whl", hash = "sha256:67e99835efe68e3ba1bc721074e726081e65bfc51f5a81b6ac9407979ad4d33e", size = 166267, upload-time = "2026-05-19T17:34:17.97Z" },
+    { url = "https://files.pythonhosted.org/packages/e2/fe/4947398babec3a517f43e10555d2d37f8dea19dbc9a09bb398080088e3ac/daqp-0.8.7-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:de5540765884e56d0fb8bf945a8d500aa9ca268b506535c4dac37ff48c8bf9d5", size = 156307, upload-time = "2026-05-19T17:34:19.415Z" },
+    { url = "https://files.pythonhosted.org/packages/bd/af/a8e544f8e9dd143dbc0cb2afdbd0221f2a272dd662323ab1243857269d5e/daqp-0.8.7-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:2307d8e96417c6965e4bd6e7857e80d1ca0c52bec2cba13173dec736252d52c4", size = 838020, upload-time = "2026-05-19T17:21:32.219Z" },
+    { url = "https://files.pythonhosted.org/packages/80/a5/c80745b09d54eb83ddef70dacc74499360395f3d9f7cbba8bfc95165ed40/daqp-0.8.7-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:4be0d4256100a4fd35d01907ae1d4ad164e8a152707e7ddfebe386b082652242", size = 776438, upload-time = "2026-05-19T18:15:19.014Z" },
+    { url = "https://files.pythonhosted.org/packages/0c/06/d11d5bb0ad9d14ee2b0db09eeba796ea56168c7ce20494e22a5f25482c5d/daqp-0.8.7-cp310-cp310-musllinux_1_2_aarch64.whl", hash = "sha256:62dd2c6d14c8baefbc489ae6ba178debf36388eebd12bfa6fefed0599675fc69", size = 802887, upload-time = "2026-05-19T18:15:20.662Z" },
+    { url = "https://files.pythonhosted.org/packages/a0/dd/2a12b44e054c4e416ac27b0e115c518cec79c7efe62f5306b12113815657/daqp-0.8.7-cp310-cp310-win32.whl", hash = "sha256:97ba8d791ae9fa27233d2e35458753e51e6868f8bb69a969db2f5a58845b26a6", size = 112174, upload-time = "2026-05-19T17:28:59.071Z" },
+    { url = "https://files.pythonhosted.org/packages/a3/97/c790956cfda45fa350a7edcc04e52d91807af6872a87d8887db15140a29b/daqp-0.8.7-cp310-cp310-win_amd64.whl", hash = "sha256:dfcf324bb1b1092c2732d6ec1080cf526a52a915a52aa2a0161e874dc6c2d57e", size = 135871, upload-time = "2026-05-19T17:29:00.191Z" },
 ]
 
 [[package]]
@@ -1407,7 +1425,7 @@ wheels = [
 [[package]]
 name = "libero"
 version = "0.1.0"
-source = { git = "https://github.com/shuheng-liu/LIBERO?branch=master#84c2dae3dca300a1fdd2954453d0209a32ec0446" }
+source = { git = "https://github.com/shuheng-liu/LIBERO?branch=master#6a6fe956ae676283cf525bbfd8af5dd6d73c59f6" }
 
 [[package]]
 name = "llvmlite"
@@ -1551,6 +1569,21 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/3a/41/580bb4006e3ed0361b8151a01d324fb03f420815446c7def45d02f74c270/mergedeep-1.3.4.tar.gz", hash = "sha256:0096d52e9dad9939c3d975a774666af186eda617e6ca84df4c94dec30004f2a8", size = 4661, upload-time = "2021-02-05T18:55:30.623Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/2c/19/04f9b178c2d8a15b076c8b5140708fa6ffc5601fb6f1e975537072df5b2a/mergedeep-1.3.4-py3-none-any.whl", hash = "sha256:70775750742b25c0d8f36c55aed03d24c3384d17c951b3175d898bd778ef0307", size = 6354, upload-time = "2021-02-05T18:55:29.583Z" },
+]
+
+[[package]]
+name = "mink"
+version = "0.0.13"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "mujoco" },
+    { name = "numpy" },
+    { name = "qpsolvers", extra = ["daqp"] },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/9d/a3/dcb9ba6099894bd5ae50a3edce4b5b5bdac42a648b919cd06a177f58b0d8/mink-0.0.13.tar.gz", hash = "sha256:481f6187dc3fd320e2c0b6e8393d79c52bc70272835d641ecdf6e5fdf0e6b835", size = 693562, upload-time = "2025-09-12T21:29:46.821Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/66/3e/3340943f4c614c584efd56ea2ac42cf5358f469a81b424e4acf4fccaa33e/mink-0.0.13-py3-none-any.whl", hash = "sha256:07b9e780f79937b082de01a0fea64b33aa43160ad088217998a212fc0bfb1173", size = 914736, upload-time = "2025-09-12T21:29:42.051Z" },
 ]
 
 [[package]]
@@ -2291,7 +2324,7 @@ requires-dist = [
     { name = "rerun-sdk", specifier = ">=0.21.0" },
     { name = "rerun-sdk", marker = "extra == 'urdf'", specifier = ">=0.28.2" },
     { name = "robomimic", marker = "extra == 'libero'", specifier = "==0.2.0" },
-    { name = "robosuite", marker = "extra == 'libero'", specifier = "==1.4.0" },
+    { name = "robosuite", marker = "extra == 'libero'", specifier = "==1.5.2" },
     { name = "rosbags", specifier = ">=0.10.4" },
     { name = "scikit-image", specifier = ">=0.23.2" },
     { name = "scikit-learn", specifier = ">=1.7.1" },
@@ -2929,6 +2962,42 @@ wheels = [
 ]
 
 [[package]]
+name = "qpsolvers"
+version = "4.12.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b9/35/fc1f8b033b7ba6ecede5db093741df6a3adba6059346a586550f46254315/qpsolvers-4.12.0.tar.gz", hash = "sha256:2ec9c46294ae02bdac8969352726d2c2d5ed85f00c096881b27909e4f103ca7c", size = 235173, upload-time = "2026-05-08T09:18:06.925Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/da/68/c6e6f378f79dff83584ed18acae88c1de1ea56afc5ba9a2831ad3716083d/qpsolvers-4.12.0-py3-none-any.whl", hash = "sha256:30545f3eba98655a3c9410a071c70bb016e320a8d80a0c1a854aba00963b9b7f", size = 106752, upload-time = "2026-05-08T09:18:02.366Z" },
+]
+
+[package.optional-dependencies]
+daqp = [
+    { name = "daqp" },
+]
+quadprog = [
+    { name = "quadprog" },
+]
+
+[[package]]
+name = "quadprog"
+version = "0.1.13"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/9e/60/fb9b56d425c5b3495bb92683c28f954aedb609ae62f14c81a1b5621ad759/quadprog-0.1.13.tar.gz", hash = "sha256:9d6dd32f2762f29b840fb83741d11e527ddf48745f63b79caad0e530b4a6a0ff", size = 16883, upload-time = "2024-10-24T16:58:58.004Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/91/8d/42ac0251e022972b2febdd206afe4f3aa2fdd0e43611fc22441d18829628/quadprog-0.1.13-cp310-cp310-macosx_10_9_x86_64.whl", hash = "sha256:25fda45c9fbcfa832d30ff54fff5f499572aa9f258bcb33d0ddd767a84aa57c8", size = 102669, upload-time = "2024-10-24T16:58:28.617Z" },
+    { url = "https://files.pythonhosted.org/packages/98/65/ebe3cb51ad92d1c6a92705991394eee13a1362982dcd27f9ea8511ff75eb/quadprog-0.1.13-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:e45501cf7765b47abb4cba100b695cae1a5f110df157209d0a123f17634225ed", size = 95081, upload-time = "2024-10-24T16:58:30.64Z" },
+    { url = "https://files.pythonhosted.org/packages/95/56/69b044ad6cd724331b4e0d56dab0408c2e8c2fdccdf9b720b7285c432713/quadprog-0.1.13-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:a33d2171f3f7f608ae2cce3ff8a79aa906902f79d57c1fc9b68ce3d88ba0f410", size = 505911, upload-time = "2024-10-24T16:58:32.189Z" },
+    { url = "https://files.pythonhosted.org/packages/f4/73/9957c397490a4088a8d21a8e1b1b7f23fcfd456fffb47c23610ff67fd358/quadprog-0.1.13-cp310-cp310-win_amd64.whl", hash = "sha256:bb10f5ce4f0c006a8b185f8b1b474175edcfd7005a7cefa5db2d9d19f08f6bed", size = 92425, upload-time = "2024-10-24T16:58:34.789Z" },
+]
+
+[[package]]
 name = "referencing"
 version = "0.37.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3027,19 +3096,25 @@ sdist = { url = "https://files.pythonhosted.org/packages/3d/c3/44b1d1ea4bcb4bbed
 
 [[package]]
 name = "robosuite"
-version = "1.4.0"
+version = "1.5.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
+    { name = "mink" },
     { name = "mujoco" },
     { name = "numba" },
     { name = "numpy" },
     { name = "opencv-python" },
     { name = "pillow" },
+    { name = "pynput" },
+    { name = "pytest" },
+    { name = "qpsolvers", extra = ["quadprog"] },
     { name = "scipy" },
+    { name = "termcolor" },
+    { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/25/a1/9dd07a9a5e09c6aa032faf531da985808b34437cbf6c8f358fe8f7c47118/robosuite-1.4.0.tar.gz", hash = "sha256:a8a6233d7458dbd91bf00a86cab15aa1c178bd9d1b28d515db2cf3d152cb48e6", size = 192182147, upload-time = "2022-12-01T07:31:55.791Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/27/96/13c4c63860a3809740efa7406d01ff8ea3ebbdbd5d35eec0e8ead486f654/robosuite-1.5.2.tar.gz", hash = "sha256:9f128d57e4f090a9d78d93b246bd2a862b7fa6fc2ccb837aac06cf0ab19fde78", size = 155629116, upload-time = "2025-12-24T22:31:47.394Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2e/08/fe231064caaf2766d47818ca12fd8acf10dc4e762a33dabc6293e83bfead/robosuite-1.4.0-py3-none-any.whl", hash = "sha256:aba065e7b36745738cede259457b2cb349427f3608728d867ef3a2034cb62994", size = 193477875, upload-time = "2022-12-01T07:28:53.457Z" },
+    { url = "https://files.pythonhosted.org/packages/c8/54/3c0940c92d381eb5837cd29bf2c9fbf0a9dff313a2b2779e3902665276b3/robosuite-1.5.2-py3-none-any.whl", hash = "sha256:b9e02df55de8949739de6ba1d196d2ba59cf33c51a76efcfbe5c2f73cdcf99ce", size = 156827641, upload-time = "2025-12-24T22:31:40.166Z" },
 ]
 
 [[package]]
