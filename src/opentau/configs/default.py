@@ -22,7 +22,6 @@ This module provides default configuration classes for:
 - Evaluation settings and parameters
 """
 
-import warnings
 from dataclasses import dataclass, field
 
 import draccus
@@ -138,15 +137,12 @@ class DatasetConfig:
     tolerance_s: float | None = None
     skip_timestamp_check: bool | None = None
 
-    # DEPRECATED. Set `val_split_ratio` on `DatasetMixtureConfig` instead — the
-    # mixture-level value is the single source of truth and is applied uniformly
-    # to every dataset in the mixture. This per-dataset field is retained only
-    # so that pre-existing JSON configs continue to parse; setting it here has
-    # no effect on the actual split. The default is `None` (sentinel meaning
-    # "user did not set this") so that
-    # `DatasetMixtureConfig.__post_init__` can distinguish a real per-dataset
-    # override from the unset default and only emit a `DeprecationWarning` in
-    # the former case.
+    # Per-dataset override for the train/validation split ratio. `None`
+    # inherits from `DatasetMixtureConfig.val_split_ratio`. A non-None value
+    # (including `0.0`, which opts this dataset out of validation) wins over the
+    # mixture default for this dataset only — useful when one dataset in a
+    # mixture wants a different validation fraction than the rest. Must be in
+    # `[0, 1]` when set. Only consulted when `TrainPipelineConfig.val_freq > 0`.
     val_split_ratio: float | None = None
 
     def __post_init__(self):
@@ -158,6 +154,12 @@ class DatasetConfig:
             raise ValueError(
                 f"`DatasetConfig.tolerance_s` must be >= 0 (or None to inherit), "
                 f"got {self.tolerance_s} for {self.repo_id or self.vqa}."
+            )
+
+        if self.val_split_ratio is not None and not (0.0 <= self.val_split_ratio <= 1.0):
+            raise ValueError(
+                f"`DatasetConfig.val_split_ratio` must be in [0, 1] (or None to inherit), "
+                f"got {self.val_split_ratio} for {self.repo_id or self.vqa}."
             )
 
         # If data_features_name_mapping is provided, upsert it into the global
@@ -207,6 +209,12 @@ class DatasetMixtureConfig:
         vector_resample_strategy: Resample strategy for non-image features, such
             as action or state. Must be one of 'linear' or 'nearest'.
             Defaults to 'nearest'.
+        val_split_ratio: Mixture-wide default fraction of each dataset reserved
+            for the validation split (only used when
+            ``TrainPipelineConfig.val_freq > 0``). A per-dataset
+            ``DatasetConfig.val_split_ratio`` overrides this value for that
+            dataset; ``None`` there inherits this mixture default. Must be in
+            ``[0, 1]``. Defaults to 0.05.
         n_obs_history: Number of historical observation steps to include. When
             set to ``T``, each camera returns shape ``(T, C, H, W)`` and state
             returns shape ``(T, max_state_dim)``. When ``None``, the default
@@ -320,9 +328,10 @@ class DatasetMixtureConfig:
     image_resample_strategy: str = "nearest"
     # Resample strategy for non-image features, such as action or state
     vector_resample_strategy: str = "nearest"
-    # Ratio of the dataset to be used for validation. Please specify a value.
+    # Mixture-wide default ratio of each dataset to be used for validation.
     # If `val_freq` is set to 0, a validation dataset will not be created and this value will be ignored.
-    # This value is applied to all datasets in the mixture.
+    # A per-dataset `DatasetConfig.val_split_ratio` overrides this for that
+    # dataset (`None` there inherits this value).
     # Defaults to 0.05.
     val_split_ratio: float = 0.05
     # Number of historical observation steps. None preserves default single-step behavior.
@@ -397,23 +406,6 @@ class DatasetMixtureConfig:
             value = getattr(self, name)
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"`{name}` must be in [0, 1], got {value}.")
-
-        # `DatasetConfig.val_split_ratio` is deprecated — the mixture-level
-        # value is the single source of truth (read by `factory.make_dataset`).
-        # The per-dataset field defaults to `None`; warn only when the user
-        # actually set a value there, since that's the case where their input
-        # is being silently ignored.
-        for dataset_cfg in self.datasets:
-            if dataset_cfg.val_split_ratio is not None:
-                warnings.warn(
-                    "`DatasetConfig.val_split_ratio` is deprecated and ignored; "
-                    "set `val_split_ratio` on `DatasetMixtureConfig` instead. "
-                    f"Got dataset value {dataset_cfg.val_split_ratio} "
-                    f"vs. mixture value {self.val_split_ratio}; the mixture "
-                    "value will be used.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
 
 
 @dataclass

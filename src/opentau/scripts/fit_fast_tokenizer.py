@@ -1017,6 +1017,15 @@ def _build_train_cfg(
 
     from opentau.configs.train import TrainPipelineConfig
 
+    # DatasetMixtureConfig.val_split_ratio defaults to 0.05, and a per-dataset
+    # ``DatasetConfig.val_split_ratio`` overrides it -- if either is non-zero,
+    # make_dataset would return a (train, val) tuple per dataset and the assert
+    # in ``_build_mixture_parallel`` would (correctly) reject it. Zero out BOTH
+    # the mixture default and every per-dataset override so the parallel mixture
+    # build always returns single train datasets. Rebuild the dataset configs
+    # (``dataclasses.replace`` shares the ``datasets`` list reference) so the
+    # caller's parsed config is left untouched.
+    datasets_for_fit = [dataclasses.replace(dc, val_split_ratio=0.0) for dc in mixture_cfg.datasets]
     # We only need action chunks for the tokenizer fit. Override mixture-side
     # knobs that would otherwise force per-sample state-history loads and
     # augmentation rolls (none of which affect the action column). Use
@@ -1031,11 +1040,8 @@ def _build_train_cfg(
         response_drop_prob=1.0,  # drop all responses
         metadata_drop_all_prob=1.0,  # drop all metadata
         metadata_drop_each_prob=0.0,
-        # DatasetMixtureConfig.val_split_ratio defaults to 0.05 -- if we let it
-        # through, make_dataset would return a (train, val) tuple per dataset
-        # and the assert below would (correctly) reject it. Force 0 here so the
-        # parallel mixture build always returns single train datasets.
         val_split_ratio=0.0,
+        datasets=datasets_for_fit,
     )
     fake_policy = SimpleNamespace(
         action_delta_indices=list(range(chunk_size)),

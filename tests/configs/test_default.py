@@ -163,17 +163,31 @@ def test_val_split_ratio_no_warning_when_only_mixture_customized():
     )
 
 
-def test_val_split_ratio_warns_when_child_overrides():
-    """Setting `val_split_ratio` on a child `DatasetConfig` must emit a DeprecationWarning."""
+def test_val_split_ratio_no_warning_when_child_overrides():
+    """Setting `val_split_ratio` on a child `DatasetConfig` is a supported
+    per-dataset override (inherit-on-None, like `tolerance_s`), not a deprecated
+    field, so it must NOT emit a DeprecationWarning.
+    """
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         DatasetMixtureConfig(
             datasets=[DatasetConfig(repo_id="foo/bar", val_split_ratio=0.2)],
             val_split_ratio=0.1,
         )
-    assert any(
-        issubclass(w.category, DeprecationWarning) and "val_split_ratio" in str(w.message) for w in caught
+    val_split_warnings = [
+        w
+        for w in caught
+        if issubclass(w.category, DeprecationWarning) and "val_split_ratio" in str(w.message)
+    ]
+    assert not val_split_warnings, (
+        f"Unexpected val_split_ratio DeprecationWarning(s): {[str(w.message) for w in val_split_warnings]}"
     )
+
+
+def test_dataset_config_val_split_ratio_out_of_range_raises():
+    """A per-dataset `val_split_ratio` outside [0, 1] must be rejected at config time."""
+    with pytest.raises(ValueError, match=r"`DatasetConfig.val_split_ratio` must be in \[0, 1\]"):
+        DatasetConfig(repo_id="foo/bar", val_split_ratio=1.5)
 
 
 def test_dataset_mixture_config_tolerance_defaults():
