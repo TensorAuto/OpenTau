@@ -314,6 +314,33 @@ class TestWeightedDatasetMixture:
         assert weights is not None
         assert torch.sum(weights) == 0
 
+    @pytest.mark.slow  # 2 sec
+    def test_calculate_sample_weights_skips_empty_member(self, train_pipeline_config, datasets_factory):
+        """A zero-length member contributes no samples even with a positive weight.
+
+        This is the validation-mixture shape produced when a dataset opts out of
+        validation via `DatasetConfig.val_split_ratio=0.0`: `make_dataset` still
+        returns a `(train, val)` tuple whose val half is an empty `Subset`, which
+        gets appended to the val mixture. `_calculate_sample_weights` skips
+        length-0 datasets, so an explicit non-zero mixture weight on that member
+        has no effect — the opt-out works on the explicit-weights path too, not
+        only the inferred-weights path.
+        """
+        full, to_empty = datasets_factory(2)
+        # An empty Subset with `.meta` mirrors what `make_dataset` builds for a
+        # 0.0 val split (random_split(..., [len, 0]) + meta deep-copy).
+        empty = torch.utils.data.Subset(to_empty, [])
+        empty.meta = to_empty.meta
+
+        mixture = WeightedDatasetMixture(train_pipeline_config, [full, empty], [0.5, 0.5], 30.0)
+        weights = mixture._calculate_sample_weights()
+
+        assert weights is not None
+        # Only the non-empty member contributes samples; the empty member is
+        # skipped despite its 0.5 weight.
+        assert len(weights) == len(full)
+        assert torch.all(weights > 0)
+
     def test_get_dataloader_success(self, train_pipeline_config, datasets_factory):
         """Test successful dataloader creation."""
         mixture = WeightedDatasetMixture(train_pipeline_config, datasets_factory(2), [0.7, 0.3], 30.0)
