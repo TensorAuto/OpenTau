@@ -176,12 +176,16 @@ def test_pi07_embed_suffix_routes_action_in_proj_per_group(monkeypatch):
     ``denoise_step``). Build a backbone-free model carrying only the suffix's
     own submodules and confirm ``group_index`` selects the right row.
     """
-    import opentau.policies.pi07.low_level.modeling_pi07_low_level as mod
     from opentau.policies.pi07.low_level.modeling_pi07_low_level import PI07LowLevelFlowMatching
 
     # Keep everything float32 so the float32 time_mlp doesn't clash with the
-    # default bf16 _preferred_dtype the suffix path casts inputs to.
-    monkeypatch.setattr(mod, "_preferred_dtype", lambda: torch.float32)
+    # default bf16 _preferred_dtype the suffix path casts inputs to. Patch the
+    # module global via its dotted path so this file imports the modeling module
+    # one way only (`from ... import ...`).
+    monkeypatch.setattr(
+        "opentau.policies.pi07.low_level.modeling_pi07_low_level._preferred_dtype",
+        lambda: torch.float32,
+    )
 
     model = object.__new__(PI07LowLevelFlowMatching)
     nn.Module.__init__(model)
