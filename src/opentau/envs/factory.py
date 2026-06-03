@@ -95,6 +95,8 @@ def make_envs(
             env_cls=env_cls,
             episode_length=cfg.episode_length,
             obj_registries=tuple(cfg.obj_registries),
+            assets_root=cfg.assets_root,
+            auto_download_assets=cfg.auto_download_assets,
         )
 
     try:

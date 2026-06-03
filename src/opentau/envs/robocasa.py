@@ -30,15 +30,23 @@ this module (e.g. in the CPU test suite) never requires the sim to be installed.
 
 from __future__ import annotations
 
+import importlib.util
+import json
+import os
+import shutil
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from functools import partial
+from pathlib import Path
 from typing import Any
+from urllib.request import urlretrieve
+from zipfile import ZipFile
 
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
+from opentau.constants import HF_OPENTAU_HOME
 from opentau.utils.accelerate_utils import acc_print, get_proc_accelerator
 
 # Flat action/state vector dimensions for the PandaOmron mobile manipulator
@@ -107,6 +115,111 @@ def _default_camera_name_mapping(camera_names: Sequence[str]) -> dict[str, list[
     return {cam: [f"camera{i}"] for i, cam in enumerate(camera_names)}
 
 
+ROBOCASA_ASSETS_ROOT_ENV = "ROBOCASA_ASSETS_ROOT"
+
+
+def _resolve_robocasa_assets_root() -> Path:
+    r"""Directory where RoboCasa kitchen assets live, *outside* the ephemeral uv venv.
+
+    Resolution order: the ``ROBOCASA_ASSETS_ROOT`` env var, else a stable default under
+    OpenTau's HuggingFace cache (``HF_OPENTAU_HOME/robocasa/assets``). Deterministic in
+    every process — the main process and each ``AsyncVectorEnv`` spawn worker (which
+    inherits the env var) — so the per-process loader redirect and the one-time download
+    always agree on the same path.
+    """
+    env = os.environ.get(ROBOCASA_ASSETS_ROOT_ENV)
+    if env:
+        return Path(env).expanduser()
+    return HF_OPENTAU_HOME / "robocasa" / "assets"
+
+
+def _robocasa_pkg_assets_dir() -> Path:
+    r"""Locate ``<robocasa-pkg>/models/assets`` *without importing* robocasa.
+
+    Importing robocasa eagerly builds its object registry by scanning this directory at
+    import time (``kitchen_object_utils`` walks ``assets/objects`` to populate every
+    category's ``mjcf_paths``). So relocation has to be a symlink that is already in place
+    *before* the first import — which means locating the package via its import spec, not
+    via ``robocasa.__path__`` (that would require importing it).
+    """
+    spec = importlib.util.find_spec("robocasa")
+    if spec is None or not spec.submodule_search_locations:
+        raise ModuleNotFoundError("robocasa is not installed; cannot locate its assets dir.")
+    return Path(next(iter(spec.submodule_search_locations))) / "models" / "assets"
+
+
+def _direct_download_url(shared_url: str) -> str:
+    r"""Convert a Box shared link into a direct-download ``.zip`` URL.
+
+    Reimplements ``download_kitchen_assets._get_direct_download_url`` so we never import
+    that module — importing it imports robocasa, which would build the object registry
+    against the not-yet-relocated assets dir.
+    """
+    shared_id = shared_url.rstrip("/").split("/")[-1]
+    base = shared_url.split("/s/")[0]
+    return f"{base}/shared/static/{shared_id}.zip"
+
+
+def _download_and_extract_zip(url: str, dest: Path) -> None:
+    r"""Download ``url`` (a ``.zip``) and extract it so its top-level dir lands at ``dest``.
+
+    Mirrors robocasa's own downloader (extract into ``dest.parent``; the zip's single
+    top-level directory matches ``dest.name``) but without importing anything from robocasa.
+    """
+    download_dir = dest.parent
+    download_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = download_dir / f"{dest.name}.zip"
+    try:
+        urlretrieve(url, filename=str(zip_path))  # noqa: S310  # nosec B310 - trusted UT-Austin Box URL
+        with ZipFile(zip_path) as zf:
+            zf.extractall(path=str(download_dir))  # noqa: S202  # nosec B202 - trusted first-party archive
+    finally:
+        if zip_path.exists():
+            zip_path.unlink()
+
+
+def _load_box_links(pkg_assets: Path, external_root: Path) -> dict:
+    r"""Load robocasa's ``box_links_assets.json`` (the per-pack download URLs)."""
+    for base in (external_root, pkg_assets):
+        path = base / "box_links" / "box_links_assets.json"
+        if path.is_file():
+            with open(path) as f:
+                return json.load(f)
+    raise FileNotFoundError(f"box_links_assets.json not found under {external_root} or {pkg_assets}.")
+
+
+def _symlink_pkg_assets_to(pkg_assets: Path, external_root: Path) -> None:
+    r"""Make ``pkg_assets`` (``<venv>/robocasa/models/assets``) a symlink to ``external_root``.
+
+    This is what relocates assets out of the ephemeral venv: robocasa keeps reading its
+    hardcoded ``models/assets`` path, but that path now points at the external store, so
+    even the import-time object-registry scan sees the downloaded packs. Idempotent.
+    """
+    target = external_root.resolve()
+    if pkg_assets.is_symlink():
+        if pkg_assets.resolve() == target:
+            return
+        pkg_assets.unlink()
+    elif pkg_assets.exists():
+        shutil.rmtree(pkg_assets)
+    pkg_assets.parent.mkdir(parents=True, exist_ok=True)
+    pkg_assets.symlink_to(target, target_is_directory=True)
+
+
+def _maybe_relink_robocasa_assets() -> None:
+    r"""Point robocasa's assets dir at the external store, *if* that store is ready.
+
+    Runs in every process right before robocasa is imported (notably ``AsyncVectorEnv``
+    spawn workers, which import robocasa fresh and must see the symlink the main process
+    created). It only acts once the store has been seeded by ``_ensure_robocasa_assets``,
+    so a plain install with no relocation keeps its wheel-bundled assets untouched.
+    """
+    external_root = _resolve_robocasa_assets_root()
+    if not (external_root / ".opentau_seeded").exists():
+        return
+    _symlink_pkg_assets_to(_robocasa_pkg_assets_dir(), external_root)
+
+
 def _import_robocasa_with_version_shim() -> None:
     """Import the top-level ``robocasa`` package despite its over-strict pins.
 
@@ -130,6 +243,11 @@ def _import_robocasa_with_version_shim() -> None:
     try:
         mujoco.__version__ = "3.3.1"
         numpy.__version__ = "2.2.5"
+        # Relocate robocasa's assets dir to the external store (a symlink) BEFORE importing
+        # it: the import eagerly builds its object registry by scanning models/assets, so
+        # the symlink must already be in place or the registry comes up empty (every object
+        # category gets zero candidates -> "Probabilities contain NaN" at sampling time).
+        _maybe_relink_robocasa_assets()
         import robocasa  # noqa: F401  (runs robocasa's version asserts once)
     finally:
         mujoco.__version__, numpy.__version__ = saved
@@ -162,6 +280,94 @@ def _resolve_tasks(task: str) -> tuple[list[str], str | None]:
     if not names:
         raise ValueError("`task` must contain at least one RoboCasa task name.")
     return names, None
+
+
+# RoboCasa ships its assets as separately-downloaded packs. Every kitchen scene needs the
+# base textures (plain + AI-generated wall/floor textures) and lightwheel fixtures; object
+# meshes depend on which registries the env samples from (``obj_registries``). Keys below
+# are the registry names accepted in ``RoboCasaEnv.obj_registries``; values map to packs.
+_BASE_ASSET_PACKS: tuple[str, ...] = ("textures", "tex_generative", "fixtures_lw")
+_REGISTRY_TO_PACK: dict[str, str] = {
+    "lightwheel": "objs_lw",
+    "objaverse": "objs_objaverse",
+    "aigen": "objs_aigen",
+    "aigen_objs": "objs_aigen",
+}
+# pack name -> (key into robocasa's ``BOX_LINKS``, destination subdir under assets_root)
+_PACK_DEST: dict[str, tuple[str, str]] = {
+    "textures": ("textures", "textures"),
+    "tex_generative": ("generative_textures", "generative_textures"),
+    "fixtures_lw": ("fixtures_lightwheel", "fixtures"),
+    "objs_lw": ("objects_lightwheel", "objects/lightwheel"),
+    "objs_objaverse": ("objaverse", "objects/objaverse"),
+    "objs_aigen": ("aigen_objs", "objects/aigen_objs"),
+}
+
+
+def _needed_asset_packs(obj_registries: Sequence[str]) -> list[str]:
+    r"""Asset packs required for ``obj_registries``: the base packs + per-registry objects."""
+    packs = list(_BASE_ASSET_PACKS)
+    for reg in obj_registries:
+        pack = _REGISTRY_TO_PACK.get(reg)
+        if pack is not None and pack not in packs:
+            packs.append(pack)
+    return packs
+
+
+def _ensure_robocasa_assets(assets_root: Path, obj_registries: Sequence[str]) -> None:
+    r"""Download the asset packs ``obj_registries`` needs into ``assets_root`` and relocate.
+
+    One-time, idempotent, and safe under distributed eval: only the main (or solo) process
+    seeds / downloads / symlinks, and **every** rank meets at a barrier afterwards (so
+    callers must invoke this before any per-rank early return, or non-main ranks desync at
+    NCCL).
+
+    robocasa ships some assets inside the wheel (fixture / scene / arena XML) that no
+    download pack contains, so the external store is first seeded from the installed
+    package, then the heavy packs (object meshes, textures, fixture meshes) are downloaded
+    into it, and finally the venv's ``models/assets`` is replaced by a symlink to the
+    store. Nothing here imports robocasa — that would build its object registry against the
+    not-yet-relocated assets dir — so the package is located via its import spec instead.
+    Per-pack marker files make re-runs (and the mixed ``fixtures`` dir, which holds both
+    shipped XML and downloaded meshes) skip cleanly.
+    """
+    pkg_assets = _robocasa_pkg_assets_dir()
+    needed = _needed_asset_packs(obj_registries)
+
+    acc = get_proc_accelerator()
+    distributed = acc is not None and acc.num_processes > 1
+    is_main_or_solo = (not distributed) or acc.is_main_process
+    try:
+        if is_main_or_solo:
+            assets_root.mkdir(parents=True, exist_ok=True)
+            # 1) Seed the wheel-shipped stubs (XML not in any pack) from the real venv dir.
+            seed_marker = assets_root / ".opentau_seeded"
+            if not pkg_assets.is_symlink() and pkg_assets.exists() and not seed_marker.exists():
+                shutil.copytree(pkg_assets, assets_root, dirs_exist_ok=True)
+                seed_marker.touch()
+            # 2) Download each missing pack into the external store.
+            box_links = _load_box_links(pkg_assets, assets_root)
+            for pack in needed:
+                pack_marker = assets_root / f".opentau_pack_{pack}.done"
+                if pack_marker.exists():
+                    continue
+                box_key, subdir = _PACK_DEST[pack]
+                dest = assets_root / subdir
+                acc_print(f"[opentau] downloading RoboCasa asset pack '{pack}' -> {dest}")
+                _download_and_extract_zip(_direct_download_url(box_links[box_key]), dest)
+                pack_marker.touch()
+            # 3) Relocate: point the venv's assets dir at the populated external store so
+            #    robocasa's import-time registry scan reads it.
+            if seed_marker.exists():
+                _symlink_pkg_assets_to(pkg_assets, assets_root)
+        if distributed:
+            acc.wait_for_everyone()
+    except Exception:
+        # Keep ranks in lockstep even if the main process fails here, so non-main ranks
+        # don't hang at the next collective; the exception still aborts the main process.
+        if distributed:
+            acc.wait_for_everyone()
+        raise
 
 
 def convert_action(flat_action: np.ndarray) -> dict[str, Any]:
@@ -453,6 +659,8 @@ def create_robocasa_envs(
     env_cls: type[gym.vector.SyncVectorEnv] | type[gym.vector.AsyncVectorEnv] | None = None,
     episode_length: int | None = None,
     obj_registries: Sequence[str] = DEFAULT_OBJ_REGISTRIES,
+    assets_root: str | None = None,
+    auto_download_assets: bool = True,
 ) -> dict[str, dict[int, gym.vector.VectorEnv]]:
     r"""Create vectorized RoboCasa365 environments with a consistent return shape.
 
@@ -475,6 +683,20 @@ def create_robocasa_envs(
         raise ValueError("env_cls must be a callable that wraps a list of environment factory callables.")
     if not isinstance(n_envs, int) or n_envs <= 0:
         raise ValueError(f"n_envs must be a positive int; got {n_envs}.")
+
+    # Relocate RoboCasa assets out of the (ephemeral) uv venv and make the packs the
+    # requested registries need available. Resolve + export the root, then run the download
+    # BEFORE `_resolve_tasks` (or any other) robocasa import, so the assets-dir symlink is
+    # already in place when robocasa builds its object registry at import. Propagate the
+    # root via os.environ so AsyncVectorEnv spawn workers relink to the same store. The
+    # download is rank-0 gated with an internal barrier, run before the per-rank task
+    # sharding / empty-rank early return below so every rank reaches that barrier.
+    resolved_assets_root = (
+        _resolve_robocasa_assets_root() if assets_root is None else Path(assets_root).expanduser()
+    )
+    os.environ[ROBOCASA_ASSETS_ROOT_ENV] = str(resolved_assets_root)
+    if auto_download_assets:
+        _ensure_robocasa_assets(resolved_assets_root, obj_registries)
 
     gym_kwargs = dict(gym_kwargs or {})
     obs_type = gym_kwargs.pop("obs_type", "pixels_agent_pos")
