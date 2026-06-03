@@ -823,6 +823,17 @@ def eval_policy_all(
     """
     start_t = time.time()
 
+    # `recording_root` records rollouts through the LIBERO-specific dataset recorder
+    # (``libero_dataset_recorder``, with a hardcoded ``LIBERO_TASKS`` list), so it only
+    # makes sense for a LIBERO env. Fail fast for any other env rather than silently
+    # mislabeling the recorded dataset — until an env-aware rollout recorder exists.
+    if cfg.eval.recording_root is not None and not isinstance(cfg.env, LiberoEnv):
+        raise NotImplementedError(
+            f"eval.recording_root is only supported for the LIBERO env (it uses the LIBERO "
+            f"dataset recorder), but env.type={cfg.env.type!r}. Unset recording_root, or add "
+            f"an env-aware rollout recorder."
+        )
+
     # Flatten envs into list of (task_group, task_id, env)
     tasks = [(tg, tid, vec) for tg, group in envs.items() for tid, vec in group.items()]
 
