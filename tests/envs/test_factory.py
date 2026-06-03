@@ -20,7 +20,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from opentau.configs.train import TrainPipelineConfig
-from opentau.envs.configs import LiberoEnv
+from opentau.envs.configs import LiberoEnv, RoboCasaEnv
 from opentau.envs.factory import make_env_config, make_envs
 
 
@@ -37,6 +37,11 @@ class TestMakeEnvConfig:
         assert isinstance(config, LiberoEnv)
         assert config.task == "libero_10"
         assert config.task_ids is None
+
+    def test_make_env_config_robocasa(self):
+        config = make_env_config("robocasa")
+        assert isinstance(config, RoboCasaEnv)
+        assert config.task == "CloseFridge"
 
 
 class TestMakeEnv:

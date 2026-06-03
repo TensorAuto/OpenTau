@@ -307,3 +307,109 @@ class LiberoEnv(EnvConfig):
             "task_ids": task_ids,
             "control_freq": self.fps,
         }
+
+
+@EnvConfig.register_subclass("robocasa")
+@dataclass
+class RoboCasaEnv(EnvConfig):
+    r"""Configuration for the RoboCasa365 kitchen environment.
+
+    RoboCasa runs on robosuite 1.5 (shared with LIBERO since the libero extra was
+    bumped to robosuite 1.5.2), so it co-installs in the same venv. The default
+    robot is the PandaOmron mobile manipulator — hence the 12-D action and 16-D
+    state, distinct from LIBERO's 7-D/8-D. Set ``metadata.robot_type`` /
+    ``eval.control_mode`` to select the matching per-(robot_type, control_mode)
+    projection head when evaluating a co-trained policy.
+
+    Args:
+        task: A RoboCasa task name (e.g. ``"CloseFridge"``), a comma-separated
+            list of task names, or a benchmark-group shortcut
+            (``atomic_seen``/``composite_seen``/``composite_unseen``/
+            ``pretrain50``/``pretrain100``/``pretrain200``/``pretrain300``), which
+            auto-expands to the upstream task list and auto-sets ``split``.
+        fps: RoboCasa control frequency (Hz); also the ``render_fps`` for videos.
+        episode_length: Maximum steps per episode (``_max_episode_steps``).
+        obs_type: ``"pixels"`` or ``"pixels_agent_pos"``.
+        render_mode: Rendering mode for the environment.
+        camera_name: Comma-separated raw RoboCasa camera names to render. The
+            wrapper remaps them to ``camera0``/``camera1``/... so the policy input
+            structure matches LIBERO regardless of the raw names; when the policy
+            was trained with a larger ``cfg.num_cams``, ``preprocess_observation``
+            zero-fills the remaining slots.
+        observation_height: Height of observation images.
+        observation_width: Width of observation images.
+        visualization_height: Height of visualization frames.
+        visualization_width: Width of visualization frames.
+        split: RoboCasa dataset split (``None``/``"all"``/``"pretrain"``/
+            ``"target"``). Left ``None`` unless a task-group shortcut sets it.
+        obj_registries: Object-mesh registries to sample assets from. Defaults to
+            ``["lightwheel"]`` (the pack the asset downloader ships by default);
+            add ``"objaverse"`` only after downloading that ~30GB pack.
+        features: Mapping from logical feature names to ``PolicyFeature`` definitions.
+        features_map: Mapping from environment keys to standardized OpenTau keys.
+    """
+
+    task: str = "CloseFridge"
+    fps: int = 20
+    episode_length: int = 1000
+    obs_type: str = "pixels_agent_pos"
+    render_mode: str = "rgb_array"
+    camera_name: str = "robot0_agentview_left,robot0_eye_in_hand,robot0_agentview_right"
+    observation_height: int = 256
+    observation_width: int = 256
+    visualization_height: int = 512
+    visualization_width: int = 512
+    split: str | None = None
+    obj_registries: list[str] = field(default_factory=lambda: ["lightwheel"])
+    features: dict[str, PolicyFeature] = field(
+        default_factory=lambda: {
+            "action": PolicyFeature(type=FeatureType.ACTION, shape=(12,)),
+        }
+    )
+    features_map: dict[str, str] = field(
+        default_factory=lambda: {
+            "action": ACTION,
+            "agent_pos": OBS_STATE,
+        }
+    )
+
+    def __post_init__(self):
+        if self.fps <= 0:
+            raise ValueError(f"RoboCasa env.fps (control frequency in Hz) must be positive, got {self.fps}")
+        if self.obs_type not in ("pixels", "pixels_agent_pos"):
+            raise ValueError(f"Unsupported obs_type: {self.obs_type}")
+
+        # The wrapper remaps the i-th raw camera to ``camera{i}``; mirror that in
+        # the feature map using OpenTau's ``image`` / ``image2`` / ... convention
+        # (camera0 -> image, camera1 -> image2, ...), matching LIBERO.
+        cams = [c.strip() for c in self.camera_name.split(",") if c.strip()]
+        for i, cam in enumerate(cams):
+            self.features[f"pixels/{cam}"] = PolicyFeature(
+                type=FeatureType.VISUAL,
+                shape=(self.observation_height, self.observation_width, 3),
+            )
+            mapped = "image" if i == 0 else f"image{i + 1}"
+            self.features_map[f"pixels/{cam}"] = f"{OBS_IMAGES}.{mapped}"
+
+        if self.obs_type == "pixels_agent_pos":
+            self.features["agent_pos"] = PolicyFeature(type=FeatureType.STATE, shape=(16,))
+
+    @property
+    def gym_kwargs(self) -> dict:
+        r"""Return the keyword arguments used to construct the RoboCasa environment.
+
+        Task resolution and per-rank sharding live in ``create_robocasa_envs`` (they
+        need the ``robocasa`` package for group expansion), so this stays sim-free
+        and only carries the obs/render parameters plus an optional ``split``.
+        """
+        kwargs: dict = {
+            "obs_type": self.obs_type,
+            "render_mode": self.render_mode,
+            "observation_height": self.observation_height,
+            "observation_width": self.observation_width,
+            "visualization_height": self.visualization_height,
+            "visualization_width": self.visualization_width,
+        }
+        if self.split is not None:
+            kwargs["split"] = self.split
+        return kwargs

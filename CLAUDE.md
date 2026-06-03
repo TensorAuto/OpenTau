@@ -43,13 +43,15 @@ Dependency management is **`uv` (>= 0.8.4) only** — `pyproject.toml`/`uv.lock`
 
 ```bash
 uv sync --extra dev --extra libero          # standard dev setup (matches CI)
-uv sync --all-extras                         # everything (libero + urdf now co-install on numpy 2.x)
+uv sync --all-extras                         # everything (libero + urdf co-install on the shared robosuite 1.5.2 / numpy 2.x stack)
 source .venv/bin/activate
 ```
 
 Re-run `uv sync` whenever `pyproject.toml`/`uv.lock` change. Add deps with `uv add <pkg>`; lock with `uv lock`.
 
-Installable extras: `dev` (pre-commit, sphinx, pytest), `libero` (sim env — pulls a forked LIBERO from `shuheng-liu/LIBERO`, runs on numpy 2.x + gymnasium), `urdf` (rerun ≥0.28, numpy 2.x), `trt` (TensorRT, Linux/Win x86_64 only).
+Installable extras: `dev` (pre-commit, sphinx, pytest), `libero` (sim env — pulls a forked LIBERO from `shuheng-liu/LIBERO`, on robosuite 1.5.2 + numpy 2.x + gymnasium), `urdf` (rerun ≥0.28, numpy 2.x), `trt` (TensorRT, Linux/Win x86_64 only).
+
+**RoboCasa365** (`envs/robocasa.py`) shares the `libero` extra's robosuite 1.5.2 stack but has **no first-class uv extra yet**: upstream `robocasa`'s `setup.py` hard-pins `lerobot==0.3.3` (would drag a second, conflicting LeRobot into the shared lock) plus over-strict `numba`/`numpy`/`mujoco`/`tianshou`. A packaging fork (`shuheng-liu/robocasa`) that drops those pins — mirroring the `shuheng-liu/LIBERO` / `egl_probe` forks — is the intended home for a `robocasa` extra. Until then install it manually into the libero venv: `uv pip install "git+https://github.com/robocasa/robocasa" --no-deps`, then download kitchen assets (`python -m robocasa.scripts.download_kitchen_assets`, ~10GB) and run headless with `MUJOCO_GL=egl`.
 
 ## Common commands
 
@@ -117,7 +119,7 @@ Key invariant on `TrainPipelineConfig`: `batch_size == dataloader_batch_size * g
 
 - `configs/` — dataclass configs (train, eval, policies, envs, optim, deployment, libero, ros2lerobot)
 - `datasets/` — LeRobot-compatible datasets, `WeightedDatasetMixture` (heterogeneous co-training), VQA datasets, v1→v2 / v2→v2.1 converters under `v2/`, `v21/`
-- `envs/` — gym/gymnasium envs (currently LIBERO); `factory.make_envs()`
+- `envs/` — gym/gymnasium envs (LIBERO in `libero.py`, RoboCasa365 in `robocasa.py`); `factory.make_envs()` dispatches per `env.type`. Both return `dict[group][task_id] -> VectorEnv` so the env-agnostic eval pipeline (`scripts/eval.py`) gives per-task success rates + `grid_summary` wandb videos for free.
 - `optim/` — optimizer + LR-scheduler dataclass-configured factories
 - `planner/` — high-level planner using `prompts.yaml`
 - `policies/` — `pi0`, `pi05`, `pi05_mem`, `pi06`, `pi07/{high_level_planner,low_level}` (current π0.7 impl: Gemma 3 backbone + SpaceTime SigLIP video encoder; note `low_level/` — not `low_level_planner/`, since the low-level policy is a controller, not a planner), `pi07_paligemma/{high_level_planner,low_level}` (legacy PaliGemma variant of π0.7 — kept for older checkpoints; a fix targeting π0.7 usually needs to land in `pi07/`, not here), `value`. Each subdir has a `configuration_*.py` and `modeling_*.py`. Vision backbone wrappers: `paligemma_with_expert.py` (pi0/pi05/pi05_mem/pi07_paligemma) and `gemma3_with_expert.py` (pi06/pi07).

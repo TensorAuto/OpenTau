@@ -22,15 +22,17 @@ from functools import partial
 import gymnasium as gym
 
 from opentau.configs.train import TrainPipelineConfig
-from opentau.envs.configs import EnvConfig, LiberoEnv
+from opentau.envs.configs import EnvConfig, LiberoEnv, RoboCasaEnv
 
 
 def make_env_config(env_type: str, **kwargs) -> EnvConfig:
     r"""Factory method to create an environment config based on the env_type.
-    Right now, only 'libero' is supported.
+    Supports 'libero' and 'robocasa'.
     """
     if env_type == "libero":
         return LiberoEnv(**kwargs)
+    elif env_type == "robocasa":
+        return RoboCasaEnv(**kwargs)
     else:
         raise ValueError(f"Env type '{env_type}' is not available.")
 
@@ -77,6 +79,22 @@ def make_envs(
             init_states=cfg.init_states,
             gym_kwargs=cfg.gym_kwargs,
             env_cls=env_cls,
+        )
+
+    # RoboCasa, like LIBERO, is multi-task: build one vec env per task so eval
+    # reports per-task success and per-task grid videos, and so tasks shard
+    # disjointly across accelerator ranks (handled inside create_robocasa_envs).
+    if isinstance(cfg, RoboCasaEnv):
+        from opentau.envs.robocasa import create_robocasa_envs
+
+        return create_robocasa_envs(
+            task=cfg.task,
+            n_envs=n_envs,
+            camera_name=cfg.camera_name,
+            gym_kwargs=cfg.gym_kwargs,
+            env_cls=env_cls,
+            episode_length=cfg.episode_length,
+            obj_registries=tuple(cfg.obj_registries),
         )
 
     try:
