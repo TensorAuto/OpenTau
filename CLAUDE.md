@@ -43,15 +43,15 @@ Dependency management is **`uv` (>= 0.8.4) only** — `pyproject.toml`/`uv.lock`
 
 ```bash
 uv sync --extra dev --extra libero          # standard dev setup (matches CI)
-uv sync --all-extras                         # everything (libero + urdf co-install on the shared robosuite 1.5.2 / numpy 2.x stack)
+uv sync --all-extras                         # everything (libero + robocasa + urdf co-install on the shared robosuite-1.5 master / numpy 2.x stack); Linux-only (trt)
 source .venv/bin/activate
 ```
 
 Re-run `uv sync` whenever `pyproject.toml`/`uv.lock` change. Add deps with `uv add <pkg>`; lock with `uv lock`.
 
-Installable extras: `dev` (pre-commit, sphinx, pytest), `libero` (sim env — pulls a forked LIBERO from `shuheng-liu/LIBERO`, on robosuite 1.5.2 + numpy 2.x + gymnasium), `urdf` (rerun ≥0.28, numpy 2.x), `trt` (TensorRT, Linux/Win x86_64 only).
+Installable extras: `dev` (pre-commit, sphinx, pytest), `libero` (sim env — pulls a forked LIBERO from `shuheng-liu/LIBERO`, on robosuite 1.5 master + numpy 2.x + gymnasium), `robocasa` (RoboCasa365 kitchen sim — co-installs with `libero` on the shared robosuite stack; see the RoboCasa365 note below), `urdf` (rerun ≥0.28, numpy 2.x), `trt` (TensorRT, Linux/Win x86_64 only).
 
-**RoboCasa365** (`envs/robocasa.py`) shares the `libero` extra's robosuite 1.5.2 stack but has **no first-class uv extra yet**: upstream `robocasa`'s `setup.py` hard-pins `lerobot==0.3.3` (would drag a second, conflicting LeRobot into the shared lock) plus over-strict `numba`/`numpy`/`mujoco`/`tianshou`. A packaging fork (`shuheng-liu/robocasa`) that drops those pins — mirroring the `shuheng-liu/LIBERO` / `egl_probe` forks — is the intended home for a `robocasa` extra. Until then install it manually into the libero venv: `uv pip install "git+https://github.com/robocasa/robocasa" --no-deps`, then download kitchen assets (`python -m robocasa.scripts.download_kitchen_assets`, ~10GB) and run headless with `MUJOCO_GL=egl`.
+**RoboCasa365** (`envs/robocasa.py`) is a first-class extra that co-installs with `libero` on a shared robosuite stack: `uv sync --extra robocasa`. Two non-obvious things make it resolve: (1) robocasa needs `MujocoEnv(load_model_on_init=...)`, added on robosuite **master** *after* the 1.5.2 PyPI release, so `[tool.uv.sources]` repins `robosuite` to a master commit — which still self-reports "1.5.2" (matching the extras' pins) and is validated to also run LIBERO; (2) robocasa is pulled from the `shuheng-liu/robocasa` packaging fork (mirroring the `shuheng-liu/LIBERO` / `egl_probe` forks) that drops upstream's `lerobot==0.3.3` / `tianshou` / `opencv-python` / `hidapi` deps and loosens its `numpy`/`numba`/`scipy`/`mujoco` pins + import-time version asserts, since uv can't `--no-deps` a single package in a lock. Kitchen assets (~5-10GB) are a separate runtime step — `python -m robocasa.scripts.download_kitchen_assets` — then run headless with `MUJOCO_GL=egl`. NOTE: a full `uv lock` / `uv sync --all-extras` must run on Linux (the `trt` extra's TensorRT sdist can't build on macOS arm64); `uv sync --extra robocasa` from the committed lock works anywhere.
 
 ## Common commands
 
