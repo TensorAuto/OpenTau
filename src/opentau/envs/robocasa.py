@@ -391,11 +391,9 @@ class RoboCasaEnv(gym.Env):
 
         observation = self._format_raw_obs(raw_obs)
         if terminated:
-            info["final_info"] = {
-                "task": self.task,
-                "done": bool(done),
-                "is_success": bool(is_success),
-            }
+            # Auto-reset on terminal so the next rollout step starts a fresh
+            # episode (the rollout masks post-done data). Mirrors LiberoEnv.step;
+            # the task / done / is_success keys set above are what eval consumes.
             self.reset()
 
         return observation, reward, terminated, truncated, info
