@@ -345,6 +345,11 @@ class RoboCasaEnv(EnvConfig):
         obj_registries: Object-mesh registries to sample assets from. Defaults to
             ``["lightwheel"]`` (the pack the asset downloader ships by default);
             add ``"objaverse"`` only after downloading that ~30GB pack.
+        assets_root: Directory to store/read RoboCasa kitchen assets, kept outside the
+            (ephemeral) uv venv. ``None`` resolves to the ``ROBOCASA_ASSETS_ROOT`` env
+            var, else ``HF_OPENTAU_HOME/robocasa/assets``.
+        auto_download_assets: If ``True`` (default), the asset packs ``obj_registries``
+            needs are downloaded automatically (once) on first env build.
         features: Mapping from logical feature names to ``PolicyFeature`` definitions.
         features_map: Mapping from environment keys to standardized OpenTau keys.
     """
@@ -361,6 +366,8 @@ class RoboCasaEnv(EnvConfig):
     visualization_width: int = 512
     split: str | None = None
     obj_registries: list[str] = field(default_factory=lambda: ["lightwheel"])
+    assets_root: str | None = None
+    auto_download_assets: bool = True
     features: dict[str, PolicyFeature] = field(
         default_factory=lambda: {
             "action": PolicyFeature(type=FeatureType.ACTION, shape=(12,)),
