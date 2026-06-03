@@ -127,9 +127,11 @@ libero = [
     "egl-probe",
     "robomimic==0.2.0",
     # robosuite 1.5.2 (composite-controller framework) so LIBERO shares a venv with
-    # RoboCasa, which needs >=1.5. The LIBERO fork is ported to the 1.5 controller API
-    # (see load_arm_controller_config); robomimic 0.2.0 does not pin robosuite, so it
-    # co-installs unchanged.
+    # RoboCasa. Sourced from a pinned robosuite *master* commit (see [tool.uv.sources])
+    # because robocasa needs MujocoEnv(load_model_on_init=...), added on master after
+    # the 1.5.2 PyPI release; master still self-reports "1.5.2" so this pin matches.
+    # The LIBERO fork (1.5 controller API, see load_arm_controller_config) is validated
+    # on this commit; robomimic 0.2.0 does not pin robosuite, so it co-installs unchanged.
     "robosuite==1.5.2",
     "thop==0.1.1.post2209072238",
     "mujoco>=3.3.5",
@@ -142,6 +144,20 @@ libero = [
     "pyopengl-accelerate==3.1.10 ; sys_platform == 'linux'",
     "mujoco>=3.1.6 ; sys_platform == 'linux'",
     "pyopengl==3.1.10 ; sys_platform == 'linux'",
+]
+robocasa = [
+    # RoboCasa365 kitchen sim for simulated eval, co-installed on the shared
+    # robosuite-1.5 (master) stack from the `libero` extra. Uses the
+    # shuheng-liu/robocasa packaging fork (see [tool.uv.sources]) that drops
+    # upstream's lerobot==0.3.3 / tianshou / opencv-python / hidapi deps and loosens
+    # its numpy/numba/scipy/mujoco pins so it resolves in the shared lock (upstream's
+    # setup.py can't be `--no-deps`'d inside a uv lock). robosuite is not in robocasa's
+    # deps (installed separately), so pin it here matching `libero`. Kitchen assets
+    # (~5-10GB) are a separate runtime download:
+    # `python -m robocasa.scripts.download_kitchen_assets`.
+    "robocasa",
+    "robosuite==1.5.2",
+    "mujoco>=3.3.5",
 ]
 urdf = [
     "rerun-sdk>=0.28.2",
@@ -156,6 +172,15 @@ libero = { git = "https://github.com/shuheng-liu/LIBERO" , branch = "master" }  
 # which CMake >= 4 rejects. This fork raises the floor to 3.5 so it builds on CMake 4
 # without pinning the build's cmake; the tag keeps the source reproducible.
 egl-probe = { git = "https://github.com/shuheng-liu/egl_probe", tag = "v1.0.1-cmake4" }
+# robocasa main needs robosuite *master* (MujocoEnv(load_model_on_init=...), added after
+# the 1.5.2 PyPI release); pin the exact commit for reproducibility. Master self-reports
+# version "1.5.2", which satisfies the `robosuite==1.5.2` pins in the extras above, and
+# LIBERO is validated to construct+step on this commit (so the shared stack still works).
+robosuite = { git = "https://github.com/ARISE-Initiative/robosuite", rev = "85abee228d1c43ab1939bce33028099945d453b4" }
+# OpenTau packaging fork of robocasa: drops upstream's lerobot==0.3.3 / tianshou /
+# opencv-python / hidapi deps and loosens its numpy/numba/scipy/mujoco pins + import-time
+# version asserts so it co-installs on the shared robosuite-1.5 / numpy-2 stack.
+robocasa = { git = "https://github.com/shuheng-liu/robocasa", rev = "f7db21c11f25408d3a59a5e878bb5c7ca9030c4d" }
 
 [tool.uv]
 # `extra-build-dependencies` injects a cmake wheel into egl-probe's PEP 517 build

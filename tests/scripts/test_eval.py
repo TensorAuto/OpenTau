@@ -13,8 +13,12 @@
 # limitations under the License.
 
 from pathlib import Path
+from unittest.mock import Mock
 
-from opentau.scripts.eval import collect_grid_summary_videos
+import pytest
+
+from opentau.envs.configs import RoboCasaEnv
+from opentau.scripts.eval import collect_grid_summary_videos, eval_policy_all
 
 
 def _touch(p: Path):
@@ -35,3 +39,15 @@ def test_collect_grid_summary_videos_strips_rank_and_excludes_clips(tmp_path):
 
 def test_collect_grid_summary_videos_missing_dir(tmp_path):
     assert collect_grid_summary_videos(tmp_path / "does_not_exist") == []
+
+
+def test_eval_policy_all_rejects_recording_root_for_non_libero_env():
+    """eval.recording_root drives the LIBERO-only dataset recorder, so it must fail
+    fast (before any rollout) for a non-LIBERO env rather than silently mislabel the
+    recorded dataset."""
+    cfg = Mock()
+    cfg.eval.recording_root = "/tmp/robocasa-rollout"
+    cfg.env = RoboCasaEnv()  # not a LIBERO env
+
+    with pytest.raises(NotImplementedError, match="recording_root"):
+        eval_policy_all({}, policy=Mock(), n_episodes=1, cfg=cfg)
