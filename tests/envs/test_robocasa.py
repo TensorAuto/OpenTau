@@ -37,6 +37,7 @@ from opentau.envs.robocasa import (
     ACTION_DIM,
     OBS_STATE_DIM,
     _default_camera_name_mapping,
+    _import_robocasa_with_version_shim,
     _parse_camera_names,
     _resolve_tasks,
     convert_action,
@@ -161,6 +162,23 @@ class TestPureHelpers:
     def test_constants(self):
         assert ACTION_DIM == 12
         assert OBS_STATE_DIM == 16
+
+    def test_version_shim_is_noop_when_robocasa_already_imported(self):
+        # When robocasa is already in sys.modules the shim must return early
+        # without importing mujoco/numpy, so CPU-only runs (no sim) never touch
+        # those modules. Inject a placeholder and assert it returns cleanly.
+        import sys
+
+        had = "robocasa" in sys.modules
+        saved = sys.modules.get("robocasa")
+        sys.modules["robocasa"] = object()
+        try:
+            _import_robocasa_with_version_shim()  # must not raise / import anything
+        finally:
+            if had:
+                sys.modules["robocasa"] = saved
+            else:
+                sys.modules.pop("robocasa", None)
 
 
 def _mock_accelerator(num_processes: int, process_index: int) -> Mock:

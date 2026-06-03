@@ -107,6 +107,34 @@ def _default_camera_name_mapping(camera_names: Sequence[str]) -> dict[str, list[
     return {cam: [f"camera{i}"] for i, cam in enumerate(camera_names)}
 
 
+def _import_robocasa_with_version_shim() -> None:
+    """Import the top-level ``robocasa`` package despite its over-strict pins.
+
+    robocasa 1.0.1 hard-asserts ``mujoco.__version__ == "3.3.1"`` and
+    ``numpy.__version__ in ["2.2.5"]`` at import time. OpenTau shares LIBERO's
+    stack (robosuite 1.5.2 + ``mujoco>=3.3.5`` + ``numpy>=2.2.6``) — and robosuite
+    1.5.2 itself only needs ``mujoco>=3.3.0`` / ``numpy>=1.13.3`` — so those
+    equality pins are too strict to satisfy here. Spoof the two version strings
+    only for the one-time package import, then restore them. A robocasa packaging
+    fork that drops the asserts makes this shim unnecessary; until then it lets
+    the integration run on a stock ``pip install robocasa``. No-op once imported.
+    """
+    import sys
+
+    if "robocasa" in sys.modules:
+        return
+    import mujoco
+    import numpy
+
+    saved = (mujoco.__version__, numpy.__version__)
+    try:
+        mujoco.__version__ = "3.3.1"
+        numpy.__version__ = "2.2.5"
+        import robocasa  # noqa: F401  (runs robocasa's version asserts once)
+    finally:
+        mujoco.__version__, numpy.__version__ = saved
+
+
 def _resolve_tasks(task: str) -> tuple[list[str], str | None]:
     """Resolve an ``env.task`` value to ``(task_names, split_override)``.
 
@@ -119,6 +147,7 @@ def _resolve_tasks(task: str) -> tuple[list[str], str | None]:
     """
     key = task.strip()
     if key in _TASK_GROUP_SPLITS:
+        _import_robocasa_with_version_shim()
         from robocasa.utils.dataset_registry import PRETRAINING_TASKS, TARGET_TASKS
 
         combined = {**TARGET_TASKS, **PRETRAINING_TASKS}
@@ -268,6 +297,7 @@ class RoboCasaEnv(gym.Env):
         """
         if self._env is not None:
             return
+        _import_robocasa_with_version_shim()
         from robocasa.wrappers.gym_wrapper import RoboCasaGymEnv
 
         # RoboCasaGymEnv defaults split="test", which create_env rejects (only
