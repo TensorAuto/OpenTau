@@ -34,6 +34,7 @@ import importlib.util
 import json
 import os
 import shutil
+import socket
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from functools import partial
@@ -160,34 +161,45 @@ def _direct_download_url(shared_url: str) -> str:
     return f"{base}/shared/static/{shared_id}.zip"
 
 
+# Per-attempt socket timeout for asset downloads: a wedged connection (no data, no error)
+# raises socket.timeout (an OSError) and falls into the retry loop instead of hanging.
+_DOWNLOAD_TIMEOUT_S = 120
+
+
 def _download_and_extract_zip(url: str, dest: Path, retries: int = 3) -> None:
     r"""Download ``url`` (a ``.zip``) and extract it so its top-level dir lands at ``dest``.
 
     Mirrors robocasa's own downloader (extract into ``dest.parent``; the zip's single
-    top-level directory matches ``dest.name``, and the download is retried a few times for
-    these multi-GB packs) but without importing anything from robocasa. ``extractall`` is
-    not atomic, but the caller only writes the pack's done-marker after this returns cleanly,
-    so a failed/partial extract is simply retried and overwritten on the next attempt/run.
+    top-level directory matches ``dest.name``, and the download is retried a few times —
+    each attempt bounded by a socket timeout so a hung connection still fails over) but
+    without importing anything from robocasa. ``extractall`` is not atomic, but the caller
+    only writes the pack's done-marker after this returns cleanly, so a failed/partial
+    extract is simply retried and overwritten on the next attempt/run.
     """
     download_dir = dest.parent
     download_dir.mkdir(parents=True, exist_ok=True)
     zip_path = download_dir / f"{dest.name}.zip"
     last_err: Exception | None = None
-    for attempt in range(1, retries + 1):
-        try:
-            urlretrieve(url, filename=str(zip_path))  # noqa: S310  # nosec B310 - trusted UT-Austin Box URL
-            with ZipFile(zip_path) as zf:
-                zf.extractall(path=str(download_dir))  # noqa: S202  # nosec B202 - trusted first-party archive
-            return
-        except (OSError, BadZipFile) as err:
-            last_err = err
-            acc_print(f"[opentau] RoboCasa asset download attempt {attempt}/{retries} failed: {err}")
-        finally:
-            if zip_path.exists():
-                zip_path.unlink()
-    raise RuntimeError(
-        f"Failed to download RoboCasa assets from {url} after {retries} attempts"
-    ) from last_err
+    old_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(_DOWNLOAD_TIMEOUT_S)
+    try:
+        for attempt in range(1, retries + 1):
+            try:
+                urlretrieve(url, filename=str(zip_path))  # noqa: S310  # nosec B310 - trusted Box URL
+                with ZipFile(zip_path) as zf:
+                    zf.extractall(path=str(download_dir))  # noqa: S202  # nosec B202 - trusted archive
+                return
+            except (OSError, BadZipFile) as err:
+                last_err = err
+                acc_print(f"[opentau] RoboCasa asset download attempt {attempt}/{retries} failed: {err}")
+            finally:
+                if zip_path.exists():
+                    zip_path.unlink()
+        raise RuntimeError(
+            f"Failed to download RoboCasa assets from {url} after {retries} attempts"
+        ) from last_err
+    finally:
+        socket.setdefaulttimeout(old_timeout)
 
 
 def _load_box_links(pkg_assets: Path, external_root: Path) -> dict:
