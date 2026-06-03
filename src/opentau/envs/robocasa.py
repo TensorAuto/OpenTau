@@ -40,7 +40,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 from urllib.request import urlretrieve
-from zipfile import ZipFile
+from zipfile import BadZipFile, ZipFile
 
 import gymnasium as gym
 import numpy as np
@@ -160,22 +160,34 @@ def _direct_download_url(shared_url: str) -> str:
     return f"{base}/shared/static/{shared_id}.zip"
 
 
-def _download_and_extract_zip(url: str, dest: Path) -> None:
+def _download_and_extract_zip(url: str, dest: Path, retries: int = 3) -> None:
     r"""Download ``url`` (a ``.zip``) and extract it so its top-level dir lands at ``dest``.
 
     Mirrors robocasa's own downloader (extract into ``dest.parent``; the zip's single
-    top-level directory matches ``dest.name``) but without importing anything from robocasa.
+    top-level directory matches ``dest.name``, and the download is retried a few times for
+    these multi-GB packs) but without importing anything from robocasa. ``extractall`` is
+    not atomic, but the caller only writes the pack's done-marker after this returns cleanly,
+    so a failed/partial extract is simply retried and overwritten on the next attempt/run.
     """
     download_dir = dest.parent
     download_dir.mkdir(parents=True, exist_ok=True)
     zip_path = download_dir / f"{dest.name}.zip"
-    try:
-        urlretrieve(url, filename=str(zip_path))  # noqa: S310  # nosec B310 - trusted UT-Austin Box URL
-        with ZipFile(zip_path) as zf:
-            zf.extractall(path=str(download_dir))  # noqa: S202  # nosec B202 - trusted first-party archive
-    finally:
-        if zip_path.exists():
-            zip_path.unlink()
+    last_err: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            urlretrieve(url, filename=str(zip_path))  # noqa: S310  # nosec B310 - trusted UT-Austin Box URL
+            with ZipFile(zip_path) as zf:
+                zf.extractall(path=str(download_dir))  # noqa: S202  # nosec B202 - trusted first-party archive
+            return
+        except (OSError, BadZipFile) as err:
+            last_err = err
+            acc_print(f"[opentau] RoboCasa asset download attempt {attempt}/{retries} failed: {err}")
+        finally:
+            if zip_path.exists():
+                zip_path.unlink()
+    raise RuntimeError(
+        f"Failed to download RoboCasa assets from {url} after {retries} attempts"
+    ) from last_err
 
 
 def _load_box_links(pkg_assets: Path, external_root: Path) -> dict:
@@ -330,6 +342,11 @@ def _ensure_robocasa_assets(assets_root: Path, obj_registries: Sequence[str]) ->
     not-yet-relocated assets dir — so the package is located via its import spec instead.
     Per-pack marker files make re-runs (and the mixed ``fixtures`` dir, which holds both
     shipped XML and downloaded meshes) skip cleanly.
+
+    Note: only the *global* main process downloads, so under multi-node eval ``assets_root``
+    must be on storage shared by all nodes. The default (under ``HF_OPENTAU_HOME``) is fine
+    for single-node eval; for a node-local ``HF_OPENTAU_HOME``, point ``ROBOCASA_ASSETS_ROOT``
+    at a shared path so non-zero nodes find the seeded store.
     """
     pkg_assets = _robocasa_pkg_assets_dir()
     needed = _needed_asset_packs(obj_registries)

@@ -41,6 +41,7 @@ from opentau.envs.robocasa import (
     OBS_STATE_DIM,
     ROBOCASA_ASSETS_ROOT_ENV,
     _default_camera_name_mapping,
+    _direct_download_url,
     _ensure_robocasa_assets,
     _import_robocasa_with_version_shim,
     _maybe_relink_robocasa_assets,
@@ -353,6 +354,22 @@ class TestNeededAssetPacks:
             "fixtures_lw",
             "objs_lw",
         ]
+
+
+class TestDirectDownloadUrl:
+    """``_direct_download_url`` rewrites a Box share link to a direct-download ``.zip``."""
+
+    def test_rewrites_box_share_url(self):
+        assert (
+            _direct_download_url("https://utexas.box.com/s/abc123")
+            == "https://utexas.box.com/shared/static/abc123.zip"
+        )
+
+    def test_tolerates_trailing_slash(self):
+        assert (
+            _direct_download_url("https://utexas.box.com/s/xyz789/")
+            == "https://utexas.box.com/shared/static/xyz789.zip"
+        )
 
 
 class TestEnsureRoboCasaAssets:
