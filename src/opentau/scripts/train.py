@@ -56,6 +56,7 @@ from opentau.utils.accelerate_utils import set_proc_accelerator
 from opentau.utils.logging_utils import AverageMeter, MetricsTracker
 from opentau.utils.random_utils import set_seed
 from opentau.utils.train_utils import (
+    find_missing_rng_state_ranks,
     get_step_checkpoint_dir,
     get_step_identifier,
     load_training_state,
@@ -889,20 +890,19 @@ def train(cfg: TrainPipelineConfig):
             accelerator.wait_for_everyone()
 
             # Defense-in-depth tripwire for the partial-save / output_dir-divergence failure
-            # mode: accelerate writes exactly one ``random_states_<process_index>.pkl`` per
-            # process on every backend, so after the barrier the count must equal
-            # ``world_size``. Fewer means a rank saved into a different directory or not at
-            # all, leaving an unresumable checkpoint -- surface it loudly here instead of
-            # discovering it at resume/consolidation time.
+            # mode: accelerate writes one ``random_states_<process_index>.pkl`` per process on
+            # every backend, so a complete checkpoint has one per rank. Surface a missing rank
+            # loudly here (the hard failure otherwise only appears at resume/consolidation time).
             if accelerator.is_main_process:
-                n_rng = len(list(Path(checkpoint_dir).glob("random_states_*.pkl")))
-                if n_rng != accelerator.num_processes:
+                missing_ranks = find_missing_rng_state_ranks(checkpoint_dir, accelerator.num_processes)
+                if missing_ranks:
                     logging.error(
-                        "Checkpoint %s is incomplete: found %d/%d per-rank RNG-state files. A "
-                        "rank likely wrote to a different output_dir or failed to save; this "
-                        "checkpoint may not be resumable.",
+                        "CHECKPOINT INCOMPLETE: %s is missing per-rank RNG state for rank(s) %s "
+                        "(have %d/%d). A rank likely wrote to a different output_dir or failed to "
+                        "save; this checkpoint is not resumable.",
                         checkpoint_dir,
-                        n_rng,
+                        missing_ranks,
+                        accelerator.num_processes - len(missing_ranks),
                         accelerator.num_processes,
                     )
 

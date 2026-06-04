@@ -130,6 +130,29 @@ def save_checkpoint(
     save_rng_state(checkpoint_dir)
 
 
+def find_missing_rng_state_ranks(checkpoint_dir: Path, world_size: int) -> list[int]:
+    """Return the process indices whose ``random_states_<i>.pkl`` is absent from a checkpoint.
+
+    Accelerate writes exactly one ``random_states_<process_index>.pkl`` per process on
+    every backend, so a complete checkpoint contains ``world_size`` of them. A non-empty
+    result means some rank saved into a different directory or not at all (e.g. a divergent
+    ``output_dir`` across ranks), leaving the checkpoint unresumable.
+
+    Args:
+        checkpoint_dir: Directory accelerate saved the per-rank RNG files into.
+        world_size: Expected number of processes (``accelerator.num_processes``).
+
+    Returns:
+        Sorted list of missing process indices; empty when the checkpoint is complete.
+    """
+    present: set[int] = set()
+    for path in Path(checkpoint_dir).glob("random_states_*.pkl"):
+        index = path.name[len("random_states_") : -len(".pkl")]
+        if index.isdigit():
+            present.add(int(index))
+    return sorted(set(range(world_size)) - present)
+
+
 def reseed_new_ranks_on_resume(
     checkpoint_dir: Path,
     accelerator: "accelerate.Accelerator",

@@ -21,6 +21,7 @@ from opentau.constants import (
     TRAINING_STEP,
 )
 from opentau.utils.train_utils import (
+    find_missing_rng_state_ranks,
     get_step_checkpoint_dir,
     get_step_identifier,
     load_training_step,
@@ -35,6 +36,24 @@ def test_get_step_identifier():
     assert get_step_identifier(5, 1000) == "000005"
     assert get_step_identifier(123, 100_000) == "000123"
     assert get_step_identifier(456789, 1_000_000) == "0456789"
+
+
+def test_find_missing_rng_state_ranks(tmp_path):
+    """find_missing_rng_state_ranks flags ranks whose per-rank RNG file is absent."""
+    # Complete checkpoint: one random_states_<i>.pkl per rank -> nothing missing.
+    for i in range(8):
+        (tmp_path / f"random_states_{i}.pkl").touch()
+    assert find_missing_rng_state_ranks(tmp_path, 8) == []
+
+    # The output_dir-divergence failure mode: rank 6 wrote to a sibling dir, so its
+    # per-rank file is absent here.
+    (tmp_path / "random_states_6.pkl").unlink()
+    assert find_missing_rng_state_ranks(tmp_path, 8) == [6]
+
+    # Unrelated files are ignored, and a non-existent directory reports every rank.
+    (tmp_path / "bf16_zero_pp_rank_0_mp_rank_00_optim_states.pt").touch()
+    assert find_missing_rng_state_ranks(tmp_path, 8) == [6]
+    assert find_missing_rng_state_ranks(tmp_path / "does_not_exist", 3) == [0, 1, 2]
 
 
 def test_get_step_checkpoint_dir():
