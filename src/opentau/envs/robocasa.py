@@ -30,11 +30,13 @@ this module (e.g. in the CPU test suite) never requires the sim to be installed.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
 import shutil
 import socket
+import sys
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from functools import partial
@@ -134,6 +136,42 @@ def _resolve_robocasa_assets_root() -> Path:
     return HF_OPENTAU_HOME / "robocasa" / "assets"
 
 
+def _internal_robocasa_pkg_dir() -> str:
+    r"""Realpath of OpenTau's *internal* ``opentau/scripts/robocasa`` package.
+
+    That package (the inference WebSocket server) shares the bare name ``robocasa``
+    with the external sim. When ``train.py`` / ``eval.py`` run as scripts — which is
+    how ``accelerate launch`` and the ``opentau-*`` console entry points invoke them —
+    Python puts ``opentau/scripts/`` on ``sys.path[0]``, so ``import robocasa`` /
+    ``find_spec("robocasa")`` resolve to this empty package instead of the sim. The
+    helpers below use this path to skip the shadow.
+    """
+    return os.path.realpath(os.path.join(os.path.dirname(__file__), os.pardir, "scripts", "robocasa"))
+
+
+@contextlib.contextmanager
+def _robocasa_unshadowed():
+    r"""Temporarily drop the ``sys.path`` entry that shadows the external robocasa
+    package, and purge an already-imported shadow, so ``import robocasa`` /
+    ``find_spec("robocasa")`` resolve to the installed sim. Restores ``sys.path`` on exit.
+    """
+    internal = _internal_robocasa_pkg_dir()
+    # If the internal package was already imported under the bare name, evict it
+    # (and its submodules) so resolution can fall through to the real sim.
+    existing = sys.modules.get("robocasa")
+    if existing is not None:
+        mod_file = getattr(existing, "__file__", "") or ""
+        if os.path.realpath(os.path.dirname(mod_file)) == internal:
+            for name in [m for m in sys.modules if m == "robocasa" or m.startswith("robocasa.")]:
+                del sys.modules[name]
+    saved_path = list(sys.path)
+    sys.path[:] = [p for p in sys.path if os.path.realpath(os.path.join(p, "robocasa")) != internal]
+    try:
+        yield
+    finally:
+        sys.path[:] = saved_path
+
+
 def _robocasa_pkg_assets_dir() -> Path:
     r"""Locate ``<robocasa-pkg>/models/assets`` *without importing* robocasa.
 
@@ -143,7 +181,10 @@ def _robocasa_pkg_assets_dir() -> Path:
     *before* the first import — which means locating the package via its import spec, not
     via ``robocasa.__path__`` (that would require importing it).
     """
-    spec = importlib.util.find_spec("robocasa")
+    # Skip OpenTau's internal ``opentau/scripts/robocasa`` shadow, else ``find_spec``
+    # returns it and we look for assets in the wrong directory (see _internal_robocasa_pkg_dir).
+    with _robocasa_unshadowed():
+        spec = importlib.util.find_spec("robocasa")
     if spec is None or not spec.submodule_search_locations:
         raise ModuleNotFoundError("robocasa is not installed; cannot locate its assets dir.")
     return Path(next(iter(spec.submodule_search_locations))) / "models" / "assets"
@@ -255,11 +296,18 @@ def _import_robocasa_with_version_shim() -> None:
     only for the one-time package import, then restore them. A robocasa packaging
     fork that drops the asserts makes this shim unnecessary; until then it lets
     the integration run on a stock ``pip install robocasa``. No-op once imported.
-    """
-    import sys
 
-    if "robocasa" in sys.modules:
-        return
+    Also skips OpenTau's internal ``opentau/scripts/robocasa`` package, which would
+    otherwise shadow the sim under the script-launched entry points (see
+    :func:`_internal_robocasa_pkg_dir`).
+    """
+    # Already imported as the *real* sim -> nothing to do. (A shadow import is
+    # purged inside ``_robocasa_unshadowed`` so the real package can load.)
+    existing = sys.modules.get("robocasa")
+    if existing is not None:
+        mod_file = getattr(existing, "__file__", "") or ""
+        if os.path.realpath(os.path.dirname(mod_file)) != _internal_robocasa_pkg_dir():
+            return
     import mujoco
     import numpy
 
@@ -272,7 +320,8 @@ def _import_robocasa_with_version_shim() -> None:
         # the symlink must already be in place or the registry comes up empty (every object
         # category gets zero candidates -> "Probabilities contain NaN" at sampling time).
         _maybe_relink_robocasa_assets()
-        import robocasa  # noqa: F401  (runs robocasa's version asserts once)
+        with _robocasa_unshadowed():
+            import robocasa  # noqa: F401  (runs robocasa's version asserts once)
     finally:
         mujoco.__version__, numpy.__version__ = saved
 
