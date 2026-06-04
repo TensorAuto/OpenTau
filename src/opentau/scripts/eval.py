@@ -563,16 +563,21 @@ def create_grid_summary_video(
         y, x = row * frame_height, col * frame_width
         grid[y : y + frame_height, x : x + frame_width] = frame
 
-    readers = [imageio.get_reader(p) for p in valid_paths]
-    frame_streams = [reader.iter_data() for reader in readers]
-    # Hold each clip's last frame so a clip that ends early keeps showing its
-    # final state (matches the previous behaviour) rather than going blank.
-    last_frames: list = [None] * len(readers)
-    exhausted = [False] * len(readers)
-    writer = imageio.get_writer(output_path, fps=fps)
+    # Open readers/writer inside the try so a mid-way get_reader failure still
+    # closes whatever was already opened (no leaked file handles).
+    readers: list = []
+    writer = None
     end = object()  # sentinel: next(stream, end) avoids the inf-length list() pitfall
     last_grid = None
     try:
+        for path in valid_paths:
+            readers.append(imageio.get_reader(path))
+        frame_streams = [reader.iter_data() for reader in readers]
+        # Hold each clip's last frame so a clip that ends early keeps showing its
+        # final state (matches the previous behaviour) rather than going blank.
+        last_frames: list = [None] * len(readers)
+        exhausted = [False] * len(readers)
+        writer = imageio.get_writer(output_path, fps=fps)
         # One iteration per output frame; stop once every clip is exhausted.
         while True:
             advanced = False
@@ -607,7 +612,8 @@ def create_grid_summary_video(
             for _ in range(int(highlight_duration * fps)):
                 writer.append_data(highlighted_frame)
     finally:
-        writer.close()
+        if writer is not None:
+            writer.close()
         for reader in readers:
             reader.close()
 
