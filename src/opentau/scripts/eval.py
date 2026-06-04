@@ -535,7 +535,11 @@ def create_grid_summary_video(
         if not Path(video_path).exists():
             logging.warning(f"Video file not found: {video_path}")
             continue
-        video = imageio.mimread(video_path)
+        # memtest=False disables imageio.mimread's 256 MB read cap — a full
+        # multi-camera episode video (e.g. 3 cams × 256 px × ~500 steps ≈ 280 MB)
+        # exceeds the default. The grid builder already holds every loaded video
+        # in memory, so the cap was the only blocker.
+        video = imageio.mimread(video_path, memtest=False)
         videos.append(video)
         max_frames = max(max_frames, len(video))
 
