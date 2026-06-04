@@ -38,11 +38,11 @@ You can install OpenTau directly from PyPI using pip:
 
     pip install opentau
 
-To install with extra dependencies (e.g., ``dev``, ``trt``, ``libero``), use brackets:
+To install with extra dependencies (e.g., ``dev``, ``libero``, ``robocasa``, ``urdf``, ``trt``), use brackets:
 
 .. code-block:: bash
 
-    pip install opentau[dev,libero,trt]
+    pip install opentau[dev,libero,robocasa,urdf,trt]
 
 
 Installation with Source Code
@@ -73,11 +73,12 @@ We recommend using `uv <https://docs.astral.sh/uv/>`_ (>= 0.8.4) for fast and si
    CMake 4. Older ``uv`` is rejected via ``required-version``.
 
 2. **Install dependencies**
-   Sync all required dependencies. To install all extras:
+   Sync all required dependencies. To install all extras (they all
+   co-resolve into a single environment):
 
    .. code-block:: bash
 
-      uv sync
+      uv sync --all-extras
 
    To install specific extras (e.g., ``dev``, ``libero``):
 

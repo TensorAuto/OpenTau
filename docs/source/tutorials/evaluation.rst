@@ -30,7 +30,7 @@ For example, to evaluate a policy on the LIBERO 10, run:
 Evaluating a policy in a LIBERO environment
 -------------------------------------------
 
-OpenTau currently supports the `LIBERO benchmark <https://libero-project.github.io/main.html>`_. To evaluate the policy on the LIBERO benchmark, add the following section to the training config:
+OpenTau supports simulated evaluation in both the `LIBERO benchmark <https://libero-project.github.io/main.html>`_ and the `RoboCasa365 <https://robocasa.ai/>`_ kitchen simulation. To evaluate a policy on LIBERO, add the following section to the training config:
 
 .. code-block:: javascript
 
@@ -50,6 +50,48 @@ OpenTau currently supports the `LIBERO benchmark <https://libero-project.github.
     }
 
 This will run the 0th task and 2nd task in ``libero_spatial``. Each task will run for 8 simulations in parallel.
+
+.. _evaluating-robocasa:
+
+Evaluating a policy in a RoboCasa environment
+---------------------------------------------
+
+OpenTau also evaluates in the `RoboCasa365 <https://robocasa.ai/>`_ kitchen
+simulation, in-process and vectorized just like LIBERO (no external server
+required). Install the simulator with the ``robocasa`` extra
+(``uv sync --extra robocasa`` or ``uv sync --all-extras``); kitchen assets
+auto-download on the first env build. See :doc:`/tutorials/robocasa` for setup
+details and an external rollout-client alternative.
+
+Set ``env.type`` to ``robocasa`` in the training config (see
+``configs/examples/pi05_robocasa_eval_config.json`` for a complete example):
+
+.. code-block:: javascript
+
+    {
+        ...,
+        "env": {
+            "type": "robocasa",
+            "task": "CloseFridge",
+            "camera_name": "robot0_agentview_left,robot0_eye_in_hand,robot0_agentview_right",
+            "metadata": {
+                "robot_type": "PandaOmron",
+                "control_mode": "ee"
+            }
+        },
+        "eval": {
+            "n_episodes": 2,
+            "batch_size": 2,
+            "use_async_envs": true,
+            "control_mode": "ee"
+        },
+        "eval_freq": 25,
+        ...
+    }
+
+Run headless (e.g. on a GPU server) with ``MUJOCO_GL=egl``. As with LIBERO, each
+RoboCasa task is its own group, so eval reports a per-task success rate and a
+per-task video grid, and tasks shard across accelerate ranks.
 
 Running validation during training
 ----------------------------------

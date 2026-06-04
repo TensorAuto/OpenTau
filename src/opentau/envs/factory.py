@@ -102,7 +102,7 @@ def make_envs(
     try:
         importlib.import_module(cfg.import_name)
     except ModuleNotFoundError as e:
-        print(f"{cfg.import_name} is not installed. Please install it with `uv sync --all-extras'`")
+        print(f"{cfg.import_name} is not installed. Please install it with `uv sync --all-extras`")
         raise e
 
     def _make_one():

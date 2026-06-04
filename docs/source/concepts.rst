@@ -110,7 +110,7 @@ The following fields are set in ``DatasetMixtureConfig``:
 Cameras should be labeled in order of importance (e.g. camera0 is the most important camera, camera1 is the second most important camera, etc.). The model dataset will select the most important cameras to use if num_cams is less than the number of cameras in the dataset.
 
 Action-dim padding mask
-~~~~~~~~~~~~~~~~~~~~~~~
+^^^^^^^^^^^^^^^^^^^^^^^
 
 For heterogeneous co-training across datasets with different native action
 dimensionalities (e.g. a 7-DoF arm dataset and a 14-DoF bimanual dataset in
@@ -341,6 +341,14 @@ for reproducibility.
      - Per-field independent mask roll for each of ``speed``,
        ``mistake``, ``quality``, ``robot_type``, ``control_mode``.
        Only rolled when the shared drop did not fire.
+   * - ``val_enable_optional_key_dropout``
+     - ``False``
+     - Whether the five drop rolls above also fire on the **validation**
+       split. Default is ``False`` so validation metrics aren't
+       artificially noisy. Set to ``True`` if you want the validation
+       distribution to match training. Subgoal *frame* selection
+       (end-of-segment vs. uniform in the next 4 s) stays random either
+       way — only the masking logic is gated.
 
 .. note::
 
@@ -351,14 +359,6 @@ for reproducibility.
    all" (the policy's ``has_metadata`` branch sees a non-empty metadata
    mask and keeps the ``Metadata: FPS: N, `` block in the prefix). For a
    true no-metadata ablation, keep the default ``emit_fps=False``.
-   * - ``val_enable_optional_key_dropout``
-     - ``False``
-     - Whether the five drop rolls above also fire on the **validation**
-       split. Default is ``False`` so validation metrics aren't
-       artificially noisy. Set to ``True`` if you want the validation
-       distribution to match training. Subgoal *frame* selection
-       (end-of-segment vs. uniform in the next 4 s) stays random either
-       way — only the masking logic is gated.
 
 ``make_dataset`` enforces this by giving the validation subset its own
 shallow-copied dataset instance with ``enable_optional_key_dropout``
@@ -380,4 +380,4 @@ Environments
 ------------
 Environments wrap simulation or real-robot interfaces compatible with OpenAI Gym/Gymnasium.
 The factory `src/opentau/envs/factory.py <https://github.com/TensorAuto/OpenTau/blob/main/src/opentau/envs/factory.py>`_ creates vectorized environments for efficient training and evaluation.
-Currently, only `Libero <https://libero-project.github.io/main.html>`_ is supported and it is configured via ``opentau.envs.configs.LiberoEnv``.
+Currently, `LIBERO <https://libero-project.github.io/main.html>`_ and `RoboCasa365 <https://robocasa.ai/>`_ are supported, configured via ``opentau.envs.configs.LiberoEnv`` and ``opentau.envs.configs.RoboCasaEnv`` respectively.
