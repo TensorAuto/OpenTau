@@ -49,7 +49,9 @@ jobs:
     name: Run Pytest on GPU
     needs: start-runner
     runs-on: [g6.2xlarge]
-    timeout-minutes: 30
+    # 45 (not 30): the RoboCasa GPU test cold-downloads ~4.4G of kitchen asset packs onto
+    # the ephemeral runner before building a real scene; the rest of the suite is ~15 min.
+    timeout-minutes: 45
 
     container:
       image: nvidia/cuda:12.2.0-devel-ubuntu22.04
@@ -72,7 +74,11 @@ jobs:
 
       - name: Install dependencies
         run: |
-          uv sync --extra dev --extra libero
+          # --extra robocasa installs the RoboCasa sim (shuheng-liu/robocasa fork) so the
+          # @pytest.mark.gpu RoboCasa env test in tests/envs/test_robocasa.py can run instead
+          # of erroring with "robocasa is not installed"; it co-resolves with libero on the
+          # shared robosuite-master stack, so the resolved env for the other tests is unchanged.
+          uv sync --extra dev --extra libero --extra robocasa
 
       - name: Check GPU
         run: nvidia-smi
