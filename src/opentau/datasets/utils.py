@@ -88,6 +88,7 @@ import datasets
 import jsonlines
 import numpy as np
 import packaging.version
+import pandas as pd
 import torch
 from datasets.table import embed_table_storage
 from huggingface_hub import DatasetCard, DatasetCardData, HfApi
@@ -115,6 +116,26 @@ TASKS_PATH = "meta/tasks.jsonl"
 DEFAULT_VIDEO_PATH = "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"
 DEFAULT_PARQUET_PATH = "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"
 DEFAULT_IMAGE_PATH = "images/{image_key}/episode_{episode_index:06d}/frame_{frame_index:06d}.png"
+
+# --- LeRobot v3.0 "file consolidation" format (read-only support) ------------
+# v3.0 packs many episodes into a single parquet / mp4 instead of one file per
+# episode. The data/video path templates below are read from each dataset's own
+# `meta/info.json` (`data_path`/`video_path`), exactly like v2.1; these
+# constants are used for the metadata glob and tests. The per-episode mapping
+# (which file + row/timestamp range an episode occupies) lives in the parquet
+# `meta/episodes/**/*.parquet`, and tasks moved to `meta/tasks.parquet`. See
+# `load_episodes_v30` / `load_tasks_v30`.
+V30_DATA_PATH = "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
+V30_VIDEO_PATH = "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
+V30_EPISODES_DIR = "meta/episodes"
+V30_EPISODES_PATH = "meta/episodes/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
+V30_TASKS_PATH = "meta/tasks.parquet"
+
+# Newest dataset format the loader can READ. The write path stays v2.1
+# (`CODEBASE_VERSION` in lerobot_dataset.py); this is the upper bound used when
+# resolving a Hub revision so a v3.0-only repo loads instead of raising
+# `ForwardCompatibilityError`.
+READ_CODEBASE_VERSION = "v3.0"
 
 DATASET_CARD_TEMPLATE = """
 ---
@@ -525,6 +546,113 @@ def load_episodes_stats(local_dir: Path) -> dict[int, dict[str, dict[str, np.nda
     }
 
 
+def load_tasks_v30(local_dir: Path) -> tuple[dict, dict]:
+    """Load tasks from the v3.0 ``meta/tasks.parquet`` file.
+
+    v3.0 replaces ``tasks.jsonl`` with a parquet indexed by the task string
+    (named ``task``) holding an integer ``task_index`` column. Returns the same
+    ``(tasks, task_to_task_index)`` contract as :func:`load_tasks`.
+    """
+    df = pd.read_parquet(local_dir / V30_TASKS_PATH).reset_index()
+    if "task" not in df.columns and "index" in df.columns:
+        # Unnamed index fallback: the task string surfaced as the generic "index".
+        df = df.rename(columns={"index": "task"})
+    tasks = {int(ti): str(t) for t, ti in zip(df["task"], df["task_index"], strict=True)}
+    tasks = dict(sorted(tasks.items()))
+    task_to_task_index = {task: task_index for task_index, task in tasks.items()}
+    return tasks, task_to_task_index
+
+
+def _read_v30_episodes_table(local_dir: Path) -> pd.DataFrame:
+    """Read and row-concat all v3.0 ``meta/episodes/**/*.parquet`` shards.
+
+    One row per episode, sorted by shard path so episodes stay in ascending
+    order. Columns carry the data/video file mapping
+    (``data/chunk_index``, ``data/file_index``, ``videos/{key}/...``),
+    ``dataset_from_index``/``dataset_to_index``, the legacy ``tasks``/``length``,
+    and flattened ``stats/{feature}/{stat}`` per-episode statistics.
+    """
+    episodes_dir = local_dir / V30_EPISODES_DIR
+    files = sorted(episodes_dir.glob("**/*.parquet"))
+    if not files:
+        raise FileNotFoundError(f"No v3.0 episode metadata parquet found under {episodes_dir}")
+    return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+
+
+def load_episodes_v30(local_dir: Path) -> dict[int, dict]:
+    """Load episodes from the v3.0 ``meta/episodes/**/*.parquet`` shards.
+
+    Emits the same ``{episode_index: {...}}`` shape as :func:`load_episodes`, so
+    ``get_episode_data_index``, the per-episode caches, and the file-path
+    accessors are unchanged. Each value additionally carries the v3.0
+    file-mapping columns. The flattened ``stats/*`` columns are dropped here and
+    loaded separately by :func:`load_episodes_stats_v30`.
+    """
+    df = _read_v30_episodes_table(local_dir)
+    stat_cols = [c for c in df.columns if c.startswith("stats/")]
+    df = df.drop(columns=stat_cols)
+    episodes: dict[int, dict] = {}
+    for record in df.to_dict(orient="records"):
+        ep_idx = int(record["episode_index"])
+        record["episode_index"] = ep_idx
+        record["length"] = int(record["length"])
+        if record.get("tasks") is not None:
+            # parquet list<string> reads back as an ndarray; normalize to list.
+            record["tasks"] = list(record["tasks"])
+        episodes[ep_idx] = record
+    return dict(sorted(episodes.items()))
+
+
+def _deep_float_array(value) -> np.ndarray:
+    """Recursively coerce a parquet stat cell into a clean float ndarray.
+
+    Image/video stats round-trip from parquet as deeply nested *object* arrays
+    (ndarrays whose elements are themselves object ndarrays, e.g. a ``(3,)``
+    object array of ``(1,)`` object arrays of ``(1,)`` float arrays). A single
+    ``ndarray.tolist()`` does not recurse through object dtype, leaving an
+    ``object``-dtype array that breaks numeric ops like ``np.isfinite`` in
+    ``aggregate_stats``. This walks every nested ndarray down to plain Python
+    floats so ``np.array`` rebuilds a clean float array with the stored shape.
+    Vector stats and ``count`` (already clean 1-D arrays) pass through unchanged.
+    """
+
+    def _deep(x):
+        if hasattr(x, "tolist"):
+            x = x.tolist()
+        if isinstance(x, (list, tuple)):
+            return [_deep(e) for e in x]
+        return float(x)
+
+    return np.array(_deep(value), dtype=np.float64)
+
+
+def load_episodes_stats_v30(local_dir: Path) -> dict[int, dict[str, dict[str, np.ndarray]]]:
+    """Reconstruct per-episode stats from the flattened ``stats/*`` columns of
+    the v3.0 episodes parquet. Returns the same shape as
+    :func:`load_episodes_stats` so ``aggregate_stats`` accepts v3.0 stats
+    identically: ``count`` is ``(1,)`` int and image/video stats are ``(C, 1, 1)``.
+    """
+    df = _read_v30_episodes_table(local_dir)
+    stat_cols = [c for c in df.columns if c.startswith("stats/")]
+    episodes_stats: dict[int, dict[str, dict[str, np.ndarray]]] = {}
+    for record in df[["episode_index", *stat_cols]].to_dict(orient="records"):
+        ep_idx = int(record["episode_index"])
+        flat: dict[str, np.ndarray] = {}
+        for col in stat_cols:
+            # col == "stats/{feature}/{stat}"; feature names use dots, not slashes.
+            _, feature, stat = col.split("/", 2)
+            arr = _deep_float_array(record[col])
+            if stat == "count":
+                arr = arr.astype(np.int64)
+            elif "image" in feature:
+                # A parquet round-trip can drop/add trailing singleton dims;
+                # normalize to (C, 1, 1) like compute_stats._assert_type_and_shape.
+                arr = arr.reshape(-1, 1, 1)
+            flat[col] = arr
+        episodes_stats[ep_idx] = unflatten_dict(flat).get("stats", {})
+    return dict(sorted(episodes_stats.items()))
+
+
 def backward_compatible_episodes_stats(
     stats: dict[str, dict[str, np.ndarray]], episodes: Iterable[int]
 ) -> dict[int, dict[str, dict[str, np.ndarray]]]:
@@ -659,7 +787,11 @@ def check_version_compatibility(
     )
     if v_check.major < v_current.major and enforce_breaking_major:
         raise BackwardCompatibilityError(repo_id, v_check)
-    elif v_check.minor < v_current.minor:
+    elif v_check.major == v_current.major and v_check.minor < v_current.minor:
+        # Only the v2.0 -> v2.1 gap (same major, lower minor) needs the
+        # global-stats upgrade warning. Guarding on the major keeps a newer
+        # readable format (e.g. v3.0, which has its own per-episode stats) from
+        # tripping this v2.0-specific message.
         _warn_v21_global_stats(repo_id, v_check)
 
 
@@ -676,13 +808,28 @@ def get_repo_versions(repo_id: str) -> list[packaging.version.Version]:
     return repo_versions
 
 
-def get_safe_version(repo_id: str, version: str | packaging.version.Version) -> str:
+def get_safe_version(
+    repo_id: str,
+    version: str | packaging.version.Version,
+    read_ceiling: str | packaging.version.Version = READ_CODEBASE_VERSION,
+) -> str:
     """
     Returns the version if available on repo or the latest compatible one.
     Otherwise, will throw a `CompatibilityError`.
+
+    ``read_ceiling`` is the newest format the loader can read (default
+    ``READ_CODEBASE_VERSION``). When the requested ``version`` is unavailable but
+    the repo only carries a newer-yet-still-readable format (e.g. a v3.0-only
+    dataset while the default target is v2.1), the newest such version up to the
+    ceiling is selected instead of raising ``ForwardCompatibilityError``.
     """
     target_version = (
         packaging.version.parse(version) if not isinstance(version, packaging.version.Version) else version
+    )
+    ceiling_version = (
+        packaging.version.parse(read_ceiling)
+        if not isinstance(read_ceiling, packaging.version.Version)
+        else read_ceiling
     )
     hub_versions = get_repo_versions(repo_id)
 
@@ -710,6 +857,14 @@ def get_safe_version(repo_id: str, version: str | packaging.version.Version) -> 
         if return_version < target_version:
             logging.warning(f"Revision {version} for {repo_id} not found, using version v{return_version}")
         return f"v{return_version}"
+
+    # The requested version is absent and no same-major older format exists, but
+    # the repo may carry a newer format the loader still reads (e.g. target v2.1,
+    # repo published only as v3.0). Pick the newest such version up to the read
+    # ceiling rather than failing forward.
+    readable_newer = [v for v in hub_versions if target_version < v <= ceiling_version]
+    if readable_newer:
+        return f"v{max(readable_newer)}"
 
     lower_major = [v for v in hub_versions if v.major < target_version.major]
     if lower_major:
