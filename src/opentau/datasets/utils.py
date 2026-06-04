@@ -817,6 +817,24 @@ def check_version_compatibility(
         _warn_v21_global_stats(repo_id, v_check)
 
 
+DEFAULT_BRANCHES = ("main", "master")
+
+
+def get_repo_branches(repo_id: str) -> list[str]:
+    """Return the branch names of a dataset repo on the Hub.
+
+    Args:
+        repo_id: Repository ID of the dataset on the Hugging Face Hub.
+
+    Returns:
+        The names of every branch ref on the repo (e.g. ``["main"]``); tags are
+        not included.
+    """
+    api = HfApi()
+    refs = api.list_repo_refs(repo_id, repo_type="dataset")
+    return [b.name for b in refs.branches]
+
+
 def get_repo_versions(repo_id: str) -> list[packaging.version.Version]:
     """Returns available valid versions (branches and tags) on given repo."""
     api = HfApi()
@@ -834,16 +852,42 @@ def get_safe_version(
     repo_id: str,
     version: str | packaging.version.Version,
     read_ceiling: str | packaging.version.Version = READ_CODEBASE_VERSION,
+    allow_branch_fallback: bool = False,
 ) -> str:
-    """
-    Returns the version if available on repo or the latest compatible one.
-    Otherwise, will throw a `CompatibilityError`.
+    """Resolve ``version`` to a concrete revision available on the repo.
 
-    ``read_ceiling`` is the newest format the loader can read (default
-    ``READ_CODEBASE_VERSION``). When the requested ``version`` is unavailable but
-    the repo only carries a newer-yet-still-readable format (e.g. a v3.0-only
-    dataset while the default target is v2.1), the newest such version up to the
-    ceiling is selected instead of raising ``ForwardCompatibilityError``.
+    Returns the requested version if the repo carries it, otherwise the latest
+    compatible one. ``read_ceiling`` is the newest format the loader can read
+    (default ``READ_CODEBASE_VERSION``): when the requested ``version`` is
+    unavailable but the repo only carries a newer-yet-still-readable format (e.g.
+    a v3.0-only dataset while the default target is v2.1), the newest such
+    version up to the ceiling is selected instead of raising
+    ``ForwardCompatibilityError``.
+
+    When the repo carries no codebase-version tag at all and
+    ``allow_branch_fallback`` is set, the repo's default branch (``main``, then
+    ``master``) is returned instead of raising ``RevisionNotFoundError`` — this
+    lets untagged Hub datasets load when the caller did not pin a revision.
+
+    Args:
+        repo_id: Repository ID of the dataset on the Hugging Face Hub.
+        version: Desired codebase version (e.g. ``"v2.1"``).
+        read_ceiling: Newest format the loader can read. Defaults to
+            ``READ_CODEBASE_VERSION``.
+        allow_branch_fallback: When True and the repo carries no version tags,
+            fall back to the ``main``/``master`` branch instead of raising. Set
+            by callers only when no explicit revision was requested.
+
+    Returns:
+        A revision usable as a Hub ``revision``: either ``f"v{version}"`` for a
+        resolved version, or a branch name (``"main"``/``"master"``) on fallback.
+
+    Raises:
+        RevisionNotFoundError: The repo has no version tags and either
+            ``allow_branch_fallback`` is False or it has no ``main``/``master``
+            branch.
+        BackwardCompatibilityError: Only older, incompatible major versions exist.
+        ForwardCompatibilityError: Only newer versions beyond the ceiling exist.
     """
     target_version = (
         packaging.version.parse(version) if not isinstance(version, packaging.version.Version) else version
@@ -856,6 +900,18 @@ def get_safe_version(
     hub_versions = get_repo_versions(repo_id)
 
     if not hub_versions:
+        # An untagged repo carries no codebase-version ref to resolve against.
+        # When the caller did not pin a revision, fall back to the repo's default
+        # branch (main, then master) so such datasets still load instead of
+        # hard-failing; an explicitly requested revision keeps the strict error.
+        if allow_branch_fallback:
+            branches = get_repo_branches(repo_id)
+            for candidate in DEFAULT_BRANCHES:
+                if candidate in branches:
+                    logging.warning(
+                        f"{repo_id} has no codebase-version tag; defaulting to the '{candidate}' branch."
+                    )
+                    return candidate
         raise RevisionNotFoundError(
             f"""Your dataset must be tagged with a codebase version.
             Assuming _version_ is the codebase_version value in the info.json, you can run this:

@@ -388,7 +388,9 @@ class LeRobotDatasetMetadata(DatasetMetadata):
             self.load_metadata()
         except (FileNotFoundError, NotADirectoryError):
             if is_valid_version(self.revision):
-                self.revision = get_safe_version(self.repo_id, self.revision)
+                self.revision = get_safe_version(
+                    self.repo_id, self.revision, allow_branch_fallback=not revision
+                )
 
             # In distributed training, only rank 0 downloads to avoid race conditions
             # where other ranks read metadata before the download has finished.
@@ -1597,7 +1599,9 @@ class LeRobotDataset(BaseDataset):
             self.hf_dataset = self.load_hf_dataset()
         except (AssertionError, FileNotFoundError, NotADirectoryError):
             if is_valid_version(self.revision):
-                self.revision = get_safe_version(self.repo_id, self.revision)
+                self.revision = get_safe_version(
+                    self.repo_id, self.revision, allow_branch_fallback=not revision
+                )
             self.download_episodes(download_videos)
             self.hf_dataset = self.load_hf_dataset()
 
