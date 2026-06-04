@@ -1502,9 +1502,12 @@ class LeRobotDataset(BaseDataset):
 
         self.root.mkdir(exist_ok=True, parents=True)
 
-        # Load metadata
+        # Load metadata. Forward the *original* `revision` (may be None), not the
+        # `CODEBASE_VERSION`-coerced `self.revision`: the metadata constructor
+        # applies the default itself and must see an unset revision to enable its
+        # main/master branch fallback for untagged repos.
         self.meta = LeRobotDatasetMetadata(
-            self.repo_id, self.root, self.revision, force_cache_sync=force_cache_sync
+            self.repo_id, self.root, revision, force_cache_sync=force_cache_sync
         )
 
         # Overlay setup: when info.json declares a `videos.source_repo`, all video

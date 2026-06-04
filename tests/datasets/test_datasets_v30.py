@@ -480,6 +480,27 @@ def test_metadata_untagged_repo_explicit_revision_still_raises(tmp_path, monkeyp
         LeRobotDatasetMetadata(repo_id="dummy/untagged", root=root, revision="v2.1")
 
 
+def test_dataset_untagged_repo_loads_via_branch_fallback(tmp_path, monkeypatch):
+    # Full LeRobotDataset path (the primary use case): an untagged repo with no
+    # local cache must load by falling back to the default branch, not raise at
+    # metadata construction. Regression test for forwarding the *original*
+    # (uncoerced) revision from LeRobotDataset to its metadata constructor — with
+    # the coerced `self.revision` the fallback was dead and this raised.
+    root = tmp_path / "ds"
+    monkeypatch.setattr("opentau.datasets.lerobot_dataset.get_proc_accelerator", lambda: None)
+    monkeypatch.setattr("opentau.datasets.utils.get_repo_versions", lambda repo_id: [])
+    monkeypatch.setattr("opentau.datasets.utils.get_repo_branches", lambda repo_id: ["main"])
+
+    def _fake_pull(self, allow_patterns=None, ignore_patterns=None):
+        _write_v30_dataset(root, use_videos=False)
+
+    monkeypatch.setattr(LeRobotDatasetMetadata, "pull_from_repo", _fake_pull)
+    dataset = _make_dataset(root)  # repo_id="dummy/v30", revision unset
+    assert dataset.meta.revision == "main"
+    assert dataset.episodes == [0, 1, 2]
+    assert len(dataset) == sum(DEFAULT_LENGTHS)
+
+
 # --------------------------------------------------------------------------- #
 # Full LeRobotDataset: alignment + __getitem__ + video offset
 # --------------------------------------------------------------------------- #
