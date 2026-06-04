@@ -15,10 +15,12 @@
 from pathlib import Path
 from unittest.mock import Mock
 
+import imageio.v2 as imageio
+import numpy as np
 import pytest
 
 from opentau.envs.configs import RoboCasaEnv
-from opentau.scripts.eval import collect_grid_summary_videos, eval_policy_all
+from opentau.scripts.eval import collect_grid_summary_videos, create_grid_summary_video, eval_policy_all
 
 
 def _touch(p: Path):
@@ -51,3 +53,38 @@ def test_eval_policy_all_rejects_recording_root_for_non_libero_env():
 
     with pytest.raises(NotImplementedError, match="recording_root"):
         eval_policy_all({}, policy=Mock(), n_episodes=1, cfg=cfg)
+
+
+def test_create_grid_summary_video_streams_into_expected_grid(tmp_path):
+    """The grid builder streams each clip frame-by-frame (bounded memory) and tiles
+    them into a (grid_rows*H, grid_cols*W, 3) video, holding a clip's last frame
+    once it ends. Two clips of different lengths exercise both paths."""
+    h, w = 16, 16
+    paths = []
+    for k, n_frames in enumerate((3, 5)):  # different lengths -> hold-last-frame path
+        clip = tmp_path / f"clip_{k}.mp4"
+        frames = [np.full((h, w, 3), 40 * (k + 1), np.uint8) for _ in range(n_frames)]
+        imageio.mimsave(str(clip), frames, fps=10)
+        paths.append(str(clip))
+
+    out = tmp_path / "grid_summary.mp4"
+    create_grid_summary_video(paths, [False, True], str(out), fps=10, highlight_duration=0.2)
+
+    assert out.exists()
+    reader = imageio.get_reader(str(out))
+    try:
+        first_frame = reader.get_data(0)
+        n_out = reader.count_frames()
+    finally:
+        reader.close()
+    # 2 clips -> auto grid rows=ceil(sqrt(2))=2, cols=1 -> tiles stacked vertically.
+    assert first_frame.shape == (2 * h, 1 * w, 3)
+    # at least the longest clip's frames (5); + highlight frames (int(0.2*10)=2).
+    assert n_out >= 5
+
+
+def test_create_grid_summary_video_no_valid_videos_is_noop(tmp_path):
+    """Missing input clips are skipped; with none left it writes nothing."""
+    out = tmp_path / "grid_summary.mp4"
+    create_grid_summary_video([str(tmp_path / "missing.mp4")], [True], str(out), fps=10)
+    assert not out.exists()

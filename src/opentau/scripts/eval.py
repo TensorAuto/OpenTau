@@ -528,84 +528,89 @@ def create_grid_summary_video(
             f"Too many videos ({len(video_paths)}) for grid size {grid_size} (max {expected_videos})"
         )
 
-    # Load all videos
-    videos = []
-    max_frames = 0
-    for video_path in video_paths:
-        if not Path(video_path).exists():
+    # Stream the tiling instead of pre-loading every clip. Each episode video is
+    # advanced one frame at a time and written straight to the output, so peak
+    # memory is one frame per clip plus the grid — not every decoded clip at once.
+    # With multi-camera (wide) frames and high episode counts the old load-all
+    # approach scaled as episodes × n_cams × width × frames and could OOM rank-0.
+    valid_paths: list[str] = []
+    valid_successes: list[bool] = []
+    for video_path, success in zip(video_paths, success_statuses, strict=True):
+        if Path(video_path).exists():
+            valid_paths.append(video_path)
+            valid_successes.append(success)
+        else:
             logging.warning(f"Video file not found: {video_path}")
-            continue
-        # memtest=False disables imageio.mimread's 256 MB read cap — a full
-        # multi-camera episode video (e.g. 3 cams × 256 px × ~500 steps ≈ 280 MB)
-        # exceeds the default. The grid builder already holds every loaded video
-        # in memory, so the cap was the only blocker.
-        video = imageio.mimread(video_path, memtest=False)
-        videos.append(video)
-        max_frames = max(max_frames, len(video))
 
-    if not videos:
+    if not valid_paths:
         logging.error("No valid videos found to create grid summary")
         return
 
-    # Get dimensions from first video
-    frame_height, frame_width = videos[0][0].shape[:2]
+    # Tile dimensions from the first clip's first frame (one-frame decode).
+    probe = imageio.get_reader(valid_paths[0])
+    try:
+        frame_height, frame_width = probe.get_data(0).shape[:2]
+    finally:
+        probe.close()
     grid_width = frame_width * grid_cols
     grid_height = frame_height * grid_rows
 
-    # Create grid frames
-    grid_frames = []
+    def _place(grid: np.ndarray, idx: int, frame) -> None:
+        # Frames may be RGBA or grayscale on rare backends; only tile RGB.
+        if frame is None or frame.ndim != 3 or frame.shape[2] != 3:
+            return
+        row, col = idx // grid_cols, idx % grid_cols
+        y, x = row * frame_height, col * frame_width
+        grid[y : y + frame_height, x : x + frame_width] = frame
 
-    for frame_idx in range(max_frames):
-        # Create empty grid frame
-        grid_frame = np.zeros((grid_height, grid_width, 3), dtype=np.uint8)
+    readers = [imageio.get_reader(p) for p in valid_paths]
+    frame_streams = [reader.iter_data() for reader in readers]
+    # Hold each clip's last frame so a clip that ends early keeps showing its
+    # final state (matches the previous behaviour) rather than going blank.
+    last_frames: list = [None] * len(readers)
+    exhausted = [False] * len(readers)
+    writer = imageio.get_writer(output_path, fps=fps)
+    end = object()  # sentinel: next(stream, end) avoids the inf-length list() pitfall
+    last_grid = None
+    try:
+        # One iteration per output frame; stop once every clip is exhausted.
+        while True:
+            advanced = False
+            for i, stream in enumerate(frame_streams):
+                if exhausted[i]:
+                    continue
+                frame = next(stream, end)
+                if frame is end:
+                    exhausted[i] = True
+                else:
+                    last_frames[i] = frame
+                    advanced = True
+            if not advanced:
+                break
+            grid_frame = np.zeros((grid_height, grid_width, 3), dtype=np.uint8)
+            for i, frame in enumerate(last_frames):
+                _place(grid_frame, i, frame)
+            writer.append_data(grid_frame)
+            last_grid = grid_frame
 
-        # Fill grid with video frames
-        for i, video in enumerate(videos):
-            row = i // grid_cols
-            col = i % grid_cols
+        # Hold the final frame with a green/red success border per tile.
+        if last_grid is not None:
+            highlighted_frame = last_grid.copy()
+            for i, success in enumerate(valid_successes):
+                row, col = i // grid_cols, i % grid_cols
+                y, x = row * frame_height, col * frame_width
+                color = np.array([0, 255, 0]) if success else np.array([255, 0, 0])  # green / red
+                overlay = np.full((frame_height, frame_width, 3), color, dtype=np.uint8)
+                highlighted_frame[y : y + frame_height, x : x + frame_width] = (
+                    0.5 * highlighted_frame[y : y + frame_height, x : x + frame_width] + 0.5 * overlay
+                ).astype(np.uint8)
+            for _ in range(int(highlight_duration * fps)):
+                writer.append_data(highlighted_frame)
+    finally:
+        writer.close()
+        for reader in readers:
+            reader.close()
 
-            # Use last frame if video is shorter
-            frame_to_use = min(frame_idx, len(video) - 1)
-            frame = video[frame_to_use]
-
-            # Ensure frame is RGB
-            if len(frame.shape) == 3 and frame.shape[2] == 3:
-                y_start = row * frame_height
-                y_end = y_start + frame_height
-                x_start = col * frame_width
-                x_end = x_start + frame_width
-                grid_frame[y_start:y_end, x_start:x_end] = frame
-
-        grid_frames.append(grid_frame)
-
-    # Add highlighting frames at the end
-    highlight_frames = int(highlight_duration * fps)
-    for _ in range(highlight_frames):
-        # Create highlighted version of the last frame
-        highlighted_frame = grid_frame.copy()
-
-        for i, success in enumerate(success_statuses):
-            row = i // grid_cols
-            col = i % grid_cols
-
-            y_start = row * frame_height
-            y_end = y_start + frame_height
-            x_start = col * frame_width
-            x_end = x_start + frame_width
-
-            # Create colored overlay
-            color = np.array([0, 255, 0]) if success else np.array([255, 0, 0])  # Green or Red
-            overlay = np.full((frame_height, frame_width, 3), color, dtype=np.uint8)
-
-            # Blend with original frame (50% opacity)
-            highlighted_frame[y_start:y_end, x_start:x_end] = (
-                0.5 * highlighted_frame[y_start:y_end, x_start:x_end] + 0.5 * overlay
-            ).astype(np.uint8)
-
-        grid_frames.append(highlighted_frame)
-
-    # Save the grid video
-    imageio.mimsave(output_path, grid_frames, fps=fps)
     logging.info(f"Grid summary video saved to: {output_path}")
 
 
