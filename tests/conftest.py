@@ -79,11 +79,15 @@ def patch_builtins_input(monkeypatch):
 
 @pytest.fixture(scope="session")
 def get_huggingface_api():
+    # Deliberately no whoami() call: its result (the username) is unused by the
+    # only consumer (test_save_pretrained discards api/username, uses hf_token).
+    # whoami() hits the same rate-limit-prone endpoint that has flaked CI at
+    # setup, so we skip it; the token is validated implicitly when the push test
+    # actually writes to the Hub. The middle tuple element stays for arity.
     hf_token = os.getenv("HUGGINGFACE_HUB_TOKEN")
     api = HfApi(token=hf_token)
-    username = api.whoami(token=hf_token)["name"]
 
-    return api, username, hf_token
+    return api, None, hf_token
 
 
 @pytest.fixture(scope="session", autouse=True)

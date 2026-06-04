@@ -140,13 +140,6 @@ jobs:
       - name: Verify ffmpeg
         run: ffmpeg -version
 
-      - name: Set up HuggingFace authentication
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          source .venv/bin/activate
-          hf auth login --token $HF_TOKEN
-
       - name: Configure wandb
         run: |
           source .venv/bin/activate
@@ -156,6 +149,16 @@ jobs:
         run: df -h /dev/shm
 
       - name: Run CPU tests with coverage
+        # Authenticate to the HF Hub via env vars instead of `hf auth login`.
+        # The CLI login does an eager whoami() network call to validate the token;
+        # that call gets rate-limited (429) and fails the whole job at setup before
+        # any test runs. huggingface_hub reads HF_TOKEN / HUGGINGFACE_HUB_TOKEN with
+        # no network call. A handful of tests still need the token: test_hub.py
+        # pushes to the Hub, and the dataset tests get a higher (authenticated)
+        # rate limit on public-repo downloads.
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HUGGINGFACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           source .venv/bin/activate
           mkdir -p /tmp/libero-assets/libero/libero

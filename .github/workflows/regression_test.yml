@@ -52,6 +52,14 @@ jobs:
     needs: start-runner
     runs-on: [g6.12xlarge]
     timeout-minutes: 30
+    # Authenticate to the HF Hub via env vars instead of `hf auth login` (which
+    # does an eager, rate-limit-prone whoami() at setup and can 429 the whole job).
+    # Set at job level because several steps below hit the Hub: Run Training (base
+    # weights), Check State Keys (--source=hf), and Run Inference. huggingface_hub
+    # reads HF_TOKEN / HUGGINGFACE_HUB_TOKEN directly, with no network call.
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HUGGINGFACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
 
     container:
       image: nvidia/cuda:12.2.0-devel-ubuntu22.04
@@ -79,14 +87,6 @@ jobs:
 
       - name: Check GPU
         run: nvidia-smi
-
-      - name: Set up HuggingFace authentication
-        shell: bash
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          source .venv/bin/activate
-          huggingface-cli login --token $HF_TOKEN
 
       - name: Set up Wandb authentication
         shell: bash

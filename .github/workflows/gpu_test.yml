@@ -83,16 +83,15 @@ jobs:
       - name: Check GPU
         run: nvidia-smi
 
-      - name: Set up HuggingFace authentication
-        shell: bash
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          source .venv/bin/activate
-          hf auth login --token $HF_TOKEN
-
       - name: Run Tests
         shell: bash
+        # Authenticate via env vars instead of `hf auth login`: the CLI login does
+        # an eager whoami() call that can be rate-limited (429) and fail the job at
+        # setup. huggingface_hub reads HF_TOKEN / HUGGINGFACE_HUB_TOKEN with no
+        # network call, and the GPU tests need it (gated model weights, datasets).
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HUGGINGFACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           source .venv/bin/activate
           # Point LIBERO at the assets bundled inside the installed package (the
