@@ -14,6 +14,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import gc
 import inspect
 import json
 import logging
@@ -1086,7 +1087,13 @@ def train(cfg: TrainPipelineConfig):
             accelerator.wait_for_everyone()
 
         if is_eval_step and eval_envs:
+            # Return the allocator's cached-but-unused blocks (freed training
+            # activations) to the CUDA driver before eval, so eval runs at a lower
+            # peak and any non-PyTorch GPU consumer (e.g. an EGL render context for
+            # sim eval) has room. Training re-grows the cache on the next step.
+            gc.collect()
             if torch.cuda.is_available():
+                torch.cuda.empty_cache()
                 pre_eval_alloc_gib = torch.cuda.memory_allocated() / 1024**3
                 pre_eval_resv_gib = torch.cuda.memory_reserved() / 1024**3
                 torch.cuda.reset_peak_memory_stats()
