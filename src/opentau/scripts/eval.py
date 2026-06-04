@@ -686,7 +686,8 @@ def eval_main(cfg: TrainPipelineConfig):
             policy=policy,
             n_episodes=cfg.eval.n_episodes,
             cfg=cfg,
-            max_episodes_rendered=10,
+            max_episodes_rendered=cfg.eval.max_episodes_rendered,
+            grid_size=cfg.eval.grid_size,
             videos_dir=eval_output_dir / "videos",
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,
@@ -735,6 +736,7 @@ def eval_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    grid_size: tuple[int, int] | None = None,
     subgoal_generator: SubgoalImageGenerator | None = None,
 ) -> tuple[TaskMetrics, dict]:
     """Evaluates one task_id of one suite using the provided vec env."""
@@ -750,6 +752,7 @@ def eval_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        grid_size=grid_size,
         subgoal_generator=subgoal_generator,
     )
 
@@ -774,6 +777,7 @@ def run_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    grid_size: tuple[int, int] | None = None,
     subgoal_generator: SubgoalImageGenerator | None = None,
 ) -> tuple[str, int, TaskMetrics, dict]:
     """
@@ -800,6 +804,7 @@ def run_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        grid_size=grid_size,
         subgoal_generator=subgoal_generator,
     )
     # ensure we always provide video_paths key to simplify accumulation
@@ -826,6 +831,7 @@ def eval_policy_all(
     videos_dir: Path | None = None,
     return_episode_data: bool = False,
     start_seed: int | None = None,
+    grid_size: tuple[int, int] | None = None,
     max_parallel_tasks: int = 1,
     subgoal_generator: SubgoalImageGenerator | None = None,
 ) -> dict:
@@ -835,6 +841,10 @@ def eval_policy_all(
     accumulates per-group and overall statistics, and returns the same aggregate metrics
     schema as the single-env evaluator (avg_sum_reward / avg_max_reward / pc_success / timings)
     plus per-task infos.
+
+    ``max_episodes_rendered`` (how many rollouts to render into each task's grid
+    summary) and ``grid_size`` (its ``(rows, cols)`` layout, ``None`` = auto square)
+    are forwarded unchanged to ``eval_policy`` for every task.
     """
     start_t = time.time()
 
@@ -891,6 +901,7 @@ def eval_policy_all(
         videos_dir=videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        grid_size=grid_size,
         subgoal_generator=subgoal_generator,
     )
 

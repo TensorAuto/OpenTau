@@ -55,6 +55,42 @@ def test_eval_policy_all_rejects_recording_root_for_non_libero_env():
         eval_policy_all({}, policy=Mock(), n_episodes=1, cfg=cfg)
 
 
+def test_eval_policy_all_forwards_render_cap_and_grid_size_to_eval_policy(monkeypatch):
+    """The grid-summary controls must reach the leaf evaluator. eval_main exposes
+    `cfg.eval.max_episodes_rendered` / `cfg.eval.grid_size` by forwarding them through
+    eval_policy_all -> run_one -> eval_one -> eval_policy. Regression guard: eval_main
+    used to hardcode the render cap (10) and never threaded grid_size, so both
+    EvalConfig fields were silently ignored and grids only ever tiled 10 rollouts."""
+    import opentau.scripts.eval as eval_mod
+
+    captured: dict = {}
+
+    def fake_eval_policy(**kwargs):
+        # Stub the real rollout: capture the render controls and return an empty
+        # per-episode result so the (real) run_one/eval_one wrappers still run.
+        captured.update(kwargs)
+        return {"per_episode": []}
+
+    monkeypatch.setattr(eval_mod, "eval_policy", fake_eval_policy)
+
+    cfg = Mock()
+    cfg.eval.recording_root = None  # skip the LIBERO-only recorder guard + block
+
+    eval_mod.eval_policy_all(
+        {"group": {0: object()}},  # one fake task; the env is never touched (eval_policy is stubbed)
+        policy=Mock(),
+        n_episodes=1,
+        cfg=cfg,
+        max_episodes_rendered=7,
+        grid_size=(2, 3),
+        videos_dir=None,
+        max_parallel_tasks=1,
+    )
+
+    assert captured["max_episodes_rendered"] == 7
+    assert captured["grid_size"] == (2, 3)
+
+
 def test_create_grid_summary_video_streams_into_expected_grid(tmp_path):
     """The grid builder streams each clip frame-by-frame (bounded memory) and tiles
     them into a (grid_rows*H, grid_cols*W, 3) video, holding a clip's last frame
