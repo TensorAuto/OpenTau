@@ -141,9 +141,8 @@ from opentau.datasets.utils import (
     is_valid_version,
     load_advantages,
     load_episodes,
+    load_episodes_and_stats_v30,
     load_episodes_stats,
-    load_episodes_stats_v30,
-    load_episodes_v30,
     load_info,
     load_stats,
     load_tasks,
@@ -421,8 +420,8 @@ class LeRobotDatasetMetadata(DatasetMetadata):
             # carries the extra file-mapping columns the v3.0 path accessors and
             # video offset read; everything else downstream is unchanged.
             self.tasks, self.task_to_task_index = load_tasks_v30(self.root)
-            self.episodes = load_episodes_v30(self.root)
-            self.episodes_stats = load_episodes_stats_v30(self.root)
+            # Parse the episode-metadata shards once for both episodes + stats.
+            self.episodes, self.episodes_stats = load_episodes_and_stats_v30(self.root)
             self.stats = load_stats(self.root)
         else:
             self.tasks, self.task_to_task_index = load_tasks(self.root)
@@ -1939,17 +1938,23 @@ class LeRobotDataset(BaseDataset):
             raise FileNotFoundError(f"No parquet files for {self.repo_id} under {self.root}")
         hf_dataset = load_dataset("parquet", data_files=files, split="train")
 
-        # Subset load: a consolidated file may also hold unselected episodes, so
-        # drop their rows to keep the row layout aligned with episode_data_index.
-        # A whole-dataset load (`_episodes_were_specified` False -> self.episodes
-        # was backfilled to every episode and every file is loaded) keeps all
-        # rows and skips the episode_index column scan entirely.
-        if self._episodes_were_specified:
-            selected = np.asarray(sorted(self.episodes))
-            ep_col = np.asarray(hf_dataset.with_format("numpy")["episode_index"]).reshape(-1)
-            keep_mask = np.isin(ep_col, selected)
-            if not keep_mask.all():
-                hf_dataset = hf_dataset.select(np.nonzero(keep_mask)[0].tolist())
+        # episode_data_index (built from per-episode `length` cumsum) and the
+        # row-alignment invariant require the loaded rows to be ascending by
+        # episode_index: (chunk, file) file order == episode order, ascending
+        # within each file. Assert it so a malformed layout fails loudly here
+        # rather than silently desyncing per-dataset metrics (CLAUDE.md §5).
+        ep_col = np.asarray(hf_dataset.with_format("numpy")["episode_index"]).reshape(-1)
+        if ep_col.size and not np.all(ep_col[:-1] <= ep_col[1:]):
+            raise RuntimeError(
+                f"{self.repo_id}: v3.0 data rows are not ordered by ascending episode_index; "
+                "episode_data_index would desync. Check the consolidated data-file ordering."
+            )
+        # A consolidated file may also hold unselected episodes (subset load), so
+        # drop their rows to keep the row layout aligned with the selected-episode
+        # episode_data_index. Full loads keep every row.
+        keep_mask = np.isin(ep_col, np.asarray(sorted(self.episodes)))
+        if not keep_mask.all():
+            hf_dataset = hf_dataset.select(np.nonzero(keep_mask)[0].tolist())
 
         hf_dataset.set_transform(hf_transform_to_torch)
         return hf_dataset

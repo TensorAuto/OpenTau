@@ -579,7 +579,7 @@ def _read_v30_episodes_table(local_dir: Path) -> pd.DataFrame:
     return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
 
 
-def load_episodes_v30(local_dir: Path) -> dict[int, dict]:
+def load_episodes_v30(local_dir: Path, episodes_df: pd.DataFrame | None = None) -> dict[int, dict]:
     """Load episodes from the v3.0 ``meta/episodes/**/*.parquet`` shards.
 
     Emits the same ``{episode_index: {...}}`` shape as :func:`load_episodes`, so
@@ -587,8 +587,11 @@ def load_episodes_v30(local_dir: Path) -> dict[int, dict]:
     accessors are unchanged. Each value additionally carries the v3.0
     file-mapping columns. The flattened ``stats/*`` columns are dropped here and
     loaded separately by :func:`load_episodes_stats_v30`.
+
+    ``episodes_df`` lets a caller pass a pre-read table so the shards are parsed
+    once across episodes + stats (see :func:`load_episodes_and_stats_v30`).
     """
-    df = _read_v30_episodes_table(local_dir)
+    df = episodes_df if episodes_df is not None else _read_v30_episodes_table(local_dir)
     stat_cols = [c for c in df.columns if c.startswith("stats/")]
     df = df.drop(columns=stat_cols)
     episodes: dict[int, dict] = {}
@@ -626,13 +629,18 @@ def _deep_float_array(value) -> np.ndarray:
     return np.array(_deep(value), dtype=np.float64)
 
 
-def load_episodes_stats_v30(local_dir: Path) -> dict[int, dict[str, dict[str, np.ndarray]]]:
+def load_episodes_stats_v30(
+    local_dir: Path, episodes_df: pd.DataFrame | None = None
+) -> dict[int, dict[str, dict[str, np.ndarray]]]:
     """Reconstruct per-episode stats from the flattened ``stats/*`` columns of
     the v3.0 episodes parquet. Returns the same shape as
     :func:`load_episodes_stats` so ``aggregate_stats`` accepts v3.0 stats
     identically: ``count`` is ``(1,)`` int and image/video stats are ``(C, 1, 1)``.
+
+    ``episodes_df`` lets a caller pass a pre-read table so the shards are parsed
+    once across episodes + stats (see :func:`load_episodes_and_stats_v30`).
     """
-    df = _read_v30_episodes_table(local_dir)
+    df = episodes_df if episodes_df is not None else _read_v30_episodes_table(local_dir)
     stat_cols = [c for c in df.columns if c.startswith("stats/")]
     episodes_stats: dict[int, dict[str, dict[str, np.ndarray]]] = {}
     for record in df[["episode_index", *stat_cols]].to_dict(orient="records"):
@@ -651,6 +659,20 @@ def load_episodes_stats_v30(local_dir: Path) -> dict[int, dict[str, dict[str, np
             flat[col] = arr
         episodes_stats[ep_idx] = unflatten_dict(flat).get("stats", {})
     return dict(sorted(episodes_stats.items()))
+
+
+def load_episodes_and_stats_v30(
+    local_dir: Path,
+) -> tuple[dict[int, dict], dict[int, dict[str, dict[str, np.ndarray]]]]:
+    """Load v3.0 episodes and per-episode stats, parsing the metadata shards once.
+
+    The episodes parquet (incl. the wide flattened ``stats/*`` columns) is read a
+    single time and split into the :func:`load_episodes_v30` and
+    :func:`load_episodes_stats_v30` results, halving the metadata-load cost on
+    large datasets (e.g. DROID, whose episode metadata is ~600 MB).
+    """
+    df = _read_v30_episodes_table(local_dir)
+    return load_episodes_v30(local_dir, df), load_episodes_stats_v30(local_dir, df)
 
 
 def backward_compatible_episodes_stats(
@@ -861,7 +883,11 @@ def get_safe_version(
     # The requested version is absent and no same-major older format exists, but
     # the repo may carry a newer format the loader still reads (e.g. target v2.1,
     # repo published only as v3.0). Pick the newest such version up to the read
-    # ceiling rather than failing forward.
+    # ceiling rather than failing forward. In practice the only published formats
+    # in this window are v3.0 (read via the v3.0 path) and the v2.x minors (read
+    # via the v2.1-compatible path) — a hypothetical same-major newer minor like
+    # `v2.5` would resolve here and be read through the v2.1 path, consistent with
+    # how check_version_compatibility already treats all v2.x as v2.1-compatible.
     readable_newer = [v for v in hub_versions if target_version < v <= ceiling_version]
     if readable_newer:
         return f"v{max(readable_newer)}"

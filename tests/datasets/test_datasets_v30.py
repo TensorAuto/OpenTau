@@ -30,7 +30,6 @@ import pandas as pd
 import pytest
 import torch
 
-import opentau.datasets.lerobot_dataset as lerobot_dataset_mod
 from opentau.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from opentau.datasets.utils import (
     DEFAULT_FEATURES,
@@ -400,16 +399,16 @@ def test_check_version_compatibility_does_not_warn_on_v30(caplog):
 def test_get_safe_version_resolves_v30_only_repo(monkeypatch):
     # A repo published only as v3.0 must resolve (not ForwardCompatibilityError)
     # under the default v2.1 target, thanks to the read ceiling.
-    import opentau.datasets.utils as utils_mod
-
-    monkeypatch.setattr(utils_mod, "get_repo_versions", lambda repo_id: [packaging.version.parse("v3.0")])
+    monkeypatch.setattr(
+        "opentau.datasets.utils.get_repo_versions", lambda repo_id: [packaging.version.parse("v3.0")]
+    )
     assert get_safe_version("dummy/v30", "v2.1") == "v3.0"
 
 
 def test_get_safe_version_v21_repo_unchanged(monkeypatch):
-    import opentau.datasets.utils as utils_mod
-
-    monkeypatch.setattr(utils_mod, "get_repo_versions", lambda repo_id: [packaging.version.parse("v2.1")])
+    monkeypatch.setattr(
+        "opentau.datasets.utils.get_repo_versions", lambda repo_id: [packaging.version.parse("v2.1")]
+    )
     assert get_safe_version("dummy/v21", "v2.1") == "v2.1"
 
 
@@ -474,19 +473,19 @@ def test_v30_video_query_uses_from_timestamp_offset(tmp_path, monkeypatch):
         captured.append((str(video_path), list(np.asarray(timestamps, dtype=np.float64))))
         return torch.zeros((len(timestamps), 3, 16, 16))
 
-    monkeypatch.setattr(lerobot_dataset_mod, "decode_video_frames", _fake_decode)
+    monkeypatch.setattr("opentau.datasets.lerobot_dataset.decode_video_frames", _fake_decode)
 
     dataset = _make_dataset(root)  # nearest resample (default) -> one decode call
 
     # episode 0, frame 0: offset 0.0 -> queried at t=0.0
     captured.clear()
-    dataset[0]
+    _ = dataset[0]
     assert captured[-1][0].endswith(f"videos/{VIDEO_KEY}/chunk-000/file-000.mp4")
     assert captured[-1][1] == pytest.approx([0.0])
 
     # episode 2, frame 0 (global row 7): cumulative offset 0.7s -> queried at 0.7
     captured.clear()
-    dataset[7]
+    _ = dataset[7]
     assert captured[-1][1] == pytest.approx([0.7])
 
 
