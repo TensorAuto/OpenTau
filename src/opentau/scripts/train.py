@@ -32,7 +32,7 @@ import torch
 import wandb
 from accelerate.optimizer import AcceleratedOptimizer
 from accelerate.scheduler import AcceleratedScheduler
-from accelerate.utils import DistributedDataParallelKwargs, gather_object
+from accelerate.utils import DistributedDataParallelKwargs, broadcast_object_list, gather_object
 from termcolor import colored
 
 from opentau.configs import parser
@@ -504,6 +504,18 @@ def train(cfg: TrainPipelineConfig):
         accelerator_kwargs["log_with"] = "wandb"
 
     accelerator = accelerate.Accelerator(**accelerator_kwargs)
+    # ``cfg.output_dir`` embeds a per-process wall-clock timestamp (assigned in
+    # ``TrainPipelineConfig`` as ``f"{now:%Y-%m-%d}/{now:%H-%M-%S}_{job_name}"``) and every
+    # rank parses the config independently, so a launch whose startup straddles a one-second
+    # tick leaves ranks disagreeing on ``output_dir`` (e.g. one rank lands on ``HH-MM-49``
+    # while the rest use ``HH-MM-50``). Each rank then writes its checkpoint shard / RNG state
+    # into a *sibling* directory, silently yielding a checkpoint with fewer than ``world_size``
+    # shards that cannot be consolidated or resumed. Broadcast rank 0's value so all ranks
+    # share one output tree before ``output_dir`` is first used (the Accelerator does not
+    # consume ``output_dir``, so doing this immediately after construction is safe).
+    _output_dir = [str(cfg.output_dir)]
+    broadcast_object_list(_output_dir, from_process=0)
+    cfg.output_dir = Path(_output_dir[0])
     init_logging(accelerator, level=logging.DEBUG if cfg.debug else logging.INFO)
     # Register accelerator globally for use in other modules, (e.g., detect current rank, etc.)
     set_proc_accelerator(accelerator)
@@ -875,6 +887,24 @@ def train(cfg: TrainPipelineConfig):
                     prune_old_checkpoints(checkpoint_dir)
 
             accelerator.wait_for_everyone()
+
+            # Defense-in-depth tripwire for the partial-save / output_dir-divergence failure
+            # mode: accelerate writes exactly one ``random_states_<process_index>.pkl`` per
+            # process on every backend, so after the barrier the count must equal
+            # ``world_size``. Fewer means a rank saved into a different directory or not at
+            # all, leaving an unresumable checkpoint -- surface it loudly here instead of
+            # discovering it at resume/consolidation time.
+            if accelerator.is_main_process:
+                n_rng = len(list(Path(checkpoint_dir).glob("random_states_*.pkl")))
+                if n_rng != accelerator.num_processes:
+                    logging.error(
+                        "Checkpoint %s is incomplete: found %d/%d per-rank RNG-state files. A "
+                        "rank likely wrote to a different output_dir or failed to save; this "
+                        "checkpoint may not be resumable.",
+                        checkpoint_dir,
+                        n_rng,
+                        accelerator.num_processes,
+                    )
 
         if is_val_step and val_dataloader is not None:
             policy.eval()
