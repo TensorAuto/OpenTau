@@ -24,6 +24,7 @@ import torch
 
 from opentau.envs.configs import EnvMetadataConfig
 from opentau.envs.utils import (
+    _env_attr_present,
     add_eval_metadata,
     are_all_envs_same_type,
     check_env_attributes_and_types,
@@ -55,6 +56,12 @@ def make_no_attributes_env():
 def make_partial_attributes_env():
     env = make_no_attributes_env()
     env.task_description = "test task description"
+    return env
+
+
+def make_task_only_env():
+    env = make_no_attributes_env()
+    env.task = "test task"
     return env
 
 
@@ -199,6 +206,44 @@ class TestCheckEnvAttributesAndTypes:
 
             # Should not issue warning about missing attributes
             assert len(w) == 0
+
+
+class TestEnvAttrPresent:
+    """``_env_attr_present`` — the gymnasium-<1.0 emulation of ``has_wrapper_attr``.
+
+    Two properties are pinned here: per-sub-env granularity on ``SyncVectorEnv``
+    (heterogeneous sub-envs must not collapse to a uniform all-True/all-False
+    list), and async-safety — the probe must never let ``get_wrapper_attr``
+    raise across an ``AsyncVectorEnv`` worker pipe, which gymnasium 0.29 turns
+    into ``finally: env.close()`` and silently tears the rollout envs down.
+    """
+
+    def test_sync_per_sub_env_granularity(self):
+        """Heterogeneous sub-envs report individually, not as one collapsed bool."""
+        vector_env = gym.vector.SyncVectorEnv([make_task_only_env, make_no_attributes_env])
+        assert _env_attr_present(vector_env, "task") == [True, False]
+        assert _env_attr_present(vector_env, "task_description") == [False, False]
+
+    def test_sync_all_present_and_all_absent(self):
+        vector_env = gym.vector.SyncVectorEnv([make_type1_env for _ in range(3)])
+        assert _env_attr_present(vector_env, "task") == [True, True, True]
+        assert _env_attr_present(vector_env, "missing_attr") == [False, False, False]
+
+    def test_async_missing_attr_does_not_tear_down_envs(self):
+        """The blocking bug: on ``AsyncVectorEnv`` a missing attr must not raise
+        across the worker pipe (which would close the workers). The probe assumes
+        presence and the env stays usable for the rollout that reuses it.
+        """
+        vector_env = gym.vector.AsyncVectorEnv([make_no_attributes_env for _ in range(2)])
+        try:
+            # No raise, no worker teardown, even though neither attr exists.
+            assert _env_attr_present(vector_env, "task") == [True, True]
+            assert _env_attr_present(vector_env, "task_description") == [True, True]
+            # Env is still alive: a reset (which crosses the same pipe) succeeds.
+            obs, _info = vector_env.reset(seed=0)
+            assert len(obs) == 2
+        finally:
+            vector_env.close()
 
 
 def _make_obs(batch_size: int = 2, device: str = "cpu") -> dict:
