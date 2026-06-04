@@ -141,10 +141,12 @@ from opentau.datasets.utils import (
     is_valid_version,
     load_advantages,
     load_episodes,
+    load_episodes_and_stats_v30,
     load_episodes_stats,
     load_info,
     load_stats,
     load_tasks,
+    load_tasks_v30,
     validate_episode_buffer,
     validate_frame,
     write_episode,
@@ -410,15 +412,27 @@ class LeRobotDatasetMetadata(DatasetMetadata):
         assert self.repo_id is not None
         self.info = load_info(self.root)
         check_version_compatibility(self.repo_id, self._version, CODEBASE_VERSION)
-        self.tasks, self.task_to_task_index = load_tasks(self.root)
-        self.episodes = load_episodes(self.root)
-        if self._version < packaging.version.parse("v2.1"):
+        if self._is_v30:
+            # v3.0: parquet-based metadata (meta/tasks.parquet,
+            # meta/episodes/**/*.parquet) with aggregated stats kept in
+            # meta/stats.json. Per-episode stats are reconstructed from the
+            # episodes parquet's flattened stats/* columns. The episodes dict
+            # carries the extra file-mapping columns the v3.0 path accessors and
+            # video offset read; everything else downstream is unchanged.
+            self.tasks, self.task_to_task_index = load_tasks_v30(self.root)
+            # Parse the episode-metadata shards once for both episodes + stats.
+            self.episodes, self.episodes_stats = load_episodes_and_stats_v30(self.root)
             self.stats = load_stats(self.root)
-            assert self.stats is not None
-            self.episodes_stats = backward_compatible_episodes_stats(self.stats, self.episodes)
         else:
-            self.episodes_stats = load_episodes_stats(self.root)
-            self.stats = aggregate_stats(list(self.episodes_stats.values()))
+            self.tasks, self.task_to_task_index = load_tasks(self.root)
+            self.episodes = load_episodes(self.root)
+            if self._version < packaging.version.parse("v2.1"):
+                self.stats = load_stats(self.root)
+                assert self.stats is not None
+                self.episodes_stats = backward_compatible_episodes_stats(self.stats, self.episodes)
+            else:
+                self.episodes_stats = load_episodes_stats(self.root)
+                self.stats = aggregate_stats(list(self.episodes_stats.values()))
 
         self.advantages = load_advantages(self.root)
 
@@ -442,6 +456,16 @@ class LeRobotDatasetMetadata(DatasetMetadata):
         """Codebase version used to create this dataset."""
         return packaging.version.parse(self.info["codebase_version"])
 
+    @property
+    def _is_v30(self) -> bool:
+        """True when this dataset uses the v3.0 (file-consolidation) format.
+
+        In v3.0 many episodes are packed into one parquet / mp4, and the
+        per-episode file + row/timestamp mapping lives in the
+        ``meta/episodes/**/*.parquet`` rows (loaded into ``self.episodes``).
+        """
+        return self._version >= packaging.version.parse("v3.0")
+
     def get_data_file_path(self, ep_index: int) -> Path:
         """Get the file path for a specific episode's parquet data file.
 
@@ -451,6 +475,12 @@ class LeRobotDatasetMetadata(DatasetMetadata):
         Returns:
             Path to the parquet file for the episode.
         """
+        if self._is_v30:
+            ep = self.episodes[ep_index]
+            fpath = self.data_path.format(
+                chunk_index=int(ep["data/chunk_index"]), file_index=int(ep["data/file_index"])
+            )
+            return Path(fpath)
         ep_chunk = self.get_episode_chunk(ep_index)
         fpath = self.data_path.format(episode_chunk=ep_chunk, episode_index=ep_index)
         return Path(fpath)
@@ -465,8 +495,16 @@ class LeRobotDatasetMetadata(DatasetMetadata):
         Returns:
             Path to the video file for the episode.
         """
-        ep_chunk = self.get_episode_chunk(ep_index)
         assert self.video_path is not None
+        if self._is_v30:
+            ep = self.episodes[ep_index]
+            fpath = self.video_path.format(
+                video_key=vid_key,
+                chunk_index=int(ep[f"videos/{vid_key}/chunk_index"]),
+                file_index=int(ep[f"videos/{vid_key}/file_index"]),
+            )
+            return Path(fpath)
+        ep_chunk = self.get_episode_chunk(ep_index)
         fpath = self.video_path.format(episode_chunk=ep_chunk, video_key=vid_key, episode_index=ep_index)
         return Path(fpath)
 
@@ -1762,7 +1800,10 @@ class LeRobotDataset(BaseDataset):
         # trips the 3000 req / 5 min rate limit (429). Skip files already on
         # disk — when the selected episodes were pre-downloaded this is a
         # no-op that makes zero requests.
-        missing = [f for f in files if not (self.root / f).is_file()]
+        # Dedup: v3.0 maps many episodes to one consolidated file, so the
+        # per-episode path list repeats files; collapse before fetching to avoid
+        # racing concurrent downloads of the same path (v2.1 has no dups -> no-op).
+        missing = list(dict.fromkeys(f for f in files if not (self.root / f).is_file()))
         if not missing:
             return
         logging.info(
@@ -1864,10 +1905,57 @@ class LeRobotDataset(BaseDataset):
         list here: __init__ backfills it with the full episode list before this
         method is ever called.
         """
+        if self.meta._is_v30:
+            return self._load_hf_dataset_v30()
+
         files = [str(self.root / self.meta.get_data_file_path(ep_idx)) for ep_idx in self.episodes]
         if not files:
             raise FileNotFoundError(f"No parquet files for {self.repo_id} under {self.root}")
         hf_dataset = load_dataset("parquet", data_files=files, split="train")
+        hf_dataset.set_transform(hf_transform_to_torch)
+        return hf_dataset
+
+    def _load_hf_dataset_v30(self) -> datasets.Dataset:
+        """Load consolidated v3.0 data files and compact to the selected episodes.
+
+        v3.0 packs many episodes per parquet, so we load the deduped set of
+        consolidated files covering ``self.episodes`` (the same set
+        ``get_episodes_file_paths`` downloads) and then keep only the rows whose
+        ``episode_index`` is selected. Files are read in ascending
+        ``(chunk, file)`` order and episodes within a file are ascending, so the
+        kept rows come out in ascending-episode order == ``sorted(self.episodes)``
+        order. The existing ``get_episode_data_index`` (cumsum of per-episode
+        ``length``) and the row-layout invariant therefore hold exactly as for
+        v2.1 — no global-index bookkeeping is needed.
+
+        ``load_dataset("parquet", ...)`` is kept for its mmap behavior (see the
+        ``load_hf_dataset`` docstring); ``Dataset.select`` returns an
+        indices-mapped view over that same mmap-backed Arrow table, so RAM stays
+        bounded even when a consolidated file is only partially selected.
+        """
+        files = sorted({str(self.root / self.meta.get_data_file_path(ep_idx)) for ep_idx in self.episodes})
+        if not files:
+            raise FileNotFoundError(f"No parquet files for {self.repo_id} under {self.root}")
+        hf_dataset = load_dataset("parquet", data_files=files, split="train")
+
+        # episode_data_index (built from per-episode `length` cumsum) and the
+        # row-alignment invariant require the loaded rows to be ascending by
+        # episode_index: (chunk, file) file order == episode order, ascending
+        # within each file. Assert it so a malformed layout fails loudly here
+        # rather than silently desyncing per-dataset metrics (CLAUDE.md §5).
+        ep_col = np.asarray(hf_dataset.with_format("numpy")["episode_index"]).reshape(-1)
+        if ep_col.size and not np.all(ep_col[:-1] <= ep_col[1:]):
+            raise RuntimeError(
+                f"{self.repo_id}: v3.0 data rows are not ordered by ascending episode_index; "
+                "episode_data_index would desync. Check the consolidated data-file ordering."
+            )
+        # A consolidated file may also hold unselected episodes (subset load), so
+        # drop their rows to keep the row layout aligned with the selected-episode
+        # episode_data_index. Full loads keep every row.
+        keep_mask = np.isin(ep_col, np.asarray(sorted(self.episodes)))
+        if not keep_mask.all():
+            hf_dataset = hf_dataset.select(np.nonzero(keep_mask)[0].tolist())
+
         hf_dataset.set_transform(hf_transform_to_torch)
         return hf_dataset
 
@@ -2079,6 +2167,11 @@ class LeRobotDataset(BaseDataset):
         item = {}
         for vid_key, query_ts in query_timestamps.items():
             video_path = self._resolve_video_path(ep_idx, vid_key)
+            # v3.0 packs many episodes into one mp4; shift the episode-relative
+            # query timestamps by this episode's offset into the consolidated
+            # file. Absent (v2.1 per-episode mp4) the offset is 0.0 -> unchanged.
+            ts_offset = float(self.meta.episodes[ep_idx].get(f"videos/{vid_key}/from_timestamp", 0.0) or 0.0)
+            query_ts = np.asarray(query_ts, dtype=np.float64) + ts_offset
             frame_indices_soft = query_ts * self.fps
             if self.image_resample_strategy == "linear":
                 frame_indices_floor = np.floor(frame_indices_soft).astype(int)
