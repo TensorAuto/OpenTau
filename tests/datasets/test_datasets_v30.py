@@ -29,6 +29,7 @@ import packaging.version
 import pandas as pd
 import pytest
 import torch
+from huggingface_hub.errors import RevisionNotFoundError
 
 from opentau.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from opentau.datasets.utils import (
@@ -410,6 +411,94 @@ def test_get_safe_version_v21_repo_unchanged(monkeypatch):
         "opentau.datasets.utils.get_repo_versions", lambda repo_id: [packaging.version.parse("v2.1")]
     )
     assert get_safe_version("dummy/v21", "v2.1") == "v2.1"
+
+
+def test_get_safe_version_untagged_repo_falls_back_to_main(monkeypatch):
+    # An untagged repo (no version refs) resolves to the default branch when the
+    # caller did not pin a revision, instead of raising RevisionNotFoundError.
+    monkeypatch.setattr("opentau.datasets.utils.get_repo_versions", lambda repo_id: [])
+    monkeypatch.setattr("opentau.datasets.utils.get_repo_branches", lambda repo_id: ["main", "parquet"])
+    assert get_safe_version("dummy/untagged", "v2.1", allow_branch_fallback=True) == "main"
+
+
+def test_get_safe_version_untagged_repo_falls_back_to_master(monkeypatch):
+    # With no `main`, the next default branch (`master`) is used.
+    monkeypatch.setattr("opentau.datasets.utils.get_repo_versions", lambda repo_id: [])
+    monkeypatch.setattr("opentau.datasets.utils.get_repo_branches", lambda repo_id: ["master"])
+    assert get_safe_version("dummy/untagged", "v2.1", allow_branch_fallback=True) == "master"
+
+
+def test_get_safe_version_prefers_main_over_master(monkeypatch):
+    # Order matters: `main` wins even when `master` is listed first.
+    monkeypatch.setattr("opentau.datasets.utils.get_repo_versions", lambda repo_id: [])
+    monkeypatch.setattr("opentau.datasets.utils.get_repo_branches", lambda repo_id: ["master", "main"])
+    assert get_safe_version("dummy/untagged", "v2.1", allow_branch_fallback=True) == "main"
+
+
+def test_get_safe_version_untagged_repo_raises_without_fallback(monkeypatch):
+    # Default behaviour (an explicitly requested revision): still hard-fails.
+    monkeypatch.setattr("opentau.datasets.utils.get_repo_versions", lambda repo_id: [])
+    monkeypatch.setattr("opentau.datasets.utils.get_repo_branches", lambda repo_id: ["main"])
+    with pytest.raises(RevisionNotFoundError):
+        get_safe_version("dummy/untagged", "v2.1")
+
+
+def test_get_safe_version_raises_when_no_default_branch(monkeypatch):
+    # Fallback allowed but neither `main` nor `master` exists -> still raises.
+    monkeypatch.setattr("opentau.datasets.utils.get_repo_versions", lambda repo_id: [])
+    monkeypatch.setattr("opentau.datasets.utils.get_repo_branches", lambda repo_id: ["dev"])
+    with pytest.raises(RevisionNotFoundError):
+        get_safe_version("dummy/untagged", "v2.1", allow_branch_fallback=True)
+
+
+def test_metadata_untagged_repo_defaults_to_main(tmp_path, monkeypatch):
+    # End-to-end: an untagged repo with no local cache resolves its revision to
+    # the default branch (revision unset) and loads, rather than hitting the
+    # strict get_safe_version error path. pull_from_repo is faked to materialize
+    # the metadata the second load reads.
+    root = tmp_path / "ds"
+    monkeypatch.setattr("opentau.datasets.lerobot_dataset.get_proc_accelerator", lambda: None)
+    monkeypatch.setattr("opentau.datasets.utils.get_repo_versions", lambda repo_id: [])
+    monkeypatch.setattr("opentau.datasets.utils.get_repo_branches", lambda repo_id: ["main"])
+
+    def _fake_pull(self, allow_patterns=None, ignore_patterns=None):
+        _write_v30_dataset(root)
+
+    monkeypatch.setattr(LeRobotDatasetMetadata, "pull_from_repo", _fake_pull)
+    meta = LeRobotDatasetMetadata(repo_id="dummy/untagged", root=root)  # revision unset
+    assert meta.revision == "main"
+    assert meta._is_v30
+
+
+def test_metadata_untagged_repo_explicit_revision_still_raises(tmp_path, monkeypatch):
+    # An explicitly pinned revision keeps the strict behaviour (no branch fallback).
+    root = tmp_path / "ds"
+    monkeypatch.setattr("opentau.datasets.lerobot_dataset.get_proc_accelerator", lambda: None)
+    monkeypatch.setattr("opentau.datasets.utils.get_repo_versions", lambda repo_id: [])
+    monkeypatch.setattr("opentau.datasets.utils.get_repo_branches", lambda repo_id: ["main"])
+    with pytest.raises(RevisionNotFoundError):
+        LeRobotDatasetMetadata(repo_id="dummy/untagged", root=root, revision="v2.1")
+
+
+def test_dataset_untagged_repo_loads_via_branch_fallback(tmp_path, monkeypatch):
+    # Full LeRobotDataset path (the primary use case): an untagged repo with no
+    # local cache must load by falling back to the default branch, not raise at
+    # metadata construction. Regression test for forwarding the *original*
+    # (uncoerced) revision from LeRobotDataset to its metadata constructor — with
+    # the coerced `self.revision` the fallback was dead and this raised.
+    root = tmp_path / "ds"
+    monkeypatch.setattr("opentau.datasets.lerobot_dataset.get_proc_accelerator", lambda: None)
+    monkeypatch.setattr("opentau.datasets.utils.get_repo_versions", lambda repo_id: [])
+    monkeypatch.setattr("opentau.datasets.utils.get_repo_branches", lambda repo_id: ["main"])
+
+    def _fake_pull(self, allow_patterns=None, ignore_patterns=None):
+        _write_v30_dataset(root, use_videos=False)
+
+    monkeypatch.setattr(LeRobotDatasetMetadata, "pull_from_repo", _fake_pull)
+    dataset = _make_dataset(root)  # repo_id="dummy/v30", revision unset
+    assert dataset.meta.revision == "main"
+    assert dataset.episodes == [0, 1, 2]
+    assert len(dataset) == sum(DEFAULT_LENGTHS)
 
 
 # --------------------------------------------------------------------------- #

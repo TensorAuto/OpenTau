@@ -388,7 +388,9 @@ class LeRobotDatasetMetadata(DatasetMetadata):
             self.load_metadata()
         except (FileNotFoundError, NotADirectoryError):
             if is_valid_version(self.revision):
-                self.revision = get_safe_version(self.repo_id, self.revision)
+                self.revision = get_safe_version(
+                    self.repo_id, self.revision, allow_branch_fallback=not revision
+                )
 
             # In distributed training, only rank 0 downloads to avoid race conditions
             # where other ranks read metadata before the download has finished.
@@ -1500,9 +1502,12 @@ class LeRobotDataset(BaseDataset):
 
         self.root.mkdir(exist_ok=True, parents=True)
 
-        # Load metadata
+        # Load metadata. Forward the *original* `revision` (may be None), not the
+        # `CODEBASE_VERSION`-coerced `self.revision`: the metadata constructor
+        # applies the default itself and must see an unset revision to enable its
+        # main/master branch fallback for untagged repos.
         self.meta = LeRobotDatasetMetadata(
-            self.repo_id, self.root, self.revision, force_cache_sync=force_cache_sync
+            self.repo_id, self.root, revision, force_cache_sync=force_cache_sync
         )
 
         # Overlay setup: when info.json declares a `videos.source_repo`, all video
@@ -1597,7 +1602,9 @@ class LeRobotDataset(BaseDataset):
             self.hf_dataset = self.load_hf_dataset()
         except (AssertionError, FileNotFoundError, NotADirectoryError):
             if is_valid_version(self.revision):
-                self.revision = get_safe_version(self.repo_id, self.revision)
+                self.revision = get_safe_version(
+                    self.repo_id, self.revision, allow_branch_fallback=not revision
+                )
             self.download_episodes(download_videos)
             self.hf_dataset = self.load_hf_dataset()
 
