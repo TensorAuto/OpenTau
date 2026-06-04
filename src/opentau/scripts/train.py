@@ -1142,6 +1142,7 @@ def train(cfg: TrainPipelineConfig):
                     cfg,
                     videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
                     max_episodes_rendered=cfg.eval.max_episodes_rendered,
+                    grid_size=cfg.eval.grid_size,
                     start_seed=cfg.seed,
                     max_parallel_tasks=cfg.env.max_parallel_tasks,
                     subgoal_generator=eval_subgoal_generator,

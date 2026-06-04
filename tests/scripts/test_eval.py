@@ -61,8 +61,6 @@ def test_eval_policy_all_forwards_render_cap_and_grid_size_to_eval_policy(monkey
     eval_policy_all -> run_one -> eval_one -> eval_policy. Regression guard: eval_main
     used to hardcode the render cap (10) and never threaded grid_size, so both
     EvalConfig fields were silently ignored and grids only ever tiled 10 rollouts."""
-    import opentau.scripts.eval as eval_mod
-
     captured: dict = {}
 
     def fake_eval_policy(**kwargs):
@@ -71,12 +69,14 @@ def test_eval_policy_all_forwards_render_cap_and_grid_size_to_eval_policy(monkey
         captured.update(kwargs)
         return {"per_episode": []}
 
-    monkeypatch.setattr(eval_mod, "eval_policy", fake_eval_policy)
+    # Patch the module global by dotted path so eval_one's call-time lookup of
+    # `eval_policy` resolves to the stub (keeps a single `from`-import style).
+    monkeypatch.setattr("opentau.scripts.eval.eval_policy", fake_eval_policy)
 
     cfg = Mock()
     cfg.eval.recording_root = None  # skip the LIBERO-only recorder guard + block
 
-    eval_mod.eval_policy_all(
+    eval_policy_all(
         {"group": {0: object()}},  # one fake task; the env is never touched (eval_policy is stubbed)
         policy=Mock(),
         n_episodes=1,
