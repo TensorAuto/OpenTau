@@ -116,6 +116,63 @@ def are_all_envs_same_type(env: gym.vector.VectorEnv) -> bool:
     return all(t == first_type for t in types)
 
 
+def _single_env_attr_present(env: gym.Env, attr: str) -> bool:
+    r"""Whether a single (non-vector) env exposes wrapper attribute ``attr``.
+
+    Uses ``get_wrapper_attr`` (present on gymnasium ``0.29``), which searches the
+    wrapper stack and raises ``AttributeError`` when the attribute is absent.
+    Only call this on an in-process env — never across an ``AsyncVectorEnv``
+    pipe, where a raise tears the worker down (see :func:`_env_attr_present`).
+
+    Args:
+        env: A single (non-vector) Gym environment, e.g. a sub-env of a
+            ``SyncVectorEnv``.
+        attr: The wrapper attribute name to probe.
+
+    Returns:
+        ``True`` if ``attr`` is reachable on the env or any wrapper beneath it,
+        ``False`` otherwise.
+    """
+    try:
+        env.get_wrapper_attr(attr)
+        return True
+    except AttributeError:
+        return False
+
+
+def _env_attr_present(env: gym.vector.VectorEnv, attr: str) -> list[bool]:
+    r"""Return, per sub-env, whether wrapper attribute ``attr`` exists.
+
+    gymnasium ``>=1.0`` exposes ``Env.has_wrapper_attr`` — a non-raising,
+    async-safe presence check — and we use it directly when available. But the
+    RoboCasa / LIBERO stack caps gymnasium below ``1.0`` (via ``lerobot``),
+    where that method is absent. On ``0.29`` we must *not* emulate it by letting
+    ``env.call("get_wrapper_attr", attr)`` raise: on an ``AsyncVectorEnv`` (the
+    eval default, ``EnvConfig.use_async_envs``) the ``AttributeError`` propagates
+    inside gymnasium's worker to its ``finally: env.close()``, killing every
+    rollout sub-env before the rollout that reuses the same env runs. Instead:
+
+    * ``SyncVectorEnv`` — probe each sub-env directly via ``env.envs`` (in
+      process, never crosses a worker pipe), which also preserves the per-sub-env
+      granularity ``has_wrapper_attr`` would give.
+    * ``AsyncVectorEnv`` on gymnasium ``<1.0`` — there is no non-destructive
+      presence check across the pipe, so assume the attribute is present and skip
+      the (advisory-only) warning rather than risk tearing the rollout envs down.
+
+    Args:
+        env: A vectorized Gym environment (SyncVectorEnv or AsyncVectorEnv).
+        attr: The wrapper attribute name to probe on each sub-env.
+
+    Returns:
+        A length-``num_envs`` list of booleans, one per sub-env.
+    """
+    if hasattr(env, "has_wrapper_attr"):
+        return list(env.call("has_wrapper_attr", attr))
+    if isinstance(env, gym.vector.SyncVectorEnv):
+        return [_single_env_attr_present(sub_env, attr) for sub_env in env.envs]
+    return [True] * env.num_envs
+
+
 def check_env_attributes_and_types(env: gym.vector.VectorEnv) -> None:
     r"""Checks if all environments in a vectorized environment have 'task_description' or 'task' attributes.
     A warning will be raised if any environment is missing these attributes.
@@ -133,8 +190,8 @@ def check_env_attributes_and_types(env: gym.vector.VectorEnv) -> None:
                 "Only gym.vector.SyncVectorEnv and gym.vector.AsyncVectorEnv are supported for now."
             )
 
-        task_desc_set = env.call("has_wrapper_attr", "task_description")
-        task_set = env.call("has_wrapper_attr", "task")
+        task_desc_set = _env_attr_present(env, "task_description")
+        task_set = _env_attr_present(env, "task")
         if not all(td or t for td, t in zip(task_desc_set, task_set, strict=True)):
             warnings.warn(
                 "At least 1 environment does not have 'task_description' or 'task'. Some policies require these features.",

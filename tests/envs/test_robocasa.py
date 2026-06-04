@@ -44,12 +44,14 @@ from opentau.envs.robocasa import (
     _direct_download_url,
     _ensure_robocasa_assets,
     _import_robocasa_with_version_shim,
+    _internal_robocasa_pkg_dir,
     _maybe_relink_robocasa_assets,
     _needed_asset_packs,
     _parse_camera_names,
     _resolve_robocasa_assets_root,
     _resolve_tasks,
     _robocasa_pkg_assets_dir,
+    _robocasa_unshadowed,
     _symlink_pkg_assets_to,
     convert_action,
     create_robocasa_envs,
@@ -185,6 +187,102 @@ class TestPureHelpers:
         sys.modules["robocasa"] = object()
         try:
             _import_robocasa_with_version_shim()  # must not raise / import anything
+        finally:
+            if had:
+                sys.modules["robocasa"] = saved
+            else:
+                sys.modules.pop("robocasa", None)
+
+
+class TestRobocasaUnshadow:
+    """The import-shadow guard.
+
+    OpenTau's internal ``opentau/scripts/robocasa`` package (the inference
+    WebSocket server) shares the bare name ``robocasa`` with the external sim.
+    Under the script-launched entry points (``accelerate launch`` / the
+    ``opentau-*`` console scripts) Python puts ``opentau/scripts`` on
+    ``sys.path[0]``, so ``import robocasa`` / ``find_spec("robocasa")`` resolve
+    to that empty package instead of the sim. These tests pin that
+    ``_robocasa_unshadowed`` drops the shadowing path entry and evicts an
+    already-imported shadow — without the real sim installed.
+    """
+
+    def test_internal_pkg_dir_resolves_to_scripts_robocasa(self):
+        internal = _internal_robocasa_pkg_dir()
+        assert os.path.isdir(internal)
+        assert internal.endswith(os.path.join("opentau", "scripts", "robocasa"))
+        # Already a realpath, so the comparisons inside the helper are stable.
+        assert internal == os.path.realpath(internal)
+
+    def test_unshadow_drops_shadowing_path_entry_and_restores(self):
+        import importlib.util
+        import sys
+
+        internal = _internal_robocasa_pkg_dir()
+        scripts_dir = os.path.dirname(internal)  # .../opentau/scripts
+
+        saved_path = list(sys.path)
+        sys.path.insert(0, scripts_dir)  # mimic train.py being launched as a script
+        try:
+            # The shadow is reachable before unshadowing...
+            spec = importlib.util.find_spec("robocasa")
+            assert spec is not None and spec.origin is not None
+            assert os.path.realpath(os.path.dirname(spec.origin)) == internal
+
+            before = list(sys.path)
+            with _robocasa_unshadowed():
+                # ...and no remaining sys.path entry resolves `robocasa` to it.
+                assert all(os.path.realpath(os.path.join(p, "robocasa")) != internal for p in sys.path)
+            # sys.path is restored verbatim on exit.
+            assert sys.path == before
+        finally:
+            sys.path[:] = saved_path
+
+    def test_unshadow_evicts_already_imported_shadow(self):
+        import sys
+        import types
+
+        internal = _internal_robocasa_pkg_dir()
+        had = "robocasa" in sys.modules
+        saved = sys.modules.get("robocasa")
+        saved_sub = sys.modules.get("robocasa.server")
+
+        # Fake a shadow import: a module whose file lives in the internal package,
+        # plus a submodule, exactly as importing the WebSocket server would leave them.
+        shadow = types.ModuleType("robocasa")
+        shadow.__file__ = os.path.join(internal, "__init__.py")
+        sys.modules["robocasa"] = shadow
+        sys.modules["robocasa.server"] = types.ModuleType("robocasa.server")
+        try:
+            with _robocasa_unshadowed():
+                # The shadow and its submodules are evicted so resolution falls
+                # through to the real sim.
+                assert "robocasa" not in sys.modules
+                assert "robocasa.server" not in sys.modules
+        finally:
+            sys.modules.pop("robocasa", None)
+            sys.modules.pop("robocasa.server", None)
+            if had:
+                sys.modules["robocasa"] = saved
+                if saved_sub is not None:
+                    sys.modules["robocasa.server"] = saved_sub
+
+    def test_unshadow_leaves_real_robocasa_import_untouched(self):
+        """A ``robocasa`` already imported as the *real* sim (file outside the
+        internal package) must not be evicted.
+        """
+        import sys
+        import types
+
+        had = "robocasa" in sys.modules
+        saved = sys.modules.get("robocasa")
+
+        real = types.ModuleType("robocasa")
+        real.__file__ = os.path.join(os.sep, "opt", "site-packages", "robocasa", "__init__.py")
+        sys.modules["robocasa"] = real
+        try:
+            with _robocasa_unshadowed():
+                assert sys.modules.get("robocasa") is real
         finally:
             if had:
                 sys.modules["robocasa"] = saved
