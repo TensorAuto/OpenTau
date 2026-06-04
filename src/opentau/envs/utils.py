@@ -116,6 +116,24 @@ def are_all_envs_same_type(env: gym.vector.VectorEnv) -> bool:
     return all(t == first_type for t in types)
 
 
+def _env_attr_present(env: gym.vector.VectorEnv, attr: str) -> list[bool]:
+    r"""Return, per sub-env, whether wrapper attribute ``attr`` exists.
+
+    gymnasium ``>=1.0`` exposes ``Env.has_wrapper_attr`` for this, but the
+    RoboCasa / LIBERO stack caps gymnasium below ``1.0`` (via ``lerobot``), so
+    that method is unavailable here. Emulate it with ``get_wrapper_attr``, which
+    exists on ``0.29`` and raises ``AttributeError`` when the attribute is
+    absent — the same accessor ``add_envs_task`` already relies on.
+    """
+    if hasattr(env, "has_wrapper_attr"):
+        return list(env.call("has_wrapper_attr", attr))
+    try:
+        env.call("get_wrapper_attr", attr)
+        return [True] * env.num_envs
+    except AttributeError:
+        return [False] * env.num_envs
+
+
 def check_env_attributes_and_types(env: gym.vector.VectorEnv) -> None:
     r"""Checks if all environments in a vectorized environment have 'task_description' or 'task' attributes.
     A warning will be raised if any environment is missing these attributes.
@@ -133,8 +151,8 @@ def check_env_attributes_and_types(env: gym.vector.VectorEnv) -> None:
                 "Only gym.vector.SyncVectorEnv and gym.vector.AsyncVectorEnv are supported for now."
             )
 
-        task_desc_set = env.call("has_wrapper_attr", "task_description")
-        task_set = env.call("has_wrapper_attr", "task")
+        task_desc_set = _env_attr_present(env, "task_description")
+        task_set = _env_attr_present(env, "task")
         if not all(td or t for td, t in zip(task_desc_set, task_set, strict=True)):
             warnings.warn(
                 "At least 1 environment does not have 'task_description' or 'task'. Some policies require these features.",

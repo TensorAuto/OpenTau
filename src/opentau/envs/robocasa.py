@@ -118,21 +118,50 @@ def _import_robocasa_with_version_shim() -> None:
     only for the one-time package import, then restore them. A robocasa packaging
     fork that drops the asserts makes this shim unnecessary; until then it lets
     the integration run on a stock ``pip install robocasa``. No-op once imported.
+
+    Also guards against a name collision: OpenTau ships an internal
+    ``opentau/scripts/robocasa`` package (the inference WebSocket server). When
+    ``train.py`` / ``eval.py`` are run as scripts (which is how ``accelerate
+    launch`` and the ``opentau-*`` console entry points invoke them), Python puts
+    ``opentau/scripts/`` on ``sys.path[0]``, so a bare ``import robocasa`` resolves
+    to that empty server package instead of the installed sim — leaving RoboCasa's
+    kitchen envs (e.g. ``CloseCabinet``) unregistered and every rollout raising
+    ``Environment ... not found``. We strip the shadowing path entry for the
+    duration of the import (and purge an already-imported shadow) so the real sim
+    package wins.
     """
+    import os
     import sys
 
-    if "robocasa" in sys.modules:
-        return
+    internal_pkg = os.path.realpath(os.path.join(os.path.dirname(__file__), os.pardir, "scripts", "robocasa"))
+
+    def _is_shadow(mod) -> bool:
+        mod_file = getattr(mod, "__file__", "") or ""
+        return os.path.realpath(os.path.dirname(mod_file)) == internal_pkg
+
+    existing = sys.modules.get("robocasa")
+    if existing is not None:
+        if not _is_shadow(existing):
+            return
+        # The internal server package got imported under the bare name first;
+        # purge it (and any submodules) so we can load the real sim package.
+        for name in [m for m in sys.modules if m == "robocasa" or m.startswith("robocasa.")]:
+            del sys.modules[name]
+
     import mujoco
     import numpy
 
     saved = (mujoco.__version__, numpy.__version__)
+    saved_path = list(sys.path)
+    # Drop the path entry that would resolve ``robocasa`` to the internal package.
+    sys.path[:] = [p for p in sys.path if os.path.realpath(os.path.join(p, "robocasa")) != internal_pkg]
     try:
         mujoco.__version__ = "3.3.1"
         numpy.__version__ = "2.2.5"
         import robocasa  # noqa: F401  (runs robocasa's version asserts once)
     finally:
         mujoco.__version__, numpy.__version__ = saved
+        sys.path[:] = saved_path
 
 
 def _resolve_tasks(task: str) -> tuple[list[str], str | None]:
