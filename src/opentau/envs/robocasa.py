@@ -45,6 +45,7 @@ from typing import Any
 from urllib.request import urlretrieve
 from zipfile import BadZipFile, ZipFile
 
+import einops
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
@@ -537,6 +538,9 @@ class RoboCasaEnv(gym.Env):
         # subprocess to avoid inheriting a stale GPU/EGL context across fork().
         self._env: Any = None
         self.task_description = ""
+        # Latest per-camera frames ({camera0,camera1,...}), cached by
+        # _format_raw_obs so render() can composite all cameras for eval videos.
+        self._render_pixels: dict[str, np.ndarray] | None = None
 
         images = {}
         for cam in self.camera_name:
@@ -609,6 +613,10 @@ class RoboCasaEnv(gym.Env):
             for mapped_cam in self.camera_name_mapping[cam]:
                 images[mapped_cam] = frame
 
+        # Cache for render(): the underlying RoboCasaGymEnv.render() is single-cam,
+        # so we composite these frames ourselves to show every camera in eval videos.
+        self._render_pixels = images
+
         if self.obs_type == "pixels":
             return {"pixels": images}
 
@@ -627,9 +635,15 @@ class RoboCasaEnv(gym.Env):
         return {"pixels": images, "agent_pos": agent_pos}
 
     def render(self) -> np.ndarray:
-        r"""Render the environment and return an RGB array for video recording."""
+        r"""Render an RGB array for video recording: all configured cameras
+        concatenated side-by-side (left→right in ``camera_name`` order), so eval
+        rollout videos show every camera the policy sees rather than just one."""
         self._ensure_env()
         assert self._env is not None
+        if self._render_pixels:
+            frames = list(self._render_pixels.values())  # each (H, W, 3), camera_name order
+            return einops.rearrange(np.stack(frames), "n h w c -> h (n w) c")
+        # No observation cached yet (render before the first reset/step).
         return self._env.render()
 
     def reset(self, seed=None, **kwargs) -> tuple[dict[str, Any], dict[str, Any]]:

@@ -24,6 +24,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+import einops
 import gymnasium as gym
 import numpy as np
 import torch
@@ -225,13 +226,15 @@ class LiberoEnv(gym.Env):
         )
 
     def render(self) -> np.ndarray:
-        r"""Render the environment and return a numpy array representing the RGB camera.
-        If `self.render_cam` is set, use that camera; otherwise, use the first camera."""
+        r"""Render an RGB array for video recording. If ``self.render_cam`` is set,
+        use that single camera; otherwise concatenate all configured cameras
+        side-by-side so eval rollout videos show every camera the policy sees."""
         raw_obs = self._env.env._get_observations()
         cams: dict[str, np.ndarray] = self._format_raw_obs(raw_obs)["pixels"]
-        # if `self.render_cam` is not set, use the first camera
-        render_cam = self.render_cam or next(iter(cams))
-        return cams[render_cam]
+        if self.render_cam:
+            return cams[self.render_cam]
+        frames = list(cams.values())  # each (H, W, 3), camera_name order
+        return einops.rearrange(np.stack(frames), "n h w c -> h (n w) c")
 
     def _make_envs_task(self, task_suite: Any, task_id: int = 0):
         task = task_suite.get_task(task_id)

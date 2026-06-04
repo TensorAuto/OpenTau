@@ -647,6 +647,51 @@ class TestCreateRoboCasaEnvsAssets:
         ensure.assert_called_once()  # but the asset/barrier step still ran
 
 
+class TestRenderMultiCamera:
+    """``render()`` composites every configured camera side-by-side for eval videos.
+
+    CPU-only: the gym env is built without the sim (``_ensure_env`` returns early
+    once ``_env`` is set), and the per-camera frames ``render`` reads are stubbed
+    directly via ``_render_pixels``.
+    """
+
+    @staticmethod
+    def _env_with_pixels(pixels: dict | None):
+        from opentau.envs.robocasa import RoboCasaEnv as RoboCasaGymEnv
+
+        env = RoboCasaGymEnv(task="CloseFridge")
+        env._env = Mock()  # non-None so _ensure_env() is a no-op (no sim build)
+        env._render_pixels = pixels
+        return env
+
+    def test_concatenates_all_cameras_left_to_right(self):
+        env = self._env_with_pixels(
+            {
+                "camera0": np.full((4, 5, 3), 1, np.uint8),
+                "camera1": np.full((4, 5, 3), 2, np.uint8),
+                "camera2": np.full((4, 5, 3), 3, np.uint8),
+            }
+        )
+        frame = env.render()
+        # 3 cameras (5 px wide each) tiled along width, in camera_name order.
+        assert frame.shape == (4, 15, 3)
+        assert (frame[:, 0:5] == 1).all()
+        assert (frame[:, 5:10] == 2).all()
+        assert (frame[:, 10:15] == 3).all()
+
+    def test_single_camera_is_not_widened(self):
+        env = self._env_with_pixels({"camera0": np.full((4, 5, 3), 7, np.uint8)})
+        frame = env.render()
+        assert frame.shape == (4, 5, 3)
+        assert (frame == 7).all()
+
+    def test_falls_back_to_env_render_before_first_observation(self):
+        env = self._env_with_pixels(None)  # no frames cached yet
+        sentinel = np.zeros((2, 2, 3), np.uint8)
+        env._env.render.return_value = sentinel
+        assert env.render() is sentinel
+
+
 @pytest.mark.gpu
 @pytest.mark.slow
 def test_robocasa_autodownload_and_rollout_from_relocated_root(monkeypatch):
