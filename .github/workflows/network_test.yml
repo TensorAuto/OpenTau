@@ -42,7 +42,9 @@ jobs:
   network-tests:
     name: Network Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # ~57 tests run serially (-n 0) here, including a ~3.5-min mixture test and
+    # @retry_on_hf_flakiness reruns; give the non-gating job comfortable headroom.
+    timeout-minutes: 45
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
