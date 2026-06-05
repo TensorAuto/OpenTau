@@ -94,6 +94,7 @@
     "wandb": {
         "enable": false,
         "disable_artifact": false,
+        "disable_video": false,
         "project": "lerobot",
         "entity": null,
         "notes": null,

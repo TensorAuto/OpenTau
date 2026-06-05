@@ -1195,7 +1195,7 @@ def train(cfg: TrainPipelineConfig):
                 # assumes every rank wrote to a filesystem the main process can
                 # read (true for the single-node multi-GPU setup; non-rank-0
                 # videos on a multi-node run without a shared FS won't be seen).
-                if cfg.wandb.enable and cfg.eval.max_episodes_rendered > 0:
+                if cfg.wandb.enable and not cfg.wandb.disable_video and cfg.eval.max_episodes_rendered > 0:
                     grid_videos = {
                         f"Eval Videos/{task_name}": wandb.Video(grid_path, format="mp4")
                         for task_name, grid_path in collect_grid_summary_videos(videos_dir)

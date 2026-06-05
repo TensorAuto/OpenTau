@@ -433,6 +433,8 @@ class WandBConfig:
             `run_id` is provided. Defaults to True.
         disable_artifact: Set to True to disable saving an artifact despite
             `training.save_checkpoint=True`. Defaults to False.
+        disable_video: Set to True to skip logging eval grid-summary videos to
+            wandb. Defaults to False (videos are logged).
     """
 
     enable: bool = False  # Enable Weights & Biases logging.
@@ -450,6 +452,8 @@ class WandBConfig:
     allow_resume: bool | None = True  # If True, resume the run from the last checkpoint.
     # Set to true to disable saving an artifact despite training.save_checkpoint=True
     disable_artifact: bool = False
+    # Set to true to skip logging eval grid-summary videos to wandb.
+    disable_video: bool = False
 
     def __post_init__(self):
         """Prompt user for wandb notes if enabled and notes are not provided."""
@@ -472,7 +476,7 @@ class WandBConfig:
             Dictionary of keyword arguments suitable for passing to wandb.init().
         """
         kwargs = encode_dataclass(self)
-        excluded_keys = ["enable", "disable_artifact", "project"]
+        excluded_keys = ["enable", "disable_artifact", "disable_video", "project"]
         for ek in excluded_keys:
             kwargs.pop(ek)
 
