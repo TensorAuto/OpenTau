@@ -14,7 +14,7 @@ These override defaults — read them before running anything.
    If you find yourself overriding `--steps` to anything > a few hundred, stop and ask.
 
 2. **Default to the CPU test subset.** Local dev typically has no NVIDIA GPU; running the full suite will fail confusingly partway through GPU-only tests.
-   - Local / CI-equivalent: `pytest -m "not gpu" -n auto` — this is what `cpu_test.yml` runs and what should always pass.
+   - Local / CI-equivalent: `pytest -m "not gpu and not network" -n auto` — this is what `cpu_test.yml` runs and what should always pass. The `not network` clause excludes live-Hugging-Face-Hub tests, which were quarantined off the gate (#410) because transient Hub 429/connectivity errors were reddening the required check; they now run nightly in `network_test.yml`. If you add a test that downloads from the live Hub, mark it `@pytest.mark.network` (or mock `snapshot_download` / `hf_hub_download`) so it stays off the gate.
    - GPU-only subset: `pytest -m "gpu" -n 0` — only run on a CUDA box (the slurm `oracle` cluster or `mlbox`); on a Mac/CPU laptop it will fail at fixture setup. Markers are defined in `pyproject.toml::[tool.pytest.ini_options]`.
    - When CI shows a failure under `-m "gpu"` and you can't reproduce locally, say so explicitly — don't pretend you ran it.
 
@@ -58,12 +58,13 @@ Installable extras: `dev` (pre-commit, sphinx, pytest), `libero` (sim env — pu
 ### Testing
 
 ```bash
-pytest -m "not gpu" -n auto                  # CPU suite (what cpu_test.yml runs)
+pytest -m "not gpu and not network" -n auto  # CPU suite (what cpu_test.yml runs)
 pytest -m "gpu" -n 0                         # GPU suite (what gpu_test.yml runs)
+pytest -m "network" -n 0                      # live-Hub suite (what network_test.yml runs nightly, serial)
 pytest -sx tests/path/to/test_x.py::test_y   # single test, fail-fast, no capture
 ```
 
-Markers defined in `pyproject.toml`: `slow` (>1s runtime), `gpu` (needs GPU). Tests requiring LIBERO need `LIBERO_CONFIG_PATH` set (CI points it at `.github/assets/libero`). CI also runs nightly regression tests on g6.12xlarge — see `.github/workflows/regression_test.yml`.
+Markers defined in `pyproject.toml`: `slow` (>1s runtime), `gpu` (needs GPU), `network` (needs live Hugging Face Hub access — excluded from the gating CPU run, run nightly in `network_test.yml -n 0`). Tests requiring LIBERO need `LIBERO_CONFIG_PATH` set (CI points it at `.github/assets/libero`). CI also runs nightly regression tests on g6.12xlarge — see `.github/workflows/regression_test.yml`.
 
 ### Linting / pre-commit
 
@@ -138,7 +139,7 @@ Key invariant on `TrainPipelineConfig`: `batch_size == dataloader_batch_size * g
 - **Commit messages: keep them simple. The first line must be under 80 characters.** No long preambles in the subject.
 - **PRs must follow `.github/PULL_REQUEST_TEMPLATE.md` verbatim.** The `check-pr-checklist.yml` CI grep-matches the exact phrases for the docstring and policy-change checkboxes — do not rephrase them, do not delete sections. Fill in `What this does`, `How it was tested`, and `How to checkout & try`.
 - Policy-related PRs require running GPU pytests + nightly regression tests; check both boxes.
-- Required tests/lint that gate merge: `cpu_test.yml` (PRs/pushes) and `pre-commit.yml`. `gpu_test.yml` and `regression_test.yml` run nightly on AWS g6 runners (cron 10:00 UTC).
+- Required tests/lint that gate merge: `cpu_test.yml` (PRs/pushes) and `pre-commit.yml`. `gpu_test.yml` and `regression_test.yml` run nightly on AWS g6 runners (cron 10:00 UTC). `network_test.yml` runs the `network`-marked live-Hub subset nightly too (cron 10:00 UTC, `ubuntu-latest`, serial) — it is **non-gating**, so a Hub flake there can't block a PR.
 - Per-file ruff overrides in `pyproject.toml`: gRPC server (PascalCase methods, `N802`), `recordhuman_to_lerobot.py` (math-convention uppercase names, `N803`/`N806`).
 - **Claude integration:** three workflows under `.github/workflows/` add bots — `claude-pr-review.yml` does auto-review on PR open/sync (single edit-in-place summary tagged `[claude-review]`), `claude-implement-fixes.yml` handles `@claude fix` and addresses feedback in one coalesced commit (replies tagged `[claude-fix]`), and `extract-claude-lessons.yml` does post-merge lessons extraction into `chore(claude): learn from #N` PRs.
 
