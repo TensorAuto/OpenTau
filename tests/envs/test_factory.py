@@ -117,6 +117,25 @@ class TestMakeEnv:
             assert isinstance(result.get("libero_10"), dict)
             assert result["libero_10"].get(0) is mock_vector_env
 
+    @patch("opentau.envs.libero.LiberoEnv")
+    def test_make_env_pins_egl_device_before_spawning_workers(
+        self, mock_libero_env_cls, libero_env_config, mock_train_cfg
+    ):
+        """make_envs pins the per-rank EGL device *before* the vec env spawns workers.
+
+        The ordering is the crux of the fix: the spawn workers inherit os.environ,
+        so MUJOCO_EGL_DEVICE_ID must be set before the vec env is constructed.
+        """
+        mock_libero_env_cls.return_value = Mock()
+        manager = Mock()
+        with (
+            patch("opentau.envs.factory._pin_egl_render_device", manager.pin_egl),
+            patch("gymnasium.vector.SyncVectorEnv", manager.sync_vector),
+        ):
+            make_envs(libero_env_config, mock_train_cfg, n_envs=1, use_async_envs=False)
+        ordered = [c[0] for c in manager.mock_calls]
+        assert ordered.index("pin_egl") < ordered.index("sync_vector")
+
 
 class TestPinEglRenderDevice:
     """`_pin_egl_render_device` pins each rank's MuJoCo EGL render to its own GPU.
@@ -126,12 +145,23 @@ class TestPinEglRenderDevice:
     (no GPU, no sim import); ``monkeypatch`` restores the environment after each.
     """
 
-    def test_sets_local_process_index_under_egl(self, monkeypatch):
+    def test_falls_back_to_local_index_when_no_cuda_visible_devices(self, monkeypatch):
         monkeypatch.setenv("MUJOCO_GL", "egl")
         monkeypatch.delenv("MUJOCO_EGL_DEVICE_ID", raising=False)
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
         with patch("opentau.envs.factory.get_proc_accelerator", return_value=Mock(local_process_index=3)):
             assert _pin_egl_render_device() == "3"
         assert os.environ["MUJOCO_EGL_DEVICE_ID"] == "3"
+
+    def test_maps_through_masked_cuda_visible_devices(self, monkeypatch):
+        # Rank 1 of a job pinned to physical GPUs 4-7 must render on GPU 5, not 1 —
+        # the raw local index would also trip robosuite's CUDA_VISIBLE_DEVICES assert.
+        monkeypatch.setenv("MUJOCO_GL", "egl")
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4,5,6,7")
+        monkeypatch.delenv("MUJOCO_EGL_DEVICE_ID", raising=False)
+        with patch("opentau.envs.factory.get_proc_accelerator", return_value=Mock(local_process_index=1)):
+            assert _pin_egl_render_device() == "5"
+        assert os.environ["MUJOCO_EGL_DEVICE_ID"] == "5"
 
     def test_noop_when_render_backend_is_not_egl(self, monkeypatch):
         monkeypatch.setenv("MUJOCO_GL", "osmesa")

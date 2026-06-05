@@ -47,8 +47,13 @@ def _pin_egl_render_device() -> str | None:
     device 0 when it is unset — and robosuite forwards a ``device_id`` that
     ``mujoco.egl`` ignores. So under multi-rank eval *every* rank would render on
     GPU 0, overloading it (it also holds rank 0's resident training state, so it
-    typically OOMs) while the other GPUs render nothing. Setting the variable to
-    the local process index makes each rank render on its own GPU.
+    typically OOMs) while the other GPUs render nothing. Setting it to the rank's
+    own GPU makes each rank render on its own device.
+
+    The value is the rank's entry in ``CUDA_VISIBLE_DEVICES`` (so a masked or
+    reordered subset like ``"4,5,6,7"`` still maps to the right physical GPU and
+    satisfies robosuite's ``MUJOCO_EGL_DEVICE_ID in CUDA_VISIBLE_DEVICES`` assert),
+    falling back to the local process index when ``CUDA_VISIBLE_DEVICES`` is unset.
 
     No-op unless ``MUJOCO_GL=egl``; an explicit ``MUJOCO_EGL_DEVICE_ID`` is left
     untouched, and so is the single-process / no-accelerator case (device 0 is
@@ -63,7 +68,9 @@ def _pin_egl_render_device() -> str | None:
     acc = get_proc_accelerator()
     if acc is None:
         return None
-    device_id = str(acc.local_process_index)
+    local_index = acc.local_process_index
+    visible = [d.strip() for d in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if d.strip()]
+    device_id = visible[local_index] if local_index < len(visible) else str(local_index)
     os.environ["MUJOCO_EGL_DEVICE_ID"] = device_id
     return device_id
 
