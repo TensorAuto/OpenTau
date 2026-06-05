@@ -76,19 +76,28 @@ def _ensure_nvidia_egl_icd() -> str | None:
     for vendor_dir in ("/usr/share/glvnd/egl_vendor.d", "/etc/glvnd/egl_vendor.d"):
         if glob.glob(os.path.join(vendor_dir, "*nvidia*.json")):
             return None
-    libs = sorted(glob.glob("/usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.*")) or sorted(
-        glob.glob("/usr/lib/*/libEGL_nvidia.so.*")
+    # Prefer the version-stable soname symlink (``libEGL_nvidia.so.0``) over a
+    # specific versioned file, so the choice doesn't depend on lexicographic-vs-
+    # numeric ordering of multiple injected libs.
+    libs = (
+        glob.glob("/usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.0")
+        or glob.glob("/usr/lib/*/libEGL_nvidia.so.0")
+        or sorted(glob.glob("/usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.*"))
+        or sorted(glob.glob("/usr/lib/*/libEGL_nvidia.so.*"))
     )
     if not libs:
         return None
-    icd_dir = os.path.join(tempfile.gettempdir(), "opentau_egl")
+    # Namespace the descriptor dir by uid: on a shared multi-tenant node a second
+    # user must not hit ``PermissionError`` writing into the first user's dir (which
+    # would crash ``make_envs``). Same-user ranks share it; the write below is atomic
+    # (mkstemp + ``os.replace``) so a partial file is never visible to a spawn worker.
+    uid = getattr(os, "getuid", os.getpid)()
+    icd_dir = os.path.join(tempfile.gettempdir(), f"opentau_egl_{uid}")
     os.makedirs(icd_dir, exist_ok=True)
     icd_path = os.path.join(icd_dir, "10_nvidia.json")
-    # Atomic write: ranks share /tmp on a node, so a partial file must never be
-    # visible to a spawn worker reading the descriptor.
     fd, tmp_path = tempfile.mkstemp(dir=icd_dir, suffix=".json")
     with os.fdopen(fd, "w") as f:
-        json.dump({"file_format_version": "1.0.0", "ICD": {"library_path": libs[-1]}}, f)
+        json.dump({"file_format_version": "1.0.0", "ICD": {"library_path": libs[0]}}, f)
     os.replace(tmp_path, icd_path)
     os.environ["__EGL_VENDOR_LIBRARY_FILENAMES"] = icd_path
     return icd_path
