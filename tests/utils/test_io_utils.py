@@ -185,22 +185,25 @@ def test_silence_output_unless_error_mutes_on_success(capfd):
 
 def test_silence_output_unless_error_replays_on_failure(capfd):
     """If the block raises, the captured fd output is replayed to stderr with the label."""
-    # Explicit try/except (rather than `pytest.raises`) so the exception propagation
-    # is modelled plainly and the assertions afterwards are unambiguously reachable.
-    raised = False
-    try:
-        with silence_output_unless_error(label="task=CloseFridge idx=3"):
-            os.write(1, b"stdout before crash\n")
-            os.write(2, b"stderr before crash\n")
-            raise ValueError("boom")
-    except ValueError as exc:
-        raised = True
-        assert str(exc) == "boom"
-    assert raised, "the exception must propagate through the context manager"
+
+    def _emit_then_raise():
+        # Factored into a helper so the failing action is a call rather than a literal
+        # raise as the block's last statement, which keeps static analyzers from
+        # wrongly treating the post-block assertions as unreachable code.
+        os.write(1, b"stdout before crash\n")
+        os.write(2, b"stderr before crash\n")
+        raise ValueError("boom")
+
+    with (
+        pytest.raises(ValueError, match="boom"),
+        silence_output_unless_error(label="task=CloseFridge idx=3"),
+    ):
+        _emit_then_raise()
 
     out, err = capfd.readouterr()
-    # The otherwise-muted output is replayed on stderr, tagged with the label, so a
-    # failing worker stays debuggable.
+    # The exception still propagates (asserted by pytest.raises) and the otherwise-muted
+    # output is replayed on stderr, tagged with the label, so a failing worker stays
+    # debuggable.
     assert "task=CloseFridge idx=3" in err
     assert "stdout before crash" in err
     assert "stderr before crash" in err
