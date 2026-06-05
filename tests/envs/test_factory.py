@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 from unittest.mock import Mock, patch
 
@@ -22,7 +23,12 @@ import pytest
 
 from opentau.configs.train import TrainPipelineConfig
 from opentau.envs.configs import LiberoEnv, RoboCasaEnv
-from opentau.envs.factory import _pin_egl_render_device, make_env_config, make_envs
+from opentau.envs.factory import (
+    _ensure_nvidia_egl_icd,
+    _pin_egl_render_device,
+    make_env_config,
+    make_envs,
+)
 
 
 class TestMakeEnvConfig:
@@ -183,3 +189,66 @@ class TestPinEglRenderDevice:
         with patch("opentau.envs.factory.get_proc_accelerator", return_value=None):
             assert _pin_egl_render_device() is None
         assert "MUJOCO_EGL_DEVICE_ID" not in os.environ
+
+
+class TestEnsureNvidiaEglIcd:
+    """`_ensure_nvidia_egl_icd` registers the nvidia EGL ICD when only Mesa's ships.
+
+    Without it, glvnd loads Mesa (which needs ``/dev/dri``) and robosuite cannot init
+    a headless GPU display. Pure env-var/filesystem checks (no GPU, no sim import);
+    ``monkeypatch`` restores the environment and ``tmp_path`` isolates the descriptor.
+    """
+
+    def test_noop_when_render_backend_is_not_egl(self, monkeypatch):
+        monkeypatch.setenv("MUJOCO_GL", "osmesa")
+        monkeypatch.delenv("__EGL_VENDOR_LIBRARY_FILENAMES", raising=False)
+        assert _ensure_nvidia_egl_icd() is None
+        assert "__EGL_VENDOR_LIBRARY_FILENAMES" not in os.environ
+
+    def test_noop_when_vendor_already_set(self, monkeypatch):
+        monkeypatch.setenv("MUJOCO_GL", "egl")
+        monkeypatch.setenv("__EGL_VENDOR_LIBRARY_FILENAMES", "/somewhere/10_nvidia.json")
+        assert _ensure_nvidia_egl_icd() is None
+
+    def test_noop_when_nvidia_icd_already_registered(self, monkeypatch):
+        monkeypatch.setenv("MUJOCO_GL", "egl")
+        monkeypatch.delenv("__EGL_VENDOR_LIBRARY_FILENAMES", raising=False)
+        monkeypatch.delenv("__EGL_VENDOR_LIBRARY_DIRS", raising=False)
+        monkeypatch.setattr(
+            "opentau.envs.factory.glob.glob",
+            lambda p: (["/usr/share/glvnd/egl_vendor.d/10_nvidia.json"] if "egl_vendor.d" in p else []),
+        )
+        assert _ensure_nvidia_egl_icd() is None
+        assert "__EGL_VENDOR_LIBRARY_FILENAMES" not in os.environ
+
+    def test_noop_when_no_nvidia_lib(self, monkeypatch):
+        monkeypatch.setenv("MUJOCO_GL", "egl")
+        monkeypatch.delenv("__EGL_VENDOR_LIBRARY_FILENAMES", raising=False)
+        monkeypatch.setattr("opentau.envs.factory.glob.glob", lambda p: [])
+        assert _ensure_nvidia_egl_icd() is None
+        assert "__EGL_VENDOR_LIBRARY_FILENAMES" not in os.environ
+
+    def test_synthesizes_descriptor_and_sets_vendor(self, monkeypatch, tmp_path):
+        # Container has libEGL_nvidia.so but only Mesa's glvnd descriptor -> synthesize one.
+        monkeypatch.setenv("MUJOCO_GL", "egl")
+        monkeypatch.delenv("__EGL_VENDOR_LIBRARY_FILENAMES", raising=False)
+        monkeypatch.delenv("__EGL_VENDOR_LIBRARY_DIRS", raising=False)
+        fake_lib = "/usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.999.0"
+
+        def fake_glob(pattern):
+            if "egl_vendor.d" in pattern:
+                return []  # no nvidia ICD registered
+            if "libEGL_nvidia.so" in pattern:
+                return [fake_lib]
+            return []
+
+        monkeypatch.setattr("opentau.envs.factory.glob.glob", fake_glob)
+        monkeypatch.setattr("opentau.envs.factory.tempfile.gettempdir", lambda: str(tmp_path))
+        icd = _ensure_nvidia_egl_icd()
+        assert icd is not None and os.path.exists(icd)
+        with open(icd) as f:
+            descriptor = json.load(f)
+        assert descriptor["ICD"]["library_path"] == fake_lib
+        assert os.environ["__EGL_VENDOR_LIBRARY_FILENAMES"] == icd
+        # Idempotent: with the vendor var now set, a second call leaves it alone.
+        assert _ensure_nvidia_egl_icd() is None

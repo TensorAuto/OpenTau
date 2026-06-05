@@ -16,8 +16,11 @@
 # limitations under the License.
 r"""This module contains factory methods to create environments based on their configuration."""
 
+import glob
 import importlib
+import json
 import os
+import tempfile
 from functools import partial
 
 import gymnasium as gym
@@ -37,6 +40,58 @@ def make_env_config(env_type: str, **kwargs) -> EnvConfig:
         return RoboCasaEnv(**kwargs)
     else:
         raise ValueError(f"Env type '{env_type}' is not available.")
+
+
+def _ensure_nvidia_egl_icd() -> str | None:
+    r"""Register the nvidia EGL ICD when a container ships only Mesa's, so GPU rendering works.
+
+    Some container images (e.g. the training enroot image) inject
+    ``libEGL_nvidia.so`` via ``NVIDIA_DRIVER_CAPABILITIES`` *graphics* but ship only
+    Mesa's glvnd ICD descriptor (``egl_vendor.d/50_mesa.json``) and no nvidia one.
+    glvnd then loads Mesa, whose GPU path needs ``/dev/dri`` render nodes the
+    container typically does not expose — so ``eglQueryDevicesEXT`` enumerates
+    unusable Mesa devices and robosuite's per-device EGL context (it indexes that
+    list by ``MUJOCO_EGL_DEVICE_ID``) fails to initialize a headless display, while
+    MuJoCo's own backend silently falls back to the llvmpipe *software* device.
+
+    When ``MUJOCO_GL=egl`` and no nvidia ICD is registered, write a minimal glvnd
+    descriptor pointing at the injected ``libEGL_nvidia.so`` and point
+    ``__EGL_VENDOR_LIBRARY_FILENAMES`` at it, so glvnd uses only nvidia EGL and
+    ``eglQueryDevicesEXT`` returns the GPUs. The vec env's ``AsyncVectorEnv`` spawn
+    workers inherit ``os.environ``, so setting it here — before the env is built —
+    reaches the worker that creates the EGL context (paired with
+    ``_pin_egl_render_device``, which selects which GPU that worker uses).
+
+    No-op unless ``MUJOCO_GL=egl``; if ``__EGL_VENDOR_LIBRARY_*`` is already set, an
+    nvidia ICD descriptor already exists, or no ``libEGL_nvidia.so`` is present (so
+    there is nothing to point at), the environment is left untouched.
+
+    Returns the descriptor path it wrote, or ``None`` if it left the environment alone.
+    """
+    if os.environ.get("MUJOCO_GL") != "egl":
+        return None
+    if os.environ.get("__EGL_VENDOR_LIBRARY_FILENAMES") or os.environ.get("__EGL_VENDOR_LIBRARY_DIRS"):
+        return None
+    # An nvidia ICD already registered with glvnd -> let it be.
+    for vendor_dir in ("/usr/share/glvnd/egl_vendor.d", "/etc/glvnd/egl_vendor.d"):
+        if glob.glob(os.path.join(vendor_dir, "*nvidia*.json")):
+            return None
+    libs = sorted(glob.glob("/usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.*")) or sorted(
+        glob.glob("/usr/lib/*/libEGL_nvidia.so.*")
+    )
+    if not libs:
+        return None
+    icd_dir = os.path.join(tempfile.gettempdir(), "opentau_egl")
+    os.makedirs(icd_dir, exist_ok=True)
+    icd_path = os.path.join(icd_dir, "10_nvidia.json")
+    # Atomic write: ranks share /tmp on a node, so a partial file must never be
+    # visible to a spawn worker reading the descriptor.
+    fd, tmp_path = tempfile.mkstemp(dir=icd_dir, suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        json.dump({"file_format_version": "1.0.0", "ICD": {"library_path": libs[-1]}}, f)
+    os.replace(tmp_path, icd_path)
+    os.environ["__EGL_VENDOR_LIBRARY_FILENAMES"] = icd_path
+    return icd_path
 
 
 def _pin_egl_render_device() -> str | None:
@@ -99,9 +154,12 @@ def make_envs(
     if n_envs < 1:
         raise ValueError("`n_envs must be at least 1")
 
-    # Under multi-GPU eval, pin each rank's EGL renderer to its own GPU before the
-    # vec env's spawn workers (which inherit os.environ) create their render context;
-    # otherwise every rank renders on GPU 0 and OOMs it. No-op unless MUJOCO_GL=egl.
+    # Make GPU EGL rendering work before the vec env's spawn workers (which inherit
+    # os.environ) create their render context. Both are no-ops unless MUJOCO_GL=egl:
+    # (1) register the nvidia EGL ICD if the container ships only Mesa's (else robosuite
+    # cannot init a headless GPU display); (2) pin each rank's renderer to its own GPU
+    # (else every rank renders on GPU 0 and OOMs it).
+    _ensure_nvidia_egl_icd()
     _pin_egl_render_device()
 
     # "spawn" is more robust (and, for libero on oracle, the only option) than "fork".
