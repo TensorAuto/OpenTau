@@ -243,7 +243,13 @@ class TestEnsureNvidiaEglIcd:
             return []
 
         monkeypatch.setattr("opentau.envs.factory.glob.glob", fake_glob)
-        monkeypatch.setattr("opentau.envs.factory.tempfile.gettempdir", lambda: str(tmp_path))
+
+        def fake_mkdtemp(prefix="", **kwargs):
+            d = tmp_path / "egl_icd"
+            d.mkdir(exist_ok=True)
+            return str(d)
+
+        monkeypatch.setattr("opentau.envs.factory.tempfile.mkdtemp", fake_mkdtemp)
         icd = _ensure_nvidia_egl_icd()
         assert icd is not None and os.path.exists(icd)
         with open(icd) as f:

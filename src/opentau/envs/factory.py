@@ -87,18 +87,14 @@ def _ensure_nvidia_egl_icd() -> str | None:
     )
     if not libs:
         return None
-    # Namespace the descriptor dir by uid: on a shared multi-tenant node a second
-    # user must not hit ``PermissionError`` writing into the first user's dir (which
-    # would crash ``make_envs``). Same-user ranks share it; the write below is atomic
-    # (mkstemp + ``os.replace``) so a partial file is never visible to a spawn worker.
-    uid = getattr(os, "getuid", os.getpid)()
-    icd_dir = os.path.join(tempfile.gettempdir(), f"opentau_egl_{uid}")
-    os.makedirs(icd_dir, exist_ok=True)
+    # Write the descriptor into a fresh private (0700) tmp dir: mkdtemp returns a
+    # unique, unpredictable path owned by this process, so there is no cross-user
+    # collision and no fixed path a co-tenant could pre-squat to break the write.
+    # Each rank makes its own; the spawn workers inherit __EGL_VENDOR_LIBRARY_FILENAMES.
+    icd_dir = tempfile.mkdtemp(prefix="opentau_egl_")
     icd_path = os.path.join(icd_dir, "10_nvidia.json")
-    fd, tmp_path = tempfile.mkstemp(dir=icd_dir, suffix=".json")
-    with os.fdopen(fd, "w") as f:
+    with open(icd_path, "w") as f:
         json.dump({"file_format_version": "1.0.0", "ICD": {"library_path": libs[0]}}, f)
-    os.replace(tmp_path, icd_path)
     os.environ["__EGL_VENDOR_LIBRARY_FILENAMES"] = icd_path
     return icd_path
 
