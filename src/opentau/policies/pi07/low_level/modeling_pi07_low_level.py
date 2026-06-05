@@ -77,6 +77,7 @@ def _global_or_branch_decisions(
     any_locals: tuple[bool, ...],
     field_names: tuple[str, ...],
     device: torch.device,
+    sync_across_ranks: bool = True,
 ) -> tuple[bool, ...]:
     """Synchronize ``embed_prefix`` branch decisions across distributed ranks.
 
@@ -117,6 +118,16 @@ def _global_or_branch_decisions(
             (used in the divergence error message).
         device: Device to allocate the all-reduce buffer on; must match the
             distributed backend (typically the policy's CUDA device).
+        sync_across_ranks: When ``True`` (training default), OR-reduce the
+            decisions across ranks. When ``False`` (threaded explicitly from the
+            independent sim-eval rollout path — ``sample_actions``), skip the
+            all-reduce and return the local decision — required because the
+            per-rank-independent eval rollouts call
+            the forward a different number of times, so a per-step collective
+            here would desync at NCCL (one rank's ALLREDUCE vs another's later
+            post-eval ALLGATHER). Safe under replicated params (DDP / ZeRO-1/2),
+            where the eval forward fires no other cross-rank collective; not
+            safe under ZeRO-3 / FSDP sharded-param eval (guarded in train.py).
 
     Returns:
         A tuple of OR-reduced ``has_*`` booleans, one per ``any_locals`` entry,
@@ -133,7 +144,7 @@ def _global_or_branch_decisions(
             f"must have the same length, got "
             f"{len(presence_locals)}/{n}/{len(field_names)}."
         )
-    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+    if not sync_across_ranks or not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return tuple(bool(a) for a in any_locals)
     # One SUM all-reduce over [presence | any]: SUM lets us derive both the
     # OR (sum > 0) for the any flags and the cross-rank-agreement check
@@ -1462,6 +1473,7 @@ class PI07LowLevelFlowMatching(nn.Module):
         subgoal_images: list[Tensor] | None = None,
         subgoal_img_masks: list[Tensor] | None = None,
         group_index: Tensor | None = None,
+        sync_across_ranks: bool = True,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Embed all prefix modalities and build the 1-D attention pattern.
 
@@ -1576,6 +1588,7 @@ class PI07LowLevelFlowMatching(nn.Module):
             any_locals=(has_response_local, has_subgoal_local, has_metadata_local),
             field_names=("response", "subgoal", "metadata"),
             device=device,
+            sync_across_ranks=sync_across_ranks,
         )
         has_any_optional = bool(has_response or has_subgoal or has_metadata)
 
@@ -2177,6 +2190,9 @@ class PI07LowLevelFlowMatching(nn.Module):
             subgoal_img_masks=subgoal_img_masks,
             obs_history_is_pad=obs_history_is_pad,
             group_index=group_index,
+            # Independent per-rank rollout (sim eval): skip the cross-rank branch
+            # all-reduce so variable-length rollouts don't desync at NCCL.
+            sync_across_ranks=False,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1

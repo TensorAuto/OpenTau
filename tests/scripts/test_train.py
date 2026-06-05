@@ -23,7 +23,9 @@ isolated coverage.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import accelerate
 import pytest
@@ -32,6 +34,7 @@ import torch
 from opentau.scripts.train import (
     _bucket_per_sample,
     _commit_wandb_step,
+    _eval_with_fresh_envs,
     _find_unused_params_from_env,
     _mixture_weighted_aggregate,
     _sync_deepspeed_gradient_accumulation_steps,
@@ -326,6 +329,68 @@ class TestCommitWandbStep:
         _commit_wandb_step(accelerator, 1234)
 
         assert calls == [({}, 1234, {"wandb": {"commit": True}})]
+
+
+class TestEvalWithFreshEnvs:
+    """``_eval_with_fresh_envs`` builds eval envs, runs eval, and ALWAYS closes them.
+
+    Per-eval teardown frees the sim renderer's non-PyTorch GPU memory before
+    training resumes (otherwise it stacks with the regrown training footprint
+    and OOMs the next backward). The ``finally`` must close the envs even when
+    the eval itself raises.
+    """
+
+    @staticmethod
+    def _cfg():
+        return SimpleNamespace(
+            env=SimpleNamespace(max_parallel_tasks=1),
+            eval=SimpleNamespace(
+                batch_size=2,
+                use_async_envs=True,
+                n_episodes=2,
+                max_episodes_rendered=0,
+                grid_size=None,
+            ),
+            policy=SimpleNamespace(use_amp=False),
+            output_dir=Path("/tmp/opentau_eval_test"),
+            seed=0,
+        )
+
+    def test_builds_and_closes_each_call(self, monkeypatch):
+        envs1 = {"robocasa": {0: object()}}
+        envs2 = {"robocasa": {0: object()}}
+        make = Mock(side_effect=[envs1, envs2])
+        close = Mock()
+        ep_all = Mock(return_value={"overall": {}})
+        monkeypatch.setattr("opentau.scripts.train.make_envs", make)
+        monkeypatch.setattr("opentau.scripts.train.close_envs", close)
+        monkeypatch.setattr("opentau.scripts.train.eval_policy_all", ep_all)
+
+        acc = SimpleNamespace(device=SimpleNamespace(type="cpu"))
+        cfg = self._cfg()
+        out1 = _eval_with_fresh_envs(cfg, Mock(), acc, None, "000010")
+        out2 = _eval_with_fresh_envs(cfg, Mock(), acc, None, "000020")
+
+        assert make.call_count == 2
+        assert close.call_count == 2
+        # The exact env dict built each call is the one handed to close (lifecycle pairing).
+        assert [c.args[0] for c in close.call_args_list] == [envs1, envs2]
+        assert out1 is ep_all.return_value
+        assert out2 is ep_all.return_value
+
+    def test_closes_even_when_eval_raises(self, monkeypatch):
+        envs = {"robocasa": {0: object()}}
+        make = Mock(return_value=envs)
+        close = Mock()
+        boom = Mock(side_effect=RuntimeError("eval blew up"))
+        monkeypatch.setattr("opentau.scripts.train.make_envs", make)
+        monkeypatch.setattr("opentau.scripts.train.close_envs", close)
+        monkeypatch.setattr("opentau.scripts.train.eval_policy_all", boom)
+
+        acc = SimpleNamespace(device=SimpleNamespace(type="cpu"))
+        with pytest.raises(RuntimeError, match="eval blew up"):
+            _eval_with_fresh_envs(self._cfg(), Mock(), acc, None, "000010")
+        close.assert_called_once_with(envs)
 
 
 if __name__ == "__main__":

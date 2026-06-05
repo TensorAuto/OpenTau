@@ -2418,6 +2418,59 @@ class TestPI07PaligemmaLowLevelSubgoalEmbedding:
         # No image item at all → skip (and no crash deriving the device).
         assert not model._global_run_image_tower([text])
 
+    def test_global_run_image_tower_sync_across_ranks_false_skips_collective(self, monkeypatch):
+        """``sync_across_ranks=False`` (set on the independent sim-eval rollout path) gates the
+        hoisted collective off, so each rank uses its LOCAL decision and fires NO all-reduce —
+        even with a process group "initialized". This is what lets variable-length per-rank eval
+        rollouts not desync. (The default ``True`` keeps training + validation in lockstep.)"""
+        bsz, h = 2, 8
+        model = TestPI07PaligemmaLowLevelResponseEmbedding._make_mock_model(hidden_size=h)
+
+        n_all_reduce = {"n": 0}
+        monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(
+            torch.distributed,
+            "all_reduce",
+            lambda *a, **k: n_all_reduce.__setitem__("n", n_all_reduce["n"] + 1),
+        )
+
+        def _img(mask):
+            return ContextItem(
+                data=torch.zeros(bsz, 3, 224, 224), item_type="image", pad_mask=mask, attention="continue"
+            )
+
+        text = ContextItem(
+            data=torch.zeros(bsz, 3, dtype=torch.long),
+            item_type="text",
+            pad_mask=torch.ones(bsz, 3, dtype=torch.bool),
+            attention="continue",
+        )
+        # Local OR over image items, with NO cross-rank collective fired.
+        assert model._global_run_image_tower(
+            [text, _img(torch.zeros(bsz, dtype=torch.bool)), _img(torch.tensor([False, True]))],
+            sync_across_ranks=False,
+        )
+        assert not model._global_run_image_tower(
+            [text, _img(torch.zeros(bsz, dtype=torch.bool))], sync_across_ranks=False
+        )
+        assert n_all_reduce["n"] == 0
+
+    def test_global_run_image_tower_default_syncs_across_ranks(self):
+        """The flag defaults to ``True`` so training + (lockstep) validation keep the
+        cross-rank OR-reduce — guards against silently disabling it for those paths."""
+        import inspect
+
+        from opentau.policies.pi07_paligemma.low_level.modeling_pi07_low_level import (
+            PI07PaligemmaLowLevelFlowMatching,
+        )
+
+        for fn in (
+            PI07PaligemmaLowLevelFlowMatching._global_run_image_tower,
+            PI07PaligemmaLowLevelFlowMatching.embed_prefix,
+        ):
+            assert inspect.signature(fn).parameters["sync_across_ranks"].default is True
+
     # ------------------------------------------------------------------ #
     # DDP lockstep: the hoisted ``_global_run_image_tower`` collective must make
     # the run/skip decision follow the *global* OR (not each rank's local

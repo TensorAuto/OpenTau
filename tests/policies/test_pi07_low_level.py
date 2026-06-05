@@ -23,6 +23,7 @@ from opentau.policies.pi07.low_level.configuration_pi07_low_level import (
 from opentau.policies.pi07.low_level.modeling_pi07_low_level import (
     PI07LowLevelFlowMatching,
     PI07LowLevelPolicy,
+    _global_or_branch_decisions,
     make_att_2d_masks,
 )
 
@@ -1030,3 +1031,46 @@ class TestPI07LowLevelExecutionHorizon:
         a_next = PI07LowLevelPolicy.select_action(policy, batch)
         assert calls["n"] == 2
         assert a_next[0, 0].item() == 2000.0
+
+
+class TestGlobalOrBranchDecisionsSyncGuard:
+    """``_global_or_branch_decisions(sync_across_ranks=...)`` gates the cross-rank all-reduce.
+
+    During eval/inference each rank rolls out independently, so the branch
+    all-reduce must be skipped (``sync_across_ranks=False``, threaded explicitly
+    from the sim-eval rollout entry point) — otherwise ranks call the forward a
+    different number of times and the mismatched collectives deadlock at NCCL.
+    """
+
+    def test_sync_across_ranks_false_skips_collective_returns_local(self, monkeypatch):
+        called = {"n": 0}
+        monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(
+            torch.distributed,
+            "all_reduce",
+            lambda *a, **k: called.__setitem__("n", called["n"] + 1),
+        )
+        out = _global_or_branch_decisions(
+            presence_locals=(True, True, False),
+            any_locals=(True, False, False),
+            field_names=("response", "subgoal", "metadata"),
+            device=torch.device("cpu"),
+            sync_across_ranks=False,
+        )
+        assert out == (True, False, False)  # local any_locals, returned un-reduced
+        assert called["n"] == 0  # no collective fired in eval/inference
+
+    def test_default_sync_across_ranks_is_true(self):
+        import inspect
+
+        sig = inspect.signature(_global_or_branch_decisions)
+        assert sig.parameters["sync_across_ranks"].default is True
+
+    def test_embed_prefix_defaults_to_sync_on(self):
+        """embed_prefix defaults sync_across_ranks=True, so training + (lockstep) validation
+        keep the cross-rank OR-reduce; only the independent sim-eval rollout passes False."""
+        import inspect
+
+        sig = inspect.signature(PI07LowLevelFlowMatching.embed_prefix)
+        assert sig.parameters["sync_across_ranks"].default is True

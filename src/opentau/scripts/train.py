@@ -73,6 +73,50 @@ from opentau.utils.utils import (
 )
 
 
+def _eval_with_fresh_envs(
+    cfg: TrainPipelineConfig,
+    policy: PreTrainedPolicy,
+    accelerator: accelerate.Accelerator,
+    eval_subgoal_generator,
+    step_id: str,
+) -> dict:
+    r"""Build the in-training eval envs, run one ``eval_policy_all``, and ALWAYS tear them down.
+
+    The eval envs are created per-eval and closed in a ``finally`` so the sim
+    renderer's GPU memory is released before training resumes. RoboCasa's
+    ``AsyncVectorEnv`` spawn workers hold their EGL render contexts as
+    *non-PyTorch* device memory (~GiB per env) that ``torch.cuda.empty_cache``
+    cannot reclaim; left open across an eval it stacks with the regrown training
+    footprint and OOMs the next backward. Mirrors the standalone eval lifecycle
+    in ``eval.py`` (build -> eval -> ``close_envs``).
+
+    Returns this rank's local ``eval_info`` (the caller gathers across ranks).
+    """
+    eval_envs = make_envs(cfg.env, cfg, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
+    try:
+        with (
+            torch.no_grad(),
+            torch.autocast(device_type=accelerator.device.type) if cfg.policy.use_amp else nullcontext(),
+        ):
+            return eval_policy_all(
+                eval_envs,
+                policy,
+                cfg.eval.n_episodes,
+                cfg,
+                videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
+                max_episodes_rendered=cfg.eval.max_episodes_rendered,
+                grid_size=cfg.eval.grid_size,
+                start_seed=cfg.seed,
+                max_parallel_tasks=cfg.env.max_parallel_tasks,
+                subgoal_generator=eval_subgoal_generator,
+            )
+    finally:
+        close_envs(eval_envs)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 def update_policy(
     train_config: TrainPipelineConfig,
     train_metrics: MetricsTracker,
@@ -600,15 +644,31 @@ def train(cfg: TrainPipelineConfig):
     else:
         train_dataset = make_dataset_mixture(cfg)
 
-    # Create environment used for evaluating checkpoints during training on simulation data.
-    # On real-world data, no need to create an environment as evaluations are done outside train.py,
-    eval_envs = None
+    # Eval envs for in-training sim eval are built *per eval* (inside the eval branch,
+    # via _eval_with_fresh_envs) and torn down immediately after, so the sim renderer's
+    # non-PyTorch GPU memory doesn't persist into training steps and OOM the next backward.
+    # On real-world data, no env is needed (eval runs outside train.py).
     eval_subgoal_generator = None
     if cfg.eval_freq > 0 and cfg.env is not None:
-        logging.info("Creating env")
-        eval_envs = make_envs(
-            cfg.env, cfg, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs
-        )
+        # Per-rank-independent eval rollouts require the eval forward to fire no
+        # cross-rank collective (``_global_or_branch_decisions`` is gated off in eval).
+        # Under parameter sharding the forward still all-gathers params per layer,
+        # which WOULD desync across the independent rollouts and hang at NCCL — fail
+        # fast instead of hanging hours into a run.
+        sharded_params = accelerator.distributed_type == accelerate.DistributedType.FSDP
+        if accelerator.distributed_type == accelerate.DistributedType.DEEPSPEED:
+            zero_stage = accelerator.deepspeed_plugin.hf_ds_config.config.get("zero_optimization", {}).get(
+                "stage", 0
+            )
+            sharded_params = zero_stage >= 3
+        if sharded_params:
+            raise ValueError(
+                "In-training simulation eval (eval_freq > 0 with a sim env) is not "
+                "supported under parameter sharding (DeepSpeed ZeRO-3 or FSDP): each "
+                "rank rolls out independently, so the sharded-param all-gathers in the "
+                "eval forward desync across ranks and hang at NCCL. Use ZeRO-1/2 (params "
+                "replicated), or run eval out-of-process on saved checkpoints."
+            )
         eval_subgoal_generator = make_subgoal_generator(cfg)
 
     logging.info("Creating policy")
@@ -1116,11 +1176,11 @@ def train(cfg: TrainPipelineConfig):
             # other processes wait for the main process to finish saving
             accelerator.wait_for_everyone()
 
-        if is_eval_step and eval_envs:
+        if is_eval_step and cfg.env is not None:
             # Return the allocator's cached-but-unused blocks (freed training
             # activations) to the CUDA driver before eval, so eval runs at a lower
-            # peak and any non-PyTorch GPU consumer (e.g. an EGL render context for
-            # sim eval) has room. Training re-grows the cache on the next step.
+            # peak and the sim's non-PyTorch EGL render context has room. Training
+            # re-grows the cache on the next step.
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -1131,22 +1191,9 @@ def train(cfg: TrainPipelineConfig):
                 pre_eval_alloc_gib = pre_eval_resv_gib = 0.0
             step_id = get_step_identifier(step, cfg.steps)
             logging.info(f"Eval policy at step {step}")
-            with (
-                torch.no_grad(),
-                torch.autocast(device_type=accelerator.device.type) if cfg.policy.use_amp else nullcontext(),
-            ):
-                eval_info = eval_policy_all(
-                    eval_envs,
-                    policy,
-                    cfg.eval.n_episodes,
-                    cfg,
-                    videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
-                    max_episodes_rendered=cfg.eval.max_episodes_rendered,
-                    grid_size=cfg.eval.grid_size,
-                    start_seed=cfg.seed,
-                    max_parallel_tasks=cfg.env.max_parallel_tasks,
-                    subgoal_generator=eval_subgoal_generator,
-                )
+            # Build eval envs, run eval, then tear them down so the sim renderer's
+            # GPU memory is freed before training resumes (see _eval_with_fresh_envs).
+            eval_info = _eval_with_fresh_envs(cfg, policy, accelerator, eval_subgoal_generator, step_id)
 
             eval_info = gather_object([eval_info])  # gather across all accelerator processes
             if accelerator.is_main_process:
@@ -1239,11 +1286,10 @@ def train(cfg: TrainPipelineConfig):
         # conditions that gate the logging blocks above, so we only commit on
         # steps that actually logged, and only on main where the trackers live.
         # See issue #353.
-        if accelerator.is_main_process and (is_log_step or is_val_step or (is_eval_step and eval_envs)):
+        if accelerator.is_main_process and (
+            is_log_step or is_val_step or (is_eval_step and cfg.env is not None)
+        ):
             _commit_wandb_step(accelerator, step)
-
-    if cfg.eval_freq > 0 and eval_envs:
-        close_envs(eval_envs)
 
     accelerator.end_training()
     if accelerator.is_main_process:
