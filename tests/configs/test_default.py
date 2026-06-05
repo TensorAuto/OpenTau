@@ -19,7 +19,7 @@ from pathlib import Path
 import draccus
 import pytest
 
-from opentau.configs.default import DatasetConfig, DatasetMixtureConfig
+from opentau.configs.default import DatasetConfig, DatasetMixtureConfig, WandBConfig
 from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
 
 
@@ -226,6 +226,23 @@ def test_invalid_negative_bare_dataset_tolerance_raises():
         match=r"`DatasetConfig\.tolerance_s` must be >= 0 \(or None to inherit\), got -1\.0 for foo/bar",
     ):
         DatasetConfig(repo_id="foo/bar", tolerance_s=-1.0)
+
+
+class TestWandBConfig:
+    """Cover the optional ``disable_video`` flag on ``WandBConfig``."""
+
+    def test_disable_video_defaults_to_false(self):
+        """Videos are logged by default — the flag is opt-in (like
+        ``disable_artifact``), so existing runs keep logging eval videos."""
+        assert WandBConfig().disable_video is False
+
+    def test_disable_video_excluded_from_wandb_init_kwargs(self):
+        """``disable_video`` is an OpenTau-side switch, not a ``wandb.init()``
+        argument, so ``to_wandb_kwargs`` must drop it (mirroring
+        ``disable_artifact``); leaking it would make ``wandb.init()`` reject an
+        unknown keyword."""
+        cfg = WandBConfig(disable_video=True)
+        assert "disable_video" not in cfg.to_wandb_kwargs()
 
 
 class TestDatasetConfigDataMapping:
