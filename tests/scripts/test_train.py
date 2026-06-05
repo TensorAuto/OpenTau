@@ -34,6 +34,7 @@ import torch
 from opentau.scripts.train import (
     _bucket_per_sample,
     _commit_wandb_step,
+    _eval_with_fresh_envs,
     _find_unused_params_from_env,
     _mixture_weighted_aggregate,
     _sync_deepspeed_gradient_accumulation_steps,
@@ -356,21 +357,19 @@ class TestEvalWithFreshEnvs:
         )
 
     def test_builds_and_closes_each_call(self, monkeypatch):
-        import opentau.scripts.train as train_mod
-
         envs1 = {"robocasa": {0: object()}}
         envs2 = {"robocasa": {0: object()}}
         make = Mock(side_effect=[envs1, envs2])
         close = Mock()
         ep_all = Mock(return_value={"overall": {}})
-        monkeypatch.setattr(train_mod, "make_envs", make)
-        monkeypatch.setattr(train_mod, "close_envs", close)
-        monkeypatch.setattr(train_mod, "eval_policy_all", ep_all)
+        monkeypatch.setattr("opentau.scripts.train.make_envs", make)
+        monkeypatch.setattr("opentau.scripts.train.close_envs", close)
+        monkeypatch.setattr("opentau.scripts.train.eval_policy_all", ep_all)
 
         acc = SimpleNamespace(device=SimpleNamespace(type="cpu"))
         cfg = self._cfg()
-        out1 = train_mod._eval_with_fresh_envs(cfg, Mock(), acc, None, "000010")
-        out2 = train_mod._eval_with_fresh_envs(cfg, Mock(), acc, None, "000020")
+        out1 = _eval_with_fresh_envs(cfg, Mock(), acc, None, "000010")
+        out2 = _eval_with_fresh_envs(cfg, Mock(), acc, None, "000020")
 
         assert make.call_count == 2
         assert close.call_count == 2
@@ -380,19 +379,17 @@ class TestEvalWithFreshEnvs:
         assert out2 is ep_all.return_value
 
     def test_closes_even_when_eval_raises(self, monkeypatch):
-        import opentau.scripts.train as train_mod
-
         envs = {"robocasa": {0: object()}}
         make = Mock(return_value=envs)
         close = Mock()
         boom = Mock(side_effect=RuntimeError("eval blew up"))
-        monkeypatch.setattr(train_mod, "make_envs", make)
-        monkeypatch.setattr(train_mod, "close_envs", close)
-        monkeypatch.setattr(train_mod, "eval_policy_all", boom)
+        monkeypatch.setattr("opentau.scripts.train.make_envs", make)
+        monkeypatch.setattr("opentau.scripts.train.close_envs", close)
+        monkeypatch.setattr("opentau.scripts.train.eval_policy_all", boom)
 
         acc = SimpleNamespace(device=SimpleNamespace(type="cpu"))
         with pytest.raises(RuntimeError, match="eval blew up"):
-            train_mod._eval_with_fresh_envs(self._cfg(), Mock(), acc, None, "000010")
+            _eval_with_fresh_envs(self._cfg(), Mock(), acc, None, "000010")
         close.assert_called_once_with(envs)
 
 

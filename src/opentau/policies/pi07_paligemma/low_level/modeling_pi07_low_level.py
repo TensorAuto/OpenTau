@@ -1873,7 +1873,7 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         """
         return self.video_encoder(video, obs_history_is_pad=obs_history_is_pad)
 
-    def _global_run_image_tower(self, items: list[ContextItem]) -> bool:
+    def _global_run_image_tower(self, items: list[ContextItem], sync_across_ranks: bool = True) -> bool:
         """Decide once, across all ranks, whether the subgoal image tower runs.
 
         :meth:`embed_prefix` calls this exactly once per forward — before the
@@ -1914,7 +1914,7 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
             any_locals=(subgoal_any_local,),
             field_names=("subgoal_image",),
             device=items[0].data.device,
-            sync_across_ranks=self.training,
+            sync_across_ranks=sync_across_ranks,
         )
         return run_image_tower
 
@@ -2066,7 +2066,7 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         raise ValueError(f"Unknown attention mode: {mode!r}")
 
     def embed_prefix(
-        self, items: list[ContextItem], group_index: Tensor | None = None
+        self, items: list[ContextItem], group_index: Tensor | None = None, sync_across_ranks: bool = True
     ) -> tuple[Tensor, Tensor, Tensor, int]:
         """Embed a layout-agnostic list of ``ContextItem``s into the prefix.
 
@@ -2095,7 +2095,7 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         # rank, before the loop) and threaded into each item — see
         # _global_run_image_tower for why the collective must not live inside
         # the per-item ``image`` branch.
-        run_image_tower = self._global_run_image_tower(items)
+        run_image_tower = self._global_run_image_tower(items, sync_across_ranks=sync_across_ranks)
 
         cross_att_running = 0
         cross_att_locked = False
@@ -2383,7 +2383,11 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
             The sampled action tensor.
         """
         prefix_embs, prefix_pad_masks, prefix_att_masks, num_cross_att_tokens = self.embed_prefix(
-            prefix_items, group_index=group_index
+            # Independent per-rank rollout (sim eval): skip the cross-rank branch
+            # all-reduce so variable-length rollouts don't desync at NCCL.
+            prefix_items,
+            group_index=group_index,
+            sync_across_ranks=False,
         )
         bsize = prefix_embs.shape[0]
         device = prefix_embs.device

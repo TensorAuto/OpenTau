@@ -1472,6 +1472,7 @@ class PI07LowLevelFlowMatching(nn.Module):
         subgoal_images: list[Tensor] | None = None,
         subgoal_img_masks: list[Tensor] | None = None,
         group_index: Tensor | None = None,
+        sync_across_ranks: bool = True,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Embed all prefix modalities and build the 1-D attention pattern.
 
@@ -1586,7 +1587,7 @@ class PI07LowLevelFlowMatching(nn.Module):
             any_locals=(has_response_local, has_subgoal_local, has_metadata_local),
             field_names=("response", "subgoal", "metadata"),
             device=device,
-            sync_across_ranks=self.training,
+            sync_across_ranks=sync_across_ranks,
         )
         has_any_optional = bool(has_response or has_subgoal or has_metadata)
 
@@ -2188,6 +2189,9 @@ class PI07LowLevelFlowMatching(nn.Module):
             subgoal_img_masks=subgoal_img_masks,
             obs_history_is_pad=obs_history_is_pad,
             group_index=group_index,
+            # Independent per-rank rollout (sim eval): skip the cross-rank branch
+            # all-reduce so variable-length rollouts don't desync at NCCL.
+            sync_across_ranks=False,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1

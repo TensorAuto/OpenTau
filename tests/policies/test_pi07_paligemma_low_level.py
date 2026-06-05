@@ -700,10 +700,6 @@ class TestPI07PaligemmaLowLevelStateEmbedding:
         drive ``embed_prefix`` on CPU with non-zero state embeddings."""
         h = hidden_size
         model = object.__new__(PI07PaligemmaLowLevelFlowMatching)
-        # Fabricated via object.__new__ (no nn.Module.__init__), so mirror a real
-        # module's default train mode: embed_prefix / _global_run_image_tower read
-        # self.training to gate the cross-rank branch all-reduce (sync_across_ranks).
-        model.training = True
 
         # num_image_tokens mirrors embed_image's 4-token output below, so the
         # image-tower skip path (zeros of that width) matches the run path.
@@ -1278,10 +1274,6 @@ class TestPI07PaligemmaLowLevelResponseEmbedding:
     def _make_mock_model(cls, hidden_size: int = 8):
         h = hidden_size
         model = object.__new__(PI07PaligemmaLowLevelFlowMatching)
-        # Fabricated via object.__new__ (no nn.Module.__init__), so mirror a real
-        # module's default train mode: embed_prefix / _global_run_image_tower read
-        # self.training to gate the cross-rank branch all-reduce (sync_across_ranks).
-        model.training = True
 
         # num_image_tokens mirrors embed_image's 4-token output below, so the
         # image-tower skip path (zeros of that width) matches the run path.
@@ -2426,13 +2418,13 @@ class TestPI07PaligemmaLowLevelSubgoalEmbedding:
         # No image item at all → skip (and no crash deriving the device).
         assert not model._global_run_image_tower([text])
 
-    def test_global_run_image_tower_eval_mode_skips_collective(self, monkeypatch):
-        """In eval mode the hoisted collective is gated off (``sync_across_ranks=self.training``),
-        so each rank uses its LOCAL decision and fires NO all-reduce — even with a process
-        group "initialized". This is what lets independent per-rank eval rollouts not desync."""
+    def test_global_run_image_tower_sync_across_ranks_false_skips_collective(self, monkeypatch):
+        """``sync_across_ranks=False`` (set on the independent sim-eval rollout path) gates the
+        hoisted collective off, so each rank uses its LOCAL decision and fires NO all-reduce —
+        even with a process group "initialized". This is what lets variable-length per-rank eval
+        rollouts not desync. (The default ``True`` keeps training + validation in lockstep.)"""
         bsz, h = 2, 8
         model = TestPI07PaligemmaLowLevelResponseEmbedding._make_mock_model(hidden_size=h)
-        model.training = False  # eval mode (the fabricated mock has no nn.Module .eval() machinery)
 
         n_all_reduce = {"n": 0}
         monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
@@ -2456,10 +2448,28 @@ class TestPI07PaligemmaLowLevelSubgoalEmbedding:
         )
         # Local OR over image items, with NO cross-rank collective fired.
         assert model._global_run_image_tower(
-            [text, _img(torch.zeros(bsz, dtype=torch.bool)), _img(torch.tensor([False, True]))]
+            [text, _img(torch.zeros(bsz, dtype=torch.bool)), _img(torch.tensor([False, True]))],
+            sync_across_ranks=False,
         )
-        assert not model._global_run_image_tower([text, _img(torch.zeros(bsz, dtype=torch.bool))])
+        assert not model._global_run_image_tower(
+            [text, _img(torch.zeros(bsz, dtype=torch.bool))], sync_across_ranks=False
+        )
         assert n_all_reduce["n"] == 0
+
+    def test_global_run_image_tower_default_syncs_across_ranks(self):
+        """The flag defaults to ``True`` so training + (lockstep) validation keep the
+        cross-rank OR-reduce — guards against silently disabling it for those paths."""
+        import inspect
+
+        from opentau.policies.pi07_paligemma.low_level.modeling_pi07_low_level import (
+            PI07PaligemmaLowLevelFlowMatching,
+        )
+
+        for fn in (
+            PI07PaligemmaLowLevelFlowMatching._global_run_image_tower,
+            PI07PaligemmaLowLevelFlowMatching.embed_prefix,
+        ):
+            assert inspect.signature(fn).parameters["sync_across_ranks"].default is True
 
     # ------------------------------------------------------------------ #
     # DDP lockstep: the hoisted ``_global_run_image_tower`` collective must make

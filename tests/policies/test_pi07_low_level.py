@@ -1066,3 +1066,11 @@ class TestGlobalOrBranchDecisionsSyncGuard:
 
         sig = inspect.signature(_global_or_branch_decisions)
         assert sig.parameters["sync_across_ranks"].default is True
+
+    def test_embed_prefix_defaults_to_sync_on(self):
+        """embed_prefix defaults sync_across_ranks=True, so training + (lockstep) validation
+        keep the cross-rank OR-reduce; only the independent sim-eval rollout passes False."""
+        import inspect
+
+        sig = inspect.signature(PI07LowLevelFlowMatching.embed_prefix)
+        assert sig.parameters["sync_across_ranks"].default is True
