@@ -17,12 +17,14 @@
 r"""This module contains factory methods to create environments based on their configuration."""
 
 import importlib
+import os
 from functools import partial
 
 import gymnasium as gym
 
 from opentau.configs.train import TrainPipelineConfig
 from opentau.envs.configs import EnvConfig, LiberoEnv, RoboCasaEnv
+from opentau.utils.accelerate_utils import get_proc_accelerator
 
 
 def make_env_config(env_type: str, **kwargs) -> EnvConfig:
@@ -35,6 +37,35 @@ def make_env_config(env_type: str, **kwargs) -> EnvConfig:
         return RoboCasaEnv(**kwargs)
     else:
         raise ValueError(f"Env type '{env_type}' is not available.")
+
+
+def _pin_egl_render_device() -> str | None:
+    r"""Pin this rank's MuJoCo EGL renderer to its own GPU, for multi-GPU sim eval.
+
+    MuJoCo's EGL backend (``mujoco.egl.create_initialized_egl_device_display``)
+    selects the render GPU from ``MUJOCO_EGL_DEVICE_ID`` and falls back to EGL
+    device 0 when it is unset — and robosuite forwards a ``device_id`` that
+    ``mujoco.egl`` ignores. So under multi-rank eval *every* rank would render on
+    GPU 0, overloading it (it also holds rank 0's resident training state, so it
+    typically OOMs) while the other GPUs render nothing. Setting the variable to
+    the local process index makes each rank render on its own GPU.
+
+    No-op unless ``MUJOCO_GL=egl``; an explicit ``MUJOCO_EGL_DEVICE_ID`` is left
+    untouched, and so is the single-process / no-accelerator case (device 0 is
+    correct there). The vec env's ``AsyncVectorEnv`` spawn workers inherit
+    ``os.environ``, so setting it here — before the env is built — reaches the
+    worker that actually creates the EGL context.
+
+    Returns the value it set, or ``None`` if it left the environment untouched.
+    """
+    if os.environ.get("MUJOCO_GL") != "egl" or "MUJOCO_EGL_DEVICE_ID" in os.environ:
+        return None
+    acc = get_proc_accelerator()
+    if acc is None:
+        return None
+    device_id = str(acc.local_process_index)
+    os.environ["MUJOCO_EGL_DEVICE_ID"] = device_id
+    return device_id
 
 
 def make_envs(
@@ -60,6 +91,11 @@ def make_envs(
 
     if n_envs < 1:
         raise ValueError("`n_envs must be at least 1")
+
+    # Under multi-GPU eval, pin each rank's EGL renderer to its own GPU before the
+    # vec env's spawn workers (which inherit os.environ) create their render context;
+    # otherwise every rank renders on GPU 0 and OOMs it. No-op unless MUJOCO_GL=egl.
+    _pin_egl_render_device()
 
     # "spawn" is more robust (and, for libero on oracle, the only option) than "fork".
     # Caveat is that the entry point must be protected by `if __name__ == "__main__":`.

@@ -15,13 +15,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from unittest.mock import Mock, patch
 
 import pytest
 
 from opentau.configs.train import TrainPipelineConfig
 from opentau.envs.configs import LiberoEnv, RoboCasaEnv
-from opentau.envs.factory import make_env_config, make_envs
+from opentau.envs.factory import _pin_egl_render_device, make_env_config, make_envs
 
 
 class TestMakeEnvConfig:
@@ -115,3 +116,40 @@ class TestMakeEnv:
             assert isinstance(result, dict)
             assert isinstance(result.get("libero_10"), dict)
             assert result["libero_10"].get(0) is mock_vector_env
+
+
+class TestPinEglRenderDevice:
+    """`_pin_egl_render_device` pins each rank's MuJoCo EGL render to its own GPU.
+
+    Without it, ``mujoco.egl`` defaults every rank to EGL device 0, so multi-GPU
+    sim eval piles all ranks onto GPU 0 and OOMs it. These are pure env-var checks
+    (no GPU, no sim import); ``monkeypatch`` restores the environment after each.
+    """
+
+    def test_sets_local_process_index_under_egl(self, monkeypatch):
+        monkeypatch.setenv("MUJOCO_GL", "egl")
+        monkeypatch.delenv("MUJOCO_EGL_DEVICE_ID", raising=False)
+        with patch("opentau.envs.factory.get_proc_accelerator", return_value=Mock(local_process_index=3)):
+            assert _pin_egl_render_device() == "3"
+        assert os.environ["MUJOCO_EGL_DEVICE_ID"] == "3"
+
+    def test_noop_when_render_backend_is_not_egl(self, monkeypatch):
+        monkeypatch.setenv("MUJOCO_GL", "osmesa")
+        monkeypatch.delenv("MUJOCO_EGL_DEVICE_ID", raising=False)
+        with patch("opentau.envs.factory.get_proc_accelerator", return_value=Mock(local_process_index=2)):
+            assert _pin_egl_render_device() is None
+        assert "MUJOCO_EGL_DEVICE_ID" not in os.environ
+
+    def test_respects_explicit_device_id(self, monkeypatch):
+        monkeypatch.setenv("MUJOCO_GL", "egl")
+        monkeypatch.setenv("MUJOCO_EGL_DEVICE_ID", "5")
+        with patch("opentau.envs.factory.get_proc_accelerator", return_value=Mock(local_process_index=3)):
+            assert _pin_egl_render_device() is None
+        assert os.environ["MUJOCO_EGL_DEVICE_ID"] == "5"
+
+    def test_noop_without_accelerator(self, monkeypatch):
+        monkeypatch.setenv("MUJOCO_GL", "egl")
+        monkeypatch.delenv("MUJOCO_EGL_DEVICE_ID", raising=False)
+        with patch("opentau.envs.factory.get_proc_accelerator", return_value=None):
+            assert _pin_egl_render_device() is None
+        assert "MUJOCO_EGL_DEVICE_ID" not in os.environ
