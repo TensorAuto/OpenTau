@@ -1914,6 +1914,7 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
             any_locals=(subgoal_any_local,),
             field_names=("subgoal_image",),
             device=items[0].data.device,
+            sync_across_ranks=self.training,
         )
         return run_image_tower
 

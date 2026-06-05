@@ -778,6 +778,9 @@ def _make_fake_flow_matching(*, hidden: int = 4, n_video_tokens: int = 3):
         embed_video=_embed_video,
         config=types.SimpleNamespace(discrete_action_max_length=2),
         _apply_proj=PI07LowLevelFlowMatching._apply_proj,
+        # embed_prefix reads self.training to gate the cross-rank branch all-reduce
+        # (sync_across_ranks); single-process here, so the value only needs to exist.
+        training=True,
     )
     return fake
 
