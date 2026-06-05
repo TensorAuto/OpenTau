@@ -17,11 +17,18 @@
 """Utilities for file I/O operations.
 
 This module provides functions for reading and writing JSON files, saving videos,
-and deserializing JSON data into structured objects with type checking.
+and deserializing JSON data into structured objects with type checking. It also
+provides :func:`silence_output_unless_error` for muting noisy subprocess output
+(captured and replayed only if the wrapped block raises).
 """
 
+import contextlib
 import json
+import os
+import sys
+import tempfile
 import warnings
+from collections.abc import Iterator
 from pathlib import Path
 from typing import TypeVar
 
@@ -29,6 +36,65 @@ import imageio
 
 JsonLike = str | int | float | bool | None | list["JsonLike"] | dict[str, "JsonLike"] | tuple["JsonLike", ...]
 T = TypeVar("T", bound=JsonLike)
+
+
+@contextlib.contextmanager
+def silence_output_unless_error(label: str = "") -> Iterator[None]:
+    r"""Mute this process's stdout/stderr for the block, replaying it only on error.
+
+    Redirection happens at the **file-descriptor** level (``os.dup2`` on fds 1 and
+    2), not by swapping ``sys.stdout`` / ``sys.stderr``. That is what lets it capture
+    output a Python-level :func:`contextlib.redirect_stdout` would miss: writes from
+    C extensions (mujoco / EGL) and ``logging`` handlers that grabbed a reference to
+    the original stream at import time (e.g. robosuite's logger).
+
+    The motivating use is muting the noisy one-per-worker robosuite/robocasa
+    import-and-construction banner emitted inside ``gym.vector.AsyncVectorEnv`` spawn
+    workers during sim eval — ``n_envs * world_size`` duplicate copies of the
+    private-macro / mink / mimicgen / controller-config lines on every eval. On
+    success the captured output is discarded; if the wrapped block raises, the
+    captured bytes are written to the real stderr first (prefixed with ``label``) so
+    the failing worker stays debuggable, then the exception propagates unchanged.
+
+    Args:
+        label: Optional identifier (e.g. ``"task=CloseFridge idx=3"``) prepended to
+            the replayed output so a failing worker can be attributed.
+
+    Yields:
+        None. Wrap the code whose output should be muted in the ``with`` block.
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+    saved_stdout_fd = os.dup(1)
+    saved_stderr_fd = os.dup(2)
+    failed = False
+    try:
+        with tempfile.TemporaryFile(mode="w+b") as buffer:
+            os.dup2(buffer.fileno(), 1)
+            os.dup2(buffer.fileno(), 2)
+            try:
+                yield
+            except BaseException:
+                failed = True
+                raise
+            finally:
+                # Restore the real stdout/stderr fds whether or not the block raised,
+                # then (on failure only) replay the captured bytes so they are not lost.
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os.dup2(saved_stdout_fd, 1)
+                os.dup2(saved_stderr_fd, 2)
+                if failed:
+                    buffer.seek(0)
+                    captured = buffer.read()
+                    if captured:
+                        prefix = f"[silenced output — {label}]\n" if label else "[silenced output]\n"
+                        payload = prefix.encode(errors="replace") + captured
+                        while payload:
+                            payload = payload[os.write(saved_stderr_fd, payload) :]
+    finally:
+        os.close(saved_stdout_fd)
+        os.close(saved_stderr_fd)
 
 
 def write_video(video_path: str | Path, stacked_frames: list, fps: float) -> None:

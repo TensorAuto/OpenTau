@@ -19,7 +19,11 @@ from typing import Any
 
 import pytest
 
-from opentau.utils.io_utils import deserialize_json_into_object, write_video
+from opentau.utils.io_utils import (
+    deserialize_json_into_object,
+    silence_output_unless_error,
+    write_video,
+)
 
 
 def create_temp_json(tmp_path: Path, data: Any) -> Path:
@@ -162,3 +166,47 @@ def test_success_on_int_float(value, tmp_path):
     source = deserialize_json_into_object(fpath, template_obj)
 
     assert source == json_data
+
+
+# These exercise the file-descriptor-level redirect — the robosuite-logger / mujoco-C
+# case the helper exists for — via os.write(1/2, ...). Note: pytest swaps
+# sys.stdout/sys.stderr for objects NOT backed by fds 1/2, so a plain print() bypasses
+# the fd redirect under pytest and is not a valid probe here; write to the fds directly.
+def test_silence_output_unless_error_mutes_on_success(capfd):
+    """On the success path, fd-level stdout and stderr writes are discarded."""
+    with silence_output_unless_error():
+        os.write(1, b"stdout banner noise\n")
+        os.write(2, b"stderr banner noise\n")
+
+    out, err = capfd.readouterr()
+    assert "stdout banner noise" not in out
+    assert "stderr banner noise" not in err
+
+
+def test_silence_output_unless_error_replays_on_failure(capfd):
+    """If the block raises, the captured fd output is replayed to stderr with the label."""
+    with (
+        pytest.raises(ValueError, match="boom"),
+        silence_output_unless_error(label="task=CloseFridge idx=3"),
+    ):
+        os.write(1, b"stdout before crash\n")
+        os.write(2, b"stderr before crash\n")
+        raise ValueError("boom")
+
+    out, err = capfd.readouterr()
+    # The exception still propagates (asserted above) and the otherwise-muted output
+    # is replayed on stderr, tagged with the label, so the failure stays debuggable.
+    assert "task=CloseFridge idx=3" in err
+    assert "stdout before crash" in err
+    assert "stderr before crash" in err
+
+
+def test_silence_output_unless_error_restores_streams(capfd):
+    """fd-level stdout/stderr resume working after the block exits."""
+    with silence_output_unless_error():
+        os.write(1, b"hidden\n")
+    os.write(1, b"visible again\n")
+
+    out, err = capfd.readouterr()
+    assert "hidden" not in out
+    assert "visible again" in out

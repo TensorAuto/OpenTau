@@ -52,6 +52,7 @@ from gymnasium import spaces
 
 from opentau.constants import HF_OPENTAU_HOME
 from opentau.utils.accelerate_utils import acc_print, get_proc_accelerator
+from opentau.utils.io_utils import silence_output_unless_error
 
 # Flat action/state vector dimensions for the PandaOmron mobile manipulator
 # (RoboCasa365's default robot).
@@ -585,21 +586,27 @@ class RoboCasaEnv(gym.Env):
         """
         if self._env is not None:
             return
-        _import_robocasa_with_version_shim()
-        from robocasa.wrappers.gym_wrapper import RoboCasaGymEnv
+        # Mute the noisy one-per-worker robosuite/robocasa import + construction
+        # banner (private-macro / mink / mimicgen / controller-config lines): with
+        # AsyncVectorEnv there is one copy per spawn worker, i.e. n_envs * world_size
+        # duplicates flooding the log on every eval. Captured output is replayed to
+        # stderr only if construction raises, so a real failure stays debuggable.
+        with silence_output_unless_error(label=f"task={self.task} idx={self.episode_index}"):
+            _import_robocasa_with_version_shim()
+            from robocasa.wrappers.gym_wrapper import RoboCasaGymEnv
 
-        # RoboCasaGymEnv defaults split="test", which create_env rejects (only
-        # None/"all"/"pretrain"/"target" are valid). Always pass a valid value.
-        self._env = RoboCasaGymEnv(
-            env_name=self.task,
-            camera_widths=self.observation_width,
-            camera_heights=self.observation_height,
-            split=self.split if self.split is not None else "all",
-            obj_registries=self.obj_registries,
-        )
+            # RoboCasaGymEnv defaults split="test", which create_env rejects (only
+            # None/"all"/"pretrain"/"target" are valid). Always pass a valid value.
+            self._env = RoboCasaGymEnv(
+                env_name=self.task,
+                camera_widths=self.observation_width,
+                camera_heights=self.observation_height,
+                split=self.split if self.split is not None else "all",
+                obj_registries=self.obj_registries,
+            )
 
-        ep_meta = self._env.env.get_ep_meta()
-        self.task_description = ep_meta.get("lang", self.task)
+            ep_meta = self._env.env.get_ep_meta()
+            self.task_description = ep_meta.get("lang", self.task)
 
     def _format_raw_obs(self, raw_obs: dict[str, Any]) -> dict[str, Any]:
         r"""Convert a ``RoboCasaGymEnv`` observation dict to OpenTau format."""
