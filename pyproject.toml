@@ -247,5 +247,6 @@ build-backend = "setuptools.build_meta"
 [tool.pytest.ini_options]
 markers = [
     "slow: marks tests as slow (runtime > 1s).",
-    "gpu: marks tests as gpu (uses gpu)."
+    "gpu: marks tests as gpu (uses gpu).",
+    "network: marks tests that require live Hugging Face Hub access (excluded from the gating CPU run; run nightly in network_test.yml).",
 ]

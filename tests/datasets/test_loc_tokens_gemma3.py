@@ -35,6 +35,11 @@ from transformers import AutoTokenizer
 from opentau.datasets.grounding.loc_codec import xyxy_to_loc_tokens
 from opentau.datasets.grounding.tokenizer_utils import LOC_TOKENS, ensure_loc_tokens
 
+# Every test in this module fetches a tokenizer from the live HF Hub
+# (gated google/gemma-3-4b-pt), so quarantine the whole file off the gating
+# CPU run; it runs in the nightly network_test.yml instead.
+pytestmark = pytest.mark.network
+
 
 def _fresh_gemma3_tokenizer():
     """Always return a freshly loaded tokenizer so tests don't share state."""

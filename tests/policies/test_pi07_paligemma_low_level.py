@@ -1209,6 +1209,7 @@ class TestPI07EmbedPrefixInvariants:
         )
 
 
+@pytest.mark.network
 class TestPI07PaligemmaLowLevelResponseEmbedding:
     """CPU-only tests verifying response token masking in ``embed_prefix``.
 
@@ -1505,6 +1506,7 @@ class TestPI07PaligemmaLowLevelResponseEmbedding:
         )
 
 
+@pytest.mark.network
 class TestPI07PaligemmaLowLevelMetadataEmbedding:
     """CPU-only tests for metadata pad masks in ``embed_prefix``.
 
@@ -1873,6 +1875,7 @@ def _ddp_image_skip_worker(rank: int, world_size: int, port: int, scenario: str)
         torch.distributed.destroy_process_group()
 
 
+@pytest.mark.network
 class TestPI07PaligemmaLowLevelSubgoalEmbedding:
     """CPU-only tests for subgoal block pad masks in ``embed_prefix``.
 
