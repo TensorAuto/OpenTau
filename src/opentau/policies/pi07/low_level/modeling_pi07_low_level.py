@@ -119,9 +119,10 @@ def _global_or_branch_decisions(
         device: Device to allocate the all-reduce buffer on; must match the
             distributed backend (typically the policy's CUDA device).
         sync_across_ranks: When ``True`` (training default), OR-reduce the
-            decisions across ranks. When ``False`` (eval/inference, passed from
-            ``self.training``), skip the all-reduce and return the local
-            decision — required because per-rank-independent eval rollouts call
+            decisions across ranks. When ``False`` (threaded explicitly from the
+            independent sim-eval rollout path — ``sample_actions``), skip the
+            all-reduce and return the local decision — required because the
+            per-rank-independent eval rollouts call
             the forward a different number of times, so a per-step collective
             here would desync at NCCL (one rank's ALLREDUCE vs another's later
             post-eval ALLGATHER). Safe under replicated params (DDP / ZeRO-1/2),

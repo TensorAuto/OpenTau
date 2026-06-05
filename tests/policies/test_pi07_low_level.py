@@ -1037,8 +1037,8 @@ class TestGlobalOrBranchDecisionsSyncGuard:
     """``_global_or_branch_decisions(sync_across_ranks=...)`` gates the cross-rank all-reduce.
 
     During eval/inference each rank rolls out independently, so the branch
-    all-reduce must be skipped (``sync_across_ranks=False``, wired from
-    ``self.training`` at both call sites) — otherwise ranks call the forward a
+    all-reduce must be skipped (``sync_across_ranks=False``, threaded explicitly
+    from the sim-eval rollout entry point) — otherwise ranks call the forward a
     different number of times and the mismatched collectives deadlock at NCCL.
     """
 
