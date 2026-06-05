@@ -377,6 +377,20 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         # rather than CPU so subsequent `index_select` runs on the right side.
         return 0, self._model_device()
 
+    def _single_head_fallback_index(self, batch: dict[str, Tensor]) -> Tensor | None:
+        """Row 0 for a single-norm-head policy, else ``None``.
+
+        Checkpoints predating per-(robot_type, control_mode) normalization carry a
+        single norm head and no name maps, so an eval batch tagged with an
+        identifier can't be looked up — but with one head there is nothing to
+        resolve, so route every sample to row 0. Returns ``None`` for a multi-head
+        policy, which is genuinely unresolvable without a map and must raise.
+        """
+        if self._stacked_num_datasets() <= 1:
+            batch_size, device = self._infer_batch_size_and_device(batch)
+            return torch.zeros(batch_size or 1, dtype=torch.long, device=device)
+        return None
+
     def _resolve_dataset_index(self, batch: dict[str, Tensor]) -> Tensor:
         """Resolve per-sample norm-head row indices from a training or inference batch.
 
@@ -402,7 +416,9 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
            ``self._norm_key_to_index``. Checked before ``dataset_repo_id``
            so the "precedence when both are present" invariant documented
            on ``EvalConfig`` / ``ServerConfig`` holds even for callers
-           that bypass the eval / gRPC scripts.
+           that bypass the eval / gRPC scripts. A legacy *single-head*
+           checkpoint (no ``dataset_names``, hence no norm-key map) has
+           nothing to resolve and falls back to row 0 rather than raising.
 
         3. **Inference by repo id.** ``batch["dataset_repo_id"]`` (a
            single ``str`` or ``list[str]`` of length B) is mapped through
@@ -423,8 +439,8 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
             ValueError: an identifier was supplied that doesn't match any
                 row on the policy.
             RuntimeError: ``dataset_repo_id`` or ``(robot_type, control_mode)``
-                supplied but the policy has no name maps (legacy
-                pre-multi-dataset checkpoint).
+                supplied to a *multi-head* policy that has no name maps
+                (a single-head legacy checkpoint falls back to row 0 instead).
         """
         if "dataset_index" in batch:
             idx = batch["dataset_index"]
@@ -442,6 +458,9 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
 
         if "robot_type" in batch and "control_mode" in batch:
             if self._norm_key_to_index is None:
+                single = self._single_head_fallback_index(batch)
+                if single is not None:
+                    return single
                 raise RuntimeError(
                     "Policy was loaded without `dataset_names`; cannot resolve "
                     "`(robot_type, control_mode)` to a norm head. Pass "
@@ -480,6 +499,11 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
 
         if "dataset_repo_id" in batch:
             if self._dataset_to_norm_index is None:
+                # Single-head legacy checkpoint: see the (robot_type, control_mode)
+                # branch above — one norm head means row 0; multi-head still raises.
+                single = self._single_head_fallback_index(batch)
+                if single is not None:
+                    return single
                 raise RuntimeError(
                     "Policy was loaded without `dataset_names`; cannot resolve "
                     "`dataset_repo_id` strings. Either pass `batch['dataset_index']` "

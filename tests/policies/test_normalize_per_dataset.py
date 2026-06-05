@@ -251,7 +251,7 @@ def _make_policy_with_normalize(dataset_names, dataset_to_norm_index, *, num_row
             raise NotImplementedError
 
     cfg = _DummyConfig()
-    cfg.dataset_names = list(dataset_names)
+    cfg.dataset_names = list(dataset_names) if dataset_names is not None else None
     cfg.dataset_to_norm_index = dict(dataset_to_norm_index) if dataset_to_norm_index is not None else None
     return _DummyPolicy(cfg)
 
@@ -360,6 +360,44 @@ class TestResolveDatasetIndex:
         )
         with pytest.raises(KeyError, match="requires one of"):
             policy._resolve_dataset_index({"observation.state": torch.zeros(1, 2)})
+
+    def test_single_head_legacy_no_maps_robot_type_routes_to_row0(self):
+        """Backward-compat: a checkpoint predating per-(robot_type, control_mode)
+        normalization has one norm head and no name maps (`dataset_names=None`). An
+        eval batch tagged with (robot_type, control_mode) must route to row 0 rather
+        than raising "loaded without dataset_names" — one head, nothing to resolve."""
+        policy = _make_policy_with_normalize(None, None, num_rows=1)
+        assert policy._norm_key_to_index is None  # genuinely the legacy single-head case
+        idx = policy._resolve_dataset_index(
+            {
+                "robot_type": ["PandaOmron"],
+                "control_mode": ["ee"],
+                "observation.state": torch.zeros(1, 2),
+            }
+        )
+        assert torch.equal(idx.cpu(), torch.tensor([0], dtype=torch.long))
+
+    def test_single_head_legacy_no_maps_repo_id_routes_to_row0(self):
+        """Same single-head fallback on the `dataset_repo_id` route."""
+        policy = _make_policy_with_normalize(None, None, num_rows=1)
+        idx = policy._resolve_dataset_index(
+            {"dataset_repo_id": ["whatever/repo"], "observation.state": torch.zeros(1, 2)}
+        )
+        assert torch.equal(idx.cpu(), torch.tensor([0], dtype=torch.long))
+
+    def test_multihead_no_maps_robot_type_still_raises(self):
+        """The fallback must NOT swallow a genuinely-unresolvable case: a *multi-head*
+        policy with no name map can't be routed from (robot_type, control_mode)."""
+        policy = _make_policy_with_normalize(None, None, num_rows=2)
+        assert policy._norm_key_to_index is None
+        with pytest.raises(RuntimeError, match="without `dataset_names`"):
+            policy._resolve_dataset_index(
+                {
+                    "robot_type": ["franka"],
+                    "control_mode": ["joint"],
+                    "observation.state": torch.zeros(1, 2),
+                }
+            )
 
 
 # -- zero-variance guard ----------------------------------------------------
