@@ -70,9 +70,11 @@ def silence_output_unless_error(label: str = "") -> Iterator[None]:
     failed = False
     try:
         with tempfile.TemporaryFile(mode="w+b") as buffer:
-            os.dup2(buffer.fileno(), 1)
-            os.dup2(buffer.fileno(), 2)
             try:
+                # Inside the try so a failure of the second dup2 (fd 1 already
+                # redirected) still hits the finally and restores both fds.
+                os.dup2(buffer.fileno(), 1)
+                os.dup2(buffer.fileno(), 2)
                 yield
             except BaseException:
                 failed = True
