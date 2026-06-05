@@ -35,6 +35,11 @@ from transformers import AutoTokenizer
 from opentau.datasets.grounding.loc_codec import xyxy_to_loc_tokens
 from opentau.datasets.grounding.tokenizer_utils import LOC_TOKENS, ensure_loc_tokens
 
+# Every test in this module fetches a tokenizer from the live HF Hub
+# (gated google/paligemma-3b-pt-224), so quarantine the whole file off the
+# gating CPU run; it runs in the nightly network_test.yml instead.
+pytestmark = pytest.mark.network
+
 
 @pytest.fixture(scope="module")
 def paligemma_tokenizer():

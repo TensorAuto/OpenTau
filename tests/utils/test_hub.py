@@ -20,6 +20,10 @@ import pytest
 from opentau.utils.hub import HubMixin
 from tests.fixtures.utils import DummyHubMixin
 
+# Both tests here push to / pull from the live HF Hub, so quarantine the file
+# off the gating CPU run; it runs in the nightly network_test.yml instead.
+pytestmark = pytest.mark.network
+
 
 @pytest.mark.parametrize(
     "create_hubmixin_instance",

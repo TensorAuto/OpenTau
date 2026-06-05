@@ -19,6 +19,7 @@ from unittest.mock import patch
 import pytest
 from draccus.utils import ParsingError
 from huggingface_hub.constants import CONFIG_NAME
+from huggingface_hub.errors import RepositoryNotFoundError
 
 from opentau.configs.policies import (
     PreTrainedConfig,
@@ -144,7 +145,18 @@ def test_from_pretrained_path_does_not_exits():
     """
     Tests if from_pretrained raises FIleNotFpund Error when invalid repo id is passed
     """
-    with pytest.raises(FileNotFoundError):
+    # Mock the Hub lookup so this stays on the gating CPU run instead of
+    # reaching the live Hub: from_pretrained must translate a Hub "repo not
+    # found" error into FileNotFoundError. Hitting the real Hub here flakes on
+    # connectivity -- a raw OSError is not an HfHubHTTPError, so it would escape
+    # the pytest.raises(FileNotFoundError) below and red the gate.
+    with (
+        patch(
+            "opentau.configs.policies.hf_hub_download",
+            side_effect=RepositoryNotFoundError("bert123 does not exist"),
+        ),
+        pytest.raises(FileNotFoundError),
+    ):
         PreTrainedConfig.from_pretrained(pretrained_name_or_path="bert123")
 
 

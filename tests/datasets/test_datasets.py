@@ -693,6 +693,7 @@ def check_standard_data_format(item, delta_timestamps_params, dataset, train_pip
     ],
 )
 @retry_on_hf_flakiness()
+@pytest.mark.network
 def test_lerobot_dataset_factory(dataset_config, train_pipeline_config, repo_id):
     """
     Tests that:
@@ -721,6 +722,7 @@ def test_lerobot_dataset_factory(dataset_config, train_pipeline_config, repo_id)
     ],
 )
 @retry_on_hf_flakiness()
+@pytest.mark.network
 def test_do_not_use_imagenet_stats(dataset_config, train_pipeline_config, repo_id):
     """
     Tests that:

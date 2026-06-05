@@ -1,0 +1,96 @@
+# Copyright 2026 Tensor Auto Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Network Tests
+
+# Tests that reach the live Hugging Face Hub (dataset / tokenizer downloads,
+# Hub push and pull) are marked `@pytest.mark.network` and EXCLUDED from the
+# gating CPU suite (cpu_test.yml runs `-m "not gpu and not network"`), so a
+# transient Hub rate-limit or outage can never block a PR or push. This
+# workflow runs that quarantined subset on a nightly schedule purely for
+# signal. It is intentionally NOT wired into branch-protection required checks.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Nightly at 10:00 UTC, alongside the gpu / regression nightlies.
+    - cron: "0 10 * * *"
+
+permissions:
+  contents: read
+
+env:
+  GIT_LFS_SKIP_SMUDGE: "1"
+  GIT_CLEAN_FLAGS: "-ffdx -e .venv/"
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  UV_LINK_MODE: "copy"
+  MUJOCO_GL: "egl"
+  PYOPENGL_PLATFORM: "egl"
+
+jobs:
+  network-tests:
+    name: Network Tests
+    runs-on: ubuntu-latest
+    # ~57 tests run serially (-n 0) here, including a ~3.5-min mixture test and
+    # @retry_on_hf_flakiness reruns; give the non-gating job comfortable headroom.
+    timeout-minutes: 45
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          lfs: false
+
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libegl1 libegl-mesa0 libgl1 libglx-mesa0 libgles2 mesa-utils
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+
+      - name: Install dependencies
+        run: |
+          uv sync --extra dev --extra libero
+
+      - name: Configure wandb
+        run: |
+          source .venv/bin/activate
+          wandb offline
+
+      - name: Run network tests
+        # The gated google/gemma-3 and google/paligemma tokenizers and the
+        # lerobot/* datasets need an authenticated token. Run serially (-n 0):
+        # parallel xdist workers fetching the same gated repos is what trips the
+        # 429 rate-limit storms this quarantine exists to avoid.
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HUGGINGFACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          source .venv/bin/activate
+          mkdir -p /tmp/libero-assets/libero/libero
+          export LIBERO_CONFIG_PATH="$(pwd)/.github/assets/libero"
+          echo "LIBERO_CONFIG_PATH is $LIBERO_CONFIG_PATH"
+          echo "Running network-marked pytest subset..."
+          pytest -m "network" -n 0 -v --ignore=tests/planner/test_planner.py --ignore tests/utils/test_libero_utils.py tests/
