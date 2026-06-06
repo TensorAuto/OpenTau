@@ -114,6 +114,8 @@ Everything starts from a `TrainPipelineConfig` (`src/opentau/configs/train.py`) 
 
 Key invariant on `TrainPipelineConfig`: `batch_size == dataloader_batch_size * gradient_accumulation_steps`. When sweeping per-rank batch, override all three together — the validator will reject inconsistent combinations. When using DeepSpeed, `gradient_accumulation_steps` must also match the value in the DeepSpeed JSON.
 
+Config-knob convention: a feature gated by "how many / how often" uses a **single count/frequency field with `0 == off`** (e.g. `eval_freq`, `val_freq`, `running_best_count`), not a separate boolean toggle plus a count. When adding an opt-in feature, prefer one such field over a `enable_x: bool` + `x_count: int` pair — the redundant boolean will be rejected in review.
+
 `PreTrainedConfig` (`configs/policies.py`) is the abstract base for policy configs. Subclasses register themselves via the `policy.type` choice key (draccus `CHOICE_TYPE_KEY`). To add a new policy: subclass `PreTrainedConfig`, subclass `PreTrainedPolicy`, and register both in `policies/factory.py::get_policy_class` / `get_policy_class_config`.
 
 ### Module layout (`src/opentau/`)
