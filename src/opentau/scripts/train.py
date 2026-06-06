@@ -19,6 +19,7 @@ import inspect
 import json
 import logging
 import os
+import shutil
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -59,11 +60,13 @@ from opentau.utils.train_utils import (
     find_missing_rng_state_ranks,
     get_step_checkpoint_dir,
     get_step_identifier,
+    load_running_best_state,
     load_training_state,
     load_training_step,
     prune_old_checkpoints,
     reseed_new_ranks_on_resume,
     save_checkpoint,
+    save_running_best_state,
 )
 from opentau.utils.utils import (
     encode_accelerator_state_dict,
@@ -860,6 +863,18 @@ def train(cfg: TrainPipelineConfig):
 
         logging.info(f"Resuming training from checkpoint {cfg.checkpoint_path}")
 
+    # Running-best checkpoint bookkeeping lives on the main process only (all metrics that drive
+    # it are rank-0-only). It is restored from disk so the high-water mark and retained-best pool
+    # survive a resume; a run that predates the feature starts fresh.
+    running_best = None
+    if cfg.save_running_best and accelerator.is_main_process:
+        running_best = load_running_best_state(
+            cfg.output_dir,
+            cfg.steps,
+            higher_is_better=cfg.running_best_metric_resolved == "eval_success",
+            max_count=cfg.running_best_count,
+        )
+
     policy.train()
 
     # setup metrics tracker to average metrics over the logging interval.
@@ -904,6 +919,10 @@ def train(cfg: TrainPipelineConfig):
         # increment `step` here.
         step += 1
         train_tracker.step()
+        # Per-iteration metric capture for the running-best decision (rank-0 only; left None on
+        # other ranks and on steps where the corresponding eval/validation did not run).
+        current_success = None
+        current_val_loss = None
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
         is_saving_step = (step % cfg.save_freq == 0 or step == cfg.steps) and cfg.save_checkpoint
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
@@ -945,7 +964,10 @@ def train(cfg: TrainPipelineConfig):
                 cfg.policy.pretrained_path = checkpoint_dir
                 save_checkpoint(checkpoint_dir, step, cfg)
                 if cfg.last_checkpoint_only:
-                    prune_old_checkpoints(checkpoint_dir)
+                    # Protect running-best checkpoints from the latest-only prune. Read live each
+                    # save so bests created since the last save are not deleted.
+                    protected = running_best.protected_dirs() if running_best is not None else None
+                    prune_old_checkpoints(checkpoint_dir, protected_paths=protected)
 
             accelerator.wait_for_everyone()
 
@@ -1155,6 +1177,8 @@ def train(cfg: TrainPipelineConfig):
 
                 if agg:
                     logging.info(f"Validation/aggregate {agg}")
+                    # Coerce to float: on the per-sample path agg["loss"] is a 0-d tensor.
+                    current_val_loss = float(agg["loss"])
                     accelerator.log({"Validation/Loss": agg["loss"]}, step=step)
                     accelerator.log({"Validation/MSE Loss": agg["mse_loss"]}, step=step)
                     accelerator.log({"Validation/CE Loss": agg["ce_loss"]}, step=step)
@@ -1225,6 +1249,7 @@ def train(cfg: TrainPipelineConfig):
                 eval_tracker.eval_per_gpu_s = aggregated.get("eval_per_gpu_s", float("nan"))
                 eval_tracker.avg_sum_reward = aggregated.get("avg_sum_reward", float("nan"))
                 eval_tracker.pc_success = aggregated.get("pc_success", float("nan"))
+                current_success = aggregated.get("pc_success", float("nan"))
                 logging.info(eval_tracker)
                 eval_dict = eval_tracker.to_dict(use_avg=True)
                 accelerator.log({"Success Rate": eval_dict["pc_success"]}, step=step)
@@ -1279,6 +1304,51 @@ def train(cfg: TrainPipelineConfig):
                             s["post_resv"],
                             s["post_alloc"] - s["pre_alloc"],
                         )
+
+        # Running best: retain the checkpoint that achieved the best metric so far. The new-best
+        # decision is made on rank 0 (the only rank holding the metric) and broadcast so every
+        # rank agrees before the collective ``accelerator.save_state`` (a per-rank-divergent save
+        # would hang NCCL). The gate is a pure function of step/config, identical on all ranks, so
+        # every rank enters and hits the broadcast together. Touches no RNG -> loss determinism
+        # is unaffected.
+        if cfg.save_running_best and (is_eval_step or is_val_step):
+            score = (
+                current_success if cfg.running_best_metric_resolved == "eval_success" else current_val_loss
+            )
+            improved = bool(
+                accelerator.is_main_process and score is not None and running_best.is_improvement(score)
+            )
+            _improved = [improved]
+            broadcast_object_list(_improved, from_process=0)
+            improved = _improved[0]
+            # Identical on every rank (pure function of step/config); mirrors is_saving_step.
+            is_regular_this_step = cfg.save_checkpoint and (step % cfg.save_freq == 0 or step == cfg.steps)
+            if improved:
+                running_best_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
+                if not is_regular_this_step:
+                    # No regular checkpoint exists at this step -> save the current weights now.
+                    accelerator.save_state(running_best_dir)
+                    if accelerator.is_main_process:
+                        cfg.policy.pretrained_path = running_best_dir
+                        save_checkpoint(running_best_dir, step, cfg)
+                    accelerator.wait_for_everyone()
+                if accelerator.is_main_process:
+                    # rank-0-only bookkeeping (filesystem, no collectives): register the new best,
+                    # then delete any running-best-only dir evicted past running_best_count. A best
+                    # that coincided with a regular save_freq checkpoint is left to normal retention.
+                    for stale_dir in running_best.register(step, score, is_regular_this_step):
+                        try:
+                            shutil.rmtree(stale_dir)
+                        except OSError as e:
+                            logging.error("Failed to delete stale running best '%s': %s", stale_dir, e)
+                    save_running_best_state(running_best, cfg.running_best_metric_resolved)
+                    logging.info(
+                        "New running best (%s=%.4f) at step %d -> %s",
+                        cfg.running_best_metric_resolved,
+                        score,
+                        step,
+                        running_best_dir,
+                    )
 
         # Seal this step's wandb row as soon as all of its logging (training /
         # validation / eval scalars + eval videos) is done, instead of waiting

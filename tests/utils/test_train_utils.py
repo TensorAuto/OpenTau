@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import shutil
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -21,12 +22,16 @@ from opentau.constants import (
     TRAINING_STEP,
 )
 from opentau.utils.train_utils import (
+    RunningBestTracker,
     find_missing_rng_state_ranks,
     get_step_checkpoint_dir,
     get_step_identifier,
+    load_running_best_state,
     load_training_step,
     prune_old_checkpoints,
     reseed_new_ranks_on_resume,
+    running_best_is_improvement,
+    save_running_best_state,
     save_training_step,
     update_last_checkpoint,
 )
@@ -338,3 +343,184 @@ class TestReseedNewRanksOnResume:
             reseed_new_ranks_on_resume(tmp_path, acc_nonmain, seed=42)
         scale_down_msgs = [rec for rec in caplog.records if "Resuming on fewer processes" in rec.message]
         assert scale_down_msgs == []
+
+
+# ---------------------------------------------------------------------------
+# Running-best checkpoint bookkeeping
+# ---------------------------------------------------------------------------
+
+
+def test_running_best_is_improvement_maximize():
+    """Strict improvement when higher is better; equal/worse/None/NaN do not count."""
+    assert running_best_is_improvement(60.0, 50.0, higher_is_better=True) is True
+    assert running_best_is_improvement(50.0, 50.0, higher_is_better=True) is False
+    assert running_best_is_improvement(40.0, 50.0, higher_is_better=True) is False
+    assert running_best_is_improvement(0.0, float("-inf"), higher_is_better=True) is True
+    assert running_best_is_improvement(None, 50.0, higher_is_better=True) is False
+    assert running_best_is_improvement(float("nan"), 50.0, higher_is_better=True) is False
+
+
+def test_running_best_is_improvement_minimize():
+    """Strict improvement when lower is better (validation loss)."""
+    assert running_best_is_improvement(0.05, 0.1, higher_is_better=False) is True
+    assert running_best_is_improvement(0.1, 0.1, higher_is_better=False) is False
+    assert running_best_is_improvement(0.2, 0.1, higher_is_better=False) is False
+    assert running_best_is_improvement(1.0, float("inf"), higher_is_better=False) is True
+    assert running_best_is_improvement(float("nan"), 0.1, higher_is_better=False) is False
+
+
+def _mk_tracker(tmp_path, higher_is_better=True, max_count=1):
+    return RunningBestTracker(
+        output_dir=tmp_path,
+        total_steps=1000,
+        higher_is_better=higher_is_better,
+        max_count=max_count,
+    )
+
+
+def _mk_step_dir(tracker, step):
+    """Create (mkdir) the checkpoint dir a tracker would use for a step, and return it."""
+    d = tracker.step_dir(step)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def test_running_best_tracker_first_register_no_eviction(tmp_path):
+    tracker = _mk_tracker(tmp_path, higher_is_better=True, max_count=1)
+    _mk_step_dir(tracker, 100)
+    deleted = tracker.register(100, 50.0, is_regular=False)
+    assert deleted == []
+    assert tracker.best == 50.0
+    assert [e["step"] for e in tracker.steps] == [100]
+
+
+def test_running_best_tracker_evicts_non_regular(tmp_path):
+    tracker = _mk_tracker(tmp_path, higher_is_better=True, max_count=1)
+    d100 = _mk_step_dir(tracker, 100)
+    tracker.register(100, 50.0, is_regular=False)
+    _mk_step_dir(tracker, 200)
+    deleted = tracker.register(200, 60.0, is_regular=False)
+    assert deleted == [d100]
+    assert tracker.best == 60.0
+    assert [e["step"] for e in tracker.steps] == [200]
+
+
+def test_running_best_tracker_keeps_regular_checkpoint(tmp_path):
+    """An evicted entry that coincided with a regular checkpoint is NOT deleted."""
+    tracker = _mk_tracker(tmp_path, higher_is_better=True, max_count=1)
+    d100 = _mk_step_dir(tracker, 100)
+    tracker.register(100, 50.0, is_regular=True)  # coincided with a save_freq checkpoint
+    _mk_step_dir(tracker, 200)
+    deleted = tracker.register(200, 60.0, is_regular=False)
+    assert deleted == []  # regular dir left to normal retention
+    assert d100.exists()
+    assert [e["step"] for e in tracker.steps] == [200]
+
+
+def test_running_best_tracker_keeps_top_n(tmp_path):
+    tracker = _mk_tracker(tmp_path, higher_is_better=True, max_count=3)
+    all_deleted = []
+    for i, step in enumerate([100, 200, 300, 400, 500]):
+        _mk_step_dir(tracker, step)
+        all_deleted += tracker.register(step, float(10 * (i + 1)), is_regular=False)
+    # Pool holds the 3 most-recent; the 2 oldest non-regular dirs were deleted.
+    assert [e["step"] for e in tracker.steps] == [300, 400, 500]
+    assert sorted(d.name for d in all_deleted) == [
+        get_step_checkpoint_dir(tmp_path, 1000, 100).name,
+        get_step_checkpoint_dir(tmp_path, 1000, 200).name,
+    ]
+
+
+def test_running_best_tracker_count_larger_than_found(tmp_path):
+    tracker = _mk_tracker(tmp_path, higher_is_better=False, max_count=5)
+    _mk_step_dir(tracker, 100)
+    assert tracker.register(100, 0.2, is_regular=False) == []
+    _mk_step_dir(tracker, 200)
+    assert tracker.register(200, 0.1, is_regular=False) == []
+    assert {e["step"] for e in tracker.steps} == {100, 200}
+
+
+def test_running_best_tracker_protected_dirs(tmp_path):
+    tracker = _mk_tracker(tmp_path, higher_is_better=True, max_count=3)
+    for i, step in enumerate([100, 200]):
+        _mk_step_dir(tracker, step)
+        tracker.register(step, float(10 * (i + 1)), is_regular=False)
+    assert tracker.protected_dirs() == {tracker.step_dir(100), tracker.step_dir(200)}
+
+
+def test_running_best_state_roundtrip(tmp_path):
+    tracker = _mk_tracker(tmp_path, higher_is_better=False, max_count=2)
+    _mk_step_dir(tracker, 100)
+    tracker.register(100, 0.2, is_regular=True)
+    _mk_step_dir(tracker, 200)
+    tracker.register(200, 0.1, is_regular=False)
+    save_running_best_state(tracker, metric="val_loss")
+
+    loaded = load_running_best_state(tmp_path, total_steps=1000, higher_is_better=False, max_count=2)
+    assert loaded.best == 0.1
+    assert [e["step"] for e in loaded.steps] == [100, 200]
+    assert loaded.steps[0]["is_regular"] is True
+    assert loaded.steps[1]["is_regular"] is False
+
+
+def test_running_best_state_missing_file_is_fresh(tmp_path):
+    loaded = load_running_best_state(tmp_path, total_steps=1000, higher_is_better=True, max_count=1)
+    assert loaded.best == float("-inf")
+    assert loaded.steps == []
+
+
+def test_running_best_state_self_heals_pruned_dirs(tmp_path):
+    """Pool entries whose dir was pruned are dropped on load; the high-water mark survives."""
+    tracker = _mk_tracker(tmp_path, higher_is_better=True, max_count=3)
+    _mk_step_dir(tracker, 100)
+    tracker.register(100, 50.0, is_regular=False)
+    _mk_step_dir(tracker, 200)
+    tracker.register(200, 60.0, is_regular=False)
+    save_running_best_state(tracker, metric="eval_success")
+
+    # Simulate a later prune removing the step-100 dir.
+    shutil.rmtree(tracker.step_dir(100))
+
+    loaded = load_running_best_state(tmp_path, total_steps=1000, higher_is_better=True, max_count=3)
+    assert [e["step"] for e in loaded.steps] == [200]
+    assert loaded.best == 60.0  # high-water mark preserved
+
+
+# ---------------------------------------------------------------------------
+# prune_old_checkpoints protected_paths
+# ---------------------------------------------------------------------------
+
+
+def test_prune_skips_protected_paths(tmp_path):
+    """Protected (running-best) dirs and non-dir files are never deleted."""
+    ckpts = tmp_path / "checkpoints"
+    ckpts.mkdir()
+    latest = ckpts / "000300"
+    protected = ckpts / "000150"
+    old = ckpts / "000100"
+    for d in (latest, protected, old):
+        d.mkdir()
+    state_file = ckpts / "running_best.json"
+    state_file.write_text("{}")
+
+    prune_old_checkpoints(str(latest), protected_paths={protected})
+
+    assert latest.exists()
+    assert protected.exists()
+    assert state_file.exists()
+    assert not old.exists()
+
+
+def test_prune_protected_none_is_backward_compatible(tmp_path):
+    """Default protected_paths=None keeps only the latest dir (existing behavior)."""
+    ckpts = tmp_path / "checkpoints"
+    ckpts.mkdir()
+    latest = ckpts / "000300"
+    old = ckpts / "000100"
+    for d in (latest, old):
+        d.mkdir()
+
+    prune_old_checkpoints(str(latest))
+
+    assert latest.exists()
+    assert not old.exists()

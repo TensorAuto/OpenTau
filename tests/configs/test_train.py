@@ -297,3 +297,160 @@ def test_from_pretrained_model_exits(tmp_path):
             TrainPipelineConfig.from_pretrained(pretrained_name_or_path=repo_id)
         except Exception as e:
             pytest.fail(f"The pytests failed due to {e}")
+
+
+# ---------------------------------------------------------------------------
+# Running-best checkpoint config
+# ---------------------------------------------------------------------------
+
+
+def _running_best_cfg(dataset_mixture_config, policy_config, tmp_path, **kwargs):
+    """Build a minimal TrainPipelineConfig for exercising running-best validation."""
+    return TrainPipelineConfig(
+        dataset_mixture=dataset_mixture_config,
+        policy=policy_config,
+        output_dir=tmp_path,
+        seed=42,
+        batch_size=8,
+        **kwargs,
+    )
+
+
+def test_running_best_defaults(dataset_mixture_config, policy_config, tmp_path):
+    """The feature is off by default with a single running best driven by the auto metric."""
+    cfg = _running_best_cfg(dataset_mixture_config, policy_config, tmp_path)
+    assert cfg.save_running_best is False
+    assert cfg.running_best_count == 1
+    assert cfg.running_best_metric == "auto"
+    assert cfg.running_best_metric_resolved is None
+
+
+def test_running_best_count_zero_raises(dataset_mixture_config, policy_config, tmp_path):
+    """running_best_count must be >= 1 even when the feature is off."""
+    cfg = _running_best_cfg(dataset_mixture_config, policy_config, tmp_path, running_best_count=0)
+    with pytest.raises(ValueError, match="running_best_count"):
+        cfg._validate_running_best()
+
+
+def test_running_best_invalid_metric_raises(dataset_mixture_config, policy_config, tmp_path):
+    """running_best_metric must be one of the allowed literals."""
+    cfg = _running_best_cfg(dataset_mixture_config, policy_config, tmp_path, running_best_metric="foo")
+    with pytest.raises(ValueError, match="running_best_metric"):
+        cfg._validate_running_best()
+
+
+def test_running_best_no_metric_source_raises(dataset_mixture_config, policy_config, tmp_path):
+    """Enabling the flag with no eval and no validation source is an error."""
+    cfg = _running_best_cfg(
+        dataset_mixture_config, policy_config, tmp_path, save_running_best=True, eval_freq=0, val_freq=0
+    )
+    cfg.env = None
+    with pytest.raises(ValueError, match="no metric source"):
+        cfg._validate_running_best()
+
+
+def test_running_best_eval_metric_requires_env(dataset_mixture_config, policy_config, tmp_path):
+    """metric='eval_success' requires a sim eval source (env + eval_freq)."""
+    cfg = _running_best_cfg(
+        dataset_mixture_config,
+        policy_config,
+        tmp_path,
+        save_running_best=True,
+        running_best_metric="eval_success",
+        eval_freq=0,
+    )
+    with pytest.raises(ValueError, match="eval_success"):
+        cfg._validate_running_best()
+
+
+def test_running_best_val_metric_requires_val_freq(dataset_mixture_config, policy_config, tmp_path):
+    """metric='val_loss' requires val_freq > 0."""
+    cfg = _running_best_cfg(
+        dataset_mixture_config,
+        policy_config,
+        tmp_path,
+        save_running_best=True,
+        running_best_metric="val_loss",
+        val_freq=0,
+    )
+    with pytest.raises(ValueError, match="val_loss"):
+        cfg._validate_running_best()
+
+
+def test_running_best_auto_resolves_to_eval(dataset_mixture_config, policy_config, tmp_path):
+    """'auto' resolves to eval_success when an env + eval_freq are configured."""
+    cfg = _running_best_cfg(
+        dataset_mixture_config, policy_config, tmp_path, save_running_best=True, eval_freq=100
+    )
+    cfg.env = object()  # any non-None eval source
+    cfg._validate_running_best()
+    assert cfg.running_best_metric == "auto"  # serialized field is untouched
+    assert cfg.running_best_metric_resolved == "eval_success"
+
+
+def test_running_best_auto_resolves_to_val(dataset_mixture_config, policy_config, tmp_path):
+    """'auto' falls back to val_loss when only validation is configured."""
+    cfg = _running_best_cfg(
+        dataset_mixture_config, policy_config, tmp_path, save_running_best=True, val_freq=100
+    )
+    cfg._validate_running_best()
+    assert cfg.running_best_metric_resolved == "val_loss"
+
+
+def test_running_best_with_save_checkpoint_false_is_valid(dataset_mixture_config, policy_config, tmp_path):
+    """save_running_best with save_checkpoint=False is a valid 'keep only the best' config."""
+    cfg = _running_best_cfg(
+        dataset_mixture_config,
+        policy_config,
+        tmp_path,
+        save_running_best=True,
+        save_checkpoint=False,
+        val_freq=100,
+    )
+    cfg._validate_running_best()  # must not raise
+    assert cfg.running_best_metric_resolved == "val_loss"
+
+
+def test_running_best_fields_serialize_roundtrip(dataset_mixture_config, policy_config, tmp_path):
+    """The new fields serialize; the runtime-resolved metric does not."""
+    cfg = _running_best_cfg(
+        dataset_mixture_config,
+        policy_config,
+        tmp_path,
+        save_running_best=True,
+        running_best_metric="val_loss",
+        running_best_count=3,
+    )
+    d = cfg.to_dict()
+    assert d["save_running_best"] is True
+    assert d["running_best_metric"] == "val_loss"
+    assert d["running_best_count"] == 3
+    assert "running_best_metric_resolved" not in d
+
+
+def test_running_best_backward_compat_old_config(tmp_path):
+    """A train_config.json predating the feature loads with the defaults."""
+    assert "save_running_best" not in train_config  # the fixture predates the feature
+    with open(tmp_path / "train_config.json", "w") as f:
+        json.dump(train_config, f, indent=4)
+
+    cfg = TrainPipelineConfig.from_pretrained(pretrained_name_or_path=tmp_path)
+    assert cfg.save_running_best is False
+    assert cfg.running_best_count == 1
+    assert cfg.running_best_metric == "auto"
+
+
+def test_running_best_validate_integration(dataset_mixture_config, policy_config, tmp_path):
+    """The full validate() surfaces a bad running_best_count."""
+    cfg = TrainPipelineConfig(
+        dataset_mixture=dataset_mixture_config,
+        policy=policy_config,
+        output_dir=str(tmp_path),
+        job_name="test_run",
+        seed=42,
+        batch_size=8,
+        use_policy_training_preset=True,
+        running_best_count=0,
+    )
+    with pytest.raises(ValueError, match="running_best_count"):
+        cfg.validate()
