@@ -447,6 +447,11 @@ def load_running_best_state(
     dropped (a regular-coincident best may have been pruned later by the normal retention logic),
     but the high-water mark is preserved regardless.
 
+    If the persisted optimization direction disagrees with ``higher_is_better`` (a resume that
+    flipped ``running_best_metric`` between maximize and minimize), the persisted high-water mark
+    is meaningless under the new direction, so it is discarded (reset to ``-inf``/``+inf``) while
+    the existing pool is kept; a warning is emitted.
+
     Args:
         output_dir: The run output directory (its ``checkpoints/`` subdir holds the state file).
         total_steps: Total training steps (for step-dir zero-padding).
@@ -461,12 +466,22 @@ def load_running_best_state(
         return RunningBestTracker(output_dir, total_steps, higher_is_better, max_count)
 
     state = load_json(state_path)
+    # A resume that flips the metric direction makes the persisted best uncomparable; drop it.
+    best = state.get("best")
+    if state.get("higher_is_better") is not None and state["higher_is_better"] != higher_is_better:
+        logging.warning(
+            "running_best.json was saved with higher_is_better=%s but the current run uses %s; "
+            "discarding the persisted high-water mark (the pool is kept).",
+            state["higher_is_better"],
+            higher_is_better,
+        )
+        best = None
     tracker = RunningBestTracker(
         output_dir,
         total_steps,
         higher_is_better,
         max_count,
-        best=state.get("best"),
+        best=best,
         steps=state.get("steps", []),
     )
     # Self-heal: drop pool entries whose checkpoint directory is gone.

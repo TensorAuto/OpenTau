@@ -867,7 +867,7 @@ def train(cfg: TrainPipelineConfig):
     # it are rank-0-only). It is restored from disk so the high-water mark and retained-best pool
     # survive a resume; a run that predates the feature starts fresh.
     running_best = None
-    if cfg.save_running_best and accelerator.is_main_process:
+    if cfg.running_best_count > 0 and accelerator.is_main_process:
         running_best = load_running_best_state(
             cfg.output_dir,
             cfg.steps,
@@ -1311,7 +1311,7 @@ def train(cfg: TrainPipelineConfig):
         # would hang NCCL). The gate is a pure function of step/config, identical on all ranks, so
         # every rank enters and hits the broadcast together. Touches no RNG -> loss determinism
         # is unaffected.
-        if cfg.save_running_best and (is_eval_step or is_val_step):
+        if cfg.running_best_count > 0 and (is_eval_step or is_val_step):
             score = (
                 current_success if cfg.running_best_metric_resolved == "eval_success" else current_val_loss
             )

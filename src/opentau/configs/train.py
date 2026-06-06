@@ -124,20 +124,20 @@ class TrainPipelineConfig(HubMixin):
             is disabled. Defaults to 0.
         last_checkpoint_only: If True, only evaluate the last checkpoint.
             Defaults to True.
-        save_running_best: If True, additionally keep the checkpoint(s) that achieved the
-            best metric so far (a "running best"). After an eval/validation step that hits a
-            new best, the current weights are saved (or, if that step already wrote a regular
-            `save_freq` checkpoint, that directory is reused). Older running-bests are evicted
-            down to `running_best_count`, but a running-best that coincided with a regular
-            checkpoint is left to the normal retention logic. Running-bests are protected from
-            `last_checkpoint_only` pruning. Valid even when `save_checkpoint` is False (only the
-            best-performing checkpoints are then written, so resume granularity is limited to
-            running-best steps). Defaults to False.
+        running_best_count: Number of "running best" checkpoints to keep, i.e. the
+            checkpoint(s) that achieved the best metric so far. If 0, the feature is disabled
+            (like `eval_freq`/`val_freq`). When >= 1, after an eval/validation step that hits a
+            new best the current weights are saved (or, if that step already wrote a regular
+            `save_freq` checkpoint, that directory is reused); older running-bests are evicted
+            down to `running_best_count`, but one that coincided with a regular checkpoint is
+            left to the normal retention logic. Running-bests are protected from
+            `last_checkpoint_only` pruning, and work even when `save_checkpoint` is False (only
+            the best-performing checkpoints are then written, so resume granularity is limited
+            to running-best steps). Defaults to 0.
         running_best_metric: Which metric drives the running best. One of "auto", "eval_success"
             (maximize sim-eval success rate), or "val_loss" (minimize validation loss). "auto"
             resolves to "eval_success" when sim eval is configured (env set and eval_freq > 0),
-            otherwise "val_loss". Defaults to "auto".
-        running_best_count: Maximum number of running-best checkpoints to keep. Defaults to 1.
+            otherwise "val_loss". Only used when `running_best_count` >= 1. Defaults to "auto".
         server: Configuration for the gRPC inference server. Defaults to ServerConfig().
     """
 
@@ -189,9 +189,9 @@ class TrainPipelineConfig(HubMixin):
     val_freq: int = 0  # validate every val_freq steps, if 0, then a validation split is not created
     last_checkpoint_only: bool = True
     # Keep the best-performing checkpoint(s) ("running best") in addition to the regular ones.
-    save_running_best: bool = False
+    # 0 disables the feature (cf. eval_freq/val_freq); >= 1 keeps that many running bests.
+    running_best_count: int = 0
     running_best_metric: str = "auto"  # "auto" | "eval_success" | "val_loss"
-    running_best_count: int = 1
     # gRPC inference server configuration
     server: ServerConfig = field(default_factory=ServerConfig)
 
@@ -314,13 +314,14 @@ class TrainPipelineConfig(HubMixin):
     def _validate_running_best(self):
         """Validate the running-best checkpoint config and resolve the driving metric.
 
-        Sets ``self.running_best_metric_resolved`` to a concrete metric ("eval_success" or
-        "val_loss") when ``save_running_best`` is enabled. The ``running_best_metric`` /
+        The feature is enabled by ``running_best_count`` >= 1 (0 disables it, like
+        ``eval_freq``/``val_freq``). Sets ``self.running_best_metric_resolved`` to a concrete
+        metric ("eval_success" or "val_loss") when enabled. The ``running_best_metric`` /
         ``running_best_count`` bounds are checked unconditionally so a bad value is caught even
         when the feature is off.
 
         Raises:
-            ValueError: If ``running_best_count`` < 1, ``running_best_metric`` is not one of the
+            ValueError: If ``running_best_count`` < 0, ``running_best_metric`` is not one of the
                 allowed values, or the feature is enabled without a usable metric source.
         """
         allowed = {"auto", "eval_success", "val_loss"}
@@ -328,24 +329,26 @@ class TrainPipelineConfig(HubMixin):
             raise ValueError(
                 f"running_best_metric must be one of {sorted(allowed)}, got {self.running_best_metric!r}."
             )
-        if self.running_best_count < 1:
-            raise ValueError(f"running_best_count must be >= 1, got {self.running_best_count}.")
+        if self.running_best_count < 0:
+            raise ValueError(f"running_best_count must be >= 0, got {self.running_best_count}.")
 
-        if not self.save_running_best:
+        if self.running_best_count == 0:
             return
 
         has_eval = self.env is not None and self.eval_freq > 0
         has_val = self.val_freq > 0
         if self.running_best_metric == "eval_success" and not has_eval:
             raise ValueError(
-                "save_running_best with running_best_metric='eval_success' requires a sim eval "
+                "running_best_count >= 1 with running_best_metric='eval_success' requires a sim eval "
                 "source: set env and eval_freq > 0."
             )
         if self.running_best_metric == "val_loss" and not has_val:
-            raise ValueError("save_running_best with running_best_metric='val_loss' requires val_freq > 0.")
+            raise ValueError(
+                "running_best_count >= 1 with running_best_metric='val_loss' requires val_freq > 0."
+            )
         if self.running_best_metric == "auto" and not (has_eval or has_val):
             raise ValueError(
-                "save_running_best is enabled but no metric source is configured. Set eval_freq > 0 "
+                "running_best_count >= 1 but no metric source is configured. Set eval_freq > 0 "
                 "with an env (for eval success rate), or val_freq > 0 (for validation loss)."
             )
         # Resolve "auto": prefer sim eval when available, else validation loss.
@@ -356,7 +359,7 @@ class TrainPipelineConfig(HubMixin):
 
         if not self.save_checkpoint:
             warn(
-                "save_running_best is enabled but save_checkpoint is False; only running-best "
+                "running_best_count >= 1 but save_checkpoint is False; only running-best "
                 "checkpoints will be saved, so resume granularity is limited to running-best steps."
             )
 

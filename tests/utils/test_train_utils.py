@@ -486,6 +486,19 @@ def test_running_best_state_self_heals_pruned_dirs(tmp_path):
     assert loaded.best == 60.0  # high-water mark preserved
 
 
+def test_running_best_state_direction_mismatch_resets_best(tmp_path):
+    """Resuming with a flipped optimization direction discards the stale high-water mark."""
+    tracker = _mk_tracker(tmp_path, higher_is_better=True, max_count=3)
+    _mk_step_dir(tracker, 100)
+    tracker.register(100, 50.0, is_regular=False)
+    save_running_best_state(tracker, metric="eval_success")
+
+    # Load as a minimize metric (val_loss): the persisted best (50.0) is uncomparable -> reset.
+    loaded = load_running_best_state(tmp_path, total_steps=1000, higher_is_better=False, max_count=3)
+    assert loaded.best == float("inf")  # reset to the minimize sentinel
+    assert [e["step"] for e in loaded.steps] == [100]  # pool kept
+
+
 # ---------------------------------------------------------------------------
 # prune_old_checkpoints protected_paths
 # ---------------------------------------------------------------------------
