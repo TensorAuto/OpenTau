@@ -1632,7 +1632,9 @@ class LeRobotDataset(BaseDataset):
                     self.repo_id,
                 )
         else:
-            no_transform_ds = self.hf_dataset.with_transform(None).with_format("numpy")
+            # "arrow" (columnar), not "numpy": with_format("numpy")[col] row-formats
+            # the whole table (O(rows) Python) -- very slow on large v3.0 datasets.
+            no_transform_ds = self.hf_dataset.with_transform(None).with_format("arrow")
             logging.info("Checking timestamps synchronization...")
             timestamps = np.asarray(no_transform_ds["timestamp"], dtype=np.float32)
             episode_indices = np.asarray(no_transform_ds["episode_index"], dtype=np.int64)
@@ -1950,7 +1952,12 @@ class LeRobotDataset(BaseDataset):
         # episode_index: (chunk, file) file order == episode order, ascending
         # within each file. Assert it so a malformed layout fails loudly here
         # rather than silently desyncing per-dataset metrics (CLAUDE.md §5).
-        ep_col = np.asarray(hf_dataset.with_format("numpy")["episode_index"]).reshape(-1)
+        # Read `episode_index` via the columnar "arrow" formatter, NOT
+        # `with_format("numpy")[col]`: the latter row-formats/decodes the entire
+        # table (O(rows) Python), which is pathologically slow on large
+        # consolidated v3.0 splits -- tens of minutes for a ~29M-row file set vs.
+        # milliseconds here. `np.asarray` converts the Arrow column in one shot.
+        ep_col = np.asarray(hf_dataset.with_format("arrow")["episode_index"]).reshape(-1)
         if ep_col.size and not np.all(ep_col[:-1] <= ep_col[1:]):
             raise RuntimeError(
                 f"{self.repo_id}: v3.0 data rows are not ordered by ascending episode_index; "
