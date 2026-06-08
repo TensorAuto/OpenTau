@@ -168,6 +168,17 @@ from opentau.policies.value.reward import (
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import on_accelerate_main_proc
 
+# Default number of random-index retries for ``retry_random_on_failure`` when a
+# dataset item fails to load. Until now ``_total_rand_attempts`` was read with a
+# ``getattr(..., 0)`` fallback and never set anywhere, so the retry feature was
+# inert (exactly one attempt) and a single unrecoverable item killed the whole
+# run. Transient per-item failures are real on large mixtures — most commonly a
+# consolidated video encoded with marginally fewer frames than its metadata
+# implies, whose trailing-frame decode raises — so a handful of retries lets the
+# loader skip that item and resample instead of aborting training. Subclasses may
+# still override ``self._total_rand_attempts`` to tune or disable it.
+DEFAULT_RAND_RETRY_ATTEMPTS = 8
+
 
 def retry_random_on_failure(f):
     """Decorator to retry dataset item retrieval with random indices on failure.
@@ -185,7 +196,7 @@ def retry_random_on_failure(f):
     @functools.wraps(f)
     def wrapped(self, idx):
         g = getattr(self, "_rr_rng", None)
-        total_attempts = getattr(self, "_total_rand_attempts", 0)
+        total_attempts = getattr(self, "_total_rand_attempts", DEFAULT_RAND_RETRY_ATTEMPTS)
         if g is None:
             g = torch.Generator()
             g.manual_seed(torch.initial_seed())  # different seed per DataLoader worker

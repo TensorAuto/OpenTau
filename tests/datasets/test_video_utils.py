@@ -127,3 +127,40 @@ def test_explicit_torchcodec_falls_back_to_pyav_with_single_warning(tmp_path, ca
     assert len(fallback_warnings) == 1, (
         f"expected exactly one explicit-fallback warning across 3 calls, got {len(fallback_warnings)}"
     )
+
+
+def test_torchcodec_clamps_out_of_range_frame_index(monkeypatch):
+    """A query timestamp mapping past the last frame is clamped to ``num_frames-1``.
+
+    Consolidated v3.0 videos are occasionally encoded with marginally fewer frames
+    than their metadata implies, so ``round(ts * average_fps)`` can land at/just
+    past ``num_frames``. ``torchcodec.get_frames_at`` raises a hard ``IndexError``
+    on such an index; the loader must instead clamp to the nearest decodable frame
+    (matching the pyav path), letting the tolerance check decide acceptance.
+    """
+    import torch
+
+    captured = {}
+    num_frames, avg_fps = 100, 20.0
+
+    class _FakeBatch:
+        def __init__(self, indices):
+            self.data = [torch.zeros(3, 4, 4, dtype=torch.uint8) for _ in indices]
+            self.pts_seconds = [torch.tensor(i / avg_fps) for i in indices]
+
+    class _FakeDecoder:
+        def __init__(self, *a, **k):
+            self.metadata = type("M", (), {"num_frames": num_frames, "average_fps": avg_fps})()
+
+        def get_frames_at(self, indices):
+            captured["indices"] = list(indices)
+            return _FakeBatch(indices)
+
+    monkeypatch.setattr(video_utils, "_load_torchcodec_videodecoder", lambda: (_FakeDecoder, None))
+
+    # ts = num_frames / avg_fps -> round() == num_frames (out of range by one).
+    ts = num_frames / avg_fps
+    frames = video_utils.decode_video_frames_torchcodec("fake.mp4", [ts], tolerance_s=0.5)
+
+    assert captured["indices"] == [num_frames - 1], f"index not clamped: {captured['indices']}"
+    assert frames.shape[0] == 1

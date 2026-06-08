@@ -376,9 +376,21 @@ def decode_video_frames_torchcodec(
     # get metadata for frame information
     metadata = decoder.metadata
     average_fps = metadata.average_fps
+    num_frames = metadata.num_frames
 
     # convert timestamps to frame indices
     frame_indices = [round(ts * average_fps) for ts in timestamps]
+    # Clamp to the decodable range [0, num_frames - 1]. A query timestamp can map
+    # past the final frame when a consolidated video was encoded with marginally
+    # fewer frames than its metadata implies, or when ``average_fps`` rounds up
+    # near the end of a long video. ``torchcodec``'s ``get_frames_at`` raises a
+    # hard ``IndexError`` on an out-of-range index, whereas the pyav path returns
+    # the nearest decoded frame; clamping reproduces that nearest-frame behavior.
+    # The tolerance check below still rejects a frame that is genuinely too far
+    # from its query timestamp (and ``retry_random_on_failure`` then skips that
+    # item), so this only rescues the off-by-rounding boundary case.
+    if num_frames:
+        frame_indices = [min(max(int(fi), 0), num_frames - 1) for fi in frame_indices]
 
     # retrieve frames based on indices
     frames_batch = decoder.get_frames_at(indices=frame_indices)

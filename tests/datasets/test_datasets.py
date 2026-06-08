@@ -1546,3 +1546,50 @@ def test_robot_type_and_control_mode_in_meta_info(tmp_path, lerobot_dataset_fact
     )
     assert ds_without.meta.info["robot_type"] is None
     assert "control_mode" not in ds_without.meta.info
+
+
+def test_retry_random_on_failure_uses_default_attempts():
+    """``retry_random_on_failure`` retries ``DEFAULT_RAND_RETRY_ATTEMPTS`` times.
+
+    Regression for the dead-retry bug: ``_total_rand_attempts`` was never set, so
+    the fallback was 0 -> exactly one attempt -> a single unrecoverable item
+    (e.g. a short consolidated video) aborted the whole run. The default must now
+    drive multiple retries.
+    """
+    from opentau.datasets.lerobot_dataset import DEFAULT_RAND_RETRY_ATTEMPTS, retry_random_on_failure
+
+    assert DEFAULT_RAND_RETRY_ATTEMPTS > 0
+    calls = {"n": 0}
+
+    class _AlwaysFails:
+        def __len__(self):
+            return 16
+
+        @retry_random_on_failure
+        def __getitem__(self, idx):
+            calls["n"] += 1
+            raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match=rf"after {DEFAULT_RAND_RETRY_ATTEMPTS + 1} attempt"):
+        _AlwaysFails()[0]
+    # one initial attempt + DEFAULT_RAND_RETRY_ATTEMPTS retries.
+    assert calls["n"] == DEFAULT_RAND_RETRY_ATTEMPTS + 1
+
+
+def test_retry_random_on_failure_recovers_from_transient_failure():
+    """A transient per-item failure is skipped: the wrapper resamples a different
+    index and returns successfully instead of raising."""
+    from opentau.datasets.lerobot_dataset import retry_random_on_failure
+
+    class _FailsOnce:
+        def __len__(self):
+            return 16
+
+        @retry_random_on_failure
+        def __getitem__(self, idx):
+            if idx == 0:  # the originally-requested (bad) index
+                raise RuntimeError("bad video frame")
+            return idx
+
+    out = _FailsOnce()[0]
+    assert out != 0  # recovered on a resampled index
