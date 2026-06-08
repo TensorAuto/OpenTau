@@ -169,6 +169,33 @@ def resolve_delta_timestamps(
     return dt_mean, {}, {}, {}
 
 
+def _subset_meta(meta: LeRobotDatasetMetadata) -> LeRobotDatasetMetadata:
+    """Per-subset metadata copy that shares read-only per-episode structures.
+
+    Returns a shallow copy of ``meta`` that shares ``episodes`` /
+    ``episodes_stats`` (and every other attribute) by reference, deep-copying
+    only the small aggregated ``stats`` dict so the train/val halves can hold
+    independent normalization stats without cross-contamination.
+
+    ``random_split`` divides a dataset by frame index, so the per-episode
+    ``episodes`` / ``episodes_stats`` are identical across the two subsets and
+    are read-only on the training path (only the dataset-*creation*
+    ``save_episode`` / stats-conversion paths write them). A blanket
+    ``deepcopy(meta)`` cloned them per subset: for a large per-episode-stats
+    dataset listed under many mixture configs that is tens of GB of needless
+    copies per rank, and — worse — copy-on-write surface that blows up host RAM
+    once forked across dataloader workers (every worker touches the clones).
+    Sharing them by reference removes both costs. Mirrors the share-by-reference
+    contract of :meth:`BaseDataset.shallow_copy_with_dropout`.
+
+    Args:
+        meta: The source dataset metadata to copy for a train/val subset.
+    """
+    subset_meta = copy.copy(meta)
+    subset_meta.stats = copy.deepcopy(meta.stats)
+    return subset_meta
+
+
 def make_dataset(
     cfg: DatasetConfig,
     train_cfg: TrainPipelineConfig,
@@ -278,8 +305,14 @@ def make_dataset(
         val_size = int(len(dataset) * effective_val_split)
         train_size = len(dataset) - val_size
         train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
-        train_dataset.meta = copy.deepcopy(dataset.meta)  # type: ignore[assignment]
-        val_dataset.meta = copy.deepcopy(dataset.meta)  # type: ignore[assignment]
+        # Share the large, read-only per-episode metadata (`episodes`,
+        # `episodes_stats`) across the two halves; deep-copy only the small
+        # aggregated `stats`. A blanket `deepcopy(meta)` here is tens of GB of
+        # needless per-rank copies for a large per-episode-stats dataset and
+        # becomes copy-on-write surface that OOMs the host across dataloader
+        # workers. See `_subset_meta`.
+        train_dataset.meta = _subset_meta(dataset.meta)  # type: ignore[assignment]
+        val_dataset.meta = _subset_meta(dataset.meta)  # type: ignore[assignment]
 
         # Subset wraps the same underlying dataset by reference, so the
         # training and validation halves would share every instance attribute

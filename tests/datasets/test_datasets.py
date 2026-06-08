@@ -961,6 +961,40 @@ def test_make_dataset_per_dataset_val_split_ratio_zero_opts_out(train_pipeline_c
         cleanup()
 
 
+def test_subset_meta_shares_episode_metadata_but_isolates_stats():
+    """`_subset_meta` shares the large read-only per-episode metadata by reference
+    while giving each subset an independent aggregated `stats`.
+
+    This is the host-RAM-blowup fix: a blanket `deepcopy(meta)` per train/val
+    subset cloned the per-episode `episodes` / `episodes_stats` (tens of GB for a
+    large per-episode-stats dataset, and copy-on-write surface that OOMs across
+    dataloader workers). They are identical between the split halves and read-only
+    during training, so they must be SHARED; only the small aggregated `stats`
+    may diverge and is deep-copied.
+    """
+    from types import SimpleNamespace
+
+    from opentau.datasets.factory import _subset_meta
+
+    episodes = {0: {"length": 3}, 1: {"length": 5}}
+    episodes_stats = {0: {"action": {"mean": np.zeros(4)}}, 1: {"action": {"mean": np.ones(4)}}}
+    stats = {"action": {"mean": np.zeros(4)}}
+    meta = SimpleNamespace(episodes=episodes, episodes_stats=episodes_stats, stats=stats, info={}, tasks={})
+
+    sub = _subset_meta(meta)
+
+    # Large per-episode structures are shared by reference (no per-subset clone).
+    assert sub.episodes is meta.episodes
+    assert sub.episodes_stats is meta.episodes_stats
+    # The small aggregated stats is an independent deep copy.
+    assert sub.stats is not meta.stats
+    assert sub.stats.keys() == meta.stats.keys()
+    assert np.array_equal(sub.stats["action"]["mean"], meta.stats["action"]["mean"])
+    # Mutating the subset's stats must not bleed into the source's.
+    sub.stats["action"]["mean"][:] = 7.0
+    assert np.array_equal(meta.stats["action"]["mean"], np.zeros(4))
+
+
 # TODO(aliberts): Move to more appropriate location
 def test_flatten_unflatten_dict():
     d = {
