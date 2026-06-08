@@ -95,3 +95,45 @@ def test_v21_warning_dedup(caplog, reset_v21_warning_state):
         assert repo_id in msg
         assert "convert_dataset_v20_to_v21.py" in msg
         assert "discord.com/invite" not in msg
+
+
+@pytest.fixture
+def reset_dropped_column_warning_state():
+    """Reset the warn-once dedup set for dropped non-tensorizable columns so the
+    warning assertion is deterministic regardless of test ordering."""
+    datasets_utils._DROPPED_NONTENSOR_COLUMNS_WARNED.clear()
+    yield
+    datasets_utils._DROPPED_NONTENSOR_COLUMNS_WARNED.clear()
+
+
+def test_hf_transform_drops_nontensorizable_columns(caplog, reset_dropped_column_warning_state):
+    """`hf_transform_to_torch` drops dict/struct columns it can't tensorize
+    (e.g. chat-style `language_persistent` annotations) and warns once, while
+    leaving numeric / string / empty-list columns intact."""
+    items_dict = {
+        "observation.state": [[1.0, 2.0, 3.0]],
+        "task": ["close the fridge"],
+        "language_events": [[]],  # null/empty list -> torch.tensor([]) -> kept
+        "language_persistent": [[{"role": "user", "content": "hi"}]],  # struct -> dropped
+    }
+    with caplog.at_level(logging.WARNING):
+        out = hf_transform_to_torch(items_dict)
+
+    # The struct column is dropped; model-relevant columns survive unchanged.
+    assert "language_persistent" not in out
+    assert torch.equal(out["observation.state"][0], torch.tensor([1.0, 2.0, 3.0]))
+    assert out["task"][0] == "close the fridge"
+    assert isinstance(out["language_events"][0], torch.Tensor)
+    assert out["language_events"][0].numel() == 0
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("language_persistent" in m for m in warnings), warnings
+
+    # Warn-once: a second call with the same column does not re-warn.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        hf_transform_to_torch({"language_persistent": [[{"a": 1}]], "observation.state": [[1.0]]})
+    repeat = [
+        r for r in caplog.records if r.levelno == logging.WARNING and "language_persistent" in r.getMessage()
+    ]
+    assert not repeat, "dropped-column warning should be emitted only once per column"

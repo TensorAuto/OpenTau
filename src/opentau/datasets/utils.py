@@ -718,12 +718,37 @@ def load_image_as_numpy(
     return img_array
 
 
+_DROPPED_NONTENSOR_COLUMNS_WARNED: set[str] = set()
+
+
+def _warn_dropped_nontensor_column_once(key: str) -> None:
+    """Warn once per column that a non-tensorizable field was dropped.
+
+    Args:
+        key: Name of the column dropped from the sample dict.
+    """
+    if key not in _DROPPED_NONTENSOR_COLUMNS_WARNED:
+        _DROPPED_NONTENSOR_COLUMNS_WARNED.add(key)
+        logging.warning(
+            "hf_transform_to_torch: dropping column %r whose values are not "
+            "convertible to tensors (e.g. a dict/struct annotation column such "
+            "as `language_persistent`). It is not a model input; this is "
+            "expected for datasets carrying auxiliary annotation fields.",
+            key,
+        )
+
+
 def hf_transform_to_torch(items_dict: dict[str, list]):
     """Get a transform function that convert items from Hugging Face dataset (pyarrow)
     to torch tensors. Importantly, images are converted from PIL, which corresponds to
     a channel last representation (h w c) of uint8 type, to a torch image representation
     with channel first (c h w) of float32 type in range [0,1].
+
+    Columns whose values cannot be converted to tensors (e.g. dict/struct
+    annotation columns such as ``language_persistent``) are not model inputs and
+    are dropped from the returned dict rather than crashing the dataloader.
     """
+    drop_keys: list[str] = []
     for key in items_dict:
         first_item = items_dict[key][0]
         if isinstance(first_item, PILImage.Image):
@@ -732,7 +757,18 @@ def hf_transform_to_torch(items_dict: dict[str, list]):
         elif first_item is None:
             pass
         else:
-            items_dict[key] = [x if isinstance(x, str) else torch.tensor(x) for x in items_dict[key]]
+            try:
+                items_dict[key] = [x if isinstance(x, str) else torch.tensor(x) for x in items_dict[key]]
+            except (TypeError, ValueError, RuntimeError):
+                # Auxiliary struct/dict columns (e.g. chat-style language
+                # annotations such as `language_persistent`) are not model
+                # inputs and torch.tensor() cannot infer their dtype. Drop them
+                # so the dataloader/collate does not choke, instead of crashing
+                # the whole run on the first batch.
+                drop_keys.append(key)
+    for key in drop_keys:
+        _warn_dropped_nontensor_column_once(key)
+        del items_dict[key]
     return items_dict
 
 
