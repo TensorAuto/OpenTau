@@ -704,7 +704,10 @@ def load_episodes_stats_v30(
     n = len(ep_index)
 
     # Materialize each stat column to an (n, -1) numpy block in one vectorized
-    # pass; only a ragged column falls back to per-cell coercion.
+    # pass; only a ragged column falls back to per-cell coercion. Uniform
+    # per-episode dimensionality is assumed (true for well-formed v3.0 stats):
+    # the ``size % n == 0`` guard catches the common ragged case, but a
+    # divisible-yet-ragged column would still be reshaped wrongly, not fall back.
     col_rows: dict[str, Any] = {}
     for col in stat_cols:
         chunked = table.column(col).combine_chunks()

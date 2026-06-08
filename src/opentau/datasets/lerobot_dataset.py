@@ -624,6 +624,11 @@ class LeRobotDatasetMetadata(DatasetMetadata):
             "tasks": episode_tasks,
             "length": episode_length,
         }
+        # NOTE: these in-place writes are the dataset-*creation* path. On the
+        # read/training path `self.episodes` / `self.episodes_stats` may be the
+        # shared objects handed out by the v3.0 meta cache
+        # (`utils._V30_META_CACHE`), which assumes they are not mutated after
+        # load -- so this must only run on freshly created/owned metadata.
         self.episodes[episode_index] = episode_dict
         write_episode(episode_dict, self.root)
 
