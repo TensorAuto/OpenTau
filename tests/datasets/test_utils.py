@@ -137,3 +137,10 @@ def test_hf_transform_drops_nontensorizable_columns(caplog, reset_dropped_column
         r for r in caplog.records if r.levelno == logging.WARNING and "language_persistent" in r.getMessage()
     ]
     assert not repeat, "dropped-column warning should be emitted only once per column"
+
+
+def test_hf_transform_raises_on_malformed_model_input():
+    """A malformed (non-dict-like) numeric column still raises loudly rather than
+    being silently dropped, so genuine data/shape bugs surface at their source."""
+    with pytest.raises((ValueError, RuntimeError, TypeError)):
+        hf_transform_to_torch({"observation.state": [[[1.0, 2.0], [1.0, 2.0, 3.0]]]})

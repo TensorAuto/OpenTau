@@ -738,6 +738,25 @@ def _warn_dropped_nontensor_column_once(key: str) -> None:
         )
 
 
+def _is_dict_like(value) -> bool:
+    """Return True if a column value is a dict or a list/tuple of dicts.
+
+    Such values come from struct / list-of-struct parquet columns (e.g.
+    chat-style ``language_persistent`` annotations) and cannot be converted to
+    tensors. Plain numeric scalars/sequences (and string columns) are not
+    dict-like, so a genuinely malformed model-input column still raises loudly at
+    ``torch.tensor`` instead of being silently dropped.
+
+    Args:
+        value: A single column value taken from one dataset row.
+    """
+    if isinstance(value, dict):
+        return True
+    if isinstance(value, (list, tuple)) and value:
+        return _is_dict_like(value[0])
+    return False
+
+
 def hf_transform_to_torch(items_dict: dict[str, list]):
     """Get a transform function that convert items from Hugging Face dataset (pyarrow)
     to torch tensors. Importantly, images are converted from PIL, which corresponds to
@@ -756,16 +775,17 @@ def hf_transform_to_torch(items_dict: dict[str, list]):
             items_dict[key] = [to_tensor(img) for img in items_dict[key]]
         elif first_item is None:
             pass
+        elif _is_dict_like(first_item):
+            # Struct / list-of-struct annotation columns (e.g. chat-style
+            # language annotations such as `language_persistent`) are not model
+            # inputs and cannot be converted to tensors. Drop them so the
+            # dataloader/collate does not choke. Narrowed to dict-like values so
+            # a genuinely malformed model-input column (e.g. a ragged `action`)
+            # still raises loudly at `torch.tensor` below instead of being
+            # silently dropped here.
+            drop_keys.append(key)
         else:
-            try:
-                items_dict[key] = [x if isinstance(x, str) else torch.tensor(x) for x in items_dict[key]]
-            except (TypeError, ValueError, RuntimeError):
-                # Auxiliary struct/dict columns (e.g. chat-style language
-                # annotations such as `language_persistent`) are not model
-                # inputs and torch.tensor() cannot infer their dtype. Drop them
-                # so the dataloader/collate does not choke, instead of crashing
-                # the whole run on the first batch.
-                drop_keys.append(key)
+            items_dict[key] = [x if isinstance(x, str) else torch.tensor(x) for x in items_dict[key]]
     for key in drop_keys:
         _warn_dropped_nontensor_column_once(key)
         del items_dict[key]
