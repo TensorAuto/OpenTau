@@ -89,6 +89,8 @@ import jsonlines
 import numpy as np
 import packaging.version
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import torch
 from datasets.table import embed_table_storage
 from huggingface_hub import DatasetCard, DatasetCardData, HfApi
@@ -563,23 +565,59 @@ def load_tasks_v30(local_dir: Path) -> tuple[dict, dict]:
     return tasks, task_to_task_index
 
 
-def _read_v30_episodes_table(local_dir: Path) -> pd.DataFrame:
-    """Read and row-concat all v3.0 ``meta/episodes/**/*.parquet`` shards.
+# Process-level cache of parsed v3.0 episode metadata, keyed by a content
+# signature of the dataset's episode parquet shards. A mixture often lists the
+# same repo under several configs (different episode subsets / weights); without
+# this each config re-parses the full episode table (pathological for large
+# datasets). The cached dicts are read-only on the training path (the only
+# writers are the dataset-*creation* `save_episode` path), so sharing them across
+# configs is safe.
+_V30_META_CACHE: dict[tuple, tuple[dict, dict]] = {}
+
+
+def _v30_meta_cache_key(local_dir: Path) -> tuple:
+    """Content-addressed cache key for v3.0 episode metadata.
+
+    Combines the resolved dataset dir with a ``(path, size, mtime)`` signature of
+    every episode parquet shard, so the cache hits when the same repo is loaded
+    again but auto-invalidates if the on-disk metadata changes.
+
+    Args:
+        local_dir: Dataset root directory.
+    """
+    episodes_dir = Path(local_dir) / V30_EPISODES_DIR
+    sig = tuple(
+        (str(f), st.st_size, st.st_mtime_ns)
+        for f in sorted(episodes_dir.glob("**/*.parquet"))
+        for st in (f.stat(),)
+    )
+    return (str(Path(local_dir).resolve()), sig)
+
+
+def _read_v30_episodes_arrow(local_dir: Path) -> pa.Table:
+    """Read and row-concat all v3.0 ``meta/episodes/**/*.parquet`` shards as one
+    Arrow table.
 
     One row per episode, sorted by shard path so episodes stay in ascending
     order. Columns carry the data/video file mapping
     (``data/chunk_index``, ``data/file_index``, ``videos/{key}/...``),
     ``dataset_from_index``/``dataset_to_index``, the legacy ``tasks``/``length``,
-    and flattened ``stats/{feature}/{stat}`` per-episode statistics.
+    and flattened ``stats/{feature}/{stat}`` per-episode statistics. Read as
+    Arrow (not pandas) so columns -- especially the per-episode ``stats/*`` list
+    columns -- can be materialized to numpy column-wise, avoiding a slow per-cell
+    Python coercion.
+
+    Args:
+        local_dir: Dataset root directory.
     """
     episodes_dir = local_dir / V30_EPISODES_DIR
     files = sorted(episodes_dir.glob("**/*.parquet"))
     if not files:
         raise FileNotFoundError(f"No v3.0 episode metadata parquet found under {episodes_dir}")
-    return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+    return pa.concat_tables([pq.read_table(f) for f in files])
 
 
-def load_episodes_v30(local_dir: Path, episodes_df: pd.DataFrame | None = None) -> dict[int, dict]:
+def load_episodes_v30(local_dir: Path, episodes_table: pa.Table | None = None) -> dict[int, dict]:
     """Load episodes from the v3.0 ``meta/episodes/**/*.parquet`` shards.
 
     Emits the same ``{episode_index: {...}}`` shape as :func:`load_episodes`, so
@@ -588,19 +626,27 @@ def load_episodes_v30(local_dir: Path, episodes_df: pd.DataFrame | None = None) 
     file-mapping columns. The flattened ``stats/*`` columns are dropped here and
     loaded separately by :func:`load_episodes_stats_v30`.
 
-    ``episodes_df`` lets a caller pass a pre-read table so the shards are parsed
-    once across episodes + stats (see :func:`load_episodes_and_stats_v30`).
+    Columns are read column-wise (Arrow ``to_pylist`` per column, then zipped into
+    per-episode rows) instead of ``DataFrame.to_dict(orient="records")``, which is
+    materially faster on large episode tables.
+
+    Args:
+        local_dir: Dataset root directory.
+        episodes_table: Optional pre-read Arrow table so the shards are parsed
+            once across episodes + stats (see :func:`load_episodes_and_stats_v30`).
     """
-    df = episodes_df if episodes_df is not None else _read_v30_episodes_table(local_dir)
-    stat_cols = [c for c in df.columns if c.startswith("stats/")]
-    df = df.drop(columns=stat_cols)
+    table = episodes_table if episodes_table is not None else _read_v30_episodes_arrow(local_dir)
+    keep = [c for c in table.column_names if not c.startswith("stats/")]
+    columns = {c: table.column(c).to_pylist() for c in keep}
+    ep_index = columns["episode_index"]
     episodes: dict[int, dict] = {}
-    for record in df.to_dict(orient="records"):
+    for i in range(len(ep_index)):
+        record = {c: columns[c][i] for c in keep}
         ep_idx = int(record["episode_index"])
         record["episode_index"] = ep_idx
         record["length"] = int(record["length"])
         if record.get("tasks") is not None:
-            # parquet list<string> reads back as an ndarray; normalize to list.
+            # Arrow list<string> -> python list already; normalize defensively.
             record["tasks"] = list(record["tasks"])
         episodes[ep_idx] = record
     return dict(sorted(episodes.items()))
@@ -609,14 +655,18 @@ def load_episodes_v30(local_dir: Path, episodes_df: pd.DataFrame | None = None) 
 def _deep_float_array(value) -> np.ndarray:
     """Recursively coerce a parquet stat cell into a clean float ndarray.
 
-    Image/video stats round-trip from parquet as deeply nested *object* arrays
-    (ndarrays whose elements are themselves object ndarrays, e.g. a ``(3,)``
-    object array of ``(1,)`` object arrays of ``(1,)`` float arrays). A single
-    ``ndarray.tolist()`` does not recurse through object dtype, leaving an
-    ``object``-dtype array that breaks numeric ops like ``np.isfinite`` in
-    ``aggregate_stats``. This walks every nested ndarray down to plain Python
-    floats so ``np.array`` rebuilds a clean float array with the stored shape.
-    Vector stats and ``count`` (already clean 1-D arrays) pass through unchanged.
+    Fallback for the rare ragged ``stats/*`` column that cannot be materialized
+    column-wise (see :func:`load_episodes_stats_v30`). Image/video stats
+    round-trip from parquet as deeply nested *object* arrays (ndarrays whose
+    elements are themselves object ndarrays, e.g. a ``(3,)`` object array of
+    ``(1,)`` object arrays of ``(1,)`` float arrays). A single ``ndarray.tolist()``
+    does not recurse through object dtype, leaving an ``object``-dtype array that
+    breaks numeric ops like ``np.isfinite`` in ``aggregate_stats``. This walks
+    every nested ndarray down to plain Python floats so ``np.array`` rebuilds a
+    clean float array with the stored shape.
+
+    Args:
+        value: A single ``stats/*`` parquet cell.
     """
 
     def _deep(x):
@@ -630,34 +680,71 @@ def _deep_float_array(value) -> np.ndarray:
 
 
 def load_episodes_stats_v30(
-    local_dir: Path, episodes_df: pd.DataFrame | None = None
+    local_dir: Path, episodes_table: pa.Table | None = None
 ) -> dict[int, dict[str, dict[str, np.ndarray]]]:
     """Reconstruct per-episode stats from the flattened ``stats/*`` columns of
     the v3.0 episodes parquet. Returns the same shape as
     :func:`load_episodes_stats` so ``aggregate_stats`` accepts v3.0 stats
     identically: ``count`` is ``(1,)`` int and image/video stats are ``(C, 1, 1)``.
 
-    ``episodes_df`` lets a caller pass a pre-read table so the shards are parsed
-    once across episodes + stats (see :func:`load_episodes_and_stats_v30`).
+    Each ``stats/*`` column is materialized to numpy *column-wise* -- flatten the
+    Arrow list column once and reshape to ``(num_episodes, -1)`` -- instead of a
+    per-cell Python coercion, which is the dominant cost when loading large v3.0
+    episode tables. A ragged column (non-uniform per-episode length) falls back to
+    the per-cell path.
+
+    Args:
+        local_dir: Dataset root directory.
+        episodes_table: Optional pre-read Arrow table so the shards are parsed
+            once across episodes + stats (see :func:`load_episodes_and_stats_v30`).
     """
-    df = episodes_df if episodes_df is not None else _read_v30_episodes_table(local_dir)
-    stat_cols = [c for c in df.columns if c.startswith("stats/")]
+    table = episodes_table if episodes_table is not None else _read_v30_episodes_arrow(local_dir)
+    stat_cols = [c for c in table.column_names if c.startswith("stats/")]
+    ep_index = table.column("episode_index").to_numpy()
+    n = len(ep_index)
+
+    # Materialize each stat column to an (n, -1) numpy block in one vectorized
+    # pass; only a ragged column falls back to per-cell coercion. Uniform
+    # per-episode dimensionality is assumed (true for well-formed v3.0 stats):
+    # the ``size % n == 0`` guard catches the common ragged case, but a
+    # divisible-yet-ragged column would still be reshaped wrongly, not fall back.
+    col_rows: dict[str, Any] = {}
+    for col in stat_cols:
+        chunked = table.column(col).combine_chunks()
+        flat = chunked
+        while pa.types.is_list(flat.type) or pa.types.is_large_list(flat.type):
+            flat = flat.flatten()
+        values = np.asarray(flat.to_numpy(zero_copy_only=False))
+        if n and values.size % n == 0:
+            col_rows[col] = values.reshape(n, -1)
+        else:
+            col_rows[col] = [_deep_float_array(v) for v in chunked.to_pylist()]
+
+    # Precompute (feature, stat, kind) per column so the per-episode loop is tight.
+    col_meta: list[tuple[str, str, str, str]] = []
+    features: list[str] = []
+    for col in stat_cols:
+        # col == "stats/{feature}/{stat}"; feature names use dots, not slashes.
+        _, feature, stat = col.split("/", 2)
+        kind = "count" if stat == "count" else ("image" if "image" in feature else "vector")
+        col_meta.append((col, feature, stat, kind))
+        if feature not in features:
+            features.append(feature)
+
     episodes_stats: dict[int, dict[str, dict[str, np.ndarray]]] = {}
-    for record in df[["episode_index", *stat_cols]].to_dict(orient="records"):
-        ep_idx = int(record["episode_index"])
-        flat: dict[str, np.ndarray] = {}
-        for col in stat_cols:
-            # col == "stats/{feature}/{stat}"; feature names use dots, not slashes.
-            _, feature, stat = col.split("/", 2)
-            arr = _deep_float_array(record[col])
-            if stat == "count":
-                arr = arr.astype(np.int64)
-            elif "image" in feature:
-                # A parquet round-trip can drop/add trailing singleton dims;
+    for i in range(n):
+        per_feature: dict[str, dict[str, np.ndarray]] = {f: {} for f in features}
+        for col, feature, stat, kind in col_meta:
+            v = col_rows[col][i]
+            if kind == "count":
+                v = np.asarray(v).reshape(-1).astype(np.int64)
+            elif kind == "image":
                 # normalize to (C, 1, 1) like compute_stats._assert_type_and_shape.
-                arr = arr.reshape(-1, 1, 1)
-            flat[col] = arr
-        episodes_stats[ep_idx] = unflatten_dict(flat).get("stats", {})
+                v = np.asarray(v, dtype=np.float64).reshape(-1, 1, 1)
+            else:
+                v = np.asarray(v, dtype=np.float64).reshape(-1)
+            per_feature[feature][stat] = v
+        episodes_stats[int(ep_index[i])] = per_feature
     return dict(sorted(episodes_stats.items()))
 
 
@@ -666,13 +753,23 @@ def load_episodes_and_stats_v30(
 ) -> tuple[dict[int, dict], dict[int, dict[str, dict[str, np.ndarray]]]]:
     """Load v3.0 episodes and per-episode stats, parsing the metadata shards once.
 
-    The episodes parquet (incl. the wide flattened ``stats/*`` columns) is read a
-    single time and split into the :func:`load_episodes_v30` and
-    :func:`load_episodes_stats_v30` results, halving the metadata-load cost on
-    large datasets (e.g. DROID, whose episode metadata is ~600 MB).
+    The episode-metadata shards are read a single time (one Arrow table) and
+    split into the :func:`load_episodes_v30` and :func:`load_episodes_stats_v30`
+    results. The result is cached per ``local_dir`` (keyed by a content
+    signature), so a mixture that lists the same repo under several configs parses
+    its metadata once instead of once per config.
+
+    Args:
+        local_dir: Dataset root directory.
     """
-    df = _read_v30_episodes_table(local_dir)
-    return load_episodes_v30(local_dir, df), load_episodes_stats_v30(local_dir, df)
+    cache_key = _v30_meta_cache_key(local_dir)
+    cached = _V30_META_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    table = _read_v30_episodes_arrow(local_dir)
+    result = (load_episodes_v30(local_dir, table), load_episodes_stats_v30(local_dir, table))
+    _V30_META_CACHE[cache_key] = result
+    return result
 
 
 def backward_compatible_episodes_stats(
