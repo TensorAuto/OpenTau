@@ -370,6 +370,29 @@ def test_v30_loaders_standalone(tmp_path):
     assert stats[1]["observation.state"]["std"].shape == (STATE_DIM,)
 
 
+def test_v30_meta_load_dedup_cache(tmp_path):
+    """`load_episodes_and_stats_v30` caches per dataset dir, so a repo listed
+    under several mixture configs parses its episode metadata once instead of
+    once per config. The cache auto-invalidates if the on-disk metadata changes.
+    """
+    from opentau.datasets.utils import _V30_META_CACHE, load_episodes_and_stats_v30
+
+    root = tmp_path / "ds"
+    _write_v30_dataset(root, multi_task=True)
+    _V30_META_CACHE.clear()
+    try:
+        eps1, stats1 = load_episodes_and_stats_v30(root)
+        eps2, stats2 = load_episodes_and_stats_v30(root)
+        # Second load is a cache hit -> identical objects, not re-parsed.
+        assert eps1 is eps2
+        assert stats1 is stats2
+        # Cached result matches the standalone loaders (same episodes + stats).
+        assert eps1.keys() == load_episodes_v30(root).keys()
+        assert set(stats1) == set(load_episodes_stats_v30(root))
+    finally:
+        _V30_META_CACHE.clear()
+
+
 def test_deep_float_array_coerces_object_nested_image_stat():
     # Reproduce the exact structure a real v3.0 image stat round-trips to from
     # parquet: a (3,) object array of (1,) object arrays of (1,) float arrays
