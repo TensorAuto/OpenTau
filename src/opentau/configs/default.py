@@ -513,11 +513,23 @@ class EvalConfig:
             Defaults to 16.
         grid_size: Grid dimensions for video summary (rows, cols). If None, will
             be auto-calculated as a square grid. Defaults to None.
+        video_crf: H.264 constant-rate-factor for the uploaded grid-summary video
+            (higher = smaller file / lower quality, 0-51). Defaults to 30.
+        video_preset: x264 encode preset (ultrafast..veryslow); an encode-speed
+            vs compression-ratio knob that does not change the quality target.
+            Defaults to "veryfast".
+        video_frame_stride: Keep only every k-th frame of the grid-summary video
+            (k>1 shrinks the upload ~linearly and speeds playback up k x).
+            Defaults to 2.
+        keep_per_episode_videos: If False, delete the per-episode
+            eval_episode_*.mp4 clips after the grid summary is built (they are
+            never uploaded to wandb). Defaults to False.
         recording_root: Root directory for saving evaluation recordings.
             Defaults to None.
 
     Raises:
-        ValueError: If `batch_size` is greater than `n_episodes`.
+        ValueError: If `batch_size` is greater than `n_episodes`, or if any of
+            `video_crf`, `video_preset`, `video_frame_stride` is out of range.
     """
 
     n_episodes: int = 16
@@ -528,6 +540,24 @@ class EvalConfig:
     max_episodes_rendered: int = 16
     # Grid dimensions for video summary (rows, cols). If None, will be auto-calculated as square grid.
     grid_size: tuple[int, int] | None = None
+
+    # ---- Eval grid-summary video encoding (wandb upload storage footprint) ----
+    # Only the grid summary is uploaded to wandb, so these knobs control the size
+    # of the wandb media. H.264 constant-rate-factor: higher = smaller / lower
+    # quality (0=lossless, 23=x264 default, 51=worst). Defaults to 30.
+    video_crf: int = 30
+    # x264 encode preset (ultrafast..veryslow): encode-speed vs compression-ratio.
+    # Does NOT change the CRF quality target. "veryfast" keeps encoding off the
+    # eval critical path. Defaults to "veryfast".
+    video_preset: str = "veryfast"
+    # Write only every k-th frame of the grid summary. k>1 shrinks the upload
+    # ~linearly and plays back k x faster (at the cost of temporal smoothness).
+    # Defaults to 2.
+    video_frame_stride: int = 2
+    # If False, per-episode eval_episode_*.mp4 clips are deleted once the grid
+    # summary is built (they are never uploaded to wandb and are the bulk of
+    # local disk usage). Set True to keep them for inspection. Defaults to False.
+    keep_per_episode_videos: bool = False
 
     recording_root: str | None = None
 
@@ -560,4 +590,23 @@ class EvalConfig:
                 "This might significantly slow down evaluation. To fix this, you should update your command "
                 f"to increase the number of episodes to match the batch size (e.g. `eval.n_episodes={self.batch_size}`), "
                 f"or lower the batch size (e.g. `eval.batch_size={self.n_episodes}`)."
+            )
+        if not 0 <= self.video_crf <= 51:
+            raise ValueError(f"eval.video_crf must be in [0, 51], got {self.video_crf}.")
+        if self.video_frame_stride < 1:
+            raise ValueError(f"eval.video_frame_stride must be >= 1, got {self.video_frame_stride}.")
+        valid_presets = {
+            "ultrafast",
+            "superfast",
+            "veryfast",
+            "faster",
+            "fast",
+            "medium",
+            "slow",
+            "slower",
+            "veryslow",
+        }
+        if self.video_preset not in valid_presets:
+            raise ValueError(
+                f"eval.video_preset must be one of {sorted(valid_presets)}, got {self.video_preset!r}."
             )
