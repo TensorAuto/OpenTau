@@ -444,8 +444,15 @@ def eval_policy(
                 fps=env.unwrapped.metadata["render_fps"],
                 highlight_duration=2.0,
                 grid_size=grid_size,
+                crf=getattr(cfg.eval, "video_crf", 30),
+                preset=getattr(cfg.eval, "video_preset", "veryfast"),
+                frame_stride=getattr(cfg.eval, "video_frame_stride", 2),
             )
             logging.info(f"Grid summary video created: {grid_summary_path}")
+            # Only the grid summary is uploaded to wandb; the per-episode clips
+            # are pure local disk. Remove them once the grid is built (kept on a
+            # failed build for debugging, since this runs inside the try).
+            _cleanup_episode_clips(video_paths, getattr(cfg.eval, "keep_per_episode_videos", False))
         except Exception as e:
             logging.error(f"Failed to create grid summary video: {e}")
 
@@ -484,7 +491,10 @@ def eval_policy(
         info["episodes"] = episode_data
 
     if max_episodes_rendered > 0:
-        info["video_paths"] = video_paths
+        # Reflect on-disk reality: _cleanup_episode_clips may have removed the
+        # per-episode clips, so only record paths that still exist (this dict is
+        # serialized to eval_info.json, which external consumers may read).
+        info["video_paths"] = [p for p in video_paths if Path(p).exists()]
 
     return info
 
@@ -496,8 +506,16 @@ def create_grid_summary_video(
     fps: float,
     highlight_duration: float = 1.0,
     grid_size: tuple[int, int] | None = None,
+    crf: int = 30,
+    preset: str = "veryfast",
+    frame_stride: int = 1,
 ) -> None:
     """Create a grid summary video from individual episode videos.
+
+    The output is encoded with H.264 (libx264) at the given constant-rate-factor
+    and ``yuv420p`` pixel format so it stays small and plays back in the wandb /
+    browser HTML5 player. ``frame_stride`` keeps only every k-th composed frame,
+    which shrinks the upload ~linearly (and speeds playback up k x).
 
     Args:
         video_paths: List of paths to individual video files
@@ -506,6 +524,10 @@ def create_grid_summary_video(
         fps: Frames per second for the output video
         highlight_duration: Duration in seconds to show the highlighting at the end
         grid_size: Tuple of (rows, cols) for the grid. If None, will be auto-calculated as square grid.
+        crf: H.264 constant-rate-factor (higher = smaller / lower quality, 0-51).
+        preset: x264 encode preset (ultrafast..veryslow); encode-speed vs ratio.
+        frame_stride: Keep only every k-th composed frame (k>=1). The held
+            highlight tail is unaffected.
     """
     if len(video_paths) != len(success_statuses):
         raise ValueError(
@@ -577,8 +599,24 @@ def create_grid_summary_video(
         # final state (matches the previous behaviour) rather than going blank.
         last_frames: list = [None] * len(readers)
         exhausted = [False] * len(readers)
-        writer = imageio.get_writer(output_path, fps=fps)
-        # One iteration per output frame; stop once every clip is exhausted.
+        # Explicit, storage-lean H.264 params: imageio's default writer exposes
+        # no size knob (quality=5 -> -qscale:v), and only this grid is uploaded to
+        # wandb. quality=None suppresses -qscale so -crf governs the rate; yuv420p
+        # keeps the file playable in the wandb / browser HTML5 player.
+        writer = imageio.get_writer(
+            output_path,
+            fps=fps,
+            codec="libx264",
+            quality=None,
+            pixelformat="yuv420p",
+            macro_block_size=16,
+            output_params=["-crf", str(crf), "-preset", preset],
+        )
+        # One iteration per source timestep; stop once every clip is exhausted.
+        # ``out_idx`` counts timesteps so frame_stride writes only every k-th
+        # composed frame; the grid is still rebuilt each step so ``last_grid``
+        # (used for the highlight tail) reflects the true final frame.
+        out_idx = 0
         while True:
             advanced = False
             for i, stream in enumerate(frame_streams):
@@ -595,8 +633,10 @@ def create_grid_summary_video(
             grid_frame = np.zeros((grid_height, grid_width, 3), dtype=np.uint8)
             for i, frame in enumerate(last_frames):
                 _place(grid_frame, i, frame)
-            writer.append_data(grid_frame)
+            if out_idx % frame_stride == 0:
+                writer.append_data(grid_frame)
             last_grid = grid_frame
+            out_idx += 1
 
         # Hold the final frame with a green/red success border per tile.
         if last_grid is not None:
@@ -618,6 +658,27 @@ def create_grid_summary_video(
             reader.close()
 
     logging.info(f"Grid summary video saved to: {output_path}")
+
+
+def _cleanup_episode_clips(video_paths: list[str], keep: bool) -> None:
+    """Delete the per-episode eval clips once the grid summary is built.
+
+    Only ``grid_summary.mp4`` is uploaded to wandb; the per-episode
+    ``eval_episode_*.mp4`` clips are local-only and are the bulk of eval disk
+    usage. ``keep=True`` retains them for per-episode inspection. Each unlink is
+    guarded so a partial cleanup never aborts eval.
+
+    Args:
+        video_paths: Paths to the per-episode clips that fed the grid summary.
+        keep: If True, keep the clips (no-op).
+    """
+    if keep:
+        return
+    for clip_path in video_paths:
+        try:
+            Path(clip_path).unlink(missing_ok=True)
+        except OSError as e:
+            logging.warning(f"Failed to remove eval clip {clip_path}: {e}")
 
 
 def make_subgoal_generator(cfg: TrainPipelineConfig) -> SubgoalImageGenerator | None:

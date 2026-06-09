@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -19,8 +20,14 @@ import imageio.v2 as imageio
 import numpy as np
 import pytest
 
+from opentau.configs.default import EvalConfig
 from opentau.envs.configs import RoboCasaEnv
-from opentau.scripts.eval import collect_grid_summary_videos, create_grid_summary_video, eval_policy_all
+from opentau.scripts.eval import (
+    _cleanup_episode_clips,
+    collect_grid_summary_videos,
+    create_grid_summary_video,
+    eval_policy_all,
+)
 
 
 def _touch(p: Path):
@@ -124,3 +131,116 @@ def test_create_grid_summary_video_no_valid_videos_is_noop(tmp_path):
     out = tmp_path / "grid_summary.mp4"
     create_grid_summary_video([str(tmp_path / "missing.mp4")], [True], str(out), fps=10)
     assert not out.exists()
+
+
+def _make_clip(path: Path, h: int, w: int, n_frames: int, seed: int, fps: int = 10) -> None:
+    """Write a deterministic high-entropy clip so CRF/size differences are visible.
+
+    Random noise is a near-worst case for H.264, which makes the CRF size-drop
+    assertion a conservative floor (real sim renders compress much better).
+    """
+    rng = np.random.default_rng(seed)
+    frames = [rng.integers(0, 256, (h, w, 3), dtype=np.uint8) for _ in range(n_frames)]
+    imageio.mimsave(str(path), frames, fps=fps)
+
+
+def _count_frames(path: Path) -> int:
+    reader = imageio.get_reader(str(path))
+    try:
+        return reader.count_frames()
+    finally:
+        reader.close()
+
+
+def test_create_grid_summary_video_crf_shrinks_file(tmp_path):
+    """A higher CRF yields a smaller grid file for the same input — this is the
+    wandb-upload storage knob. crf=0 (near-lossless) must be larger than crf=40."""
+    clips = []
+    for k in range(2):
+        c = tmp_path / f"clip_{k}.mp4"
+        _make_clip(c, 64, 64, 20, seed=k)
+        clips.append(str(c))
+
+    low_crf = tmp_path / "low_crf.mp4"
+    high_crf = tmp_path / "high_crf.mp4"
+    create_grid_summary_video(clips, [True, False], str(low_crf), fps=10, highlight_duration=0.0, crf=0)
+    create_grid_summary_video(clips, [True, False], str(high_crf), fps=10, highlight_duration=0.0, crf=40)
+
+    assert low_crf.exists() and high_crf.exists()
+    assert os.path.getsize(high_crf) < os.path.getsize(low_crf)
+
+
+def test_create_grid_summary_video_frame_stride_subsamples(tmp_path):
+    """frame_stride=k writes only every k-th composed frame, shrinking the body
+    ~linearly. highlight_duration=0 removes the constant tail to count cleanly."""
+    clips = []
+    for k in range(2):
+        c = tmp_path / f"clip_{k}.mp4"
+        _make_clip(c, 32, 32, 10, seed=10 + k)
+        clips.append(str(c))
+
+    out1 = tmp_path / "stride1.mp4"
+    out2 = tmp_path / "stride2.mp4"
+    create_grid_summary_video(clips, [True, True], str(out1), fps=10, highlight_duration=0.0, frame_stride=1)
+    create_grid_summary_video(clips, [True, True], str(out2), fps=10, highlight_duration=0.0, frame_stride=2)
+
+    n1, n2 = _count_frames(out1), _count_frames(out2)
+    assert n2 < n1  # striding wrote strictly fewer frames
+    # 10 source timesteps -> stride 2 keeps indices 0,2,4,6,8 (== 5); allow +/-1
+    # for any encoder frame-count quirk.
+    assert (n1 // 2) - 1 <= n2 <= (n1 // 2) + 1
+
+
+def test_create_grid_summary_video_default_params_keep_shape(tmp_path):
+    """Codec/pixel-format regression guard: explicit libx264/yuv420p must not
+    change the composed grid dimensions (4 clips -> 2x2 grid)."""
+    clips = []
+    for k in range(4):
+        c = tmp_path / f"clip_{k}.mp4"
+        _make_clip(c, 64, 64, 6, seed=20 + k)
+        clips.append(str(c))
+
+    out = tmp_path / "grid_summary.mp4"
+    create_grid_summary_video(clips, [True, False, True, False], str(out), fps=10, highlight_duration=0.0)
+
+    assert out.exists()
+    reader = imageio.get_reader(str(out))
+    try:
+        shape = reader.get_data(0).shape
+    finally:
+        reader.close()
+    assert shape == (2 * 64, 2 * 64, 3)
+
+
+def test_cleanup_episode_clips_deletes_unless_kept(tmp_path):
+    """Per-episode clips are removed after the grid is built (keep=False) and
+    retained when keep=True; a missing path is tolerated."""
+    paths = []
+    for k in range(3):
+        p = tmp_path / f"eval_episode_{k}.mp4"
+        p.write_bytes(b"x")
+        paths.append(str(p))
+    paths.append(str(tmp_path / "already_gone.mp4"))  # exercises the missing_ok path
+
+    _cleanup_episode_clips(paths, keep=True)
+    assert all(Path(p).exists() for p in paths[:3])
+
+    _cleanup_episode_clips(paths, keep=False)
+    assert all(not Path(p).exists() for p in paths)
+
+
+def test_eval_config_rejects_out_of_range_video_params():
+    """__post_init__ guards the new grid-encoding knobs: CRF in [0, 51], stride
+    >= 1, and a known x264 preset; valid bounds construct fine."""
+    # Valid bounds construct without error.
+    EvalConfig(video_crf=0, video_frame_stride=1, video_preset="slow")
+    EvalConfig(video_crf=51, video_frame_stride=10, video_preset="ultrafast")
+
+    with pytest.raises(ValueError, match="video_crf"):
+        EvalConfig(video_crf=52)
+    with pytest.raises(ValueError, match="video_crf"):
+        EvalConfig(video_crf=-1)
+    with pytest.raises(ValueError, match="video_frame_stride"):
+        EvalConfig(video_frame_stride=0)
+    with pytest.raises(ValueError, match="video_preset"):
+        EvalConfig(video_preset="turbo")
