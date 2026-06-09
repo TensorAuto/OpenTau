@@ -20,6 +20,7 @@ import imageio.v2 as imageio
 import numpy as np
 import pytest
 
+from opentau.configs.default import EvalConfig
 from opentau.envs.configs import RoboCasaEnv
 from opentau.scripts.eval import (
     _cleanup_episode_clips,
@@ -226,3 +227,20 @@ def test_cleanup_episode_clips_deletes_unless_kept(tmp_path):
 
     _cleanup_episode_clips(paths, keep=False)
     assert all(not Path(p).exists() for p in paths)
+
+
+def test_eval_config_rejects_out_of_range_video_params():
+    """__post_init__ guards the new grid-encoding knobs: CRF in [0, 51], stride
+    >= 1, and a known x264 preset; valid bounds construct fine."""
+    # Valid bounds construct without error.
+    EvalConfig(video_crf=0, video_frame_stride=1, video_preset="slow")
+    EvalConfig(video_crf=51, video_frame_stride=10, video_preset="ultrafast")
+
+    with pytest.raises(ValueError, match="video_crf"):
+        EvalConfig(video_crf=52)
+    with pytest.raises(ValueError, match="video_crf"):
+        EvalConfig(video_crf=-1)
+    with pytest.raises(ValueError, match="video_frame_stride"):
+        EvalConfig(video_frame_stride=0)
+    with pytest.raises(ValueError, match="video_preset"):
+        EvalConfig(video_preset="turbo")

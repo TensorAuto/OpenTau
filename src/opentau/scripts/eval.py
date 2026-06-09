@@ -491,7 +491,10 @@ def eval_policy(
         info["episodes"] = episode_data
 
     if max_episodes_rendered > 0:
-        info["video_paths"] = video_paths
+        # Reflect on-disk reality: _cleanup_episode_clips may have removed the
+        # per-episode clips, so only record paths that still exist (this dict is
+        # serialized to eval_info.json, which external consumers may read).
+        info["video_paths"] = [p for p in video_paths if Path(p).exists()]
 
     return info
 
