@@ -91,7 +91,9 @@ def _eval_with_fresh_envs(
     *non-PyTorch* device memory (~GiB per env) that ``torch.cuda.empty_cache``
     cannot reclaim; left open across an eval it stacks with the regrown training
     footprint and OOMs the next backward. Mirrors the standalone eval lifecycle
-    in ``eval.py`` (build -> eval -> ``close_envs``).
+    in ``eval.py`` (build -> eval -> ``close_envs``). The ``finally`` also
+    ``reset()``s the policy so its per-eval observation buffers (sized to
+    ``eval.batch_size``) do not persist into the resumed training step.
 
     Returns this rank's local ``eval_info`` (the caller gathers across ranks).
     """
@@ -115,6 +117,15 @@ def _eval_with_fresh_envs(
             )
     finally:
         close_envs(eval_envs)
+        # Drop the policy's per-eval observation history before training resumes.
+        # ``select_action`` accumulates ``_obs_buffers`` / ``_state_buffer`` /
+        # ``_action_queue`` sized to ``eval.batch_size``; ``reset()`` runs at each
+        # rollout *start* but never after the eval, so those eval-batch tensors stay
+        # *referenced* into the next training step. ``empty_cache`` cannot reclaim
+        # referenced memory, so without this they surface as a positive
+        # ``retained_alloc`` in the HBM probe and OOM the next backward at larger
+        # eval batch sizes (e.g. +1.36 GiB at batch 16 on an already-tight run).
+        accelerator.unwrap_model(policy).reset()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

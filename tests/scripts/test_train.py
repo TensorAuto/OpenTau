@@ -332,12 +332,14 @@ class TestCommitWandbStep:
 
 
 class TestEvalWithFreshEnvs:
-    """``_eval_with_fresh_envs`` builds eval envs, runs eval, and ALWAYS closes them.
+    """``_eval_with_fresh_envs`` builds eval envs, runs eval, and ALWAYS tears them down.
 
     Per-eval teardown frees the sim renderer's non-PyTorch GPU memory before
     training resumes (otherwise it stacks with the regrown training footprint
-    and OOMs the next backward). The ``finally`` must close the envs even when
-    the eval itself raises.
+    and OOMs the next backward). Even when the eval itself raises, the ``finally``
+    must (1) close the envs and (2) ``reset()`` the policy so its per-eval
+    observation buffers (sized to ``eval.batch_size``) do not persist into the
+    next training step (the ``retained_alloc`` leak).
     """
 
     @staticmethod
@@ -356,6 +358,12 @@ class TestEvalWithFreshEnvs:
             seed=0,
         )
 
+    @staticmethod
+    def _acc():
+        # ``unwrap_model`` returns the underlying module so the helper can call
+        # ``reset()`` on it (mirrors ``accelerate.Accelerator.unwrap_model``).
+        return SimpleNamespace(device=SimpleNamespace(type="cpu"), unwrap_model=lambda p: p)
+
     def test_builds_and_closes_each_call(self, monkeypatch):
         envs1 = {"robocasa": {0: object()}}
         envs2 = {"robocasa": {0: object()}}
@@ -366,7 +374,7 @@ class TestEvalWithFreshEnvs:
         monkeypatch.setattr("opentau.scripts.train.close_envs", close)
         monkeypatch.setattr("opentau.scripts.train.eval_policy_all", ep_all)
 
-        acc = SimpleNamespace(device=SimpleNamespace(type="cpu"))
+        acc = self._acc()
         cfg = self._cfg()
         out1 = _eval_with_fresh_envs(cfg, Mock(), acc, None, "000010")
         out2 = _eval_with_fresh_envs(cfg, Mock(), acc, None, "000020")
@@ -387,10 +395,37 @@ class TestEvalWithFreshEnvs:
         monkeypatch.setattr("opentau.scripts.train.close_envs", close)
         monkeypatch.setattr("opentau.scripts.train.eval_policy_all", boom)
 
-        acc = SimpleNamespace(device=SimpleNamespace(type="cpu"))
         with pytest.raises(RuntimeError, match="eval blew up"):
-            _eval_with_fresh_envs(self._cfg(), Mock(), acc, None, "000010")
+            _eval_with_fresh_envs(self._cfg(), Mock(), self._acc(), None, "000010")
         close.assert_called_once_with(envs)
+
+    def test_resets_policy_after_successful_eval(self, monkeypatch):
+        # The policy accumulates eval-batch-sized observation history in its internal
+        # buffers; reset() must run after the eval so referenced GPU memory (which
+        # empty_cache cannot reclaim) does not persist into the resumed training step.
+        make = Mock(return_value={"robocasa": {0: object()}})
+        ep_all = Mock(return_value={"overall": {}})
+        monkeypatch.setattr("opentau.scripts.train.make_envs", make)
+        monkeypatch.setattr("opentau.scripts.train.close_envs", Mock())
+        monkeypatch.setattr("opentau.scripts.train.eval_policy_all", ep_all)
+
+        policy = Mock()
+        _eval_with_fresh_envs(self._cfg(), policy, self._acc(), None, "000010")
+        policy.reset.assert_called_once_with()
+
+    def test_resets_policy_even_when_eval_raises(self, monkeypatch):
+        # reset() shares the ``finally`` with ``close_envs``: a failed eval must not
+        # leak the policy's eval-batch observation buffers into the next training step.
+        make = Mock(return_value={"robocasa": {0: object()}})
+        boom = Mock(side_effect=RuntimeError("eval blew up"))
+        monkeypatch.setattr("opentau.scripts.train.make_envs", make)
+        monkeypatch.setattr("opentau.scripts.train.close_envs", Mock())
+        monkeypatch.setattr("opentau.scripts.train.eval_policy_all", boom)
+
+        policy = Mock()
+        with pytest.raises(RuntimeError, match="eval blew up"):
+            _eval_with_fresh_envs(self._cfg(), policy, self._acc(), None, "000010")
+        policy.reset.assert_called_once_with()
 
 
 if __name__ == "__main__":
