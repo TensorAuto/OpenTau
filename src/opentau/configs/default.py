@@ -22,7 +22,9 @@ This module provides default configuration classes for:
 - Evaluation settings and parameters
 """
 
+import warnings
 from dataclasses import dataclass, field
+from typing import Literal
 
 import draccus
 import numpy as np
@@ -429,8 +431,16 @@ class WandBConfig:
             Defaults to None.
         mode: Allowed values: 'online', 'offline', 'disabled'. Defaults to None
             (which uses 'online').
-        allow_resume: If True, resume the run from the last checkpoint when
-            `run_id` is provided. Defaults to True.
+        on_resume: What to do when resuming a run that has a `run_id` and a
+            training `step` (i.e. resuming from a checkpoint). Allowed values:
+            'fork' (default) creates a NEW run that branches from the parent at
+            the resume step via wandb's `fork_from`; 'continue' resumes the same
+            run in place (`resume='allow'`). Forking keeps the parent run
+            immutable and records server-side lineage; the cost is that a job
+            preempted/requeued N times produces a chain of N linked runs.
+        allow_resume: DEPRECATED, use `on_resume` instead. If set, it is mapped
+            to `on_resume` for backward compatibility (True -> 'continue',
+            False -> 'fork') and a `FutureWarning` is emitted. Defaults to None.
         disable_artifact: Set to True to disable saving an artifact despite
             `training.save_checkpoint=True`. Defaults to False.
         disable_video: Set to True to skip logging eval grid-summary videos to
@@ -449,14 +459,43 @@ class WandBConfig:
     group: str | None = None  # Used to group runs in the UI, e.g. "experiment_1", "experiment_2"
     job_type: str | None = None  # Used to group runs in the UI, e.g. "train", "eval", "test"
     mode: str | None = None  # Allowed values: 'online', 'offline' 'disabled'. Defaults to 'online'
-    allow_resume: bool | None = True  # If True, resume the run from the last checkpoint.
+    # On checkpoint resume: 'fork' a new branched run (default) or 'continue' the same run in place.
+    on_resume: Literal["fork", "continue"] = "fork"
+    # DEPRECATED, use `on_resume`. Mapped to `on_resume` for back-compat (True->continue, False->fork).
+    allow_resume: bool | None = None
     # Set to true to disable saving an artifact despite training.save_checkpoint=True
     disable_artifact: bool = False
     # Set to true to skip logging eval grid-summary videos to wandb.
     disable_video: bool = False
 
     def __post_init__(self):
-        """Prompt user for wandb notes if enabled and notes are not provided."""
+        """Map the deprecated `allow_resume` alias, validate, and prompt for notes."""
+        # Back-compat: `allow_resume` is deprecated in favor of `on_resume`.
+        if self.allow_resume is not None:
+            warnings.warn(
+                "`wandb.allow_resume` is deprecated; use `wandb.on_resume='fork'|'continue'`.",
+                FutureWarning,
+                stacklevel=2,
+            )
+            # True historically meant "resume the run in place" -> 'continue'.
+            mapped = "continue" if self.allow_resume else "fork"
+            if self.on_resume == "fork":
+                # `on_resume` left at its default -> let the deprecated alias drive behavior.
+                self.on_resume = mapped
+            elif self.on_resume != mapped:
+                warnings.warn(
+                    f"Both `allow_resume`={self.allow_resume} and `on_resume`='{self.on_resume}' "
+                    "are set; using `on_resume`.",
+                    FutureWarning,
+                    stacklevel=2,
+                )
+            # Normalize so a re-saved checkpoint config does not re-trigger this warning forever.
+            self.allow_resume = None
+
+        if self.on_resume not in ("fork", "continue"):
+            raise ValueError(f"`on_resume` must be 'fork' or 'continue', got {self.on_resume!r}.")
+
+        # Prompt user for wandb notes if enabled and notes are not provided.
         if not self.enable or self.notes is not None:
             return
 
@@ -476,24 +515,40 @@ class WandBConfig:
             Dictionary of keyword arguments suitable for passing to wandb.init().
         """
         kwargs = encode_dataclass(self)
-        excluded_keys = ["enable", "disable_artifact", "disable_video", "project"]
+        # OpenTau-side switches that are not valid `wandb.init()` arguments.
+        excluded_keys = [
+            "enable",
+            "disable_artifact",
+            "disable_video",
+            "project",
+            "on_resume",
+            "allow_resume",
+        ]
         for ek in excluded_keys:
-            kwargs.pop(ek)
+            kwargs.pop(ek, None)
 
-        allow_resume = kwargs.pop("allow_resume")
         run_id = kwargs.pop("run_id", None)
 
-        # If both `run_id` and `step` are provided, we handle the resuming or forking logic.
+        # If both `run_id` and `step` are provided, we are resuming from a checkpoint and
+        # handle the resuming or forking logic. Use `step is not None` (not truthiness) so a
+        # resume from a step-0 checkpoint still forks at `?_step=0`.
         if run_id is not None and step is not None:
-            if allow_resume:
-                # if `allow_resume`, we resume from the `run_id` if provided.
+            offline = self.mode in ("offline", "disabled")
+            if self.on_resume == "continue":
+                # Resume the same run in place.
                 kwargs["id"] = run_id
                 kwargs["resume"] = "allow"
+            elif not offline:
+                # Fork a new run that branches from the parent at `step`. Server-side lineage
+                # requires an online run, hence the offline guard below.
+                kwargs["fork_from"] = f"{run_id}?_step={step}"
+                note = f"Forked from run {run_id} at step {step}."
+                kwargs["notes"] = note if kwargs.get("notes") is None else f"{kwargs['notes']}\n{note}"
             else:
-                # Without `allow_resume`, we create a new run,
-                # and add information about the forked run in the notes.
-                # TODO request `kwargs[fork_from]=f"{run_id}?_step={step}"` feature from wandb
-                kwargs["notes"] += f"\nForked from run {run_id} at step {step}."
+                # Offline/disabled: lineage cannot be resolved, so start a fresh run and only
+                # record the intended fork in the notes.
+                note = f"(offline) would fork from run {run_id} at step {step}."
+                kwargs["notes"] = note if kwargs.get("notes") is None else f"{kwargs['notes']}\n{note}"
 
         return kwargs
 

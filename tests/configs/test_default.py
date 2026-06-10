@@ -229,7 +229,12 @@ def test_invalid_negative_bare_dataset_tolerance_raises():
 
 
 class TestWandBConfig:
-    """Cover the optional ``disable_video`` flag on ``WandBConfig``."""
+    """Cover the ``disable_video`` flag and the ``on_resume`` fork/continue behavior.
+
+    All cases use ``enable=False`` (the default) so ``__post_init__`` never hits
+    the interactive ``input()`` notes prompt (the patching fixture is opt-in, not
+    autouse, so an enabled config without ``notes`` would block on stdin).
+    """
 
     def test_disable_video_defaults_to_false(self):
         """Videos are logged by default — the flag is opt-in (like
@@ -243,6 +248,82 @@ class TestWandBConfig:
         unknown keyword."""
         cfg = WandBConfig(disable_video=True)
         assert "disable_video" not in cfg.to_wandb_kwargs()
+
+    # --- on_resume: fork (default) vs continue ---------------------------------
+
+    def test_on_resume_defaults_to_fork(self):
+        """Resuming forks a new branched run by default."""
+        assert WandBConfig().on_resume == "fork"
+
+    def test_fork_path_sets_fork_from_and_not_resume(self):
+        """With ``on_resume='fork'`` (default), a resume (run_id + step) emits
+        ``fork_from`` and must NOT set ``id``/``resume`` (which would instead
+        continue the parent run in place)."""
+        kwargs = WandBConfig(run_id="abc", notes="n").to_wandb_kwargs(step=100)
+        assert kwargs["fork_from"] == "abc?_step=100"
+        assert "id" not in kwargs
+        assert "resume" not in kwargs
+
+    def test_continue_path_sets_resume_and_not_fork(self):
+        """``on_resume='continue'`` resumes the same run in place."""
+        kwargs = WandBConfig(on_resume="continue", run_id="abc").to_wandb_kwargs(step=100)
+        assert kwargs["id"] == "abc"
+        assert kwargs["resume"] == "allow"
+        assert "fork_from" not in kwargs
+
+    def test_no_run_id_or_step_is_a_fresh_run(self):
+        """Without both a run_id and a step there is nothing to fork/resume from,
+        so neither ``fork_from`` nor ``id`` is emitted."""
+        # No run_id, step given.
+        assert "fork_from" not in WandBConfig().to_wandb_kwargs(step=100)
+        # run_id given but step is None (e.g. not actually resuming).
+        kwargs = WandBConfig(run_id="abc").to_wandb_kwargs(step=None)
+        assert "fork_from" not in kwargs and "id" not in kwargs
+
+    def test_fork_at_step_zero(self):
+        """``step=0`` must still fork (guards against a truthiness check)."""
+        kwargs = WandBConfig(run_id="abc", notes="n").to_wandb_kwargs(step=0)
+        assert kwargs["fork_from"] == "abc?_step=0"
+
+    def test_fork_with_none_notes_does_not_crash(self):
+        """``notes`` defaults to None and the fork path now runs on every resume,
+        so the annotation must be built without ``None + str``."""
+        kwargs = WandBConfig(run_id="abc").to_wandb_kwargs(step=7)
+        assert kwargs["fork_from"] == "abc?_step=7"
+        assert "Forked from run abc at step 7" in kwargs["notes"]
+
+    def test_offline_mode_skips_fork_from(self):
+        """Server-side lineage cannot be resolved offline, so ``fork_from`` is
+        dropped (a fresh run is started) and the intent is left in the notes."""
+        kwargs = WandBConfig(mode="offline", run_id="abc").to_wandb_kwargs(step=5)
+        assert "fork_from" not in kwargs
+        assert "would fork from run abc at step 5" in kwargs["notes"]
+
+    def test_on_resume_and_allow_resume_excluded_from_init_kwargs(self):
+        """Both are OpenTau-side switches; neither is a valid ``wandb.init()``
+        keyword."""
+        kwargs = WandBConfig().to_wandb_kwargs()
+        assert "on_resume" not in kwargs
+        assert "allow_resume" not in kwargs
+
+    def test_invalid_on_resume_raises(self):
+        with pytest.raises(ValueError, match="on_resume"):
+            WandBConfig(on_resume="bogus")
+
+    # --- deprecated allow_resume alias -----------------------------------------
+
+    def test_allow_resume_true_maps_to_continue_with_warning(self):
+        with pytest.warns(FutureWarning, match="allow_resume"):
+            cfg = WandBConfig(allow_resume=True)
+        assert cfg.on_resume == "continue"
+        # Normalized so a re-saved checkpoint config does not re-warn forever.
+        assert cfg.allow_resume is None
+
+    def test_allow_resume_false_maps_to_fork_with_warning(self):
+        with pytest.warns(FutureWarning, match="allow_resume"):
+            cfg = WandBConfig(allow_resume=False)
+        assert cfg.on_resume == "fork"
+        assert cfg.allow_resume is None
 
 
 class TestDatasetConfigDataMapping:

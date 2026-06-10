@@ -98,7 +98,7 @@
         "group": null,
         "job_type": null,
         "mode": null,
-        "allow_resume": true,
+        "on_resume": "fork",
         "disable_artifact": false
     },
     "env": {

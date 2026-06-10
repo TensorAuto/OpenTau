@@ -81,7 +81,7 @@
         "group": null,
         "job_type": null,
         "mode": null,
-        "allow_resume": false,
+        "on_resume": "fork",
         "disable_artifact": true
     }
 }

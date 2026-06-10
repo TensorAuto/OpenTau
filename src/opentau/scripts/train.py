@@ -632,11 +632,30 @@ def train(cfg: TrainPipelineConfig):
         if cfg.wandb.enable:
             step = load_training_step(cfg.checkpoint_path) if cfg.resume else None
             slurm_dict = {k: v for k, v in os.environ.items() if k.startswith("SLURM_")}
-            accelerator.init_trackers(
-                cfg.wandb.project,
-                config={**cfg.to_dict(), "accelerator": accelerator_config, "slurm": slurm_dict},
-                init_kwargs={"wandb": cfg.wandb.to_wandb_kwargs(step=step)},
-            )
+            tracker_config = {**cfg.to_dict(), "accelerator": accelerator_config, "slurm": slurm_dict}
+            wandb_kwargs = cfg.wandb.to_wandb_kwargs(step=step)
+            try:
+                accelerator.init_trackers(
+                    cfg.wandb.project, config=tracker_config, init_kwargs={"wandb": wandb_kwargs}
+                )
+            except Exception as e:
+                # Forking (`on_resume="fork"`) needs a paid wandb tier and a resolvable parent
+                # run; wandb raises CommError if either is missing (e.g. free tier, or a stale /
+                # deleted parent id). Fall back to resuming the parent run in place so a resume
+                # never hard-crashes at init. Re-raise anything unrelated to forking.
+                if "fork_from" not in wandb_kwargs:
+                    raise
+                logging.warning(
+                    f"wandb fork_from={wandb_kwargs['fork_from']!r} failed ({e}); falling back to "
+                    "resuming the run in place. Forking requires a paid wandb tier."
+                )
+                wandb_kwargs.pop("fork_from", None)
+                if cfg.wandb.run_id is not None:
+                    wandb_kwargs["id"] = cfg.wandb.run_id
+                    wandb_kwargs["resume"] = "allow"
+                accelerator.init_trackers(
+                    cfg.wandb.project, config=tracker_config, init_kwargs={"wandb": wandb_kwargs}
+                )
             tracker = accelerator.get_tracker("wandb", unwrap=True)
             cfg.wandb.run_id = tracker.id
             logging.info(f"tracker initialized with wandb job id: {tracker.id}")
