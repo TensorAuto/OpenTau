@@ -45,6 +45,9 @@ Main Classes:
       GPT-4o and open-source vision-language models (CogVLM, SmolVLM variants).
     - **NavHighLevelPlanner**: Specialized planner for navigation tasks with
       support for processing multiple camera views.
+    - **GeminiERPlanner**: Memory-as-language planner backed by Gemini
+      Robotics-ER; each call rewrites a memory string and returns the next
+      subtask for a low-level VLA policy.
     - **Memory**: Conversation history manager that stores and retrieves
       multi-turn conversations between user and LLM assistant.
 
@@ -52,7 +55,8 @@ Supported Models:
 
     - **Open-source**: CogVLM-Chat-HF, SmolVLM-256M-Instruct,
       SmolVLM-500M-Instruct, SmolVLM2-2.2B-Instruct
-    - **Closed-source**: GPT-4o (via OpenAI API)
+    - **Closed-source**: GPT-4o (via OpenAI API), Gemini Robotics-ER
+      (via google-genai API)
 
 Modules:
 
@@ -77,6 +81,8 @@ Example:
         ... )
 """
 
+from .gemini_er_planner import GeminiERPlanner as GeminiERPlanner
+from .gemini_er_planner import PlanResult as PlanResult
 from .high_level_planner import HighLevelPlanner as HighLevelPlanner
 from .high_level_planner import NavHighLevelPlanner as NavHighLevelPlanner
 from .utils.memory import Memory as Memory

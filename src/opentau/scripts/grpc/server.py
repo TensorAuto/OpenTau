@@ -17,13 +17,40 @@
 This server loads an ML policy model and serves inference requests from
 robots running ROS 2. Designed to run on a server with a ML GPU.
 
+Optionally (``--planner.enabled=true``) it also spins up a Gemini Robotics-ER
+high-level planner that runs asynchronously alongside the VLA policy:
+
+- The request ``prompt`` is treated as the *overall task*. The planner consumes
+  the latest cached observation (images, state), the task and its own
+  memory-as-language string, and produces the subtask the VLA policy is
+  actually conditioned on.
+- The planner runs on its own free-running background loop, replanning every
+  ``planner.interval_s`` wall-clock seconds — fully decoupled from request
+  arrival. It skips a cycle when no new observation has arrived since the last
+  plan, so an idle server makes no API calls.
+- The VLA inference path never blocks on the planner — it reads whatever
+  subtask is currently available. The one exception is the start of a task
+  (the first request, or the first after the prompt changes), which blocks
+  (up to ``planner.first_plan_timeout_s``) so the policy starts on a real
+  subtask rather than the raw task.
+
+With the planner disabled (the default) the server serves the VLA policy only.
+The wire API is identical either way.
+
 Usage:
     python src/opentau/scripts/grpc/server.py --config_path=/path/to/config.json \\
         --server.port=50051 --server.max_workers=4
+
+    # with the high-level planner
+    GEMINI_API_KEY=... python src/opentau/scripts/grpc/server.py \\
+        --config_path=/path/to/config.json \\
+        --server.port=50051 --planner.enabled=true --planner.interval_s=5
 """
 
 import io
 import logging
+import threading
+import time
 import traceback
 from concurrent import futures
 from dataclasses import asdict
@@ -40,6 +67,7 @@ import grpc
 from opentau.configs import parser
 from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.lerobot_dataset import BaseDataset
+from opentau.planner.gemini_er_planner import GeminiERPlanner
 from opentau.policies.factory import get_policy_class
 from opentau.scripts.grpc import robot_inference_pb2, robot_inference_pb2_grpc
 from opentau.utils.random_utils import set_seed
@@ -53,13 +81,22 @@ logger = logging.getLogger(__name__)
 
 
 class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
-    """gRPC servicer implementing the RobotPolicyService."""
+    """gRPC servicer implementing the RobotPolicyService.
+
+    When ``cfg.planner.enabled`` is set, a high-level planner runs alongside
+    the policy on its own free-running daemon thread, replanning periodically
+    from the latest cached observation. Shared planner state (latest
+    observation, task, subtask, memory) is guarded by a single lock; the
+    network-bound Gemini call happens outside the lock, so it never stalls
+    policy inference.
+    """
 
     def __init__(self, cfg: TrainPipelineConfig):
         """Initialize the servicer with model and configuration.
 
         Args:
-            cfg: Training pipeline configuration including policy settings.
+            cfg: Training pipeline configuration including policy, server and
+                planner settings.
         """
         self.cfg = cfg
         self.device = auto_torch_device()
@@ -69,6 +106,158 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
 
         # Load the policy model
         self._load_policy()
+
+        # Optionally spin up the high-level planner
+        self._init_planner(cfg.planner)
+
+    def _init_planner(self, pcfg):
+        """Set up the high-level planner and start its background loop (if enabled)."""
+        self._planner: GeminiERPlanner | None = None
+        self._planner_thread: threading.Thread | None = None
+
+        self._interval_s = pcfg.interval_s
+        self._first_plan_timeout_s = pcfg.first_plan_timeout_s
+        self._include_state = pcfg.include_state
+
+        self._lock = threading.Lock()
+        # Shared state, all guarded by self._lock.
+        self._latest_images: list[tuple[bytes, str]] = []
+        self._latest_state: list[float] | None = None
+        self._task: str | None = None
+        self._subtask: str | None = None
+        self._memory: str = ""
+        # Incremented whenever a request caches a fresh observation; the loop
+        # only replans when there is something new to plan on, so an idle
+        # server makes no planner API calls.
+        self._obs_seq: int = 0
+        self._last_planned_seq: int = 0
+        # Bumped on task change so a stale in-flight plan cannot commit.
+        self._plan_generation: int = 0
+
+        # Loop control. ``_subtask_ready`` is set when a plan for the current
+        # task has been committed (start-of-inference requests wait on it);
+        # ``_replan_event`` short-circuits the interval sleep on task change.
+        self._stop_event = threading.Event()
+        self._subtask_ready = threading.Event()
+        self._replan_event = threading.Event()
+
+        if pcfg.enabled:
+            # Fails fast here if no API key is resolvable.
+            self._planner = GeminiERPlanner(
+                model=pcfg.model,
+                api_key_env=pcfg.api_key_env,
+                max_output_tokens=pcfg.max_output_tokens,
+                temperature=pcfg.temperature,
+                system_prompt_key=pcfg.system_prompt_key,
+                user_prompt_key=pcfg.user_prompt_key,
+            )
+            self._planner_thread = threading.Thread(target=self._planner_loop, name="planner", daemon=True)
+            self._planner_thread.start()
+            logger.info(
+                f"High-level planner enabled: model={pcfg.model}, interval_s={pcfg.interval_s}, "
+                f"first_plan_timeout_s={pcfg.first_plan_timeout_s}"
+            )
+
+    def _update_shared_state(self, request: robot_inference_pb2.ObservationRequest) -> None:
+        """Cache the latest observation; reset planner state on task change."""
+        with self._lock:
+            self._latest_images = [(img.image_data, img.encoding) for img in request.images]
+            self._latest_state = list(request.robot_state.state) or None
+            self._obs_seq += 1
+            if request.prompt != self._task:
+                logger.info(f"New task: {request.prompt!r} — resetting planner memory")
+                self._task = request.prompt
+                self._subtask = None
+                self._memory = ""
+                self._plan_generation += 1
+                self._subtask_ready.clear()
+                self._replan_event.set()
+
+    def _planner_loop(self) -> None:
+        """Free-running planner: replan every ``interval_s`` on fresh observations.
+
+        Runs fully decoupled from request handling — requests only cache the
+        latest observation; this loop periodically turns it into a subtask.
+        """
+        idle_poll_s = 0.05
+        while not self._stop_event.is_set():
+            with self._lock:
+                has_new_obs = self._obs_seq != self._last_planned_seq
+            if not has_new_obs:
+                # Nothing new to plan on (no robot connected, or it stopped
+                # sending) — idle cheaply instead of burning API calls.
+                self._stop_event.wait(idle_poll_s)
+                continue
+            # The plan below runs on the freshest state, so it satisfies any
+            # replan request raised up to this point.
+            self._replan_event.clear()
+            self._run_plan()
+            # Sleep out the planning interval; a task change (or shutdown)
+            # short-circuits it so a new task replans immediately.
+            self._replan_event.wait(timeout=self._interval_s)
+
+    def _run_plan(self) -> None:
+        """One planner step: snapshot state, call the model, commit the result."""
+        with self._lock:
+            task = self._task
+            images = list(self._latest_images)
+            state = self._latest_state if self._include_state else None
+            memory = self._memory
+            generation = self._plan_generation
+            self._last_planned_seq = self._obs_seq
+        try:
+            # Network-bound call, deliberately outside the lock.
+            result = self._planner.plan(task=task, images=images, state=state, memory=memory)
+            with self._lock:
+                if self._plan_generation == generation:
+                    self._subtask = result.subtask
+                    self._memory = result.memory
+                    self._subtask_ready.set()
+            logger.info(
+                f"Planner ({result.latency_s:.2f}s) subtask={result.subtask!r} memory={result.memory!r}"
+            )
+        except Exception:
+            # A planner failure must never crash the server or clear an
+            # existing subtask — a stale subtask beats no subtask.
+            logger.exception("High-level planner call failed; keeping previous subtask")
+
+    def _current_subtask(self) -> str | None:
+        with self._lock:
+            return self._subtask
+
+    def _apply_planner(self, request: robot_inference_pb2.ObservationRequest) -> None:
+        """Rewrite ``request.prompt`` to the planner's current subtask.
+
+        No-op when the planner is disabled. The request prompt is treated as
+        the overall task; the policy is conditioned on the subtask instead.
+        Non-blocking except at the start of inference for a task (subtask not
+        yet available), where it waits for the planner loop's first plan.
+        """
+        if self._planner is None:
+            return
+
+        self._update_shared_state(request)
+        # Start of inference for this task (no subtask yet): wait for the
+        # initial subtask so the policy starts on a real subtask rather than
+        # the raw task.
+        if self._current_subtask() is None and not self._subtask_ready.wait(
+            timeout=self._first_plan_timeout_s
+        ):
+            logger.warning(
+                f"First plan not ready after {self._first_plan_timeout_s}s; "
+                "falling back to the raw task prompt"
+            )
+
+        subtask = self._current_subtask()
+        if subtask is not None:
+            request.prompt = subtask
+
+    def close(self) -> None:
+        """Stop the planner loop (an in-flight Gemini call may delay exit briefly)."""
+        self._stop_event.set()
+        self._replan_event.set()
+        if self._planner_thread is not None:
+            self._planner_thread.join(timeout=5)
 
     def _load_policy(self):
         """Load the policy model from pretrained weights."""
@@ -258,14 +447,16 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
         Returns:
             ActionChunkResponse containing the predicted action chunk.
         """
-        import time
-
         start_time = time.perf_counter()
         response = robot_inference_pb2.ActionChunkResponse()
         response.request_id = request.request_id
         response.timestamp_ns = time.time_ns()
 
         try:
+            # Substitute the high-level planner's subtask for the prompt (no-op
+            # when the planner is disabled).
+            self._apply_planner(request)
+
             # Prepare observation batch
             batch, action_prefix, delay = self._prepare_observation(request)
 
@@ -375,6 +566,7 @@ def serve(cfg: TrainPipelineConfig):
     except KeyboardInterrupt:
         logger.info("Shutting down server...")
         server.stop(grace=5)
+        servicer.close()
 
 
 @parser.wrap()

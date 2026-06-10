@@ -96,3 +96,67 @@ class ServerConfig:
             Maximum receive message length in bytes.
         """
         return self.max_receive_message_length_mb * 1024 * 1024
+
+
+@dataclass
+class PlannerConfig:
+    """Configuration for the high-level planner of the gRPC inference server.
+
+    When ``enabled`` is False (the default), the inference server runs the VLA
+    policy only. When enabled, a Gemini Robotics-ER planner runs
+    asynchronously alongside the policy: it
+    consumes the latest observation (images, state) plus the request prompt
+    (treated as the overall task) and a memory-as-language string, and produces
+    the subtask the VLA policy is conditioned on.
+
+    Args:
+        enabled: Whether to spin up the high-level planner. Defaults to False.
+        model: Gemini model ID used for planning. Defaults to
+            ``gemini-robotics-er-1.5-preview``.
+        api_key_env: Environment variable holding the Gemini API key
+            (``GOOGLE_API_KEY`` is also tried as a fallback). Defaults to
+            ``GEMINI_API_KEY``.
+        interval_s: Wall-clock seconds between planner calls. The planner runs
+            on its own free-running background loop, decoupled from request
+            arrival; the VLA path never blocks on replanning and reads
+            whatever subtask is currently available. The loop skips a cycle
+            when no new observation arrived since the last plan. Defaults
+            to 5.0.
+        first_plan_timeout_s: Maximum seconds a request blocks at the start of
+            inference for a task (no subtask available yet) waiting for the
+            initial subtask. On timeout the request falls back to the raw
+            task prompt. Defaults to 30.0.
+        max_output_tokens: Generation cap for the planner response.
+            Defaults to 512.
+        temperature: Sampling temperature for the planner. Defaults to 0.0.
+        include_state: Whether to include the robot proprioceptive state in
+            the planner prompt. Defaults to True.
+        system_prompt_key: Key into ``planner/prompts.yaml`` for the system
+            prompt template.
+        user_prompt_key: Key into ``planner/prompts.yaml`` for the user
+            prompt template.
+
+    Raises:
+        ValueError: If ``interval_s``, ``first_plan_timeout_s`` or
+            ``max_output_tokens`` are out of range.
+    """
+
+    enabled: bool = False
+    model: str = "gemini-robotics-er-1.5-preview"
+    api_key_env: str = "GEMINI_API_KEY"
+    interval_s: float = 5.0
+    first_plan_timeout_s: float = 30.0
+    max_output_tokens: int = 512
+    temperature: float = 0.0
+    include_state: bool = True
+    system_prompt_key: str = "gemini_er_planner_system"
+    user_prompt_key: str = "gemini_er_planner_user"
+
+    def __post_init__(self):
+        """Validate planner configuration parameters."""
+        if self.interval_s <= 0:
+            raise ValueError(f"`interval_s` must be positive, got {self.interval_s}.")
+        if self.first_plan_timeout_s <= 0:
+            raise ValueError(f"`first_plan_timeout_s` must be positive, got {self.first_plan_timeout_s}.")
+        if self.max_output_tokens < 1:
+            raise ValueError(f"`max_output_tokens` must be at least 1, got {self.max_output_tokens}.")
