@@ -372,6 +372,61 @@ def _commit_wandb_step(accelerator: accelerate.Accelerator, step: int) -> None:
     accelerator.log({}, step=step, log_kwargs={"wandb": {"commit": True}})
 
 
+def _init_wandb_trackers(
+    accelerator: accelerate.Accelerator,
+    cfg: TrainPipelineConfig,
+    tracker_config: dict,
+    step: int | None,
+) -> object:
+    """Initialize the wandb tracker, forking on resume when configured.
+
+    Wraps ``accelerator.init_trackers`` so that a fork failure does not crash a
+    resume. Forking (``wandb.on_resume="fork"``) needs a paid wandb tier and a
+    resolvable parent run; wandb raises a ``wandb.Error`` (``CommError``) if
+    either is missing (e.g. a free tier, or a stale / deleted parent id). In that
+    case we drop ``fork_from`` and retry as an in-place resume of the parent run
+    so the run still starts. Non-wandb exceptions (and wandb errors on a
+    non-fork init) propagate unchanged.
+
+    Args:
+        accelerator: The active accelerate ``Accelerator`` (caller must already
+            be on the main process, where the trackers live).
+        cfg: The training config; ``cfg.wandb`` drives the init kwargs and holds
+            the parent ``run_id`` used by the fork fallback.
+        tracker_config: The config dict logged to wandb (passed through verbatim).
+        step: The resume step (``None`` for a fresh run), forwarded to
+            ``WandBConfig.to_wandb_kwargs``.
+
+    Returns:
+        The unwrapped wandb run object.
+    """
+    wandb_kwargs = cfg.wandb.to_wandb_kwargs(step=step)
+    try:
+        accelerator.init_trackers(
+            cfg.wandb.project, config=tracker_config, init_kwargs={"wandb": wandb_kwargs}
+        )
+    except wandb.Error as e:
+        # Only the fork path has a meaningful fallback; a non-fork wandb failure is a real error.
+        if "fork_from" not in wandb_kwargs:
+            raise
+        logging.warning(
+            f"wandb fork_from={wandb_kwargs['fork_from']!r} failed ({e}); falling back to resuming "
+            "the run in place. Forking requires a paid wandb tier and a resolvable parent run."
+        )
+        # Build a fresh dict for the retry (do not mutate the kwargs already handed to the failed
+        # call). Drop `fork_from`, drop the now-inaccurate "Forked from ..." note that
+        # `to_wandb_kwargs` added (restore the user's original notes), and resume in place.
+        retry_kwargs = {k: v for k, v in wandb_kwargs.items() if k != "fork_from"}
+        retry_kwargs["notes"] = cfg.wandb.notes
+        if cfg.wandb.run_id is not None:
+            retry_kwargs["id"] = cfg.wandb.run_id
+            retry_kwargs["resume"] = "allow"
+        accelerator.init_trackers(
+            cfg.wandb.project, config=tracker_config, init_kwargs={"wandb": retry_kwargs}
+        )
+    return accelerator.get_tracker("wandb", unwrap=True)
+
+
 def _mixture_weighted_aggregate(
     per_dataset_trackers: dict[str, MetricsTracker],
     name_to_weight: dict[str, float],
@@ -633,30 +688,7 @@ def train(cfg: TrainPipelineConfig):
             step = load_training_step(cfg.checkpoint_path) if cfg.resume else None
             slurm_dict = {k: v for k, v in os.environ.items() if k.startswith("SLURM_")}
             tracker_config = {**cfg.to_dict(), "accelerator": accelerator_config, "slurm": slurm_dict}
-            wandb_kwargs = cfg.wandb.to_wandb_kwargs(step=step)
-            try:
-                accelerator.init_trackers(
-                    cfg.wandb.project, config=tracker_config, init_kwargs={"wandb": wandb_kwargs}
-                )
-            except Exception as e:
-                # Forking (`on_resume="fork"`) needs a paid wandb tier and a resolvable parent
-                # run; wandb raises CommError if either is missing (e.g. free tier, or a stale /
-                # deleted parent id). Fall back to resuming the parent run in place so a resume
-                # never hard-crashes at init. Re-raise anything unrelated to forking.
-                if "fork_from" not in wandb_kwargs:
-                    raise
-                logging.warning(
-                    f"wandb fork_from={wandb_kwargs['fork_from']!r} failed ({e}); falling back to "
-                    "resuming the run in place. Forking requires a paid wandb tier."
-                )
-                wandb_kwargs.pop("fork_from", None)
-                if cfg.wandb.run_id is not None:
-                    wandb_kwargs["id"] = cfg.wandb.run_id
-                    wandb_kwargs["resume"] = "allow"
-                accelerator.init_trackers(
-                    cfg.wandb.project, config=tracker_config, init_kwargs={"wandb": wandb_kwargs}
-                )
-            tracker = accelerator.get_tracker("wandb", unwrap=True)
+            tracker = _init_wandb_trackers(accelerator, cfg, tracker_config, step)
             cfg.wandb.run_id = tracker.id
             logging.info(f"tracker initialized with wandb job id: {tracker.id}")
 

@@ -30,12 +30,14 @@ from unittest.mock import Mock
 import accelerate
 import pytest
 import torch
+import wandb
 
 from opentau.scripts.train import (
     _bucket_per_sample,
     _commit_wandb_step,
     _eval_with_fresh_envs,
     _find_unused_params_from_env,
+    _init_wandb_trackers,
     _mixture_weighted_aggregate,
     _sync_deepspeed_gradient_accumulation_steps,
 )
@@ -329,6 +331,62 @@ class TestCommitWandbStep:
         _commit_wandb_step(accelerator, 1234)
 
         assert calls == [({}, 1234, {"wandb": {"commit": True}})]
+
+
+class TestInitWandbTrackers:
+    """``_init_wandb_trackers`` forks on resume and degrades safely on a fork failure."""
+
+    @staticmethod
+    def _cfg(**wandb_kwargs):
+        from opentau.configs.default import WandBConfig
+
+        return SimpleNamespace(wandb=WandBConfig(enable=False, project="proj", **wandb_kwargs))
+
+    def test_fork_passes_fork_from_in_single_init(self):
+        """A successful resume-fork issues exactly one init carrying ``fork_from``
+        and returns the new tracker."""
+        cfg = self._cfg(run_id="parent", notes="user notes")
+        init = Mock()
+        accelerator = SimpleNamespace(
+            init_trackers=init, get_tracker=lambda name, unwrap: SimpleNamespace(id="forked")
+        )
+
+        run = _init_wandb_trackers(accelerator, cfg, {"cfg": 1}, step=50)
+
+        assert run.id == "forked"
+        assert init.call_count == 1
+        assert init.call_args.kwargs["init_kwargs"]["wandb"]["fork_from"] == "parent?_step=50"
+
+    def test_fork_failure_falls_back_to_in_place_resume(self):
+        """A ``wandb.Error`` on the fork init drops ``fork_from``, restores the user's
+        notes (no stale "Forked from ..." annotation), and retries as an in-place
+        resume (``id`` + ``resume='allow'``)."""
+        cfg = self._cfg(run_id="parent", notes="user notes")
+        init = Mock(side_effect=[wandb.errors.CommError("run not found"), None])
+        accelerator = SimpleNamespace(
+            init_trackers=init, get_tracker=lambda name, unwrap: SimpleNamespace(id="resumed")
+        )
+
+        run = _init_wandb_trackers(accelerator, cfg, {"cfg": 1}, step=50)
+
+        assert run.id == "resumed"
+        assert init.call_count == 2
+        first = init.call_args_list[0].kwargs["init_kwargs"]["wandb"]
+        assert first["fork_from"] == "parent?_step=50"
+        retry = init.call_args_list[1].kwargs["init_kwargs"]["wandb"]
+        assert "fork_from" not in retry
+        assert retry["id"] == "parent" and retry["resume"] == "allow"
+        assert retry["notes"] == "user notes"
+
+    def test_non_fork_wandb_error_propagates(self):
+        """A ``wandb.Error`` on a non-fork init (no ``run_id`` -> no ``fork_from``) is a
+        real failure and must not be swallowed by the fork fallback."""
+        cfg = self._cfg()  # no run_id -> to_wandb_kwargs emits no fork_from
+        init = Mock(side_effect=wandb.errors.CommError("boom"))
+        accelerator = SimpleNamespace(init_trackers=init, get_tracker=lambda name, unwrap: None)
+
+        with pytest.raises(wandb.errors.CommError):
+            _init_wandb_trackers(accelerator, cfg, {"cfg": 1}, step=None)
 
 
 class TestEvalWithFreshEnvs:

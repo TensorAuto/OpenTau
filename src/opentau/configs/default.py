@@ -479,6 +479,11 @@ class WandBConfig:
             )
             # True historically meant "resume the run in place" -> 'continue'.
             mapped = "continue" if self.allow_resume else "fork"
+            # Known limitation: because "fork" is also the default, we cannot tell an explicit
+            # `on_resume="fork"` apart from the default, so a deprecated `allow_resume=True` paired
+            # with an explicit `on_resume="fork"` silently lets the alias win (-> "continue"). The
+            # conflict warning below only fires for the unambiguous case (alias maps to "fork" while
+            # `on_resume` is "continue"). Both inputs together are a deprecated-config edge case.
             if self.on_resume == "fork":
                 # `on_resume` left at its default -> let the deprecated alias drive behavior.
                 self.on_resume = mapped
