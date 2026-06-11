@@ -44,6 +44,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+from einops import rearrange
 from google import genai
 from google.genai import types as genai_types
 from PIL import Image
@@ -131,11 +132,11 @@ def _to_part(image: PlannerImage) -> genai_types.Part:
         data, encoding = image
         return genai_types.Part.from_bytes(data=data, mime_type=f"image/{encoding.lower()}")
     if isinstance(image, torch.Tensor):
-        tensor = image.detach().squeeze(0) if image.dim() == 4 else image.detach()
+        tensor = rearrange(image.detach(), "1 c h w -> c h w") if image.dim() == 4 else image.detach()
         if tensor.dim() != 3:
             raise ValueError(f"Expected image tensor of shape (3, H, W) or (1, 3, H, W), got {image.shape}")
         tensor = (tensor.to(dtype=torch.float32, device="cpu").clamp(0, 1) * 255.0).to(torch.uint8)
-        image = Image.fromarray(tensor.permute(1, 2, 0).numpy())
+        image = Image.fromarray(rearrange(tensor, "c h w -> h w c").numpy())
     if isinstance(image, Image.Image):
         buffer = io.BytesIO()
         image.convert("RGB").save(buffer, format="JPEG")
