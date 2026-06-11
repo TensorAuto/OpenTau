@@ -32,7 +32,7 @@ from huggingface_hub.errors import HfHubHTTPError
 
 from opentau.configs import parser
 from opentau.configs.default import DatasetMixtureConfig, EvalConfig, WandBConfig
-from opentau.configs.deployment import ServerConfig
+from opentau.configs.deployment import PlannerConfig, ServerConfig
 from opentau.configs.policies import (
     PreTrainedConfig,
     load_resolved_config_dict,
@@ -139,6 +139,9 @@ class TrainPipelineConfig(HubMixin):
             resolves to "eval_success" when sim eval is configured (env set and eval_freq > 0),
             otherwise "val_loss". Only used when `running_best_count` >= 1. Defaults to "auto".
         server: Configuration for the gRPC inference server. Defaults to ServerConfig().
+        planner: Configuration for the high-level planner of the gRPC inference server
+            (`server.py`). Disabled by default, in which case only the VLA policy is
+            served. Defaults to PlannerConfig().
     """
 
     dataset_mixture: DatasetMixtureConfig
@@ -194,6 +197,8 @@ class TrainPipelineConfig(HubMixin):
     running_best_metric: str = "auto"  # "auto" | "eval_success" | "val_loss"
     # gRPC inference server configuration
     server: ServerConfig = field(default_factory=ServerConfig)
+    # high-level planner configuration for the hierarchical gRPC inference server
+    planner: PlannerConfig = field(default_factory=PlannerConfig)
 
     def __post_init__(self):
         """Initialize post-creation attributes and validate batch size configuration."""

@@ -205,6 +205,8 @@ where = ["src"]
 # Ship the custom flash-attention CUDA source so the kernel can be JIT-compiled
 # from an installed wheel (not just an editable/source checkout).
 "opentau.policies.flash_attn_cuda" = ["_csrc/*.cu", "_csrc/*.cuh", "_csrc/*.cpp", "_csrc/*.h"]
+# Ship the planner prompt library so installed (non-editable) wheels can load it.
+"opentau.planner" = ["prompts.yaml"]
 
 [tool.ruff]
 line-length = 110
