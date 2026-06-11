@@ -195,14 +195,15 @@ def oom_demo():
 
 
 def stacked_memory_comparison(b=2, s=1024, h=8, hkv=1, d=256, layers=18):
-    """Fair full-model-style memory comparison: a stack of attention layers run
-    fwd+bwd, with and without ``torch.utils.checkpoint``, for eager vs flash.
+    """Fair full-model-style comparison: a stack of attention layers run fwd+bwd,
+    with and without ``torch.utils.checkpoint``, for eager / sdpa / flash.
 
-    This is the decision-relevant memory comparison (the per-op tables above
-    compare a single attention call with no checkpointing). Realistic
-    pi07_paligemma training uses ``gradient_checkpointing=True``, which already
-    frees eager's per-layer (B,H,S,S) scores by recomputing them in backward;
-    so the honest apples-to-apples is "eager+ckpt vs flash+ckpt".
+    This is the decision-relevant comparison (the per-op tables above compare a
+    single attention call with no checkpointing). Realistic pi07_paligemma
+    training uses ``gradient_checkpointing=True``, which already frees eager's
+    per-layer (B,H,S,S) scores by recomputing them in backward; so the honest
+    apples-to-apples for training is the "+ckpt" rows. Reports both peak memory
+    and fwd+bwd wall-clock latency for each backend.
     """
     import torch.utils.checkpoint as cp
 
@@ -218,30 +219,50 @@ def stacked_memory_comparison(b=2, s=1024, h=8, hkv=1, d=256, layers=18):
         aw = torch.where(dense[:, None], torch.matmul(q, k.transpose(-1, -2)) * scale, BIG_NEG)
         return torch.matmul(torch.softmax(aw, -1), v).permute(0, 2, 1, 3).to(x.dtype)
 
+    def sdpa_layer(x):
+        g = h // hkv
+        q = x.permute(0, 2, 1, 3)
+        k = x[:, :, :hkv].permute(0, 2, 1, 3).repeat_interleave(g, 1)
+        v = x[:, :, :hkv].permute(0, 2, 1, 3).repeat_interleave(g, 1)
+        o = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=dense[:, None], scale=scale)
+        return o.permute(0, 2, 1, 3)
+
     def flash_layer(x):
         return flash_attn_blockmask(
             x, x[:, :, :hkv].contiguous(), x[:, :, :hkv].contiguous(), q_blk, k_blk, q_valid, k_valid, scale
         )
 
-    def measure(layer, ckpt):
+    def fwd_bwd(layer, ckpt):
+        x = torch.randn(b, s, h, d, device=device, dtype=torch.bfloat16, requires_grad=True)
+        for _ in range(layers):
+            x = (cp.checkpoint(layer, x, use_reentrant=False) if ckpt else layer(x)) + 1.0
+        x.sum().backward()
+
+    def measure(layer, ckpt, iters=10):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         try:
-            x = torch.randn(b, s, h, d, device=device, dtype=torch.bfloat16, requires_grad=True)
-            for _ in range(layers):
-                x = (cp.checkpoint(layer, x, use_reentrant=False) if ckpt else layer(x)) + 1.0
-            x.sum().backward()
+            for _ in range(2):  # warmup
+                fwd_bwd(layer, ckpt)
             torch.cuda.synchronize()
-            return f"{torch.cuda.max_memory_allocated() / 1e9:.2f} GB"
+            mem = torch.cuda.max_memory_allocated() / 1e9
+            s0, e0 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            s0.record()
+            for _ in range(iters):
+                fwd_bwd(layer, ckpt)
+            e0.record()
+            torch.cuda.synchronize()
+            return f"{s0.elapsed_time(e0) / iters:7.2f} ms / {mem:5.2f} GB"
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
-            return "OOM"
+            return "        OOM        "
 
-    print(f"{layers} stacked attention layers, B{b} S{s} H{h} Hkv{hkv} D{d} bf16, fwd+bwd peak:")
-    print(f"  eager, no-ckpt : {measure(eager_layer, False)}")
-    print(f"  eager, +ckpt   : {measure(eager_layer, True)}   <- realistic training baseline")
-    print(f"  flash, no-ckpt : {measure(flash_layer, False)}")
-    print(f"  flash, +ckpt   : {measure(flash_layer, True)}")
+    print(
+        f"{layers} stacked attention layers, B{b} S{s} H{h} Hkv{hkv} D{d} bf16, fwd+bwd (latency / peak mem):"
+    )
+    print(f"  {'backend':6s} {'no-ckpt':>22s}   {'+ckpt (realistic training)':>26s}")
+    for name, layer in [("eager", eager_layer), ("sdpa", sdpa_layer), ("flash", flash_layer)]:
+        print(f"  {name:6s} {measure(layer, False):>22s}   {measure(layer, True):>26s}")
 
 
 def sdpa_backend_probe(b=1, s=4096, h=8, hkv=1, d=256):
