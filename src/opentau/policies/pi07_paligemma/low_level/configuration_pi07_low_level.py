@@ -136,6 +136,18 @@ class PI07PaligemmaLowLevelConfig(PreTrainedConfig):
     # ``opentau.scripts.fit_fast_tokenizer``).
     discrete_action_tokenizer_path: str = "physical-intelligence/fast"
 
+    # EXPERIMENTAL eval-only path: when True, ``sample_actions`` ignores the
+    # flow-matching action expert and instead autoregressively generates the
+    # FAST discrete-action tokens with the VLM backbone (greedy argmax over
+    # ``da_head`` logits, same "Action: " prefix layout as training), decodes
+    # them to an action chunk, and inverts the MIN_MAX discrete-action
+    # normalization. Generation stops when the BPE expansion of the generated
+    # tokens reaches chunk_size * max_action_dim DCT coefficients (FAST
+    # sequences are self-delimiting given the (T, D) shape — there is no
+    # learned EOS because training masks the CE loss at pad positions), capped
+    # at ``discrete_action_max_length`` tokens (the same cap training applies).
+    eval_use_discrete_actions: bool = False
+
     # Projector
     proj_width: int = 1024
 
