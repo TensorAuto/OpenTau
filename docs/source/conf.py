@@ -30,8 +30,8 @@ project = "OpenTau"
 copyright = "2026, Tensor Auto Inc"
 author = "Tensor Auto Inc"
 
-version = "0.1.0"
-release = "0.1.0"
+version = "0.7.0"
+release = "0.7.0"
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
