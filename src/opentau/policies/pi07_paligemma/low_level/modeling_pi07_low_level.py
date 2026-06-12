@@ -64,6 +64,10 @@ AttentionMode = Literal["continue", "bidirectional", "causal"]
 # Temporary stage-level inference profiling for the AR-vs-flow comparison
 # (OPENTAU_AR_PROFILE=1). Logs AR_PROF / FLOW_PROF lines per chunk query.
 _AR_PROFILE = os.environ.get("OPENTAU_AR_PROFILE", "0") == "1"
+# Module-level alias: `model.sample_actions` assigns a local named `time` (the
+# flow-matching time tensor), which makes the `time` module unreachable inside
+# that function scope (UnboundLocalError).
+_perf_counter = time.perf_counter
 
 
 def _prof_sync() -> None:
@@ -2662,7 +2666,7 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
             The sampled action tensor.
         """
         if _AR_PROFILE:
-            pc = time.perf_counter  # `time` is shadowed by the flow-time tensor below
+            pc = _perf_counter  # the `time` module is shadowed by the local flow-time tensor
             _prof_sync()
             t0 = pc()
 
