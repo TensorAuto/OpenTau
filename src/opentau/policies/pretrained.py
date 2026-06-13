@@ -24,6 +24,7 @@ and safetensors for efficient serialization.
 import abc
 import logging
 import os
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Type, TypeVar
 
@@ -629,29 +630,46 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
             # the dataset->norm-row map should update `config.dataset_to_norm_index`
             # before reinstantiating the policy.
 
+    @staticmethod
+    def _iter_norm_buffer_params(owner: nn.Module) -> Iterator[tuple[str, Tensor]]:
+        """Yield ``(qualified_name, param)`` for every Normalize/Unnormalize
+        buffer parameter on ``owner`` across :data:`NORM_MODULE_NAMES`.
+
+        Single source of truth for the buffer walk shared by the three
+        inf-sentinel guards (:meth:`_norm_buffers_have_inf`,
+        :meth:`_check_norm_stats_loaded`,
+        :meth:`_assert_normalize_buffers_initialized`) so they cannot drift.
+        A ``@staticmethod`` taking the owner explicitly so the classmethod guard
+        (which receives a ``model`` that may be any ``nn.Module``, e.g. a test
+        fixture) and the instance guards can all share it.
+        ``Normalize`` registers stats as ``nn.Parameter(requires_grad=False)``,
+        so these live under ``named_parameters()``, not ``named_buffers()`` —
+        same convention as the inline ``Normalize.forward`` checks.
+        """
+        for module_attr in NORM_MODULE_NAMES:
+            module = getattr(owner, module_attr, None)
+            if module is None:
+                continue
+            for name, param in module.named_parameters(recurse=True):
+                if name.startswith("buffer_"):
+                    yield f"{module_attr}.{name}", param
+
     def _norm_buffers_have_inf(self) -> bool:
         """Return True if any Normalize/Unnormalize buffer still holds the +inf
         sentinel — i.e. the buffer was neither loaded from a checkpoint nor
         initialised from stats.
 
-        Mirrors the iteration in :meth:`_check_norm_stats_loaded` but returns a
-        bool instead of raising, so ``make_policy`` can decide *whether* to
-        repopulate. The contract: inject stats only when buffers are still ∞
-        (the ``save_normalization_stats=False`` round-trip), and otherwise keep
-        the buffers that were deliberately loaded (``skip_normalization_weights
+        Like :meth:`_check_norm_stats_loaded` but returns a bool instead of
+        raising, so ``make_policy`` can decide *whether* to repopulate. The
+        contract: inject stats only when buffers are still ∞ (the
+        ``save_normalization_stats=False`` round-trip), and otherwise keep the
+        buffers that were deliberately loaded (``skip_normalization_weights
         =False``) or freshly built from the current mixture
         (``skip_normalization_weights=True``). Unconditionally injecting would
         clobber a loaded checkpoint's normalization, which silently turned
         ``skip_normalization_weights=False`` into a no-op for mixture fine-tunes.
         """
-        for module_attr in NORM_MODULE_NAMES:
-            module = getattr(self, module_attr, None)
-            if module is None:
-                continue
-            for name, param in module.named_parameters(recurse=True):
-                if name.startswith("buffer_") and torch.isinf(param).any():
-                    return True
-        return False
+        return any(torch.isinf(param).any() for _, param in self._iter_norm_buffer_params(self))
 
     def _check_norm_stats_loaded(self) -> None:
         """Raise a clear error if any Normalize/Unnormalize buffer is still ∞.
@@ -663,14 +681,7 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         ``save_normalization_stats=False`` round-trip mistake at
         policy-construction time rather than at the first forward.
         """
-        bad: list[str] = []
-        for module_attr in NORM_MODULE_NAMES:
-            module = getattr(self, module_attr, None)
-            if module is None:
-                continue
-            for name, param in module.named_parameters(recurse=True):
-                if name.startswith("buffer_") and torch.isinf(param).any():
-                    bad.append(f"{module_attr}.{name}")
+        bad = [name for name, param in self._iter_norm_buffer_params(self) if torch.isinf(param).any()]
         if bad:
             raise RuntimeError(
                 "Normalization buffers were not initialised from a checkpoint "
@@ -981,10 +992,9 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         """
         if not stripped_keys:
             return
-        # Walk the same NORM_MODULE_NAMES attribute tree that
-        # `_check_norm_stats_loaded` iterates, so the two guards stay
-        # synchronized with `_save_pretrained`'s detach/restore loop and
-        # `_inject_stats`.
+        # Walk the same buffer params as the sibling guards via the shared
+        # `_iter_norm_buffer_params`, so they stay synchronized with
+        # `_save_pretrained`'s detach/restore loop and `_inject_stats`.
         #
         # Note: the check intentionally does NOT cross-reference each inf
         # buffer against ``stripped_keys`` (which would be a stricter
@@ -1008,14 +1018,11 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         # ``accelerator.prepare`` today (so params are still plain Tensors
         # here), but the call is cheap on plain Tensors and keeps the
         # helper safe for any future caller that invokes it post-wrap.
-        inf_buffers: list[str] = []
-        for module_attr in NORM_MODULE_NAMES:
-            module = getattr(model, module_attr, None)
-            if module is None:
-                continue
-            for name, param in module.named_parameters(recurse=True):
-                if name.startswith("buffer_") and torch.isinf(_materialize(param)).any():
-                    inf_buffers.append(f"{module_attr}.{name}")
+        inf_buffers = [
+            name
+            for name, param in cls._iter_norm_buffer_params(model)
+            if torch.isinf(_materialize(param)).any()
+        ]
         if inf_buffers:
             raise ValueError(
                 "skip_normalization_weights=True requires `per_dataset_stats` "
