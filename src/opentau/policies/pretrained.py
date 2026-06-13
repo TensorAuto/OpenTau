@@ -629,6 +629,30 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
             # the dataset->norm-row map should update `config.dataset_to_norm_index`
             # before reinstantiating the policy.
 
+    def _norm_buffers_have_inf(self) -> bool:
+        """Return True if any Normalize/Unnormalize buffer still holds the +inf
+        sentinel — i.e. the buffer was neither loaded from a checkpoint nor
+        initialised from stats.
+
+        Mirrors the iteration in :meth:`_check_norm_stats_loaded` but returns a
+        bool instead of raising, so ``make_policy`` can decide *whether* to
+        repopulate. The contract: inject stats only when buffers are still ∞
+        (the ``save_normalization_stats=False`` round-trip), and otherwise keep
+        the buffers that were deliberately loaded (``skip_normalization_weights
+        =False``) or freshly built from the current mixture
+        (``skip_normalization_weights=True``). Unconditionally injecting would
+        clobber a loaded checkpoint's normalization, which silently turned
+        ``skip_normalization_weights=False`` into a no-op for mixture fine-tunes.
+        """
+        for module_attr in NORM_MODULE_NAMES:
+            module = getattr(self, module_attr, None)
+            if module is None:
+                continue
+            for name, param in module.named_parameters(recurse=True):
+                if name.startswith("buffer_") and torch.isinf(param).any():
+                    return True
+        return False
+
     def _check_norm_stats_loaded(self) -> None:
         """Raise a clear error if any Normalize/Unnormalize buffer is still ∞.
 

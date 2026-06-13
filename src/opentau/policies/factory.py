@@ -298,7 +298,20 @@ def make_policy(
     # have them, otherwise raise a clear error rather than letting the first
     # forward fail mid-step.
     if cfg.pretrained_path and per_norm_key_stats is not None:
-        policy._inject_stats(per_norm_key_stats, dataset_names=norm_keys)
+        # Repopulate normalization buffers ONLY when the checkpoint carried no
+        # stats (buffers are still the +inf sentinel — the
+        # `save_normalization_stats=False` round-trip). When the checkpoint's
+        # stats loaded cleanly (`skip_normalization_weights=False`) or were
+        # freshly built from the current mixture
+        # (`skip_normalization_weights=True`, which strips the saved buffers and
+        # keeps the per_dataset_stats-initialised ones), keep them as-is.
+        # Unconditionally injecting here clobbered a deliberately-loaded
+        # checkpoint normalization, which made `skip_normalization_weights=False`
+        # a silent no-op for mixture fine-tunes.
+        if policy._norm_buffers_have_inf():
+            policy._inject_stats(per_norm_key_stats, dataset_names=norm_keys)
+        else:
+            policy._check_norm_stats_loaded()
     elif cfg.pretrained_path:
         policy._check_norm_stats_loaded()
 
