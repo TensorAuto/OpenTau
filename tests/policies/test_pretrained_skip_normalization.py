@@ -598,3 +598,60 @@ class TestSkipNormalizationMultiHeadRoundTrip:
                     "observation.state": torch.zeros(1, 4),
                 }
             )
+
+
+class TestNormBufferInfGate:
+    """``make_policy`` injects mixture stats only when the loaded buffers are
+    still the +inf sentinel. With valid loaded buffers it must KEEP them, so
+    ``skip_normalization_weights=False`` actually reuses the checkpoint's
+    normalization instead of being silently clobbered by the current mixture's
+    recomputed stats.
+    """
+
+    def test_have_inf_false_for_valid_buffers_true_when_sentinel(self):
+        policy = _make_multihead_policy(["a::1", "b::2"], base=_NEW_BASE, skip=False)
+        assert policy._norm_buffers_have_inf() is False
+        with torch.no_grad():
+            policy.normalize_targets.buffer_action["mean"].fill_(float("inf"))
+        assert policy._norm_buffers_have_inf() is True
+
+    def test_skip_false_keeps_checkpoint_stats_when_buffers_valid(self):
+        """The fix: a clean ``skip_normalization_weights=False`` load leaves the
+        buffers finite, so the factory gate skips ``_inject_stats`` and the
+        checkpoint's stats survive (the current-mixture ``_NEW_BASE`` stats do
+        NOT overwrite the loaded ``_CKPT_BASE`` ones)."""
+        ckpt = _make_multihead_policy(["a::1", "b::2"], base=_CKPT_BASE, skip=False)
+        policy = _make_multihead_policy(["a::1", "b::2"], base=_NEW_BASE, skip=False)
+        _replay_norm_load(policy, ckpt.state_dict(), strict=True)
+
+        assert policy._norm_buffers_have_inf() is False
+        # Replicate the factory gate (factory.py make_policy):
+        new_stats = _build_head_stats(2, _NEW_BASE)
+        if policy._norm_buffers_have_inf():
+            policy._inject_stats(new_stats, dataset_names=["a::1", "b::2"])
+
+        mean = policy.normalize_targets.buffer_action["mean"]
+        for h in range(2):
+            torch.testing.assert_close(mean[h], torch.full((3,), _CKPT_BASE + h))
+
+    def test_inf_buffers_repopulated_by_inject(self):
+        """The save_normalization_stats=False round-trip: buffers load as +inf,
+        the gate sees them and injects the current mixture's stats."""
+        policy = _make_multihead_policy(["a::1", "b::2"], base=_NEW_BASE, skip=False)
+        with torch.no_grad():
+            for module_attr in ("normalize_inputs", "normalize_targets", "unnormalize_outputs"):
+                module = getattr(policy, module_attr)
+                buf_attr = (
+                    "buffer_action" if module_attr != "normalize_inputs" else "buffer_observation_state"
+                )
+                getattr(module, buf_attr)["mean"].fill_(float("inf"))
+        assert policy._norm_buffers_have_inf() is True
+
+        new_stats = _build_head_stats(2, _NEW_BASE)
+        if policy._norm_buffers_have_inf():
+            policy._inject_stats(new_stats, dataset_names=["a::1", "b::2"])
+
+        assert policy._norm_buffers_have_inf() is False
+        mean = policy.normalize_targets.buffer_action["mean"]
+        for h in range(2):
+            torch.testing.assert_close(mean[h], torch.full((3,), _NEW_BASE + h))
