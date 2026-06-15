@@ -138,6 +138,17 @@ class PI05Config(PreTrainedConfig):
     # maximum number of frozen actions
     max_delay: int = 0
 
+    # Modality positional embedding.
+    # When > 0, each input modality (vision, language, state, response, discrete
+    # actions, action expert) is shifted forward in RoPE position-id space by
+    # ``modality_slot * modality_position_gap`` on top of its contiguous token
+    # positions. This guarantees that the first position of every modality is at
+    # least ``modality_position_gap`` past the last position of the previous one
+    # (positions stay monotonic, so the per-token spacing inside a modality is
+    # unchanged). 0 disables the gap and falls back to fully contiguous position
+    # ids — the original behavior and the value existing checkpoints expect.
+    modality_position_gap: int = 0
+
     # Attention utils
     attention_implementation: str = "eager"
 
