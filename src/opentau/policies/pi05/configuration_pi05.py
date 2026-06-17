@@ -138,6 +138,28 @@ class PI05Config(PreTrainedConfig):
     # maximum number of frozen actions
     max_delay: int = 0
 
+    # Learned per-modality embeddings for the VLM prefix. When True, a
+    # learnable embedding selected by input modality (vision, language, state,
+    # response, discrete action) is *added* on top of every prefix token
+    # embedding before the transformer — an additive signal telling the model
+    # which modality each token came from, layered over the existing RoPE
+    # positions (it does not replace them). The table is zero-initialized so
+    # enabling it on an existing checkpoint is a no-op at step 0 and the signal
+    # is learned from there. The action expert is handled separately by
+    # ``action_expert_position_gap`` below, not by this table. Defaults to
+    # False (original behavior, what existing checkpoints expect).
+    use_modality_embedding: bool = False
+
+    # Position-id "modality gap" for the action expert. When > 0, the
+    # action-expert (flow-matching) tokens are shifted this many RoPE positions
+    # past the VLM prefix, separating the action modality from the prefix in
+    # position space (rather than via a learned embedding). The per-token
+    # spacing inside the action chunk is unchanged; only the offset from the
+    # prefix grows. Applied identically in the training forward and the
+    # inference denoise step. 0 disables the gap (contiguous positions — the
+    # original behavior). Defaults to 0.
+    action_expert_position_gap: int = 0
+
     # Attention utils
     attention_implementation: str = "eager"
 

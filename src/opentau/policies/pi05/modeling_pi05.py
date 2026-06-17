@@ -988,6 +988,21 @@ class PI05FlowMatching(nn.Module):
     └──────────────────────────────────────────┘
     """
 
+    # Fixed modality slots indexing the learnable VLM-prefix modality embedding
+    # added on top of each prefix token embedding when
+    # ``config.use_modality_embedding`` is set (see ``embed_prefix``). The
+    # action expert is NOT in this table — it is separated from the prefix via a
+    # RoPE position gap (``config.action_expert_position_gap``) instead. Slots
+    # are fixed (not a running counter over present blocks) so a modality gets
+    # the same embedding whether or not optional blocks (state, response,
+    # discrete actions) appear in a given batch.
+    _MODALITY_VISION = 0
+    _MODALITY_LANGUAGE = 1
+    _MODALITY_STATE = 2
+    _MODALITY_RESPONSE = 3
+    _MODALITY_DISCRETE_ACTION = 4
+    _NUM_PREFIX_MODALITIES = 5
+
     def __init__(
         self,
         config: PI05Config,
@@ -1028,6 +1043,16 @@ class PI05FlowMatching(nn.Module):
 
         self.time_mlp_in = nn.Linear(self.config.proj_width, self.config.proj_width)
         self.time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
+
+        # Optional learned per-modality embedding added on top of the VLM-prefix
+        # token embeddings (layered over RoPE — see ``config.use_modality_embedding``).
+        # Lives in VLM hidden space. Zero-initialized so turning the feature on
+        # for an existing checkpoint is a no-op at step 0. The action expert is
+        # handled by the position gap, not by this table.
+        if self.config.use_modality_embedding:
+            vlm_hidden_size = self.paligemma_with_expert.config.paligemma_config.text_config.hidden_size
+            self.modality_embedding = nn.Embedding(self._NUM_PREFIX_MODALITIES, vlm_hidden_size)
+            nn.init.zeros_(self.modality_embedding.weight)
 
         if language_tokenizer is None:
             language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
@@ -1112,11 +1137,19 @@ class PI05FlowMatching(nn.Module):
                 - embs: Concatenated embeddings tensor.
                 - pad_masks: Concatenated padding masks tensor.
                 - att_masks: Attention masks tensor.
+                - segment_ids: Per-token modality slot tensor (shape matches
+                  ``pad_masks``). Used to add the learned modality embedding on
+                  top of ``embs`` when ``config.use_modality_embedding`` is set;
+                  also returned for downstream/diagnostic use.
         """
         # TODO: avoid list in python and torch.cat ; prefer pre-allocation with torch.empty
         embs = []
         pad_masks = []
         att_masks = []
+        # Per-token modality slot, parallel to ``att_masks``. Only consumed when
+        # ``config.use_modality_embedding`` is set, to add the learned modality
+        # embedding on top of the token embeddings (see end of method).
+        segment_ids = []
 
         # TODO: remove for loop
         for (
@@ -1138,6 +1171,7 @@ class PI05FlowMatching(nn.Module):
 
             # Create attention masks so that image tokens attend to each other
             att_masks += [0] * num_img_embs
+            segment_ids += [self._MODALITY_VISION] * num_img_embs
 
         lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
 
@@ -1151,6 +1185,7 @@ class PI05FlowMatching(nn.Module):
         # full attention between image and language inputs
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
+        segment_ids += [self._MODALITY_LANGUAGE] * num_lang_embs
 
         if self.config.state_type == "continuous" and state is not None:
             state_indicator_ids = self.language_tokenizer.encode("State: ", add_special_tokens=False)
@@ -1163,6 +1198,7 @@ class PI05FlowMatching(nn.Module):
             embs.append(state_indicator_emb)
             pad_masks.append(state_indicator_mask)
             att_masks += [0] * state_indicator_emb.shape[1]
+            segment_ids += [self._MODALITY_STATE] * state_indicator_emb.shape[1]
 
             state_emb = self.state_proj(state.to(dtype=_preferred_dtype()))
             state_emb = rearrange(state_emb, "b d -> b 1 d")
@@ -1171,6 +1207,7 @@ class PI05FlowMatching(nn.Module):
             embs.append(state_emb)
             pad_masks.append(state_mask)
             att_masks += [0]  # full attention with images and language
+            segment_ids += [self._MODALITY_STATE]
 
             state_end_indicator_ids = self.language_tokenizer.encode(":\n", add_special_tokens=False)
             state_end_indicator_tokens = torch.tensor(
@@ -1186,6 +1223,7 @@ class PI05FlowMatching(nn.Module):
             embs.append(state_end_indicator_emb)
             pad_masks.append(state_end_indicator_mask)
             att_masks += [0] * state_end_indicator_emb.shape[1]
+            segment_ids += [self._MODALITY_STATE] * state_end_indicator_emb.shape[1]
 
         if self.config.predict_response:
             response_indicator_ids = self.language_tokenizer.encode("Response: ", add_special_tokens=False)
@@ -1202,6 +1240,7 @@ class PI05FlowMatching(nn.Module):
             embs.append(response_indicator_emb)
             pad_masks.append(response_indicator_mask)
             att_masks += [1] * response_indicator_emb.shape[1]
+            segment_ids += [self._MODALITY_RESPONSE] * response_indicator_emb.shape[1]
 
         if response_tokens is not None:
             response_emb = self.paligemma_with_expert.embed_language_tokens(response_tokens)
@@ -1216,6 +1255,7 @@ class PI05FlowMatching(nn.Module):
             # full attention between image, language and response inputs
             num_response_embs = response_emb.shape[1]
             att_masks += [1] * num_response_embs
+            segment_ids += [self._MODALITY_RESPONSE] * num_response_embs
 
         if discrete_actions is not None:
             discrete_action_indicator_ids = self.language_tokenizer.encode(
@@ -1236,18 +1276,29 @@ class PI05FlowMatching(nn.Module):
             embs.append(discrete_action_indicator_emb)
             pad_masks.append(discrete_action_indicator_mask)
             att_masks += [1] * discrete_action_indicator_emb.shape[1]
+            segment_ids += [self._MODALITY_DISCRETE_ACTION] * discrete_action_indicator_emb.shape[1]
 
             discrete_action_emb = self.paligemma_with_expert.embed_discrete_actions(discrete_actions)
             embs.append(discrete_action_emb.to(dtype=_preferred_dtype()))
             pad_masks.append(discrete_action_masks)
             att_masks += [1] * discrete_action_emb.shape[1]
+            segment_ids += [self._MODALITY_DISCRETE_ACTION] * discrete_action_emb.shape[1]
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
+        segment_ids = torch.tensor(segment_ids, dtype=torch.long, device=pad_masks.device)
+        segment_ids = segment_ids[None, :].expand(bsize, segment_ids.shape[0])
 
-        return embs, pad_masks, att_masks
+        # Add the learned, modality-specific embedding on top of the VLM-prefix
+        # token embeddings (layered over the existing RoPE positions, not a
+        # replacement). Zero-initialized, so this is a no-op until trained.
+        if self.config.use_modality_embedding:
+            modality_emb = self.modality_embedding(segment_ids)
+            embs = embs + modality_emb.to(dtype=embs.dtype)
+
+        return embs, pad_masks, att_masks, segment_ids
 
     def embed_suffix(self, noisy_actions: Tensor, timestep: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Embed noisy_actions, timestep to prepare for Expert Gemma processing.
@@ -1310,6 +1361,29 @@ class PI05FlowMatching(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond
 
+    def _action_expert_position_ids(self, prefix_offsets: Tensor, suffix_pad_masks: Tensor) -> Tensor:
+        """RoPE position ids for the action-expert (suffix) tokens.
+
+        The action tokens are numbered contiguously starting right after the
+        prefix (``prefix_offsets + cumsum(pad_masks) - 1``). When
+        ``config.action_expert_position_gap > 0`` the whole block is then pushed
+        that many positions further out, opening a fixed "modality gap" between
+        the prefix and the action expert in position space. Per-token spacing
+        inside the chunk is unchanged. Shared by the training forward and the
+        inference denoise step so the gap is applied identically in both.
+
+        Args:
+            prefix_offsets: Per-sample start offset of shape (batch_size, 1).
+            suffix_pad_masks: Action-token padding masks of shape (batch_size, seq).
+
+        Returns:
+            Position id tensor of shape (batch_size, seq).
+        """
+        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        if self.config.action_expert_position_gap > 0:
+            position_ids = position_ids + self.config.action_expert_position_gap
+        return position_ids
+
     def forward(
         self,
         images: list[Tensor],
@@ -1351,7 +1425,7 @@ class PI05FlowMatching(nn.Module):
             A dictionary containing the loss components ("MSE" and "CE").
         """
         # Run VLM first to get key value cache
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+        prefix_embs, prefix_pad_masks, prefix_att_masks, _ = self.embed_prefix(
             images,
             img_masks,
             lang_tokens,
@@ -1421,7 +1495,8 @@ class PI05FlowMatching(nn.Module):
             ],
             dim=-1,
         )[:, None]  # action expert position ids start after prefix
-        action_expert_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        # Applies the action-expert modality gap when configured (no-op at gap=0).
+        action_expert_position_ids = self._action_expert_position_ids(prefix_offsets, suffix_pad_masks)
 
         # stop gradient to avoid backpropagating from action expert to VLM
         for layer_idx in past_key_values:
@@ -1583,7 +1658,7 @@ class PI05FlowMatching(nn.Module):
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+        prefix_embs, prefix_pad_masks, prefix_att_masks, _ = self.embed_prefix(
             images,
             img_masks,
             lang_tokens,
@@ -1689,7 +1764,8 @@ class PI05FlowMatching(nn.Module):
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[
             :, None
         ]  # action expert position ids start after prefix
-        action_expert_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        # Mirror the training forward: apply the action-expert modality gap when configured.
+        action_expert_position_ids = self._action_expert_position_ids(prefix_offsets, suffix_pad_masks)
 
         outputs_embeds, _ = self.paligemma_with_expert.forward(
             attention_mask=action_expert_2d_attention_mask,
