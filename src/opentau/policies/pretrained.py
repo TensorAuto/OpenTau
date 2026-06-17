@@ -1113,6 +1113,56 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         """
         raise NotImplementedError
 
+    def maybe_compile_for_training(self) -> None:
+        """Optionally ``torch.compile`` the heavy compute submodule for training.
+
+        Controlled by ``config.use_torch_compile``. When enabled, compiles the
+        inner flow-matching module (``self.model`` on pi05 / pi07) *in place*
+        via :meth:`torch.nn.Module.compile`. The in-place form only swaps the
+        submodule's ``__call__`` dispatch for a compiled one — it does **not**
+        wrap the module in a ``torch._dynamo.OptimizedModule`` and does **not**
+        prefix ``state_dict`` keys with ``_orig_mod.``. So ``self.parameters()``
+        and the on-disk checkpoint layout are unchanged: the optimizer built
+        afterwards sees the same params, and resume / ``from_pretrained`` stay
+        compatible with both compiled and uncompiled checkpoints.
+
+        The policy wrapper's own ``forward`` (tokenization, normalization, the
+        ``.cpu().tolist()`` / numpy / string preprocessing) is intentionally
+        left uncompiled — it is cheap relative to the transformer and is full of
+        host-side ops that would only force graph breaks.
+
+        Note: this relies on the training forward calling the submodule via
+        ``self.model(...)`` (``__call__``), not ``self.model.forward(...)`` —
+        the latter bypasses the compiled dispatch installed by
+        ``nn.Module.compile`` and would silently no-op the compile.
+
+        No-op unless ``config.use_torch_compile`` is True. The caller
+        (``train.py``) is responsible for rejecting parameter-sharding backends
+        (DeepSpeed ZeRO-3 / FSDP) before this runs.
+        """
+        if not getattr(self.config, "use_torch_compile", False):
+            return
+        target = getattr(self, "model", None)
+        if not isinstance(target, nn.Module):
+            logging.warning(
+                "use_torch_compile=True but %s has no inner `self.model` nn.Module to compile; "
+                "leaving the policy uncompiled.",
+                type(self).__name__,
+            )
+            return
+        mode = getattr(self.config, "torch_compile_mode", "default") or "default"
+        logging.info(
+            "torch.compile: compiling %s.model in place (mode=%r). The policy wrapper's "
+            "forward (preprocessing) stays in eager.",
+            type(self).__name__,
+            mode,
+        )
+        # In-place compile: rewrites only `target.__call__`, preserving the
+        # module hierarchy / state_dict keys. Lazy — the actual trace happens on
+        # the first forward, so this is safe to call before `accelerator.prepare`
+        # moves params to GPU.
+        target.compile(mode=mode)
+
     @abc.abstractmethod
     def reset(self):
         """Resets the policy state.

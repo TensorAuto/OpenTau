@@ -726,7 +726,10 @@ class PI05Policy(PreTrainedPolicy):
         )  # in actions_is_pad we have False for real actions and True for padded actions
 
         state = self.prepare_state(batch) if self.config.state_type == "continuous" else None
-        losses = self.model.forward(
+        # Call via __call__ (not .forward) so an in-place torch.compile of
+        # self.model (see PreTrainedPolicy.maybe_compile_for_training) is
+        # actually dispatched; a direct .forward() bypasses the compiled call.
+        losses = self.model(
             images,
             img_masks,
             lang_tokens,

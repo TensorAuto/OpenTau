@@ -306,6 +306,25 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
     # `use_amp` determines whether to use Automatic Mixed Precision (AMP) for training and evaluation. With AMP,
     # automatic gradient scaling is used.
     use_amp: bool = False
+
+    # When True, training `torch.compile`s the policy's heavy compute submodule
+    # (the flow-matching `self.model` for pi05 / pi07) *in place* via
+    # `torch.nn.Module.compile`, leaving the host-side preprocessing in the
+    # policy wrapper's own forward uncompiled. The compile is applied in
+    # `PreTrainedPolicy.maybe_compile_for_training`, called from train.py after
+    # the bf16 cast and before `accelerator.prepare`. Compatible with DDP /
+    # single-process / DeepSpeed ZeRO-1/2; train.py rejects ZeRO-3 and FSDP
+    # (both re-shard parameters during forward, which invalidates the traced
+    # graphs). Defaults to False (no behaviour change; the default eager path
+    # is byte-for-byte unchanged).
+    use_torch_compile: bool = False
+    # `torch.compile` mode forwarded to `torch.nn.Module.compile(mode=...)` when
+    # `use_torch_compile` is True. One of "default", "reduce-overhead",
+    # "max-autotune", "max-autotune-no-cudagraphs". Stick with "default" under
+    # DeepSpeed — the cudagraph-based modes ("reduce-overhead", "max-autotune")
+    # conflict with DeepSpeed's activation/parameter memory reuse.
+    torch_compile_mode: str = "default"
+
     pretrained_path: str | None = None
     skip_normalization_weights: bool = False
 
