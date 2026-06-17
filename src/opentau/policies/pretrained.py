@@ -1151,9 +1151,29 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
             )
             return
         mode = getattr(self.config, "torch_compile_mode", "default") or "default"
+        # Use eager's RNG under compile instead of inductor's functionalized
+        # (philox) RNG. Two reasons, both load-bearing here:
+        #   1. Determinism: the flow-matching forward samples `noise` / `time`
+        #      *inside* the compiled region. With functionalized RNG, two
+        #      same-seed runs diverge at the per-step loss (inductor seeds the
+        #      philox offset independently of eager's generator); fallback_random
+        #      makes the compiled draws match eager, so same-seed runs stay
+        #      bit-identical — preserving the determinism the eager path has.
+        #   2. Stability: inductor's backward RNG-op partitioner raises
+        #      `KeyError: '_scaled_dot_product_flash_attention'` when SDPA-flash
+        #      attention (pi07) is combined with gradient checkpointing under
+        #      functionalized RNG. Falling back to eager RNG bypasses that path.
+        # The cost (RNG ops aren't fused into surrounding kernels) is negligible
+        # for training.
+        try:
+            import torch._inductor.config as _inductor_config
+
+            _inductor_config.fallback_random = True
+        except Exception as exc:  # pragma: no cover - inductor always present with torch>=2
+            logging.warning("Could not set torch._inductor.config.fallback_random: %s", exc)
         logging.info(
-            "torch.compile: compiling %s.model in place (mode=%r). The policy wrapper's "
-            "forward (preprocessing) stays in eager.",
+            "torch.compile: compiling %s.model in place (mode=%r, inductor fallback_random=True). "
+            "The policy wrapper's forward (preprocessing) stays in eager.",
             type(self).__name__,
             mode,
         )
