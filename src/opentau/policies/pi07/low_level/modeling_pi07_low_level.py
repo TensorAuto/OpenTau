@@ -329,6 +329,8 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
 
     config_class = PI07LowLevelConfig
     name = "pi07_low_level"
+    # forward() dispatches self.model via __call__, so nn.Module.compile() takes effect.
+    supports_torch_compile = True
 
     # Per-(robot_type, control_mode) projections live on the inner
     # `self.model` (PerGroupLinear when `config.per_group_projection`), so their

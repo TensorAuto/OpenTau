@@ -109,6 +109,17 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
     name: None
     """The name of the policy. Must be defined in subclasses."""
 
+    supports_torch_compile: bool = False
+    """Whether :meth:`maybe_compile_for_training` may compile this policy's
+    ``self.model``. Default ``False``: opt-in per policy, because the in-place
+    ``nn.Module.compile`` only takes effect if the policy's training ``forward``
+    invokes the submodule via ``self.model(...)`` (``__call__``) rather than
+    ``self.model.forward(...)``. Subclasses whose forward has been switched to
+    ``self.model(...)`` (currently :class:`~opentau.policies.pi05.modeling_pi05.PI05Policy`
+    and :class:`~opentau.policies.pi07.low_level.modeling_pi07_low_level.PI07LowLevelPolicy`)
+    set this ``True``. Leaving it ``False`` makes ``use_torch_compile=True`` a
+    *loud* no-op on unwired policies instead of a silent compile-but-never-dispatch."""
+
     _PER_GROUP_PROJECTION_PREFIXES: tuple[str, ...] = ()
     """State-dict key prefixes for per-(robot_type, control_mode) projection
     weights (``PerGroupLinear``: ``<prefix>weight`` shaped ``(G, out, in)`` and
@@ -1141,6 +1152,19 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         (DeepSpeed ZeRO-3 / FSDP) before this runs.
         """
         if not getattr(self.config, "use_torch_compile", False):
+            return
+        # The in-place compile only fires if the policy's forward calls the
+        # submodule via ``self.model(...)``. Policies that still call
+        # ``self.model.forward(...)`` would compile-but-never-dispatch — a silent
+        # no-op. Gate on the explicit opt-in so unwired policies warn loudly
+        # instead. Only pi05 / pi07-low-level are wired (and validated) today.
+        if not getattr(self, "supports_torch_compile", False):
+            logging.warning(
+                "use_torch_compile=True but %s is not wired for torch.compile "
+                "(its forward does not dispatch self.model via __call__); skipping "
+                "compilation. Supported today: PI05Policy, PI07LowLevelPolicy.",
+                type(self).__name__,
+            )
             return
         target = getattr(self, "model", None)
         if not isinstance(target, nn.Module):

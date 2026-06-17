@@ -238,6 +238,8 @@ class PI05Policy(PreTrainedPolicy):
 
     config_class = PI05Config
     name = "pi05"
+    # forward() dispatches self.model via __call__, so nn.Module.compile() takes effect.
+    supports_torch_compile = True
 
     def __init__(
         self,

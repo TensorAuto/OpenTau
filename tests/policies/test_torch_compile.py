@@ -108,9 +108,10 @@ class _StubPolicy:
 
     maybe_compile_for_training = PreTrainedPolicy.maybe_compile_for_training
 
-    def __init__(self, config, model):
+    def __init__(self, config, model, supports=True):
         self.config = config
         self.model = model
+        self.supports_torch_compile = supports
 
 
 def _tiny_model() -> nn.Module:
@@ -157,3 +158,29 @@ def test_missing_model_is_safe(caplog):
     policy = _StubPolicy(_StubConfig(use_torch_compile=True), model=None)
     # Should not raise.
     policy.maybe_compile_for_training()
+
+
+def test_unsupported_policy_warns_and_skips():
+    """``use_torch_compile=True`` on a policy whose forward still calls
+    ``self.model.forward(...)`` (``supports_torch_compile=False``) must be a LOUD
+    no-op — warn and skip, never silently compile-but-never-dispatch. Pins the fix
+    for the shared-config footgun: the flag lives on ``PreTrainedConfig`` but only
+    wired policies should actually compile."""
+    model = _tiny_model()
+    policy = _StubPolicy(_StubConfig(use_torch_compile=True), model, supports=False)
+    policy.maybe_compile_for_training()  # must not raise
+    assert model._compiled_call_impl is None  # left uncompiled
+
+
+def test_support_marker_is_opt_in():
+    """Only the wired policies advertise compile support; the base default is off,
+    and an unwired policy (pi0) stays off. Guards against a future policy
+    inheriting ``True`` by accident or the wired flags being dropped."""
+    from opentau.policies.pi0.modeling_pi0 import PI0Policy
+    from opentau.policies.pi05.modeling_pi05 import PI05Policy
+    from opentau.policies.pi07.low_level.modeling_pi07_low_level import PI07LowLevelPolicy
+
+    assert PreTrainedPolicy.supports_torch_compile is False
+    assert PI05Policy.supports_torch_compile is True
+    assert PI07LowLevelPolicy.supports_torch_compile is True
+    assert PI0Policy.supports_torch_compile is False
