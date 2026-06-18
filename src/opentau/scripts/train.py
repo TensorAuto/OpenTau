@@ -526,6 +526,29 @@ def _find_unused_params_from_env() -> bool:
     return os.environ.get("FIND_UNUSED_PARAMS", "true").lower() == "true"
 
 
+def _deepspeed_zero_stage(accelerator: accelerate.Accelerator) -> int:
+    """Return the active DeepSpeed ZeRO stage, or 0 when DeepSpeed is not the backend.
+
+    Centralizes the ``accelerator.deepspeed_plugin.hf_ds_config.config`` lookup
+    that gates every ZeRO-3-specific code path in ``train()`` — the
+    per-construction parameter-partitioning suppression
+    (``_zero3_disabled_init_context``) and the gradient-checkpointing /
+    ``use_torch_compile`` / in-training-sim-eval guards, all of which branch on
+    "is this ZeRO-3?". Returning 0 for non-DeepSpeed backends lets callers test
+    ``>= 3`` without first checking ``distributed_type``.
+
+    Args:
+        accelerator: The active accelerate ``Accelerator``.
+
+    Returns:
+        int: The configured ZeRO optimization stage (0, 1, 2, or 3). 0 when the
+        distributed backend is not DeepSpeed (so ``< 3`` everywhere it matters).
+    """
+    if accelerator.distributed_type != accelerate.DistributedType.DEEPSPEED:
+        return 0
+    return accelerator.deepspeed_plugin.hf_ds_config.config.get("zero_optimization", {}).get("stage", 0)
+
+
 @contextmanager
 def _zero3_disabled_init_context(accelerator: accelerate.Accelerator):
     """Context manager that suppresses ZeRO-3 per-construction param partitioning.
@@ -551,11 +574,7 @@ def _zero3_disabled_init_context(accelerator: accelerate.Accelerator):
     Args:
         accelerator: The active accelerate ``Accelerator``.
     """
-    if accelerator.distributed_type != accelerate.DistributedType.DEEPSPEED:
-        yield
-        return
-    zero_stage = accelerator.deepspeed_plugin.hf_ds_config.config.get("zero_optimization", {}).get("stage", 0)
-    if zero_stage < 3:
+    if _deepspeed_zero_stage(accelerator) < 3:
         yield
         return
 
@@ -663,20 +682,17 @@ def train(cfg: TrainPipelineConfig):
                 "Either set gradient_checkpointing=False or switch to a "
                 "supported backend."
             )
-        if accelerator.distributed_type == accelerate.DistributedType.DEEPSPEED:
-            zero_stage = accelerator.deepspeed_plugin.hf_ds_config.config.get("zero_optimization", {}).get(
-                "stage", 0
+        zero_stage = _deepspeed_zero_stage(accelerator)
+        if zero_stage >= 3:
+            raise ValueError(
+                f"gradient_checkpointing=True is not supported under "
+                f"DeepSpeed ZeRO stage {zero_stage}. ZeRO-3 re-shards parameters "
+                "during forward and needs deepspeed.checkpointing.checkpoint "
+                "rather than torch.utils.checkpoint. Either set "
+                "gradient_checkpointing=False, use zero_stage: 1 or 2, or "
+                "switch to FSDP (which has equivalent param sharding and "
+                "is compatible with torch.utils.checkpoint)."
             )
-            if zero_stage >= 3:
-                raise ValueError(
-                    f"gradient_checkpointing=True is not supported under "
-                    f"DeepSpeed ZeRO stage {zero_stage}. ZeRO-3 re-shards parameters "
-                    "during forward and needs deepspeed.checkpointing.checkpoint "
-                    "rather than torch.utils.checkpoint. Either set "
-                    "gradient_checkpointing=False, use zero_stage: 1 or 2, or "
-                    "switch to FSDP (which has equivalent param sharding and "
-                    "is compatible with torch.utils.checkpoint)."
-                )
 
     # Backend compatibility for use_torch_compile. `nn.Module.compile` caches
     # guards keyed on parameter/buffer storage, but DeepSpeed ZeRO-3 and FSDP
@@ -697,9 +713,7 @@ def train(cfg: TrainPipelineConfig):
         ):
             unsupported_backend = str(accelerator.distributed_type)
         elif accelerator.distributed_type == accelerate.DistributedType.DEEPSPEED:
-            zero_stage = accelerator.deepspeed_plugin.hf_ds_config.config.get("zero_optimization", {}).get(
-                "stage", 0
-            )
+            zero_stage = _deepspeed_zero_stage(accelerator)
             if zero_stage >= 3:
                 unsupported_backend = f"DeepSpeed ZeRO stage {zero_stage}"
         if unsupported_backend is not None:
@@ -754,12 +768,10 @@ def train(cfg: TrainPipelineConfig):
         # Under parameter sharding the forward still all-gathers params per layer,
         # which WOULD desync across the independent rollouts and hang at NCCL — fail
         # fast instead of hanging hours into a run.
-        sharded_params = accelerator.distributed_type == accelerate.DistributedType.FSDP
-        if accelerator.distributed_type == accelerate.DistributedType.DEEPSPEED:
-            zero_stage = accelerator.deepspeed_plugin.hf_ds_config.config.get("zero_optimization", {}).get(
-                "stage", 0
-            )
-            sharded_params = zero_stage >= 3
+        sharded_params = (
+            accelerator.distributed_type == accelerate.DistributedType.FSDP
+            or _deepspeed_zero_stage(accelerator) >= 3
+        )
         if sharded_params:
             raise ValueError(
                 "In-training simulation eval (eval_freq > 0 with a sim env) is not "
