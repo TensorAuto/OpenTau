@@ -109,6 +109,17 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
     name: None
     """The name of the policy. Must be defined in subclasses."""
 
+    supports_torch_compile: bool = False
+    """Whether :meth:`maybe_compile_for_training` may compile this policy's
+    ``self.model``. Default ``False``: opt-in per policy, because the in-place
+    ``nn.Module.compile`` only takes effect if the policy's training ``forward``
+    invokes the submodule via ``self.model(...)`` (``__call__``) rather than
+    ``self.model.forward(...)``. Subclasses whose forward has been switched to
+    ``self.model(...)`` (currently :class:`~opentau.policies.pi05.modeling_pi05.PI05Policy`
+    and :class:`~opentau.policies.pi07.low_level.modeling_pi07_low_level.PI07LowLevelPolicy`)
+    set this ``True``. Leaving it ``False`` makes ``use_torch_compile=True`` a
+    *loud* no-op on unwired policies instead of a silent compile-but-never-dispatch."""
+
     _PER_GROUP_PROJECTION_PREFIXES: tuple[str, ...] = ()
     """State-dict key prefixes for per-(robot_type, control_mode) projection
     weights (``PerGroupLinear``: ``<prefix>weight`` shaped ``(G, out, in)`` and
@@ -1112,6 +1123,89 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
             dict: A dictionary of parameters to optimize.
         """
         raise NotImplementedError
+
+    def maybe_compile_for_training(self) -> None:
+        """Optionally ``torch.compile`` the heavy compute submodule for training.
+
+        Controlled by ``config.use_torch_compile``. When enabled, compiles the
+        inner flow-matching module (``self.model`` on pi05 / pi07) *in place*
+        via :meth:`torch.nn.Module.compile`. The in-place form only swaps the
+        submodule's ``__call__`` dispatch for a compiled one — it does **not**
+        wrap the module in a ``torch._dynamo.OptimizedModule`` and does **not**
+        prefix ``state_dict`` keys with ``_orig_mod.``. So ``self.parameters()``
+        and the on-disk checkpoint layout are unchanged: the optimizer built
+        afterwards sees the same params, and resume / ``from_pretrained`` stay
+        compatible with both compiled and uncompiled checkpoints.
+
+        The policy wrapper's own ``forward`` (tokenization, normalization, the
+        ``.cpu().tolist()`` / numpy / string preprocessing) is intentionally
+        left uncompiled — it is cheap relative to the transformer and is full of
+        host-side ops that would only force graph breaks.
+
+        Note: this relies on the training forward calling the submodule via
+        ``self.model(...)`` (``__call__``), not ``self.model.forward(...)`` —
+        the latter bypasses the compiled dispatch installed by
+        ``nn.Module.compile`` and would silently no-op the compile.
+
+        No-op unless ``config.use_torch_compile`` is True. The caller
+        (``train.py``) is responsible for rejecting parameter-sharding backends
+        (DeepSpeed ZeRO-3 / FSDP) before this runs.
+        """
+        if not getattr(self.config, "use_torch_compile", False):
+            return
+        # The in-place compile only fires if the policy's forward calls the
+        # submodule via ``self.model(...)``. Policies that still call
+        # ``self.model.forward(...)`` would compile-but-never-dispatch — a silent
+        # no-op. Gate on the explicit opt-in so unwired policies warn loudly
+        # instead. Only pi05 / pi07-low-level are wired (and validated) today.
+        if not getattr(self, "supports_torch_compile", False):
+            logging.warning(
+                "use_torch_compile=True but %s is not wired for torch.compile "
+                "(its forward does not dispatch self.model via __call__); skipping "
+                "compilation. Supported today: PI05Policy, PI07LowLevelPolicy.",
+                type(self).__name__,
+            )
+            return
+        target = getattr(self, "model", None)
+        if not isinstance(target, nn.Module):
+            logging.warning(
+                "use_torch_compile=True but %s has no inner `self.model` nn.Module to compile; "
+                "leaving the policy uncompiled.",
+                type(self).__name__,
+            )
+            return
+        mode = getattr(self.config, "torch_compile_mode", "default") or "default"
+        # Use eager's RNG under compile instead of inductor's functionalized
+        # (philox) RNG. Two reasons, both load-bearing here:
+        #   1. Determinism: the flow-matching forward samples `noise` / `time`
+        #      *inside* the compiled region. With functionalized RNG, two
+        #      same-seed runs diverge at the per-step loss (inductor seeds the
+        #      philox offset independently of eager's generator); fallback_random
+        #      makes the compiled draws match eager, so same-seed runs stay
+        #      bit-identical — preserving the determinism the eager path has.
+        #   2. Stability: inductor's backward RNG-op partitioner raises
+        #      `KeyError: '_scaled_dot_product_flash_attention'` when SDPA-flash
+        #      attention (pi07) is combined with gradient checkpointing under
+        #      functionalized RNG. Falling back to eager RNG bypasses that path.
+        # The cost (RNG ops aren't fused into surrounding kernels) is negligible
+        # for training.
+        try:
+            import torch._inductor.config as _inductor_config
+
+            _inductor_config.fallback_random = True
+        except Exception as exc:  # pragma: no cover - inductor always present with torch>=2
+            logging.warning("Could not set torch._inductor.config.fallback_random: %s", exc)
+        logging.info(
+            "torch.compile: compiling %s.model in place (mode=%r, inductor fallback_random=True). "
+            "The policy wrapper's forward (preprocessing) stays in eager.",
+            type(self).__name__,
+            mode,
+        )
+        # In-place compile: rewrites only `target.__call__`, preserving the
+        # module hierarchy / state_dict keys. Lazy — the actual trace happens on
+        # the first forward, so this is safe to call before `accelerator.prepare`
+        # moves params to GPU.
+        target.compile(mode=mode)
 
     @abc.abstractmethod
     def reset(self):

@@ -678,6 +678,40 @@ def train(cfg: TrainPipelineConfig):
                     "is compatible with torch.utils.checkpoint)."
                 )
 
+    # Backend compatibility for use_torch_compile. `nn.Module.compile` caches
+    # guards keyed on parameter/buffer storage, but DeepSpeed ZeRO-3 and FSDP
+    # re-shard / re-materialize parameters on every forward, so those guards go
+    # stale (recompiling every step or reading a sharded parameter). DDP /
+    # single-process / DeepSpeed ZeRO-1/2 keep parameters intact across forwards.
+    # Because compile now defaults ON for the policies that support it, fall back
+    # to eager with a warning under an incompatible backend rather than raising —
+    # a ZeRO-3 / FSDP run should still train (just uncompiled), not crash on a
+    # default. (An explicit --policy.use_torch_compile=true on such a backend is
+    # likewise honored as a best-effort request and downgraded with the warning.)
+    if getattr(cfg.policy, "use_torch_compile", False):
+        unsupported_backend = None
+        if accelerator.distributed_type not in (
+            accelerate.DistributedType.MULTI_GPU,
+            accelerate.DistributedType.NO,
+            accelerate.DistributedType.DEEPSPEED,
+        ):
+            unsupported_backend = str(accelerator.distributed_type)
+        elif accelerator.distributed_type == accelerate.DistributedType.DEEPSPEED:
+            zero_stage = accelerator.deepspeed_plugin.hf_ds_config.config.get("zero_optimization", {}).get(
+                "stage", 0
+            )
+            if zero_stage >= 3:
+                unsupported_backend = f"DeepSpeed ZeRO stage {zero_stage}"
+        if unsupported_backend is not None:
+            logging.warning(
+                "use_torch_compile=True is not supported under %s: parameters are "
+                "re-sharded during forward, which invalidates torch.compile's traced "
+                "guards. Falling back to eager (training continues uncompiled). Use "
+                "DDP / single-process / DeepSpeed ZeRO-1/2 to enable compilation.",
+                unsupported_backend,
+            )
+            cfg.policy.use_torch_compile = False
+
     logging.info(pformat(cfg.to_dict()))
 
     if accelerator.is_main_process:
@@ -779,6 +813,16 @@ def train(cfg: TrainPipelineConfig):
     #     params materialize in bf16 transiently during the all-gather.
     if accelerator.distributed_type != accelerate.DistributedType.FSDP:
         policy.to(torch.bfloat16)
+    # Optionally torch.compile the flow-matching submodule (in place) now, while
+    # `policy` is still the raw module so `self.model` is directly reachable, and
+    # before the optimizer / `accelerator.prepare` wrap it. The in-place compile
+    # leaves `policy.parameters()` and the state_dict layout unchanged (see
+    # PreTrainedPolicy.maybe_compile_for_training), so the optimizer built below
+    # still sees the same params and resume stays checkpoint-compatible. The
+    # compile is lazy (first-forward trace) and the compiled call runs inside the
+    # DeepSpeedEngine / DDP wrapper's forward. No-op unless
+    # cfg.policy.use_torch_compile is set (validated against the backend above).
+    policy.maybe_compile_for_training()
     logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
     # Outside DeepSpeed *and* FSDP, wrap the optimizer so it carries fp32

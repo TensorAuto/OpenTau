@@ -228,6 +228,13 @@ class PI07LowLevelConfig(PreTrainedConfig):
     spacetime_layer_stride: int = 4
     gradient_checkpointing: bool = False
 
+    # torch.compile defaults ON for pi07 low-level: PI07LowLevelPolicy is wired
+    # for it (supports_torch_compile=True). Note that pi07's variable-length text
+    # embedding can trigger torch.compile recompiles unless sequence lengths are
+    # stable; correctness holds regardless, and train.py auto-falls back to eager
+    # under FSDP / ZeRO-3. Set False to force eager.
+    use_torch_compile: bool = True
+
     # Training presets
     optimizer_lr: float = 2.5e-5
     optimizer_betas: tuple[float, float] = (0.9, 0.95)

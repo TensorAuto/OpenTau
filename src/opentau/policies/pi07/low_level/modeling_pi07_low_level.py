@@ -72,6 +72,7 @@ def _preferred_dtype():
     return torch.float32 if torch.onnx.is_in_onnx_export() else torch.bfloat16
 
 
+@torch.compiler.disable
 def _global_or_branch_decisions(
     presence_locals: tuple[bool, ...],
     any_locals: tuple[bool, ...],
@@ -328,6 +329,8 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
 
     config_class = PI07LowLevelConfig
     name = "pi07_low_level"
+    # forward() dispatches self.model via __call__, so nn.Module.compile() takes effect.
+    supports_torch_compile = True
 
     # Per-(robot_type, control_mode) projections live on the inner
     # `self.model` (PerGroupLinear when `config.per_group_projection`), so their
@@ -921,7 +924,10 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
         actions = batch["actions"]
         actions_is_pad = batch.get("action_is_pad")
 
-        losses = self.model.forward(
+        # Call via __call__ (not .forward) so an in-place torch.compile of
+        # self.model (see PreTrainedPolicy.maybe_compile_for_training) is
+        # actually dispatched; a direct .forward() bypasses the compiled call.
+        losses = self.model(
             videos,
             vid_masks,
             lang_tokens,
