@@ -660,7 +660,7 @@ class TestSuppressSpacetimeTemporal:
         )
         bad_input = torch.rand(3, 256, wrapper.embed_dim)
         with suppress_spacetime_temporal(encoder.vision_tower):
-            out = wrapper.forward(bad_input)[0]
+            out = wrapper.forward(bad_input)
         assert out.shape == bad_input.shape
 
 
@@ -1051,8 +1051,8 @@ class TestReadingBMaskStructure:
         hidden_b = torch.cat([past, current_b], dim=0)
 
         with torch.no_grad():
-            out_a = wrapper(hidden_a, num_frames=t)[0]
-            out_b = wrapper(hidden_b, num_frames=t)[0]
+            out_a = wrapper(hidden_a, num_frames=t)
+            out_b = wrapper(hidden_b, num_frames=t)
 
         # Past frame at index 0: causal mask must prevent it from seeing
         # the current frame's data, so out_a[0] must equal out_b[0].

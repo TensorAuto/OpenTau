@@ -228,20 +228,22 @@ class SpaceTimeEncoderLayerWrapper(nn.Module):
         hidden_states: Tensor,
         attention_mask: Optional[Tensor],
         output_attentions: bool,
-    ) -> tuple[Tensor, ...]:
+    ) -> Tensor:
         """Inlined SiglipEncoderLayer.forward using the adopted submodules.
 
         Mirrors
         ``transformers.models.siglip.modeling_siglip.SiglipEncoderLayer.forward``
         exactly — any upstream change to that forward would need to be
-        reflected here.
+        reflected here. As of transformers >= 4.57 that forward returns a bare
+        hidden-state tensor (``output_attentions`` was dropped from the layer
+        API), so this returns a tensor too; ``output_attentions`` is accepted
+        for signature compatibility but ignored (SDPA exposes no weights).
         """
         residual = hidden_states
         hidden_states = self.layer_norm1(hidden_states)
-        hidden_states, attn_weights = self.self_attn(
+        hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
-            output_attentions=output_attentions,
         )
         hidden_states = residual + hidden_states
 
@@ -250,10 +252,7 @@ class SpaceTimeEncoderLayerWrapper(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        outputs: tuple[Tensor, ...] = (hidden_states,)
-        if output_attentions:
-            outputs = outputs + (attn_weights,)
-        return outputs
+        return hidden_states
 
     def forward(
         self,
@@ -262,8 +261,8 @@ class SpaceTimeEncoderLayerWrapper(nn.Module):
         output_attentions: bool = False,
         temporal_attn_mask: Tensor | None = None,
         num_frames: int | None = None,
-    ) -> tuple[Tensor, ...]:
-        """hidden_states: (B*T, N, D) -> tuple starting with (B*T, N, D).
+    ) -> Tensor:
+        """hidden_states: (B*T, N, D) -> (B*T, N, D).
 
         Signature extends ``SiglipEncoderLayer.forward`` with two extra
         kwargs: ``temporal_attn_mask`` and ``num_frames``. Vanilla
@@ -417,15 +416,11 @@ class SpaceTimeEncoderLayerWrapper(nn.Module):
         h_mlp = self.mlp(h_norm)
         h_out = residual + h_mlp
 
-        outputs: tuple[Tensor, ...] = (h_out,)
-        if output_attentions:
-            # SDPA does not return attention weights, and Reading B never
-            # materializes either α_temporal or α_spatial. Return None to
-            # keep the tuple shape; callers requesting weights at T>1 should
-            # switch to an explicit-attention build of SigLIP if they need
-            # per-layer weights.
-            outputs = outputs + (None,)
-        return outputs
+        # transformers >= 4.57 ``SiglipEncoderLayer.forward`` returns a bare
+        # tensor (no ``output_attentions`` / weights), and SDPA exposes no
+        # weights anyway, so this wrapper returns the hidden state directly to
+        # stay a drop-in for both the stock ``SiglipEncoder`` loop and our own.
+        return h_out
 
 
 @contextmanager
@@ -678,23 +673,22 @@ class SpaceTimeSiglipVideoEncoder(nn.Module):
         use_ckpt = self.gradient_checkpointing and self.training
         for layer in self.vision_tower.vision_model.encoder.layers:
             is_spacetime = isinstance(layer, SpaceTimeEncoderLayerWrapper)
-            if use_ckpt:
-                if is_spacetime:
-                    layer_outputs = torch.utils.checkpoint.checkpoint(
+            # Both the SpaceTime wrapper and the vanilla transformers >= 4.57
+            # ``SiglipEncoderLayer`` return a bare hidden-state tensor; the wrapper
+            # additionally accepts the temporal kwargs (positional under checkpoint,
+            # which does not forward kwargs).
+            if is_spacetime:
+                if use_ckpt:
+                    hidden = torch.utils.checkpoint.checkpoint(
                         layer, hidden, None, False, temporal_attn_mask, t, use_reentrant=False
                     )
                 else:
-                    layer_outputs = torch.utils.checkpoint.checkpoint(
-                        layer, hidden, None, False, use_reentrant=False
-                    )
+                    hidden = layer(hidden, None, False, temporal_attn_mask=temporal_attn_mask, num_frames=t)
             else:
-                if is_spacetime:
-                    layer_outputs = layer(
-                        hidden, None, False, temporal_attn_mask=temporal_attn_mask, num_frames=t
-                    )
+                if use_ckpt:
+                    hidden = torch.utils.checkpoint.checkpoint(layer, hidden, None, use_reentrant=False)
                 else:
-                    layer_outputs = layer(hidden, None, False)
-            hidden = layer_outputs[0]
+                    hidden = layer(hidden, None)
 
         hidden = self.vision_tower.vision_model.post_layernorm(hidden)
 

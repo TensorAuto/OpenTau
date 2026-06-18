@@ -76,7 +76,7 @@ dependencies = [
     "onnxruntime-gpu>=1.22.0 ; ((sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and (platform_machine == 'AMD64' or platform_machine == 'x86_64'))) ",
     "onnxscript>=0.3.1",
     "onnx-ir>=0.1.4",
-    "transformers==4.53.3",
+    "transformers>=4.57,<4.58",
     "scipy>=1.15.2",
     "pytest>=8.1.0",
     "pytest-cov>=5.0.0",
@@ -240,6 +240,9 @@ default.extend-ignore-identifiers-re = [
     "pn",
     "ser",
     "ein",
+    # Qwen3-VL grid shape names (temporal/height/width): image_grid_thw, video_grid_thw, grid_thw.
+    ".*grid_thw.*",
+    "thw",
 ]
 
 [build-system]
