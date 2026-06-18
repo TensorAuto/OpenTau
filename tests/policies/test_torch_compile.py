@@ -67,15 +67,24 @@ _POLICY_CONFIG_CASES = [
 ALL_POLICY_CONFIGS = [c for c, _ in _POLICY_CONFIG_CASES]
 _POLICY_CONFIG_IDS = [name for _, name in _POLICY_CONFIG_CASES]
 
+# Policies wired for (and defaulting to) torch.compile — their forward dispatches
+# self.model via __call__ and they set supports_torch_compile=True. PI05Config's
+# default propagates to its PI05ContinuousStateConfig subclass.
+_COMPILE_ON_BY_DEFAULT = {PI05Config, PI05ContinuousStateConfig, PI07LowLevelConfig}
+
 
 @pytest.mark.parametrize("config_cls", ALL_POLICY_CONFIGS, ids=_POLICY_CONFIG_IDS)
-def test_compile_defaults_off(config_cls):
-    """Every policy config inherits the compile knobs with safe defaults:
-    compilation off, mode "default". A regression means a subclass shadowed the
-    parent field or a default flipped — either of which would change the default
-    training path."""
+def test_compile_default(config_cls):
+    """torch.compile defaults ON only for the wired pi05 / pi07-low-level configs
+    and OFF for every other policy (so unwired policies keep their eager default
+    and never hit the warn-and-skip). ``torch_compile_mode`` defaults "default"
+    everywhere. A regression here means a default flipped or a subclass shadowed
+    the field."""
     cfg = config_cls()
-    assert cfg.use_torch_compile is False
+    expected = config_cls in _COMPILE_ON_BY_DEFAULT
+    assert cfg.use_torch_compile is expected, (
+        f"{config_cls.__name__}.use_torch_compile default should be {expected}"
+    )
     assert cfg.torch_compile_mode == "default"
 
 
