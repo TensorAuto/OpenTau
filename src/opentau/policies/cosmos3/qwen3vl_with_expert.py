@@ -440,10 +440,16 @@ class Qwen3VLWithExpertModel(nn.Module):
         pixel_values: Tensor | None,
         image_grid_thw: Tensor | None,
     ) -> list[tuple[Tensor, Tensor]]:
-        """Run the frozen backbone over the observation prefix; return per-layer (K, V) cache.
+        """Run the backbone over the observation prefix; return the per-layer (K, V) cache.
 
-        Each entry is ``(key, value)`` of shape ``(B, num_kv_heads, S_prefix, head_dim)``,
-        detached from the backbone graph (the expert reads them as constants).
+        Each entry is ``(key, value)`` of shape ``(B, num_kv_heads, S_prefix, head_dim)``.
+
+        When ``train_expert_only`` (the default), the backbone is fully frozen: the forward
+        runs under ``no_grad`` and the cached KV is ``.detach()``'d, so the expert reads it
+        as a constant. When ``train_expert_only`` is False (partial unfreeze, e.g. a
+        trainable text tower with a frozen vision encoder), the forward keeps its graph and
+        the KV is **not** detached, so the expert's loss backpropagates into the (unfrozen)
+        backbone — otherwise unfreezing would be a silent no-op.
         """
         ctx = torch.no_grad() if self.train_expert_only else nullcontext()
         with ctx:
@@ -459,7 +465,9 @@ class Qwen3VLWithExpertModel(nn.Module):
         cached = []
         for i in range(self.num_layers):
             key, value = pkv[i]
-            cached.append((key.detach(), value.detach()))
+            if self.train_expert_only:
+                key, value = key.detach(), value.detach()
+            cached.append((key, value))
         return cached
 
     def run_expert(

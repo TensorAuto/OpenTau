@@ -285,3 +285,38 @@ def test_cosmos3_expert_under_1b_params():
     )
     total = per_layer * cfg.expert_num_hidden_layers + (c * 3 * h + 3 * h)  # + final norm
     assert total < 1_000_000_000, f"expert has {total:,} params (>= 1B)"
+
+
+def test_first_tensor_skips_non_tensor_prompt():
+    """``_first_tensor`` must skip the non-tensor ``prompt`` entry (the wrapper relies on it
+    to infer device / batch size without ``AttributeError`` on the string list)."""
+    from opentau.policies.cosmos3.modeling_cosmos3 import _first_tensor
+
+    batch = {"prompt": ["pick up the block", "place it"], "actions": torch.zeros(2, CHUNK, MAX_ACTION_DIM)}
+    ref = _first_tensor(batch)
+    assert isinstance(ref, torch.Tensor)
+    assert ref.shape[0] == 2
+
+
+def test_cosmos3_partial_unfreeze_backbone_receives_grad():
+    """With train_expert_only=False the cached KV keeps its graph, so the unfrozen text
+    backbone receives gradients (otherwise unfreezing would be a silent no-op)."""
+    torch.manual_seed(0)
+    cfg = _tiny_cosmos3_config(train_expert_only=False, freeze_vision_encoder=True)
+    model = Cosmos3FlowMatching(cfg, qwen3vl_config=_tiny_qwen3vl_config())
+    input_ids, attention_mask, state, actions = _text_batch()
+    out = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        pixel_values=None,
+        image_grid_thw=None,
+        state=state,
+        actions=actions,
+        noise=torch.randn_like(actions),
+        time=torch.rand(actions.shape[0]),
+    )
+    out["MSE"].backward()
+    text_backbone = model.qwen3vl_with_expert.backbone.model.language_model
+    assert any(p.grad is not None for p in text_backbone.parameters()), (
+        "unfrozen text backbone must receive gradients via the (non-detached) cached KV"
+    )

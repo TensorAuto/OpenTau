@@ -79,8 +79,6 @@ class Cosmos3Config(PreTrainedConfig):
         gradient_checkpointing: Checkpoint the expert decoder layers to trade
             compute for activation memory. Defaults to False.
         dropout: Dropout probability inside the expert. Defaults to 0.1.
-        use_deepstack: Inject Qwen3-VL deepstack vision features into the prefix
-            (fidelity to Cosmos-Reason2). Defaults to True.
         expert_hidden_size: Action-expert hidden width. Defaults to 1024.
         expert_intermediate_size: Action-expert SwiGLU MLP width. Defaults to 2048.
         expert_num_hidden_layers: Action-expert depth. MUST equal the backbone text
@@ -136,7 +134,6 @@ class Cosmos3Config(PreTrainedConfig):
     train_expert_only: bool = True
     gradient_checkpointing: bool = False
     dropout: float = 0.1
-    use_deepstack: bool = True
 
     # --- Action-expert sizing (see module docstring for the hard constraints) ---
     expert_hidden_size: int = 1024

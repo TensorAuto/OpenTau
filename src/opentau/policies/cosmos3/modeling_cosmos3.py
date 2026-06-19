@@ -102,6 +102,18 @@ def make_att_2d_masks(
     return att_2d
 
 
+def _first_tensor(batch: dict) -> Tensor:
+    """Return the first ``torch.Tensor`` value in ``batch`` for device/batch-size inference.
+
+    Skips non-tensor entries such as the ``prompt`` string list, which would raise on
+    ``.device`` / ``.shape`` if ``next(iter(batch.values()))`` happened to hit it first.
+    """
+    for value in batch.values():
+        if isinstance(value, Tensor):
+            return value
+    raise ValueError("batch contains no tensor values to infer device / batch size from")
+
+
 class Cosmos3FlowMatching(nn.Module):
     """Flow-matching head: frozen Qwen3-VL prefix + trainable Qwen3 action expert."""
 
@@ -437,7 +449,7 @@ class Cosmos3Policy(PreTrainedPolicy):
     def prepare_state(self, batch: dict[str, Tensor]) -> Tensor:
         """Return the proprioceptive state padded to ``max_state_dim`` (zeros if absent)."""
         if "state" not in batch:
-            ref = next(iter(batch.values()))
+            ref = _first_tensor(batch)
             return torch.zeros(
                 ref.shape[0], self.config.max_state_dim, device=ref.device, dtype=torch.float32
             )
@@ -479,7 +491,14 @@ class Cosmos3Policy(PreTrainedPolicy):
                 img = (img.clamp(0, 1) * 255).round().to(torch.uint8)
                 sample_imgs.append(rearrange(img, "c h w -> h w c").cpu().numpy())
                 content.append({"type": "image"})
-            content.append({"type": "text", "text": prompts[b]})
+            # Bound the language prompt to prompt_max_length tokens. We truncate the text
+            # alone (not the assembled multimodal sequence) so image placeholder tokens are
+            # never clipped.
+            prompt = prompts[b]
+            tokenizer = self.processor.tokenizer
+            prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)[: self.config.prompt_max_length]
+            prompt = tokenizer.decode(prompt_ids)
+            content.append({"type": "text", "text": prompt})
             messages = [{"role": "user", "content": content}]
             texts.append(
                 self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
@@ -531,7 +550,7 @@ class Cosmos3Policy(PreTrainedPolicy):
                 delay = min(len(prefix_actions), self.config.max_delay)
                 prefix_actions = prefix_actions[-delay:]
                 action_prefix = torch.stack(prefix_actions, dim=1)
-            ref = next(iter(batch.values()))
+            ref = _first_tensor(batch)
             delay = torch.tensor(delay, dtype=torch.long, device=ref.device)
             actions = self.sample_actions(batch, noise=noise, action_prefix=action_prefix, delay=delay)
             actions = rearrange(actions, "b c d -> c b d")
