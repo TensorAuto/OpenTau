@@ -119,6 +119,86 @@ cosmos3
 - Config selector: ``--policy.type=cosmos3``.
 - Disclaimer: the reasoner *backbone* is published (private ``TensorAuto/cosmos3-reason-32b``), but no full cosmos3 *policy* checkpoint exists yet — the action expert is randomly initialized on top of the frozen reasoner and produced by training.
 
+The training-time tensor flow, from the raw batch through the frozen reasoner
+prefix and the trainable action expert to the flow-matching velocity head
+(shapes shown at config defaults: ``chunk_size=50``, ``max_action_dim=32``,
+``expert_hidden_size=1024``, 64 layers, 8 KV heads, ``head_dim=128``;
+``S`` = prefix length, ``B`` = batch):
+
+.. code-block:: text
+
+     raw batch                          normalize_inputs / normalize_targets
+     +--------------------------------------------------------------------+
+     | images   (B, C, H, W)        VISUAL: identity   (per-dataset       |
+     | state    (B, state_dim)      STATE : mean-std     stats, keyed     |
+     | actions  (B, 50, act_dim)    ACTION: mean-std     by dataset_idx)  |
+     | prompt   list[str]                                                 |
+     +--------------------------------------------------------------------+
+                |
+                v   prepare_multimodal_inputs / prepare_state
+     +--------------------------------------------------------------------+
+     | each image -> resize 224x224 -> uint8 ; prompt -> <=256 tokens     |
+     | Qwen3-VL chat template + processor (image tokens interleaved       |
+     | with text):                                                        |
+     |     input_ids (B, S) , attention_mask (B, S)                       |
+     |     pixel_values , image_grid_thw                                  |
+     | state -> pad to max_state_dim=32  ->  (B, 32)                      |
+     +--------------------------------------------------------------------+
+                |
+                v
+     ====== FROZEN Qwen3-VL-32B reasoner : prefix forward (no_grad) =======
+     +--------------------------------------------------------------------+
+     | get_rope_index -> MRoPE positions            (3, B, S)             |
+     | run_prefix = stock Qwen3VLModel.forward:                           |
+     |   vision tower -> image embeds scattered into the token            |
+     |   sequence, deepstack, MRoPE, QK-norm, native causal mask          |
+     | => per-layer KV cache: 64 x (K, V), each (B, 8, S, 128) --+        |
+     +--------------------------------------------------------------------+
+                |  (detached; backbone never reads the expert)   | cached_kv
+                v                                                |
+     ------------ flow-matching interpolation (suffix targets) ------------
+     +--------------------------------------------------------------------+
+     | noise ~ N(0,1)                      (B, 50, 32)                    |
+     | time  ~ Beta(1.5,1.0)*0.999+0.001 in [0.001,1]  (B,) -> (B,50)     |
+     |    (real-time-inference `delay` can pin the first `delay`          |
+     |     chunk steps to t=0; max_delay defaults to 0 = none pinned)     |
+     | x_t = t*noise + (1-t)*actions       (B, 50, 32)  expert input      |
+     | u_t = noise - actions               (B, 50, 32)  MSE target        |
+     +--------------------------------------------------------------------+
+                |
+                v   embed_suffix
+     +--------------------------------------------------------------------+
+     | action_in_proj(x_t)        (B, 50, 1024)                           |
+     | state_proj(state)          (B,  1, 1024)  <- prepended token       |
+     | embs = [state ; actions]   (B, 51, 1024)                           |
+     | time -> sinusoid -> MLP -> adarms_proj -> adarms_cond (B,51,256)   |
+     |    (state-token slot uses fixed t=1.0; 50 action slots use t)      |
+     +--------------------------------------------------------------------+
+                |
+                v
+     ============= TRAINABLE Qwen3 action expert  (64 layers) =============
+     +--------------------------------------------------------------------+
+     | for each layer i = 0..63:                                          |
+     |   AdaRMS(hidden, adarms_cond) -> q/k/v, QK-norm, MRoPE             |
+     |   K,V = concat( cached_kv[i] , expert K,V )  <- reasoner cache     |
+     |           (B,8,S,128)        (B,8,51,128)                          |
+     |   attn: expert queries over [prefix ; suffix] -> gated resid.      |
+     |   AdaRMS -> SwiGLU MLP -> gated residual                           |
+     | final AdaRMS norm                            (B, 51, 1024)         |
+     +--------------------------------------------------------------------+
+                |
+                v   drop state token -> last 50 ; action_out_proj  [HEAD]
+     +--------------------------------------------------------------------+
+     | v_t = action_out_proj(out[:, -50:])    (B, 50, 32)  velocity       |
+     +--------------------------------------------------------------------+
+                |
+                v
+          flow_matching_masked_mse(v_t, u_t)  ->  MSE loss   (CE = 0)
+
+     Inference swaps the interpolation block for Euler integration:
+     x_t = noise at t=1, run the expert num_steps (10) times,
+     x_t += dt*v_t, then unnormalize -> executed action chunk.
+
 
 value
 -----
