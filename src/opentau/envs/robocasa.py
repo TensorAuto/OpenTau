@@ -357,6 +357,36 @@ def _resolve_tasks(task: str) -> tuple[list[str], str | None]:
     return names, None
 
 
+def _official_task_horizon(task: str) -> int | None:
+    r"""RoboCasa's official per-task horizon (max env steps), read from the dataset
+    registry -- e.g. ``OpenCabinet``=1050, ``CloseFridge``=900, ``TurnOnMicrowave``=450.
+
+    Used as the default episode length so each task is evaluated for its intended
+    duration instead of a single global cap. Returns ``None`` if the task is absent
+    from the registry (the caller then falls back to the 1000-step default). The
+    robocasa import is deferred to here, mirroring ``_resolve_tasks``.
+    """
+    try:
+        _import_robocasa_with_version_shim()
+        from robocasa.utils.dataset_registry import (
+            ATOMIC_TASK_DATASETS,
+            COMPOSITE_TASK_DATASETS,
+        )
+    except Exception as err:
+        # Surface the degradation: without this, a renamed key / moved module in the
+        # registry would silently revert *every* task to the 1000-step cap, invisibly.
+        acc_print(
+            f"[opentau] could not read RoboCasa per-task horizon for '{task}' "
+            f"({type(err).__name__}: {err}); falling back to the 1000-step default."
+        )
+        return None
+    for registry in (ATOMIC_TASK_DATASETS, COMPOSITE_TASK_DATASETS):
+        entry = registry.get(task)
+        if isinstance(entry, dict) and entry.get("horizon") is not None:
+            return int(entry["horizon"])
+    return None
+
+
 # RoboCasa ships its assets as separately-downloaded packs. Every kitchen scene needs the
 # base textures (plain + AI-generated wall/floor textures) and lightwheel fixtures; object
 # meshes depend on which registries the env samples from (``obj_registries``). Keys below
@@ -835,6 +865,13 @@ def create_robocasa_envs(
 
     out: dict[str, dict[int, Any]] = defaultdict(dict)
     for task_name in task_names:
+        # With no explicit episode_length, default to RoboCasa's official per-task
+        # horizon from the dataset registry (e.g. OpenCabinet=1050, TurnOnMicrowave=450)
+        # so each task runs for its intended length rather than one global cap.
+        # None -> RoboCasaEnv's 1000-step fallback.
+        task_episode_length = (
+            episode_length if episode_length is not None else _official_task_horizon(task_name)
+        )
         fns = _make_env_fns(
             task=task_name,
             n_envs=n_envs,
@@ -846,11 +883,14 @@ def create_robocasa_envs(
             visualization_width=visualization_width,
             visualization_height=visualization_height,
             split=split,
-            episode_length=episode_length,
+            episode_length=task_episode_length,
             obj_registries=obj_registries,
         )
         out[task_name][0] = env_cls(fns)
-        acc_print(f"Built vec env | task={task_name} | n_envs={n_envs}")
+        acc_print(
+            f"Built vec env | task={task_name} | n_envs={n_envs} | "
+            f"horizon={task_episode_length if task_episode_length is not None else 1000}"
+        )
 
     # return plain dicts for predictability
     return {name: dict(task_map) for name, task_map in out.items()}
