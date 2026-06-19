@@ -341,7 +341,7 @@ class TestPI05Integration:
             )
             args1 = tuple(args1)
             result = original_embed_prefix(*args1, **kwargs)
-            prefix_embs, prefix_pad_masks, prefix_att_masks = result
+            prefix_embs, prefix_pad_masks, prefix_att_masks, prefix_segment_ids = result
             captured_variables["prefix_pad_masks"] = prefix_pad_masks.clone()
             return result
 
@@ -497,7 +497,7 @@ class TestPI05Integration:
 
         def capture_embed_prefix_select_action(*args, **kwargs):
             result = original_embed_prefix_select_action(*args, **kwargs)
-            prefix_embs, prefix_pad_masks, prefix_att_masks = result
+            prefix_embs, prefix_pad_masks, prefix_att_masks, prefix_segment_ids = result
             captured_variables_select_action["prefix_pad_masks"] = prefix_pad_masks.clone()
             return result
 
@@ -743,3 +743,154 @@ class TestPI05ExecutionHorizon:
         )
         pad_masks, att_masks = out[1], out[2]
         assert pad_masks.shape[1] == att_masks.shape[1] == cfg.chunk_size
+
+
+class TestPI05ModalityEmbedding:
+    """CPU coverage for the hybrid modality scheme:
+
+    - ``config.use_modality_embedding``: a learnable, modality-indexed embedding
+      added on top of the VLM-prefix token embeddings (layered over RoPE).
+      Zero-initialized, so enabling it on an existing checkpoint is a no-op at
+      step 0 and the per-modality signal is learned from there.
+    - ``config.action_expert_position_gap``: the action expert is instead
+      separated from the prefix by a fixed RoPE position-id gap (no learned
+      embedding for the action modality).
+    """
+
+    HIDDEN = 4
+
+    def _make_prefix_fm(self, *, use_modality_embedding, monkeypatch):
+        """Partial PI05FlowMatching exposing only what ``embed_prefix`` reads on
+        the vision+language path (discrete state, no response, no discrete
+        actions) — no PaliGemma init."""
+        import types
+
+        import torch.nn as nn
+
+        from opentau.policies.pi05.modeling_pi05 import PI05FlowMatching
+
+        mod = "opentau.policies.pi05.modeling_pi05"
+        monkeypatch.setattr(f"{mod}._preferred_dtype", lambda: torch.float32)
+
+        hidden = self.HIDDEN
+        fm = object.__new__(PI05FlowMatching)
+        nn.Module.__init__(fm)
+
+        class _FakePaligemma:
+            def embed_image(self, img):
+                b = img.shape[0]
+                return rearrange(
+                    torch.arange(b * 2 * hidden, dtype=torch.float32), "(b s d) -> b s d", b=b, s=2, d=hidden
+                )
+
+            def embed_language_tokens(self, tokens):
+                return torch.full((*tokens.shape, hidden), 0.5, dtype=torch.float32)
+
+        fm.paligemma_with_expert = _FakePaligemma()
+        fm.config = types.SimpleNamespace(
+            state_type="discrete",
+            predict_response=False,
+            use_modality_embedding=use_modality_embedding,
+        )
+        if use_modality_embedding:
+            fm.modality_embedding = nn.Embedding(fm._NUM_PREFIX_MODALITIES, hidden)
+            nn.init.zeros_(fm.modality_embedding.weight)
+        return fm
+
+    def _prefix_inputs(self, bsize=2, lang_len=3):
+        images = [torch.zeros(bsize, 3, 4, 4)]
+        img_masks = [torch.ones(bsize, dtype=torch.bool)]
+        lang_tokens = torch.zeros(bsize, lang_len, dtype=torch.long)
+        lang_masks = torch.ones(bsize, lang_len, dtype=torch.bool)
+        return images, img_masks, lang_tokens, lang_masks
+
+    def test_embed_prefix_returns_segment_ids(self, monkeypatch):
+        """``embed_prefix`` returns a 4-tuple whose ``segment_ids`` mark each
+        token's modality (vision then language), shape-aligned with pad_masks."""
+        from opentau.policies.pi05.modeling_pi05 import PI05FlowMatching
+
+        fm = self._make_prefix_fm(use_modality_embedding=False, monkeypatch=monkeypatch)
+        embs, pad_masks, att_masks, segment_ids = PI05FlowMatching.embed_prefix(fm, *self._prefix_inputs())
+
+        assert segment_ids.shape == pad_masks.shape
+        # 2 image tokens (vision), then 3 language tokens (language).
+        expected = [fm._MODALITY_VISION] * 2 + [fm._MODALITY_LANGUAGE] * 3
+        for row in segment_ids.tolist():
+            assert row == expected
+
+    def test_zero_init_modality_embedding_is_noop(self, monkeypatch):
+        """Enabling the feature with the default zero-init table must not change
+        the embeddings vs. the feature being off."""
+        from opentau.policies.pi05.modeling_pi05 import PI05FlowMatching
+
+        inputs = self._prefix_inputs()
+        off = self._make_prefix_fm(use_modality_embedding=False, monkeypatch=monkeypatch)
+        on = self._make_prefix_fm(use_modality_embedding=True, monkeypatch=monkeypatch)
+
+        embs_off = PI05FlowMatching.embed_prefix(off, *inputs)[0]
+        embs_on = PI05FlowMatching.embed_prefix(on, *inputs)[0]
+        assert torch.equal(embs_off, embs_on)
+
+    def test_modality_embedding_shifts_each_modality(self, monkeypatch):
+        """With non-zero weights, each token is shifted by exactly its own
+        modality vector on top of the original embedding."""
+        from opentau.policies.pi05.modeling_pi05 import PI05FlowMatching
+
+        inputs = self._prefix_inputs()
+        off = self._make_prefix_fm(use_modality_embedding=False, monkeypatch=monkeypatch)
+        on = self._make_prefix_fm(use_modality_embedding=True, monkeypatch=monkeypatch)
+
+        # Distinct, recognizable vector per modality.
+        with torch.no_grad():
+            for slot in range(on._NUM_PREFIX_MODALITIES):
+                on.modality_embedding.weight[slot] = float(slot + 1)
+
+        embs_off = PI05FlowMatching.embed_prefix(off, *inputs)[0]
+        embs_on, _, _, segment_ids = PI05FlowMatching.embed_prefix(on, *inputs)
+        delta = embs_on - embs_off
+        expected_delta = on.modality_embedding(segment_ids)
+        assert torch.allclose(delta, expected_delta)
+        # Sanity: vision tokens shifted by 1.0, language tokens by 2.0.
+        assert torch.allclose(delta[:, :2], torch.ones_like(delta[:, :2]) * 1.0)
+        assert torch.allclose(delta[:, 2:], torch.ones_like(delta[:, 2:]) * 2.0)
+
+    def _make_position_fm(self, gap):
+        import types
+
+        import torch.nn as nn
+
+        from opentau.policies.pi05.modeling_pi05 import PI05FlowMatching
+
+        fm = object.__new__(PI05FlowMatching)
+        nn.Module.__init__(fm)
+        fm.config = types.SimpleNamespace(action_expert_position_gap=gap)
+        return fm
+
+    def test_action_expert_gap_disabled_is_contiguous(self):
+        """gap=0: action-expert positions continue contiguously after the
+        prefix (``prefix_offset + cumsum(pad) - 1``), unchanged from baseline."""
+        from opentau.policies.pi05.modeling_pi05 import PI05FlowMatching
+
+        fm = self._make_position_fm(gap=0)
+        prefix_offsets = torch.tensor([[10], [7]])
+        suffix_pad_masks = torch.ones(2, 4, dtype=torch.long)
+        pos = PI05FlowMatching._action_expert_position_ids(fm, prefix_offsets, suffix_pad_masks)
+        assert torch.equal(pos, torch.tensor([[10, 11, 12, 13], [7, 8, 9, 10]]))
+
+    def test_action_expert_gap_shifts_positions(self):
+        """gap>0: every action-expert position is pushed forward by exactly the
+        gap, while per-token spacing inside the chunk stays 1."""
+        from opentau.policies.pi05.modeling_pi05 import PI05FlowMatching
+
+        gap = 100
+        fm = self._make_position_fm(gap=gap)
+        prefix_offsets = torch.tensor([[10], [7]])
+        suffix_pad_masks = torch.ones(2, 4, dtype=torch.long)
+
+        baseline = PI05FlowMatching._action_expert_position_ids(
+            self._make_position_fm(gap=0), prefix_offsets, suffix_pad_masks
+        )
+        shifted = PI05FlowMatching._action_expert_position_ids(fm, prefix_offsets, suffix_pad_masks)
+        assert torch.equal(shifted - baseline, torch.full_like(baseline, gap))
+        # Spacing inside the chunk is unchanged (still increments of 1).
+        assert torch.equal(shifted.diff(dim=1), torch.ones(2, 3, dtype=shifted.dtype))
