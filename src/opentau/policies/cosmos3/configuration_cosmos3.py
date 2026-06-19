@@ -67,8 +67,11 @@ class Cosmos3Config(PreTrainedConfig):
             backbone weights -- the Cosmos3-Super reasoning tower extracted into a
             standalone Qwen3-VL-32B checkpoint by
             ``opentau.scripts.extract_cosmos3_reasoner`` (run once on the ungated
-            ``nvidia/Cosmos3-Super``). Defaults to ``TensorAuto/cosmos3-reason-32b``;
-            point it at your local extracted directory until that is published.
+            ``nvidia/Cosmos3-Super``). Defaults to ``TensorAuto/cosmos3-reason-32b``,
+            the published extraction (**private** -- the training environment needs an
+            HF token with read access to the TensorAuto org; ``from_pretrained`` picks
+            up the ambient ``HF_TOKEN`` / ``~/.cache/huggingface/token``). Re-run the
+            extraction script if you need to reproduce or re-host it.
         load_pretrained_backbone: Whether to download/load the backbone weights on
             construction. Set ``False`` for CPU tests / tiny random configs.
         image_resize: Square side length (pixels) to resize every camera image to
