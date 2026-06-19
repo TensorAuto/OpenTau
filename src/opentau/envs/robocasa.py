@@ -506,8 +506,12 @@ class RoboCasaEnv(gym.Env):
             split: RoboCasa dataset split (``None``/``"all"``/``"pretrain"``/``"target"``).
             episode_length: Max steps per episode (``_max_episode_steps``); defaults to 1000.
             obj_registries: Object-mesh registries to sample assets from.
-            episode_index: Per-worker index (``0..n_envs-1``) used to spread the
-                ``reset`` seed so each sub-env explores a distinct layout.
+            episode_index: Per-worker index (``0..n_envs-1``) used as the
+                ``reset`` seed *only when reset is called unseeded*, so the
+                workers still explore distinct layouts. When ``reset`` is given an
+                explicit seed (the eval path) that seed is used verbatim and this
+                index is ignored — the vector env already made the seed
+                per-worker-distinct.
             camera_name_mapping: Optional mapping from raw camera names to
                 positional ``camera{i}`` keys; defaults to first→``camera0``, etc.
         """
@@ -654,14 +658,23 @@ class RoboCasaEnv(gym.Env):
         return self._env.render()
 
     def reset(self, seed=None, **kwargs) -> tuple[dict[str, Any], dict[str, Any]]:
-        r"""Reset the environment, deriving a per-worker seed from ``episode_index``."""
+        r"""Reset the environment.
+
+        Spreading the seed across the ``n_envs`` workers is the *caller's* job, not
+        this method's: gymnasium's ``SyncVectorEnv`` / ``AsyncVectorEnv`` already
+        hand each sub-env a distinct seed (``seed[i]`` for a list, ``seed + i`` for
+        an int), and the eval harness builds an explicit per-worker range (see
+        ``scripts/eval.py``). So an explicit ``seed`` is forwarded verbatim — adding
+        ``episode_index`` on top would *double*-shift an already-distinct seed and
+        make scene seeds collide across rollout batches (e.g. with ``n_envs=4`` the
+        spacing-of-2 makes batch 0 / slot 2 reuse batch 1 / slot 0), so an eval
+        samples fewer distinct scenes than ``n_episodes``. Only the *unseeded* path
+        falls back to ``episode_index`` so the workers still roll distinct scenes.
+        """
         self._ensure_env()
         assert self._env is not None
         super().reset(seed=seed)
-        # Spread the seed across workers so n_envs factories don't all roll the
-        # same scene: shift an explicit seed by episode_index; with no seed fall
-        # back to episode_index so each worker is still distinct.
-        worker_seed = seed + self.episode_index if seed is not None else self.episode_index
+        worker_seed = seed if seed is not None else self.episode_index
         raw_obs, _ = self._env.reset(seed=worker_seed)
 
         ep_meta = self._env.env.get_ep_meta()
@@ -726,8 +739,9 @@ def _make_env_fns(
 ) -> list[Callable[[], RoboCasaEnv]]:
     """Build ``n_envs`` factory callables for a single task.
 
-    Each factory carries a distinct ``episode_index`` (``0..n_envs-1``) so
-    ``RoboCasaEnv.reset()`` derives a per-worker seed from the rollout seed.
+    Each factory carries a distinct ``episode_index`` (``0..n_envs-1``) that
+    ``RoboCasaEnv.reset()`` uses as the seed only on an unseeded reset; under the
+    eval harness the per-worker seed comes from the explicit rollout seed range.
     """
 
     def _make_env(episode_index: int) -> RoboCasaEnv:

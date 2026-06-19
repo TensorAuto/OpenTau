@@ -24,6 +24,8 @@ from opentau.configs.default import EvalConfig
 from opentau.envs.configs import RoboCasaEnv
 from opentau.scripts.eval import (
     _cleanup_episode_clips,
+    _rank_seed_offset,
+    _resolve_eval_seed,
     collect_grid_summary_videos,
     create_grid_summary_video,
     eval_policy_all,
@@ -244,3 +246,70 @@ def test_eval_config_rejects_out_of_range_video_params():
         EvalConfig(video_frame_stride=0)
     with pytest.raises(ValueError, match="video_preset"):
         EvalConfig(video_preset="turbo")
+
+
+class TestRankSeedOffset:
+    """`_rank_seed_offset` controls whether ranks evaluate the same or distinct scenes."""
+
+    def test_default_is_zero_so_all_ranks_seed_identically(self):
+        # decorrelate=False -> every rank gets offset 0, regardless of rank index,
+        # so the eval is reproducible across world sizes / node counts.
+        for r in range(16):
+            assert _rank_seed_offset(process_index=r, decorrelate=False, per_rank_span=12) == 0
+
+    def test_decorrelated_blocks_tile_without_gap_or_overlap(self):
+        # Each rank's seed block is [r*span, (r+1)*span); since stride == span the
+        # blocks partition [0, W*span) exactly — no collision, no wasted seeds,
+        # and no magic constant.
+        n_batches, num_envs, world_size = 3, 4, 5
+        span = n_batches * num_envs
+        blocks = [
+            set(
+                range(
+                    _rank_seed_offset(process_index=r, decorrelate=True, per_rank_span=span),
+                    _rank_seed_offset(process_index=r, decorrelate=True, per_rank_span=span) + span,
+                )
+            )
+            for r in range(world_size)
+        ]
+        union = set().union(*blocks)
+        assert len(union) == world_size * span  # pairwise disjoint (no overlap)
+        assert union == set(range(world_size * span))  # contiguous (no gap)
+
+    def test_offset_is_collision_free_even_beyond_10000_episodes(self):
+        # The old `* 10000` stride aliased once a rank exceeded 10000 episodes;
+        # the span-based stride never does, because the stride IS the span.
+        span = 12000  # a rank running >10000 episodes
+        assert _rank_seed_offset(process_index=0, decorrelate=True, per_rank_span=span) == 0
+        assert _rank_seed_offset(process_index=1, decorrelate=True, per_rank_span=span) == span
+        # rank 0's last seed (span-1) is strictly below rank 1's first seed (span).
+        assert span - 1 < _rank_seed_offset(process_index=1, decorrelate=True, per_rank_span=span)
+
+
+class TestResolveEvalSeed:
+    """`eval.seed` overrides the top-level `cfg.seed` for env scene seeding only."""
+
+    @staticmethod
+    def _cfg(*, top_seed, eval_seed):
+        cfg = Mock()
+        cfg.seed = top_seed
+        cfg.eval.seed = eval_seed
+        return cfg
+
+    def test_falls_back_to_top_level_seed_when_eval_seed_is_none(self):
+        assert _resolve_eval_seed(self._cfg(top_seed=1000, eval_seed=None)) == 1000
+
+    def test_eval_seed_takes_precedence_when_set(self):
+        assert _resolve_eval_seed(self._cfg(top_seed=1000, eval_seed=7)) == 7
+
+    def test_eval_seed_zero_is_an_explicit_seed_not_unset(self):
+        # 0 is a valid seed and must take precedence — not be treated as falsy/unset.
+        assert _resolve_eval_seed(self._cfg(top_seed=1000, eval_seed=0)) == 0
+
+    def test_returns_none_only_when_both_are_none(self):
+        assert _resolve_eval_seed(self._cfg(top_seed=None, eval_seed=None)) is None
+
+    def test_eval_config_default_seed_is_none(self):
+        # The field exists and defaults to None (fall back to cfg.seed).
+        assert EvalConfig().seed is None
+        assert EvalConfig(seed=42).seed == 42

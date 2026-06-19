@@ -586,6 +586,15 @@ class EvalConfig:
             never uploaded to wandb). Defaults to False.
         recording_root: Root directory for saving evaluation recordings.
             Defaults to None.
+        seed: Master seed for the eval simulations (env scene generation). When
+            set, takes precedence over the top-level `cfg.seed` for seeding the
+            eval environments; when None (default), falls back to `cfg.seed`.
+            Does not affect the global `set_seed`. Defaults to None.
+        decorrelate_rank_seeds: If True, each accelerator rank evaluates a
+            distinct, orthogonal slice of scenes (for tasks deliberately
+            replicated across ranks to gain coverage). If False (default), all
+            ranks seed identically, so the eval is reproducible across world
+            sizes. Defaults to False.
 
     Raises:
         ValueError: If `batch_size` is greater than `n_episodes`, or if any of
@@ -620,6 +629,28 @@ class EvalConfig:
     keep_per_episode_videos: bool = False
 
     recording_root: str | None = None
+
+    # Master seed for the evaluation *simulations* (env scene generation). When
+    # set, it takes precedence over the top-level `cfg.seed` for seeding the eval
+    # environments, so the eval scene set can be pinned independently of the
+    # training/global seed (e.g. hold the eval scenes fixed while sweeping the
+    # training seed, or vary the eval scenes without disturbing model init /
+    # dataset shuffling). When None (default), the eval falls back to the
+    # top-level `cfg.seed`. Resolved by `scripts/eval.py::_resolve_eval_seed`;
+    # only affects the env/scene seeding, NOT the global `set_seed`.
+    seed: int | None = None
+
+    # Whether each accelerator rank should evaluate a *different* set of scenes.
+    # Default False: every rank seeds its environments identically, so the scene a
+    # given (task, episode) maps to does not depend on the world size / node count
+    # — the eval is reproducible whether it runs on 1 GPU or 16, and two ranks that
+    # happen to share a task evaluate the same scenes. Set True only when you have
+    # deliberately replicated a task across ranks (listed it N x to fill N ranks via
+    # the round-robin sharding) to get N x *distinct* scenes instead of redundant
+    # copies; each rank then gets an orthogonal, non-overlapping slice of the seed
+    # line. Trades world-size reproducibility for extra per-task coverage. Plumbed
+    # by `scripts/eval.py::eval_policy` via `_rank_seed_offset`.
+    decorrelate_rank_seeds: bool = False
 
     # Which training-time norm head to use when calling `policy.select_action`
     # on eval observations. Either:
