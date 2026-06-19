@@ -329,6 +329,9 @@ class RoboCasaEnv(EnvConfig):
             auto-expands to the upstream task list and auto-sets ``split``.
         fps: RoboCasa control frequency (Hz); also the ``render_fps`` for videos.
         episode_length: Maximum steps per episode (``_max_episode_steps``).
+            Defaults to 1000; set to ``null`` (None) to use RoboCasa's official
+            per-task horizon from the dataset registry (e.g. OpenCabinet=1050,
+            TurnOnMicrowave=450) instead of a single global cap.
         obs_type: ``"pixels"`` or ``"pixels_agent_pos"``.
         render_mode: Rendering mode for the environment.
         camera_name: Comma-separated raw RoboCasa camera names to render. The
@@ -356,7 +359,7 @@ class RoboCasaEnv(EnvConfig):
 
     task: str = "CloseFridge"
     fps: int = 20
-    episode_length: int = 1000
+    episode_length: int | None = 1000
     obs_type: str = "pixels_agent_pos"
     render_mode: str = "rgb_array"
     camera_name: str = "robot0_agentview_left,robot0_eye_in_hand,robot0_agentview_right"
