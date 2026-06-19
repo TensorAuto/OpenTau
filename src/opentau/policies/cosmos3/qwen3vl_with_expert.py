@@ -30,8 +30,8 @@ That structure lets cosmos3 run the **entire stock** ``Qwen3VLModel.forward`` as
 black box for the prefix (``Qwen3VLWithExpertModel.run_prefix``). Stock transformers
 handles vision encoding, image-token scatter, deepstack injection, the 3-D
 multimodal RoPE (MRoPE), QK-norm and the native causal mask — so the frozen
-Cosmos-Reason2 reasoner behaves exactly as trained, with zero reimplementation of
-the 32B backbone. Only the small (<1B) action expert is hand-written here.
+Cosmos3-Super reasoning tower behaves exactly as trained, with zero reimplementation
+of the 32B backbone. Only the small (<1B) action expert is hand-written here.
 
 Hard cross-attention constraints (validated at build time)
 ----------------------------------------------------------

@@ -15,9 +15,10 @@
 """Configuration for the cosmos3 policy.
 
 cosmos3 is the π0.5 flow-matching recipe with the PaliGemma backbone swapped for
-a **frozen Qwen3-VL-32B** vision-language model (loaded from
-``nvidia/Cosmos-Reason2-32B``) and a custom **sub-1B Qwen3-style action expert**.
-Continuous actions only -- there is no FAST discrete-action branch and no
+a **frozen Qwen3-VL-32B** vision-language model -- the **reasoning tower of NVIDIA
+Cosmos3-Super**, extracted into a standalone Qwen3-VL-32B checkpoint by
+``opentau.scripts.extract_cosmos3_reasoner`` -- and a custom **sub-1B Qwen3-style
+action expert**. Continuous actions only -- there is no FAST discrete-action branch and no
 response/subtask head, so the discrete/response fields of ``PI05Config`` are
 intentionally absent here.
 
@@ -63,9 +64,11 @@ class Cosmos3Config(PreTrainedConfig):
         num_steps: Number of flow-matching Euler denoising steps. Defaults to 10.
         max_delay: Maximum number of frozen action-prefix steps (real-time inference).
         pretrained_backbone_repo_id: HF repo id (or local path) for the Qwen3-VL
-            backbone weights. Defaults to ``nvidia/Cosmos-Reason2-32B`` (the
-            Cosmos 3 reasoner, a Qwen3-VL-32B fine-tune that loads with stock
-            ``transformers.Qwen3VLForConditionalGeneration``).
+            backbone weights -- the Cosmos3-Super reasoning tower extracted into a
+            standalone Qwen3-VL-32B checkpoint by
+            ``opentau.scripts.extract_cosmos3_reasoner`` (run once on the ungated
+            ``nvidia/Cosmos3-Super``). Defaults to ``TensorAuto/cosmos3-reason-32b``;
+            point it at your local extracted directory until that is published.
         load_pretrained_backbone: Whether to download/load the backbone weights on
             construction. Set ``False`` for CPU tests / tiny random configs.
         image_resize: Square side length (pixels) to resize every camera image to
@@ -125,8 +128,8 @@ class Cosmos3Config(PreTrainedConfig):
     num_steps: int = 10
     max_delay: int = 0
 
-    # --- Backbone (Qwen3-VL-32B via Cosmos-Reason2-32B) ---
-    pretrained_backbone_repo_id: str = "nvidia/Cosmos-Reason2-32B"
+    # --- Backbone (Qwen3-VL-32B reasoning tower extracted from NVIDIA Cosmos3-Super) ---
+    pretrained_backbone_repo_id: str = "TensorAuto/cosmos3-reason-32b"
     load_pretrained_backbone: bool = True
     image_resize: int = 224
     attention_implementation: str = "sdpa"

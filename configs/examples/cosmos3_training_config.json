@@ -30,7 +30,7 @@
         "proj_width": 1024,
         "num_steps": 10,
         "attention_implementation": "sdpa",
-        "pretrained_backbone_repo_id": "nvidia/Cosmos-Reason2-32B",
+        "pretrained_backbone_repo_id": "TensorAuto/cosmos3-reason-32b",
         "load_pretrained_backbone": true,
         "image_resize": 224,
         "freeze_vision_encoder": true,

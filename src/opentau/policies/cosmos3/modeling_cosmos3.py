@@ -17,9 +17,10 @@
 """cosmos3: a Vision-Language-Action flow-matching policy on a frozen Qwen3-VL-32B reasoner.
 
 cosmos3 follows the π0.5 flow-matching recipe (see ``policies/pi05/modeling_pi05.py``)
-but swaps the PaliGemma backbone for a **frozen Qwen3-VL-32B** vision-language model
-loaded with NVIDIA ``Cosmos-Reason2-32B`` weights, and pairs it with a custom sub-1B
-Qwen3-style action expert (``qwen3vl_with_expert.py``).
+but swaps the PaliGemma backbone for a **frozen Qwen3-VL-32B** vision-language model --
+the **reasoning tower of NVIDIA Cosmos3-Super** (extracted to a standalone Qwen3-VL-32B
+checkpoint by ``opentau.scripts.extract_cosmos3_reasoner``) -- and pairs it with a custom
+sub-1B Qwen3-style action expert (``qwen3vl_with_expert.py``).
 
 Pipeline:
   * The frozen reasoner encodes the camera images + language prompt once (the prefix)
