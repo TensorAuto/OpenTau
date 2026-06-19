@@ -372,7 +372,13 @@ def _official_task_horizon(task: str) -> int | None:
             ATOMIC_TASK_DATASETS,
             COMPOSITE_TASK_DATASETS,
         )
-    except Exception:
+    except Exception as err:
+        # Surface the degradation: without this, a renamed key / moved module in the
+        # registry would silently revert *every* task to the 1000-step cap, invisibly.
+        acc_print(
+            f"[opentau] could not read RoboCasa per-task horizon for '{task}' "
+            f"({type(err).__name__}: {err}); falling back to the 1000-step default."
+        )
         return None
     for registry in (ATOMIC_TASK_DATASETS, COMPOSITE_TASK_DATASETS):
         entry = registry.get(task)

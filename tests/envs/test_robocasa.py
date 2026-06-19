@@ -23,6 +23,7 @@ action/camera helpers are all exercisable without a GPU or the sim installed.
 Real sim rollouts are validated separately on a CUDA box.
 """
 
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -47,6 +48,7 @@ from opentau.envs.robocasa import (
     _internal_robocasa_pkg_dir,
     _maybe_relink_robocasa_assets,
     _needed_asset_packs,
+    _official_task_horizon,
     _parse_camera_names,
     _resolve_robocasa_assets_root,
     _resolve_tasks,
@@ -192,6 +194,67 @@ class TestPureHelpers:
                 sys.modules["robocasa"] = saved
             else:
                 sys.modules.pop("robocasa", None)
+
+
+@contextlib.contextmanager
+def _fake_dataset_registry(atomic: dict, composite: dict):
+    """Inject a fake ``robocasa.utils.dataset_registry`` for the duration of the
+    block so ``_official_task_horizon`` resolves against it without the real sim.
+
+    The version shim is patched to a no-op (it would otherwise import mujoco/numpy
+    and assert versions); only the registry module is faked, mirroring how the
+    other tests stub ``robocasa`` in ``sys.modules``.
+    """
+    import sys
+    import types
+
+    mod = types.ModuleType("robocasa.utils.dataset_registry")
+    mod.ATOMIC_TASK_DATASETS = atomic
+    mod.COMPOSITE_TASK_DATASETS = composite
+    saved = sys.modules.get("robocasa.utils.dataset_registry")
+    sys.modules["robocasa.utils.dataset_registry"] = mod
+    try:
+        with patch("opentau.envs.robocasa._import_robocasa_with_version_shim"):
+            yield
+    finally:
+        if saved is not None:
+            sys.modules["robocasa.utils.dataset_registry"] = saved
+        else:
+            sys.modules.pop("robocasa.utils.dataset_registry", None)
+
+
+class TestOfficialTaskHorizon:
+    """``_official_task_horizon`` reads per-task horizons from the registry."""
+
+    def test_known_atomic_task_returns_registry_horizon(self):
+        with _fake_dataset_registry({"CloseFridge": {"horizon": 900}}, {}):
+            assert _official_task_horizon("CloseFridge") == 900
+
+    def test_known_composite_task_returns_registry_horizon(self):
+        with _fake_dataset_registry({}, {"ArrangeVegetables": {"horizon": 1200}}):
+            assert _official_task_horizon("ArrangeVegetables") == 1200
+
+    def test_horizon_is_coerced_to_int(self):
+        with _fake_dataset_registry({"CloseFridge": {"horizon": 450.0}}, {}):
+            result = _official_task_horizon("CloseFridge")
+        assert result == 450 and isinstance(result, int)
+
+    def test_unknown_task_returns_none(self):
+        with _fake_dataset_registry({"CloseFridge": {"horizon": 900}}, {}):
+            assert _official_task_horizon("NoSuchTask") is None
+
+    def test_entry_without_horizon_returns_none(self):
+        with _fake_dataset_registry({"WeirdTask": {"name": "x"}}, {}):
+            assert _official_task_horizon("WeirdTask") is None
+
+    def test_import_failure_returns_none(self):
+        # robocasa not installed -> the shim raises -> caught -> None (1000-step
+        # fallback). This is the path the new diagnostic log guards.
+        with patch(
+            "opentau.envs.robocasa._import_robocasa_with_version_shim",
+            side_effect=ImportError("no robocasa"),
+        ):
+            assert _official_task_horizon("CloseFridge") is None
 
 
 class TestRobocasaUnshadow:
@@ -345,6 +408,43 @@ class TestCreateRoboCasaEnvs:
     def test_rejects_non_callable_env_cls(self):
         with pytest.raises(ValueError, match="env_cls must be a callable"):
             create_robocasa_envs(task="A", n_envs=1, env_cls=None)
+
+    def test_episode_length_none_threads_official_horizon_into_env_fns(self):
+        # episode_length=None -> each task's official horizon is resolved and
+        # threaded into _make_env_fns (the per-task duration the eval runs for).
+        env_cls = Mock(return_value=Mock())
+        with (
+            patch("opentau.envs.robocasa.get_proc_accelerator", return_value=None),
+            patch("opentau.envs.robocasa._official_task_horizon", return_value=777) as horizon,
+            patch("opentau.envs.robocasa._make_env_fns", return_value=[lambda: None]) as make_fns,
+        ):
+            create_robocasa_envs(
+                task="CloseFridge",
+                n_envs=1,
+                env_cls=env_cls,
+                episode_length=None,
+                auto_download_assets=False,
+            )
+        horizon.assert_called_once_with("CloseFridge")
+        assert make_fns.call_args.kwargs["episode_length"] == 777
+
+    def test_explicit_episode_length_skips_official_horizon(self):
+        # An explicit int forces one global cap and never consults the registry.
+        env_cls = Mock(return_value=Mock())
+        with (
+            patch("opentau.envs.robocasa.get_proc_accelerator", return_value=None),
+            patch("opentau.envs.robocasa._official_task_horizon") as horizon,
+            patch("opentau.envs.robocasa._make_env_fns", return_value=[lambda: None]) as make_fns,
+        ):
+            create_robocasa_envs(
+                task="CloseFridge",
+                n_envs=1,
+                env_cls=env_cls,
+                episode_length=450,
+                auto_download_assets=False,
+            )
+        horizon.assert_not_called()
+        assert make_fns.call_args.kwargs["episode_length"] == 450
 
 
 class TestMakeEnvsDispatch:
