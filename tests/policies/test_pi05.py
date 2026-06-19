@@ -341,7 +341,7 @@ class TestPI05Integration:
             )
             args1 = tuple(args1)
             result = original_embed_prefix(*args1, **kwargs)
-            prefix_embs, prefix_pad_masks, prefix_att_masks = result
+            prefix_embs, prefix_pad_masks, prefix_att_masks, prefix_segment_ids = result
             captured_variables["prefix_pad_masks"] = prefix_pad_masks.clone()
             return result
 
@@ -497,7 +497,7 @@ class TestPI05Integration:
 
         def capture_embed_prefix_select_action(*args, **kwargs):
             result = original_embed_prefix_select_action(*args, **kwargs)
-            prefix_embs, prefix_pad_masks, prefix_att_masks = result
+            prefix_embs, prefix_pad_masks, prefix_att_masks, prefix_segment_ids = result
             captured_variables_select_action["prefix_pad_masks"] = prefix_pad_masks.clone()
             return result
 
@@ -743,3 +743,196 @@ class TestPI05ExecutionHorizon:
         )
         pad_masks, att_masks = out[1], out[2]
         assert pad_masks.shape[1] == att_masks.shape[1] == cfg.chunk_size
+
+
+class TestPI05ModalityEmbedding:
+    """CPU coverage for the opt-in modality-specific learnable embedding.
+
+    ``embed_prefix`` gained a per-token ``segment_ids`` slot and an additive
+    learnable ``modality_embedding`` table gated on ``use_modality_embedding``.
+    These tests build a ``PI05FlowMatching`` shell with stubbed embedders (no
+    real PaliGemma weights, so they run on CPU) and guard two properties:
+
+      1. **Zero-init no-op** -- enabling ``use_modality_embedding`` on a freshly
+         (zero-)initialized table leaves the prefix embeddings bit-identical to
+         the feature being off, so turning it on for an existing checkpoint is a
+         no-op at step 0.
+      2. **``segment_ids`` length alignment** -- ``segment_ids`` stays the same
+         length as ``embs`` / ``pad_masks`` / ``att_masks`` across every
+         optional-block combination (state / response / discrete actions),
+         guarding the parallel ``segment_ids += [...]`` appends from drifting
+         out of sync with the ``att_masks`` appends if the layout changes later.
+    """
+
+    HIDDEN = 8
+    N_IMG_TOKENS = 3
+    MAX_STATE_DIM = 4
+    MAX_ACTION_DIM = 4
+
+    class _FakePaliGemma(torch.nn.Module):
+        """Deterministic, weight-free stand-in for ``paligemma_with_expert``."""
+
+        def __init__(self, hidden, n_img_tokens):
+            super().__init__()
+            self.hidden = hidden
+            self.n_img_tokens = n_img_tokens
+
+        def embed_image(self, img):
+            b = img.shape[0]
+            grid = torch.arange(self.n_img_tokens * self.hidden, dtype=torch.float32)
+            grid = grid.reshape(1, self.n_img_tokens, self.hidden) * 0.001
+            return grid.expand(b, -1, -1).clone()
+
+        def embed_language_tokens(self, tokens):
+            base = tokens.float().unsqueeze(-1)  # (b, t, 1)
+            return (base + torch.arange(self.hidden, dtype=torch.float32)) * 0.01
+
+        def embed_discrete_actions(self, discrete_actions):
+            base = discrete_actions.float().unsqueeze(-1)  # (b, t, 1)
+            return (base + 1.0 + torch.arange(self.hidden, dtype=torch.float32)) * 0.02
+
+    class _FakeTokenizer:
+        def encode(self, text, add_special_tokens=False):
+            # Deterministic, length-dependent so different indicator strings get
+            # different (but stable) token counts.
+            return list(range(len(text) % 3 + 1))
+
+    @classmethod
+    def _config(cls, *, use_modality_embedding, predict_response=False, state_type="discrete"):
+        return PI05Config(
+            n_obs_steps=1,
+            chunk_size=4,
+            n_action_steps=4,
+            max_state_dim=cls.MAX_STATE_DIM,
+            max_action_dim=cls.MAX_ACTION_DIM,
+            state_type=state_type,
+            predict_response=predict_response,
+            use_modality_embedding=use_modality_embedding,
+        )
+
+    def _build_fm(
+        self, monkeypatch, *, use_modality_embedding, predict_response=False, state_type="discrete", fill=None
+    ):
+        import torch.nn as nn
+
+        from opentau.policies.pi05.modeling_pi05 import PI05FlowMatching
+
+        mod = "opentau.policies.pi05.modeling_pi05"
+        monkeypatch.setattr(f"{mod}._preferred_dtype", lambda: torch.float32)
+
+        cfg = self._config(
+            use_modality_embedding=use_modality_embedding,
+            predict_response=predict_response,
+            state_type=state_type,
+        )
+        fm = object.__new__(PI05FlowMatching)
+        nn.Module.__init__(fm)  # set up _modules so we can attach stub layers
+        fm.config = cfg
+        # Seed so the random state_proj weights match across on/off builds, which
+        # the zero-init no-op equivalence check relies on.
+        torch.manual_seed(0)
+        fm.paligemma_with_expert = self._FakePaliGemma(self.HIDDEN, self.N_IMG_TOKENS)
+        fm.language_tokenizer = self._FakeTokenizer()
+        fm.state_proj = nn.Linear(self.MAX_STATE_DIM, self.HIDDEN)
+        if use_modality_embedding:
+            emb = nn.Embedding(PI05FlowMatching._NUM_PREFIX_MODALITIES, self.HIDDEN)
+            nn.init.zeros_(emb.weight)
+            if fill is not None:
+                with torch.no_grad():
+                    emb.weight.copy_(fill)
+            fm.modality_embedding = emb
+        return fm
+
+    def _inputs(self, bsize=2, *, state=False, response=False, discrete=False):
+        kwargs = {
+            "images": [torch.zeros(bsize, 3, 8, 8)],
+            "img_masks": [torch.ones(bsize, dtype=torch.bool)],
+            "lang_tokens": torch.arange(bsize * 5).reshape(bsize, 5) % 11,
+            "lang_masks": torch.ones(bsize, 5, dtype=torch.bool),
+        }
+        if state:
+            kwargs["state"] = torch.randn(bsize, self.MAX_STATE_DIM)
+        if response:
+            kwargs["response_tokens"] = torch.arange(bsize * 4).reshape(bsize, 4) % 7
+            kwargs["response_masks"] = torch.ones(bsize, 4, dtype=torch.bool)
+        if discrete:
+            kwargs["discrete_actions"] = torch.arange(bsize * 6).reshape(bsize, 6) % 13
+            kwargs["discrete_action_masks"] = torch.ones(bsize, 6, dtype=torch.bool)
+        return kwargs
+
+    def test_zero_init_modality_embedding_is_noop(self, monkeypatch):
+        """With a zero-initialized table, the additive modality embedding must
+        leave ``embs`` bit-identical to running with the feature off."""
+        from opentau.policies.pi05.modeling_pi05 import PI05FlowMatching
+
+        inputs = self._inputs(state=True, response=True, discrete=True)
+
+        fm_off = self._build_fm(
+            monkeypatch, use_modality_embedding=False, predict_response=True, state_type="continuous"
+        )
+        embs_off, pad_off, att_off, seg_off = PI05FlowMatching.embed_prefix(fm_off, **inputs)
+
+        fm_on = self._build_fm(
+            monkeypatch, use_modality_embedding=True, predict_response=True, state_type="continuous"
+        )
+        embs_on, pad_on, att_on, seg_on = PI05FlowMatching.embed_prefix(fm_on, **inputs)
+
+        assert torch.equal(embs_off, embs_on)  # zero-init -> exact no-op
+        assert torch.equal(pad_off, pad_on)
+        assert torch.equal(att_off, att_on)
+        assert torch.equal(seg_off, seg_on)
+
+    def test_nonzero_modality_embedding_shifts_embs(self, monkeypatch):
+        """A non-zero table must actually change ``embs`` (guards that the
+        additive branch fires), shifting each row by its modality vector."""
+        from opentau.policies.pi05.modeling_pi05 import PI05FlowMatching
+
+        inputs = self._inputs(state=True, response=True, discrete=True)
+
+        fm_off = self._build_fm(
+            monkeypatch, use_modality_embedding=False, predict_response=True, state_type="continuous"
+        )
+        embs_off, _, _, seg_off = PI05FlowMatching.embed_prefix(fm_off, **inputs)
+
+        fill = torch.arange(
+            PI05FlowMatching._NUM_PREFIX_MODALITIES * self.HIDDEN, dtype=torch.float32
+        ).reshape(PI05FlowMatching._NUM_PREFIX_MODALITIES, self.HIDDEN)
+        fm_on = self._build_fm(
+            monkeypatch,
+            use_modality_embedding=True,
+            predict_response=True,
+            state_type="continuous",
+            fill=fill,
+        )
+        embs_on, _, _, seg_on = PI05FlowMatching.embed_prefix(fm_on, **inputs)
+
+        assert torch.equal(seg_off, seg_on)
+        assert not torch.equal(embs_off, embs_on)
+        # The delta at each token must equal that token's modality vector.
+        expected_delta = fill[seg_on]
+        assert torch.allclose(embs_on - embs_off, expected_delta, atol=1e-5)
+
+    @pytest.mark.parametrize("state", [False, True])
+    @pytest.mark.parametrize("response", [False, True])
+    @pytest.mark.parametrize("discrete", [False, True])
+    def test_segment_ids_length_matches_embs(self, monkeypatch, state, response, discrete):
+        """``segment_ids`` must stay length-aligned with ``embs`` / ``pad_masks``
+        / ``att_masks`` across every optional-block combination."""
+        from opentau.policies.pi05.modeling_pi05 import PI05FlowMatching
+
+        inputs = self._inputs(state=state, response=response, discrete=discrete)
+        fm = self._build_fm(
+            monkeypatch,
+            use_modality_embedding=True,
+            predict_response=response,
+            state_type="continuous" if state else "discrete",
+        )
+        embs, pad_masks, att_masks, segment_ids = PI05FlowMatching.embed_prefix(fm, **inputs)
+
+        seq_len = embs.shape[1]
+        assert pad_masks.shape[1] == seq_len
+        assert att_masks.shape[1] == seq_len
+        assert segment_ids.shape == (embs.shape[0], seq_len)
+        # Slots must stay within the table the embedding was sized for.
+        assert int(segment_ids.max()) < PI05FlowMatching._NUM_PREFIX_MODALITIES
+        assert int(segment_ids.min()) >= 0

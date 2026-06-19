@@ -138,6 +138,17 @@ class PI05Config(PreTrainedConfig):
     # maximum number of frozen actions
     max_delay: int = 0
 
+    # Modality-specific learnable embedding.
+    # When True, a learnable embedding selected by input modality (vision,
+    # language, state, response, discrete action, action expert) is *added* on
+    # top of every token embedding before the transformer. This is an additive
+    # positional signal that tells the model which modality each token came
+    # from, layered over the existing RoPE positions (it does not replace them).
+    # The table is zero-initialized so enabling it on an existing checkpoint is
+    # a no-op at step 0 and the signal is learned from there. Defaults to False
+    # (original behavior, what existing checkpoints expect).
+    use_modality_embedding: bool = False
+
     # Attention utils
     attention_implementation: str = "eager"
 
