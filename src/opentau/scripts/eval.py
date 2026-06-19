@@ -256,6 +256,68 @@ def rollout(
     return ret
 
 
+def _resolve_eval_seed(cfg: TrainPipelineConfig) -> int | None:
+    """Master seed for the eval *simulations* (env scene generation).
+
+    ``cfg.eval.seed``, when set, takes precedence over the top-level ``cfg.seed``,
+    so the eval scene set can be pinned independently of the training/global seed.
+    Falls back to ``cfg.seed`` when ``cfg.eval.seed`` is None. Returns None only
+    when both are None — in which case the env seeds each worker by its slot index
+    (see ``RoboCasaEnv.reset``) rather than from a master seed.
+
+    Note this resolves *only* the env/scene seed threaded in as ``start_seed``; the
+    global ``set_seed`` (model init, dataset shuffling, policy sampling) always uses
+    the top-level ``cfg.seed`` and is intentionally left untouched.
+
+    Args:
+        cfg: The training/eval pipeline config carrying both ``cfg.seed`` (global)
+            and ``cfg.eval.seed`` (optional eval-simulation override).
+
+    Returns:
+        ``cfg.eval.seed`` if set, else ``cfg.seed``; ``None`` only if both are ``None``.
+    """
+    return cfg.eval.seed if cfg.eval.seed is not None else cfg.seed
+
+
+def _rank_seed_offset(*, process_index: int, decorrelate: bool, per_rank_span: int) -> int:
+    """Per-rank additive offset applied to every eval episode's seed.
+
+    Default (``decorrelate=False``) returns ``0``: every rank seeds its
+    environments identically, so the scene a given ``(task, episode)`` maps to is
+    independent of the world size / node count and the eval is reproducible whether
+    it ran on 1 GPU or 16.
+
+    When ``decorrelate=True`` each rank gets an orthogonal, non-overlapping block of
+    the integer seed line: rank ``r`` occupies ``[r * span, (r + 1) * span)`` where
+    ``span`` is the *exact* per-rank episode span (``n_batches * num_envs``). Because
+    the stride equals the span, the blocks tile the line with no gap or overlap — so
+    there is no magic constant and no collision regardless of how many episodes each
+    rank runs (unlike a fixed ``* 10000``, which silently collides once a rank
+    exceeds 10000 episodes). ``process_index`` must be the *global* rank (unique
+    across all nodes); the node-local ``local_process_index`` would alias rank 0 on
+    every node and is therefore wrong here.
+
+    Note the seeds within a block need not be "spread out": each integer is fed to
+    ``np.random.default_rng`` (which hashes it through a ``SeedSequence``), so even
+    adjacent seeds yield statistically independent scene streams.
+
+    Args:
+        process_index: This rank's *global* process index (``0..world_size-1``,
+            unique across nodes), used as the block index.
+        decorrelate: Whether ranks should evaluate distinct scenes. When False the
+            offset is always 0 (all ranks seed identically).
+        per_rank_span: The exact number of seeds one rank consumes
+            (``n_batches * num_envs``), used as the (collision-free) block stride.
+
+    Returns:
+        The additive seed offset for this rank: ``0`` when ``decorrelate`` is False,
+        else ``process_index * per_rank_span``.
+    """
+    if not decorrelate:
+        return 0
+    return process_index * per_rank_span
+
+
 def eval_policy(
     env: gym.vector.VectorEnv,
     policy: PreTrainedPolicy,
@@ -333,9 +395,16 @@ def eval_policy(
         if start_seed is None:
             seeds = None
         else:
-            # HACK: to get different seeds per accelerator process when using distributed eval.
+            # By default all ranks seed identically (offset 0), so the eval is
+            # reproducible across world sizes. Only when `eval.decorrelate_rank_seeds`
+            # is set does each rank take an orthogonal, non-overlapping slice of the
+            # seed line so a task replicated across ranks covers distinct scenes.
             acc = get_proc_accelerator()
-            acc_offset = acc.process_index * 10000 if acc else 0
+            acc_offset = _rank_seed_offset(
+                process_index=acc.process_index if acc else 0,
+                decorrelate=cfg.eval.decorrelate_rank_seeds,
+                per_rank_span=n_batches * env.num_envs,
+            )
             seeds = range(
                 start_seed + acc_offset + (batch_ix * env.num_envs),
                 start_seed + acc_offset + ((batch_ix + 1) * env.num_envs),
@@ -750,7 +819,7 @@ def eval_main(cfg: TrainPipelineConfig):
             max_episodes_rendered=cfg.eval.max_episodes_rendered,
             grid_size=cfg.eval.grid_size,
             videos_dir=eval_output_dir / "videos",
-            start_seed=cfg.seed,
+            start_seed=_resolve_eval_seed(cfg),
             max_parallel_tasks=cfg.env.max_parallel_tasks,
             return_episode_data=bool(cfg.eval.recording_root),
             subgoal_generator=subgoal_generator,

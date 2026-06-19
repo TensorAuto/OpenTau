@@ -48,6 +48,7 @@ from opentau.policies.factory import make_policy
 from opentau.policies.outlier_utils import OutlierRecord
 from opentau.policies.pretrained import PreTrainedPolicy, is_norm_buffer_key
 from opentau.scripts.eval import (
+    _resolve_eval_seed,
     collect_grid_summary_videos,
     consolidate_eval_info,
     eval_policy_all,
@@ -111,7 +112,7 @@ def _eval_with_fresh_envs(
                 videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
                 max_episodes_rendered=cfg.eval.max_episodes_rendered,
                 grid_size=cfg.eval.grid_size,
-                start_seed=cfg.seed,
+                start_seed=_resolve_eval_seed(cfg),
                 max_parallel_tasks=cfg.env.max_parallel_tasks,
                 subgoal_generator=eval_subgoal_generator,
             )

@@ -792,6 +792,61 @@ class TestRenderMultiCamera:
         assert env.render() is sentinel
 
 
+class TestResetSeed:
+    """``RoboCasaEnv.reset`` forwards an explicit seed to the sim verbatim.
+
+    Spreading the seed across the ``n_envs`` workers is the caller's job:
+    gymnasium's vector envs hand each sub-env a distinct ``seed[i]`` (or ``seed+i``
+    for an int) and the eval harness builds an explicit per-worker range. Adding
+    ``episode_index`` on top of an already-distinct seed would *double*-shift it and
+    make scene seeds collide across rollout batches (so an eval samples fewer
+    distinct scenes than ``n_episodes``). Only the unseeded path falls back to
+    ``episode_index`` to keep workers distinct.
+
+    CPU-only: ``_env`` is stubbed so ``_ensure_env`` is a no-op and no sim is built.
+    """
+
+    @staticmethod
+    def _stub_env(episode_index: int):
+        from opentau.envs.robocasa import RoboCasaEnv as RoboCasaGymEnv
+
+        env = RoboCasaGymEnv(task="CloseFridge", episode_index=episode_index)
+        env._env = Mock()  # non-None so _ensure_env() is a no-op (no sim build)
+        env._env.reset.return_value = ({}, {})  # (raw_obs, info); raw_obs unused below
+        env._env.env.get_ep_meta.return_value = {"lang": "close the fridge"}
+        return env
+
+    @pytest.mark.parametrize("episode_index", [0, 1, 5])
+    def test_explicit_seed_passes_through_without_episode_index_shift(self, episode_index):
+        env = self._stub_env(episode_index)
+        with patch.object(env, "_format_raw_obs", return_value={"pixels": {}}):
+            env.reset(seed=100)
+        # Seeded with exactly the caller's seed — NOT seed + episode_index.
+        env._env.reset.assert_called_once_with(seed=100)
+
+    @pytest.mark.parametrize("episode_index", [0, 1, 5])
+    def test_unseeded_reset_falls_back_to_episode_index(self, episode_index):
+        env = self._stub_env(episode_index)
+        with patch.object(env, "_format_raw_obs", return_value={"pixels": {}}):
+            env.reset()  # no seed → fall back to episode_index so workers differ
+        env._env.reset.assert_called_once_with(seed=episode_index)
+
+    def test_per_worker_range_yields_contiguous_collision_free_scene_seeds(self):
+        # Emulate the eval harness: gymnasium hands sub-env i its own seeds[i] from
+        # the per-worker range [S, S+1, ..., S+N-1]. The underlying scene seeds must
+        # be exactly those values — contiguous and distinct, no spacing-of-2 gaps
+        # that would alias across batches.
+        start, n_envs = 100, 4
+        scene_seeds = []
+        for i in range(n_envs):
+            env = self._stub_env(episode_index=i)
+            with patch.object(env, "_format_raw_obs", return_value={"pixels": {}}):
+                env.reset(seed=start + i)  # seeds[i] as distributed by the vector env
+            scene_seeds.append(env._env.reset.call_args.kwargs["seed"])
+        assert scene_seeds == [100, 101, 102, 103]
+        assert len(set(scene_seeds)) == n_envs  # no collisions
+
+
 @pytest.mark.gpu
 @pytest.mark.slow
 def test_robocasa_autodownload_and_rollout_from_relocated_root(monkeypatch):

@@ -461,6 +461,7 @@ class TestEvalWithFreshEnvs:
                 n_episodes=2,
                 max_episodes_rendered=0,
                 grid_size=None,
+                seed=None,  # fall back to the top-level cfg.seed (see _resolve_eval_seed)
             ),
             policy=SimpleNamespace(use_amp=False),
             output_dir=Path("/tmp/opentau_eval_test"),
