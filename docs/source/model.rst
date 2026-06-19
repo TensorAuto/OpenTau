@@ -106,6 +106,20 @@ pi07_paligemma_low_level
 - Config selector: ``--policy.type=pi07_paligemma_low_level``.
 
 
+cosmos3
+-------
+- cosmos3 is the π0.5 flow-matching recipe on a **frozen Qwen3-VL-32B backbone** — the **reasoning tower of NVIDIA `Cosmos3-Super <https://huggingface.co/nvidia/Cosmos3-Super>`_**, extracted into a standalone Qwen3-VL-32B checkpoint by ``src/opentau/scripts/extract_cosmos3_reasoner.py`` — paired with a custom **sub-1B Qwen3-style action expert** (``qwen3vl_with_expert.py``). Given camera images and a language prompt, the frozen reasoner encodes the observation once (prefix); the trainable expert cross-attends to the reasoner's per-layer key/value cache to denoise a continuous action chunk by flow matching.
+- Continuous actions only (MSE flow matching) — no FAST discrete-action tokens and no subtask/response head. The backbone (vision tower + text tower) is fully frozen; only the action expert and its projections train (~0.9B parameters).
+- The expert's KV heads (8) and head dim (128) match the Qwen3-VL text tower so its keys/values concatenate with the cached backbone KV at every layer; its query-head count is free. The shared multimodal RoPE (MRoPE) is computed by the backbone and reused by the expert.
+- More details on the backbone: `Cosmos 3 technical report <https://arxiv.org/abs/2606.02800>`_. ``Cosmos3-Super`` is an interleaved Mixture-of-Transformers (a shared-attention autoregressive **reasoner** tower whose text config is Qwen3-VL-32B, plus a diffusion generation tower); cosmos3 keeps only the reasoner tower (text path ``mlp`` + the ``Qwen3VLVisionModel`` ``vision_encoder/``) and drops the generation tower.
+- The extracted reasoner backbone is published at `TensorAuto/cosmos3-reason-32b <https://huggingface.co/TensorAuto/cosmos3-reason-32b>`_ (**private**; the default ``pretrained_backbone_repo_id``), so training pulls it directly given an HF token with TensorAuto read access. To reproduce or re-host it, run ``python -m opentau.scripts.extract_cosmos3_reasoner --cosmos3-path <Cosmos3-Super snapshot> --out-dir <reasoner-dir>`` (Cosmos3-Super is ungated; the script remaps the reasoner weights to a standard Qwen3-VL-32B checkpoint) and point ``--policy.pretrained_backbone_repo_id`` at the result.
+- See the implementation in `src/opentau/policies/cosmos3/modeling_cosmos3.py <https://github.com/TensorAuto/OpenTau/blob/main/src/opentau/policies/cosmos3/modeling_cosmos3.py>`_.
+- To spin up a training run, start from `configs/examples/cosmos3_training_config.json <https://github.com/TensorAuto/OpenTau/blob/main/configs/examples/cosmos3_training_config.json>`_.
+- Requires ``transformers>=4.57`` (the ``qwen3_vl`` model class). The extracted reasoner backbone is ~64 GB in bf16.
+- Config selector: ``--policy.type=cosmos3``.
+- Disclaimer: the reasoner *backbone* is published (private ``TensorAuto/cosmos3-reason-32b``), but no full cosmos3 *policy* checkpoint exists yet — the action expert is randomly initialized on top of the frozen reasoner and produced by training.
+
+
 value
 -----
 - The value model is a vision-language model used to predict the value of the current state. It is used to train VLA policies with the RECAP framework.
