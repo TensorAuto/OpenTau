@@ -198,27 +198,43 @@ def extract(cosmos3_path: str, out_dir: str, verify: bool = True) -> None:
     config = _qwen3vl_32b_config()
     os.makedirs(out_dir, exist_ok=True)
 
+    # Instantiate on meta (no real storage), then assign the loaded bf16 tensors directly.
+    # The plain ``Qwen3VLForConditionalGeneration(config)`` constructor would otherwise
+    # materialize all ~32B params in fp32 and random-init them (immediately overwritten),
+    # roughly doubling peak RAM. ``assign=True`` swaps the meta params for the state-dict
+    # tensors as-is, so the saved checkpoint keeps the source bf16 dtype with no fp32 detour.
+    with torch.device("meta"):
+        model = Qwen3VLForConditionalGeneration(config)
+
     if verify:
-        # Instantiate on meta to compare key sets without allocating 64GB.
-        with torch.device("meta"):
-            ref = Qwen3VLForConditionalGeneration(config)
-        expected = set(ref.state_dict().keys())
+        expected = set(model.state_dict().keys())
         got = set(state_dict.keys())
-        missing, unexpected = expected - got, got - expected
+        missing_keys, unexpected_keys = expected - got, got - expected
         # tie_word_embeddings=False, so lm_head should be present; tolerate it if tied.
-        if missing:
-            print(f"WARNING: {len(missing)} expected keys missing (first 15): {sorted(missing)[:15]}")
-        if unexpected:
-            print(f"WARNING: {len(unexpected)} unexpected keys (first 15): {sorted(unexpected)[:15]}")
-        if not missing and not unexpected:
+        if missing_keys:
+            print(
+                f"WARNING: {len(missing_keys)} expected keys missing (first 15): {sorted(missing_keys)[:15]}"
+            )
+        if unexpected_keys:
+            print(
+                f"WARNING: {len(unexpected_keys)} unexpected keys (first 15): {sorted(unexpected_keys)[:15]}"
+            )
+        if not missing_keys and not unexpected_keys:
             print("✓ key sets match Qwen3VLForConditionalGeneration exactly")
 
-    config.save_pretrained(out_dir)
-    # Materialize the model and let save_pretrained shard + write a correct index.
-    model = Qwen3VLForConditionalGeneration(config)
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False, assign=True)
     print(f"load_state_dict: {len(missing)} missing, {len(unexpected)} unexpected")
-    model.to(dtype=torch.bfloat16).save_pretrained(out_dir, safe_serialization=True)
+    if missing:
+        # With assign=True any unmatched param stays on the meta device; saving it would
+        # ship empty weights, so refuse rather than write a silently-broken checkpoint.
+        raise RuntimeError(
+            f"{len(missing)} params had no tensor in the extracted state dict and would remain on "
+            f"meta: {sorted(missing)[:15]} -- aborting so we never save an incomplete checkpoint."
+        )
+
+    config.save_pretrained(out_dir)
+    # save_pretrained shards + writes a correct index from the (now bf16, real) params.
+    model.save_pretrained(out_dir, safe_serialization=True)
     del model, state_dict
 
     # Copy tokenizer / processor configs so the dir is a usable Qwen3-VL checkpoint.

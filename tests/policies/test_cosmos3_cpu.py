@@ -25,7 +25,7 @@ import torch
 from transformers import Qwen3VLConfig
 
 from opentau.policies.cosmos3.configuration_cosmos3 import Cosmos3Config
-from opentau.policies.cosmos3.modeling_cosmos3 import Cosmos3FlowMatching
+from opentau.policies.cosmos3.modeling_cosmos3 import Cosmos3FlowMatching, Cosmos3Policy
 from opentau.policies.utils import PerSampleLoss
 
 # Small vision/text special-token ids that fit inside the tiny vocab below.
@@ -296,6 +296,73 @@ def test_first_tensor_skips_non_tensor_prompt():
     ref = _first_tensor(batch)
     assert isinstance(ref, torch.Tensor)
     assert ref.shape[0] == 2
+
+
+class _FakeTokenizer:
+    """Records encode/decode calls; one whitespace-separated word == one token id."""
+
+    def __init__(self):
+        self.encode_calls: list[tuple[str, list[int]]] = []
+        self.decode_calls: list[list[int]] = []
+
+    def encode(self, text, add_special_tokens=False):
+        ids = list(range(len(text.split())))
+        self.encode_calls.append((text, ids))
+        return ids
+
+    def decode(self, ids):
+        ids = list(ids)
+        self.decode_calls.append(ids)
+        return " ".join(f"t{i}" for i in ids)
+
+
+class _FakeProcessor:
+    """Minimal stand-in for the Qwen3-VL processor that records what it is handed."""
+
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer()
+        self.seen_texts = None
+        self.seen_images = "UNSET"
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
+        # Flatten just the text content so the test can read back the (truncated) prompt.
+        return " ".join(c["text"] for m in messages for c in m["content"] if c["type"] == "text")
+
+    def __call__(self, text, images, return_tensors, padding):
+        self.seen_texts = text
+        self.seen_images = images
+        bsize, seqlen = len(text), 6
+        return {
+            "input_ids": torch.zeros(bsize, seqlen, dtype=torch.long),
+            "attention_mask": torch.ones(bsize, seqlen, dtype=torch.long),
+        }
+
+
+def test_cosmos3_prompt_max_length_truncation():
+    """``prepare_multimodal_inputs`` must truncate the language prompt to
+    ``prompt_max_length`` tokens (text only -- image placeholders are never clipped).
+
+    This locks the wrapper-level truncation on the CPU gate; the real Qwen3-VL processor
+    is mocked so no 32B backbone / network is needed.
+    """
+    cfg = _tiny_cosmos3_config(prompt_max_length=4)
+    policy = Cosmos3Policy(cfg, qwen3vl_config=_tiny_qwen3vl_config())
+    policy.processor = _FakeProcessor()
+
+    batch = {
+        "prompt": ["a b c d e f g h", "x y"],  # 8 tokens -> truncate to 4; 2 tokens -> keep
+        "state": torch.zeros(2, MAX_STATE_DIM),
+    }
+    mm = policy.prepare_multimodal_inputs(batch)
+
+    tok = policy.processor.tokenizer
+    # The long prompt was sliced to prompt_max_length ids; the short one passed through.
+    assert tok.decode_calls == [[0, 1, 2, 3], [0, 1]]
+    # The (decoded) text reaching the processor reflects the per-sample truncation.
+    assert [len(t.split()) for t in policy.processor.seen_texts] == [4, 2]
+    # No image features -> the image argument is None, not an empty list.
+    assert policy.processor.seen_images is None
+    assert mm["input_ids"].shape[0] == 2
 
 
 def test_cosmos3_partial_unfreeze_backbone_receives_grad():
