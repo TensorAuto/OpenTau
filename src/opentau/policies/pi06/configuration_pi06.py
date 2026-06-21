@@ -149,6 +149,13 @@ class PI06Config(PreTrainedConfig):
     freeze_vision_encoder: bool = True
     train_expert_only: bool = False
 
+    # Knowledge insulation (π0.5): when True (default), the prefix/VLM KV cache
+    # is detached before the action expert reads it, so the flow-matching action
+    # loss does NOT backpropagate into the VLM backbone. Set False to let the
+    # action gradient flow into the VLM (end-to-end action training). Default
+    # True preserves existing behavior and is what current checkpoints expect.
+    knowledge_insulation: bool = True
+
     # Wrap each interleaved transformer-layer forward in torch.utils.checkpoint
     # to trade ~25-33% same-batch compute for a large slice of activation memory
     # per rank, typically netting +10-25% throughput once the freed memory is
