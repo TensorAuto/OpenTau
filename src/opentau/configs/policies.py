@@ -306,6 +306,14 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
     # `use_amp` determines whether to use Automatic Mixed Precision (AMP) for training and evaluation. With AMP,
     # automatic gradient scaling is used.
     use_amp: bool = False
+    # Optional `torch.compile` of the model during training (PR #428). Not exercised on the
+    # eval path; declared here so configs written by torch.compile-aware training code parse.
+    # Defaults to False (no behaviour change; eager path byte-for-byte unchanged).
+    use_torch_compile: bool = False
+    # `torch.compile` mode forwarded to `torch.nn.Module.compile(mode=...)` when
+    # `use_torch_compile` is True. One of "default", "reduce-overhead",
+    # "max-autotune", "max-autotune-no-cudagraphs".
+    torch_compile_mode: str = "default"
     pretrained_path: str | None = None
     skip_normalization_weights: bool = False
 

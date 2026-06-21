@@ -356,7 +356,10 @@ class RoboCasaEnv(EnvConfig):
 
     task: str = "CloseFridge"
     fps: int = 20
-    episode_length: int = 1000
+    # Nullable to match configs written by per-task-horizon-aware code (#431): null/None
+    # means "use the official per-task horizon". The eval here always passes an explicit
+    # --env.episode_length per task (the official horizons), so this only needs to parse.
+    episode_length: int | None = 1000
     obs_type: str = "pixels_agent_pos"
     render_mode: str = "rgb_array"
     camera_name: str = "robot0_agentview_left,robot0_eye_in_hand,robot0_agentview_right"
