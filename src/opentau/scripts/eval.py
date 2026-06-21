@@ -374,6 +374,17 @@ def eval_policy(
     start = time.time()
     policy.eval()
 
+    # Optional explicit sparse seed list (cfg.eval.seed_list, comma-separated): evaluate exactly these
+    # scene seeds instead of the contiguous range start_seed..start_seed+n_episodes-1. Used for
+    # goal-frame backfill (re-run only the scenes a prior checkpoint failed). When set it overrides
+    # n_episodes; the last batch is right-padded by repeating the final seed to fill env.num_envs
+    # (the duplicate re-runs the same deterministic scene, so captured frames just overwrite — harmless).
+    explicit_seed_list: list[int] | None = None
+    _sl = getattr(cfg.eval, "seed_list", None)
+    if _sl:
+        explicit_seed_list = [int(s) for s in str(_sl).split(",") if s.strip() != ""]
+        n_episodes = len(explicit_seed_list)
+
     # Determine how many batched rollouts we need to get n_episodes. Note that if n_episodes is not evenly
     # divisible by env.num_envs we end up discarding some data in the last batch.
     n_batches = n_episodes // env.num_envs + int((n_episodes % env.num_envs) != 0)
@@ -424,7 +435,14 @@ def eval_policy(
         if max_episodes_rendered > 0:
             ep_frames: list[np.ndarray] = []
 
-        if start_seed is None:
+        if explicit_seed_list is not None:
+            # Sparse-seed mode: take this batch's slice of the explicit list, right-padding the
+            # final short batch by repeating the last seed to fill env.num_envs.
+            batch_seeds = explicit_seed_list[batch_ix * env.num_envs : (batch_ix + 1) * env.num_envs]
+            while 0 < len(batch_seeds) < env.num_envs:
+                batch_seeds.append(batch_seeds[-1])
+            seeds = batch_seeds
+        elif start_seed is None:
             seeds = None
         else:
             # By default all ranks seed identically (offset 0), so the eval is
