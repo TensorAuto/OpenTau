@@ -109,7 +109,12 @@ def find(cfg: TrainPipelineConfig):
 
     logging.info("Running one forward + backward...")
     losses = policy.forward(batch)
-    loss = cfg.loss_weighting["MSE"] * losses["MSE"] + cfg.loss_weighting["CE"] * losses["CE"]
+    # Mirror training's weighted-loss assembly so a zero-weighted term is dropped
+    # from the backward here too — otherwise this audit would report the dropped
+    # term's parameters as "used" (multiply-by-0 still backprops zeros).
+    from opentau.scripts.train import _assemble_weighted_loss
+
+    loss = _assemble_weighted_loss(losses, cfg.loss_weighting)
     # Don't use any optimizer / scaler — just raw autograd.
     loss.backward()
 

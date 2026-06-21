@@ -1053,9 +1053,12 @@ class PI06FlowMatching(nn.Module):
         action_expert_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
         # Knowledge Insulation: block gradients from the action expert into the VLM.
-        for layer_idx in past_key_values:
-            past_key_values[layer_idx]["key_states"] = past_key_values[layer_idx]["key_states"].detach()
-            past_key_values[layer_idx]["value_states"] = past_key_values[layer_idx]["value_states"].detach()
+        if self.config.knowledge_insulation:
+            for layer_idx in past_key_values:
+                past_key_values[layer_idx]["key_states"] = past_key_values[layer_idx]["key_states"].detach()
+                past_key_values[layer_idx]["value_states"] = past_key_values[layer_idx][
+                    "value_states"
+                ].detach()
 
         (_, suffix_out), _ = self.gemma3_with_expert.forward(
             attention_mask=action_expert_2d_attention_mask,

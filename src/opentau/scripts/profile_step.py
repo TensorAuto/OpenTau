@@ -222,7 +222,7 @@ def profile(cfg: TrainPipelineConfig):
     # Mirror train.py: under DeepSpeed ZeRO-3 we must disable the per-construction
     # parameter partitioning (it shards before init, breaking shape-dependent
     # initializers like SigLIP's lecun_normal_). No-op for any non-ZeRO-3 backend.
-    from opentau.scripts.train import _zero3_disabled_init_context
+    from opentau.scripts.train import _assemble_weighted_loss, _zero3_disabled_init_context
 
     # Mirror train.py: under FSDP, gate the model's internal bf16 cast so the
     # policy stays fp32 for FSDP's MixedPrecision to manage the bf16 compute /
@@ -432,7 +432,7 @@ def profile(cfg: TrainPipelineConfig):
 
         # Phase 2: forward (mirror update_policy lines 74-77)
         losses = policy.forward(batch)
-        loss = cfg.loss_weighting["MSE"] * losses["MSE"] + cfg.loss_weighting["CE"] * losses["CE"]
+        loss = _assemble_weighted_loss(losses, cfg.loss_weighting)
         _sync()
         t2 = time.perf_counter()
 

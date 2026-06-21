@@ -212,6 +212,13 @@ class PI07LowLevelConfig(PreTrainedConfig):
     freeze_vision_encoder: bool = True
     train_expert_only: bool = False
 
+    # Knowledge insulation (π0.5): when True (default), the prefix/VLM KV cache
+    # is detached before the action expert reads it, so the flow-matching action
+    # loss does NOT backpropagate into the VLM backbone. Set False to let the
+    # action gradient flow into the VLM (end-to-end action training). Default
+    # True preserves existing behavior and is what current checkpoints expect.
+    knowledge_insulation: bool = True
+
     vlm_config: Gemma3WithExpertConfig = field(
         default_factory=lambda: Gemma3WithExpertConfig(
             freeze_vision_encoder=True,

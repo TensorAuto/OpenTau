@@ -1168,9 +1168,11 @@ class PI05MemFlowMatching(nn.Module):
 
         assert past_key_values is not None
         kv_cache: dict = past_key_values
-        for layer_idx in kv_cache:
-            kv_cache[layer_idx]["key_states"] = kv_cache[layer_idx]["key_states"].detach()
-            kv_cache[layer_idx]["value_states"] = kv_cache[layer_idx]["value_states"].detach()
+        if self.config.knowledge_insulation:
+            # stop gradient to avoid backpropagating from action expert to VLM
+            for layer_idx in kv_cache:
+                kv_cache[layer_idx]["key_states"] = kv_cache[layer_idx]["key_states"].detach()
+                kv_cache[layer_idx]["value_states"] = kv_cache[layer_idx]["value_states"].detach()
 
         (_, suffix_out), _ = self.paligemma_with_expert.forward(
             attention_mask=action_expert_2d_attention_mask,

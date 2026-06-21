@@ -132,6 +132,90 @@ def _eval_with_fresh_envs(
             torch.cuda.empty_cache()
 
 
+def _has_zero_loss_weight(loss_weighting: dict[str, float]) -> bool:
+    """Whether any loss-term weight is exactly 0 (i.e. a term is dropped from backward).
+
+    Args:
+        loss_weighting: Mapping of loss-term name to scalar weight.
+
+    Returns:
+        True if at least one weight is 0.
+    """
+    return any(w == 0 for w in loss_weighting.values())
+
+
+def _zero_weight_backend_incompatible(distributed_type: accelerate.DistributedType, zero_stage: int) -> bool:
+    """Whether dropping a loss term is unsafe on the active distributed backend.
+
+    Under parameter-sharding backends (FSDP or DeepSpeed ZeRO-3) the dropped
+    term's modules are still gathered during the forward but get no gradient in
+    the backward, so their reduce-scatter / reshard hooks can wait on a gradient
+    that never arrives and hang at NCCL. DDP (via ``find_unused_parameters``) and
+    DeepSpeed ZeRO-1/2 (no param sharding) tolerate the unused params.
+
+    Args:
+        distributed_type: The accelerator's distributed type.
+        zero_stage: The active DeepSpeed ZeRO stage (0 when not DeepSpeed).
+
+    Returns:
+        True if the backend shards parameters (FSDP or ZeRO-3).
+    """
+    return distributed_type == accelerate.DistributedType.FSDP or zero_stage >= 3
+
+
+def _assemble_weighted_loss(losses: dict, loss_weighting: dict[str, float]) -> torch.Tensor:
+    """Combine the weighted loss terms into the single scalar fed to ``backward``.
+
+    A term whose weight is exactly ``0`` is **dropped from the sum entirely**
+    (rather than multiplied by 0). Multiplying by 0 still builds the term's
+    backward graph and populates its parameters with zero gradients; dropping it
+    means autograd never traverses that subgraph at all, so ``backward`` does not
+    touch the parameters that feed only that term (they receive ``None`` grad).
+
+    Because ``loss_weighting`` is a static config value identical on every rank,
+    the drop is a rank-uniform decision and cannot cause a cross-rank collective
+    mismatch (CLAUDE.md rule #5). The unused-parameter consequences of a dropped
+    term differ per distributed backend and are handled at ``Accelerator`` setup
+    in ``train()`` (force ``find_unused_parameters`` under DDP; fail fast under
+    parameter-sharding backends).
+
+    The terms are summed in a fixed ``(MSE, CE)`` order — independent of the
+    config dict's insertion order — so the float summation order, and thus the
+    result (CLAUDE.md rule #3), is deterministic and reproduces the historical
+    ``w_mse * MSE + w_ce * CE`` summation exactly.
+
+    Args:
+        losses: The policy ``forward`` output. A non-zero-weighted term must be
+            present; a zero-weighted (dropped) term need not be.
+        loss_weighting: Mapping of loss-term name to scalar weight.
+
+    Returns:
+        The scalar weighted loss.
+
+    Raises:
+        KeyError: If a non-zero-weighted term is absent from ``losses`` (a real
+            misconfig — surfaced loudly rather than silently dropped).
+        ValueError: If every term is dropped (all weights zero), leaving nothing
+            to optimize.
+    """
+    total: torch.Tensor | None = None
+    for key in ("MSE", "CE"):
+        weight = loss_weighting.get(key, 0)
+        if weight == 0:
+            # Term dropped from backward; a zero-weighted term need not be in `losses`.
+            continue
+        # Index directly: a non-zero-weighted term the policy failed to return is
+        # a misconfig and should KeyError loudly, not be silently skipped.
+        term = weight * losses[key]
+        total = term if total is None else total + term
+    if total is None:
+        raise ValueError(
+            f"No active loss term to backpropagate: loss_weighting={loss_weighting} "
+            "drops every term. Set a non-zero weight for at least one of MSE / CE."
+        )
+    return total
+
+
 def update_policy(
     train_config: TrainPipelineConfig,
     train_metrics: MetricsTracker,
@@ -145,9 +229,7 @@ def update_policy(
     policy.train()
     losses = policy.forward(batch)
     outlier_records = losses.pop("outlier_records", [])
-    loss = (
-        train_config.loss_weighting["MSE"] * losses["MSE"] + train_config.loss_weighting["CE"] * losses["CE"]
-    )
+    loss = _assemble_weighted_loss(losses, train_config.loss_weighting)
 
     accelerator.backward(loss)
     accelerator.unscale_gradients(optimizer=optimizer)
@@ -628,6 +710,21 @@ def train(cfg: TrainPipelineConfig):
     cfg.validate()
 
     find_unused = _find_unused_params_from_env()
+    # A 0 entry in loss_weighting drops that term from the backward pass
+    # (see _assemble_weighted_loss), so the parameters that feed only that term
+    # receive no gradient. Under DDP that requires find_unused_parameters=True or
+    # the reducer raises on the now-unused params. The decision is rank-uniform
+    # (every rank reads the same config), so force it on — with a warning — so a
+    # zero weight cannot crash a run that opted into FIND_UNUSED_PARAMS=false for
+    # speed. (Ignored under DeepSpeed; the ZeRO-3 / FSDP case is guarded below.)
+    if not find_unused and _has_zero_loss_weight(cfg.loss_weighting):
+        logging.warning(
+            "loss_weighting=%s drops a zero-weighted term from backward, leaving its "
+            "parameters unused; forcing find_unused_parameters=True (overriding "
+            "FIND_UNUSED_PARAMS=false) to avoid a DDP reducer error.",
+            cfg.loss_weighting,
+        )
+        find_unused = True
     accelerator_kwargs = {
         "step_scheduler_with_optimizer": False,
         "split_batches": False,  # split_batches == True is not working anyways
@@ -658,6 +755,24 @@ def train(cfg: TrainPipelineConfig):
     # wandb-logged accelerator config and the value DeepSpeed consumes at prepare()
     # time both reflect TrainPipelineConfig.
     _sync_deepspeed_gradient_accumulation_steps(accelerator, cfg)
+
+    # A zero entry in loss_weighting drops that term from the backward pass
+    # (see _assemble_weighted_loss). Under parameter-sharding backends (DeepSpeed
+    # ZeRO-3 or FSDP) the dropped term's modules are still gathered during the
+    # forward but receive no gradient in the backward, so their reduce-scatter /
+    # reshard hooks can wait on a gradient that never arrives and hang at NCCL.
+    # DDP (handled via find_unused_parameters above) and ZeRO-1/2 (which do not
+    # shard parameters) tolerate the unused params, so fail fast only here.
+    if _has_zero_loss_weight(cfg.loss_weighting) and _zero_weight_backend_incompatible(
+        accelerator.distributed_type, _deepspeed_zero_stage(accelerator)
+    ):
+        raise ValueError(
+            f"A zero entry in loss_weighting ({cfg.loss_weighting}) drops a loss term "
+            "from the backward pass, which is not supported under parameter sharding "
+            "(DeepSpeed ZeRO-3 or FSDP): the dropped term's parameters are gathered in "
+            "the forward but get no gradient, risking a NCCL hang. Use DDP or DeepSpeed "
+            "ZeRO-1/2, or set all loss weights non-zero."
+        )
 
     # Strict guard for gradient_checkpointing: the pi05 custom forward loop
     # wraps layer bodies in torch.utils.checkpoint.checkpoint. With
