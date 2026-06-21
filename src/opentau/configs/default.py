@@ -652,6 +652,13 @@ class EvalConfig:
     # by `scripts/eval.py::eval_policy` via `_rank_seed_offset`.
     decorrelate_rank_seeds: bool = False
 
+    # When set, harvest "goal frames": for every SUCCESSFUL eval episode, save the final raw camera
+    # frames (all cameras) to this dir as `.png` files named `{task}__seed{seed}__{decoder}__{camera}.png`,
+    # plus an appended `manifest.csv`. Keyed by the per-episode scene seed so the same scene can be
+    # matched across checkpoints (pin `eval.seed` so the seed→scene map is identical everywhere) — a
+    # scene one checkpoint fails can be backfilled from another that solves it. None disables capture.
+    goal_frames_dir: str | None = None
+
     # Which training-time norm head to use when calling `policy.select_action`
     # on eval observations. Either:
     #   - set both `robot_type` and `control_mode` to address the head by

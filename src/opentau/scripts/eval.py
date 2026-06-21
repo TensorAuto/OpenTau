@@ -21,6 +21,7 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import concurrent.futures as cf
+import csv
 import datetime as dt
 import json
 import logging
@@ -82,6 +83,7 @@ def rollout(
     return_observations: bool = False,
     render_callback: Callable[[gym.vector.VectorEnv], None] | None = None,
     subgoal_generator: SubgoalImageGenerator | None = None,
+    capture_last_frames: bool = False,
 ) -> dict:
     """Run a batched policy rollout once through a batch of environments.
 
@@ -111,6 +113,11 @@ def rollout(
             are returned optionally because they typically take more memory to cache. Defaults to False.
         render_callback: Optional rendering callback to be used after the environments are reset, and after
             every step.
+        capture_last_frames: When True, capture each env's final raw camera observation (the
+            per-camera ``pixels`` dict at the step that env first becomes done) and return it under
+            ``"last_frames"`` as a per-env list of ``{camera_key: HxWx3 uint8}`` (or None for a
+            zero-step env). Memory-cheap (only the final frame per env, not the whole sequence) and
+            independent of ``return_observations``; used to harvest goal frames of successful rollouts.
     Returns:
         The dictionary described above.
     """
@@ -145,6 +152,9 @@ def rollout(
     check_env_attributes_and_types(env)
     successes = np.zeros((env.num_envs,), dtype=bool)
     subgoal_episode_picked = False
+    # Per-env final raw camera frames ({camera_key: HxWx3 uint8}); only the frame at each env's
+    # done-step is kept (updated every step the env is still live, then frozen).
+    last_frames: list[dict[str, np.ndarray] | None] = [None] * env.num_envs
     while not np.all(done) and step < max_steps:
         # Numpy array to tensor and changing dictionary keys to OpenTau policy format.
         observation = preprocess_observation(observation, cfg=cfg)
@@ -187,9 +197,18 @@ def rollout(
         assert action_numpy.ndim == 2, "Action dimensions should be (batch, action_dim)"
 
         # Apply the next action.
+        prev_done = done.copy()
         observation, reward, terminated, truncated, info = env.step(action_numpy)
         if render_callback is not None:
             render_callback(env)
+
+        # Capture each still-live env's raw camera frame. The last write for an env is the frame at
+        # the step it becomes done (its terminal/success state), since we stop updating once done.
+        if capture_last_frames and isinstance(observation, dict) and "pixels" in observation:
+            pixels = observation["pixels"]
+            for i in range(env.num_envs):
+                if not prev_done[i]:
+                    last_frames[i] = {k: np.asarray(v[i]).copy() for k, v in pixels.items()}
 
         # Once a success, always a success.
         if "is_success" in info:
@@ -249,6 +268,9 @@ def rollout(
                     "Only `torch.Tensor` and `list` are supported for now."
                 )
         ret["observation"] = stacked_observations
+
+    if capture_last_frames:
+        ret["last_frames"] = last_frames
 
     if hasattr(policy, "use_original_modules"):
         policy.use_original_modules()
@@ -365,6 +387,16 @@ def eval_policy(
     threads = []  # for video saving threads
     n_episodes_rendered = 0  # for saving the correct number of videos
 
+    # Goal-frame harvesting: when cfg.eval.goal_frames_dir is set, save the final raw camera frames
+    # of each SUCCESSFUL episode (all cameras) plus a manifest row, keyed by the per-episode scene
+    # seed so the same scene can be matched across checkpoints. Memory-cheap (final frame only).
+    goal_frames_dir = getattr(cfg.eval, "goal_frames_dir", None)
+    capture_last_frames = goal_frames_dir is not None
+    goal_manifest_rows: list[dict] = []
+    if capture_last_frames:
+        goal_frames_dir = Path(goal_frames_dir)
+        goal_frames_dir.mkdir(parents=True, exist_ok=True)
+
     # Callback for visualization.
     def render_frame(env: gym.vector.VectorEnv):
         # noqa: B023
@@ -417,6 +449,7 @@ def eval_policy(
             return_observations=return_episode_data,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
             subgoal_generator=subgoal_generator,
+            capture_last_frames=capture_last_frames,
         )
         # Figure out where in each rollout sequence the first done condition was encountered (results after
         # this won't be included).
@@ -465,6 +498,23 @@ def eval_policy(
             all_seeds.extend(seeds)
         else:
             all_seeds.append(None)
+
+        # Goal-frame harvest: save the final raw camera frames of each SUCCESSFUL episode, keyed by
+        # the per-episode scene seed (stable across checkpoints under a pinned eval.seed), so a
+        # failed scene can later be backfilled from another checkpoint that solves the same scene.
+        if capture_last_frames and seeds is not None:
+            batch_last_frames = rollout_data.get("last_frames")
+            task_name = str(getattr(cfg.env, "task", "unknown"))
+            decoder = "discrete" if getattr(cfg.policy, "eval_use_discrete_actions", False) else "flow"
+            for b, (seed, success) in enumerate(zip(seeds, batch_successes.tolist(), strict=False)):
+                if not success or batch_last_frames is None or batch_last_frames[b] is None:
+                    continue
+                row = {"task": task_name, "seed": int(seed), "decoder": decoder, "success": 1}
+                for cam_key, frame in sorted(batch_last_frames[b].items()):
+                    fname = f"{task_name}__seed{int(seed)}__{decoder}__{cam_key}.png"
+                    imageio.imwrite(goal_frames_dir / fname, np.asarray(frame).astype(np.uint8))
+                    row[cam_key] = fname
+                goal_manifest_rows.append(row)
 
         # Maybe render video for visualization.
         if max_episodes_rendered > 0 and len(ep_frames) > 0:
@@ -564,6 +614,19 @@ def eval_policy(
         # per-episode clips, so only record paths that still exist (this dict is
         # serialized to eval_info.json, which external consumers may read).
         info["video_paths"] = [p for p in video_paths if Path(p).exists()]
+
+    # Append harvested goal-frame rows to a manifest CSV (one row per successful episode), so a
+    # downstream aggregator can pick the best successful frame-set per (task, seed) across checkpoints.
+    if capture_last_frames and goal_manifest_rows:
+        manifest_path = goal_frames_dir / "manifest.csv"
+        fieldnames = ["task", "seed", "decoder", "success", "camera0", "camera1", "camera2"]
+        write_header = not manifest_path.exists()
+        with open(manifest_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            if write_header:
+                writer.writeheader()
+            writer.writerows(goal_manifest_rows)
+        info["goal_frames_saved"] = len(goal_manifest_rows)
 
     return info
 
