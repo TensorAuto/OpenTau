@@ -278,6 +278,13 @@ class PI05MemConfig(PreTrainedConfig):
                 raise ValueError(
                     f"`motion_window` must be 3 positive ints (L, kh, kw), got {self.motion_window}."
                 )
+            if any(w % 2 == 0 for w in self.motion_window):
+                raise ValueError(
+                    "`motion_window` dims (L, kh, kw) must all be ODD: each STSS axis builds a "
+                    "centered window of 2*(k//2)+1 entries and the temporal unfold only yields T "
+                    f"windows for an odd span, so an even dim crashes at the first forward. Got "
+                    f"{self.motion_window}."
+                )
             if self.motion_window[1] != self.motion_window[2]:
                 raise ValueError(
                     f"`motion_window` spatial dims must be square, got {self.motion_window[1:]}."

@@ -166,6 +166,17 @@ class TestMotionModule:
         with pytest.raises(ValueError, match="Unknown norm"):
             MotionModule(d_in=48, d_hid=32, d_out=48, norm="badnorm")
 
+    @pytest.mark.parametrize("window", [(4, 9, 9), (2, 9, 9), (5, 8, 8), (5, 9, 9, 9)])
+    def test_even_or_malformed_window_raises(self, window):
+        """Even temporal or spatial dims silently change the STSS entry count and
+        crash at forward; reject them at construction instead."""
+        with pytest.raises(ValueError, match="odd|positive odd"):
+            MotionModule(d_in=48, d_hid=32, d_out=48, window=window)
+
+    def test_non_square_window_raises_in_module(self):
+        with pytest.raises(ValueError, match="square"):
+            MotionModule(d_in=48, d_hid=32, d_out=48, window=(5, 9, 7))
+
     @pytest.mark.parametrize("corr_func", ["cosine", "dotproduct", "dotproduct_softmax"])
     def test_corr_func_variants(self, corr_func):
         x, grid = self._inputs(d_in=48)
@@ -394,6 +405,11 @@ class TestRLDXMotionConfig:
     def test_non_square_window_raises(self):
         with pytest.raises(ValueError, match="square"):
             self._cfg(use_motion=True, motion_window=(5, 9, 7))
+
+    @pytest.mark.parametrize("window", [(4, 9, 9), (5, 8, 8), (2, 9, 9)])
+    def test_even_window_raises(self, window):
+        with pytest.raises(ValueError, match="odd"):
+            self._cfg(use_motion=True, motion_window=window)
 
     def test_bad_window_length_raises(self):
         with pytest.raises(ValueError, match="motion_window"):

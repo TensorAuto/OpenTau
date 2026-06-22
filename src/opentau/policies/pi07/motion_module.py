@@ -356,6 +356,16 @@ class MotionModule(nn.Module):
         zero_init_residual: bool = True,
     ):
         super().__init__()
+        # All window dims must be positive and ODD: each STSS axis builds a
+        # centered window of 2*(k//2)+1 entries, and the temporal unfold only
+        # yields exactly T windows for an odd span. An even dim silently changes
+        # the entry count and crashes downstream (conv channel / einsum batch
+        # mismatch), so reject it up front. Spatial dims must also be square.
+        if len(window) != 3 or any(w < 1 or w % 2 == 0 for w in window):
+            raise ValueError(f"window dims must be positive odd ints (L, kh, kw); got {window}.")
+        if window[1] != window[2]:
+            raise ValueError(f"window spatial dims must be square; got {window[1:]}.")
+
         self.use_layerscale = use_layerscale
         self.layerscale_init = layerscale_init
         self.zero_init_residual = zero_init_residual
