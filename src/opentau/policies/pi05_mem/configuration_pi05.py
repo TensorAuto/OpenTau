@@ -189,10 +189,10 @@ class PI05MemConfig(PreTrainedConfig):
     motion_corr_func: str = "cosine"
     # Number of stacked STSS encoders (their outputs are summed).
     motion_n_encoders: int = 1
-    # Norm inside the STSS 3D convs: "batchnorm" (RLDX default), "groupnorm"
-    # (per-sample, no cross-rank sync — recommended under FSDP/DeepSpeed/multi-rank,
-    # CLAUDE.md rule #5), or "syncbn".
-    motion_norm: str = "batchnorm"
+    # Norm inside the STSS 3D convs: "groupnorm" (default; per-sample, no
+    # cross-rank sync — safe under FSDP/DeepSpeed/multi-rank, CLAUDE.md rule #5),
+    # "batchnorm" (RLDX-1-faithful), or "syncbn".
+    motion_norm: str = "groupnorm"
     # Integration conv: "lite" (single fuse conv) or "full" (3x3 conv stack).
     motion_int_mode: str = "lite"
     # Zero-init the residual so the module starts as a no-op (warm start).

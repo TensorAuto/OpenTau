@@ -41,9 +41,9 @@ Interface (matching the RLDX-1 reference so the math is easy to compare):
         returns:    (sum_i T_i*H_i*W_i, C) residual, same layout as ``x``.
 
 Differences from the RLDX-1 reference, all behind flags:
-  - ``norm``: BatchNorm3d (RLDX default), "groupnorm" (GroupNorm(1, C) — per-sample,
-    no cross-rank stat sync, recommended under FSDP/DeepSpeed/multi-rank; see
-    CLAUDE.md rule #5), or "syncbn".
+  - ``norm`` (default "groupnorm"): GroupNorm(1, C) — per-sample, no cross-rank
+    stat sync, safe under FSDP/DeepSpeed/multi-rank (CLAUDE.md rule #5). Pass
+    "batchnorm" for the RLDX-1-faithful BatchNorm3d, or "syncbn".
   - ``zero_init_residual`` (default True): zero-initializes the output projection
     (or the LayerScale) so the module starts as an exact no-op. A policy
     fine-tuned from a pre-existing pi05 checkpoint is therefore byte-identical at
@@ -195,7 +195,7 @@ class STSSExtraction(nn.Module):
         self,
         window: tuple[int, int, int] = (5, 9, 9),
         chnls: tuple[int, ...] = (256,),
-        norm: _NormKind = "batchnorm",
+        norm: _NormKind = "groupnorm",
     ):
         super().__init__()
         self.window = window
@@ -230,7 +230,7 @@ class STSSIntegration(nn.Module):
         d_in: int,
         window: tuple[int, int, int] = (5, 9, 9),
         chnls: tuple[int, int, int] = (64, 64, 64),
-        norm: _NormKind = "batchnorm",
+        norm: _NormKind = "groupnorm",
         mode: str = "lite",
     ):
         super().__init__()
@@ -295,7 +295,7 @@ class STSSEncoder(nn.Module):
         ext_chnls: tuple[int, ...] = (256,),
         int_chnls: tuple[int, int, int] = (256, 256, 512),
         corr_func: str = "cosine",
-        norm: _NormKind = "batchnorm",
+        norm: _NormKind = "groupnorm",
         int_mode: str = "lite",
     ):
         super().__init__()
@@ -332,7 +332,7 @@ class MotionModule(nn.Module):
         use_layerscale: gate the output with a learnable per-channel LayerScale
             instead of an ``out_proj`` linear.
         layerscale_init: initial LayerScale value (used only with ``use_layerscale``).
-        norm: "batchnorm" (RLDX default) / "groupnorm" (distributed-safe) / "syncbn".
+        norm: "groupnorm" (default, distributed-safe) / "batchnorm" (RLDX-faithful) / "syncbn".
         int_mode: "lite" (single fuse conv) or the full 3x3 conv stack.
         zero_init_residual: when True, zero-initialize the residual output so the
             module starts as an exact no-op (warm start from a pretrained
@@ -351,7 +351,7 @@ class MotionModule(nn.Module):
         n_encoders: int = 1,
         use_layerscale: bool = False,
         layerscale_init: float = 1e-5,
-        norm: _NormKind = "batchnorm",
+        norm: _NormKind = "groupnorm",
         int_mode: str = "lite",
         zero_init_residual: bool = True,
     ):

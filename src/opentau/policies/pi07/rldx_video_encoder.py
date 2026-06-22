@@ -40,10 +40,12 @@ Notes:
     trainable even when the SigLIP tower is frozen by the caller.
   - Motion runs only when there is a real time axis (``T > 1``); at ``T = 1``
     the encoder is a plain single-frame SigLIP forward.
-  - ``obs_history_is_pad`` is accepted for API parity but unused: with no
-    temporal attention there are no cross-frame attention scores to mask.
-    Padded history frames only influence the motion residual via the STSS
-    correlation window (matching the RLDX-1 reference, which does not mask them).
+  - ``obs_history_is_pad`` is honored: padded (start-of-episode zero) frames are
+    replaced by the nearest real frame before the STSS correlation, so they
+    contribute "no motion" instead of spurious motion against a blank frame.
+    This mirrors the space-time encoder, which masks exactly these frames out of
+    temporal attention. (The RLDX-1 reference does not mask them; we do, to avoid
+    a train/inference distribution mismatch at episode start.)
 """
 
 import torch
@@ -81,8 +83,8 @@ class RLDXVideoEncoder(nn.Module):
             size must fit the patch grid.
         motion_corr_func: "cosine" / "dotproduct" / "dotproduct_softmax".
         motion_n_encoders: Number of stacked STSS encoders (outputs summed).
-        motion_norm: "batchnorm" (RLDX default) / "groupnorm" (per-sample, no
-            cross-rank sync — recommended under FSDP/DeepSpeed/multi-rank) / "syncbn".
+        motion_norm: "groupnorm" (default; per-sample, no cross-rank sync — safe
+            under FSDP/DeepSpeed/multi-rank) / "batchnorm" (RLDX-faithful) / "syncbn".
         motion_int_mode: "lite" (single fuse conv) or "full" (3x3 conv stack).
         motion_zero_init: Zero-init the residual so the module starts as a no-op.
     """
@@ -99,7 +101,7 @@ class RLDXVideoEncoder(nn.Module):
         motion_window: tuple[int, int, int] = (5, 9, 9),
         motion_corr_func: str = "cosine",
         motion_n_encoders: int = 1,
-        motion_norm: str = "batchnorm",
+        motion_norm: str = "groupnorm",
         motion_int_mode: str = "lite",
         motion_zero_init: bool = True,
     ):
@@ -161,23 +163,45 @@ class RLDXVideoEncoder(nn.Module):
     def multi_modal_projector(self) -> nn.Module:
         return self._multi_modal_projector_ref[0]
 
-    def _apply_motion(self, hidden: Tensor, b: int, t: int) -> Tensor:
+    def _apply_motion(self, hidden: Tensor, b: int, t: int, obs_history_is_pad: Tensor | None) -> Tensor:
         """Add the STSS motion residual to the per-patch hidden states.
 
         Args:
             hidden: ``(B*T, N, D)`` encoder hidden states at the insert layer.
             b: batch size. t: number of frames.
+            obs_history_is_pad: Optional ``(B, T)`` bool mask, ``True`` for padded
+                (start-of-episode zero) frames. When given, padded frames are
+                replaced by the nearest real frame before the STSS correlation,
+                so they contribute "no motion" instead of spurious motion against
+                a blank frame. This mirrors the space-time encoder, which masks
+                exactly these frames out of temporal attention.
         Returns:
             ``(B*T, N, D)`` hidden states with the motion residual added.
         """
         n = hidden.shape[1]
         gh = self.motion_grid_hw
-        # (B*T, N, D) -> (B*T*N, D) preserving the (b t h w) token order the
-        # motion module expects.
-        flat = rearrange(hidden, "bt n d -> (bt n) d")
+        x = rearrange(hidden, "(b t) n d -> b t n d", b=b, t=t)
+
+        # Neutralize padded history frames. The dataloader / select_action
+        # zero-pads the EARLIEST history slots (a prefix) and the current frame
+        # (t=T-1) is always real, so forward-filling each padded frame with the
+        # FIRST real frame removes the blank-frame "jump" the STSS correlation
+        # would otherwise read as motion. Padded frames are dropped after the
+        # encoder anyway; this only protects the current frame's residual.
+        if obs_history_is_pad is not None:
+            real = ~obs_history_is_pad  # (b, t)
+            # First real index per row (argmax returns the first max=1 position).
+            first_real = real.float().argmax(dim=1)  # (b,)
+            fill = x[torch.arange(b, device=x.device), first_real]  # (b, n, d)
+            pad_mask = rearrange(obs_history_is_pad, "b t -> b t 1 1")
+            x = torch.where(pad_mask, rearrange(fill, "b n d -> b 1 n d"), x)
+
+        # (B, T, N, D) -> (B*T*N, D), preserving the (b t h w) token order the
+        # motion module expects (n is the row-major (h w) patch grid).
+        flat = rearrange(x, "b t n d -> (b t n) d")
         grid_sizes = torch.tensor([[t, gh, gh]] * b, dtype=torch.long, device=hidden.device)
         residual = self.motion_module(flat, grid_sizes)  # (B*T*N, D)
-        residual = rearrange(residual, "(bt n) d -> bt n d", n=n)
+        residual = rearrange(residual, "(b t n) d -> (b t) n d", b=b, t=t, n=n)
         return hidden + residual
 
     def forward(self, video: Tensor, obs_history_is_pad: Tensor | None = None) -> Tensor:
@@ -185,8 +209,10 @@ class RLDXVideoEncoder(nn.Module):
 
         Args:
             video: ``(B, T, C, H, W)`` pixel values in ``[0, 1]``.
-            obs_history_is_pad: Accepted for API parity; unused (no temporal
-                attention to mask).
+            obs_history_is_pad: Optional ``(B, T)`` bool mask, ``True`` for padded
+                history frames. Padded frames are replaced by the nearest real
+                frame before the STSS motion correlation so they don't inject
+                spurious motion into the current-frame residual.
 
         Returns:
             ``(B, num_video_tokens, vlm_hidden_size)`` current-frame tokens.
@@ -213,16 +239,16 @@ class RLDXVideoEncoder(nn.Module):
         # updated twice under recompute. Memory stays bounded (runs at one layer).
         run_motion = t > 1
         for idx, layer in enumerate(self.vision_tower.vision_model.encoder.layers):
+            # transformers >= 4.57 ``SiglipEncoderLayer.forward(hidden_states,
+            # attention_mask)`` returns a bare hidden-state tensor (no
+            # ``output_attentions`` arg, no tuple). Matches video_encoder.py.
             if use_ckpt:
-                layer_outputs = torch.utils.checkpoint.checkpoint(
-                    layer, hidden, None, False, use_reentrant=False
-                )
+                hidden = torch.utils.checkpoint.checkpoint(layer, hidden, None, use_reentrant=False)
             else:
-                layer_outputs = layer(hidden, None, False)
-            hidden = layer_outputs[0]
+                hidden = layer(hidden, None)
 
             if run_motion and idx == self.motion_insert_layer:
-                hidden = self._apply_motion(hidden, b, t)
+                hidden = self._apply_motion(hidden, b, t, obs_history_is_pad)
 
         hidden = self.vision_tower.vision_model.post_layernorm(hidden)
 
