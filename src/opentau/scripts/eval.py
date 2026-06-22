@@ -51,9 +51,13 @@ from tqdm import trange
 
 from opentau.configs import parser
 from opentau.configs.train import TrainPipelineConfig
-from opentau.envs.configs import LiberoEnv
+from opentau.envs.configs import LiberoEnv, RoboCasaEnv
 from opentau.envs.factory import make_envs
-from opentau.envs.subgoal import LiberoLastFrameSubgoalGenerator, SubgoalImageGenerator
+from opentau.envs.subgoal import (
+    LiberoLastFrameSubgoalGenerator,
+    RoboCasaGoalFrameSubgoalGenerator,
+    SubgoalImageGenerator,
+)
 from opentau.envs.utils import (
     add_envs_task,
     add_eval_metadata,
@@ -167,7 +171,7 @@ def rollout(
         # every step. Matches the "once per episode reset" cadence — each
         # `rollout()` call corresponds to one `env.reset()`.
         if subgoal_generator is not None and not subgoal_episode_picked:
-            subgoal_generator.start_episode(observation["prompt"])
+            subgoal_generator.start_episode(observation["prompt"], seeds)
             subgoal_episode_picked = True
         observation = add_subgoal_images(observation, subgoal_generator)
 
@@ -834,29 +838,51 @@ def _cleanup_episode_clips(video_paths: list[str], keep: bool) -> None:
 def make_subgoal_generator(cfg: TrainPipelineConfig) -> SubgoalImageGenerator | None:
     """Construct the eval-time subgoal generator from `cfg.env`.
 
-    Returns ``None`` when the env is not a LIBERO env or
-    ``cfg.env.subgoal_source`` is unset — both cases fall back to the
-    policy's missing-key default in ``prepare_subgoal_images``.
+    Dispatch:
+        - LIBERO env with ``cfg.env.subgoal_source`` set ->
+          :class:`LiberoLastFrameSubgoalGenerator` (language-matched random
+          episode last frame).
+        - RoboCasa env with ``cfg.env.subgoal_frames_dirs`` set ->
+          :class:`RoboCasaGoalFrameSubgoalGenerator` (scene-seed-keyed harvested
+          success frame; feeds the goal frame of the exact scene when available).
+        - otherwise ``None`` — the policy's missing-key default in
+          ``prepare_subgoal_images`` (zero subgoals, ``mask=False``) takes over.
 
-    Threads ``cfg.seed`` into the generator's per-instance RNG so the
+    For LIBERO, threads ``cfg.seed`` into the generator's per-instance RNG so the
     per-rollout episode picks are reproducible across runs, and logs the
-    resolved dataset revision so a silent drift between
-    ``CODEBASE_VERSION`` and the source repo is visible in the eval log.
+    resolved dataset revision so a silent drift between ``CODEBASE_VERSION`` and
+    the source repo is visible in the eval log.
     """
-    if not isinstance(cfg.env, LiberoEnv) or cfg.env.subgoal_source is None:
-        return None
-    generator = LiberoLastFrameSubgoalGenerator(
-        repo_id=cfg.env.subgoal_source,
-        resolution=tuple(cfg.resolution),
-        num_cams=cfg.num_cams,
-        seed=cfg.seed,
-    )
-    logging.info(
-        f"[subgoal] Loaded LiberoLastFrameSubgoalGenerator from {cfg.env.subgoal_source!r} "
-        f"(revision={generator.meta.revision!r}, resolution={cfg.resolution}, "
-        f"num_cams={cfg.num_cams}, seed={cfg.seed!r})."
-    )
-    return generator
+    if isinstance(cfg.env, LiberoEnv) and cfg.env.subgoal_source is not None:
+        generator = LiberoLastFrameSubgoalGenerator(
+            repo_id=cfg.env.subgoal_source,
+            resolution=tuple(cfg.resolution),
+            num_cams=cfg.num_cams,
+            seed=cfg.seed,
+        )
+        logging.info(
+            f"[subgoal] Loaded LiberoLastFrameSubgoalGenerator from {cfg.env.subgoal_source!r} "
+            f"(revision={generator.meta.revision!r}, resolution={cfg.resolution}, "
+            f"num_cams={cfg.num_cams}, seed={cfg.seed!r})."
+        )
+        return generator
+
+    if isinstance(cfg.env, RoboCasaEnv) and getattr(cfg.env, "subgoal_frames_dirs", None) is not None:
+        dirs = [d.strip() for d in str(cfg.env.subgoal_frames_dirs).split(",") if d.strip()]
+        generator = RoboCasaGoalFrameSubgoalGenerator(
+            manifest_dirs=dirs,
+            task=str(cfg.env.task),
+            resolution=tuple(cfg.resolution),
+            num_cams=cfg.num_cams,
+        )
+        logging.info(
+            f"[subgoal] Loaded RoboCasaGoalFrameSubgoalGenerator for task={cfg.env.task!r} from "
+            f"{len(dirs)} dir(s): indexed {generator.num_scenes} scene seed(s), cameras "
+            f"{generator.camera_indices} (resolution={cfg.resolution}, num_cams={cfg.num_cams})."
+        )
+        return generator
+
+    return None
 
 
 @parser.wrap()

@@ -30,13 +30,16 @@ when the dataset metadata cannot be reached so the CPU CI subset stays
 green on hosts without cluster cache.
 """
 
+import csv
 import random
 from unittest.mock import MagicMock, patch
 
+import imageio.v2 as imageio
+import numpy as np
 import pytest
 import torch
 
-from opentau.envs.subgoal import LiberoLastFrameSubgoalGenerator
+from opentau.envs.subgoal import LiberoLastFrameSubgoalGenerator, RoboCasaGoalFrameSubgoalGenerator
 from opentau.envs.utils import add_subgoal_images
 
 # Two real LIBERO task strings from the libero_spatial suite — picked so
@@ -377,6 +380,172 @@ class TestAddSubgoalImages:
         assert out is obs  # mutated in place
         new_keys = set(out.keys()) - original_keys
         assert new_keys == {"subgoal0", "subgoal1", "subgoal_is_pad"}
+
+
+# ---------------------------------------------------------------------------
+# RoboCasaGoalFrameSubgoalGenerator: scene-seed-keyed harvested-frame serving.
+# Builds a tiny on-disk goal_frames/ dir (manifest.csv + solid-color pngs) per
+# test so nothing touches the network or real harvest output.
+# ---------------------------------------------------------------------------
+_TASK = "CloseFridge"
+_OTHER_TASK = "OpenDrawer"
+
+
+def _write_goal_frames_dir(
+    tmp_path,
+    *,
+    rows: list[dict],
+    name: str = "gf",
+    src_hw: tuple[int, int] = (48, 64),
+    n_cams: int = 3,
+):
+    """Create a ``goal_frames/`` dir: a manifest.csv + one solid-color png per cell.
+
+    Each row dict needs ``task``, ``seed``, ``decoder``, ``success`` and a
+    per-camera fill value under ``fill`` (0-255) used to write distinguishable
+    solid frames. Returns the directory path (str).
+    """
+    d = tmp_path / name
+    d.mkdir(parents=True, exist_ok=True)
+    cam_cols = [f"camera{k}" for k in range(n_cams)]
+    fieldnames = ["task", "seed", "decoder", "success", *cam_cols]
+    with open(d / "manifest.csv", "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            out = {
+                "task": row["task"],
+                "seed": row["seed"],
+                "decoder": row["decoder"],
+                "success": row.get("success", 1),
+            }
+            if str(out["success"]).strip().lower() in ("1", "true"):
+                fill = int(row.get("fill", 200))
+                for k, col in enumerate(cam_cols):
+                    fname = f"{row['task']}__seed{row['seed']}__{row['decoder']}__{col}.png"
+                    frame = np.full((*src_hw, 3), min(255, fill + k * 10), dtype=np.uint8)
+                    imageio.imwrite(d / fname, frame)
+                    out[col] = fname
+            writer.writerow(out)
+    return str(d)
+
+
+def _make_obs_rc(batch_size: int, *, device: str = "cpu", dtype=torch.float32) -> dict:
+    return {"state": torch.zeros(batch_size, 16, device=device, dtype=dtype)}
+
+
+class TestRoboCasaGoalFrameGeneratorIndex:
+    def test_indexes_only_matching_task_and_successes(self, tmp_path):
+        rows = [
+            {"task": _TASK, "seed": 705, "decoder": "flow", "success": 1},
+            {"task": _TASK, "seed": 706, "decoder": "flow", "success": 0},  # failure: skipped
+            {"task": _OTHER_TASK, "seed": 705, "decoder": "flow", "success": 1},  # other task: skipped
+        ]
+        d = _write_goal_frames_dir(tmp_path, rows=rows)
+        gen = RoboCasaGoalFrameSubgoalGenerator([d], task=_TASK, resolution=(32, 32), num_cams=3)
+        assert gen.num_scenes == 1
+        assert set(gen._index) == {705}
+        assert gen.camera_indices == [0, 1, 2]
+
+    def test_decoder_preference_flow_over_discrete(self, tmp_path):
+        rows = [
+            {"task": _TASK, "seed": 705, "decoder": "discrete", "success": 1, "fill": 10},
+            {"task": _TASK, "seed": 705, "decoder": "flow", "success": 1, "fill": 250},
+        ]
+        d = _write_goal_frames_dir(tmp_path, rows=rows)
+        gen = RoboCasaGoalFrameSubgoalGenerator([d], task=_TASK, num_cams=3)
+        assert gen._decoder[705] == "flow"
+
+    def test_union_across_dirs(self, tmp_path):
+        d1 = _write_goal_frames_dir(
+            tmp_path, rows=[{"task": _TASK, "seed": 705, "decoder": "flow", "success": 1}], name="gf1"
+        )
+        d2 = _write_goal_frames_dir(
+            tmp_path, rows=[{"task": _TASK, "seed": 712, "decoder": "flow", "success": 1}], name="gf2"
+        )
+        gen = RoboCasaGoalFrameSubgoalGenerator([d1, d2], task=_TASK)
+        assert set(gen._index) == {705, 712}
+
+    def test_num_cams_caps_emitted_cameras(self, tmp_path):
+        d = _write_goal_frames_dir(
+            tmp_path, rows=[{"task": _TASK, "seed": 705, "decoder": "flow", "success": 1}], n_cams=3
+        )
+        gen = RoboCasaGoalFrameSubgoalGenerator([d], task=_TASK, num_cams=2)
+        assert gen.camera_indices == [0, 1]
+
+
+class TestRoboCasaGoalFrameGeneratorCall:
+    def _gen(self, tmp_path, **kw):
+        rows = [
+            {"task": _TASK, "seed": 705, "decoder": "flow", "success": 1},
+            {"task": _TASK, "seed": 712, "decoder": "flow", "success": 1},
+        ]
+        d = _write_goal_frames_dir(tmp_path, rows=rows)
+        return RoboCasaGoalFrameSubgoalGenerator([d], task=_TASK, **kw)
+
+    def test_serves_frame_for_known_seed_pads_unknown(self, tmp_path):
+        gen = self._gen(tmp_path, resolution=(32, 32), num_cams=3)
+        obs = _make_obs_rc(3)
+        # env0=known(705), env1=unknown(999), env2=known(712)
+        gen.start_episode(["close fridge"] * 3, seeds=[705, 999, 712])
+        out = gen(obs)
+        assert set(out) == {"subgoal0", "subgoal1", "subgoal2", "subgoal_is_pad"}
+        assert out["subgoal_is_pad"].tolist() == [False, True, False]
+        # Known envs carry a non-zero frame; the padded env stays all-zero.
+        assert float(out["subgoal0"][0].abs().sum()) > 0
+        assert float(out["subgoal0"][1].abs().sum()) == 0
+        assert float(out["subgoal0"][2].abs().sum()) > 0
+
+    def test_shape_dtype_value_range(self, tmp_path):
+        gen = self._gen(tmp_path, resolution=(48, 64), num_cams=3)
+        obs = _make_obs_rc(2, dtype=torch.bfloat16)
+        gen.start_episode(["x", "x"], seeds=[705, 712])
+        out = gen(obs)
+        for k in (0, 1, 2):
+            t = out[f"subgoal{k}"]
+            assert t.shape == (2, 3, 48, 64)
+            assert t.dtype == torch.bfloat16
+            assert float(t.min()) >= 0.0
+            assert float(t.max()) <= 1.0
+        assert out["subgoal_is_pad"].dtype == torch.bool
+
+    def test_none_seeds_pads_all(self, tmp_path):
+        gen = self._gen(tmp_path, resolution=(16, 16))
+        obs = _make_obs_rc(2)
+        gen.start_episode(["x", "x"], seeds=None)
+        out = gen(obs)
+        assert out["subgoal_is_pad"].all()
+        assert float(out["subgoal0"].abs().sum()) == 0
+
+    def test_caches_decoded_frames(self, tmp_path):
+        gen = self._gen(tmp_path, resolution=(16, 16))
+        obs = _make_obs_rc(2)
+        gen.start_episode(["x", "x"], seeds=[705, 712])
+        with patch.object(gen, "_load_frame", wraps=gen._load_frame) as load_spy:
+            gen(obs)
+            gen(obs)
+            # 2 seeds x 3 cams = 6 distinct paths loaded once; second call cached.
+            assert load_spy.call_count == 6
+
+    def test_call_without_start_episode_raises(self, tmp_path):
+        gen = self._gen(tmp_path)
+        with pytest.raises(RuntimeError, match="start_episode"):
+            gen(_make_obs_rc(1))
+
+    def test_batch_mismatch_raises(self, tmp_path):
+        gen = self._gen(tmp_path)
+        gen.start_episode(["x", "x"], seeds=[705, 712])
+        with pytest.raises(ValueError, match="batch size"):
+            gen(_make_obs_rc(4))
+
+    def test_add_subgoal_images_merges(self, tmp_path):
+        gen = self._gen(tmp_path, resolution=(16, 16), num_cams=3)
+        obs = _make_obs_rc(2)
+        original_keys = set(obs)
+        gen.start_episode(["x", "x"], seeds=[705, 712])
+        out = add_subgoal_images(obs, gen)
+        assert out is obs
+        assert set(out) - original_keys == {"subgoal0", "subgoal1", "subgoal2", "subgoal_is_pad"}
 
 
 # ---------------------------------------------------------------------------
