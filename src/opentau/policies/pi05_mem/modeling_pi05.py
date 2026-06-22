@@ -54,6 +54,7 @@ from opentau.policies.pi05.paligemma_with_expert import (
     PaliGemmaWithExpertModel,
 )
 from opentau.policies.pi05_mem.configuration_pi05 import PI05MemConfig
+from opentau.policies.pi05_mem.rldx_video_encoder import RLDXVideoEncoder
 from opentau.policies.pi07.video_encoder import SpaceTimeSiglipVideoEncoder
 from opentau.policies.pretrained import PreTrainedPolicy, T
 from opentau.policies.utils import PerSampleLoss, ce_per_sample, flow_matching_masked_mse
@@ -896,13 +897,32 @@ class PI05MemFlowMatching(nn.Module):
         # Freezing and dtype-casting of these modules are already handled by
         # ``PaliGemmaWithExpertModel``. The encoder introduces no new learnable
         # parameters, so a regular pi05 checkpoint's state_dict loads directly.
-        self.video_encoder = SpaceTimeSiglipVideoEncoder(
-            vision_tower=self.paligemma_with_expert.paligemma.vision_tower,
-            multi_modal_projector=self.paligemma_with_expert.paligemma.multi_modal_projector,
-            max_num_frames=config.n_obs_steps,
-            spacetime_layer_stride=config.spacetime_layer_stride,
-            gradient_checkpointing=config.gradient_checkpointing,
-        )
+        if config.use_motion:
+            # RLDX-1 STSS motion variant: plain SigLIP + STSS motion module, NO
+            # space-time attention layers. Lives in rldx_video_encoder.py; the
+            # base space-time encoder is left untouched.
+            self.video_encoder = RLDXVideoEncoder(
+                vision_tower=self.paligemma_with_expert.paligemma.vision_tower,
+                multi_modal_projector=self.paligemma_with_expert.paligemma.multi_modal_projector,
+                max_num_frames=config.n_obs_steps,
+                gradient_checkpointing=config.gradient_checkpointing,
+                motion_insert_layer=config.motion_insert_layer,
+                motion_hidden_dim=config.motion_hidden_dim,
+                motion_window=config.motion_window,
+                motion_corr_func=config.motion_corr_func,
+                motion_n_encoders=config.motion_n_encoders,
+                motion_norm=config.motion_norm,
+                motion_int_mode=config.motion_int_mode,
+                motion_zero_init=config.motion_zero_init,
+            )
+        else:
+            self.video_encoder = SpaceTimeSiglipVideoEncoder(
+                vision_tower=self.paligemma_with_expert.paligemma.vision_tower,
+                multi_modal_projector=self.paligemma_with_expert.paligemma.multi_modal_projector,
+                max_num_frames=config.n_obs_steps,
+                spacetime_layer_stride=config.spacetime_layer_stride,
+                gradient_checkpointing=config.gradient_checkpointing,
+            )
 
         # Per-timestep state projection: each of the T state vectors becomes one token
         self.state_proj = nn.Linear(self.config.max_state_dim, vlm_hidden_size)
