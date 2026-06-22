@@ -173,7 +173,11 @@ class STSSTransformation(nn.Module):
             x_tgt = x_pad.unfold(1, self.window[0], 1)
             x_tgt = rearrange(x_tgt, "b t c h w l -> (b t l) c h w")
         else:
-            x_src = x
+            # L=1: correlate each frame against the previous one (frame 0 against
+            # itself). Both operands must be 4D (b t) c h w for ``_correlation``'s
+            # einsum — rearrange x_src too (do NOT keep the raw 2D input), so it
+            # lines up with the l=1 case of the trailing stss rearrange.
+            x_src = rearrange(x, "(b t h w) c -> (b t) c h w", t=t, h=h, w=w)
             x = rearrange(x, "(b t h w) c -> b t c h w", t=t, h=h, w=w)
             x_tgt = torch.cat((x[:, 0].unsqueeze(1), x[:, :-1]), 1)
             x_tgt = rearrange(x_tgt, "b t c h w -> (b t) c h w")
