@@ -21,7 +21,7 @@ encoder layer. The motion module is the *only* cross-frame mechanism here:
 unlike :class:`~opentau.policies.pi07.video_encoder.SpaceTimeSiglipVideoEncoder`,
 this encoder has **no space-time / temporal attention layers** — the SigLIP
 tower is left exactly as pretrained, and temporal dynamics are captured solely
-by the STSS motion module (see :mod:`opentau.policies.pi07.motion_module`).
+by the STSS motion module (see :mod:`opentau.policies.pi05_mem.motion_module`).
 
 It deliberately does not subclass or import the space-time encoder, so the two
 implementations stay fully independent.
@@ -57,7 +57,7 @@ from transformers.models.siglip.modeling_siglip import SiglipVisionModel
 # scaling stock HuggingFace applies after the multi_modal_projector, matching
 # the rest of the OpenTau vision path.
 import opentau.utils.transformers_patch  # noqa: F401
-from opentau.policies.pi07.motion_module import MotionModule
+from opentau.policies.pi05_mem.motion_module import MotionModule
 
 
 class RLDXVideoEncoder(nn.Module):

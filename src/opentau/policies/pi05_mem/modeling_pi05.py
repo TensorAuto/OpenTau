@@ -54,7 +54,7 @@ from opentau.policies.pi05.paligemma_with_expert import (
     PaliGemmaWithExpertModel,
 )
 from opentau.policies.pi05_mem.configuration_pi05 import PI05MemConfig
-from opentau.policies.pi07.rldx_video_encoder import RLDXVideoEncoder
+from opentau.policies.pi05_mem.rldx_video_encoder import RLDXVideoEncoder
 from opentau.policies.pi07.video_encoder import SpaceTimeSiglipVideoEncoder
 from opentau.policies.pretrained import PreTrainedPolicy, T
 from opentau.policies.utils import PerSampleLoss, ce_per_sample, flow_matching_masked_mse

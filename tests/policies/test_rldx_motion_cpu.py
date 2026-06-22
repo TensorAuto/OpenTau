@@ -16,11 +16,11 @@
 
 Covers three layers of the feature:
 
-  * :class:`opentau.policies.pi07.motion_module.MotionModule` in isolation
+  * :class:`opentau.policies.pi05_mem.motion_module.MotionModule` in isolation
     (no SigLIP needed): output shape, zero-init no-op warm start, the L=1 vs
     L>1 temporal-window paths, norm/corr_func/layerscale variants, gradient
     flow, and the ragged (non-uniform grid) batch path.
-  * :class:`opentau.policies.pi07.rldx_video_encoder.RLDXVideoEncoder` on a tiny
+  * :class:`opentau.policies.pi05_mem.rldx_video_encoder.RLDXVideoEncoder` on a tiny
     randomly-initialized SigLIP: it has NO space-time attention layers,
     zero-init is a no-op vs. a plain SigLIP forward, motion fires once un-gated,
     T=1 short-circuits, and ``obs_history_is_pad`` neutralizes padded frames so
@@ -33,8 +33,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from opentau.policies.pi07.motion_module import MotionModule
-from opentau.policies.pi07.rldx_video_encoder import RLDXVideoEncoder
+from opentau.policies.pi05_mem.motion_module import MotionModule
+from opentau.policies.pi05_mem.rldx_video_encoder import RLDXVideoEncoder
 from opentau.policies.pi07.video_encoder import SpaceTimeEncoderLayerWrapper
 
 # ---------------------------------------------------------------------------
