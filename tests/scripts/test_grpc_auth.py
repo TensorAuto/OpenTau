@@ -88,9 +88,7 @@ def _start_echo_server(interceptor):
             response_serializer=lambda b: b,
         ),
     }
-    server.add_generic_rpc_handlers(
-        (grpc.method_handlers_generic_handler("test.Echo", handlers),)
-    )
+    server.add_generic_rpc_handlers((grpc.method_handlers_generic_handler("test.Echo", handlers),))
     port = server.add_insecure_port("[::]:0")
     server.start()
     return server, port
