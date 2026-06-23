@@ -23,7 +23,13 @@ from concurrent import futures
 import grpc
 import pytest
 
-from opentau.scripts.grpc import auth
+# Import via the fully-qualified module path with an alias rather than
+# ``from opentau.scripts.grpc import auth``: the local ``opentau.scripts.grpc``
+# package shares its last path component with the third-party ``grpc`` package,
+# and the "from ... import" form makes some static analyzers resolve the bare
+# ``import grpc`` above to the local package (yielding spurious "imported both
+# ways" / "non-callable" findings on ``grpc.server(...)``).
+import opentau.scripts.grpc.auth as auth
 
 
 def test_extract_api_key():
