@@ -69,7 +69,7 @@ from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.lerobot_dataset import BaseDataset
 from opentau.planner.gemini_er_planner import GeminiERPlanner
 from opentau.policies.factory import get_policy_class
-from opentau.scripts.grpc import robot_inference_pb2, robot_inference_pb2_grpc
+from opentau.scripts.grpc import auth, robot_inference_pb2, robot_inference_pb2_grpc
 from opentau.utils.random_utils import set_seed
 from opentau.utils.utils import (
     attempt_torch_compile,
@@ -541,8 +541,18 @@ def serve(cfg: TrainPipelineConfig):
         cfg: Training pipeline configuration including server settings.
     """
     server_cfg = cfg.server
+
+    # Optional API-key auth, activated by the TUNER_INFERENCE_API_KEY env var.
+    # When unset, the server keeps its historical no-auth behavior.
+    interceptors = []
+    auth_interceptor = auth.interceptor_from_env()
+    if auth_interceptor is not None:
+        interceptors.append(auth_interceptor)
+        logger.info("API-key authentication enabled (require %s header)", auth.API_KEY_HEADER)
+
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=server_cfg.max_workers),
+        interceptors=interceptors,
         options=[
             ("grpc.max_send_message_length", server_cfg.max_send_message_length),
             ("grpc.max_receive_message_length", server_cfg.max_receive_message_length),
