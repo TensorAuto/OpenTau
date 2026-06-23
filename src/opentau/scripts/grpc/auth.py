@@ -27,6 +27,7 @@ stack) so the auth logic can be unit-tested cheaply, CPU-only.
 
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 
@@ -57,9 +58,18 @@ def extract_api_key(metadata) -> str | None:
 
 
 def is_authorized(metadata, expected_key: str) -> bool:
-    """Whether ``metadata`` carries the expected api key."""
+    """Whether ``metadata`` carries the expected api key.
+
+    The comparison uses :func:`hmac.compare_digest` so it runs in constant time
+    with respect to the secret, avoiding leaking key length/prefix information
+    through timing (this guards a public endpoint).
+    """
     provided = extract_api_key(metadata)
-    return provided is not None and provided == expected_key
+    if provided is None:
+        return False
+    # compare_digest needs both operands the same type; bytes is robust to
+    # non-ASCII values that would make the str overload raise TypeError.
+    return hmac.compare_digest(provided.encode("utf-8"), expected_key.encode("utf-8"))
 
 
 class ApiKeyInterceptor(grpc.ServerInterceptor):

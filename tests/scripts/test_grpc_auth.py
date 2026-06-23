@@ -65,13 +65,25 @@ def _start_echo_server(interceptor):
     def _echo(request, context):
         return request
 
-    handler = grpc.unary_unary_rpc_method_handler(
-        _echo,
-        request_deserializer=lambda b: b,
-        response_serializer=lambda b: b,
-    )
+    def _echo_stream(request_iterator, context):
+        yield from request_iterator
+
+    handlers = {
+        # unary_unary RPC.
+        "Ping": grpc.unary_unary_rpc_method_handler(
+            _echo,
+            request_deserializer=lambda b: b,
+            response_serializer=lambda b: b,
+        ),
+        # stream_stream RPC, mirroring the real server's StreamActionChunks.
+        "PingStream": grpc.stream_stream_rpc_method_handler(
+            _echo_stream,
+            request_deserializer=lambda b: b,
+            response_serializer=lambda b: b,
+        ),
+    }
     server.add_generic_rpc_handlers(
-        (grpc.method_handlers_generic_handler("test.Echo", {"Ping": handler}),)
+        (grpc.method_handlers_generic_handler("test.Echo", handlers),)
     )
     port = server.add_insecure_port("[::]:0")
     server.start()
@@ -84,10 +96,24 @@ def _ping(port, metadata):
         return call(b"hello", metadata=metadata)
 
 
+def _ping_stream(port, metadata):
+    with grpc.insecure_channel(f"localhost:{port}") as channel:
+        call = channel.stream_stream("/test.Echo/PingStream")
+        return list(call(iter([b"hello", b"world"]), metadata=metadata))
+
+
 def test_valid_key_passes_through():
     server, port = _start_echo_server(auth.ApiKeyInterceptor("secret"))
     try:
         assert _ping(port, ((auth.API_KEY_HEADER, "secret"),)) == b"hello"
+    finally:
+        server.stop(None)
+
+
+def test_valid_key_passes_through_streaming():
+    server, port = _start_echo_server(auth.ApiKeyInterceptor("secret"))
+    try:
+        assert _ping_stream(port, ((auth.API_KEY_HEADER, "secret"),)) == [b"hello", b"world"]
     finally:
         server.stop(None)
 
@@ -98,6 +124,19 @@ def test_missing_or_wrong_key_unauthenticated(metadata):
     try:
         with pytest.raises(grpc.RpcError) as exc:
             _ping(port, metadata)
+        assert exc.value.code() == grpc.StatusCode.UNAUTHENTICATED
+    finally:
+        server.stop(None)
+
+
+@pytest.mark.parametrize("metadata", [(), (("x-tuner-api-key", "wrong"),)])
+def test_missing_or_wrong_key_unauthenticated_streaming(metadata):
+    # The deny handler is unary_unary only, but context.abort() fires before the
+    # request stream is read, so it must reject stream_stream RPCs too.
+    server, port = _start_echo_server(auth.ApiKeyInterceptor("secret"))
+    try:
+        with pytest.raises(grpc.RpcError) as exc:
+            _ping_stream(port, metadata)
         assert exc.value.code() == grpc.StatusCode.UNAUTHENTICATED
     finally:
         server.stop(None)
