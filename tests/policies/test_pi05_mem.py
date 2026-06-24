@@ -18,11 +18,14 @@ import numpy as np
 import pytest
 import torch
 
+from opentau.policies.pi05.paligemma_with_expert import apply_rope
 from opentau.policies.pi05_mem.configuration_pi05 import PI05MemConfig
 from opentau.policies.pi05_mem.modeling_pi05 import (
     PI05MemPolicy,
+    build_mrope_prefix_positions,
     create_sinusoidal_pos_embedding,
     make_att_2d_masks,
+    mrope_suffix_position_ids,
     pad_discrete_tokens,
     resize_with_pad,
 )
@@ -84,6 +87,16 @@ class TestPI05MemConfig:
     def test_action_delta_indices(self):
         config = PI05MemConfig(chunk_size=10, n_action_steps=10)
         assert config.action_delta_indices == list(range(10))
+
+    def test_rope_type_default_is_mrope_interleaved(self):
+        assert PI05MemConfig().rope_type == "mrope_interleaved"
+
+    def test_rope_type_accepts_rope(self):
+        assert PI05MemConfig(rope_type="rope").rope_type == "rope"
+
+    def test_rope_type_invalid_raises(self):
+        with pytest.raises(ValueError, match="rope_type"):
+            PI05MemConfig(rope_type="rope2d")
 
 
 class TestHelperFunctions:
@@ -368,7 +381,7 @@ def _make_embed_prefix_stub():
     fm.embed_video = lambda video, obs_history_is_pad=None: torch.zeros(
         video.shape[0], n_video_tokens, hidden, dtype=torch.float32
     )
-    fm.config = types.SimpleNamespace(discrete_action_max_length=2)
+    fm.config = types.SimpleNamespace(discrete_action_max_length=2, rope_type="rope")
     return fm
 
 
@@ -407,7 +420,7 @@ class TestStateMaskCurrentStepAlwaysReal:
         kwargs = _embed_prefix_default_inputs(batch_size=bsize, t_state=t_state)
         kwargs["obs_history_is_pad"] = torch.ones(bsize, t_state, dtype=torch.bool)
 
-        _, pad_masks, _ = PI05MemFlowMatching.embed_prefix(fake, **kwargs)
+        _, pad_masks, _, _ = PI05MemFlowMatching.embed_prefix(fake, **kwargs)
 
         state_slice = _state_slice_indices(prompt_len=3, n_video_tokens=3, t_state=t_state)
         state_mask = pad_masks[:, state_slice]
@@ -464,7 +477,7 @@ class TestStateMaskCurrentStepAlwaysReal:
         kwargs = _embed_prefix_default_inputs(batch_size=bsize, t_state=t_state)
         kwargs["obs_history_is_pad"] = None
 
-        _, pad_masks, _ = PI05MemFlowMatching.embed_prefix(fake, **kwargs)
+        _, pad_masks, _, _ = PI05MemFlowMatching.embed_prefix(fake, **kwargs)
 
         state_slice = _state_slice_indices(prompt_len=3, n_video_tokens=3, t_state=t_state)
         state_mask = pad_masks[:, state_slice]
@@ -488,7 +501,7 @@ class TestStateMaskCurrentStepAlwaysReal:
         kwargs = _embed_prefix_default_inputs(batch_size=bsize, t_state=t_state)
         kwargs["obs_history_is_pad"] = torch.tensor([[True, True, False, False], [True, False, False, False]])
 
-        _, pad_masks, _ = PI05MemFlowMatching.embed_prefix(fake, **kwargs)
+        _, pad_masks, _, _ = PI05MemFlowMatching.embed_prefix(fake, **kwargs)
 
         state_slice = _state_slice_indices(prompt_len=3, n_video_tokens=3, t_state=t_state)
         state_mask = pad_masks[:, state_slice]
@@ -703,3 +716,154 @@ class TestPI05MemExecutionHorizon:
         a_next = PI05MemPolicy.select_action(policy, batch)
         assert calls["n"] == 2
         assert a_next[0, 0].item() == 2000.0
+
+
+def _reference_interleaved_mrope(x, positions, max_wavelength=10_000):
+    """Independent reference for interleaved MRoPE used to pin ``apply_rope``.
+
+    Frequency band ``i`` is driven by axis ``i % A`` (round-robin over the
+    temporal/height/width axes), using the same split-half rotation convention
+    as ``apply_rope``.
+    """
+    d_half = x.shape[-1] // 2
+    x = x.to(torch.float32)
+    freq_exponents = (2.0 / x.shape[-1]) * torch.arange(d_half, dtype=torch.float32)
+    timescale = max_wavelength**freq_exponents
+    n_axes = positions.shape[0]
+    radians = torch.empty(x.shape[0], x.shape[1], d_half, dtype=torch.float32)
+    for i in range(d_half):
+        radians[..., i] = positions[i % n_axes].to(torch.float32) / timescale[i]
+    radians = radians[..., None, :]
+    sin, cos = torch.sin(radians), torch.cos(radians)
+    x1, x2 = x.split(d_half, dim=-1)
+    res = torch.empty_like(x)
+    res[..., :d_half] = x1 * cos - x2 * sin
+    res[..., d_half:] = x2 * cos + x1 * sin
+    return res
+
+
+class TestInterleavedMRoPE:
+    """Unit tests for the interleaved-MRoPE position machinery (rope_type=
+    'mrope_interleaved'). All pure-tensor — no PaliGemma init required."""
+
+    def test_apply_rope_degenerates_to_1d_when_axes_equal(self):
+        """MRoPE with t == h == w must be bit-identical to 1-D RoPE — this is
+        the guarantee that text-style tokens rotate exactly as before, so a
+        'rope' checkpoint's non-video tokens are unchanged."""
+        torch.manual_seed(0)
+        b, length, heads, dim = 2, 5, 3, 8
+        x = torch.randn(b, length, heads, dim)
+        pos_1d = torch.arange(length).expand(b, length)  # [B, L]
+
+        out_1d = apply_rope(x, pos_1d)
+        out_mrope = apply_rope(x, torch.stack([pos_1d, pos_1d, pos_1d], dim=0))  # [3, B, L]
+
+        torch.testing.assert_close(out_1d, out_mrope, rtol=0, atol=0)
+
+    def test_apply_rope_matches_reference_with_distinct_axes(self):
+        """With distinct (t, h, w), ``apply_rope`` must match the independent
+        round-robin reference. dim=12 -> d_half=6 -> every axis owns >=1 band."""
+        torch.manual_seed(1)
+        b, length, heads, dim = 2, 4, 2, 12
+        x = torch.randn(b, length, heads, dim)
+        t = torch.randint(0, 7, (b, length))
+        h = torch.randint(0, 7, (b, length))
+        w = torch.randint(0, 7, (b, length))
+        positions = torch.stack([t, h, w], dim=0)  # [3, B, L]
+
+        torch.testing.assert_close(apply_rope(x, positions), _reference_interleaved_mrope(x, positions))
+
+    def test_apply_rope_unused_axis_does_not_change_output(self):
+        """dim=8 -> d_half=4 -> bands use axes [t, h, w, t]; the w axis still
+        participates (band 2). dim=4 -> d_half=2 -> bands [t, h] only, so w is
+        unused and perturbing it is a no-op."""
+        torch.manual_seed(2)
+        x = torch.randn(1, 1, 1, 4)  # d_half=2 -> only axes t, h are read
+        base = torch.tensor([[3]])
+        pos_a = torch.stack([base, base + 1, base + 5], dim=0)
+        pos_b = torch.stack([base, base + 1, base + 99], dim=0)  # only w differs
+        torch.testing.assert_close(apply_rope(x, pos_a), apply_rope(x, pos_b), rtol=0, atol=0)
+
+    def test_build_prefix_positions_video_then_text(self):
+        """Video block: t=base, h=base+row, w=base+col (row-major). The cursor
+        then advances by ``grid`` (not grid*grid) and text continues 1-D."""
+        grid = 2  # 2x2 = 4 patches
+        video_mask = torch.ones(1, grid * grid, dtype=torch.bool)
+        text_mask = torch.ones(1, 3, dtype=torch.bool)
+
+        pos = build_mrope_prefix_positions([video_mask, text_mask], [True, False], grid)
+
+        assert pos.shape == (3, 1, grid * grid + 3)
+        # Video patches in row-major order: (r, c) = (0,0),(0,1),(1,0),(1,1).
+        torch.testing.assert_close(pos[0, 0], torch.tensor([0, 0, 0, 0, 2, 3, 4]))  # temporal
+        torch.testing.assert_close(pos[1, 0], torch.tensor([0, 0, 1, 1, 2, 3, 4]))  # height
+        torch.testing.assert_close(pos[2, 0], torch.tensor([0, 1, 0, 1, 2, 3, 4]))  # width
+
+    def test_build_prefix_positions_absent_video_does_not_advance(self):
+        """A padded (absent) video must not advance the cursor, so the
+        following text still starts at position 0."""
+        grid = 2
+        video_mask = torch.zeros(1, grid * grid, dtype=torch.bool)  # absent
+        text_mask = torch.ones(1, 3, dtype=torch.bool)
+
+        pos = build_mrope_prefix_positions([video_mask, text_mask], [True, False], grid)
+
+        # Text begins at cursor 0 (video advanced nothing). The video block
+        # still carries h/w spatial structure (masked downstream, not zeroed),
+        # so only the text region is text-style (t == h == w).
+        torch.testing.assert_close(pos[0, 0, -3:], torch.tensor([0, 1, 2]))
+        assert torch.equal(pos[0, :, -3:], pos[1, :, -3:])
+        assert torch.equal(pos[1, :, -3:], pos[2, :, -3:])
+
+    def test_build_prefix_positions_text_padding_advances_by_real_tokens(self):
+        """Padded text tokens repeat the prior position and don't advance the
+        cursor; only real tokens do (mirrors cumsum(pad_masks) - 1)."""
+        text_mask = torch.tensor([[True, False, True]])  # 2 real tokens
+        next_mask = torch.ones(1, 2, dtype=torch.bool)
+
+        pos = build_mrope_prefix_positions([text_mask, next_mask], [False, False], grid=2)
+
+        # local cumsum(mask)-1 = [0, 0, 1]; cursor advances by 2 -> next [2, 3].
+        torch.testing.assert_close(pos[0, 0], torch.tensor([0, 0, 1, 2, 3]))
+
+    def test_build_prefix_positions_per_sample_video_presence(self):
+        """Video presence is per-sample: an absent video for one sample must
+        not advance that sample's cursor while the present one advances by
+        grid."""
+        grid = 2
+        video_mask = torch.tensor([[True] * 4, [False] * 4])  # sample 0 present, 1 absent
+        text_mask = torch.ones(2, 2, dtype=torch.bool)
+
+        pos = build_mrope_prefix_positions([video_mask, text_mask], [True, False], grid)
+
+        # Sample 0: text after grid -> [2, 3]; sample 1: text from 0 -> [0, 1].
+        torch.testing.assert_close(pos[0, :, -2:], torch.tensor([[2, 3], [0, 1]]))
+
+    def test_suffix_positions_continue_from_prefix_max(self):
+        """Suffix offset = max prefix position over the cross region + 1, and
+        the suffix is text-style (t == h == w)."""
+        grid = 2
+        video_mask = torch.ones(1, grid * grid, dtype=torch.bool)
+        text_mask = torch.ones(1, 3, dtype=torch.bool)
+        prefix_pos = build_mrope_prefix_positions([video_mask, text_mask], [True, False], grid)
+        # max prefix position is 4 -> suffix starts at 5.
+        suffix_mask = torch.ones(1, 3, dtype=torch.bool)
+
+        suffix_pos = mrope_suffix_position_ids(prefix_pos, suffix_mask, num_cross_att_tokens=7)
+
+        assert suffix_pos.shape == (3, 1, 3)
+        for axis in range(3):
+            torch.testing.assert_close(suffix_pos[axis, 0], torch.tensor([5, 6, 7]))
+
+    def test_suffix_positions_respect_cross_region_slice(self):
+        """Excluding trailing tokens (e.g. discrete actions) from the cross
+        region lowers the offset to the max over the retained prefix only."""
+        # Prefix positions 0..6 across 7 tokens; exclude the last 3 from cross.
+        prefix_scalar = torch.arange(7).reshape(1, 7)
+        prefix_pos = torch.stack([prefix_scalar, prefix_scalar, prefix_scalar], dim=0)
+        suffix_mask = torch.ones(1, 2, dtype=torch.bool)
+
+        suffix_pos = mrope_suffix_position_ids(prefix_pos, suffix_mask, num_cross_att_tokens=4)
+
+        # max over first 4 prefix positions (0..3) is 3 -> offset 4 -> [4, 5].
+        torch.testing.assert_close(suffix_pos[0, 0], torch.tensor([4, 5]))

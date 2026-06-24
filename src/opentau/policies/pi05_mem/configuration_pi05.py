@@ -137,6 +137,26 @@ class PI05MemConfig(PreTrainedConfig):
     # Attention utils
     attention_implementation: str = "eager"
 
+    # Rotary position embedding scheme.
+    #   "mrope_interleaved" — interleaved Multimodal RoPE (Qwen3-VL style; the
+    #                        default). The head dim is split into rotary
+    #                        frequency bands and each band is assigned,
+    #                        round-robin, to one of three position axes
+    #                        (temporal, height, width) so every axis spans the
+    #                        full frequency spectrum. Only the per-frame video
+    #                        patch tokens receive true 2-D (height, width)
+    #                        positions; language / state / discrete-action
+    #                        tokens stay text-style (t == h == w), so MRoPE
+    #                        degenerates to ordinary RoPE on the non-video
+    #                        tokens.
+    #   "rope"             — standard 1-D RoPE (a single scalar position per
+    #                        token; the historical scheme). Set this to load /
+    #                        reproduce a checkpoint trained before MRoPE became
+    #                        the default — the two schemes assign different
+    #                        video-token positions, so a checkpoint trained
+    #                        under one must be evaluated under the same one.
+    rope_type: str = "mrope_interleaved"
+
     # Finetuning settings
     freeze_vision_encoder: bool = True
     train_expert_only: bool = False
@@ -260,6 +280,11 @@ class PI05MemConfig(PreTrainedConfig):
         if not isinstance(self.spacetime_layer_stride, int) or self.spacetime_layer_stride < 1:
             raise ValueError(
                 f"`spacetime_layer_stride` must be a positive integer, got {self.spacetime_layer_stride}."
+            )
+
+        if self.rope_type not in ("rope", "mrope_interleaved"):
+            raise ValueError(
+                f"`rope_type` must be one of 'rope'/'mrope_interleaved', got {self.rope_type!r}."
             )
 
         if self.use_motion:

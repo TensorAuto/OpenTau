@@ -25,6 +25,7 @@ action generation and conditioning.
 import logging
 
 import torch
+from einops import rearrange
 from torch import nn
 from transformers import (
     AutoConfig,
@@ -45,11 +46,25 @@ def _preferred_dtype():
 
 
 def apply_rope(x: torch.Tensor, positions: torch.Tensor, max_wavelength: int = 10_000) -> torch.Tensor:
-    """Applies RoPE positions to the input tensor.
+    """Applies (multimodal) RoPE positions to the input tensor.
+
+    Two position layouts are supported, selected by ``positions.ndim``:
+
+    * **1-D RoPE** — ``positions`` of shape ``[B, L]``: a single scalar
+      position per token (the historical behaviour). Every rotary frequency
+      band is driven by that one position.
+    * **Interleaved MRoPE** — ``positions`` of shape ``[A, B, L]`` (here
+      ``A == 3`` for the temporal / height / width axes): frequency band ``i``
+      is driven by axis ``i % A``, so the three axes are *interleaved* across
+      the full frequency spectrum rather than each owning a contiguous block
+      (the Qwen3-VL "interleaved MRoPE" scheme). When all ``A`` axes carry the
+      same positions this is bit-identical to the 1-D path, so text-style
+      tokens (``t == h == w``) rotate exactly as plain RoPE.
 
     Args:
         x: Input tensor of shape [B, L, H, D].
-        positions: Position tensor of shape [B, L].
+        positions: Position tensor of shape ``[B, L]`` (1-D RoPE) or
+            ``[A, B, L]`` (interleaved MRoPE).
         max_wavelength: Maximum wavelength for RoPE. Defaults to 10_000.
 
     Returns:
@@ -62,7 +77,18 @@ def apply_rope(x: torch.Tensor, positions: torch.Tensor, max_wavelength: int = 1
 
     freq_exponents = (2.0 / x.shape[-1]) * torch.arange(d_half, dtype=torch.float32, device=device)
     timescale = max_wavelength**freq_exponents
-    radians = positions[..., None].to(torch.float32) / timescale[None, None, :].to(torch.float32)
+    if positions.ndim == 2:
+        # 1-D RoPE: [B, L] -> [B, L, d_half]
+        radians = positions[..., None].to(torch.float32) / timescale[None, None, :].to(torch.float32)
+    else:
+        # Interleaved MRoPE: positions [A, B, L]. Assign frequency band i to
+        # axis i % A so every axis spans the full spectrum, then select the
+        # per-band position -> [B, L, d_half].
+        n_axes = positions.shape[0]
+        band_axis = torch.arange(d_half, device=device) % n_axes  # [d_half]
+        pos_per_band = positions.to(torch.float32)[band_axis]  # [d_half, B, L]
+        pos_per_band = rearrange(pos_per_band, "f b l -> b l f")  # [B, L, d_half]
+        radians = pos_per_band / timescale[None, None, :].to(torch.float32)
 
     radians = radians[..., None, :]
 
