@@ -82,10 +82,12 @@ DEFAULT_OBJ_REGISTRIES: tuple[str, ...] = ("lightwheel",)
 # Task-group shortcuts accepted as ``env.task``. A group name expands to the
 # upstream RoboCasa task list and auto-sets the dataset split; individual task
 # names (optionally comma-separated) take precedence and only match exactly.
+# All groups default to the ``pretrain`` split (the kitchen-scene distribution we
+# evaluate against). Pass ``env.split`` explicitly to override for a given group.
 _TASK_GROUP_SPLITS = {
-    "atomic_seen": "target",
-    "composite_seen": "target",
-    "composite_unseen": "target",
+    "atomic_seen": "pretrain",
+    "composite_seen": "pretrain",
+    "composite_unseen": "pretrain",
     "pretrain50": "pretrain",
     "pretrain100": "pretrain",
     "pretrain200": "pretrain",
