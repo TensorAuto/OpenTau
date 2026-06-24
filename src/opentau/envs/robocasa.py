@@ -359,6 +359,31 @@ def _resolve_tasks(task: str) -> tuple[list[str], str | None]:
     return names, None
 
 
+def _resolve_split(explicit_split: str | None, group_split: str | None) -> str:
+    r"""Resolve the final RoboCasa kitchen-scene split.
+
+    Precedence: an explicit ``env.split`` wins; otherwise a task-group shortcut's
+    split (from :data:`_TASK_GROUP_SPLITS`) applies; otherwise default to
+    ``"pretrain"``. The default makes concrete / comma-separated single-task
+    configs (which carry no group split) evaluate against the pretrain
+    distribution rather than ``"all"``.
+
+    Args:
+        explicit_split: The split set on ``env.split`` (``None`` if unset).
+        group_split: The split implied by a task-group shortcut (``None`` for a
+            concrete or comma-separated task name).
+
+    Returns:
+        One of ``"all"`` / ``"pretrain"`` / ``"target"`` — a value
+        ``RoboCasaGymEnv`` accepts.
+    """
+    if explicit_split is not None:
+        return explicit_split
+    if group_split is not None:
+        return group_split
+    return "pretrain"
+
+
 def _official_task_horizon(task: str) -> int | None:
     r"""RoboCasa's official per-task horizon (max env steps), read from the dataset
     registry -- e.g. ``OpenCabinet``=1050, ``CloseFridge``=900, ``TurnOnMicrowave``=450.
@@ -535,7 +560,8 @@ class RoboCasaEnv(gym.Env):
             observation_height: Height of observation images.
             visualization_width: Width of visualization frames.
             visualization_height: Height of visualization frames.
-            split: RoboCasa dataset split (``None``/``"all"``/``"pretrain"``/``"target"``).
+            split: RoboCasa dataset split (``None``/``"all"``/``"pretrain"``/``"target"``);
+                ``None`` resolves to ``"pretrain"`` at env construction.
             episode_length: Max steps per episode (``_max_episode_steps``); defaults to 1000.
             obj_registries: Object-mesh registries to sample assets from.
             episode_index: Per-worker index (``0..n_envs-1``) used as the
@@ -632,12 +658,14 @@ class RoboCasaEnv(gym.Env):
             from robocasa.wrappers.gym_wrapper import RoboCasaGymEnv
 
             # RoboCasaGymEnv defaults split="test", which create_env rejects (only
-            # None/"all"/"pretrain"/"target" are valid). Always pass a valid value.
+            # None/"all"/"pretrain"/"target" are valid). create_robocasa_envs resolves
+            # the split for the eval path; default to "pretrain" here too so a direct
+            # RoboCasaEnv(split=None) construction stays valid and consistent.
             self._env = RoboCasaGymEnv(
                 env_name=self.task,
                 camera_widths=self.observation_width,
                 camera_heights=self.observation_height,
-                split=self.split if self.split is not None else "all",
+                split=self.split if self.split is not None else "pretrain",
                 obj_registries=self.obj_registries,
             )
 
@@ -854,8 +882,7 @@ def create_robocasa_envs(
 
     camera_names = _parse_camera_names(camera_name)
     task_names, group_split = _resolve_tasks(str(task))
-    if group_split is not None and split is None:
-        split = group_split
+    split = _resolve_split(split, group_split)
 
     # Shard tasks across accelerator ranks (round-robin), so distributed eval
     # spreads tasks disjointly and per-task video keys stay unique after the

@@ -51,6 +51,7 @@ from opentau.envs.robocasa import (
     _official_task_horizon,
     _parse_camera_names,
     _resolve_robocasa_assets_root,
+    _resolve_split,
     _resolve_tasks,
     _robocasa_pkg_assets_dir,
     _robocasa_unshadowed,
@@ -221,6 +222,62 @@ def _fake_dataset_registry(atomic: dict, composite: dict):
             sys.modules["robocasa.utils.dataset_registry"] = saved
         else:
             sys.modules.pop("robocasa.utils.dataset_registry", None)
+
+
+@contextlib.contextmanager
+def _fake_task_group_registry(target: dict, pretraining: dict):
+    """Inject a fake ``robocasa.utils.dataset_registry`` exposing ``TARGET_TASKS``
+    / ``PRETRAINING_TASKS`` so ``_resolve_tasks`` can expand group shortcuts
+    without the real sim (mirrors ``_fake_dataset_registry``)."""
+    import sys
+    import types
+
+    mod = types.ModuleType("robocasa.utils.dataset_registry")
+    mod.TARGET_TASKS = target
+    mod.PRETRAINING_TASKS = pretraining
+    saved = sys.modules.get("robocasa.utils.dataset_registry")
+    sys.modules["robocasa.utils.dataset_registry"] = mod
+    try:
+        with patch("opentau.envs.robocasa._import_robocasa_with_version_shim"):
+            yield
+    finally:
+        if saved is not None:
+            sys.modules["robocasa.utils.dataset_registry"] = saved
+        else:
+            sys.modules.pop("robocasa.utils.dataset_registry", None)
+
+
+class TestResolveSplitAndTaskGroups:
+    """Split resolution + task-group → split mapping.
+
+    Pins that every benchmark-group shortcut resolves to the ``pretrain`` split
+    and that concrete single-task configs default to ``pretrain`` too, so an
+    accidental revert of either default fails CI instead of passing silently.
+    """
+
+    _TARGET_GROUPS = ("atomic_seen", "composite_seen", "composite_unseen")
+    _PRETRAIN_GROUPS = ("pretrain50", "pretrain100", "pretrain200", "pretrain300")
+
+    def test_all_task_groups_resolve_to_pretrain_split(self):
+        target = {g: [f"{g}Task"] for g in self._TARGET_GROUPS}
+        pretraining = {g: [f"{g}Task"] for g in self._PRETRAIN_GROUPS}
+        with _fake_task_group_registry(target, pretraining):
+            for group in self._TARGET_GROUPS + self._PRETRAIN_GROUPS:
+                names, split = _resolve_tasks(group)
+                assert names == [f"{group}Task"]
+                assert split == "pretrain", f"{group} must resolve to the pretrain split"
+
+    def test_resolve_split_defaults_unset_to_pretrain(self):
+        # Concrete / comma-separated task names carry no group split -> pretrain.
+        assert _resolve_split(None, None) == "pretrain"
+
+    def test_resolve_split_uses_group_split_when_no_explicit(self):
+        assert _resolve_split(None, "pretrain") == "pretrain"
+        assert _resolve_split(None, "target") == "target"
+
+    def test_resolve_split_explicit_overrides_group_and_default(self):
+        assert _resolve_split("all", None) == "all"
+        assert _resolve_split("target", "pretrain") == "target"
 
 
 class TestOfficialTaskHorizon:

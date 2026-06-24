@@ -344,7 +344,9 @@ class RoboCasaEnv(EnvConfig):
         visualization_height: Height of visualization frames.
         visualization_width: Width of visualization frames.
         split: RoboCasa dataset split (``None``/``"all"``/``"pretrain"``/
-            ``"target"``). Left ``None`` unless a task-group shortcut sets it.
+            ``"target"``). Defaults to ``"pretrain"`` when left ``None`` — every
+            task-group shortcut and concrete single-task config resolves to the
+            pretrain kitchen-scene distribution; set explicitly to override.
         obj_registries: Object-mesh registries to sample assets from. Defaults to
             ``["lightwheel"]`` (the pack the asset downloader ships by default);
             add ``"objaverse"`` only after downloading that ~30GB pack.
