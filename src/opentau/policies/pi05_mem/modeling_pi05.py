@@ -217,19 +217,32 @@ def build_mrope_prefix_positions(
 
 def mrope_suffix_position_ids(
     prefix_position_ids: Tensor,
+    prefix_pad_masks: Tensor,
     suffix_pad_masks: Tensor,
     num_cross_att_tokens: int,
 ) -> Tensor:
     """Text-style interleaved-MRoPE positions for the action-expert suffix.
 
     The suffix continues from the position right after the prefix region the
-    expert cross-attends to: ``offset = max(prefix positions over the cross
-    region) + 1`` per sample. Suffix tokens are text-style (``t == h == w``),
-    so this is the 1-D ``offset + cumsum(pad) - 1`` progression broadcast to
-    all three axes.
+    expert cross-attends to: ``offset = max(real prefix positions over the
+    cross region) + 1`` per sample. Suffix tokens are text-style
+    (``t == h == w``), so this is the 1-D ``offset + cumsum(pad) - 1``
+    progression broadcast to all three axes.
+
+    Only *real* (non-pad) prefix tokens contribute to the offset. This matters
+    because a padded prefix token's position is not "right after the real
+    content": an absent video does not advance the cursor yet its patch block
+    still carries ``h/w = base..base+grid-1`` (see ``build_mrope_prefix_positions``),
+    and a padded text/state token repeats a prior position. Masking padded
+    tokens out of the max makes ``offset`` equal the MRoPE cursor after the
+    cross region (real-token max + 1), so the suffix continues with no position
+    gap. Note this is NOT the 1-D path's token-count ``sum(pad_masks)``: a video
+    block compacts ``grid*grid`` patches into ``grid`` position units, so the
+    two schemes' offsets differ whenever the cross region contains video.
 
     Args:
         prefix_position_ids: ``[3, B, L]`` prefix MRoPE positions.
+        prefix_pad_masks: ``[B, L]`` bool prefix pad mask (``True`` = real).
         suffix_pad_masks: ``[B, Ls]`` bool suffix pad mask.
         num_cross_att_tokens: Number of leading prefix tokens cached for cross
             attention (the region the suffix offset continues from).
@@ -238,7 +251,11 @@ def mrope_suffix_position_ids(
         ``[3, B, Ls]`` long tensor of suffix positions.
     """
     cross = prefix_position_ids[:, :, :num_cross_att_tokens]  # [3, B, num_cross]
-    offset = reduce(cross, "a b n -> b", "max")[:, None] + 1  # [B, 1]
+    cross_pad = prefix_pad_masks[:, :num_cross_att_tokens]  # [B, num_cross]
+    # Exclude padded tokens from the max so absent videos / padded text don't
+    # push the offset past the real content. All-padded cross region -> -1 -> 0.
+    real = torch.where(cross_pad[None], cross, torch.full_like(cross, -1))  # [3, B, num_cross]
+    offset = reduce(real, "a b n -> b", "max")[:, None] + 1  # [B, 1]
     scalar = offset + torch.cumsum(suffix_pad_masks, dim=1) - 1  # [B, Ls]
     return repeat(scalar, "b l -> three b l", three=3)
 
@@ -1300,7 +1317,7 @@ class PI05MemFlowMatching(nn.Module):
         )
         if self.config.rope_type == "mrope_interleaved":
             action_expert_position_ids = mrope_suffix_position_ids(
-                vlm_position_ids, suffix_pad_masks, num_cross_att_tokens
+                vlm_position_ids, prefix_pad_masks, suffix_pad_masks, num_cross_att_tokens
             )
         else:
             prefix_offsets = torch.sum(prefix_pad_masks[:, :num_cross_att_tokens], dim=-1)[:, None]
@@ -1471,7 +1488,7 @@ class PI05MemFlowMatching(nn.Module):
         )
         if self.config.rope_type == "mrope_interleaved":
             action_expert_position_ids = mrope_suffix_position_ids(
-                prefix_position_ids, suffix_pad_masks, num_cross_att_tokens
+                prefix_position_ids, prefix_pad_masks, suffix_pad_masks, num_cross_att_tokens
             )
         else:
             prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]

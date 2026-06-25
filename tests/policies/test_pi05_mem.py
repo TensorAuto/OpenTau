@@ -846,10 +846,11 @@ class TestInterleavedMRoPE:
         video_mask = torch.ones(1, grid * grid, dtype=torch.bool)
         text_mask = torch.ones(1, 3, dtype=torch.bool)
         prefix_pos = build_mrope_prefix_positions([video_mask, text_mask], [True, False], grid)
+        prefix_pad = torch.ones(1, 7, dtype=torch.bool)
         # max prefix position is 4 -> suffix starts at 5.
         suffix_mask = torch.ones(1, 3, dtype=torch.bool)
 
-        suffix_pos = mrope_suffix_position_ids(prefix_pos, suffix_mask, num_cross_att_tokens=7)
+        suffix_pos = mrope_suffix_position_ids(prefix_pos, prefix_pad, suffix_mask, num_cross_att_tokens=7)
 
         assert suffix_pos.shape == (3, 1, 3)
         for axis in range(3):
@@ -861,9 +862,47 @@ class TestInterleavedMRoPE:
         # Prefix positions 0..6 across 7 tokens; exclude the last 3 from cross.
         prefix_scalar = torch.arange(7).reshape(1, 7)
         prefix_pos = torch.stack([prefix_scalar, prefix_scalar, prefix_scalar], dim=0)
+        prefix_pad = torch.ones(1, 7, dtype=torch.bool)
         suffix_mask = torch.ones(1, 2, dtype=torch.bool)
 
-        suffix_pos = mrope_suffix_position_ids(prefix_pos, suffix_mask, num_cross_att_tokens=4)
+        suffix_pos = mrope_suffix_position_ids(prefix_pos, prefix_pad, suffix_mask, num_cross_att_tokens=4)
 
         # max over first 4 prefix positions (0..3) is 3 -> offset 4 -> [4, 5].
         torch.testing.assert_close(suffix_pos[0, 0], torch.tensor([4, 5]))
+
+    def test_suffix_offset_ignores_padded_video_block(self):
+        """An absent video must not inflate the suffix offset. Its patch block
+        still carries h/w = base..base+grid-1, but those tokens are padded, so
+        the offset must continue right after the real text (no position gap)."""
+        grid = 2  # absent video would otherwise push the max to grid-1 = 1
+        video_mask = torch.zeros(1, grid * grid, dtype=torch.bool)  # absent
+        text_mask = torch.ones(1, 2, dtype=torch.bool)  # 2 real tokens at pos 0,1
+        prefix_pos = build_mrope_prefix_positions([video_mask, text_mask], [True, False], grid)
+        prefix_pad = torch.cat([video_mask, text_mask], dim=1)  # [1, 6]
+        suffix_mask = torch.ones(1, 2, dtype=torch.bool)
+
+        suffix_pos = mrope_suffix_position_ids(
+            prefix_pos, prefix_pad, suffix_mask, num_cross_att_tokens=grid * grid + 2
+        )
+
+        # Real content ends at pos 1 -> offset 2 (NOT base+grid). No gap.
+        torch.testing.assert_close(suffix_pos[0, 0], torch.tensor([2, 3]))
+
+    def test_suffix_offset_is_compacted_cursor_not_token_count(self):
+        """Cross region = present video then absent video. The offset is the
+        MRoPE cursor (`grid`), since a present video compacts grid*grid patches
+        into `grid` position units and the absent video adds nothing — NOT the
+        1-D token count (which would be grid*grid)."""
+        grid = 2
+        present = torch.ones(1, grid * grid, dtype=torch.bool)
+        absent = torch.zeros(1, grid * grid, dtype=torch.bool)
+        prefix_pos = build_mrope_prefix_positions([present, absent], [True, True], grid)
+        prefix_pad = torch.cat([present, absent], dim=1)  # [1, 8]
+        suffix_mask = torch.ones(1, 1, dtype=torch.bool)
+
+        suffix_pos = mrope_suffix_position_ids(
+            prefix_pos, prefix_pad, suffix_mask, num_cross_att_tokens=2 * grid * grid
+        )
+
+        # Compacted cursor == grid (2), not the grid*grid (4) token count.
+        torch.testing.assert_close(suffix_pos[0, 0], torch.tensor([grid]))
