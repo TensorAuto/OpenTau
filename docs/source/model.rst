@@ -119,6 +119,65 @@ cosmos3
 - Config selector: ``--policy.type=cosmos3``.
 - Disclaimer: the reasoner *backbone* is published (private ``TensorAuto/cosmos3-reason-32b``), but no full cosmos3 *policy* checkpoint exists yet — the action expert is randomly initialized on top of the frozen reasoner and produced by training.
 
+.. note::
+
+   **Choosing the DeepSpeed ZeRO stage (ZeRO-2 vs ZeRO-3).** Because the ~33B
+   reasoner backbone is *frozen*, ZeRO-2 shards only the ~0.9B action expert's
+   optimizer state and **replicates** the bf16 backbone (~66 GB/rank), whereas
+   ZeRO-3 also **shards** the backbone (~8 GB/rank) at the cost of a per-step
+   all-gather of those 33B params. Benchmarked with
+   ``opentau/scripts/profile_step.py`` on **8×A100-80GB** using
+   ``configs/examples/cosmos3_training_config.json`` (frozen backbone + vision
+   tower, ``gradient_checkpointing=True``, ``sdpa`` attention, ``chunk_size=10``,
+   two 224 px cameras, ``gradient_accumulation_steps=1``).
+
+   At a *matched* per-rank batch ZeRO-2 is ~1.3–1.4× faster — it skips ZeRO-3's
+   per-step backbone all-gather (e.g. 4.3 vs 3.0 samples/s at batch 2; 15.7 vs
+   11.8 at batch 8). But the fair question is throughput when **each stage is
+   pushed to its own limit**, since they hit very different walls:
+
+   .. list-table:: each stage at its limit (8×A100-80GB, peak reserved memory)
+      :header-rows: 1
+      :widths: 14 16 16 26 26
+
+      * - stage
+        - max per-rank batch
+        - peak mem/rank
+        - throughput
+        - limited by
+      * - ZeRO-2
+        - ~32
+        - 78.6 GB (≈ ceiling)
+        - 43 samples/s
+        - **memory** — replicated 66 GB backbone leaves no room to grow
+      * - ZeRO-3
+        - 192 (room to spare)
+        - 55.4 GB
+        - 58 samples/s (≈83 GPU-compute)
+        - **compute**, not memory
+
+   ZeRO-2 is *memory-bound*: the replicated backbone OOMs past per-rank batch ~32.
+   ZeRO-3 *shards* the backbone, so it stays compute-bound long before memory
+   fills — at batch 192 it still uses only ~55 GB while its GPU-compute throughput
+   has already plateaued at ~83 samples/s (per-sample forward cost is flat from
+   batch 64→192, so filling the remaining memory with an even larger batch does
+   not raise it). On this tiny libero smoke dataset the pyav dataloader caps the
+   *end-to-end* rate at ~58 samples/s (``dataload_wait`` ≈30 % of the step at
+   batch 192); a production data pipeline removes that ceiling. Net: at full
+   memory utilisation ZeRO-3 delivers ~1.3× (end-to-end here) to ~1.8×
+   (GPU-compute) ZeRO-2's throughput **and** keeps headroom.
+
+   **Recommendation:** for maximum training throughput on 8×A100-80GB prefer
+   **ZeRO-3** (``configs/examples/accelerate_deepspeed_zero3_config.yaml``) — it
+   reaches a higher ceiling because the sharded backbone lets you scale the batch
+   until compute (not memory) saturates, and it leaves headroom for longer
+   prompts, higher image resolution, larger ``chunk_size``, an unfrozen backbone,
+   or GPUs smaller than 80 GB. **ZeRO-2**
+   (``configs/examples/accelerate_deepspeed_config.yaml``) is the faster choice
+   only when you are pinned to a small per-rank batch (it has lower per-step
+   overhead), but the replicated backbone keeps it at ~95–98 % of memory and caps
+   its peak throughput.
+
 The training-time tensor flow, from the raw batch through the frozen reasoner
 prefix and the trainable action expert to the flow-matching velocity head
 (shapes shown at config defaults: ``chunk_size=50``, ``max_action_dim=32``,
