@@ -42,14 +42,14 @@ MAX_ACTION_DIM = 8
 MAX_STATE_DIM = 8
 
 
-def _tiny_qwen3vl_config() -> Qwen3VLConfig:
+def _tiny_qwen3vl_config(num_hidden_layers: int = 2) -> Qwen3VLConfig:
     """A minimally-sized Qwen3-VL config (head_dim/kv-heads/layers must match the expert)."""
     return Qwen3VLConfig(
         text_config={
             "model_type": "qwen3_vl_text",
             "hidden_size": 64,
             "intermediate_size": 128,
-            "num_hidden_layers": 2,
+            "num_hidden_layers": num_hidden_layers,
             "num_attention_heads": 4,
             "num_key_value_heads": 2,
             "head_dim": 16,
@@ -103,9 +103,11 @@ def _tiny_cosmos3_config(**overrides) -> Cosmos3Config:
     return Cosmos3Config(**kwargs)
 
 
-def _build_model() -> Cosmos3FlowMatching:
+def _build_model(qwen3vl_num_layers: int = 2, **overrides) -> Cosmos3FlowMatching:
     torch.manual_seed(0)
-    return Cosmos3FlowMatching(_tiny_cosmos3_config(), qwen3vl_config=_tiny_qwen3vl_config())
+    return Cosmos3FlowMatching(
+        _tiny_cosmos3_config(**overrides), qwen3vl_config=_tiny_qwen3vl_config(qwen3vl_num_layers)
+    )
 
 
 def _text_batch(bsize: int = 2, n_text: int = 6):
@@ -252,6 +254,149 @@ def test_cosmos3_sample_actions_shape():
         state=state,
         action_prefix=action_prefix,
         delay=delay,
+    )
+    assert actions.shape == (bsize, CHUNK, MAX_ACTION_DIM)
+    assert torch.isfinite(actions).all()
+
+
+# ---- single-layer conditioning (condition_on_layer) ----
+
+
+def test_cosmos3_single_layer_forward_and_grads():
+    """condition_on_layer=k: forward is finite, the backbone is truncated to k+1 layers,
+    and only the expert receives gradients (the truncated backbone stays frozen)."""
+    model = _build_model(condition_on_layer=0)
+    we = model.qwen3vl_with_expert
+    assert we.condition_on_layer == 0
+    assert we.num_layers == 1
+    assert len(we.backbone.model.language_model.layers) == 1  # deeper layers never allocated
+
+    input_ids, attention_mask, state, actions = _text_batch()
+    out = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        pixel_values=None,
+        image_grid_thw=None,
+        state=state,
+        actions=actions,
+        noise=torch.randn_like(actions),
+        time=torch.rand(actions.shape[0]),
+    )
+    assert torch.isfinite(out["MSE"])
+    out["MSE"].backward()
+    assert any(p.grad is not None for p in we.expert.parameters())
+    assert all(p.grad is None for p in we.backbone.parameters())
+
+
+def test_cosmos3_single_layer_allows_shallower_expert():
+    """In single-layer mode the expert depth is free (need not equal the backbone depth)."""
+    model = _build_model(qwen3vl_num_layers=2, condition_on_layer=1, expert_num_hidden_layers=5)
+    assert len(model.qwen3vl_with_expert.expert.layers) == 5
+    assert model.qwen3vl_with_expert.num_layers == 2  # condition_on_layer=1 -> first 2 layers
+    input_ids, attention_mask, state, actions = _text_batch()
+    out = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        pixel_values=None,
+        image_grid_thw=None,
+        state=state,
+        actions=actions,
+        noise=torch.randn_like(actions),
+        time=torch.rand(actions.shape[0]),
+    )
+    assert torch.isfinite(out["MSE"])
+
+
+def test_cosmos3_single_layer_negative_index():
+    """Negative condition_on_layer indexes from the end (Python-style)."""
+    model = _build_model(qwen3vl_num_layers=2, condition_on_layer=-1, expert_num_hidden_layers=3)
+    assert model.qwen3vl_with_expert.condition_on_layer == 1  # -1 -> last of 2 layers
+    assert model.qwen3vl_with_expert.num_layers == 2
+
+
+def test_cosmos3_single_layer_out_of_range_raises():
+    with pytest.raises(ValueError):
+        _build_model(qwen3vl_num_layers=2, condition_on_layer=2)  # valid indices are 0, 1
+    with pytest.raises(ValueError):
+        _build_model(qwen3vl_num_layers=2, condition_on_layer=-3)
+
+
+def test_cosmos3_default_mode_requires_matching_depth():
+    """With condition_on_layer=None the expert depth must still equal the backbone depth."""
+    with pytest.raises(ValueError):
+        _build_model(qwen3vl_num_layers=2, expert_num_hidden_layers=3)  # 3 != 2
+
+
+def test_cosmos3_single_layer_truncation_kv_matches_full_backbone():
+    """Truncating the backbone to k+1 layers yields the *same* KV at the selected layer as
+    the full backbone: deepstack vision features are injected only into the earliest layers,
+    so layer k's output (and its cached KV) depends only on layers 0..k."""
+    k = 2  # backbone depth 4 -> truncate to 3 layers (layer 3 dropped)
+    full = _build_model(qwen3vl_num_layers=4, expert_num_hidden_layers=4)  # condition_on_layer=None
+    trunc = _build_model(qwen3vl_num_layers=4, condition_on_layer=k, expert_num_hidden_layers=4)
+    # Pin the shared backbone weights so the comparison isolates truncation, not init RNG.
+    trunc.qwen3vl_with_expert.backbone.load_state_dict(
+        full.qwen3vl_with_expert.backbone.state_dict(), strict=False
+    )
+
+    input_ids, attention_mask, pixel_values, image_grid_thw = _image_inputs()
+
+    def cached(model):
+        pos, _ = model.qwen3vl_with_expert.get_rope_index(
+            input_ids=input_ids, image_grid_thw=image_grid_thw, attention_mask=attention_mask
+        )
+        return model.qwen3vl_with_expert.run_prefix(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=pos,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+        )
+
+    full_kv = cached(full)
+    trunc_kv = cached(trunc)
+    assert len(full_kv) == 4 and len(trunc_kv) == k + 1
+    fk, fv = full_kv[k]
+    tk, tv = trunc_kv[k]  # the selected layer is the last truncated entry
+    assert torch.equal(fk, tk)
+    assert torch.equal(fv, tv)
+
+
+def test_cosmos3_single_layer_deterministic():
+    """Two seeded single-layer forwards produce bit-identical loss (CLAUDE.md rule 3)."""
+    losses = []
+    for _ in range(2):
+        model = _build_model(qwen3vl_num_layers=2, condition_on_layer=0, expert_num_hidden_layers=3)
+        input_ids, attention_mask, state, actions = _text_batch()
+        torch.manual_seed(1234)
+        noise = torch.randn_like(actions)
+        time = torch.rand(actions.shape[0])
+        out = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=None,
+            image_grid_thw=None,
+            state=state,
+            actions=actions,
+            noise=noise,
+            time=time,
+        )
+        losses.append(out["MSE"].item())
+    assert losses[0] == losses[1], f"non-deterministic loss: {losses}"
+
+
+def test_cosmos3_single_layer_sample_actions_shape():
+    model = _build_model(qwen3vl_num_layers=2, condition_on_layer=0, expert_num_hidden_layers=3)
+    input_ids, attention_mask, state, _ = _text_batch()
+    bsize = input_ids.shape[0]
+    actions = model.sample_actions(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        pixel_values=None,
+        image_grid_thw=None,
+        state=state,
+        action_prefix=torch.zeros(bsize, CHUNK, MAX_ACTION_DIM),
+        delay=torch.tensor(0, dtype=torch.long),
     )
     assert actions.shape == (bsize, CHUNK, MAX_ACTION_DIM)
     assert torch.isfinite(actions).all()

@@ -92,9 +92,11 @@ def _tiny_config(**overrides) -> Cosmos3Config:
     return Cosmos3Config(**kwargs)
 
 
-def _build(device):
+def _build(device, qwen3vl_num_layers=2, **overrides):
     torch.manual_seed(0)
-    model = Cosmos3FlowMatching(_tiny_config(), qwen3vl_config=_tiny_qwen3vl_config())
+    qcfg = _tiny_qwen3vl_config()
+    qcfg.text_config.num_hidden_layers = qwen3vl_num_layers
+    model = Cosmos3FlowMatching(_tiny_config(**overrides), qwen3vl_config=qcfg)
     return model.to(device=device, dtype=torch.bfloat16)
 
 
@@ -131,6 +133,33 @@ def test_cosmos3_gpu_forward_backward():
     backbone = model.qwen3vl_with_expert.backbone
     assert any(p.grad is not None and torch.isfinite(p.grad).all() for p in expert.parameters())
     assert all(p.grad is None for p in backbone.parameters())
+
+
+@pytest.mark.gpu
+def test_cosmos3_gpu_single_layer_forward_backward():
+    """bf16 single-layer conditioning on CUDA: backbone truncated to k+1 layers, a shallower
+    expert reads the one selected layer, finite loss, expert grads flow, backbone frozen."""
+    device = "cuda"
+    model = _build(device, qwen3vl_num_layers=4, condition_on_layer=2, expert_num_hidden_layers=8)
+    we = model.qwen3vl_with_expert
+    assert we.condition_on_layer == 2 and we.num_layers == 3
+    assert len(we.backbone.model.language_model.layers) == 3  # layer 3 never allocated
+    assert len(we.expert.layers) == 8  # expert depth decoupled from backbone depth
+    iid, am, st, act, noise, time = _batch(device)
+    out = model(
+        input_ids=iid,
+        attention_mask=am,
+        pixel_values=None,
+        image_grid_thw=None,
+        state=st,
+        actions=act,
+        noise=noise,
+        time=time,
+    )
+    assert torch.isfinite(out["MSE"])
+    out["MSE"].backward()
+    assert any(p.grad is not None and torch.isfinite(p.grad).all() for p in we.expert.parameters())
+    assert all(p.grad is None for p in we.backbone.parameters())
 
 
 @pytest.mark.gpu

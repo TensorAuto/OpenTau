@@ -87,8 +87,26 @@ class Cosmos3Config(PreTrainedConfig):
         dropout: Dropout probability inside the expert. Defaults to 0.1.
         expert_hidden_size: Action-expert hidden width. Defaults to 1024.
         expert_intermediate_size: Action-expert SwiGLU MLP width. Defaults to 2048.
-        expert_num_hidden_layers: Action-expert depth. MUST equal the backbone text
-            tower depth (64 for Qwen3-VL-32B). Defaults to 64.
+        condition_on_layer: Which backbone (reasoner) layer the action expert
+            cross-attends to. ``None`` (default) keeps the per-layer correspondence
+            -- expert layer ``i`` reads backbone layer ``i`` -- which requires
+            ``expert_num_hidden_layers == backbone depth``. When set to an int ``k``
+            (0-indexed; Python-style negatives allowed, e.g. ``-1`` = last layer),
+            **every** expert layer cross-attends to backbone layer ``k`` instead. In
+            this single-layer regime two things follow: (1) the expert depth is freed
+            from the backbone depth (``expert_num_hidden_layers`` may be anything >= 1,
+            e.g. a shallower/cheaper expert), and (2) the frozen backbone is truncated
+            to its first ``k + 1`` layers at load time -- the deeper layers are never
+            allocated or run, a large VRAM + forward-compute saving on the 32B reasoner.
+            The selected layer's KV is bit-identical whether or not the backbone is
+            truncated (deepstack vision features are injected only into the earliest
+            layers, so layer ``k``'s output depends only on layers ``0..k``). Defaults
+            to ``None``.
+        expert_num_hidden_layers: Action-expert depth. With ``condition_on_layer=None``
+            this MUST equal the backbone text tower depth (64 for Qwen3-VL-32B) so each
+            expert layer reads the matching backbone KV layer; with a single
+            ``condition_on_layer`` selected the constraint is dropped and any depth >= 1
+            is allowed. Defaults to 64.
         expert_num_attention_heads: Action-expert query heads. Free (multiple of
             ``expert_num_key_value_heads``). Defaults to 16.
         expert_num_key_value_heads: Action-expert KV heads. MUST equal the backbone
@@ -140,6 +158,13 @@ class Cosmos3Config(PreTrainedConfig):
     train_expert_only: bool = True
     gradient_checkpointing: bool = False
     dropout: float = 0.1
+
+    # --- Backbone-layer conditioning ---
+    # None: per-layer correspondence (expert layer i reads backbone layer i).
+    # int k: every expert layer reads backbone layer k (and the backbone is truncated
+    # to its first k+1 layers; see the docstring). Resolved/range-checked against the
+    # real backbone depth at model-build time in ``Qwen3VLWithExpertModel``.
+    condition_on_layer: int | None = None
 
     # --- Action-expert sizing (see module docstring for the hard constraints) ---
     expert_hidden_size: int = 1024
