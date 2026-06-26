@@ -37,14 +37,30 @@ Hard cross-attention constraints (validated at build time)
 ----------------------------------------------------------
 The expert's per-layer keys/values are concatenated with the backbone's cached KV,
 so the expert's ``num_key_value_heads`` and ``head_dim`` **must** equal the backbone
-text tower's (8 / 128 for Qwen3-VL-32B), and the expert must have the same number of
-layers (64) as the backbone so layer ``i`` of the expert reads layer ``i`` of the
-cache. The expert's *query* head count is free (any multiple of the KV head count)
-because the backbone's queries are never consumed here. The shared MRoPE ``(cos, sin)``
-are produced by the backbone's ``rotary_emb`` and reused by the expert, which is why
-``expert_head_dim`` must match.
+text tower's (8 / 128 for Qwen3-VL-32B). The expert's *query* head count is free (any
+multiple of the KV head count) because the backbone's queries are never consumed here.
+The shared MRoPE ``(cos, sin)`` are produced by the backbone's ``rotary_emb`` and
+reused by the expert, which is why ``expert_head_dim`` must match.
+
+Which backbone layer the expert reads (``condition_on_layer``)
+--------------------------------------------------------------
+By default (``condition_on_layer=None``) the expert mirrors the backbone one-for-one:
+expert layer ``i`` reads the cached KV of backbone layer ``i``, so the expert must have
+the same number of layers (64) as the backbone. Setting ``condition_on_layer=k`` flips
+this to **single-layer conditioning**: every expert layer cross-attends to the cached
+KV of backbone layer ``k`` only. Two consequences follow and are both handled here:
+
+* The layer-count equality is dropped -- the expert may be any depth >= 1 (a shallower,
+  cheaper expert all reading the one rich layer).
+* The frozen backbone is **truncated** to its first ``k + 1`` text layers at build time
+  (``text_config.num_hidden_layers`` is lowered before the backbone is constructed /
+  loaded), so layers ``k+1..N-1`` are never allocated or run. The selected layer's KV is
+  bit-identical with or without truncation: Qwen3-VL injects deepstack vision features
+  only into the earliest layers (after layer ``j`` for ``j < len(features)``), so the
+  output of layer ``k`` -- and hence its KV -- depends only on layers ``0..k``.
 """
 
+import copy
 from contextlib import nullcontext
 
 import torch
@@ -261,8 +277,11 @@ class Qwen3ExpertDecoderLayer(nn.Module):
 class Qwen3ActionExpert(nn.Module):
     """The trainable flow-matching action expert: a stack of AdaRMS Qwen3 decoder layers.
 
-    Operates on action-token embeddings (the suffix). Each layer ``i`` cross-attends to
-    the frozen backbone's cached KV for layer ``i`` plus the action chunk itself.
+    Operates on action-token embeddings (the suffix). Layer ``i`` cross-attends to
+    ``cached_kv[i]`` plus the action chunk itself. The expert is mode-agnostic: the
+    caller (``Qwen3VLWithExpertModel.run_expert``) hands it a ``cached_kv`` list whose
+    length equals the expert depth -- the per-layer backbone cache in the default regime,
+    or the single selected layer's KV broadcast to every position in single-layer mode.
     """
 
     def __init__(
@@ -339,13 +358,20 @@ class Qwen3VLWithExpertModel(nn.Module):
         train_expert_only: bool = True,
         gradient_checkpointing: bool = False,
         load_pretrained_backbone_repo: str | None = None,
+        condition_on_layer: int | None = None,
     ):
         super().__init__()
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
 
+        # Deepcopy so the layer-count / attn-impl mutations below stay local and never
+        # corrupt the caller's config object (e.g. a shared tiny config across tests).
+        qwen3vl_config = copy.deepcopy(qwen3vl_config)
         text_cfg = qwen3vl_config.text_config
-        # Hard cross-attention constraints (see module docstring).
+        backbone_depth = text_cfg.num_hidden_layers
+
+        # Hard cross-attention constraints (see module docstring): head geometry must
+        # match regardless of which backbone layer(s) the expert reads.
         if expert_head_dim != text_cfg.head_dim:
             raise ValueError(
                 f"expert_head_dim ({expert_head_dim}) must equal the backbone head_dim ({text_cfg.head_dim})."
@@ -355,20 +381,49 @@ class Qwen3VLWithExpertModel(nn.Module):
                 f"expert_num_key_value_heads ({expert_num_key_value_heads}) must equal the backbone "
                 f"num_key_value_heads ({text_cfg.num_key_value_heads})."
             )
-        if expert_num_hidden_layers != text_cfg.num_hidden_layers:
-            raise ValueError(
-                f"expert_num_hidden_layers ({expert_num_hidden_layers}) must equal the backbone "
-                f"num_hidden_layers ({text_cfg.num_hidden_layers}) so each expert layer reads the matching "
-                "backbone KV cache layer."
-            )
-        self.num_layers = text_cfg.num_hidden_layers
 
-        qwen3vl_config.text_config._attn_implementation = attention_implementation
+        # Resolve which backbone layer the expert conditions on (Python-style negatives).
+        if condition_on_layer is None:
+            self.condition_on_layer = None
+        else:
+            resolved = condition_on_layer + backbone_depth if condition_on_layer < 0 else condition_on_layer
+            if not 0 <= resolved < backbone_depth:
+                raise ValueError(
+                    f"condition_on_layer ({condition_on_layer}) is out of range for a backbone with "
+                    f"{backbone_depth} layers; expected an index in [-{backbone_depth}, {backbone_depth - 1}]."
+                )
+            self.condition_on_layer = resolved
+
+        if self.condition_on_layer is None:
+            # Per-layer correspondence: expert layer i reads backbone layer i, so the
+            # depths must match and the full backbone is run.
+            if expert_num_hidden_layers != backbone_depth:
+                raise ValueError(
+                    f"expert_num_hidden_layers ({expert_num_hidden_layers}) must equal the backbone "
+                    f"num_hidden_layers ({backbone_depth}) so each expert layer reads the matching backbone "
+                    "KV cache layer. (Set condition_on_layer=k to read a single layer with a free expert depth.)"
+                )
+            self.num_layers = backbone_depth
+        else:
+            # Single-layer conditioning: expert depth is free, and the backbone only needs
+            # its first condition_on_layer+1 layers -- truncate so the deeper layers are
+            # never allocated or run (the selected layer's KV is unchanged; see docstring).
+            self.num_layers = self.condition_on_layer + 1
+            text_cfg.num_hidden_layers = self.num_layers
+
+        text_cfg._attn_implementation = attention_implementation
         if load_pretrained_backbone_repo is not None:
+            from_pretrained_kwargs = {
+                "dtype": torch.bfloat16,
+                "attn_implementation": attention_implementation,
+            }
+            if self.condition_on_layer is not None:
+                # Honor the truncated layer count when loading; the dropped layers'
+                # checkpoint tensors are skipped (logged as unused), so they are never
+                # materialized -- this is the VRAM saving.
+                from_pretrained_kwargs["config"] = qwen3vl_config
             self.backbone = Qwen3VLForConditionalGeneration.from_pretrained(
-                load_pretrained_backbone_repo,
-                dtype=torch.bfloat16,
-                attn_implementation=attention_implementation,
+                load_pretrained_backbone_repo, **from_pretrained_kwargs
             )
         else:
             self.backbone = Qwen3VLForConditionalGeneration(qwen3vl_config)
@@ -440,9 +495,12 @@ class Qwen3VLWithExpertModel(nn.Module):
         pixel_values: Tensor | None,
         image_grid_thw: Tensor | None,
     ) -> list[tuple[Tensor, Tensor]]:
-        """Run the backbone over the observation prefix; return the per-layer (K, V) cache.
+        """Run the backbone over the observation prefix; return its per-layer (K, V) cache.
 
         Each entry is ``(key, value)`` of shape ``(B, num_kv_heads, S_prefix, head_dim)``.
+        The list has ``self.num_layers`` entries -- the full backbone depth in the default
+        regime, or the truncated ``condition_on_layer + 1`` entries in single-layer mode
+        (the selected layer being the last). ``run_expert`` maps it onto the expert layers.
 
         When ``train_expert_only`` (the default), the backbone is fully frozen: the forward
         runs under ``no_grad`` and the cached KV is ``.detach()``'d, so the expert reads it
@@ -479,4 +537,10 @@ class Qwen3VLWithExpertModel(nn.Module):
         attn_mask: Tensor,
         adarms_cond: Tensor,
     ) -> Tensor:
+        if self.condition_on_layer is not None:
+            # Single-layer conditioning: broadcast the one selected backbone layer's KV
+            # to every expert layer. run_prefix truncated the backbone to
+            # condition_on_layer+1 layers, so the selection is the last cached entry.
+            selected_kv = cached_kv[self.condition_on_layer]
+            cached_kv = [selected_kv] * len(self.expert.layers)
         return self.expert(action_embs, cached_kv, cos, sin, attn_mask, adarms_cond)

@@ -150,6 +150,7 @@ class Cosmos3FlowMatching(nn.Module):
             load_pretrained_backbone_repo=(
                 config.pretrained_backbone_repo_id if config.load_pretrained_backbone else None
             ),
+            condition_on_layer=config.condition_on_layer,
         )
 
         expert_hidden = config.expert_hidden_size
