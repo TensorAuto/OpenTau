@@ -41,7 +41,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
-from einops import rearrange
+from einops import rearrange, reduce, repeat
 from torch import Tensor, nn
 from transformers import AutoProcessor, AutoTokenizer
 
@@ -148,6 +148,116 @@ def make_att_2d_masks(
         att_2d_masks = torch.cat((cross_att_mask, att_2d_masks), dim=2)
 
     return att_2d_masks
+
+
+def build_mrope_prefix_positions(
+    seg_masks: list[Tensor],
+    seg_is_video: list[bool],
+    grid: int,
+) -> Tensor:
+    """Build interleaved-MRoPE (t, h, w) position ids for the prefix.
+
+    The prefix is a concatenation of ordered segments (videos, language,
+    state, optionally discrete actions). Each segment is either a square video
+    patch grid or a run of text-style tokens:
+
+    * **Video segment** (``grid * grid`` row-major patches): all patches share
+      a single temporal index ``t = base`` (the encoder collapses history into
+      one current frame, so there is no per-token time axis), and receive 2-D
+      spatial positions ``h = base + row`` / ``w = base + col``. A present
+      video advances the running cursor by ``grid`` (= ``max(row, col) + 1``),
+      matching Qwen-style "text resumes after the vision block" continuity. A
+      padded (absent) video advances nothing.
+    * **Text segment**: ``t == h == w``, incrementing by 1 per *real* (non-pad)
+      token, so MRoPE degenerates to ordinary 1-D RoPE here.
+
+    The per-sample cursor mirrors the ``cumsum(pad_masks) - 1`` progression of
+    the 1-D path, but a video block consumes ``grid`` position units instead of
+    ``grid * grid``.
+
+    Args:
+        seg_masks: Per-segment bool pad masks, each ``[B, seg_len]``, in prefix
+            order (``True`` = real token).
+        seg_is_video: Parallel list flagging which segments are video grids.
+        grid: Side length of the (square) video patch grid.
+
+    Returns:
+        ``[3, B, L]`` long tensor of (temporal, height, width) positions.
+    """
+    device = seg_masks[0].device
+    bsize = seg_masks[0].shape[0]
+    cur = torch.zeros(bsize, dtype=torch.long, device=device)  # next free scalar position per sample
+
+    # Row-major (h, w) indices for a single video block.
+    patch_idx = torch.arange(grid * grid, device=device)
+    rows = torch.div(patch_idx, grid, rounding_mode="floor")  # [grid*grid]
+    cols = patch_idx % grid  # [grid*grid]
+
+    blocks: list[Tensor] = []  # each [3, B, seg_len]
+    for mask, is_video in zip(seg_masks, seg_is_video, strict=True):
+        seg_len = mask.shape[1]
+        if is_video:
+            present = mask[:, 0].long()  # [B] — 1 where the whole grid is real
+            base = cur[:, None]  # [B, 1]
+            t = base.expand(bsize, seg_len)
+            h = base + rows[None, :]
+            w = base + cols[None, :]
+            blocks.append(torch.stack([t, h, w], dim=0))  # [3, B, seg_len]
+            cur = cur + present * grid
+        else:
+            # Real tokens get cur, cur+1, ...; padded tokens repeat the prior
+            # value (masked out downstream), matching cumsum(pad_masks) - 1.
+            local = torch.cumsum(mask.long(), dim=1) - 1  # [B, seg_len]
+            pos = cur[:, None] + local
+            blocks.append(repeat(pos, "b l -> three b l", three=3))
+            cur = cur + reduce(mask.long(), "b l -> b", "sum")
+
+    return torch.cat(blocks, dim=2)  # [3, B, L]
+
+
+def mrope_suffix_position_ids(
+    prefix_position_ids: Tensor,
+    prefix_pad_masks: Tensor,
+    suffix_pad_masks: Tensor,
+    num_cross_att_tokens: int,
+) -> Tensor:
+    """Text-style interleaved-MRoPE positions for the action-expert suffix.
+
+    The suffix continues from the position right after the prefix region the
+    expert cross-attends to: ``offset = max(real prefix positions over the
+    cross region) + 1`` per sample. Suffix tokens are text-style
+    (``t == h == w``), so this is the 1-D ``offset + cumsum(pad) - 1``
+    progression broadcast to all three axes.
+
+    Only *real* (non-pad) prefix tokens contribute to the offset. This matters
+    because a padded prefix token's position is not "right after the real
+    content": an absent video does not advance the cursor yet its patch block
+    still carries ``h/w = base..base+grid-1`` (see ``build_mrope_prefix_positions``),
+    and a padded text/state token repeats a prior position. Masking padded
+    tokens out of the max makes ``offset`` equal the MRoPE cursor after the
+    cross region (real-token max + 1), so the suffix continues with no position
+    gap. Note this is NOT the 1-D path's token-count ``sum(pad_masks)``: a video
+    block compacts ``grid*grid`` patches into ``grid`` position units, so the
+    two schemes' offsets differ whenever the cross region contains video.
+
+    Args:
+        prefix_position_ids: ``[3, B, L]`` prefix MRoPE positions.
+        prefix_pad_masks: ``[B, L]`` bool prefix pad mask (``True`` = real).
+        suffix_pad_masks: ``[B, Ls]`` bool suffix pad mask.
+        num_cross_att_tokens: Number of leading prefix tokens cached for cross
+            attention (the region the suffix offset continues from).
+
+    Returns:
+        ``[3, B, Ls]`` long tensor of suffix positions.
+    """
+    cross = prefix_position_ids[:, :, :num_cross_att_tokens]  # [3, B, num_cross]
+    cross_pad = prefix_pad_masks[:, :num_cross_att_tokens]  # [B, num_cross]
+    # Exclude padded tokens from the max so absent videos / padded text don't
+    # push the offset past the real content. All-padded cross region -> -1 -> 0.
+    real = torch.where(cross_pad[None], cross, torch.full_like(cross, -1))  # [3, B, num_cross]
+    offset = reduce(real, "a b n -> b", "max")[:, None] + 1  # [B, 1]
+    scalar = offset + torch.cumsum(suffix_pad_masks, dim=1) - 1  # [B, Ls]
+    return repeat(scalar, "b l -> three b l", three=3)
 
 
 def resize_with_pad(img: Tensor, width: int, height: int, pad_value: int = -1) -> Tensor:
@@ -924,6 +1034,18 @@ class PI05MemFlowMatching(nn.Module):
                 gradient_checkpointing=config.gradient_checkpointing,
             )
 
+        # Side length of the (square) video patch grid, used by interleaved
+        # MRoPE to give per-frame patches 2-D (height, width) positions. Both
+        # encoders expose ``num_video_tokens`` (a perfect square, e.g. 256 for
+        # a 224/14 grid).
+        num_vid_tokens = self.video_encoder.num_video_tokens
+        self._video_grid = int(round(num_vid_tokens**0.5))
+        if self._video_grid * self._video_grid != num_vid_tokens:
+            raise ValueError(
+                f"Interleaved MRoPE requires a square video patch grid; got "
+                f"{num_vid_tokens} video tokens (not a perfect square)."
+            )
+
         # Per-timestep state projection: each of the T state vectors becomes one token
         self.state_proj = nn.Linear(self.config.max_state_dim, vlm_hidden_size)
 
@@ -975,7 +1097,7 @@ class PI05MemFlowMatching(nn.Module):
         discrete_actions: Tensor | None = None,
         discrete_action_masks: Tensor | None = None,
         obs_history_is_pad: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Embed videos with the space-time SigLIP video encoder, language
         tokens with the embedding layer, and temporal state via per-timestep
         learned projection.
@@ -993,11 +1115,14 @@ class PI05MemFlowMatching(nn.Module):
                 Used to mask state tokens during training; None during inference.
 
         Returns:
-            (embs, pad_masks, att_masks) tuple.
+            ``(embs, pad_masks, att_masks, position_ids)`` tuple. ``position_ids``
+            is ``[B, L]`` for ``rope_type="rope"`` and ``[3, B, L]`` (interleaved
+            MRoPE; only video tokens get 2-D spatial positions) otherwise.
         """
         embs = []
         pad_masks = []
         att_masks = []
+        seg_is_video: list[bool] = []  # parallel to pad_masks; for MRoPE position ids
         bsize = lang_tokens.shape[0]
 
         for vid, vid_mask in zip(videos, vid_masks, strict=False):
@@ -1009,6 +1134,7 @@ class PI05MemFlowMatching(nn.Module):
 
             embs.append(vid_emb)
             pad_masks.append(vid_mask_expanded)
+            seg_is_video.append(True)
 
             att_masks += [0] * num_vid_embs
 
@@ -1018,6 +1144,7 @@ class PI05MemFlowMatching(nn.Module):
 
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
+        seg_is_video.append(False)
 
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
@@ -1055,20 +1182,28 @@ class PI05MemFlowMatching(nn.Module):
 
         embs.append(state_emb)
         pad_masks.append(state_mask)
+        seg_is_video.append(False)
         att_masks += [0] * num_state_tokens  # full attention with video and language
 
         if discrete_actions is not None:
             discrete_action_emb = self.paligemma_with_expert.embed_discrete_actions(discrete_actions)
             embs.append(discrete_action_emb.to(dtype=_preferred_dtype()))
             pad_masks.append(discrete_action_masks)
+            seg_is_video.append(False)
             att_masks += [1] * discrete_action_emb.shape[1]
 
         embs = torch.cat(embs, dim=1)
-        pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
+        pad_masks_cat = torch.cat(pad_masks, dim=1)
+        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks_cat.device)
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
-        return embs, pad_masks, att_masks
+        if self.config.rope_type == "mrope_interleaved":
+            position_ids = build_mrope_prefix_positions(pad_masks, seg_is_video, self._video_grid)
+        else:
+            # 1-D RoPE: a single scalar position per real token (historical path).
+            position_ids = torch.cumsum(pad_masks_cat, dim=1) - 1
+
+        return embs, pad_masks_cat, att_masks, position_ids
 
     def embed_suffix(self, noisy_actions: Tensor, timestep: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Embed noisy_actions, timestep to prepare for Expert Gemma processing."""
@@ -1129,7 +1264,7 @@ class PI05MemFlowMatching(nn.Module):
         return_per_sample: bool = False,
     ) -> dict[str, Tensor | PerSampleLoss]:
         """Do a full training forward pass and compute the loss."""
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+        prefix_embs, prefix_pad_masks, prefix_att_masks, vlm_position_ids = self.embed_prefix(
             videos,
             vid_masks,
             lang_tokens,
@@ -1141,7 +1276,6 @@ class PI05MemFlowMatching(nn.Module):
         )
 
         vlm_2d_attention_mask = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        vlm_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
         num_cross_att_tokens = prefix_embs.shape[1] - self.config.discrete_action_max_length
 
@@ -1181,10 +1315,13 @@ class PI05MemFlowMatching(nn.Module):
             n_cross_att_tokens=num_cross_att_tokens,
             cross_att_pad_masks=prefix_pad_masks[:, :num_cross_att_tokens],
         )
-        prefix_offsets = torch.sum(prefix_pad_masks[:, : -self.config.discrete_action_max_length], dim=-1)[
-            :, None
-        ]
-        action_expert_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        if self.config.rope_type == "mrope_interleaved":
+            action_expert_position_ids = mrope_suffix_position_ids(
+                vlm_position_ids, prefix_pad_masks, suffix_pad_masks, num_cross_att_tokens
+            )
+        else:
+            prefix_offsets = torch.sum(prefix_pad_masks[:, :num_cross_att_tokens], dim=-1)[:, None]
+            action_expert_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
         assert past_key_values is not None
         kv_cache: dict = past_key_values
@@ -1285,7 +1422,7 @@ class PI05MemFlowMatching(nn.Module):
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+        prefix_embs, prefix_pad_masks, prefix_att_masks, prefix_position_ids = self.embed_prefix(
             videos,
             vid_masks,
             lang_tokens,
@@ -1294,7 +1431,6 @@ class PI05MemFlowMatching(nn.Module):
             obs_history_is_pad=obs_history_is_pad,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
         num_cross_att_tokens = prefix_embs.shape[1]
 
@@ -1320,6 +1456,7 @@ class PI05MemFlowMatching(nn.Module):
             masked_time = torch.where(prefix_mask, 0, time)
             v_t = self.denoise_step(
                 prefix_pad_masks,
+                prefix_position_ids,
                 past_key_values,
                 x_t,
                 masked_time,
@@ -1334,6 +1471,7 @@ class PI05MemFlowMatching(nn.Module):
     def denoise_step(
         self,
         prefix_pad_masks: Tensor,
+        prefix_position_ids: Tensor,
         past_key_values: list[dict[str, Tensor]],
         x_t: Tensor,
         time: Tensor,
@@ -1348,8 +1486,13 @@ class PI05MemFlowMatching(nn.Module):
             n_cross_att_tokens=num_cross_att_tokens,
             cross_att_pad_masks=prefix_pad_masks[:, :num_cross_att_tokens],
         )
-        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
-        action_expert_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        if self.config.rope_type == "mrope_interleaved":
+            action_expert_position_ids = mrope_suffix_position_ids(
+                prefix_position_ids, prefix_pad_masks, suffix_pad_masks, num_cross_att_tokens
+            )
+        else:
+            prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+            action_expert_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
         outputs_embeds, _ = self.paligemma_with_expert.forward(
             attention_mask=action_expert_2d_attention_mask,
