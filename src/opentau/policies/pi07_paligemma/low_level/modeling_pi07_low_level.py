@@ -23,8 +23,6 @@
 import builtins
 import logging
 import math
-import os
-import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,19 +58,6 @@ from opentau.utils.utils import get_safe_dtype
 
 ItemType = Literal["text", "image", "video", "state", "discrete_action", "action"]
 AttentionMode = Literal["continue", "bidirectional", "causal"]
-
-# Temporary stage-level inference profiling for the AR-vs-flow comparison
-# (OPENTAU_AR_PROFILE=1). Logs AR_PROF / FLOW_PROF lines per chunk query.
-_AR_PROFILE = os.environ.get("OPENTAU_AR_PROFILE", "0") == "1"
-# Module-level alias: `model.sample_actions` assigns a local named `time` (the
-# flow-matching time tensor), which makes the `time` module unreachable inside
-# that function scope (UnboundLocalError).
-_perf_counter = time.perf_counter
-
-
-def _prof_sync() -> None:
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
 
 
 @dataclass
@@ -2526,10 +2511,6 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
             Per-sample token id lists, each frozen at its stop point (or at
             ``max_new_tokens`` if the predicate never fired).
         """
-        if _AR_PROFILE:
-            _prof_sync()
-            t0 = time.perf_counter()
-
         prefix_embs, prefix_pad_masks, prefix_att_masks, _ = self.embed_prefix(
             # Independent per-rank rollout (sim eval): skip the cross-rank branch
             # all-reduce so variable-length rollouts don't desync at NCCL.
@@ -2540,10 +2521,6 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         bsize = prefix_embs.shape[0]
         device = prefix_embs.device
         use_flash = flash_cuda_active(self.config.attention_implementation)
-
-        if _AR_PROFILE:
-            _prof_sync()
-            t_embed = time.perf_counter() - t0
 
         prefix_att_2d_masks, prefix_block_ids = build_attention_inputs(
             use_flash, prefix_pad_masks, prefix_att_masks
@@ -2565,25 +2542,13 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         next_token = logits.argmax(dim=-1)  # (B,)
         generated = next_token[:, None]  # (B, k) running block, all samples
 
-        if _AR_PROFILE:
-            _prof_sync()
-            t_prefix_fwd = time.perf_counter() - t_embed - t0
-            step_times: list[float] = []
-            t_stop = 0.0
-            t_s = time.perf_counter()
-
         rows: list[list[int]] = [[int(t)] for t in next_token.tolist()]
         done = stop_fn(rows)
         done_len: list[int | None] = [1 if d else None for d in done]
 
-        if _AR_PROFILE:
-            t_stop += time.perf_counter() - t_s
-
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
 
         while generated.shape[1] < max_new_tokens and any(dl is None for dl in done_len):
-            if _AR_PROFILE:
-                t_s = time.perf_counter()
             k = generated.shape[1]
             gen_embs = self.paligemma_with_expert.embed_discrete_actions(generated).to(
                 dtype=_preferred_dtype()
@@ -2610,10 +2575,6 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
             logits = self.paligemma_with_expert.da_head(gen_out[:, -1])
             next_token = logits.argmax(dim=-1)
             generated = torch.cat([generated, next_token[:, None]], dim=1)
-            if _AR_PROFILE:
-                _prof_sync()
-                step_times.append(time.perf_counter() - t_s)
-                t_s = time.perf_counter()
             # Frozen (done) samples keep generating in-batch for shape
             # uniformity, but their rows stop accumulating — the extra tokens
             # only ever attend within that sample's own row and are discarded.
@@ -2624,26 +2585,6 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
             for i in range(bsize):
                 if done_len[i] is None and newly_done[i]:
                     done_len[i] = len(rows[i])
-            if _AR_PROFILE:
-                t_stop += time.perf_counter() - t_s
-
-        if _AR_PROFILE:
-            lens = [dl if dl is not None else len(r) for dl, r in zip(done_len, rows, strict=True)]
-            n_steps = len(step_times)
-            head = step_times[:5] or [0.0]
-            tail = step_times[-5:] or [0.0]
-            logging.info(
-                "AR_PROF steps=%d embed=%.1fms prefix_fwd=%.1fms fwd_total=%.1fms "
-                "fwd_first5_avg=%.2fms fwd_last5_avg=%.2fms stop_total=%.1fms tok_lens=%s",
-                n_steps + 1,
-                t_embed * 1e3,
-                t_prefix_fwd * 1e3,
-                sum(step_times) * 1e3,
-                sum(head) / len(head) * 1e3,
-                sum(tail) / len(tail) * 1e3,
-                t_stop * 1e3,
-                lens,
-            )
 
         return rows
 
@@ -2668,11 +2609,6 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         Returns:
             The sampled action tensor.
         """
-        if _AR_PROFILE:
-            pc = _perf_counter  # the `time` module is shadowed by the local flow-time tensor
-            _prof_sync()
-            t0 = pc()
-
         prefix_embs, prefix_pad_masks, prefix_att_masks, num_cross_att_tokens = self.embed_prefix(
             # Independent per-rank rollout (sim eval): skip the cross-rank branch
             # all-reduce so variable-length rollouts don't desync at NCCL.
@@ -2682,10 +2618,6 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         )
         bsize = prefix_embs.shape[0]
         device = prefix_embs.device
-
-        if _AR_PROFILE:
-            _prof_sync()
-            t_embed = pc() - t0
 
         if noise is None:
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
@@ -2708,11 +2640,6 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
             fill_kv_cache=True,
             attention_block_ids=prefix_block_ids,
         )
-
-        if _AR_PROFILE:
-            _prof_sync()
-            t_prefix_fwd = pc() - t0 - t_embed
-            t_d = pc()
 
         # perform denoising steps to get the action
         dt = -1.0 / self.config.num_steps
@@ -2739,16 +2666,6 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
 
         # we need to ensure the frozen actions are not modified before returning the denoised actions
         x_t = torch.where(rearrange(prefix_mask, "b c -> b c 1"), action_prefix, x_t)
-
-        if _AR_PROFILE:
-            _prof_sync()
-            logging.info(
-                "FLOW_PROF embed=%.1fms prefix_fwd=%.1fms denoise_loop=%.1fms num_steps=%d",
-                t_embed * 1e3,
-                t_prefix_fwd * 1e3,
-                (pc() - t_d) * 1e3,
-                self.config.num_steps,
-            )
 
         return x_t
 
