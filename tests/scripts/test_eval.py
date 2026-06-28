@@ -21,15 +21,18 @@ import imageio.v2 as imageio
 import numpy as np
 import pytest
 import torch
+from accelerate import DistributedType
 
 from opentau.configs.default import EvalConfig
 from opentau.envs.configs import RoboCasaEnv
 from opentau.scripts.eval import (
     _cleanup_episode_clips,
+    _eval_uses_sharded_params,
     _rank_seed_offset,
     _resolve_eval_seed,
     collect_grid_summary_videos,
     create_grid_summary_video,
+    eval_main,
     eval_policy,
     eval_policy_all,
 )
@@ -316,6 +319,39 @@ class TestResolveEvalSeed:
         # The field exists and defaults to None (fall back to cfg.seed).
         assert EvalConfig().seed is None
         assert EvalConfig(seed=42).seed == 42
+
+
+class TestEvalUsesShardedParams:
+    """`_eval_uses_sharded_params` gates the AR-decode eval guard (FSDP / ZeRO-3).
+
+    Calling the helper directly with a mock accelerator also guards against the
+    decorator-placement regression: `@parser.wrap()` must sit on `eval_main`, not
+    on this helper (a wrapped helper would not return a plain bool here).
+    """
+
+    @staticmethod
+    def _acc(dist_type, zero_stage=0):
+        acc = Mock()
+        acc.distributed_type = dist_type
+        acc.deepspeed_plugin.hf_ds_config.config = {"zero_optimization": {"stage": zero_stage}}
+        return acc
+
+    def test_fsdp_is_sharded(self):
+        assert _eval_uses_sharded_params(self._acc(DistributedType.FSDP)) is True
+
+    def test_deepspeed_zero3_is_sharded(self):
+        assert _eval_uses_sharded_params(self._acc(DistributedType.DEEPSPEED, zero_stage=3)) is True
+
+    def test_deepspeed_zero2_is_not_sharded(self):
+        assert _eval_uses_sharded_params(self._acc(DistributedType.DEEPSPEED, zero_stage=2)) is False
+
+    def test_multi_gpu_is_not_sharded(self):
+        assert _eval_uses_sharded_params(self._acc(DistributedType.MULTI_GPU)) is False
+
+    def test_eval_main_is_parser_wrapped(self):
+        # Regression: inserting the helper above eval_main must not steal its
+        # @parser.wrap() decorator (that breaks the opentau-eval entry point).
+        assert getattr(eval_main, "__wrapped__", None) is not None
 
 
 # --------------------------------------------------------------------------- #

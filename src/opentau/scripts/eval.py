@@ -922,7 +922,6 @@ def make_subgoal_generator(cfg: TrainPipelineConfig) -> SubgoalImageGenerator | 
     return None
 
 
-@parser.wrap()
 def _eval_uses_sharded_params(accelerator: Accelerator) -> bool:
     """Whether params are sharded across ranks (FSDP or DeepSpeed ZeRO-3).
 
@@ -947,6 +946,7 @@ def _eval_uses_sharded_params(accelerator: Accelerator) -> bool:
     return False
 
 
+@parser.wrap()
 def eval_main(cfg: TrainPipelineConfig):
     accelerator = Accelerator()
     set_proc_accelerator(accelerator)
