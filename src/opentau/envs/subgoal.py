@@ -583,12 +583,14 @@ class RoboCasaGoalFrameSubgoalGenerator:
                 cams = self._index.get(seed)
                 if not cams:
                     continue
+                # Only serve a scene that has EVERY camera this generator emits. subgoal_is_pad is a
+                # single per-sample flag, so a scene missing a camera that other indexed scenes have
+                # would otherwise feed its zero frame as a VALID (non-pad) subgoal for that camera.
+                if any(k not in cams for k in self.camera_indices):
+                    continue
                 subgoal_is_pad[i] = False
                 for k in self.camera_indices:
-                    path = cams.get(k)
-                    if path is None:
-                        continue
-                    per_cam[k][i] = self._cached_frame(path).to(device=device, dtype=dtype)
+                    per_cam[k][i] = self._cached_frame(cams[k]).to(device=device, dtype=dtype)
 
         out: dict[str, Tensor] = {f"subgoal{k}": per_cam[k] for k in self.camera_indices}
         out["subgoal_is_pad"] = subgoal_is_pad

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import numpy as np
 import pytest
 import torch
 from transformers import AutoTokenizer
@@ -2730,3 +2731,328 @@ class TestSkipNormalizationWeights:
     def test_can_be_set_true(self):
         cfg = PI07PaligemmaLowLevelConfig(skip_normalization_weights=True)
         assert cfg.skip_normalization_weights is True
+
+
+class TestDecodeDiscreteActionTokens:
+    """CPU-only tests for the AR discrete-action decode path on
+    :class:`PI07PaligemmaLowLevelPolicy`.
+
+    ``_decode_discrete_action_tokens`` is pure numpy / scipy / torch logic — it
+    reads only ``config.{chunk_size,max_action_dim}``, the
+    ``discrete_action_processor`` (``bpe_tokenizer.decode`` / ``min_token`` /
+    ``vocab_size`` / ``scale``) and the MIN_MAX stat buffers in
+    ``normalize_discrete_actions.buffer_actions``. None of the backbone is
+    needed, so we drive the UNBOUND method on a lightweight
+    ``types.SimpleNamespace`` stub.
+
+    The decode mirrors ``UniversalActionProcessor.decode`` but is relaxed:
+
+      chars  --ord-->  ords  --snap OOA-->  --truncate/pad to n_coeffs-->
+      coeffs = (ords[:n] + min_token)/scale  --idct-->  normalized
+      --inverse MIN_MAX-->  raw actions
+
+    where ``zero_ord = -min_token`` (the quantized-coefficient-0 char) is the
+    pad / out-of-alphabet snap value.
+    """
+
+    # Small, fully-controlled alphabet. min_token negative so zero_ord > 0.
+    MIN_TOKEN = -5
+    ZERO_ORD = -MIN_TOKEN  # 5 -> chr(5) is the quantized-zero coefficient
+    VOCAB_SIZE = 100  # generous upper bound for the OOA clamp
+    SCALE = 10.0
+    CHUNK_SIZE = 2
+    MAX_ACTION_DIM = 3
+    N_COEFFS = CHUNK_SIZE * MAX_ACTION_DIM  # 6
+
+    ZERO_CHAR = chr(ZERO_ORD)
+    NONZERO_ORD = 9  # chr(9): a non-zero coefficient (9 + min_token = 4 != 0)
+    NONZERO_CHAR = chr(NONZERO_ORD)
+
+    @classmethod
+    def _make_stub(cls, decode_map: dict, *, num_datasets: int, min_max):
+        """Build a stub policy object the UNBOUND method can be called on.
+
+        Args:
+            decode_map: maps ``tuple(token_row) -> decoded char string`` so each
+                input row's BPE decode is fully under test control.
+            num_datasets: number of rows in the MIN_MAX stat buffers.
+            min_max: ``(min_tensor, max_tensor)`` each shaped
+                ``(num_datasets, max_action_dim)``.
+        """
+        import types
+
+        min_t, max_t = min_max
+
+        class _BpeTok:
+            @staticmethod
+            def decode(toks):
+                return decode_map[tuple(toks)]
+
+        proc = types.SimpleNamespace(
+            bpe_tokenizer=_BpeTok(),
+            min_token=cls.MIN_TOKEN,
+            vocab_size=cls.VOCAB_SIZE,
+            scale=cls.SCALE,
+        )
+        norm = types.SimpleNamespace(buffer_actions={"min": min_t, "max": max_t})
+        return types.SimpleNamespace(
+            config=types.SimpleNamespace(chunk_size=cls.CHUNK_SIZE, max_action_dim=cls.MAX_ACTION_DIM),
+            discrete_action_processor=proc,
+            normalize_discrete_actions=norm,
+        )
+
+    @classmethod
+    def _reference_decode(cls, char_streams, min_buf, max_buf, dataset_index):
+        """Independent re-implementation of the decode for value assertions."""
+        from scipy.fft import idct
+
+        from opentau.policies.normalize import EPS
+
+        t_steps, act_dim = cls.CHUNK_SIZE, cls.MAX_ACTION_DIM
+        n_coeffs = cls.N_COEFFS
+        zero_ord, max_ord = cls.ZERO_ORD, cls.VOCAB_SIZE
+        rows = []
+        for chars in char_streams:
+            ords = np.array([ord(c) for c in chars], dtype=np.int64)
+            ords = np.where((ords < 0) | (ords > max_ord), zero_ord, ords)
+            if len(ords) < n_coeffs:
+                ords = np.pad(ords, (0, n_coeffs - len(ords)), constant_values=zero_ord)
+            coeffs = (ords[:n_coeffs] + cls.MIN_TOKEN).astype(np.float64).reshape(t_steps, act_dim)
+            rows.append(idct(coeffs / cls.SCALE, axis=0, norm="ortho"))
+        normalized = torch.from_numpy(np.stack(rows)).float()
+        min_ = min_buf.index_select(0, dataset_index).unsqueeze(1).float()
+        max_ = max_buf.index_select(0, dataset_index).unsqueeze(1).float()
+        denom = max_ - min_
+        denom = torch.where(denom.abs() < EPS, torch.ones_like(denom), denom)
+        return (normalized + 1) / 2 * (denom + EPS) + min_
+
+    def test_output_shape(self):
+        """(B, chunk_size, max_action_dim) for B token rows."""
+        min_t = torch.zeros(1, self.MAX_ACTION_DIM)
+        max_t = torch.ones(1, self.MAX_ACTION_DIM)
+        decode_map = {(1,): self.ZERO_CHAR * self.N_COEFFS, (2,): self.ZERO_CHAR * self.N_COEFFS}
+        stub = self._make_stub(decode_map, num_datasets=1, min_max=(min_t, max_t))
+        dataset_index = torch.tensor([0, 0])
+        out = PI07PaligemmaLowLevelPolicy._decode_discrete_action_tokens(
+            stub, [[1], [2]], dataset_index, torch.device("cpu")
+        )
+        assert out.shape == (2, self.CHUNK_SIZE, self.MAX_ACTION_DIM)
+        assert torch.isfinite(out).all()
+
+    def test_over_length_stream_is_truncated(self):
+        """Extra chars beyond n_coeffs are ignored (truncated): a stream of
+        n_coeffs zero-coeff chars followed by NON-zero chars must decode
+        identically to the pure n_coeffs zero-coeff stream."""
+        min_t = torch.zeros(1, self.MAX_ACTION_DIM)
+        max_t = torch.full((1, self.MAX_ACTION_DIM), 4.0)
+        # over-length: first N_COEFFS are zero coeff, the rest are non-zero.
+        over = self.ZERO_CHAR * self.N_COEFFS + self.NONZERO_CHAR * 4
+        exact = self.ZERO_CHAR * self.N_COEFFS
+        decode_map = {(7,): over, (8,): exact}
+        stub = self._make_stub(decode_map, num_datasets=1, min_max=(min_t, max_t))
+        dataset_index = torch.tensor([0, 0])
+        out = PI07PaligemmaLowLevelPolicy._decode_discrete_action_tokens(
+            stub, [[7], [8]], dataset_index, torch.device("cpu")
+        )
+        # If truncation works the trailing non-zero chars are dropped -> rows equal.
+        assert torch.allclose(out[0], out[1], atol=1e-6)
+        # Cross-check both equal the reference for the truncated stream.
+        ref = self._reference_decode([exact, exact], min_t, max_t, dataset_index)
+        assert torch.allclose(out, ref, atol=1e-5)
+
+    def test_under_length_stream_is_zero_coeff_padded(self):
+        """A short stream is zero-coefficient padded: coefficients beyond the
+        decoded chars equal the quantized-zero coefficient (chr(zero_ord))."""
+        min_t = torch.zeros(1, self.MAX_ACTION_DIM)
+        max_t = torch.full((1, self.MAX_ACTION_DIM), 4.0)
+        # Only 2 real chars (both non-zero); the remaining 4 coeffs are padded.
+        short = self.NONZERO_CHAR * 2
+        explicit = self.NONZERO_CHAR * 2 + self.ZERO_CHAR * (self.N_COEFFS - 2)
+        decode_map = {(3,): short, (4,): explicit}
+        stub = self._make_stub(decode_map, num_datasets=1, min_max=(min_t, max_t))
+        dataset_index = torch.tensor([0, 0])
+        out = PI07PaligemmaLowLevelPolicy._decode_discrete_action_tokens(
+            stub, [[3], [4]], dataset_index, torch.device("cpu")
+        )
+        # Padding the short stream with zero coeffs must equal spelling them out.
+        assert torch.allclose(out[0], out[1], atol=1e-6)
+        ref = self._reference_decode([explicit], min_t, max_t, dataset_index[:1])
+        assert torch.allclose(out[:1], ref, atol=1e-5)
+
+    def test_out_of_alphabet_char_snaps_to_zero_coeff(self):
+        """A char whose ord > vocab_size (e.g. the U+FFFD replacement char) is
+        snapped to the zero coefficient, not crashing and not leaking a huge
+        coefficient. The snapped stream must equal the same stream with that
+        char replaced by chr(zero_ord)."""
+        assert ord("�") > self.VOCAB_SIZE  # the OOA char we rely on
+        min_t = torch.zeros(1, self.MAX_ACTION_DIM)
+        max_t = torch.full((1, self.MAX_ACTION_DIM), 4.0)
+        # One OOA char among real (non-zero) chars; equivalent: OOA -> zero char.
+        with_ooa = self.NONZERO_CHAR * 2 + "�" + self.NONZERO_CHAR * 3
+        snapped = self.NONZERO_CHAR * 2 + self.ZERO_CHAR + self.NONZERO_CHAR * 3
+        decode_map = {(5,): with_ooa, (6,): snapped}
+        stub = self._make_stub(decode_map, num_datasets=1, min_max=(min_t, max_t))
+        dataset_index = torch.tensor([0, 0])
+        out = PI07PaligemmaLowLevelPolicy._decode_discrete_action_tokens(
+            stub, [[5], [6]], dataset_index, torch.device("cpu")
+        )
+        assert torch.isfinite(out).all()
+        assert torch.allclose(out[0], out[1], atol=1e-6)
+
+    def test_zero_range_row_is_finite_and_uses_snapped_denom(self):
+        """A dataset row whose min == max (zero range) decodes to a finite
+        tensor (no NaN/inf) via the ``denom = where(|denom|<EPS, 1, denom)``
+        snap. For an all-zero-coefficient input (normalized == 0) the inverse
+        MIN_MAX gives ``min + 0.5*(denom_snapped + EPS)`` per dim — NOT ``min``
+        (that midpoint is what (normalized+1)/2 yields at normalized==0)."""
+        from opentau.policies.normalize import EPS
+
+        # Two datasets: row 0 has a real range, row 1 has zero range (min==max).
+        min_t = torch.tensor([[0.0, 0.0, 0.0], [2.5, 2.5, 2.5]])
+        max_t = torch.tensor([[4.0, 4.0, 4.0], [2.5, 2.5, 2.5]])
+        exact_zero = self.ZERO_CHAR * self.N_COEFFS  # all coeffs zero -> normalized 0
+        decode_map = {(11,): exact_zero, (12,): exact_zero}
+        stub = self._make_stub(decode_map, num_datasets=2, min_max=(min_t, max_t))
+        dataset_index = torch.tensor([0, 1])  # row 1 hits the zero-range branch
+        out = PI07PaligemmaLowLevelPolicy._decode_discrete_action_tokens(
+            stub, [[11], [12]], dataset_index, torch.device("cpu")
+        )
+        assert torch.isfinite(out).all(), "zero-range row must not produce NaN/inf"
+        # Zero-range row: denom snaps to 1, normalized==0 -> min + 0.5*(1+EPS).
+        expected_zero_row = 2.5 + 0.5 * (1.0 + EPS)
+        assert torch.allclose(
+            out[1], torch.full((self.CHUNK_SIZE, self.MAX_ACTION_DIM), expected_zero_row), atol=1e-5
+        )
+        # Sanity: this is NOT equal to min (the common misconception).
+        assert not torch.allclose(out[1], torch.full_like(out[1], 2.5), atol=1e-3)
+        # And the real-range row matches the reference decode.
+        ref0 = self._reference_decode([exact_zero], min_t, max_t, dataset_index[:1])
+        assert torch.allclose(out[:1], ref0, atol=1e-5)
+
+
+class TestDiscreteActionStopRule:
+    """The FAST self-delimiting stop rule ``_rows_done`` inside
+    ``_sample_actions_discrete``: a row is done once its running BPE decode
+    reaches ``chunk_size * max_action_dim`` coefficient chars.
+
+    ``_rows_done`` is a closure over ``proc`` / ``n_coeffs`` inside
+    ``_sample_actions_discrete`` (modeling_pi07_low_level.py around line 1138)
+    and is not separately importable, so this test reconstructs the EXACT
+    closure body — ``[len(proc.bpe_tokenizer.decode(row)) >= n_coeffs for row
+    in token_rows]`` — and pins the boundary it must flip at.
+    """
+
+    @staticmethod
+    def _rows_done(proc, n_coeffs, token_rows):
+        # Mirrors the closure body verbatim (source line ~1170).
+        return [len(proc.bpe_tokenizer.decode(row)) >= n_coeffs for row in token_rows]
+
+    def test_flips_true_exactly_at_chunk_times_action_dim(self):
+        import types
+
+        chunk_size, max_action_dim = 4, 3
+        n_coeffs = chunk_size * max_action_dim  # 12
+
+        # decode returns a string whose length == the single token id in the row,
+        # so we can dial the decoded char count precisely per row.
+        class _BpeTok:
+            @staticmethod
+            def decode(row):
+                return "x" * row[0]
+
+        proc = types.SimpleNamespace(bpe_tokenizer=_BpeTok())
+
+        # below, exactly at, and above the boundary
+        rows = [[n_coeffs - 1], [n_coeffs], [n_coeffs + 1]]
+        done = self._rows_done(proc, n_coeffs, rows)
+        assert done == [False, True, True]
+
+    def test_independent_per_row(self):
+        import types
+
+        n_coeffs = 6
+
+        class _BpeTok:
+            @staticmethod
+            def decode(row):
+                return "x" * row[0]
+
+        proc = types.SimpleNamespace(bpe_tokenizer=_BpeTok())
+        rows = [[0], [3], [6], [99]]
+        assert self._rows_done(proc, n_coeffs, rows) == [False, False, True, True]
+
+
+class TestBuildPrefixItemsActionIndicator:
+    """``generate_discrete_actions`` (AR eval) depends on
+    ``_build_prefix_items(..., include_discrete_actions=False,
+    include_action_indicator=True)`` appending exactly ONE trailing
+    ``"Action: "`` text indicator and NO ``discrete_action`` item — the exact
+    prefix layout the AR decode replays. This pins that layout."""
+
+    def test_indicator_only_appends_action_text_and_no_discrete_action(self):
+        model = TestPI07PaligemmaLowLevelResponseEmbedding._make_mock_model(hidden_size=8)
+        bsz = 2
+        common = {
+            "videos": [torch.zeros(bsz, 1, 3, 8, 8)],
+            "vid_masks": [torch.ones(bsz, dtype=torch.bool)],
+            "lang_tokens": torch.zeros(bsz, 5, dtype=torch.long),
+            "lang_masks": torch.ones(bsz, 5, dtype=torch.bool),
+            "state": torch.zeros(bsz, 1, 8),
+            "response_tokens": torch.zeros(bsz, RESPONSE_MAX_LENGTH, dtype=torch.long),
+            "response_masks": torch.zeros(bsz, RESPONSE_MAX_LENGTH, dtype=torch.bool),
+            "metadata_tokens": torch.zeros(bsz, METADATA_MAX_LENGTH, dtype=torch.long),
+            "metadata_masks": torch.zeros(bsz, METADATA_MAX_LENGTH, dtype=torch.bool),
+            "subgoal_videos": [torch.zeros(bsz, 3, 224, 224)],
+            "subgoal_vid_masks": [torch.zeros(bsz, dtype=torch.bool)],
+        }
+
+        # Plain inference prefix: no Action indicator, no discrete actions.
+        plain_items = _legacy_embed_prefix(model, return_items=True, **common)
+
+        # AR-eval prefix: indicator-only.  _legacy_embed_prefix only forwards
+        # include_discrete_actions, so drive _build_prefix_items directly with
+        # the same fake policy wiring it uses internally.
+        fake_policy = object.__new__(PI07PaligemmaLowLevelPolicy)
+        fake_policy.language_tokenizer = model.language_tokenizer
+        fake_policy.prepare_videos = lambda batch: (list(common["videos"]), list(common["vid_masks"]))
+        fake_policy.prepare_language = lambda batch: (common["lang_tokens"], common["lang_masks"])
+        fake_policy.prepare_response = lambda batch: (
+            common["response_tokens"],
+            common["response_masks"],
+        )
+        fake_policy.prepare_metadata = lambda batch: (
+            common["metadata_tokens"],
+            common["metadata_masks"],
+        )
+        fake_policy.prepare_subgoal_images = lambda batch: (
+            list(common["subgoal_videos"]),
+            list(common["subgoal_vid_masks"]),
+        )
+        fake_policy.prepare_state = lambda batch: common["state"]
+
+        ar_items = PI07PaligemmaLowLevelPolicy._build_prefix_items(
+            fake_policy,
+            {},
+            include_discrete_actions=False,
+            include_action_indicator=True,
+        )
+
+        plain_types = [it.item_type for it in plain_items]
+        ar_types = [it.item_type for it in ar_items]
+
+        # AR prefix is the plain prefix + exactly one trailing "Action: " text item.
+        assert ar_types == plain_types + ["text"]
+        # No discrete_action item is present (that is training-only).
+        assert "discrete_action" not in ar_types
+
+        # The trailing item is the "Action: " indicator: causal, excluded from
+        # cross-attention, with the exact tokens from "Action: ".
+        action_item = ar_items[-1]
+        assert action_item.item_type == "text"
+        assert action_item.attention == "causal"
+        assert action_item.exclude_from_cross_attention is True
+        expected_ids = model.language_tokenizer.encode("Action: ", add_special_tokens=False)
+        assert action_item.data.shape == (bsz, len(expected_ids))
+        assert action_item.data[0].tolist() == expected_ids
+        # Indicator is fully real (all-ones mask) for every sample.
+        assert bool(action_item.pad_mask.all())

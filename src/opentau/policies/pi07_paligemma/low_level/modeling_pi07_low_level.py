@@ -24,6 +24,7 @@ import builtins
 import logging
 import math
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -39,7 +40,7 @@ from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import NormalizationMode
 from opentau.policies.flash_attn_cuda import make_att_block_ids
 from opentau.policies.layers import PerGroupLinear
-from opentau.policies.normalize import EPS, Normalize, Unnormalize
+from opentau.policies.normalize import EPS, Normalize, Unnormalize, _materialize
 from opentau.policies.normalize import resolve_num_datasets as _num_datasets
 from opentau.policies.outlier_utils import detect_state_action_outliers
 from opentau.policies.pi05.paligemma_with_expert import (
@@ -1224,9 +1225,12 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         # Inverse of Normalize's MIN_MAX ((x - min)/(denom + EPS) * 2 - 1),
         # mirroring Unnormalize.forward including the zero-range snap, inlined
         # so this experimental path adds no extra module / state-dict keys.
+        # _materialize: under FSDP2 these ParameterDict buffers are DTensors;
+        # mixing them with the plain decoded tensor below would raise. Mirrors
+        # Normalize/Unnormalize's MIN_MAX stat access.
         buffer = self.normalize_discrete_actions.buffer_actions
-        min_ = buffer["min"].index_select(0, dataset_index).unsqueeze(1).to(device=device)
-        max_ = buffer["max"].index_select(0, dataset_index).unsqueeze(1).to(device=device)
+        min_ = _materialize(buffer["min"]).index_select(0, dataset_index).unsqueeze(1).to(device=device)
+        max_ = _materialize(buffer["max"]).index_select(0, dataset_index).unsqueeze(1).to(device=device)
         denom = max_ - min_
         denom = torch.where(denom.abs() < EPS, torch.ones_like(denom), denom)
         return (normalized + 1) / 2 * (denom + EPS) + min_
@@ -2477,7 +2481,7 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         self,
         prefix_items: list[ContextItem],
         max_new_tokens: int,
-        stop_fn,
+        stop_fn: Callable[[list[list[int]]], list[bool]],
         group_index: Tensor | None = None,
     ) -> list[list[int]]:
         """Greedy autoregressive generation of FAST discrete-action tokens.

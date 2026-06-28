@@ -43,7 +43,7 @@ import gymnasium as gym
 import imageio
 import numpy as np
 import torch
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedType
 from accelerate.utils import gather_object
 from termcolor import colored
 from torch import nn
@@ -528,12 +528,24 @@ def eval_policy(
             batch_last_frames = rollout_data.get("last_frames")
             task_name = str(getattr(cfg.env, "task", "unknown"))
             decoder = "discrete" if getattr(cfg.policy, "eval_use_discrete_actions", False) else "flow"
-            for b, (seed, success) in enumerate(zip(seeds, batch_successes.tolist(), strict=False)):
-                if not success or batch_last_frames is None or batch_last_frames[b] is None:
+            acc = get_proc_accelerator()
+            rank = acc.process_index if acc is not None else 0
+            # Only the real episodes of this batch — exclude the right-pad / overshoot seeds (metrics
+            # use [:n_episodes]); harvesting padded duplicates would append duplicate manifest rows.
+            n_real = max(0, min(env.num_envs, n_episodes - batch_ix * env.num_envs))
+            for b in range(n_real):
+                seed = seeds[b]
+                if (
+                    not bool(batch_successes[b].item())
+                    or batch_last_frames is None
+                    or batch_last_frames[b] is None
+                ):
                     continue
+                # Rank-suffix the PNG filename so concurrent ranks (which evaluate the SAME seeds when
+                # decorrelate_rank_seeds is off) never write the same path and tear each other's file.
                 row = {"task": task_name, "seed": int(seed), "decoder": decoder, "success": 1}
                 for cam_key, frame in sorted(batch_last_frames[b].items()):
-                    fname = f"{task_name}__seed{int(seed)}__{decoder}__{cam_key}.png"
+                    fname = f"{task_name}__seed{int(seed)}__{decoder}__{cam_key}__rank{rank}.png"
                     imageio.imwrite(goal_frames_dir / fname, np.asarray(frame).astype(np.uint8))
                     row[cam_key] = fname
                 goal_manifest_rows.append(row)
@@ -637,18 +649,43 @@ def eval_policy(
         # serialized to eval_info.json, which external consumers may read).
         info["video_paths"] = [p for p in video_paths if Path(p).exists()]
 
-    # Append harvested goal-frame rows to a manifest CSV (one row per successful episode), so a
-    # downstream aggregator can pick the best successful frame-set per (task, seed) across checkpoints.
-    if capture_last_frames and goal_manifest_rows:
-        manifest_path = goal_frames_dir / "manifest.csv"
-        fieldnames = ["task", "seed", "decoder", "success", "camera0", "camera1", "camera2"]
-        write_header = not manifest_path.exists()
-        with open(manifest_path, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-            if write_header:
-                writer.writeheader()
-            writer.writerows(goal_manifest_rows)
-        info["goal_frames_saved"] = len(goal_manifest_rows)
+    # Write a single goal-frame manifest CSV (one row per successful episode), so a downstream
+    # aggregator can pick the best successful frame-set per (task, seed) across checkpoints.
+    # eval_policy runs on EVERY rank, so gather each rank's rows and let exactly one writer (rank 0)
+    # emit manifest.csv — concurrent appends from all ranks would interleave/duplicate rows and race
+    # on the header. gather_object is a collective; `capture_last_frames` is config-derived and
+    # identical on every rank, so all ranks reach it together.
+    if capture_last_frames:
+        acc = get_proc_accelerator()
+        if acc is not None and acc.num_processes > 1:
+            gathered_rows: list[dict] = []
+            for rank_rows in gather_object([goal_manifest_rows]):
+                gathered_rows.extend(rank_rows)
+        else:
+            gathered_rows = goal_manifest_rows
+        if (acc is None or acc.is_main_process) and gathered_rows:
+            # Dedup by (task, seed, decoder): when ranks share seeds (decorrelate_rank_seeds off) the
+            # same scene is harvested once per rank; keep the first (its rank-suffixed PNG exists).
+            seen: set[tuple] = set()
+            rows: list[dict] = []
+            for r in gathered_rows:
+                key = (r["task"], r["seed"], r["decoder"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(r)
+            # Size fieldnames to the cameras actually harvested (not a fixed camera0/1/2) so configs
+            # with >3 cameras don't silently drop columns under extrasaction="ignore".
+            cam_cols = sorted({k for r in rows for k in r if k.startswith("camera")})
+            fieldnames = ["task", "seed", "decoder", "success", *cam_cols]
+            manifest_path = goal_frames_dir / "manifest.csv"
+            write_header = not manifest_path.exists()
+            with open(manifest_path, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+                if write_header:
+                    writer.writeheader()
+                writer.writerows(rows)
+            info["goal_frames_saved"] = len(rows)
 
     return info
 
@@ -886,6 +923,30 @@ def make_subgoal_generator(cfg: TrainPipelineConfig) -> SubgoalImageGenerator | 
 
 
 @parser.wrap()
+def _eval_uses_sharded_params(accelerator: Accelerator) -> bool:
+    """Whether params are sharded across ranks (FSDP or DeepSpeed ZeRO-3).
+
+    The per-rank-independent sim-eval rollout fires no cross-rank collective of
+    its own, but under parameter sharding the policy forward all-gathers params
+    per layer; paired with a per-rank-divergent decode loop (the variable-length
+    AR discrete-action path) the ranks issue a different number of all-gathers
+    and hang at NCCL. Mirrors the in-training guard in ``train.py``.
+
+    Args:
+        accelerator: The active accelerate ``Accelerator``.
+
+    Returns:
+        bool: ``True`` under FSDP or DeepSpeed ZeRO-3, ``False`` otherwise.
+    """
+    if accelerator.distributed_type == DistributedType.FSDP:
+        return True
+    if accelerator.distributed_type == DistributedType.DEEPSPEED:
+        plugin = getattr(accelerator, "deepspeed_plugin", None)
+        ds_config = getattr(getattr(plugin, "hf_ds_config", None), "config", None) or {}
+        return int(ds_config.get("zero_optimization", {}).get("stage", 0)) >= 3
+    return False
+
+
 def eval_main(cfg: TrainPipelineConfig):
     accelerator = Accelerator()
     set_proc_accelerator(accelerator)
@@ -896,6 +957,17 @@ def eval_main(cfg: TrainPipelineConfig):
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     set_seed(cfg.seed)
+
+    # The AR discrete-action eval decode loop runs a per-rank-variable number of
+    # backbone forwards; under parameter sharding the per-layer all-gathers desync
+    # across ranks and hang at NCCL. Fail fast (mirrors the in-training guard).
+    if getattr(cfg.policy, "eval_use_discrete_actions", False) and _eval_uses_sharded_params(accelerator):
+        raise ValueError(
+            "AR discrete-action eval (policy.eval_use_discrete_actions=True) is not supported under "
+            "parameter sharding (FSDP / DeepSpeed ZeRO-3): the per-rank variable-length AR decode fires "
+            "a different number of sharded-param all-gathers per rank and hangs at NCCL. Run eval with "
+            "replicated params (single GPU / DDP / ZeRO-1/2)."
+        )
 
     details = f"{cfg.env.type}-{cfg.env.task}-{cfg.eval.n_episodes}"
     now = f"{dt.datetime.now():%Y%m%d-%H%M%S}"
