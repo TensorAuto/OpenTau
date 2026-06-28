@@ -212,6 +212,13 @@ class PI07LowLevelConfig(PreTrainedConfig):
     freeze_vision_encoder: bool = True
     train_expert_only: bool = False
 
+    # Knowledge insulation (π0.5): when True (default), the prefix/VLM KV cache
+    # is detached before the action expert reads it, so the flow-matching action
+    # loss does NOT backpropagate into the VLM backbone. Set False to let the
+    # action gradient flow into the VLM (end-to-end action training). Default
+    # True preserves existing behavior and is what current checkpoints expect.
+    knowledge_insulation: bool = True
+
     vlm_config: Gemma3WithExpertConfig = field(
         default_factory=lambda: Gemma3WithExpertConfig(
             freeze_vision_encoder=True,
@@ -227,6 +234,13 @@ class PI07LowLevelConfig(PreTrainedConfig):
     # [3, 7, 11, 15, 19, 23].
     spacetime_layer_stride: int = 4
     gradient_checkpointing: bool = False
+
+    # torch.compile defaults ON for pi07 low-level: PI07LowLevelPolicy is wired
+    # for it (supports_torch_compile=True). Note that pi07's variable-length text
+    # embedding can trigger torch.compile recompiles unless sequence lengths are
+    # stable; correctness holds regardless, and train.py auto-falls back to eager
+    # under FSDP / ZeRO-3. Set False to force eager.
+    use_torch_compile: bool = True
 
     # Training presets
     optimizer_lr: float = 2.5e-5

@@ -315,6 +315,35 @@ class TrainPipelineConfig(HubMixin):
                     )
 
         self._validate_running_best()
+        self._validate_loss_weighting()
+
+    def _validate_loss_weighting(self):
+        """Validate ``loss_weighting``.
+
+        A weight of exactly ``0`` is a supported way to drop that loss term from
+        the backward pass entirely (see ``_assemble_weighted_loss`` in
+        ``scripts/train.py``), but the weighting must still name both the ``MSE``
+        and ``CE`` terms, be non-negative, and leave at least one term active.
+
+        Raises:
+            ValueError: If a required term is missing, any weight is negative, or
+                all weights are zero (nothing to optimize).
+        """
+        required = {"MSE", "CE"}
+        missing = required - set(self.loss_weighting)
+        if missing:
+            raise ValueError(
+                f"loss_weighting must define weights for {sorted(required)}; missing "
+                f"{sorted(missing)}. Got {self.loss_weighting}."
+            )
+        negatives = {k: v for k, v in self.loss_weighting.items() if v < 0}
+        if negatives:
+            raise ValueError(f"loss_weighting values must be >= 0; got negative entries {negatives}.")
+        if all(v == 0 for v in self.loss_weighting.values()):
+            raise ValueError(
+                "loss_weighting has all-zero weights; there is nothing to optimize. Set a "
+                "non-zero weight for at least one of MSE / CE."
+            )
 
     def _validate_running_best(self):
         """Validate the running-best checkpoint config and resolve the driving metric.

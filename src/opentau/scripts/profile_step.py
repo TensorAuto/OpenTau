@@ -202,10 +202,27 @@ def profile(cfg: TrainPipelineConfig):
             )
         cfg.policy.gradient_checkpointing = want_ckpt
 
+    # Optional: toggle torch.compile per run (mirrors GRAD_CHECKPOINT above).
+    # TORCH_COMPILE=true/false overrides cfg.policy.use_torch_compile so the
+    # compile-on vs compile-off step time can be A/B'd without editing the JSON.
+    # The strict ZeRO-3/FSDP backend guard in train.py is not duplicated here:
+    # profile_step runs under the same accelerator, so an unsupported backend
+    # would hit the same stale-guard recompiles it warns about.
+    compile_env = os.environ.get("TORCH_COMPILE")
+    if compile_env is not None and hasattr(cfg.policy, "use_torch_compile"):
+        want_compile = compile_env.lower() == "true"
+        if accelerator.is_main_process:
+            logging.info(
+                "TORCH_COMPILE=%s: overriding cfg.policy.use_torch_compile (was %r)",
+                compile_env,
+                cfg.policy.use_torch_compile,
+            )
+        cfg.policy.use_torch_compile = want_compile
+
     # Mirror train.py: under DeepSpeed ZeRO-3 we must disable the per-construction
     # parameter partitioning (it shards before init, breaking shape-dependent
     # initializers like SigLIP's lecun_normal_). No-op for any non-ZeRO-3 backend.
-    from opentau.scripts.train import _zero3_disabled_init_context
+    from opentau.scripts.train import _assemble_weighted_loss, _zero3_disabled_init_context
 
     # Mirror train.py: under FSDP, gate the model's internal bf16 cast so the
     # policy stays fp32 for FSDP's MixedPrecision to manage the bf16 compute /
@@ -224,6 +241,12 @@ def profile(cfg: TrainPipelineConfig):
     # MixedPrecision provides bf16 compute on the fly).
     if accelerator.distributed_type != accelerate.DistributedType.FSDP:
         policy.to(torch.bfloat16)
+    # Mirror train.py: optionally torch.compile the flow-matching submodule in
+    # place before the optimizer / accelerator.prepare wrap it. No-op unless
+    # cfg.policy.use_torch_compile (set in the JSON or via TORCH_COMPILE above).
+    # The WARMUP_STEPS=20 loop below absorbs the first-forward compile cost, so
+    # the measured-step timings reflect steady-state compiled throughput.
+    policy.maybe_compile_for_training()
 
     skip_optim = os.environ.get("PROFILE_NO_OPTIM", "0") == "1"
     if skip_optim:
@@ -409,7 +432,7 @@ def profile(cfg: TrainPipelineConfig):
 
         # Phase 2: forward (mirror update_policy lines 74-77)
         losses = policy.forward(batch)
-        loss = cfg.loss_weighting["MSE"] * losses["MSE"] + cfg.loss_weighting["CE"] * losses["CE"]
+        loss = _assemble_weighted_loss(losses, cfg.loss_weighting)
         _sync()
         t2 = time.perf_counter()
 

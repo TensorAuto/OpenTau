@@ -329,6 +329,9 @@ class RoboCasaEnv(EnvConfig):
             auto-expands to the upstream task list and auto-sets ``split``.
         fps: RoboCasa control frequency (Hz); also the ``render_fps`` for videos.
         episode_length: Maximum steps per episode (``_max_episode_steps``).
+            Defaults to 1000; set to ``null`` (None) to use RoboCasa's official
+            per-task horizon from the dataset registry (e.g. OpenCabinet=1050,
+            TurnOnMicrowave=450) instead of a single global cap.
         obs_type: ``"pixels"`` or ``"pixels_agent_pos"``.
         render_mode: Rendering mode for the environment.
         camera_name: Comma-separated raw RoboCasa camera names to render. The
@@ -341,7 +344,9 @@ class RoboCasaEnv(EnvConfig):
         visualization_height: Height of visualization frames.
         visualization_width: Width of visualization frames.
         split: RoboCasa dataset split (``None``/``"all"``/``"pretrain"``/
-            ``"target"``). Left ``None`` unless a task-group shortcut sets it.
+            ``"target"``). Defaults to ``"pretrain"`` when left ``None`` — every
+            task-group shortcut and concrete single-task config resolves to the
+            pretrain kitchen-scene distribution; set explicitly to override.
         obj_registries: Object-mesh registries to sample assets from. Defaults to
             ``["lightwheel"]`` (the pack the asset downloader ships by default);
             add ``"objaverse"`` only after downloading that ~30GB pack.
@@ -365,9 +370,6 @@ class RoboCasaEnv(EnvConfig):
 
     task: str = "CloseFridge"
     fps: int = 20
-    # Nullable to match configs written by per-task-horizon-aware code (#431): null/None
-    # means "use the official per-task horizon". The eval here always passes an explicit
-    # --env.episode_length per task (the official horizons), so this only needs to parse.
     episode_length: int | None = 1000
     obs_type: str = "pixels_agent_pos"
     render_mode: str = "rgb_array"

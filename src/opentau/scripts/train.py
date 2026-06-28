@@ -132,6 +132,90 @@ def _eval_with_fresh_envs(
             torch.cuda.empty_cache()
 
 
+def _has_zero_loss_weight(loss_weighting: dict[str, float]) -> bool:
+    """Whether any loss-term weight is exactly 0 (i.e. a term is dropped from backward).
+
+    Args:
+        loss_weighting: Mapping of loss-term name to scalar weight.
+
+    Returns:
+        True if at least one weight is 0.
+    """
+    return any(w == 0 for w in loss_weighting.values())
+
+
+def _zero_weight_backend_incompatible(distributed_type: accelerate.DistributedType, zero_stage: int) -> bool:
+    """Whether dropping a loss term is unsafe on the active distributed backend.
+
+    Under parameter-sharding backends (FSDP or DeepSpeed ZeRO-3) the dropped
+    term's modules are still gathered during the forward but get no gradient in
+    the backward, so their reduce-scatter / reshard hooks can wait on a gradient
+    that never arrives and hang at NCCL. DDP (via ``find_unused_parameters``) and
+    DeepSpeed ZeRO-1/2 (no param sharding) tolerate the unused params.
+
+    Args:
+        distributed_type: The accelerator's distributed type.
+        zero_stage: The active DeepSpeed ZeRO stage (0 when not DeepSpeed).
+
+    Returns:
+        True if the backend shards parameters (FSDP or ZeRO-3).
+    """
+    return distributed_type == accelerate.DistributedType.FSDP or zero_stage >= 3
+
+
+def _assemble_weighted_loss(losses: dict, loss_weighting: dict[str, float]) -> torch.Tensor:
+    """Combine the weighted loss terms into the single scalar fed to ``backward``.
+
+    A term whose weight is exactly ``0`` is **dropped from the sum entirely**
+    (rather than multiplied by 0). Multiplying by 0 still builds the term's
+    backward graph and populates its parameters with zero gradients; dropping it
+    means autograd never traverses that subgraph at all, so ``backward`` does not
+    touch the parameters that feed only that term (they receive ``None`` grad).
+
+    Because ``loss_weighting`` is a static config value identical on every rank,
+    the drop is a rank-uniform decision and cannot cause a cross-rank collective
+    mismatch (CLAUDE.md rule #5). The unused-parameter consequences of a dropped
+    term differ per distributed backend and are handled at ``Accelerator`` setup
+    in ``train()`` (force ``find_unused_parameters`` under DDP; fail fast under
+    parameter-sharding backends).
+
+    The terms are summed in a fixed ``(MSE, CE)`` order — independent of the
+    config dict's insertion order — so the float summation order, and thus the
+    result (CLAUDE.md rule #3), is deterministic and reproduces the historical
+    ``w_mse * MSE + w_ce * CE`` summation exactly.
+
+    Args:
+        losses: The policy ``forward`` output. A non-zero-weighted term must be
+            present; a zero-weighted (dropped) term need not be.
+        loss_weighting: Mapping of loss-term name to scalar weight.
+
+    Returns:
+        The scalar weighted loss.
+
+    Raises:
+        KeyError: If a non-zero-weighted term is absent from ``losses`` (a real
+            misconfig — surfaced loudly rather than silently dropped).
+        ValueError: If every term is dropped (all weights zero), leaving nothing
+            to optimize.
+    """
+    total: torch.Tensor | None = None
+    for key in ("MSE", "CE"):
+        weight = loss_weighting.get(key, 0)
+        if weight == 0:
+            # Term dropped from backward; a zero-weighted term need not be in `losses`.
+            continue
+        # Index directly: a non-zero-weighted term the policy failed to return is
+        # a misconfig and should KeyError loudly, not be silently skipped.
+        term = weight * losses[key]
+        total = term if total is None else total + term
+    if total is None:
+        raise ValueError(
+            f"No active loss term to backpropagate: loss_weighting={loss_weighting} "
+            "drops every term. Set a non-zero weight for at least one of MSE / CE."
+        )
+    return total
+
+
 def update_policy(
     train_config: TrainPipelineConfig,
     train_metrics: MetricsTracker,
@@ -145,9 +229,7 @@ def update_policy(
     policy.train()
     losses = policy.forward(batch)
     outlier_records = losses.pop("outlier_records", [])
-    loss = (
-        train_config.loss_weighting["MSE"] * losses["MSE"] + train_config.loss_weighting["CE"] * losses["CE"]
-    )
+    loss = _assemble_weighted_loss(losses, train_config.loss_weighting)
 
     accelerator.backward(loss)
     accelerator.unscale_gradients(optimizer=optimizer)
@@ -527,6 +609,29 @@ def _find_unused_params_from_env() -> bool:
     return os.environ.get("FIND_UNUSED_PARAMS", "true").lower() == "true"
 
 
+def _deepspeed_zero_stage(accelerator: accelerate.Accelerator) -> int:
+    """Return the active DeepSpeed ZeRO stage, or 0 when DeepSpeed is not the backend.
+
+    Centralizes the ``accelerator.deepspeed_plugin.hf_ds_config.config`` lookup
+    that gates every ZeRO-3-specific code path in ``train()`` — the
+    per-construction parameter-partitioning suppression
+    (``_zero3_disabled_init_context``) and the gradient-checkpointing /
+    ``use_torch_compile`` / in-training-sim-eval guards, all of which branch on
+    "is this ZeRO-3?". Returning 0 for non-DeepSpeed backends lets callers test
+    ``>= 3`` without first checking ``distributed_type``.
+
+    Args:
+        accelerator: The active accelerate ``Accelerator``.
+
+    Returns:
+        int: The configured ZeRO optimization stage (0, 1, 2, or 3). 0 when the
+        distributed backend is not DeepSpeed (so ``< 3`` everywhere it matters).
+    """
+    if accelerator.distributed_type != accelerate.DistributedType.DEEPSPEED:
+        return 0
+    return accelerator.deepspeed_plugin.hf_ds_config.config.get("zero_optimization", {}).get("stage", 0)
+
+
 @contextmanager
 def _zero3_disabled_init_context(accelerator: accelerate.Accelerator):
     """Context manager that suppresses ZeRO-3 per-construction param partitioning.
@@ -552,11 +657,7 @@ def _zero3_disabled_init_context(accelerator: accelerate.Accelerator):
     Args:
         accelerator: The active accelerate ``Accelerator``.
     """
-    if accelerator.distributed_type != accelerate.DistributedType.DEEPSPEED:
-        yield
-        return
-    zero_stage = accelerator.deepspeed_plugin.hf_ds_config.config.get("zero_optimization", {}).get("stage", 0)
-    if zero_stage < 3:
+    if _deepspeed_zero_stage(accelerator) < 3:
         yield
         return
 
@@ -609,6 +710,21 @@ def train(cfg: TrainPipelineConfig):
     cfg.validate()
 
     find_unused = _find_unused_params_from_env()
+    # A 0 entry in loss_weighting drops that term from the backward pass
+    # (see _assemble_weighted_loss), so the parameters that feed only that term
+    # receive no gradient. Under DDP that requires find_unused_parameters=True or
+    # the reducer raises on the now-unused params. The decision is rank-uniform
+    # (every rank reads the same config), so force it on — with a warning — so a
+    # zero weight cannot crash a run that opted into FIND_UNUSED_PARAMS=false for
+    # speed. (Ignored under DeepSpeed; the ZeRO-3 / FSDP case is guarded below.)
+    if not find_unused and _has_zero_loss_weight(cfg.loss_weighting):
+        logging.warning(
+            "loss_weighting=%s drops a zero-weighted term from backward, leaving its "
+            "parameters unused; forcing find_unused_parameters=True (overriding "
+            "FIND_UNUSED_PARAMS=false) to avoid a DDP reducer error.",
+            cfg.loss_weighting,
+        )
+        find_unused = True
     accelerator_kwargs = {
         "step_scheduler_with_optimizer": False,
         "split_batches": False,  # split_batches == True is not working anyways
@@ -640,6 +756,24 @@ def train(cfg: TrainPipelineConfig):
     # time both reflect TrainPipelineConfig.
     _sync_deepspeed_gradient_accumulation_steps(accelerator, cfg)
 
+    # A zero entry in loss_weighting drops that term from the backward pass
+    # (see _assemble_weighted_loss). Under parameter-sharding backends (DeepSpeed
+    # ZeRO-3 or FSDP) the dropped term's modules are still gathered during the
+    # forward but receive no gradient in the backward, so their reduce-scatter /
+    # reshard hooks can wait on a gradient that never arrives and hang at NCCL.
+    # DDP (handled via find_unused_parameters above) and ZeRO-1/2 (which do not
+    # shard parameters) tolerate the unused params, so fail fast only here.
+    if _has_zero_loss_weight(cfg.loss_weighting) and _zero_weight_backend_incompatible(
+        accelerator.distributed_type, _deepspeed_zero_stage(accelerator)
+    ):
+        raise ValueError(
+            f"A zero entry in loss_weighting ({cfg.loss_weighting}) drops a loss term "
+            "from the backward pass, which is not supported under parameter sharding "
+            "(DeepSpeed ZeRO-3 or FSDP): the dropped term's parameters are gathered in "
+            "the forward but get no gradient, risking a NCCL hang. Use DDP or DeepSpeed "
+            "ZeRO-1/2, or set all loss weights non-zero."
+        )
+
     # Strict guard for gradient_checkpointing: the pi05 custom forward loop
     # wraps layer bodies in torch.utils.checkpoint.checkpoint. With
     # use_reentrant=False this uses saved_tensors_hooks, which co-exist
@@ -664,20 +798,49 @@ def train(cfg: TrainPipelineConfig):
                 "Either set gradient_checkpointing=False or switch to a "
                 "supported backend."
             )
-        if accelerator.distributed_type == accelerate.DistributedType.DEEPSPEED:
-            zero_stage = accelerator.deepspeed_plugin.hf_ds_config.config.get("zero_optimization", {}).get(
-                "stage", 0
+        zero_stage = _deepspeed_zero_stage(accelerator)
+        if zero_stage >= 3:
+            raise ValueError(
+                f"gradient_checkpointing=True is not supported under "
+                f"DeepSpeed ZeRO stage {zero_stage}. ZeRO-3 re-shards parameters "
+                "during forward and needs deepspeed.checkpointing.checkpoint "
+                "rather than torch.utils.checkpoint. Either set "
+                "gradient_checkpointing=False, use zero_stage: 1 or 2, or "
+                "switch to FSDP (which has equivalent param sharding and "
+                "is compatible with torch.utils.checkpoint)."
             )
+
+    # Backend compatibility for use_torch_compile. `nn.Module.compile` caches
+    # guards keyed on parameter/buffer storage, but DeepSpeed ZeRO-3 and FSDP
+    # re-shard / re-materialize parameters on every forward, so those guards go
+    # stale (recompiling every step or reading a sharded parameter). DDP /
+    # single-process / DeepSpeed ZeRO-1/2 keep parameters intact across forwards.
+    # Because compile now defaults ON for the policies that support it, fall back
+    # to eager with a warning under an incompatible backend rather than raising —
+    # a ZeRO-3 / FSDP run should still train (just uncompiled), not crash on a
+    # default. (An explicit --policy.use_torch_compile=true on such a backend is
+    # likewise honored as a best-effort request and downgraded with the warning.)
+    if getattr(cfg.policy, "use_torch_compile", False):
+        unsupported_backend = None
+        if accelerator.distributed_type not in (
+            accelerate.DistributedType.MULTI_GPU,
+            accelerate.DistributedType.NO,
+            accelerate.DistributedType.DEEPSPEED,
+        ):
+            unsupported_backend = str(accelerator.distributed_type)
+        elif accelerator.distributed_type == accelerate.DistributedType.DEEPSPEED:
+            zero_stage = _deepspeed_zero_stage(accelerator)
             if zero_stage >= 3:
-                raise ValueError(
-                    f"gradient_checkpointing=True is not supported under "
-                    f"DeepSpeed ZeRO stage {zero_stage}. ZeRO-3 re-shards parameters "
-                    "during forward and needs deepspeed.checkpointing.checkpoint "
-                    "rather than torch.utils.checkpoint. Either set "
-                    "gradient_checkpointing=False, use zero_stage: 1 or 2, or "
-                    "switch to FSDP (which has equivalent param sharding and "
-                    "is compatible with torch.utils.checkpoint)."
-                )
+                unsupported_backend = f"DeepSpeed ZeRO stage {zero_stage}"
+        if unsupported_backend is not None:
+            logging.warning(
+                "use_torch_compile=True is not supported under %s: parameters are "
+                "re-sharded during forward, which invalidates torch.compile's traced "
+                "guards. Falling back to eager (training continues uncompiled). Use "
+                "DDP / single-process / DeepSpeed ZeRO-1/2 to enable compilation.",
+                unsupported_backend,
+            )
+            cfg.policy.use_torch_compile = False
 
     logging.info(pformat(cfg.to_dict()))
 
@@ -721,12 +884,10 @@ def train(cfg: TrainPipelineConfig):
         # Under parameter sharding the forward still all-gathers params per layer,
         # which WOULD desync across the independent rollouts and hang at NCCL — fail
         # fast instead of hanging hours into a run.
-        sharded_params = accelerator.distributed_type == accelerate.DistributedType.FSDP
-        if accelerator.distributed_type == accelerate.DistributedType.DEEPSPEED:
-            zero_stage = accelerator.deepspeed_plugin.hf_ds_config.config.get("zero_optimization", {}).get(
-                "stage", 0
-            )
-            sharded_params = zero_stage >= 3
+        sharded_params = (
+            accelerator.distributed_type == accelerate.DistributedType.FSDP
+            or _deepspeed_zero_stage(accelerator) >= 3
+        )
         if sharded_params:
             raise ValueError(
                 "In-training simulation eval (eval_freq > 0 with a sim env) is not "
@@ -780,6 +941,16 @@ def train(cfg: TrainPipelineConfig):
     #     params materialize in bf16 transiently during the all-gather.
     if accelerator.distributed_type != accelerate.DistributedType.FSDP:
         policy.to(torch.bfloat16)
+    # Optionally torch.compile the flow-matching submodule (in place) now, while
+    # `policy` is still the raw module so `self.model` is directly reachable, and
+    # before the optimizer / `accelerator.prepare` wrap it. The in-place compile
+    # leaves `policy.parameters()` and the state_dict layout unchanged (see
+    # PreTrainedPolicy.maybe_compile_for_training), so the optimizer built below
+    # still sees the same params and resume stays checkpoint-compatible. The
+    # compile is lazy (first-forward trace) and the compiled call runs inside the
+    # DeepSpeedEngine / DDP wrapper's forward. No-op unless
+    # cfg.policy.use_torch_compile is set (validated against the backend above).
+    policy.maybe_compile_for_training()
     logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
     # Outside DeepSpeed *and* FSDP, wrap the optimizer so it carries fp32

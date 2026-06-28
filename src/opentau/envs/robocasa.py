@@ -82,10 +82,12 @@ DEFAULT_OBJ_REGISTRIES: tuple[str, ...] = ("lightwheel",)
 # Task-group shortcuts accepted as ``env.task``. A group name expands to the
 # upstream RoboCasa task list and auto-sets the dataset split; individual task
 # names (optionally comma-separated) take precedence and only match exactly.
+# All groups default to the ``pretrain`` split (the kitchen-scene distribution we
+# evaluate against). Pass ``env.split`` explicitly to override for a given group.
 _TASK_GROUP_SPLITS = {
-    "atomic_seen": "target",
-    "composite_seen": "target",
-    "composite_unseen": "target",
+    "atomic_seen": "pretrain",
+    "composite_seen": "pretrain",
+    "composite_unseen": "pretrain",
     "pretrain50": "pretrain",
     "pretrain100": "pretrain",
     "pretrain200": "pretrain",
@@ -357,6 +359,61 @@ def _resolve_tasks(task: str) -> tuple[list[str], str | None]:
     return names, None
 
 
+def _resolve_split(explicit_split: str | None, group_split: str | None) -> str:
+    r"""Resolve the final RoboCasa kitchen-scene split.
+
+    Precedence: an explicit ``env.split`` wins; otherwise a task-group shortcut's
+    split (from :data:`_TASK_GROUP_SPLITS`) applies; otherwise default to
+    ``"pretrain"``. The default makes concrete / comma-separated single-task
+    configs (which carry no group split) evaluate against the pretrain
+    distribution rather than ``"all"``.
+
+    Args:
+        explicit_split: The split set on ``env.split`` (``None`` if unset).
+        group_split: The split implied by a task-group shortcut (``None`` for a
+            concrete or comma-separated task name).
+
+    Returns:
+        One of ``"all"`` / ``"pretrain"`` / ``"target"`` — a value
+        ``RoboCasaGymEnv`` accepts.
+    """
+    if explicit_split is not None:
+        return explicit_split
+    if group_split is not None:
+        return group_split
+    return "pretrain"
+
+
+def _official_task_horizon(task: str) -> int | None:
+    r"""RoboCasa's official per-task horizon (max env steps), read from the dataset
+    registry -- e.g. ``OpenCabinet``=1050, ``CloseFridge``=900, ``TurnOnMicrowave``=450.
+
+    Used as the default episode length so each task is evaluated for its intended
+    duration instead of a single global cap. Returns ``None`` if the task is absent
+    from the registry (the caller then falls back to the 1000-step default). The
+    robocasa import is deferred to here, mirroring ``_resolve_tasks``.
+    """
+    try:
+        _import_robocasa_with_version_shim()
+        from robocasa.utils.dataset_registry import (
+            ATOMIC_TASK_DATASETS,
+            COMPOSITE_TASK_DATASETS,
+        )
+    except Exception as err:
+        # Surface the degradation: without this, a renamed key / moved module in the
+        # registry would silently revert *every* task to the 1000-step cap, invisibly.
+        acc_print(
+            f"[opentau] could not read RoboCasa per-task horizon for '{task}' "
+            f"({type(err).__name__}: {err}); falling back to the 1000-step default."
+        )
+        return None
+    for registry in (ATOMIC_TASK_DATASETS, COMPOSITE_TASK_DATASETS):
+        entry = registry.get(task)
+        if isinstance(entry, dict) and entry.get("horizon") is not None:
+            return int(entry["horizon"])
+    return None
+
+
 # RoboCasa ships its assets as separately-downloaded packs. Every kitchen scene needs the
 # base textures (plain + AI-generated wall/floor textures) and lightwheel fixtures; object
 # meshes depend on which registries the env samples from (``obj_registries``). Keys below
@@ -503,7 +560,8 @@ class RoboCasaEnv(gym.Env):
             observation_height: Height of observation images.
             visualization_width: Width of visualization frames.
             visualization_height: Height of visualization frames.
-            split: RoboCasa dataset split (``None``/``"all"``/``"pretrain"``/``"target"``).
+            split: RoboCasa dataset split (``None``/``"all"``/``"pretrain"``/``"target"``);
+                ``None`` resolves to ``"pretrain"`` at env construction.
             episode_length: Max steps per episode (``_max_episode_steps``); defaults to 1000.
             obj_registries: Object-mesh registries to sample assets from.
             episode_index: Per-worker index (``0..n_envs-1``) used as the
@@ -600,12 +658,14 @@ class RoboCasaEnv(gym.Env):
             from robocasa.wrappers.gym_wrapper import RoboCasaGymEnv
 
             # RoboCasaGymEnv defaults split="test", which create_env rejects (only
-            # None/"all"/"pretrain"/"target" are valid). Always pass a valid value.
+            # None/"all"/"pretrain"/"target" are valid). create_robocasa_envs resolves
+            # the split for the eval path; default to "pretrain" here too so a direct
+            # RoboCasaEnv(split=None) construction stays valid and consistent.
             self._env = RoboCasaGymEnv(
                 env_name=self.task,
                 camera_widths=self.observation_width,
                 camera_heights=self.observation_height,
-                split=self.split if self.split is not None else "all",
+                split=self.split if self.split is not None else "pretrain",
                 obj_registries=self.obj_registries,
             )
 
@@ -822,8 +882,7 @@ def create_robocasa_envs(
 
     camera_names = _parse_camera_names(camera_name)
     task_names, group_split = _resolve_tasks(str(task))
-    if group_split is not None and split is None:
-        split = group_split
+    split = _resolve_split(split, group_split)
 
     # Shard tasks across accelerator ranks (round-robin), so distributed eval
     # spreads tasks disjointly and per-task video keys stay unique after the
@@ -849,6 +908,13 @@ def create_robocasa_envs(
 
     out: dict[str, dict[int, Any]] = defaultdict(dict)
     for task_name in task_names:
+        # With no explicit episode_length, default to RoboCasa's official per-task
+        # horizon from the dataset registry (e.g. OpenCabinet=1050, TurnOnMicrowave=450)
+        # so each task runs for its intended length rather than one global cap.
+        # None -> RoboCasaEnv's 1000-step fallback.
+        task_episode_length = (
+            episode_length if episode_length is not None else _official_task_horizon(task_name)
+        )
         fns = _make_env_fns(
             task=task_name,
             n_envs=n_envs,
@@ -860,11 +926,14 @@ def create_robocasa_envs(
             visualization_width=visualization_width,
             visualization_height=visualization_height,
             split=split,
-            episode_length=episode_length,
+            episode_length=task_episode_length,
             obj_registries=obj_registries,
         )
         out[task_name][0] = env_cls(fns)
-        acc_print(f"Built vec env | task={task_name} | n_envs={n_envs}")
+        acc_print(
+            f"Built vec env | task={task_name} | n_envs={n_envs} | "
+            f"horizon={task_episode_length if task_episode_length is not None else 1000}"
+        )
 
     # return plain dicts for predictability
     return {name: dict(task_map) for name, task_map in out.items()}

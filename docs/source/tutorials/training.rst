@@ -16,6 +16,11 @@ The recommended distributed setup for the pi05 reference policy (and other polic
 
 A DeepSpeed ZeRO-2 example is also available at `configs/examples/accelerate_deepspeed_config.yaml <https://github.com/TensorAuto/OpenTau/blob/main/configs/examples/accelerate_deepspeed_config.yaml>`_ for memory-constrained scenarios; it is the config used by our CI pipelines so we keep coverage for that path. For mid-sized policies like pi05, DDP is significantly faster — see issue #177 for benchmarks.
 
+A DeepSpeed ZeRO-3 example is available at `configs/examples/accelerate_deepspeed_zero3_config.yaml <https://github.com/TensorAuto/OpenTau/blob/main/configs/examples/accelerate_deepspeed_zero3_config.yaml>`_. ZeRO-3 additionally shards the model *parameters* across ranks (on top of ZeRO-2's gradient and optimizer-state sharding), so it is the right choice only when a single replica of the model does not fit in one GPU's memory. ZeRO-3 is fully supported for pi05 — full fine-tuning (no frozen weights), checkpointing, resume, and in-training validation all work — but for a model that fits replicated it is not the fastest option: pi05 (≈3.3B params) fits comfortably on an 80 GB GPU, and a measured 8×A100-80GB full fine-tune found DDP and ZeRO-2 both faster than ZeRO-3 at the same batch size while reaching a comparable maximum batch size. ZeRO-3's per-layer parameter all-gather/prefetch buffers add memory and communication overhead that the parameter sharding does not pay back at this model size. See the :doc:`benchmarking` guide for the full ZeRO-2 vs ZeRO-3 comparison. Reach for ZeRO-3 when scaling to a model too large to replicate per GPU.
+
+.. note::
+   ``gradient_checkpointing`` and ``use_torch_compile`` are not compatible with ZeRO-3: parameters are re-sharded on every forward, which ``torch.utils.checkpoint`` and ``torch.compile`` guards do not handle. The launcher rejects ``gradient_checkpointing=True`` under ZeRO-3 and downgrades ``use_torch_compile`` to eager with a warning (use FSDP or ZeRO-1/2 if you need either). If you hit fragmentation-driven OOMs under ZeRO-3, set ``PYTORCH_ALLOC_CONF=expandable_segments:True`` in the environment.
+
 To train a model, run the following command:
 
 .. code-block:: bash

@@ -24,6 +24,7 @@ and safetensors for efficient serialization.
 import abc
 import logging
 import os
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Type, TypeVar
 
@@ -107,6 +108,17 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
 
     name: None
     """The name of the policy. Must be defined in subclasses."""
+
+    supports_torch_compile: bool = False
+    """Whether :meth:`maybe_compile_for_training` may compile this policy's
+    ``self.model``. Default ``False``: opt-in per policy, because the in-place
+    ``nn.Module.compile`` only takes effect if the policy's training ``forward``
+    invokes the submodule via ``self.model(...)`` (``__call__``) rather than
+    ``self.model.forward(...)``. Subclasses whose forward has been switched to
+    ``self.model(...)`` (currently :class:`~opentau.policies.pi05.modeling_pi05.PI05Policy`
+    and :class:`~opentau.policies.pi07.low_level.modeling_pi07_low_level.PI07LowLevelPolicy`)
+    set this ``True``. Leaving it ``False`` makes ``use_torch_compile=True`` a
+    *loud* no-op on unwired policies instead of a silent compile-but-never-dispatch."""
 
     _PER_GROUP_PROJECTION_PREFIXES: tuple[str, ...] = ()
     """State-dict key prefixes for per-(robot_type, control_mode) projection
@@ -629,6 +641,47 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
             # the dataset->norm-row map should update `config.dataset_to_norm_index`
             # before reinstantiating the policy.
 
+    @staticmethod
+    def _iter_norm_buffer_params(owner: nn.Module) -> Iterator[tuple[str, Tensor]]:
+        """Yield ``(qualified_name, param)`` for every Normalize/Unnormalize
+        buffer parameter on ``owner`` across :data:`NORM_MODULE_NAMES`.
+
+        Single source of truth for the buffer walk shared by the three
+        inf-sentinel guards (:meth:`_norm_buffers_have_inf`,
+        :meth:`_check_norm_stats_loaded`,
+        :meth:`_assert_normalize_buffers_initialized`) so they cannot drift.
+        A ``@staticmethod`` taking the owner explicitly so the classmethod guard
+        (which receives a ``model`` that may be any ``nn.Module``, e.g. a test
+        fixture) and the instance guards can all share it.
+        ``Normalize`` registers stats as ``nn.Parameter(requires_grad=False)``,
+        so these live under ``named_parameters()``, not ``named_buffers()`` —
+        same convention as the inline ``Normalize.forward`` checks.
+        """
+        for module_attr in NORM_MODULE_NAMES:
+            module = getattr(owner, module_attr, None)
+            if module is None:
+                continue
+            for name, param in module.named_parameters(recurse=True):
+                if name.startswith("buffer_"):
+                    yield f"{module_attr}.{name}", param
+
+    def _norm_buffers_have_inf(self) -> bool:
+        """Return True if any Normalize/Unnormalize buffer still holds the +inf
+        sentinel — i.e. the buffer was neither loaded from a checkpoint nor
+        initialised from stats.
+
+        Like :meth:`_check_norm_stats_loaded` but returns a bool instead of
+        raising, so ``make_policy`` can decide *whether* to repopulate. The
+        contract: inject stats only when buffers are still ∞ (the
+        ``save_normalization_stats=False`` round-trip), and otherwise keep the
+        buffers that were deliberately loaded (``skip_normalization_weights
+        =False``) or freshly built from the current mixture
+        (``skip_normalization_weights=True``). Unconditionally injecting would
+        clobber a loaded checkpoint's normalization, which silently turned
+        ``skip_normalization_weights=False`` into a no-op for mixture fine-tunes.
+        """
+        return any(torch.isinf(param).any() for _, param in self._iter_norm_buffer_params(self))
+
     def _check_norm_stats_loaded(self) -> None:
         """Raise a clear error if any Normalize/Unnormalize buffer is still ∞.
 
@@ -639,14 +692,7 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         ``save_normalization_stats=False`` round-trip mistake at
         policy-construction time rather than at the first forward.
         """
-        bad: list[str] = []
-        for module_attr in NORM_MODULE_NAMES:
-            module = getattr(self, module_attr, None)
-            if module is None:
-                continue
-            for name, param in module.named_parameters(recurse=True):
-                if name.startswith("buffer_") and torch.isinf(param).any():
-                    bad.append(f"{module_attr}.{name}")
+        bad = [name for name, param in self._iter_norm_buffer_params(self) if torch.isinf(param).any()]
         if bad:
             raise RuntimeError(
                 "Normalization buffers were not initialised from a checkpoint "
@@ -957,10 +1003,9 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         """
         if not stripped_keys:
             return
-        # Walk the same NORM_MODULE_NAMES attribute tree that
-        # `_check_norm_stats_loaded` iterates, so the two guards stay
-        # synchronized with `_save_pretrained`'s detach/restore loop and
-        # `_inject_stats`.
+        # Walk the same buffer params as the sibling guards via the shared
+        # `_iter_norm_buffer_params`, so they stay synchronized with
+        # `_save_pretrained`'s detach/restore loop and `_inject_stats`.
         #
         # Note: the check intentionally does NOT cross-reference each inf
         # buffer against ``stripped_keys`` (which would be a stricter
@@ -984,14 +1029,11 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         # ``accelerator.prepare`` today (so params are still plain Tensors
         # here), but the call is cheap on plain Tensors and keeps the
         # helper safe for any future caller that invokes it post-wrap.
-        inf_buffers: list[str] = []
-        for module_attr in NORM_MODULE_NAMES:
-            module = getattr(model, module_attr, None)
-            if module is None:
-                continue
-            for name, param in module.named_parameters(recurse=True):
-                if name.startswith("buffer_") and torch.isinf(_materialize(param)).any():
-                    inf_buffers.append(f"{module_attr}.{name}")
+        inf_buffers = [
+            name
+            for name, param in cls._iter_norm_buffer_params(model)
+            if torch.isinf(_materialize(param)).any()
+        ]
         if inf_buffers:
             raise ValueError(
                 "skip_normalization_weights=True requires `per_dataset_stats` "
@@ -1081,6 +1123,89 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
             dict: A dictionary of parameters to optimize.
         """
         raise NotImplementedError
+
+    def maybe_compile_for_training(self) -> None:
+        """Optionally ``torch.compile`` the heavy compute submodule for training.
+
+        Controlled by ``config.use_torch_compile``. When enabled, compiles the
+        inner flow-matching module (``self.model`` on pi05 / pi07) *in place*
+        via :meth:`torch.nn.Module.compile`. The in-place form only swaps the
+        submodule's ``__call__`` dispatch for a compiled one — it does **not**
+        wrap the module in a ``torch._dynamo.OptimizedModule`` and does **not**
+        prefix ``state_dict`` keys with ``_orig_mod.``. So ``self.parameters()``
+        and the on-disk checkpoint layout are unchanged: the optimizer built
+        afterwards sees the same params, and resume / ``from_pretrained`` stay
+        compatible with both compiled and uncompiled checkpoints.
+
+        The policy wrapper's own ``forward`` (tokenization, normalization, the
+        ``.cpu().tolist()`` / numpy / string preprocessing) is intentionally
+        left uncompiled — it is cheap relative to the transformer and is full of
+        host-side ops that would only force graph breaks.
+
+        Note: this relies on the training forward calling the submodule via
+        ``self.model(...)`` (``__call__``), not ``self.model.forward(...)`` —
+        the latter bypasses the compiled dispatch installed by
+        ``nn.Module.compile`` and would silently no-op the compile.
+
+        No-op unless ``config.use_torch_compile`` is True. The caller
+        (``train.py``) is responsible for rejecting parameter-sharding backends
+        (DeepSpeed ZeRO-3 / FSDP) before this runs.
+        """
+        if not getattr(self.config, "use_torch_compile", False):
+            return
+        # The in-place compile only fires if the policy's forward calls the
+        # submodule via ``self.model(...)``. Policies that still call
+        # ``self.model.forward(...)`` would compile-but-never-dispatch — a silent
+        # no-op. Gate on the explicit opt-in so unwired policies warn loudly
+        # instead. Only pi05 / pi07-low-level are wired (and validated) today.
+        if not getattr(self, "supports_torch_compile", False):
+            logging.warning(
+                "use_torch_compile=True but %s is not wired for torch.compile "
+                "(its forward does not dispatch self.model via __call__); skipping "
+                "compilation. Supported today: PI05Policy, PI07LowLevelPolicy.",
+                type(self).__name__,
+            )
+            return
+        target = getattr(self, "model", None)
+        if not isinstance(target, nn.Module):
+            logging.warning(
+                "use_torch_compile=True but %s has no inner `self.model` nn.Module to compile; "
+                "leaving the policy uncompiled.",
+                type(self).__name__,
+            )
+            return
+        mode = getattr(self.config, "torch_compile_mode", "default") or "default"
+        # Use eager's RNG under compile instead of inductor's functionalized
+        # (philox) RNG. Two reasons, both load-bearing here:
+        #   1. Determinism: the flow-matching forward samples `noise` / `time`
+        #      *inside* the compiled region. With functionalized RNG, two
+        #      same-seed runs diverge at the per-step loss (inductor seeds the
+        #      philox offset independently of eager's generator); fallback_random
+        #      makes the compiled draws match eager, so same-seed runs stay
+        #      bit-identical — preserving the determinism the eager path has.
+        #   2. Stability: inductor's backward RNG-op partitioner raises
+        #      `KeyError: '_scaled_dot_product_flash_attention'` when SDPA-flash
+        #      attention (pi07) is combined with gradient checkpointing under
+        #      functionalized RNG. Falling back to eager RNG bypasses that path.
+        # The cost (RNG ops aren't fused into surrounding kernels) is negligible
+        # for training.
+        try:
+            import torch._inductor.config as _inductor_config
+
+            _inductor_config.fallback_random = True
+        except Exception as exc:  # pragma: no cover - inductor always present with torch>=2
+            logging.warning("Could not set torch._inductor.config.fallback_random: %s", exc)
+        logging.info(
+            "torch.compile: compiling %s.model in place (mode=%r, inductor fallback_random=True). "
+            "The policy wrapper's forward (preprocessing) stays in eager.",
+            type(self).__name__,
+            mode,
+        )
+        # In-place compile: rewrites only `target.__call__`, preserving the
+        # module hierarchy / state_dict keys. Lazy — the actual trace happens on
+        # the first forward, so this is safe to call before `accelerator.prepare`
+        # moves params to GPU.
+        target.compile(mode=mode)
 
     @abc.abstractmethod
     def reset(self):

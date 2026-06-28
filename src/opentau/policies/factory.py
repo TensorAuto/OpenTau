@@ -33,6 +33,7 @@ from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import FeatureType
 from opentau.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from opentau.datasets.utils import dataset_to_policy_features
+from opentau.policies.cosmos3.configuration_cosmos3 import Cosmos3Config
 from opentau.policies.pi0.configuration_pi0 import PI0Config
 from opentau.policies.pi05.configuration_pi05 import PI05Config
 from opentau.policies.pi05_mem.configuration_pi05 import PI05MemConfig
@@ -115,6 +116,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         )
 
         return PI07LowLevelPolicy
+    elif name == "cosmos3":
+        from opentau.policies.cosmos3.modeling_cosmos3 import Cosmos3Policy
+
+        return Cosmos3Policy
     elif name == "value":
         from opentau.policies.value.modeling_value import ValueFunction
 
@@ -160,6 +165,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return PI07HighLevelPlannerConfig(**kwargs)
     elif policy_type == "pi07_low_level":
         return PI07LowLevelConfig(**kwargs)
+    elif policy_type == "cosmos3":
+        return Cosmos3Config(**kwargs)
     elif policy_type == "value":
         return ValueConfig(**kwargs)
     else:
@@ -298,7 +305,20 @@ def make_policy(
     # have them, otherwise raise a clear error rather than letting the first
     # forward fail mid-step.
     if cfg.pretrained_path and per_norm_key_stats is not None:
-        policy._inject_stats(per_norm_key_stats, dataset_names=norm_keys)
+        # Repopulate normalization buffers ONLY when the checkpoint carried no
+        # stats (buffers are still the +inf sentinel — the
+        # `save_normalization_stats=False` round-trip). When the checkpoint's
+        # stats loaded cleanly (`skip_normalization_weights=False`) or were
+        # freshly built from the current mixture
+        # (`skip_normalization_weights=True`, which strips the saved buffers and
+        # keeps the per_dataset_stats-initialised ones), keep them as-is.
+        # Unconditionally injecting here clobbered a deliberately-loaded
+        # checkpoint normalization, which made `skip_normalization_weights=False`
+        # a silent no-op for mixture fine-tunes.
+        if policy._norm_buffers_have_inf():
+            policy._inject_stats(per_norm_key_stats, dataset_names=norm_keys)
+        else:
+            policy._check_norm_stats_loaded()
     elif cfg.pretrained_path:
         policy._check_norm_stats_loaded()
 

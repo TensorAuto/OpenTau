@@ -137,9 +137,36 @@ class PI05MemConfig(PreTrainedConfig):
     # Attention utils
     attention_implementation: str = "eager"
 
+    # Rotary position embedding scheme.
+    #   "mrope_interleaved" — interleaved Multimodal RoPE (Qwen3-VL style; the
+    #                        default). The head dim is split into rotary
+    #                        frequency bands and each band is assigned,
+    #                        round-robin, to one of three position axes
+    #                        (temporal, height, width) so every axis spans the
+    #                        full frequency spectrum. Only the per-frame video
+    #                        patch tokens receive true 2-D (height, width)
+    #                        positions; language / state / discrete-action
+    #                        tokens stay text-style (t == h == w), so MRoPE
+    #                        degenerates to ordinary RoPE on the non-video
+    #                        tokens.
+    #   "rope"             — standard 1-D RoPE (a single scalar position per
+    #                        token; the historical scheme). Set this to load /
+    #                        reproduce a checkpoint trained before MRoPE became
+    #                        the default — the two schemes assign different
+    #                        video-token positions, so a checkpoint trained
+    #                        under one must be evaluated under the same one.
+    rope_type: str = "mrope_interleaved"
+
     # Finetuning settings
     freeze_vision_encoder: bool = True
     train_expert_only: bool = False
+
+    # Knowledge insulation (π0.5): when True (default), the prefix/VLM KV cache
+    # is detached before the action expert reads it, so the flow-matching action
+    # loss does NOT backpropagate into the VLM backbone. Set False to let the
+    # action gradient flow into the VLM (end-to-end action training). Default
+    # True preserves existing behavior and is what current checkpoints expect.
+    knowledge_insulation: bool = True
 
     # Wrap each transformer-layer forward in torch.utils.checkpoint to trade
     # ~25-33% same-batch compute for ~30-40 GB of activation memory per rank,
@@ -157,6 +184,39 @@ class PI05MemConfig(PreTrainedConfig):
     # by reference and adds zero new parameters, so there is no separate
     # model-name / dtype field here.
     spacetime_layer_stride: int = 4
+
+    # STSS motion module (RLDX-1, https://github.com/RLWRLD/RLDX-1).
+    # When enabled, a space-time self-similarity motion module injects a residual
+    # update into the SigLIP hidden states at ``motion_insert_layer``, capturing
+    # temporal dynamics across the ``n_obs_steps`` frames. Unlike the space-time
+    # attention (zero new params), this DOES add new learnable parameters, so a
+    # plain pi05 checkpoint loads with ``strict=False`` (motion params init fresh).
+    # With ``motion_zero_init=True`` (default) the residual is zero-gated at init,
+    # so the policy is byte-identical at step 0 and the motion contribution warms
+    # up during training. The module stays trainable even when
+    # ``freeze_vision_encoder`` is set (the freeze only touches the SigLIP tower).
+    use_motion: bool = False
+    # 0-indexed encoder layer after which the motion residual is injected.
+    # ``None`` -> mid-stack (n_layers // 3), which is layer 9 for the 27-layer
+    # so400m tower (matching the RLDX-1 placement).
+    motion_insert_layer: int | None = None
+    # Internal correlation/feature width of the motion module (``in_proj`` target).
+    motion_hidden_dim: int = 256
+    # (L, kh, kw) space-time correlation window. Spatial size must fit the patch
+    # grid (<= 16 for a 224/14 grid).
+    motion_window: tuple[int, int, int] = (5, 9, 9)
+    # Correlation function: "cosine" / "dotproduct" / "dotproduct_softmax".
+    motion_corr_func: str = "cosine"
+    # Number of stacked STSS encoders (their outputs are summed).
+    motion_n_encoders: int = 1
+    # Norm inside the STSS 3D convs: "groupnorm" (default; per-sample, no
+    # cross-rank sync — safe under FSDP/DeepSpeed/multi-rank, CLAUDE.md rule #5),
+    # "batchnorm" (RLDX-1-faithful), or "syncbn".
+    motion_norm: str = "groupnorm"
+    # Integration conv: "lite" (single fuse conv) or "full" (3x3 conv stack).
+    motion_int_mode: str = "lite"
+    # Zero-init the residual so the module starts as a no-op (warm start).
+    motion_zero_init: bool = True
 
     # Training presets
     optimizer_lr: float = 2.5e-5
@@ -221,6 +281,43 @@ class PI05MemConfig(PreTrainedConfig):
             raise ValueError(
                 f"`spacetime_layer_stride` must be a positive integer, got {self.spacetime_layer_stride}."
             )
+
+        if self.rope_type not in ("rope", "mrope_interleaved"):
+            raise ValueError(
+                f"`rope_type` must be one of 'rope'/'mrope_interleaved', got {self.rope_type!r}."
+            )
+
+        if self.use_motion:
+            if self.motion_norm not in ("batchnorm", "groupnorm", "syncbn"):
+                raise ValueError(
+                    f"`motion_norm` must be one of batchnorm/groupnorm/syncbn, got {self.motion_norm!r}."
+                )
+            if self.motion_int_mode not in ("lite", "full"):
+                raise ValueError(f"`motion_int_mode` must be 'lite' or 'full', got {self.motion_int_mode!r}.")
+            if self.motion_corr_func not in ("cosine", "dotproduct", "dotproduct_softmax"):
+                raise ValueError(
+                    "`motion_corr_func` must be one of cosine/dotproduct/dotproduct_softmax, "
+                    f"got {self.motion_corr_func!r}."
+                )
+            if len(self.motion_window) != 3 or any(w < 1 for w in self.motion_window):
+                raise ValueError(
+                    f"`motion_window` must be 3 positive ints (L, kh, kw), got {self.motion_window}."
+                )
+            if any(w % 2 == 0 for w in self.motion_window):
+                raise ValueError(
+                    "`motion_window` dims (L, kh, kw) must all be ODD: each STSS axis builds a "
+                    "centered window of 2*(k//2)+1 entries and the temporal unfold only yields T "
+                    f"windows for an odd span, so an even dim crashes at the first forward. Got "
+                    f"{self.motion_window}."
+                )
+            if self.motion_window[1] != self.motion_window[2]:
+                raise ValueError(
+                    f"`motion_window` spatial dims must be square, got {self.motion_window[1:]}."
+                )
+            if self.n_obs_steps < 2:
+                raise ValueError(
+                    f"`use_motion` requires `n_obs_steps` >= 2 (a real time axis), got {self.n_obs_steps}."
+                )
 
     def validate_features(self) -> None:
         """Validates the features and adds empty cameras if configured."""

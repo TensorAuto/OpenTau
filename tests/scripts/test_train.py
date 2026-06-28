@@ -35,6 +35,7 @@ import wandb
 from opentau.scripts.train import (
     _bucket_per_sample,
     _commit_wandb_step,
+    _deepspeed_zero_stage,
     _eval_with_fresh_envs,
     _find_unused_params_from_env,
     _init_wandb_trackers,
@@ -154,6 +155,56 @@ def test_deepspeed_mismatch_non_main_overrides_without_warning(caplog):
     assert accelerator.deepspeed_plugin.hf_ds_config.config["gradient_accumulation_steps"] == 4
     assert accelerator.deepspeed_plugin.gradient_accumulation_steps == 4
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def _make_stage_accelerator(distributed_type, zero_optimization=None):
+    """Accelerator stub exposing the deepspeed plugin config ``_deepspeed_zero_stage`` reads.
+
+    ``zero_optimization`` is the dict placed under the DeepSpeed config's
+    ``"zero_optimization"`` key; pass ``None`` to model a config that never
+    declared it.
+    """
+    config = {}
+    if zero_optimization is not None:
+        config["zero_optimization"] = zero_optimization
+    plugin = SimpleNamespace(hf_ds_config=SimpleNamespace(config=config))
+    return SimpleNamespace(distributed_type=distributed_type, deepspeed_plugin=plugin)
+
+
+class TestDeepspeedZeroStage:
+    """``_deepspeed_zero_stage`` extracts the active ZeRO stage; 0 for non-DeepSpeed."""
+
+    @pytest.mark.parametrize(
+        "distributed_type",
+        [
+            accelerate.DistributedType.NO,
+            accelerate.DistributedType.MULTI_GPU,
+            accelerate.DistributedType.FSDP,
+        ],
+    )
+    def test_non_deepspeed_is_zero(self, distributed_type):
+        # Non-DeepSpeed backends must short-circuit to 0 *without* touching the
+        # deepspeed plugin (which is None / unconfigured here) -- that is what
+        # lets the ZeRO-3 guards in train() test ``>= 3`` directly.
+        acc = SimpleNamespace(distributed_type=distributed_type, deepspeed_plugin=None)
+        assert _deepspeed_zero_stage(acc) == 0
+
+    @pytest.mark.parametrize("stage", [0, 1, 2, 3])
+    def test_deepspeed_returns_configured_stage(self, stage):
+        acc = _make_stage_accelerator(
+            accelerate.DistributedType.DEEPSPEED, zero_optimization={"stage": stage}
+        )
+        assert _deepspeed_zero_stage(acc) == stage
+
+    def test_deepspeed_without_zero_optimization_is_zero(self):
+        # A DeepSpeed config that never declared zero_optimization (or declared
+        # it without a stage) means no parameter sharding -> treat as stage 0 so
+        # the ZeRO-3-only guards stay off.
+        acc_missing = _make_stage_accelerator(accelerate.DistributedType.DEEPSPEED, zero_optimization=None)
+        assert _deepspeed_zero_stage(acc_missing) == 0
+
+        acc_no_stage = _make_stage_accelerator(accelerate.DistributedType.DEEPSPEED, zero_optimization={})
+        assert _deepspeed_zero_stage(acc_no_stage) == 0
 
 
 def _make_tracker(

@@ -138,12 +138,31 @@ class PI05Config(PreTrainedConfig):
     # maximum number of frozen actions
     max_delay: int = 0
 
+    # Modality-specific learnable embedding.
+    # When True, a learnable embedding selected by input modality (vision,
+    # language, state, response, discrete action, action expert) is *added* on
+    # top of every token embedding before the transformer. This is an additive
+    # positional signal that tells the model which modality each token came
+    # from, layered over the existing RoPE positions (it does not replace them).
+    # The table is zero-initialized so enabling it on an existing checkpoint is
+    # a no-op at step 0 and the signal is learned from there. Defaults to False
+    # (original behavior, what existing checkpoints expect).
+    use_modality_embedding: bool = False
+
     # Attention utils
     attention_implementation: str = "eager"
 
     # Finetuning settings
     freeze_vision_encoder: bool = True
     train_expert_only: bool = False
+
+    # Knowledge insulation (π0.5): when True (default), the prefix/VLM KV cache
+    # is detached before the action expert reads it, so the flow-matching action
+    # loss does NOT backpropagate into the VLM backbone. Set False to let the
+    # action gradient flow into the VLM (end-to-end action training). Default
+    # True preserves existing behavior and is what current checkpoints expect.
+    knowledge_insulation: bool = True
+
     # Wrap each transformer-layer forward in torch.utils.checkpoint to trade
     # ~25-33% same-batch compute for ~30-40 GB of activation memory per rank,
     # typically netting +10-25% throughput once the freed memory is spent on
@@ -154,6 +173,13 @@ class PI05Config(PreTrainedConfig):
     # the backend-specific activation-checkpointing hooks those strategies
     # require. Defaults to False (no ckpt, lowest risk).
     gradient_checkpointing: bool = False
+
+    # torch.compile defaults ON for pi05: PI05Policy is wired for it
+    # (forward dispatches self.model via __call__, supports_torch_compile=True)
+    # and it gives a measured ~1.3-1.5x faster forward with 0 recompiles under
+    # DeepSpeed ZeRO-1/2 / DDP. Set False to train in eager (train.py also
+    # auto-falls back to eager under FSDP / ZeRO-3, which compile can't support).
+    use_torch_compile: bool = True
 
     # Training presets
     optimizer_lr: float = 2.5e-5

@@ -281,3 +281,95 @@ out candidates in order of likelihood:
     #    touching any config file:
     FUSED_ADAMW=false accelerate launch ... profile_step.py ...
     FUSED_ADAMW=true  accelerate launch ... profile_step.py ...
+
+DeepSpeed ZeRO-2 vs ZeRO-3 for pi05 full fine-tuning
+----------------------------------------------------
+
+ZeRO-3 shards the model *parameters* across ranks on top of the gradient and
+optimizer-state sharding that ZeRO-2 already does. That extra sharding pays off
+only when a single replica of the model does not fit in one GPU's memory — it
+adds a per-layer parameter all-gather in the forward (and a matching
+reduce-scatter in the backward) that ZeRO-2 does not need. pi05 is ≈3.3B
+parameters and fits comfortably replicated on an 80 GB GPU, so ZeRO-3 has
+nothing to gain and pays the all-gather cost.
+
+Measured on **8×A100-80GB, full fine-tuning (no frozen weights;
+``freeze_vision_encoder=false``, ``train_expert_only=false``), bf16, sdpa
+attention, ``use_torch_compile=false``, ``gradient_accumulation_steps=1``, 8
+ranks**, with the ``configs/examples/accelerate_deepspeed*`` configs and the
+pi05 reference policy (2 cameras at 224×224, ``chunk_size=10``,
+``predict_response=true``) on ``TensorAuto/libero``:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 14 14 12 12 14 14
+
+   * - Backend
+     - Per-rank batch
+     - Global batch
+     - sec/step
+     - samples/s
+     - Peak GPU mem
+   * - ZeRO-2
+     - 8
+     - 64
+     - 5.64
+     - 11.4
+     - 53.3 GiB
+   * - ZeRO-3
+     - 8
+     - 64
+     - 7.71
+     - 8.3
+     - 62.8 GiB
+   * - ZeRO-2
+     - 16
+     - 128
+     - 5.29
+     - 24.2
+     - 78.7 GiB
+   * - ZeRO-3
+     - 16
+     - 128
+     - 9.86
+     - 13.0
+     - 79.2 GiB
+
+Both backends OOM at the same per-rank batch size on this hardware (16 fits,
+18 OOMs): ZeRO-3 frees ~5 GB of replicated parameters per rank, but its
+parameter all-gather/prefetch buffers plus the extra allocator fragmentation
+consume a comparable amount, so the maximum batch is unchanged. At a matched
+batch size ZeRO-2 is ~1.4× faster at batch 8 and ~1.9× faster at batch 16
+(the per-step parameter all-gather is the difference; both keep fp32 master
+weights and step the optimizer identically).
+
+**Recommendation:** use plain DDP (fastest) or ZeRO-2 for pi05 and similarly
+sized policies. Reach for ZeRO-3 only when a single replica no longer fits per
+GPU (much larger backbones / many-billion-parameter experts). ZeRO-3 *is* fully
+supported and validated for pi05 — training, checkpoint save, resume, offline
+checkpoint consolidation (``convert_checkpoint.sh``), and in-training validation
+all work — it is simply not the throughput-optimal choice at this model size.
+
+To reproduce, run the same config under each accelerate file (both at 8 ranks /
+``gradient_accumulation_steps=1``) and read the per-step time from the logs;
+``samples/s = per_rank_batch × num_ranks ÷ sec_per_step``:
+
+.. code-block:: bash
+
+    COMMON="--policy.freeze_vision_encoder=false --policy.train_expert_only=false \
+        --policy.use_torch_compile=false --policy.attention_implementation=sdpa \
+        --batch_size=16 --dataloader_batch_size=16 --gradient_accumulation_steps=1"
+
+    # ZeRO-2
+    accelerate launch --config_file configs/examples/accelerate_deepspeed_config.yaml --num_processes 8 \
+        src/opentau/scripts/train.py --config_path=configs/examples/pi05_training_config.json $COMMON
+
+    # ZeRO-3
+    accelerate launch --config_file configs/examples/accelerate_deepspeed_zero3_config.yaml \
+        src/opentau/scripts/train.py --config_path=configs/examples/pi05_training_config.json $COMMON
+
+.. note::
+   If a ZeRO-3 run OOMs from fragmentation (the error mentions
+   "reserved but unallocated" memory), set
+   ``PYTORCH_ALLOC_CONF=expandable_segments:True`` in the environment to recover
+   the fragmented blocks.
