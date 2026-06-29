@@ -21,6 +21,7 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import concurrent.futures as cf
+import csv
 import datetime as dt
 import json
 import logging
@@ -42,7 +43,7 @@ import gymnasium as gym
 import imageio
 import numpy as np
 import torch
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedType
 from accelerate.utils import gather_object
 from termcolor import colored
 from torch import nn
@@ -50,9 +51,13 @@ from tqdm import trange
 
 from opentau.configs import parser
 from opentau.configs.train import TrainPipelineConfig
-from opentau.envs.configs import LiberoEnv
+from opentau.envs.configs import LiberoEnv, RoboCasaEnv
 from opentau.envs.factory import make_envs
-from opentau.envs.subgoal import LiberoLastFrameSubgoalGenerator, SubgoalImageGenerator
+from opentau.envs.subgoal import (
+    LiberoLastFrameSubgoalGenerator,
+    RoboCasaGoalFrameSubgoalGenerator,
+    SubgoalImageGenerator,
+)
 from opentau.envs.utils import (
     add_envs_task,
     add_eval_metadata,
@@ -82,6 +87,7 @@ def rollout(
     return_observations: bool = False,
     render_callback: Callable[[gym.vector.VectorEnv], None] | None = None,
     subgoal_generator: SubgoalImageGenerator | None = None,
+    capture_last_frames: bool = False,
 ) -> dict:
     """Run a batched policy rollout once through a batch of environments.
 
@@ -111,6 +117,11 @@ def rollout(
             are returned optionally because they typically take more memory to cache. Defaults to False.
         render_callback: Optional rendering callback to be used after the environments are reset, and after
             every step.
+        capture_last_frames: When True, capture each env's final raw camera observation (the
+            per-camera ``pixels`` dict at the step that env first becomes done) and return it under
+            ``"last_frames"`` as a per-env list of ``{camera_key: HxWx3 uint8}`` (or None for a
+            zero-step env). Memory-cheap (only the final frame per env, not the whole sequence) and
+            independent of ``return_observations``; used to harvest goal frames of successful rollouts.
     Returns:
         The dictionary described above.
     """
@@ -145,6 +156,9 @@ def rollout(
     check_env_attributes_and_types(env)
     successes = np.zeros((env.num_envs,), dtype=bool)
     subgoal_episode_picked = False
+    # Per-env final raw camera frames ({camera_key: HxWx3 uint8}); only the frame at each env's
+    # done-step is kept (updated every step the env is still live, then frozen).
+    last_frames: list[dict[str, np.ndarray] | None] = [None] * env.num_envs
     while not np.all(done) and step < max_steps:
         # Numpy array to tensor and changing dictionary keys to OpenTau policy format.
         observation = preprocess_observation(observation, cfg=cfg)
@@ -157,7 +171,7 @@ def rollout(
         # every step. Matches the "once per episode reset" cadence — each
         # `rollout()` call corresponds to one `env.reset()`.
         if subgoal_generator is not None and not subgoal_episode_picked:
-            subgoal_generator.start_episode(observation["prompt"])
+            subgoal_generator.start_episode(observation["prompt"], seeds)
             subgoal_episode_picked = True
         observation = add_subgoal_images(observation, subgoal_generator)
 
@@ -187,9 +201,18 @@ def rollout(
         assert action_numpy.ndim == 2, "Action dimensions should be (batch, action_dim)"
 
         # Apply the next action.
+        prev_done = done.copy()
         observation, reward, terminated, truncated, info = env.step(action_numpy)
         if render_callback is not None:
             render_callback(env)
+
+        # Capture each still-live env's raw camera frame. The last write for an env is the frame at
+        # the step it becomes done (its terminal/success state), since we stop updating once done.
+        if capture_last_frames and isinstance(observation, dict) and "pixels" in observation:
+            pixels = observation["pixels"]
+            for i in range(env.num_envs):
+                if not prev_done[i]:
+                    last_frames[i] = {k: np.asarray(v[i]).copy() for k, v in pixels.items()}
 
         # Once a success, always a success.
         if "is_success" in info:
@@ -249,6 +272,9 @@ def rollout(
                     "Only `torch.Tensor` and `list` are supported for now."
                 )
         ret["observation"] = stacked_observations
+
+    if capture_last_frames:
+        ret["last_frames"] = last_frames
 
     if hasattr(policy, "use_original_modules"):
         policy.use_original_modules()
@@ -352,6 +378,17 @@ def eval_policy(
     start = time.time()
     policy.eval()
 
+    # Optional explicit sparse seed list (cfg.eval.seed_list, comma-separated): evaluate exactly these
+    # scene seeds instead of the contiguous range start_seed..start_seed+n_episodes-1. Used for
+    # goal-frame backfill (re-run only the scenes a prior checkpoint failed). When set it overrides
+    # n_episodes; the last batch is right-padded by repeating the final seed to fill env.num_envs
+    # (the duplicate re-runs the same deterministic scene, so captured frames just overwrite — harmless).
+    explicit_seed_list: list[int] | None = None
+    _sl = getattr(cfg.eval, "seed_list", None)
+    if _sl:
+        explicit_seed_list = [int(s) for s in str(_sl).split(",") if s.strip() != ""]
+        n_episodes = len(explicit_seed_list)
+
     # Determine how many batched rollouts we need to get n_episodes. Note that if n_episodes is not evenly
     # divisible by env.num_envs we end up discarding some data in the last batch.
     n_batches = n_episodes // env.num_envs + int((n_episodes % env.num_envs) != 0)
@@ -364,6 +401,16 @@ def eval_policy(
     all_done_indices = []
     threads = []  # for video saving threads
     n_episodes_rendered = 0  # for saving the correct number of videos
+
+    # Goal-frame harvesting: when cfg.eval.goal_frames_dir is set, save the final raw camera frames
+    # of each SUCCESSFUL episode (all cameras) plus a manifest row, keyed by the per-episode scene
+    # seed so the same scene can be matched across checkpoints. Memory-cheap (final frame only).
+    goal_frames_dir = getattr(cfg.eval, "goal_frames_dir", None)
+    capture_last_frames = goal_frames_dir is not None
+    goal_manifest_rows: list[dict] = []
+    if capture_last_frames:
+        goal_frames_dir = Path(goal_frames_dir)
+        goal_frames_dir.mkdir(parents=True, exist_ok=True)
 
     # Callback for visualization.
     def render_frame(env: gym.vector.VectorEnv):
@@ -392,7 +439,14 @@ def eval_policy(
         if max_episodes_rendered > 0:
             ep_frames: list[np.ndarray] = []
 
-        if start_seed is None:
+        if explicit_seed_list is not None:
+            # Sparse-seed mode: take this batch's slice of the explicit list, right-padding the
+            # final short batch by repeating the last seed to fill env.num_envs.
+            batch_seeds = explicit_seed_list[batch_ix * env.num_envs : (batch_ix + 1) * env.num_envs]
+            while 0 < len(batch_seeds) < env.num_envs:
+                batch_seeds.append(batch_seeds[-1])
+            seeds = batch_seeds
+        elif start_seed is None:
             seeds = None
         else:
             # By default all ranks seed identically (offset 0), so the eval is
@@ -417,6 +471,7 @@ def eval_policy(
             return_observations=return_episode_data,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
             subgoal_generator=subgoal_generator,
+            capture_last_frames=capture_last_frames,
         )
         # Figure out where in each rollout sequence the first done condition was encountered (results after
         # this won't be included).
@@ -465,6 +520,35 @@ def eval_policy(
             all_seeds.extend(seeds)
         else:
             all_seeds.append(None)
+
+        # Goal-frame harvest: save the final raw camera frames of each SUCCESSFUL episode, keyed by
+        # the per-episode scene seed (stable across checkpoints under a pinned eval.seed), so a
+        # failed scene can later be backfilled from another checkpoint that solves the same scene.
+        if capture_last_frames and seeds is not None:
+            batch_last_frames = rollout_data.get("last_frames")
+            task_name = str(getattr(cfg.env, "task", "unknown"))
+            decoder = "discrete" if getattr(cfg.policy, "eval_use_discrete_actions", False) else "flow"
+            acc = get_proc_accelerator()
+            rank = acc.process_index if acc is not None else 0
+            # Only the real episodes of this batch — exclude the right-pad / overshoot seeds (metrics
+            # use [:n_episodes]); harvesting padded duplicates would append duplicate manifest rows.
+            n_real = max(0, min(env.num_envs, n_episodes - batch_ix * env.num_envs))
+            for b in range(n_real):
+                seed = seeds[b]
+                if (
+                    not bool(batch_successes[b].item())
+                    or batch_last_frames is None
+                    or batch_last_frames[b] is None
+                ):
+                    continue
+                # Rank-suffix the PNG filename so concurrent ranks (which evaluate the SAME seeds when
+                # decorrelate_rank_seeds is off) never write the same path and tear each other's file.
+                row = {"task": task_name, "seed": int(seed), "decoder": decoder, "success": 1}
+                for cam_key, frame in sorted(batch_last_frames[b].items()):
+                    fname = f"{task_name}__seed{int(seed)}__{decoder}__{cam_key}__rank{rank}.png"
+                    imageio.imwrite(goal_frames_dir / fname, np.asarray(frame).astype(np.uint8))
+                    row[cam_key] = fname
+                goal_manifest_rows.append(row)
 
         # Maybe render video for visualization.
         if max_episodes_rendered > 0 and len(ep_frames) > 0:
@@ -564,6 +648,44 @@ def eval_policy(
         # per-episode clips, so only record paths that still exist (this dict is
         # serialized to eval_info.json, which external consumers may read).
         info["video_paths"] = [p for p in video_paths if Path(p).exists()]
+
+    # Write a single goal-frame manifest CSV (one row per successful episode), so a downstream
+    # aggregator can pick the best successful frame-set per (task, seed) across checkpoints.
+    # eval_policy runs on EVERY rank, so gather each rank's rows and let exactly one writer (rank 0)
+    # emit manifest.csv — concurrent appends from all ranks would interleave/duplicate rows and race
+    # on the header. gather_object is a collective; `capture_last_frames` is config-derived and
+    # identical on every rank, so all ranks reach it together.
+    if capture_last_frames:
+        acc = get_proc_accelerator()
+        if acc is not None and acc.num_processes > 1:
+            gathered_rows: list[dict] = []
+            for rank_rows in gather_object([goal_manifest_rows]):
+                gathered_rows.extend(rank_rows)
+        else:
+            gathered_rows = goal_manifest_rows
+        if (acc is None or acc.is_main_process) and gathered_rows:
+            # Dedup by (task, seed, decoder): when ranks share seeds (decorrelate_rank_seeds off) the
+            # same scene is harvested once per rank; keep the first (its rank-suffixed PNG exists).
+            seen: set[tuple] = set()
+            rows: list[dict] = []
+            for r in gathered_rows:
+                key = (r["task"], r["seed"], r["decoder"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(r)
+            # Size fieldnames to the cameras actually harvested (not a fixed camera0/1/2) so configs
+            # with >3 cameras don't silently drop columns under extrasaction="ignore".
+            cam_cols = sorted({k for r in rows for k in r if k.startswith("camera")})
+            fieldnames = ["task", "seed", "decoder", "success", *cam_cols]
+            manifest_path = goal_frames_dir / "manifest.csv"
+            write_header = not manifest_path.exists()
+            with open(manifest_path, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+                if write_header:
+                    writer.writeheader()
+                writer.writerows(rows)
+            info["goal_frames_saved"] = len(rows)
 
     return info
 
@@ -753,29 +875,75 @@ def _cleanup_episode_clips(video_paths: list[str], keep: bool) -> None:
 def make_subgoal_generator(cfg: TrainPipelineConfig) -> SubgoalImageGenerator | None:
     """Construct the eval-time subgoal generator from `cfg.env`.
 
-    Returns ``None`` when the env is not a LIBERO env or
-    ``cfg.env.subgoal_source`` is unset — both cases fall back to the
-    policy's missing-key default in ``prepare_subgoal_images``.
+    Dispatch:
+        - LIBERO env with ``cfg.env.subgoal_source`` set ->
+          :class:`LiberoLastFrameSubgoalGenerator` (language-matched random
+          episode last frame).
+        - RoboCasa env with ``cfg.env.subgoal_frames_dirs`` set ->
+          :class:`RoboCasaGoalFrameSubgoalGenerator` (scene-seed-keyed harvested
+          success frame; feeds the goal frame of the exact scene when available).
+        - otherwise ``None`` — the policy's missing-key default in
+          ``prepare_subgoal_images`` (zero subgoals, ``mask=False``) takes over.
 
-    Threads ``cfg.seed`` into the generator's per-instance RNG so the
+    For LIBERO, threads ``cfg.seed`` into the generator's per-instance RNG so the
     per-rollout episode picks are reproducible across runs, and logs the
-    resolved dataset revision so a silent drift between
-    ``CODEBASE_VERSION`` and the source repo is visible in the eval log.
+    resolved dataset revision so a silent drift between ``CODEBASE_VERSION`` and
+    the source repo is visible in the eval log.
     """
-    if not isinstance(cfg.env, LiberoEnv) or cfg.env.subgoal_source is None:
-        return None
-    generator = LiberoLastFrameSubgoalGenerator(
-        repo_id=cfg.env.subgoal_source,
-        resolution=tuple(cfg.resolution),
-        num_cams=cfg.num_cams,
-        seed=cfg.seed,
-    )
-    logging.info(
-        f"[subgoal] Loaded LiberoLastFrameSubgoalGenerator from {cfg.env.subgoal_source!r} "
-        f"(revision={generator.meta.revision!r}, resolution={cfg.resolution}, "
-        f"num_cams={cfg.num_cams}, seed={cfg.seed!r})."
-    )
-    return generator
+    if isinstance(cfg.env, LiberoEnv) and cfg.env.subgoal_source is not None:
+        generator = LiberoLastFrameSubgoalGenerator(
+            repo_id=cfg.env.subgoal_source,
+            resolution=tuple(cfg.resolution),
+            num_cams=cfg.num_cams,
+            seed=cfg.seed,
+        )
+        logging.info(
+            f"[subgoal] Loaded LiberoLastFrameSubgoalGenerator from {cfg.env.subgoal_source!r} "
+            f"(revision={generator.meta.revision!r}, resolution={cfg.resolution}, "
+            f"num_cams={cfg.num_cams}, seed={cfg.seed!r})."
+        )
+        return generator
+
+    if isinstance(cfg.env, RoboCasaEnv) and getattr(cfg.env, "subgoal_frames_dirs", None) is not None:
+        dirs = [d.strip() for d in str(cfg.env.subgoal_frames_dirs).split(",") if d.strip()]
+        generator = RoboCasaGoalFrameSubgoalGenerator(
+            manifest_dirs=dirs,
+            task=str(cfg.env.task),
+            resolution=tuple(cfg.resolution),
+            num_cams=cfg.num_cams,
+        )
+        logging.info(
+            f"[subgoal] Loaded RoboCasaGoalFrameSubgoalGenerator for task={cfg.env.task!r} from "
+            f"{len(dirs)} dir(s): indexed {generator.num_scenes} scene seed(s), cameras "
+            f"{generator.camera_indices} (resolution={cfg.resolution}, num_cams={cfg.num_cams})."
+        )
+        return generator
+
+    return None
+
+
+def _eval_uses_sharded_params(accelerator: Accelerator) -> bool:
+    """Whether params are sharded across ranks (FSDP or DeepSpeed ZeRO-3).
+
+    The per-rank-independent sim-eval rollout fires no cross-rank collective of
+    its own, but under parameter sharding the policy forward all-gathers params
+    per layer; paired with a per-rank-divergent decode loop (the variable-length
+    AR discrete-action path) the ranks issue a different number of all-gathers
+    and hang at NCCL. Mirrors the in-training guard in ``train.py``.
+
+    Args:
+        accelerator: The active accelerate ``Accelerator``.
+
+    Returns:
+        bool: ``True`` under FSDP or DeepSpeed ZeRO-3, ``False`` otherwise.
+    """
+    if accelerator.distributed_type == DistributedType.FSDP:
+        return True
+    if accelerator.distributed_type == DistributedType.DEEPSPEED:
+        plugin = getattr(accelerator, "deepspeed_plugin", None)
+        ds_config = getattr(getattr(plugin, "hf_ds_config", None), "config", None) or {}
+        return int(ds_config.get("zero_optimization", {}).get("stage", 0)) >= 3
+    return False
 
 
 @parser.wrap()
@@ -789,6 +957,17 @@ def eval_main(cfg: TrainPipelineConfig):
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     set_seed(cfg.seed)
+
+    # The AR discrete-action eval decode loop runs a per-rank-variable number of
+    # backbone forwards; under parameter sharding the per-layer all-gathers desync
+    # across ranks and hang at NCCL. Fail fast (mirrors the in-training guard).
+    if getattr(cfg.policy, "eval_use_discrete_actions", False) and _eval_uses_sharded_params(accelerator):
+        raise ValueError(
+            "AR discrete-action eval (policy.eval_use_discrete_actions=True) is not supported under "
+            "parameter sharding (FSDP / DeepSpeed ZeRO-3): the per-rank variable-length AR decode fires "
+            "a different number of sharded-param all-gathers per rank and hangs at NCCL. Run eval with "
+            "replicated params (single GPU / DDP / ZeRO-1/2)."
+        )
 
     details = f"{cfg.env.type}-{cfg.env.task}-{cfg.eval.n_episodes}"
     now = f"{dt.datetime.now():%Y%m%d-%H%M%S}"

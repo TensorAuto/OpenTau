@@ -357,6 +357,15 @@ class RoboCasaEnv(EnvConfig):
             needs are downloaded automatically (once) on first env build.
         features: Mapping from logical feature names to ``PolicyFeature`` definitions.
         features_map: Mapping from environment keys to standardized OpenTau keys.
+        subgoal_frames_dirs: Comma-separated list of ``goal_frames/`` directories
+            (each with a ``manifest.csv`` + the per-``(task, seed, decoder,
+            camera)`` ``.png`` files harvested from successful rollouts). When set,
+            eval feeds the harvested terminal frame of the *same scene seed* as the
+            subgoal image whenever one is available for that ``(task, seed)``;
+            scenes with no harvested success get no subgoal (padded). Probes how
+            much a perfect goal-image (world-model output) would help. Requires a
+            pinned ``eval.seed`` so the seed→scene map matches the harvest. ``None``
+            (default) = no subgoal conditioning.
     """
 
     task: str = "CloseFridge"
@@ -373,6 +382,7 @@ class RoboCasaEnv(EnvConfig):
     obj_registries: list[str] = field(default_factory=lambda: ["lightwheel"])
     assets_root: str | None = None
     auto_download_assets: bool = True
+    subgoal_frames_dirs: str | None = None
     features: dict[str, PolicyFeature] = field(
         default_factory=lambda: {
             "action": PolicyFeature(type=FeatureType.ACTION, shape=(12,)),

@@ -33,11 +33,15 @@ episode's last frame from each camera as the subgoal.
 
 from __future__ import annotations
 
+import csv
 import random
 import threading
 from pathlib import Path
 from typing import Any, Protocol
 
+import einops
+import imageio.v2 as imageio
+import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
 from datasets import load_dataset
@@ -62,7 +66,7 @@ class SubgoalImageGenerator(Protocol):
     inside :meth:`start_episode` so the per-step call is cheap.
     """
 
-    def start_episode(self, prompts: list[str]) -> None:
+    def start_episode(self, prompts: list[str], seeds: list[int] | None = None) -> None:
         """Re-sample the per-env subgoal source for a fresh rollout.
 
         Called once at the top of :func:`opentau.scripts.eval.rollout`
@@ -72,6 +76,12 @@ class SubgoalImageGenerator(Protocol):
         Args:
             prompts: Task language string per env in the vector, length
                 ``env.num_envs``.
+            seeds: Per-env scene seed used for ``env.reset(seed=...)`` this
+                rollout, length ``env.num_envs`` (or ``None`` if the rollout
+                was not manually seeded). Language-matched generators
+                (e.g. LIBERO) ignore this; scene-seed-keyed generators
+                (e.g. :class:`RoboCasaGoalFrameSubgoalGenerator`) use it to
+                serve the goal frame of the exact scene being run.
         """
         ...
 
@@ -246,8 +256,15 @@ class LiberoLastFrameSubgoalGenerator:
     def known_languages(self) -> list[str]:
         return sorted(self.lang_to_episodes)
 
-    def start_episode(self, prompts: list[str]) -> None:
+    def start_episode(self, prompts: list[str], seeds: list[int] | None = None) -> None:
         """Sample one random matching episode per env, store for the rollout.
+
+        Args:
+            prompts: Task language string per env in the vector.
+            seeds: Unused — this generator matches by task language and
+                samples a random matching episode, so the scene seed is
+                irrelevant. Accepted to satisfy the
+                :class:`SubgoalImageGenerator` protocol.
 
         Raises:
             ValueError: If any prompt has no matching episode in
@@ -381,6 +398,225 @@ class LiberoLastFrameSubgoalGenerator:
                 local_dir=self.meta.root,
             )
         return local_path
+
+
+class RoboCasaGoalFrameSubgoalGenerator:
+    """Serve harvested success goal-frames as eval-time subgoals, keyed by scene seed.
+
+    Unlike :class:`LiberoLastFrameSubgoalGenerator` (which matches by task
+    language and samples a *random* matching episode), this generator is keyed
+    by the exact per-episode **scene seed**. Under a pinned ``cfg.eval.seed``
+    each RoboCasa env runs a deterministic scene ``seed`` (``seed + i``), and we
+    previously harvested the terminal camera frames of *successful* rollouts of
+    those exact scenes — across several checkpoints — into ``goal_frames/`` dirs,
+    each with a ``manifest.csv`` (columns ``task,seed,decoder,success,camera0,
+    camera1,...``) plus the per-``(task, seed, decoder, camera)`` ``.png`` files.
+
+    Given the ``(task, seed)`` an env is running, this returns the matching goal
+    frames as ``subgoal{k}``; scenes with no harvested success get
+    ``subgoal_is_pad=True`` (no subgoal). That realises the "feed the successful
+    last frame whenever available" semantics, and is the world-model upper-bound
+    probe: the subgoal is the real terminus of a successful trajectory of the
+    very scene being solved, so it measures how much a perfect goal-image
+    predictor could help. The pi07/pi07-paligemma checkpoints were trained with
+    ``subgoal_end_of_segment_prob > 0``, so terminal frames are an
+    in-distribution subgoal.
+
+    Scope and assumptions:
+        - **Single task per instance.** ``task`` is fixed at construction (it
+          matches ``cfg.env.task``, which RoboCasa eval sets to one task per
+          invocation). The manifest's ``task`` column is filtered to it.
+        - **Camera alignment.** ``camera{k}`` in the manifest maps directly to
+          ``subgoal{k}`` (same ``camera{k}`` convention the env wrapper and
+          ``preprocess_observation`` produce). The experiment must use the same
+          ``env.camera_name`` ordering the frames were harvested under.
+        - **Decoder preference.** A scene may have a success frame from both the
+          ``flow`` and ``discrete`` decoders (same scene, slightly different
+          terminal pose). One is chosen per seed by ``decoder_preference``; the
+          chosen decoder's frames are used for all cameras (never mixed).
+        - **Union across dirs.** Multiple ``goal_frames/`` dirs (one per
+          harvest checkpoint) are merged so coverage is the union; on a seed
+          present in several dirs the best-ranked decoder wins, ties broken by
+          dir order.
+    """
+
+    def __init__(
+        self,
+        manifest_dirs: list[str | Path],
+        task: str,
+        resolution: tuple[int, int] = (256, 256),
+        num_cams: int = 3,
+        decoder_preference: tuple[str, ...] = ("flow", "discrete"),
+    ):
+        """Build the ``seed -> {camera_idx: png_path}`` index for ``task``.
+
+        Args:
+            manifest_dirs: ``goal_frames/`` directories, each with a
+                ``manifest.csv`` and the harvested ``.png`` files. Merged into
+                one index (union of scenes).
+            task: RoboCasa task name to serve (filters the manifest ``task``
+                column); matches ``cfg.env.task``.
+            resolution: Target ``(H, W)`` for the returned subgoal images,
+                matching ``cfg.resolution`` (the shape ``preprocess_observation``
+                produces for the live ``camera{k}`` keys).
+            num_cams: Number of camera slots to populate; cameras with index
+                ``>= num_cams`` in the manifest are ignored.
+            decoder_preference: Decoder ranking when a seed has frames from more
+                than one decoder; earlier = preferred.
+        """
+        self.task = task
+        self.resolution = resolution
+        self.num_cams = num_cams
+        self.decoder_preference = tuple(decoder_preference)
+
+        # seed -> {camera_idx: absolute png path}; plus the chosen decoder rank
+        # per seed for cross-dir / cross-decoder tie-breaking.
+        self._index: dict[int, dict[int, Path]] = {}
+        self._decoder: dict[int, str] = {}
+        chosen_rank: dict[int, int] = {}
+
+        def _rank(decoder: str) -> int:
+            return (
+                self.decoder_preference.index(decoder)
+                if decoder in self.decoder_preference
+                else len(self.decoder_preference)
+            )
+
+        for raw_dir in manifest_dirs:
+            d = Path(raw_dir)
+            manifest = d / "manifest.csv"
+            if not manifest.is_file():
+                continue
+            with open(manifest, newline="") as f:
+                reader = csv.DictReader(f)
+                cam_cols = [c for c in (reader.fieldnames or []) if c.startswith("camera")]
+                for row in reader:
+                    if row.get("task") != task:
+                        continue
+                    if str(row.get("success", "")).strip().lower() not in ("1", "true"):
+                        continue
+                    try:
+                        seed = int(row["seed"])
+                    except (KeyError, ValueError, TypeError):
+                        continue
+                    rank = _rank(row.get("decoder", ""))
+                    # Keep only if this seed is new or this row has a strictly
+                    # better-ranked decoder (equal rank -> first dir wins).
+                    if seed in chosen_rank and rank >= chosen_rank[seed]:
+                        continue
+                    cams: dict[int, Path] = {}
+                    for col in cam_cols:
+                        fname = row.get(col)
+                        if not fname:
+                            continue
+                        k = int(col[len("camera") :])
+                        if k >= num_cams:
+                            continue
+                        cams[k] = d / fname
+                    if not cams:
+                        continue
+                    self._index[seed] = cams
+                    self._decoder[seed] = row.get("decoder", "")
+                    chosen_rank[seed] = rank
+
+        # Camera indices this generator can serve (union across indexed scenes,
+        # capped at num_cams). Determines which subgoal{k} keys are emitted.
+        self.camera_indices: list[int] = sorted(
+            {k for cams in self._index.values() for k in cams if k < num_cams}
+        )
+
+        # Per-path decoded-frame cache (read-mostly; the GIL makes the
+        # setdefault-style miss safe enough). Bounded by the number of
+        # harvested scenes for this task (~48), so no LRU needed.
+        self._frame_cache: dict[Path, Tensor] = {}
+        # Threadlocal per-rollout seed list so concurrent eval workers don't
+        # clobber each other's pick.
+        self._local = threading.local()
+
+    @property
+    def num_scenes(self) -> int:
+        """Number of distinct scene seeds with a harvested success frame."""
+        return len(self._index)
+
+    def start_episode(self, prompts: list[str], seeds: list[int] | None = None) -> None:
+        """Pin the per-env scene seeds for this rollout.
+
+        Args:
+            prompts: Task language per env (unused — task is fixed at
+                construction; kept for protocol parity).
+            seeds: Per-env scene seed for this rollout. ``None`` (rollout not
+                manually seeded) means every env is served as padded (no
+                subgoal), since without the seed we cannot identify the scene.
+        """
+        self._local.seeds = None if seeds is None else [int(s) for s in seeds]
+        self._local.batch_size = len(prompts)
+
+    def __call__(self, observation: dict[str, Any]) -> dict[str, Tensor]:
+        """Return ``subgoal{k}`` / ``subgoal_is_pad`` for the current scenes."""
+        if not hasattr(self._local, "seeds"):
+            raise RuntimeError(
+                "RoboCasaGoalFrameSubgoalGenerator: start_episode(prompts, seeds) must be "
+                "called before __call__(observation)."
+            )
+        state = observation["state"]
+        batch_size = state.shape[0]
+        device = state.device
+        dtype = state.dtype if state.dtype.is_floating_point else torch.bfloat16
+
+        seeds = self._local.seeds
+        h, w = self.resolution
+        per_cam: dict[int, Tensor] = {
+            k: torch.zeros(batch_size, 3, h, w, device=device, dtype=dtype) for k in self.camera_indices
+        }
+        # True == no subgoal for this sample (padded). Default everything to
+        # padded; flip to False per env when a goal frame is found.
+        subgoal_is_pad = torch.ones(batch_size, dtype=torch.bool, device=device)
+
+        if seeds is not None:
+            if len(seeds) != batch_size:
+                raise ValueError(
+                    f"RoboCasaGoalFrameSubgoalGenerator: observation batch size {batch_size} does "
+                    f"not match the {len(seeds)} seeds pinned at start_episode(); was the env batch "
+                    f"resized mid-rollout?"
+                )
+            for i, seed in enumerate(seeds):
+                cams = self._index.get(seed)
+                if not cams:
+                    continue
+                # Only serve a scene that has EVERY camera this generator emits. subgoal_is_pad is a
+                # single per-sample flag, so a scene missing a camera that other indexed scenes have
+                # would otherwise feed its zero frame as a VALID (non-pad) subgoal for that camera.
+                if any(k not in cams for k in self.camera_indices):
+                    continue
+                subgoal_is_pad[i] = False
+                for k in self.camera_indices:
+                    per_cam[k][i] = self._cached_frame(cams[k]).to(device=device, dtype=dtype)
+
+        out: dict[str, Tensor] = {f"subgoal{k}": per_cam[k] for k in self.camera_indices}
+        out["subgoal_is_pad"] = subgoal_is_pad
+        return out
+
+    def _cached_frame(self, path: Path) -> Tensor:
+        if path not in self._frame_cache:
+            self._frame_cache[path] = self._load_frame(path)
+        return self._frame_cache[path]
+
+    def _load_frame(self, path: Path) -> Tensor:
+        """Load a harvested PNG as a ``(3, H, W)`` float tensor in ``[0, 1]``.
+
+        Mirrors the live ``camera{k}`` preparation (``preprocess_observation``
+        + ``resize_with_pad`` to ``resolution``) so the model sees identically
+        shaped subgoal and observation images.
+        """
+        img = np.asarray(imageio.imread(path))
+        if img.ndim != 3 or img.shape[2] < 3:
+            raise ValueError(
+                f"RoboCasaGoalFrameSubgoalGenerator: expected an HxWx3 RGB png at {path}, "
+                f"got array shape {tuple(img.shape)}."
+            )
+        frame = torch.from_numpy(img[:, :, :3].copy()).float() / 255.0
+        frame = einops.rearrange(frame, "h w c -> c h w")
+        return _resize_with_pad(frame, self.resolution[1], self.resolution[0])
 
 
 def _resize_with_pad(img: Tensor, width: int, height: int, pad_value: float = 0.0) -> Tensor:

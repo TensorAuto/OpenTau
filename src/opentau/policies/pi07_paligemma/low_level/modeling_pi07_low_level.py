@@ -24,6 +24,7 @@ import builtins
 import logging
 import math
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -39,7 +40,7 @@ from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import NormalizationMode
 from opentau.policies.flash_attn_cuda import make_att_block_ids
 from opentau.policies.layers import PerGroupLinear
-from opentau.policies.normalize import Normalize, Unnormalize
+from opentau.policies.normalize import EPS, Normalize, Unnormalize, _materialize
 from opentau.policies.normalize import resolve_num_datasets as _num_datasets
 from opentau.policies.outlier_utils import detect_state_action_outliers
 from opentau.policies.pi05.paligemma_with_expert import (
@@ -831,6 +832,7 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         include_discrete_actions: bool,
         discrete_actions: Tensor | None = None,
         discrete_action_masks: Tensor | None = None,
+        include_action_indicator: bool = False,
     ) -> list[ContextItem]:
         """Construct the ordered ``ContextItem`` list defining the prefix.
 
@@ -852,7 +854,7 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
             "Subgoal: "
             subgoal images (one per camera, per-sample masked)
             ":\n"
-            (training only)
+            (training: both; autoregressive eval: indicator only)
             "Action: " — excluded from cross-attention
             discrete_actions (FAST tokens) — excluded from cross-attention
         """
@@ -1004,10 +1006,7 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
             )
         )
 
-        if include_discrete_actions:
-            assert discrete_actions is not None and discrete_action_masks is not None, (
-                "discrete_actions / discrete_action_masks required when include_discrete_actions=True"
-            )
+        if include_discrete_actions or include_action_indicator:
             da_indicator_tokens, da_indicator_len = self._embed_text("Action: ", bsize, device)
             da_indicator_mask = torch.ones(bsize, da_indicator_len, dtype=torch.bool, device=device)
             items.append(
@@ -1018,6 +1017,11 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
                     attention="causal",
                     exclude_from_cross_attention=True,
                 )
+            )
+
+        if include_discrete_actions:
+            assert discrete_actions is not None and discrete_action_masks is not None, (
+                "discrete_actions / discrete_action_masks required when include_discrete_actions=True"
             )
             items.append(
                 ContextItem(
@@ -1077,6 +1081,13 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
 
         self._hydrate_optional_conditioning_batch(batch)
 
+        if self.config.eval_use_discrete_actions:
+            if action_prefix is not None or (delay is not None and int(delay.item()) != 0):
+                raise NotImplementedError(
+                    "eval_use_discrete_actions does not support a frozen action prefix (max_delay > 0)."
+                )
+            return self._sample_actions_discrete(batch, dataset_index)
+
         prefix_items = self._build_prefix_items(batch, include_discrete_actions=False)
         bsize = batch["state"].shape[0]
         device = batch["state"].device
@@ -1122,6 +1133,107 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         actions = self.unnormalize_outputs({"actions": actions}, dataset_index)["actions"]
 
         return actions
+
+    @torch.no_grad()
+    def _sample_actions_discrete(self, batch: dict[str, Tensor], dataset_index: Tensor) -> Tensor:
+        """EXPERIMENTAL: predict the action chunk by autoregressively generating
+        FAST discrete-action tokens with the VLM backbone instead of running the
+        flow-matching action expert. Gated by ``config.eval_use_discrete_actions``.
+
+        The prefix replays the exact training layout up to and including the
+        trailing ``"Action: "`` indicator; generated tokens then occupy the same
+        positions the ground-truth discrete tokens occupy in training (causal
+        attention, position ids continuing past the real prefix tokens, greedy
+        argmax over ``da_head`` logits).
+
+        End of generation: there is no learned EOS — training masks the CE loss
+        at pad positions, so the model was never taught what to emit after the
+        last real token (and pad id 0 collides with a real BPE id). But FAST is
+        self-delimiting given the chunk shape: a complete sequence BPE-decodes
+        to exactly ``chunk_size * max_action_dim`` DCT-coefficient chars, so
+        generation stops per sample once its running decode reaches that count,
+        capped at ``discrete_action_max_length`` tokens (the same truncation
+        training applies to over-long sequences).
+
+        Args:
+            batch: Normalized + hydrated observation batch (as inside
+                :meth:`sample_actions`).
+            dataset_index: Per-sample norm/projection group index.
+
+        Returns:
+            Raw (unnormalized) actions ``(B, chunk_size, action_dim)``.
+        """
+        proc = self.discrete_action_processor
+        n_coeffs = self.config.chunk_size * self.config.max_action_dim
+
+        def _rows_done(token_rows: list[list[int]]) -> list[bool]:
+            return [len(proc.bpe_tokenizer.decode(row)) >= n_coeffs for row in token_rows]
+
+        prefix_items = self._build_prefix_items(
+            batch, include_discrete_actions=False, include_action_indicator=True
+        )
+        token_rows = self.model.generate_discrete_actions(
+            prefix_items,
+            max_new_tokens=self.config.discrete_action_max_length,
+            stop_fn=_rows_done,
+            group_index=dataset_index,
+        )
+        actions = self._decode_discrete_action_tokens(token_rows, dataset_index, batch["state"].device)
+
+        original_action_dim = self.config.action_feature.shape[0]
+        return actions[:, :, :original_action_dim]
+
+    def _decode_discrete_action_tokens(
+        self, token_rows: list[list[int]], dataset_index: Tensor, device: torch.device
+    ) -> Tensor:
+        """Relaxed FAST decode of generated token rows into a raw action chunk.
+
+        Mirrors ``UniversalActionProcessor.decode`` but tolerates an imperfect
+        generation instead of zeroing the whole chunk like the strict decoder:
+        the BPE char stream is truncated / zero-coefficient-padded to exactly
+        ``chunk_size * max_action_dim`` coefficients, and out-of-alphabet chars
+        (e.g. a UTF-8 replacement char when a token boundary split a codepoint)
+        are snapped to the zero coefficient.
+
+        The decoded chunk lives in the MIN_MAX-normalized space the tokens were
+        trained in (``normalize_discrete_actions``), so the inverse MIN_MAX
+        mapping is applied here inline from that module's stats buffers — NOT
+        ``unnormalize_outputs``, whose ACTION mapping is MEAN_STD.
+        """
+        from scipy.fft import idct
+
+        t_steps, act_dim = self.config.chunk_size, self.config.max_action_dim
+        n_coeffs = t_steps * act_dim
+        proc = self.discrete_action_processor
+        # Encode maps quantized coefficient q to chr(q - min_token); coefficient
+        # 0 is therefore chr(-min_token). Valid ords are a small alphabet — use
+        # the BPE vocab size as a generous upper bound for the sanity clamp.
+        zero_ord = -int(proc.min_token)
+        max_ord = int(proc.vocab_size)
+
+        rows = []
+        for toks in token_rows:
+            chars = proc.bpe_tokenizer.decode(toks)
+            ords = np.array([ord(c) for c in chars], dtype=np.int64)
+            ords = np.where((ords < 0) | (ords > max_ord), zero_ord, ords)
+            if len(ords) < n_coeffs:
+                ords = np.pad(ords, (0, n_coeffs - len(ords)), constant_values=zero_ord)
+            coeffs = (ords[:n_coeffs] + proc.min_token).astype(np.float64).reshape(t_steps, act_dim)
+            rows.append(idct(coeffs / proc.scale, axis=0, norm="ortho"))
+        normalized = torch.from_numpy(np.stack(rows)).to(device=device, dtype=torch.float32)
+
+        # Inverse of Normalize's MIN_MAX ((x - min)/(denom + EPS) * 2 - 1),
+        # mirroring Unnormalize.forward including the zero-range snap, inlined
+        # so this experimental path adds no extra module / state-dict keys.
+        # _materialize: under FSDP2 these ParameterDict buffers are DTensors;
+        # mixing them with the plain decoded tensor below would raise. Mirrors
+        # Normalize/Unnormalize's MIN_MAX stat access.
+        buffer = self.normalize_discrete_actions.buffer_actions
+        min_ = _materialize(buffer["min"]).index_select(0, dataset_index).unsqueeze(1).to(device=device)
+        max_ = _materialize(buffer["max"]).index_select(0, dataset_index).unsqueeze(1).to(device=device)
+        denom = max_ - min_
+        denom = torch.where(denom.abs() < EPS, torch.ones_like(denom), denom)
+        return (normalized + 1) / 2 * (denom + EPS) + min_
 
     def forward(
         self,
@@ -2364,6 +2476,122 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
             )
         ]
 
+    @torch.no_grad()
+    def generate_discrete_actions(
+        self,
+        prefix_items: list[ContextItem],
+        max_new_tokens: int,
+        stop_fn: Callable[[list[list[int]]], list[bool]],
+        group_index: Tensor | None = None,
+    ) -> list[list[int]]:
+        """Greedy autoregressive generation of FAST discrete-action tokens.
+
+        Replays the training-time token layout: the prefix (which must end with
+        the ``"Action: "`` indicator block) runs through the VLM backbone once
+        with ``fill_kv_cache=True`` over its FULL length — unlike the
+        flow-matching path, the cache here exists for token generation, not for
+        action-expert cross-attention, so the indicator is not excluded. The
+        first token is predicted from the last indicator hidden state (training
+        computes the CE logits from ``prefix_out[:, -L-1:-1]``; position
+        ``-L-1`` is exactly this token). Each subsequent step re-feeds the
+        generated-so-far block with ``use_cache=True, fill_kv_cache=False`` —
+        the cached prefix KV is prepended inside ``_run_layer``, the same
+        mechanism :meth:`denoise_step` uses — with causal attention within the
+        block and position ids continuing past the real prefix tokens, matching
+        training's ``cumsum(pad_masks) - 1`` because generated tokens are never
+        padded.
+
+        Args:
+            prefix_items: Prefix ``ContextItem`` list ending with the
+                ``"Action: "`` indicator.
+            max_new_tokens: Hard cap on generated tokens (training's
+                ``discrete_action_max_length`` truncation).
+            stop_fn: ``list[list[int]] -> list[bool]`` per-sample completion
+                predicate, re-evaluated after every step (the FAST
+                coefficient-count rule lives in the policy).
+            group_index: Per-sample norm/projection group index.
+
+        Returns:
+            Per-sample token id lists, each frozen at its stop point (or at
+            ``max_new_tokens`` if the predicate never fired).
+        """
+        prefix_embs, prefix_pad_masks, prefix_att_masks, _ = self.embed_prefix(
+            # Independent per-rank rollout (sim eval): skip the cross-rank branch
+            # all-reduce so variable-length rollouts don't desync at NCCL.
+            prefix_items,
+            group_index=group_index,
+            sync_across_ranks=False,
+        )
+        bsize = prefix_embs.shape[0]
+        device = prefix_embs.device
+        use_flash = flash_cuda_active(self.config.attention_implementation)
+
+        prefix_att_2d_masks, prefix_block_ids = build_attention_inputs(
+            use_flash, prefix_pad_masks, prefix_att_masks
+        )
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+
+        (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            n_cross_att_tokens=prefix_pad_masks.shape[1],
+            use_cache=False,
+            fill_kv_cache=True,
+            attention_block_ids=prefix_block_ids,
+        )
+
+        logits = self.paligemma_with_expert.da_head(prefix_out[:, -1])
+        next_token = logits.argmax(dim=-1)  # (B,)
+        generated = next_token[:, None]  # (B, k) running block, all samples
+
+        rows: list[list[int]] = [[int(t)] for t in next_token.tolist()]
+        done = stop_fn(rows)
+        done_len: list[int | None] = [1 if d else None for d in done]
+
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+
+        while generated.shape[1] < max_new_tokens and any(dl is None for dl in done_len):
+            k = generated.shape[1]
+            gen_embs = self.paligemma_with_expert.embed_discrete_actions(generated).to(
+                dtype=_preferred_dtype()
+            )
+            gen_pad_masks = torch.ones(bsize, k, dtype=torch.bool, device=device)
+            gen_att_masks = torch.ones(bsize, k, dtype=torch.bool, device=device)  # causal block
+            att_2d_masks, block_ids = build_attention_inputs(
+                use_flash,
+                gen_pad_masks,
+                gen_att_masks,
+                n_cross_att_tokens=prefix_pad_masks.shape[1],
+                cross_att_pad_masks=prefix_pad_masks,
+            )
+            position_ids = prefix_offsets + torch.cumsum(gen_pad_masks, dim=1) - 1
+            (gen_out, _), _ = self.paligemma_with_expert.forward(
+                attention_mask=att_2d_masks,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=[gen_embs, None],
+                use_cache=True,
+                fill_kv_cache=False,
+                attention_block_ids=block_ids,
+            )
+            logits = self.paligemma_with_expert.da_head(gen_out[:, -1])
+            next_token = logits.argmax(dim=-1)
+            generated = torch.cat([generated, next_token[:, None]], dim=1)
+            # Frozen (done) samples keep generating in-batch for shape
+            # uniformity, but their rows stop accumulating — the extra tokens
+            # only ever attend within that sample's own row and are discarded.
+            for i, t in enumerate(next_token.tolist()):
+                if done_len[i] is None:
+                    rows[i].append(int(t))
+            newly_done = stop_fn(rows)
+            for i in range(bsize):
+                if done_len[i] is None and newly_done[i]:
+                    done_len[i] = len(rows[i])
+
+        return rows
+
     def sample_actions(
         self,
         prefix_items: list[ContextItem],
@@ -2442,6 +2670,7 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
 
         # we need to ensure the frozen actions are not modified before returning the denoised actions
         x_t = torch.where(rearrange(prefix_mask, "b c -> b c 1"), action_prefix, x_t)
+
         return x_t
 
     def denoise_step(
