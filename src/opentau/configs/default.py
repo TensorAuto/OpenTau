@@ -568,7 +568,11 @@ class EvalConfig:
             Only used for environments that are not already vectorized.
             Defaults to 16.
         use_async_envs: Whether to use asynchronous environments (multiprocessing).
-            Defaults to True.
+            Defaults to True. RoboCasa eval *requires* the async backend for any
+            multi-env (batch_size > 1) build: its per-env EGL/GL offscreen render
+            contexts cross-contaminate in a single process, so SyncVectorEnv feeds
+            the policy the wrong env's pixels (issue #449). A multi-env RoboCasa
+            Sync build is therefore auto-promoted to async; LIBERO is unaffected.
         max_episodes_rendered: Maximum number of episodes to render as videos.
             Defaults to 16.
         grid_size: Grid dimensions for video summary (rows, cols). If None, will
