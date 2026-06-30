@@ -26,6 +26,7 @@ Real sim rollouts are validated separately on a CUDA box.
 import contextlib
 import json
 import os
+from functools import partial
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -39,6 +40,7 @@ from opentau.envs.configs import EnvConfig, RoboCasaEnv
 from opentau.envs.factory import make_env_config, make_envs
 from opentau.envs.robocasa import (
     ACTION_DIM,
+    ALLOW_ROBOCASA_SYNC_ENV,
     OBS_STATE_DIM,
     ROBOCASA_ASSETS_ROOT_ENV,
     _default_camera_name_mapping,
@@ -46,6 +48,7 @@ from opentau.envs.robocasa import (
     _ensure_robocasa_assets,
     _import_robocasa_with_version_shim,
     _internal_robocasa_pkg_dir,
+    _maybe_promote_sync_to_async,
     _maybe_relink_robocasa_assets,
     _needed_asset_packs,
     _official_task_horizon,
@@ -529,6 +532,76 @@ class TestMakeEnvsDispatch:
         import gymnasium as gym
 
         assert kwargs["env_cls"] is gym.vector.SyncVectorEnv
+
+
+class TestSyncToAsyncPromotion:
+    """RoboCasa multi-env Sync builds are promoted to Async (issue #449).
+
+    A single-process ``SyncVectorEnv`` cross-contaminates each sub-env's MuJoCo
+    *offscreen* EGL/GL render context, so ``sim.render()`` can return the wrong
+    env's framebuffer and the policy is fed observations that don't match the scene
+    it is acting in (scene geometry itself is unaffected — it is pinned by each
+    env's seeded RNG). The builder transparently promotes a multi-env Sync build to
+    ``AsyncVectorEnv`` (spawn). Single-env Sync (one context) and already-Async
+    builds are left untouched, and an env-var escape hatch forces the Sync path.
+    """
+
+    def test_multi_env_sync_is_promoted_to_async_spawn(self, monkeypatch):
+        import gymnasium as gym
+
+        monkeypatch.delenv(ALLOW_ROBOCASA_SYNC_ENV, raising=False)
+        out = _maybe_promote_sync_to_async(gym.vector.SyncVectorEnv, n_envs=4)
+        assert isinstance(out, partial)
+        assert out.func is gym.vector.AsyncVectorEnv
+        assert out.keywords == {"context": "spawn"}
+
+    def test_single_env_sync_is_left_as_sync(self, monkeypatch):
+        import gymnasium as gym
+
+        monkeypatch.delenv(ALLOW_ROBOCASA_SYNC_ENV, raising=False)
+        # One env -> one render context -> no contamination -> keep Sync.
+        assert _maybe_promote_sync_to_async(gym.vector.SyncVectorEnv, n_envs=1) is gym.vector.SyncVectorEnv
+
+    def test_async_build_is_unchanged(self, monkeypatch):
+        import gymnasium as gym
+
+        monkeypatch.delenv(ALLOW_ROBOCASA_SYNC_ENV, raising=False)
+        async_cls = partial(gym.vector.AsyncVectorEnv, context="spawn")
+        assert _maybe_promote_sync_to_async(async_cls, n_envs=8) is async_cls
+
+    def test_escape_hatch_keeps_sync(self, monkeypatch):
+        import gymnasium as gym
+
+        monkeypatch.setenv(ALLOW_ROBOCASA_SYNC_ENV, "1")
+        # Override -> keep the (broken-render) Sync path even for n_envs > 1.
+        assert _maybe_promote_sync_to_async(gym.vector.SyncVectorEnv, n_envs=4) is gym.vector.SyncVectorEnv
+
+    def test_non_vectorenv_callable_untouched(self, monkeypatch):
+        # A mocked env_cls (as the other tests use) is not a SyncVectorEnv subclass,
+        # so it passes through unchanged regardless of n_envs.
+        monkeypatch.delenv(ALLOW_ROBOCASA_SYNC_ENV, raising=False)
+        sentinel = Mock()
+        assert _maybe_promote_sync_to_async(sentinel, n_envs=8) is sentinel
+
+    def test_create_robocasa_envs_promotes_multi_env_sync(self, monkeypatch):
+        # End-to-end: a real SyncVectorEnv + n_envs>1 through create_robocasa_envs
+        # builds via AsyncVectorEnv. Patch AsyncVectorEnv so no sim import / spawn.
+        import gymnasium as gym
+
+        monkeypatch.delenv(ALLOW_ROBOCASA_SYNC_ENV, raising=False)
+        async_sentinel = Mock(name="async_vec")
+        async_cls = Mock(return_value=async_sentinel)
+        monkeypatch.setattr(gym.vector, "AsyncVectorEnv", async_cls)
+        with patch("opentau.envs.robocasa.get_proc_accelerator", return_value=None):
+            out = create_robocasa_envs(
+                task="A",
+                n_envs=4,
+                env_cls=gym.vector.SyncVectorEnv,
+                episode_length=900,
+                auto_download_assets=False,
+            )
+        assert out["A"][0] is async_sentinel
+        assert async_cls.call_args.kwargs.get("context") == "spawn"
 
 
 def _fake_robocasa_assets(monkeypatch, tmp_path: Path) -> tuple[Path, list[dict]]:

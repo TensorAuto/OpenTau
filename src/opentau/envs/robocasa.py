@@ -823,6 +823,48 @@ def _make_env_fns(
     return [partial(_make_env, i) for i in range(n_envs)]
 
 
+# Escape hatch: force the (broken) single-process SyncVectorEnv path even for
+# n_envs > 1. Renders WILL be wrong (see _maybe_promote_sync_to_async); only for
+# callers that knowingly do not depend on observation correctness.
+ALLOW_ROBOCASA_SYNC_ENV = "OPENTAU_ALLOW_ROBOCASA_SYNC"
+
+
+def _maybe_promote_sync_to_async(
+    env_cls: Callable[..., gym.vector.VectorEnv], n_envs: int
+) -> Callable[..., gym.vector.VectorEnv]:
+    r"""Promote a multi-env ``SyncVectorEnv`` build to ``AsyncVectorEnv`` for RoboCasa.
+
+    Each RoboCasa sub-env renders its cameras through its own MuJoCo *offscreen*
+    EGL/GL context. With more than one sub-env in a single process
+    (``SyncVectorEnv``) those contexts cross-contaminate: ``sim.render()`` for one
+    env can return *another* env's framebuffer, so the policy is fed observations
+    that do not match the scene it is acting in — which tanks success and makes it
+    non-reproducible. Scene *geometry* is unaffected (it is pinned by each env's own
+    seeded RNG; verified bit-identical across Sync/Async), so the corruption is
+    purely in the rendered pixels. ``AsyncVectorEnv`` (spawn) puts each env in its
+    own process with its own context and renders correctly. This is an upstream
+    robosuite/mujoco limitation, not something fixable in the wrapper, so a
+    multi-env Sync build is transparently promoted to Async. See issue #449.
+
+    Single-env Sync (one context, no contamination) is left as-is, as is anything
+    that is already Async. ``OPENTAU_ALLOW_ROBOCASA_SYNC=1`` forces the original
+    (broken-render) Sync path for callers that knowingly do not need correct
+    observations (e.g. a dataset-independent CPU smoke test).
+    """
+    if os.environ.get(ALLOW_ROBOCASA_SYNC_ENV) == "1":
+        return env_cls
+    is_sync = isinstance(env_cls, type) and issubclass(env_cls, gym.vector.SyncVectorEnv)
+    if is_sync and n_envs > 1:
+        acc_print(
+            f"[opentau] RoboCasa eval requested SyncVectorEnv with n_envs={n_envs} (>1): its "
+            "per-env EGL/GL offscreen render contexts cross-contaminate in one process and "
+            "corrupt observations (issue #449). Promoting to AsyncVectorEnv (spawn) so each env "
+            f"renders correctly. Set {ALLOW_ROBOCASA_SYNC_ENV}=1 to keep Sync (renders will be wrong)."
+        )
+        return partial(gym.vector.AsyncVectorEnv, context="spawn")
+    return env_cls
+
+
 # main API entry point
 def create_robocasa_envs(
     task: str,
@@ -856,6 +898,10 @@ def create_robocasa_envs(
         raise ValueError("env_cls must be a callable that wraps a list of environment factory callables.")
     if not isinstance(n_envs, int) or n_envs <= 0:
         raise ValueError(f"n_envs must be a positive int; got {n_envs}.")
+
+    # A multi-env single-process Sync build corrupts RoboCasa's per-env renders
+    # (issue #449); transparently run it on the process-isolated Async backend.
+    env_cls = _maybe_promote_sync_to_async(env_cls, n_envs)
 
     # Relocate RoboCasa assets out of the (ephemeral) uv venv and make the packs the
     # requested registries need available. Resolve + export the root, then run the download
