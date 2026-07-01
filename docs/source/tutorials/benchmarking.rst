@@ -1,11 +1,15 @@
 Benchmarking and Profiling
 ==========================
 
-OpenTau ships three diagnostic scripts under ``src/opentau/scripts/`` that
-together pin down where a training run is spending its time. All three read
+OpenTau ships four diagnostic scripts under ``src/opentau/scripts/``. Three
+pin down where a *training* run is spending its time; the fourth
+(``benchmark_inference.py``) measures per-call *inference* latency. All read
 the same ``TrainPipelineConfig`` as ``opentau-train``, so you can point them
-at any training config JSON and reproduce the exact model / dataset / batch
-size the real training uses.
+at any config JSON. The three training profilers reproduce the exact model /
+dataset / batch size the real run uses; ``benchmark_inference.py`` instead
+builds a dummy observation and (for a random-init policy) forces ``IDENTITY``
+normalization, since it is measuring shape / dtype / compile-bound latency,
+which is weight- and data-independent.
 
 +----------------------------+------------------------------------------------------------+
 | Script                     | When to reach for it                                       |
@@ -21,6 +25,11 @@ size the real training uses.
 | ``find_unused_params.py``  | List parameters that receive no gradient during a real     |
 |                            | forward+backward. Use before setting                       |
 |                            | ``FIND_UNUSED_PARAMS=false`` on a new policy.              |
++----------------------------+------------------------------------------------------------+
+| ``benchmark_inference.py`` | Measure per-call ``policy.sample_actions`` latency under   |
+|                            | deployment-like conditions (random-init expert, bf16,      |
+|                            | batch 1). Use to characterize serving / on-robot           |
+|                            | inference speed.                                           |
 +----------------------------+------------------------------------------------------------+
 
 A worked example end-to-end — diagnosing a real "low GPU utilization" issue,
@@ -373,3 +382,163 @@ To reproduce, run the same config under each accelerate file (both at 8 ranks /
    "reserved but unallocated" memory), set
    ``PYTORCH_ALLOC_CONF=expandable_segments:True`` in the environment to recover
    the fragmented blocks.
+
+benchmark_inference.py — single-policy inference latency
+--------------------------------------------------------
+
+The three scripts above dissect a *training* step. ``benchmark_inference.py``
+answers a different question — **how long a single** ``policy.sample_actions``
+**call takes at deployment time** — and so is set up to look like inference,
+not training: it needs no *policy* checkpoint (the action expert and its
+projections are randomly initialized because ``pretrained_path`` is null),
+while still loading the real pretrained backbone the config specifies
+(``load_pretrained_backbone=true``); it runs in ``bfloat16`` at
+``batch_size=1`` with N cameras and a short language prompt (a ~26-word
+sentence, bounded by ``prompt_max_length``), and measures per-call latency
+rather than per-step throughput. Like the training profilers it reads the same
+``TrainPipelineConfig`` JSON as ``opentau-train``, so you can point it at any
+policy config.
+
+Because latency depends only on shapes / dtype / compile — not on weight
+values — the random-init numbers below equal what a fully-trained policy would
+produce *on this same hardware and config* (latency is weight- and
+data-independent). The harness forces ``IDENTITY`` normalization when
+``pretrained_path`` is null (so the empty stats buffers are never read), builds
+a dummy N-image + prompt observation, optionally wraps
+``policy.model.sample_actions`` in ``torch.compile``, runs ``BENCH_N_WARMUP``
+warmup calls followed by ``BENCH_N_TIMED`` timed calls with a
+``cuda.synchronize()`` on both sides of each, and writes a JSON summary
+(mean / std / p50 / p95 / p99 / min / max, plus every raw sample and the full
+host / GPU / driver / library versions) to ``BENCH_OUTPUT_DIR``.
+
+Two scoping details matter for reading the numbers. First, the **timed region
+is the full** ``policy.sample_actions`` — it includes the CPU-side Qwen3-VL
+preprocessing (tokenize + image-process + chat-template) as well as the GPU
+forward, so it reflects true end-to-end call latency. Second, ``torch.compile``
+is applied to ``policy.model.sample_actions`` (the backbone prefill + the
+flow-matching expert loop), **not** to that CPU preprocessing — so the compiled
+speedups below come entirely from the GPU forward.
+
+Run it as a plain Python module — no ``accelerate launch`` needed (it is a
+single-process, single-GPU benchmark):
+
+.. code-block:: bash
+
+    # Eager (no torch.compile)
+    BENCH_NO_COMPILE=1 \
+        python -m opentau.scripts.benchmark_inference \
+        --config_path=configs/benchmarks/cosmos3.json
+
+    # torch.compile, reduce-overhead mode (CUDA graphs) — the fastest setting
+    BENCH_COMPILE_MODE=reduce-overhead \
+        python -m opentau.scripts.benchmark_inference \
+        --config_path=configs/benchmarks/cosmos3.json
+
+cosmos3 inference latency (B200)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Measured on **1× NVIDIA B200 (183 GB HBM, sm_100), batch size 1, bfloat16**,
+``torch 2.10.0+cu128`` / CUDA 12.8 / cuDNN 91002 / driver 580.126.20 /
+transformers 4.57.6 / Python 3.10, using ``benchmark_inference.py`` with
+``configs/benchmarks/cosmos3.json``. The workload is the real pretrained
+``TensorAuto/cosmos3-reason-32b`` reasoner backbone (~33B params, full depth,
+not truncated) with a randomly-initialized ~0.9B, full-64-layer action expert
+(``condition_on_layer=None``, so the expert reads a per-layer KV cache): 3
+cameras at 224×224 + one ~26-word prompt (capped at ``prompt_max_length=64``
+tokens) → a 50-action chunk (``chunk_size = n_action_steps = 50``),
+``num_steps=10`` Euler denoising steps, ``sdpa`` attention. Each number is the
+mean over ``BENCH_N_TIMED=50`` timed calls after 5 warmup calls:
+
+.. list-table:: cosmos3 sample_actions latency — 3 img + prompt → 50-action chunk, num_steps=10 (1× B200, bf16, batch 1)
+   :header-rows: 1
+   :widths: 34 13 13 13 13 14
+
+   * - Configuration
+     - mean (ms)
+     - p50
+     - p95
+     - p99
+     - speedup
+   * - Eager (no compile)
+     - 314.57
+     - 313.83
+     - 319.73
+     - 322.04
+     - 1.00×
+   * - ``torch.compile`` (default)
+     - 129.85
+     - 129.68
+     - 131.67
+     - 133.90
+     - 2.42×
+   * - ``torch.compile`` (reduce-overhead / CUDA graphs)
+     - 106.94
+     - 106.86
+     - 107.54
+     - 109.70
+     - 2.94×
+
+Latency is very stable across the 50 timed calls: run-to-run std is 2.14 ms
+eager, 0.85 ms compiled (default), and 0.45 ms with CUDA graphs — the p99 sits
+within ~2–3 % of the mean in every case.
+
+**Where the time goes (**\ ``num_steps`` **decomposition).** A
+``sample_actions`` call is one 32B backbone prefill plus ``num_steps`` passes of
+the action expert, so latency is affine in ``num_steps``:
+``L(N) ≈ F + N·s``, where ``F`` is a fixed cost — the single Qwen3-VL backbone
+prefill over the 3 images + prompt, the CPU-side Qwen3-VL preprocessing, and
+rope / noise setup — and ``s`` is one ~0.9B action-expert forward over the 51
+suffix tokens (1 state + 50 action) cross-attending the cached backbone KV.
+Re-running at ``num_steps=1`` (eager 82.13 ms, compiled-default 57.97 ms) and
+solving the two points gives, eager, ``s = (314.57−82.13)/9 = 25.83`` ms/step
+and ``F ≈ 56.3`` ms; compiled-default, ``s = (129.85−57.97)/9 = 7.99`` ms/step
+and ``F ≈ 50.0`` ms. At ``num_steps=10`` the 10 expert passes dominate the call
+— 258 of 315 ms (82 %) eager, 80 of 130 ms (62 %) compiled. This is why
+``torch.compile`` helps so much: its win is almost entirely on the expert loop
+(25.8 → 8.0 ms/step, ~3.2×), which is launch- and fusion-bound — many small
+kernels across 64 layers × 10 steps — exactly what Inductor fusion and CUDA
+graphs (``reduce-overhead``) collapse; the compute-bound 32B prefill barely
+moves (56 → 50 ms).
+
+.. note::
+   The first warmup call pays the ``torch.compile`` cost: at ``num_steps=10``
+   the initial call takes ~58 s in ``default`` mode and ~53 s in
+   ``reduce-overhead`` (which logs "cudagraph partition into 2 partitions due to
+   CUDAGraph-unsafe custom ops" — it still graphs most of the forward);
+   ``num_steps=1`` / ``default`` is ~15 s. Steady state is reached by warmup
+   call 2, so ``BENCH_N_WARMUP=5`` leaves ample margin. The harness asserts the
+   call-1 / call-N ratio is ≥ 5× when compiling, to catch a silent compile bail.
+
+Environment variables (all optional):
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 15 60
+
+   * - Variable
+     - Default
+     - Effect
+   * - ``BENCH_NO_COMPILE``
+     - 0
+     - When ``1``, skip ``torch.compile`` entirely; ``policy.model.sample_actions``
+       runs eager. (The timed region is still the full ``policy.sample_actions``
+       call.) Use for the eager baseline.
+   * - ``BENCH_COMPILE_MODE``
+     - ``max-autotune``
+     - The ``mode=`` passed to ``torch.compile`` (ignored when
+       ``BENCH_NO_COMPILE=1``). The results above used ``default`` and
+       ``reduce-overhead`` (the latter enables CUDA graphs and was fastest).
+   * - ``BENCH_N_WARMUP``
+     - 5
+     - Warmup calls before timing. Call 1 absorbs the compile cost; leave
+       at ≥ 5 so the harness can assert compile actually fired.
+   * - ``BENCH_N_TIMED``
+     - 50
+     - Timed calls after warmup. The reported mean / std / p50 / p95 / p99 /
+       min / max are computed over these.
+   * - ``BENCH_OUTPUT_DIR``
+     - ``benchmark_results``
+     - Directory for the per-run JSON summary
+       (``<host>_<policy>_<timestamp>.json``), which stores the config
+       snapshot, host / GPU / driver / library versions, the warmup series,
+       every timed sample, and the summary statistics.
