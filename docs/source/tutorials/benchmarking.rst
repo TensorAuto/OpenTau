@@ -393,7 +393,7 @@ not training: it needs no *policy* checkpoint (the action expert and its
 projections are randomly initialized because ``pretrained_path`` is null),
 while still loading the real pretrained backbone the config specifies
 (``load_pretrained_backbone=true``); it runs in ``bfloat16`` at
-``batch_size=1`` with N cameras and a short language prompt (a ~26-word
+``batch_size=1`` with N cameras and a short language prompt (a 24-word
 sentence, bounded by ``prompt_max_length``), and measures per-call latency
 rather than per-step throughput. Like the training profilers it reads the same
 ``TrainPipelineConfig`` JSON as ``opentau-train``, so you can point it at any
@@ -444,7 +444,7 @@ transformers 4.57.6 / Python 3.10, using ``benchmark_inference.py`` with
 ``TensorAuto/cosmos3-reason-32b`` reasoner backbone (~33B params, full depth,
 not truncated) with a randomly-initialized ~0.9B, full-64-layer action expert
 (``condition_on_layer=None``, so the expert reads a per-layer KV cache): 3
-cameras at 224×224 + one ~26-word prompt (capped at ``prompt_max_length=64``
+cameras at 224×224 + one 24-word prompt (capped at ``prompt_max_length=64``
 tokens) → a 50-action chunk (``chunk_size = n_action_steps = 50``),
 ``num_steps=10`` Euler denoising steps, ``sdpa`` attention. Each number is the
 mean over ``BENCH_N_TIMED=50`` timed calls after 5 warmup calls:
