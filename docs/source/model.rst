@@ -121,6 +121,28 @@ cosmos3
 
 .. note::
 
+   **Inference latency.** Because latency is weight-independent (it depends only
+   on shapes / dtype / compile, not on trained values), a random-init cosmos3
+   policy benches the same as a fully-trained one on the same hardware and
+   config. Measured with ``benchmark_inference.py`` on **1× NVIDIA B200, bf16,
+   batch 1**, real ``TensorAuto/cosmos3-reason-32b`` backbone (~33B, full 64
+   layers; the action expert mirrors this depth with ``condition_on_layer=None``),
+   3 cameras at 224×224 + prompt → a 50-action chunk with ``num_steps=10``
+   flow-matching steps, one ``policy.sample_actions`` call costs:
+
+   - **314.6 ms** eager (no ``torch.compile``);
+   - **129.9 ms** with ``torch.compile`` (2.42× faster); and
+   - **106.9 ms** with ``torch.compile(mode="reduce-overhead")`` / CUDA graphs
+     (2.94× faster — the fastest setting).
+
+   The call is one 32B backbone prefill plus 10 action-expert passes; the expert
+   loop dominates and is what ``torch.compile`` accelerates (~25.8 → ~8.0 ms per
+   denoising step), while the compute-bound prefill barely changes. See
+   :doc:`tutorials/benchmarking` for the full methodology, the ``num_steps``
+   decomposition, and the ``BENCH_*`` env-var knobs.
+
+.. note::
+
    **Choosing the DeepSpeed ZeRO stage (ZeRO-2 vs ZeRO-3).** Because the ~33B
    reasoner backbone is *frozen*, ZeRO-2 shards only the ~0.9B action expert's
    optimizer state and **replicates** the bf16 backbone (~66 GB/rank), whereas
