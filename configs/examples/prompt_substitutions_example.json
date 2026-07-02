@@ -1,0 +1,26 @@
+{
+    "put the white mug on the left plate and put the yellow and white mug on the right plate": [
+        "place the white mug on the left plate and the yellow-and-white mug on the right plate",
+        "set the white mug onto the left plate, then set the yellow and white mug onto the right plate"
+    ],
+    "put the white mug on the plate and put the chocolate pudding to the right of the plate": [
+        "place the white mug on the plate and the chocolate pudding to the plate's right",
+        "put the white mug onto the plate, then place the pudding just right of it"
+    ],
+    "put the yellow and white mug in the microwave and close it": [
+        "place the yellow and white mug inside the microwave and shut the door",
+        "put the yellow-and-white mug into the microwave, then close the microwave"
+    ],
+    "turn on the stove and put the moka pot on it": [
+        "switch the stove on and set the moka pot on the burner",
+        "turn the stove on, then place the moka pot on top of it"
+    ],
+    "put both the alphabet soup and the cream cheese box in the basket": [
+        "place the alphabet soup can and the cream cheese box into the basket",
+        "move the alphabet soup and the cream cheese into the basket"
+    ],
+    "put both the alphabet soup and the tomato sauce in the basket": [
+        "place the alphabet soup and the tomato sauce into the basket",
+        "move both the soup can and the tomato sauce can to the basket"
+    ]
+}

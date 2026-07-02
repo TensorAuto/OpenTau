@@ -418,3 +418,96 @@ class TestPretrainedConfigCodec:
 
         assert isinstance(loaded.vlm_config, Gemma3WithExpertConfig)
         assert loaded.vlm_config.gemma3_config.text_config.hidden_size == 2560
+
+
+class TestPromptSubstitutionsConfig:
+    """`DatasetConfig.prompt_substitutions` validation and (de)serialization."""
+
+    def test_defaults(self):
+        assert DatasetConfig(repo_id="repo1").prompt_substitutions is None
+        assert DatasetMixtureConfig().val_enable_prompt_substitution is False
+
+    def test_valid_mapping_accepted(self):
+        subs = {"do x": ["do X", "perform x"]}
+        cfg = DatasetConfig(repo_id="repo1", prompt_substitutions=subs)
+        assert cfg.prompt_substitutions == subs
+
+    def test_rejected_on_vqa_entry(self):
+        with pytest.raises(ValueError, match="only applies to LeRobot datasets"):
+            DatasetConfig(vqa="clevr", prompt_substitutions={"do x": ["y"]})
+
+    @pytest.mark.parametrize("bad_subs", [[], "not-a-list", ["ok", 3], ["ok", ""]])
+    def test_invalid_substitute_list_raises(self, bad_subs):
+        """Empty strings are rejected too: with always-replace semantics an
+        empty substitute would silently train matching samples on an empty
+        prompt."""
+        with pytest.raises(ValueError, match="prompt_substitutions"):
+            DatasetConfig(repo_id="repo1", prompt_substitutions={"do x": bad_subs})
+
+    def test_non_string_key_rejected(self):
+        with pytest.raises(ValueError, match="keys must be on-disk task strings"):
+            DatasetConfig(repo_id="repo1", prompt_substitutions={0: ["do x"]})
+
+    def test_literal_ref_key_rejected(self):
+        """A task literally named ``$ref`` would be swallowed by the config
+        loader's include mechanism before it ever reached the dataset."""
+        with pytest.raises(ValueError, match=r"\$ref"):
+            DatasetConfig(repo_id="repo1", prompt_substitutions={"$ref": ["x"]})
+
+    def test_draccus_json_round_trip(self, tmp_path):
+        """Arbitrary punctuation/unicode task keys survive encode -> JSON file
+        -> decode, as exercised by checkpoint save/resume."""
+        subs = {"put the mug, gently, on the plate — now!": ["placez la tasse 杯子", "option: $2 (b)"]}
+        cfg = DatasetConfig(repo_id="repo1", prompt_substitutions=subs)
+
+        encoded = draccus.encode(cfg)
+        assert encoded["prompt_substitutions"] == subs
+
+        path = tmp_path / "dataset_config.json"
+        with draccus.config_type("json"), open(path, "w") as f:
+            draccus.dump(cfg, f)
+        with open(path) as f:
+            reloaded = draccus.decode(DatasetConfig, json.load(f))
+        assert reloaded.prompt_substitutions == subs
+
+    def test_ref_fragment_inlines_mapping(self, tmp_path):
+        """A `{"$ref": "fragment.json"}` at the field position inlines the
+        fragment's mapping (the parser resolves refs before draccus decode)."""
+        from opentau.configs.refs import resolve_refs
+
+        fragment = {"do x": ["do X", "perform x"]}
+        (tmp_path / "subs.json").write_text(json.dumps(fragment))
+        cfg_path = tmp_path / "dataset.json"
+        cfg_path.write_text(json.dumps({"repo_id": "repo1", "prompt_substitutions": {"$ref": "subs.json"}}))
+
+        cfg = draccus.decode(DatasetConfig, resolve_refs(cfg_path))
+        assert cfg.prompt_substitutions == fragment
+
+    def test_ref_fragment_sibling_keys_deep_merge(self, tmp_path):
+        from opentau.configs.refs import resolve_refs
+
+        (tmp_path / "subs.json").write_text(json.dumps({"do x": ["do X"]}))
+        cfg_path = tmp_path / "dataset.json"
+        cfg_path.write_text(
+            json.dumps(
+                {
+                    "repo_id": "repo1",
+                    "prompt_substitutions": {"$ref": "subs.json", "do y": ["do Y"]},
+                }
+            )
+        )
+
+        cfg = draccus.decode(DatasetConfig, resolve_refs(cfg_path))
+        assert cfg.prompt_substitutions == {"do x": ["do X"], "do y": ["do Y"]}
+
+    def test_example_fragment_is_valid(self):
+        """The shipped example fragment decodes into a valid DatasetConfig."""
+        example = Path(__file__).parents[2] / "configs" / "examples" / "prompt_substitutions_example.json"
+        with open(example) as f:
+            subs = json.load(f)
+
+        cfg = DatasetConfig(repo_id="TensorAuto/libero", prompt_substitutions=subs)
+        assert cfg.prompt_substitutions
+        for task, sub_list in cfg.prompt_substitutions.items():
+            assert isinstance(task, str)
+            assert sub_list and all(isinstance(s, str) for s in sub_list)

@@ -272,6 +272,7 @@ def make_dataset(
             vector_resample_strategy=train_cfg.dataset_mixture.vector_resample_strategy,
             return_advantage_input=return_advantage_input,
             skip_timestamp_check=effective_skip,
+            prompt_substitutions=cfg.prompt_substitutions,
         )
     else:
         raise ValueError("Exactly one of `cfg.vqa` and `cfg.repo_id` should be provided.")
@@ -316,12 +317,14 @@ def make_dataset(
 
         # Subset wraps the same underlying dataset by reference, so the
         # training and validation halves would share every instance attribute
-        # — including the optional-key dropout flag. Give the val subset its
-        # own shallow copy whose only divergent attribute is the dropout
-        # toggle. See ``BaseDataset.shallow_copy_with_dropout`` for the
-        # contract on what stays shared.
+        # — including the optional-key dropout and prompt-substitution flags.
+        # Give the val subset its own shallow copy whose only divergent
+        # attributes are those toggles. See
+        # ``BaseDataset.shallow_copy_with_dropout`` for the contract on what
+        # stays shared.
         val_dataset.dataset = dataset.shallow_copy_with_dropout(  # type: ignore[attr-defined]
             enable_dropout=train_cfg.dataset_mixture.val_enable_optional_key_dropout,
+            enable_prompt_substitution=train_cfg.dataset_mixture.val_enable_prompt_substitution,
         )
         return train_dataset, val_dataset  # type: ignore[return-value]
 
