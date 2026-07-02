@@ -436,8 +436,11 @@ class TestPromptSubstitutionsConfig:
         with pytest.raises(ValueError, match="only applies to LeRobot datasets"):
             DatasetConfig(vqa="clevr", prompt_substitutions={"do x": ["y"]})
 
-    @pytest.mark.parametrize("bad_subs", [[], "not-a-list", ["ok", 3]])
+    @pytest.mark.parametrize("bad_subs", [[], "not-a-list", ["ok", 3], ["ok", ""]])
     def test_invalid_substitute_list_raises(self, bad_subs):
+        """Empty strings are rejected too: with always-replace semantics an
+        empty substitute would silently train matching samples on an empty
+        prompt."""
         with pytest.raises(ValueError, match="prompt_substitutions"):
             DatasetConfig(repo_id="repo1", prompt_substitutions={"do x": bad_subs})
 

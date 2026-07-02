@@ -106,7 +106,7 @@ class DatasetConfig:
             the record-time check inside ``add_episode``.
         prompt_substitutions: Optional mapping from an on-disk task string
             (exact match against ``meta/tasks.*``) to a non-empty list of
-            substitute prompts. At fetch time a matching sample's task is
+            non-empty substitute prompts. At fetch time a matching sample's task is
             ALWAYS replaced by a uniform random draw from its list (include
             the original in the list if it should still appear); unmapped
             tasks pass through unchanged. Applies to the train split only
@@ -125,8 +125,8 @@ class DatasetConfig:
         ValueError: If both or neither of ``repo_id`` and ``vqa`` are set, if
             ``tolerance_s`` or ``val_split_ratio`` is out of range, or if
             ``prompt_substitutions`` is set on a VQA entry, maps a task
-            literally named ``"$ref"``, or contains an empty or non-string
-            substitute list.
+            literally named ``"$ref"``, has a non-string key, or contains an
+            empty substitute list or empty/non-string entries.
     """
 
     repo_id: str | None = None
@@ -217,10 +217,11 @@ class DatasetConfig:
                         f"`prompt_substitutions[{task!r}]` must be a non-empty list of strings, "
                         f"got {subs!r} for {self.repo_id}."
                     )
-                if not all(isinstance(s, str) for s in subs):
+                if not all(isinstance(s, str) and s for s in subs):
                     raise ValueError(
-                        f"`prompt_substitutions[{task!r}]` contains non-string entries: "
-                        f"{subs!r} for {self.repo_id}."
+                        f"`prompt_substitutions[{task!r}]` contains empty or non-string entries: "
+                        f"{subs!r} for {self.repo_id}. With always-replace semantics an empty "
+                        f"substitute would silently train matching samples on an empty prompt."
                     )
 
         # If data_features_name_mapping is provided, upsert it into the global

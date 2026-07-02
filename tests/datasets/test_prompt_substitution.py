@@ -117,14 +117,17 @@ class TestInitValidationAndGetItem:
         assert "Whitespace near-misses" in msg
         assert "Perform action 0." in msg
 
-    def test_empty_substitute_list_raises_at_init(self, tmp_path, lerobot_dataset_factory):
+    @pytest.mark.parametrize("bad_subs", [[], ["ok", ""]])
+    def test_invalid_substitute_list_raises_at_init(self, tmp_path, lerobot_dataset_factory, bad_subs):
         """Direct constructions bypass DatasetConfig.__post_init__; init must
-        still reject an empty list before it can crash `torch.randint`."""
-        with pytest.raises(ValueError, match="non-empty list of strings"):
+        still reject an empty list (would crash `torch.randint` at fetch time)
+        and empty-string substitutes (would silently train matching samples on
+        an empty prompt)."""
+        with pytest.raises(ValueError, match="non-empty list of non-empty strings"):
             lerobot_dataset_factory(
                 root=tmp_path,
                 total_tasks=1,
-                prompt_substitutions={"Perform action 0.": []},
+                prompt_substitutions={"Perform action 0.": bad_subs},
             )
 
     def test_non_string_key_raises_designed_error(self, tmp_path, lerobot_dataset_factory):

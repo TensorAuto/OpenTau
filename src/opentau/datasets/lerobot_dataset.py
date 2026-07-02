@@ -1476,7 +1476,7 @@ class LeRobotDataset(BaseDataset):
                 ``add_episode``.
             prompt_substitutions (dict[str, list[str]] | None, optional): Mapping from
                 an on-disk task string (exact match against ``meta.tasks``) to a
-                non-empty list of substitute prompts. During ``__getitem__`` a matching
+                non-empty list of non-empty substitute prompts. During ``__getitem__`` a matching
                 sample's task is ALWAYS replaced by a uniform random draw from its list
                 (gated by ``self.enable_prompt_substitution``); unmapped tasks pass
                 through unchanged. Keys matching no on-disk task string raise a
@@ -1559,10 +1559,10 @@ class LeRobotDataset(BaseDataset):
                         f"`prompt_substitutions` keys must be on-disk task strings, got "
                         f"{task!r} for dataset {self.repo_id!r}."
                     )
-                if not isinstance(subs, list) or not subs or not all(isinstance(s, str) for s in subs):
+                if not isinstance(subs, list) or not subs or not all(isinstance(s, str) and s for s in subs):
                     raise ValueError(
                         f"`prompt_substitutions[{task!r}]` for dataset {self.repo_id!r} must be "
-                        f"a non-empty list of strings, got {subs!r}."
+                        f"a non-empty list of non-empty strings, got {subs!r}."
                     )
             on_disk_tasks = set(self.meta.tasks.values())
             unknown = [t for t in prompt_substitutions if t not in on_disk_tasks]
