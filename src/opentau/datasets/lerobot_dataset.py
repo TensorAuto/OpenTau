@@ -788,21 +788,32 @@ class BaseDataset(torch.utils.data.Dataset):
         # is set). Subgoal *frame* selection (end-of-segment vs. uniform window)
         # stays random either way — this flag only gates masking/zero-fill.
         self.enable_optional_key_dropout = True
+        # Whether per-task prompt substitution (`LeRobotDataset`'s
+        # `prompt_substitutions`) fires. `make_dataset` flips this off on the
+        # validation subset (unless `val_enable_prompt_substitution` is set).
+        # Defined here rather than on `LeRobotDataset` because
+        # `shallow_copy_with_dropout` manages it for every subclass; VQA
+        # datasets simply never read it.
+        self.enable_prompt_substitution = True
 
-    def shallow_copy_with_dropout(self, *, enable_dropout: bool) -> "BaseDataset":
-        """Return a shallow copy that only diverges in ``enable_optional_key_dropout``.
+    def shallow_copy_with_dropout(
+        self, *, enable_dropout: bool, enable_prompt_substitution: bool = False
+    ) -> "BaseDataset":
+        """Return a shallow copy that only diverges in the augmentation toggles.
 
         Used by :func:`opentau.datasets.factory.make_dataset` to give the
-        validation subset its own dataset instance so dropout can be toggled
-        independently of the training subset. The copy shares ``meta``,
-        ``hf_dataset``, ``episode_data_index``, cached segment tables, and
-        every other instance attribute by reference — only
-        ``enable_optional_key_dropout`` diverges. If a future refactor adds an
-        instance attribute that needs to diverge between train and val, it
+        validation subset its own dataset instance so optional-key dropout and
+        prompt substitution can be toggled independently of the training
+        subset. The copy shares ``meta``, ``hf_dataset``,
+        ``episode_data_index``, cached segment tables, and every other
+        instance attribute by reference — only ``enable_optional_key_dropout``
+        and ``enable_prompt_substitution`` diverge. If a future refactor adds
+        an instance attribute that needs to diverge between train and val, it
         must be set here too.
         """
         clone = copy.copy(self)
         clone.enable_optional_key_dropout = enable_dropout
+        clone.enable_prompt_substitution = enable_prompt_substitution
         return clone
 
     @abstractmethod
@@ -1330,6 +1341,7 @@ class LeRobotDataset(BaseDataset):
         standardize: bool = True,
         return_advantage_input: bool = False,
         skip_timestamp_check: bool = False,
+        prompt_substitutions: dict[str, list[str]] | None = None,
     ):
         """Initialize LeRobotDataset.
 
@@ -1462,6 +1474,13 @@ class LeRobotDataset(BaseDataset):
                 ``delta_timestamps`` lookups may sample unintended frames. Defaults
                 to False. Does not affect the record-time check inside
                 ``add_episode``.
+            prompt_substitutions (dict[str, list[str]] | None, optional): Mapping from
+                an on-disk task string (exact match against ``meta.tasks``) to a
+                non-empty list of substitute prompts. During ``__getitem__`` a matching
+                sample's task is ALWAYS replaced by a uniform random draw from its list
+                (gated by ``self.enable_prompt_substitution``); unmapped tasks pass
+                through unchanged. Keys matching no on-disk task string raise a
+                ``ValueError`` at init. Defaults to None.
         """
         super().__init__(cfg)
         self.cfg = cfg
@@ -1525,6 +1544,44 @@ class LeRobotDataset(BaseDataset):
         self.meta = LeRobotDatasetMetadata(
             self.repo_id, self.root, revision, force_cache_sync=force_cache_sync
         )
+
+        # Resolve config-time prompt substitutions once against the on-disk
+        # task table. Kept off `meta` (shared by reference with the val split
+        # and the v3.0 metadata cache) and keyed by task_index so the
+        # `__getitem__` hot path is a single int lookup.
+        self._prompt_substitutions_by_index: dict[int, list[str]] = {}
+        if prompt_substitutions:
+            for task, subs in prompt_substitutions.items():
+                # Guards direct constructions that bypass `DatasetConfig.__post_init__`;
+                # an empty list would crash cryptically in `torch.randint` at fetch time.
+                if not isinstance(task, str):
+                    raise ValueError(
+                        f"`prompt_substitutions` keys must be on-disk task strings, got "
+                        f"{task!r} for dataset {self.repo_id!r}."
+                    )
+                if not isinstance(subs, list) or not subs or not all(isinstance(s, str) for s in subs):
+                    raise ValueError(
+                        f"`prompt_substitutions[{task!r}]` for dataset {self.repo_id!r} must be "
+                        f"a non-empty list of strings, got {subs!r}."
+                    )
+            on_disk_tasks = set(self.meta.tasks.values())
+            unknown = [t for t in prompt_substitutions if t not in on_disk_tasks]
+            if unknown:
+                near_misses = {u: [t for t in on_disk_tasks if t.strip() == u.strip()] for u in unknown}
+                raise ValueError(
+                    f"`prompt_substitutions` for dataset {self.repo_id!r} contains keys matching "
+                    f"no on-disk task string (exact match, {len(self.meta.tasks)} tasks on disk): "
+                    f"{[repr(u) for u in unknown]}. Whitespace near-misses: {near_misses}. "
+                    f"Check for typos/trailing whitespace in the config."
+                )
+            # A v2.x tasks.jsonl may map the same task string to several
+            # task_index values (`task_to_task_index` inverts last-wins), so
+            # key the map from every index whose string matches — a single
+            # reverse lookup would leave earlier duplicate indices unswapped.
+            for task_idx, task in self.meta.tasks.items():
+                subs = prompt_substitutions.get(task)
+                if subs is not None:
+                    self._prompt_substitutions_by_index[task_idx] = list(subs)
 
         # Overlay setup: when info.json declares a `videos.source_repo`, all video
         # reads are routed to that upstream repo. Fetch its info.json once (for
@@ -2362,6 +2419,24 @@ class LeRobotDataset(BaseDataset):
     def __len__(self):
         return self.num_frames
 
+    def _resolve_task(self, task_idx: int) -> str:
+        """Decode ``task_idx`` to its prompt string, applying config-time
+        prompt substitution.
+
+        A task with an entry in ``prompt_substitutions`` is ALWAYS replaced by
+        a uniform random draw from its substitute list (gated by
+        ``self.enable_prompt_substitution``, which the factory flips off on
+        the validation split); unmapped tasks pass through unchanged. No RNG
+        is consumed on the pass-through path, so configs without substitutions
+        keep a bit-identical RNG stream.
+        """
+        task = self.meta.tasks[task_idx]
+        if self.enable_prompt_substitution and self._prompt_substitutions_by_index:
+            substitutes = self._prompt_substitutions_by_index.get(task_idx)
+            if substitutes is not None:
+                task = substitutes[torch.randint(len(substitutes), ()).item()]
+        return task
+
     @retry_random_on_failure
     def __getitem__(self, idx) -> dict:
         item = self.hf_dataset[idx]
@@ -2397,9 +2472,9 @@ class LeRobotDataset(BaseDataset):
             for cam in image_keys:
                 item[cam] = self.image_transforms(item[cam])
 
-        # Add task as a string
-        task_idx = item["task_index"].item()
-        item["task"] = self.meta.tasks[task_idx]
+        # Add task as a string, applying optional config-time prompt
+        # substitution (see `_resolve_task`).
+        item["task"] = self._resolve_task(item["task_index"].item())
 
         # Squeeze the temporal dimension for features with a single delta timestamp
         for feature, mean in self.delta_timestamps_params[0].items():
@@ -3023,6 +3098,10 @@ class LeRobotDataset(BaseDataset):
         obj.image_transforms = None
         obj.delta_timestamps_params = obj.compute_delta_params(None, None, None, None)
         obj.episode_data_index = None
+        # `create` bypasses __init__, but `__getitem__` unconditionally routes
+        # the task string through `_resolve_task`, which reads these.
+        obj.enable_prompt_substitution = True
+        obj._prompt_substitutions_by_index = {}
         obj.video_backend = video_backend if video_backend is not None else get_safe_default_codec()
         obj.image_resample_strategy = image_resample_strategy
         obj.vector_resample_strategy = vector_resample_strategy

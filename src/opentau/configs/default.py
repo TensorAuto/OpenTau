@@ -104,11 +104,29 @@ class DatasetConfig:
             check (a warning is logged); ``False`` forces the check on for this
             dataset even if the mixture default is ``True``. Does not affect
             the record-time check inside ``add_episode``.
+        prompt_substitutions: Optional mapping from an on-disk task string
+            (exact match against ``meta/tasks.*``) to a non-empty list of
+            substitute prompts. At fetch time a matching sample's task is
+            ALWAYS replaced by a uniform random draw from its list (include
+            the original in the list if it should still appear); unmapped
+            tasks pass through unchanged. Applies to the train split only
+            unless ``DatasetMixtureConfig.val_enable_prompt_substitution`` is
+            set. Keys that match no on-disk task string raise at dataset
+            init. ``response``/memory CE targets are NOT rewritten, so
+            substitutes must be semantic paraphrases of the original task.
+            Only settable for LeRobot datasets (``repo_id``), not VQA
+            entries. Like every per-dataset field it has no CLI override
+            path — set it in the JSON config; an external fragment can be
+            inlined with ``{"$ref": "path/to/fragment.json"}`` (see
+            ``opentau/configs/refs.py``). Draws use the default torch RNG
+            (see the ``DatasetMixtureConfig`` note). Defaults to None.
 
     Raises:
-        ValueError: If both or neither of `repo_id` and `vqa` are set, or
-            if `data_features_name_mapping` is provided.
-            is provided.
+        ValueError: If both or neither of ``repo_id`` and ``vqa`` are set, if
+            ``tolerance_s`` or ``val_split_ratio`` is out of range, or if
+            ``prompt_substitutions`` is set on a VQA entry, maps a task
+            literally named ``"$ref"``, or contains an empty or non-string
+            substitute list.
     """
 
     repo_id: str | None = None
@@ -125,6 +143,18 @@ class DatasetConfig:
 
     # optional standard data format mapping for the dataset if mapping is not already in standard_data_format_mapping.py
     data_features_name_mapping: dict[str, str] | None = None
+
+    # Optional per-dataset prompt substitution. Maps an on-disk task string
+    # (exact match against meta/tasks.*) to a non-empty list of substitute
+    # prompts; at fetch time a matching sample's task is ALWAYS replaced by a
+    # uniform random draw from the list (include the original in the list if
+    # it should still appear). Unmapped tasks pass through unchanged. Train
+    # split only unless `DatasetMixtureConfig.val_enable_prompt_substitution`
+    # is set. Config-file-only (per-dataset fields have no CLI override path);
+    # an external fragment can be inlined with `{"$ref": "fragment.json"}`.
+    # Note: `response`/memory CE targets are NOT rewritten — substitutes must
+    # be semantic paraphrases of the original task.
+    prompt_substitutions: dict[str, list[str]] | None = None
 
     # Optional overrides for the metadata fields read from `meta/info.json`.
     # `None` means "do not override". Any string value (including "") is
@@ -163,6 +193,35 @@ class DatasetConfig:
                 f"`DatasetConfig.val_split_ratio` must be in [0, 1] (or None to inherit), "
                 f"got {self.val_split_ratio} for {self.repo_id or self.vqa}."
             )
+
+        if self.prompt_substitutions is not None:
+            if self.vqa is not None:
+                raise ValueError(
+                    f"`DatasetConfig.prompt_substitutions` only applies to LeRobot datasets "
+                    f"(`repo_id`); VQA dataset {self.vqa!r} builds its own prompt."
+                )
+            for task, subs in self.prompt_substitutions.items():
+                if not isinstance(task, str):
+                    raise ValueError(
+                        f"`prompt_substitutions` keys must be on-disk task strings, got "
+                        f"{task!r} for {self.repo_id}."
+                    )
+                if task == "$ref":
+                    raise ValueError(
+                        "`prompt_substitutions` cannot map a task literally named '$ref': the "
+                        "config loader treats any JSON object containing a '$ref' key as a file "
+                        "include directive (see opentau/configs/refs.py)."
+                    )
+                if not isinstance(subs, list) or len(subs) == 0:
+                    raise ValueError(
+                        f"`prompt_substitutions[{task!r}]` must be a non-empty list of strings, "
+                        f"got {subs!r} for {self.repo_id}."
+                    )
+                if not all(isinstance(s, str) for s in subs):
+                    raise ValueError(
+                        f"`prompt_substitutions[{task!r}]` contains non-string entries: "
+                        f"{subs!r} for {self.repo_id}."
+                    )
 
         # If data_features_name_mapping is provided, upsert it into the global
         # DATA_FEATURES_NAME_MAPPING. Register under the plain repo_id (back-compat
@@ -261,6 +320,13 @@ class DatasetMixtureConfig:
             aren't polluted by training-time augmentation. Subgoal *frame*
             sampling (end-of-segment vs. uniform in the next 4s) stays active
             either way; only the masking logic is gated.
+        val_enable_prompt_substitution: Whether the per-dataset
+            ``DatasetConfig.prompt_substitutions`` swaps also fire on the
+            validation split. Defaults to ``False`` — validation evaluates on
+            the on-disk prompts. Flip to ``True`` when val loss should match
+            the training prompt distribution (with always-replace semantics
+            the original prompt never appears in training unless listed among
+            its own substitutes).
         require_non_empty_robot_type: If True, every dataset in the mixture
             must have a non-empty ``robot_type`` after the optional
             ``DatasetConfig.robot_type`` override has been applied. Defaults to
@@ -350,6 +416,9 @@ class DatasetMixtureConfig:
     # Default keeps validation deterministic-ish (no masking); subgoal frame
     # selection stays random either way.
     val_enable_optional_key_dropout: bool = False
+    # Whether per-dataset `DatasetConfig.prompt_substitutions` swaps also fire
+    # on the validation split. Default keeps validation on the on-disk prompts.
+    val_enable_prompt_substitution: bool = False
 
     # When True, require every dataset in the mixture to have a non-empty
     # robot_type / control_mode after `DatasetConfig.{robot_type,control_mode}`

@@ -64,6 +64,63 @@ For example:
         ...
     }
 
+Randomizing task prompts with a substitution pool
+--------------------------------------------------
+
+A per-dataset ``prompt_substitutions`` mapping randomly swaps the on-disk task
+prompt at fetch time — e.g. paraphrase augmentation for prompt robustness. Each
+key must exactly match an on-disk task string (``meta/tasks.*``); a matching
+sample's prompt is **always** replaced by a uniform random draw from that key's
+list, so include the original string in the list if it should still appear.
+Unmapped tasks pass through unchanged, and keys that match no on-disk task
+string raise at dataset init (typo protection).
+
+.. code-block:: javascript
+
+    {
+        "dataset_mixture": {
+            "datasets": [
+                {
+                    "repo_id": "TensorAuto/libero",
+                    "prompt_substitutions": {
+                        "put both the alphabet soup and the tomato sauce in the basket": [
+                            "place the alphabet soup and the tomato sauce into the basket",
+                            "move both the soup can and the tomato sauce can to the basket"
+                        ]
+                    }
+                }
+            ]
+        },
+        ...
+    }
+
+Large pools can live in their own file and be inlined with a ``$ref`` include
+(resolved relative to the referencing config file — see
+`configs/examples/prompt_substitutions_example.json <https://github.com/TensorAuto/OpenTau/blob/main/configs/examples/prompt_substitutions_example.json>`_):
+
+.. code-block:: javascript
+
+    {
+        "repo_id": "TensorAuto/libero",
+        "prompt_substitutions": {"$ref": "prompt_substitutions_example.json"}
+    }
+
+Sibling keys next to ``"$ref"`` deep-merge over the loaded fragment, so a
+config can extend or override individual task entries in place.
+
+Notes:
+
+- Substitution applies to the **training split only** by default; the
+  validation split keeps the on-disk prompts. Set the mixture-level
+  ``"val_enable_prompt_substitution": true`` to also randomize validation
+  prompts (with always-replace semantics the original prompt never appears in
+  training, so this makes val loss match the training prompt distribution).
+- ``response``/memory CE targets are **not** rewritten — substitutes must be
+  semantic paraphrases of the original task.
+- Like every per-dataset field, ``prompt_substitutions`` has no CLI override
+  path; set it in the JSON config.
+- VQA datasets build their own prompts and reject this field.
+
 Computing max token length for dataset mixture
 ----------------------------------------------
 
