@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
+import draccus
 import pytest
 from draccus.utils import ParsingError
 
@@ -460,3 +461,23 @@ def test_running_best_validate_integration(dataset_mixture_config, policy_config
     )
     with pytest.raises(ValueError, match="running_best_count"):
         cfg.validate()
+
+
+def test_help_generation_does_not_raise(capsys):
+    """`--help` over the full TrainPipelineConfig tree must render, not crash.
+
+    Draccus turns dataclass field comments into argparse help strings, and
+    argparse %-formats those strings to substitute ``%(default)s`` — so a bare
+    ``%`` in any field comment anywhere in the config tree (policies, optim,
+    envs, ...) raises ``TypeError: not enough arguments for format string``.
+    Literal percent signs in field comments must be escaped as ``%%``.
+    """
+    with pytest.raises(SystemExit) as exc_info:
+        draccus.parse(TrainPipelineConfig, args=["--help"])
+    assert exc_info.value.code == 0
+    out = capsys.readouterr().out
+    # Sanity-check the help actually rendered the nested policy/optim groups.
+    assert "--policy.gradient_checkpointing" in out
+    assert "--optimizer.fused" in out
+    # An un-rendered %% means the string skipped argparse's %-formatting.
+    assert "%%" not in out

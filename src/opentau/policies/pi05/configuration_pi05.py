@@ -164,8 +164,8 @@ class PI05Config(PreTrainedConfig):
     knowledge_insulation: bool = True
 
     # Wrap each transformer-layer forward in torch.utils.checkpoint to trade
-    # ~25-33% same-batch compute for ~30-40 GB of activation memory per rank,
-    # typically netting +10-25% throughput once the freed memory is spent on
+    # ~25-33%% same-batch compute for ~30-40 GB of activation memory per rank,
+    # typically netting +10-25%% throughput once the freed memory is spent on
     # a larger per-rank batch. Only supported with distributed_type=MULTI_GPU
     # (DDP), NO (single process), or DeepSpeed ZeRO-1/2 — src/opentau/scripts/
     # train.py raises if the accelerator's distributed_type is anything else
