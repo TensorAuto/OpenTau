@@ -114,6 +114,8 @@ Everything starts from a `TrainPipelineConfig` (`src/opentau/configs/train.py`) 
 
 Key invariant on `TrainPipelineConfig`: `batch_size == dataloader_batch_size * gradient_accumulation_steps`. When sweeping per-rank batch, override all three together — the validator will reject inconsistent combinations. When using DeepSpeed, `gradient_accumulation_steps` must also match the value in the DeepSpeed JSON.
 
+**Escape bare `%` as `%%` in dataclass field comments.** draccus turns each field comment into an argparse help string and appends `(default: %(default)s)`, so argparse `%`-formats the whole thing — a literal `%` in a field comment (e.g. `~25-33%`, `+10-25%`, `~60%`) crashes any `--help` over that config with `TypeError: not enough arguments for format string` (#455). Write `%%`; argparse renders it back to a single `%`. This applies only to **field** comments — class docstrings become argparse group descriptions, which are *not* `%`-formatted, so leave any `%` in them alone.
+
 `PreTrainedConfig` (`configs/policies.py`) is the abstract base for policy configs. Subclasses register themselves via the `policy.type` choice key (draccus `CHOICE_TYPE_KEY`). To add a new policy: subclass `PreTrainedConfig`, subclass `PreTrainedPolicy`, and register both in `policies/factory.py::get_policy_class` / `get_policy_class_config`.
 
 ### Module layout (`src/opentau/`)
