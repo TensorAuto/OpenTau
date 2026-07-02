@@ -62,7 +62,7 @@ class AdamConfig(OptimizerConfig):
     # Use the fused Adam CUDA kernel when running on GPU. Falls back to the
     # default foreach path on CPU-only hosts (see build()). Typically faster
     # than foreach once models get large enough that launch overhead matters;
-    # exact speedup is workload-dependent (e.g. ~60% on pi05's ~3.4B params
+    # exact speedup is workload-dependent (e.g. ~60%% on pi05's ~3.4B params
     # on A100, smaller for smaller models). No math change; same state_dict
     # layout.
     fused: bool = True

@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import json
 import os
 from pathlib import Path
 from unittest.mock import patch
 
+import draccus
 import pytest
 from draccus.utils import ParsingError
 
@@ -460,3 +462,52 @@ def test_running_best_validate_integration(dataset_mixture_config, policy_config
     )
     with pytest.raises(ValueError, match="running_best_count"):
         cfg.validate()
+
+
+def test_help_generation_does_not_raise(capsys):
+    """`--help` over the full TrainPipelineConfig tree must render, not crash.
+
+    Draccus turns dataclass field comments into argparse help strings, and
+    argparse %-formats those strings to substitute ``%(default)s`` — so a bare
+    ``%`` in any field comment anywhere in the config tree (policies, optim,
+    envs, ...) raises ``TypeError: not enough arguments for format string``.
+    Literal percent signs in field comments must be escaped as ``%%``.
+    """
+    with pytest.raises(SystemExit) as exc_info:
+        draccus.parse(TrainPipelineConfig, args=["--help"])
+    assert exc_info.value.code == 0
+    out = capsys.readouterr().out
+    # Sanity-check the help actually rendered the nested policy/optim groups.
+    assert "--policy.gradient_checkpointing" in out
+    assert "--optimizer.fused" in out
+    # An un-rendered %% means the string skipped argparse's %-formatting.
+    assert "%%" not in out
+
+
+@pytest.mark.parametrize(
+    "config_module, config_cls",
+    [
+        ("opentau.policies.pi0.configuration_pi0", "PI0Config"),
+        ("opentau.policies.pi05.configuration_pi05", "PI05Config"),
+        ("opentau.policies.pi05_mem.configuration_pi05", "PI05MemConfig"),
+        ("opentau.policies.pi06.configuration_pi06", "PI06Config"),
+        (
+            "opentau.policies.pi07_paligemma.low_level.configuration_pi07_low_level",
+            "PI07PaligemmaLowLevelConfig",
+        ),
+        ("opentau.optim.optimizers", "AdamConfig"),
+    ],
+)
+def test_policy_config_help_generation_does_not_raise(config_module: str, config_cls: str, capsys):
+    """`--help` over each policy/optim config class must render, not crash.
+
+    Complements ``test_help_generation_does_not_raise``: the full
+    TrainPipelineConfig help only renders the policy choices registered at
+    import time (e.g. pi06 is not on that import chain), so each config class
+    whose field comments contain escaped percent signs is exercised directly.
+    """
+    cls = getattr(importlib.import_module(config_module), config_cls)
+    with pytest.raises(SystemExit) as exc_info:
+        draccus.parse(cls, args=["--help"])
+    assert exc_info.value.code == 0
+    assert "%%" not in capsys.readouterr().out
