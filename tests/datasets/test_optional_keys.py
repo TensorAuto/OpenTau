@@ -61,6 +61,7 @@ class _DummyBaseDataset(BaseDataset):
         history_state_drop_prob=0.0,
         subgoal_drop_prob=0.0,
         subgoal_end_of_segment_prob=0.0,
+        subgoal_window_seconds=4.0,
         response_drop_prob=0.0,
         metadata_drop_all_prob=0.0,
         metadata_drop_each_prob=0.0,
@@ -79,6 +80,7 @@ class _DummyBaseDataset(BaseDataset):
         self.history_state_drop_prob = history_state_drop_prob
         self.subgoal_drop_prob = subgoal_drop_prob
         self.subgoal_end_of_segment_prob = subgoal_end_of_segment_prob
+        self.subgoal_window_seconds = subgoal_window_seconds
         self.response_drop_prob = response_drop_prob
         self.metadata_drop_all_prob = metadata_drop_all_prob
         self.metadata_drop_each_prob = metadata_drop_each_prob
@@ -339,6 +341,7 @@ class TestDropoutDisabled:
         _ld.DATA_FEATURES_NAME_MAPPING[mapping_key] = {"camera0": "camera0"}
 
         ds = _ld.LeRobotDataset.__new__(_ld.LeRobotDataset)
+        ds.subgoal_window_seconds = 4.0
         ds.enable_optional_key_dropout = False
         ds.subgoal_end_of_segment_prob = 1.0
         ds.subgoal_drop_prob = 1.0  # would drop every sample in train mode
@@ -378,6 +381,33 @@ class TestDropoutDisabled:
         expected_ts = (ds.episode_lengths[0] - 1) / ds.meta.fps
         assert abs(ts_dict["camera0"][0] - expected_ts) < 1e-9
 
+    def test_subgoal_window_seconds_bounds_sampled_frame(self):
+        """``subgoal_window_seconds`` scales the [t, t+window] sampling range.
+
+        A 1 s window at 20 fps must keep the sampled subgoal frame within
+        ~20 frames of the current frame, whereas the 4 s default reaches ~80.
+        """
+        from types import SimpleNamespace
+
+        import numpy as _np
+
+        import opentau.datasets.lerobot_dataset as _ld
+
+        ds = _ld.LeRobotDataset.__new__(_ld.LeRobotDataset)
+        ds.episode_lengths = {0: 1000}
+        ds.segment_starts_by_episode = {0: _np.array([0])}
+        ds.meta = SimpleNamespace(episodes={0: {"segments": [0]}}, fps=20)  # self.fps reads meta.fps
+
+        t = 100
+        ds.subgoal_window_seconds = 1.0  # 1 s @ 20 fps = 20 frames
+        samples = [ds._sample_subgoal_frame(0, t, at_end_of_segment=False) for _ in range(500)]
+        assert all(t <= f <= t + 20 for f in samples)
+        assert max(samples) > t + 15, "should occasionally sample near the window edge"
+
+        ds.subgoal_window_seconds = 4.0  # 4 s @ 20 fps = 80 frames
+        wide = [ds._sample_subgoal_frame(0, t, at_end_of_segment=False) for _ in range(500)]
+        assert max(wide) > t + 40, "4 s window must reach further than the 1 s window"
+
     def test_subgoal_drop_skips_video_decode_in_train_mode(self, monkeypatch):
         """In train mode with ``subgoal_drop_prob=1.0`` we must NOT call
         ``_query_videos`` — the whole point of rolling the drop upstream is
@@ -393,6 +423,7 @@ class TestDropoutDisabled:
         _ld.DATA_FEATURES_NAME_MAPPING[mapping_key] = {"camera0": "camera0"}
 
         ds = _ld.LeRobotDataset.__new__(_ld.LeRobotDataset)
+        ds.subgoal_window_seconds = 4.0
         ds.enable_optional_key_dropout = True  # train mode
         ds.subgoal_end_of_segment_prob = 0.0
         ds.subgoal_drop_prob = 1.0  # always drop
@@ -433,6 +464,7 @@ class TestDropoutDisabled:
         _ld.DATA_FEATURES_NAME_MAPPING[mapping_key] = {"camera0": "camera0"}
 
         ds = _ld.LeRobotDataset.__new__(_ld.LeRobotDataset)
+        ds.subgoal_window_seconds = 4.0
         ds.enable_optional_key_dropout = False
         ds.subgoal_end_of_segment_prob = 1.0
         ds.subgoal_drop_prob = 0.0
@@ -474,6 +506,7 @@ class TestDropoutDisabled:
         _ld.DATA_FEATURES_NAME_MAPPING[mapping_key] = {"camera0": "camera0"}
 
         ds = _ld.LeRobotDataset.__new__(_ld.LeRobotDataset)
+        ds.subgoal_window_seconds = 4.0
         ds.enable_optional_key_dropout = False
         ds.subgoal_end_of_segment_prob = 0.0
         ds.subgoal_drop_prob = 0.0
@@ -526,6 +559,7 @@ class TestDropoutDisabled:
         _ld.DATA_FEATURES_NAME_MAPPING[mapping_key] = {"camera0": "camera0"}
 
         ds = _ld.LeRobotDataset.__new__(_ld.LeRobotDataset)
+        ds.subgoal_window_seconds = 4.0
         ds.enable_optional_key_dropout = False
         ds.subgoal_end_of_segment_prob = 0.0
         ds.subgoal_drop_prob = 0.0

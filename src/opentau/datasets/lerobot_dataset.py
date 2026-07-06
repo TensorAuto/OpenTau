@@ -771,6 +771,10 @@ class BaseDataset(torch.utils.data.Dataset):
         self.history_state_drop_prob = dm.history_state_drop_prob if dm else 0.0
         self.subgoal_drop_prob = dm.subgoal_drop_prob if dm else 0.0
         self.subgoal_end_of_segment_prob = dm.subgoal_end_of_segment_prob if dm else 0.0
+        # Lookahead window (seconds) for within-episode subgoal frame sampling.
+        # Defaults to 4.0 s to preserve legacy behavior when no mixture config
+        # is provided (VQA-only / unit-test paths).
+        self.subgoal_window_seconds = dm.subgoal_window_seconds if dm else 4.0
         self.response_drop_prob = dm.response_drop_prob if dm else 0.0
         self.metadata_drop_all_prob = dm.metadata_drop_all_prob if dm else 0.0
         self.metadata_drop_each_prob = dm.metadata_drop_each_prob if dm else 0.0
@@ -2319,17 +2323,19 @@ class LeRobotDataset(BaseDataset):
 
         When ``at_end_of_segment`` is True, returns the last frame of the
         current segment (clipped to the episode's last frame). Otherwise samples
-        a timestamp uniformly in ``[t, t + 4s]`` (wall-clock) and converts it to
-        a frame index, clipping to the current segment end and the episode end.
+        a timestamp uniformly in ``[t, t + subgoal_window_seconds]`` (wall-clock)
+        and converts it to a frame index, clipping to the current segment end and
+        the episode end. The window defaults to 4 s (``subgoal_window_seconds``,
+        configurable via ``DatasetMixtureConfig``).
 
         Episodes that have no ``segments`` annotation in ``episodes.jsonl``
         skip segment-aware clipping entirely and fall back to a fixed
-        ~4-seconds-ahead subgoal frame (clipped to the episode end). This
-        keeps subgoal supervision available on legacy datasets that never
-        wrote per-episode segment boundaries.
+        ~``subgoal_window_seconds``-ahead subgoal frame (clipped to the episode
+        end). This keeps subgoal supervision available on legacy datasets that
+        never wrote per-episode segment boundaries.
         """
         ep_length = self.episode_lengths[ep_idx]
-        window_frames = int(round(4.0 * self.fps))
+        window_frames = int(round(self.subgoal_window_seconds * self.fps))
         if "segments" not in self.meta.episodes[ep_idx]:
             return min(frame_in_ep + window_frames, ep_length - 1)
         seg_idx = self._lookup_segment_index(ep_idx, frame_in_ep)

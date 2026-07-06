@@ -410,6 +410,10 @@ class DatasetMixtureConfig:
     history_state_drop_prob: float = 0.3
     subgoal_drop_prob: float = 0.75
     subgoal_end_of_segment_prob: float = 0.25
+    # Lookahead window (wall-clock seconds) for sampling the within-episode
+    # subgoal frame: the goal is drawn uniformly from [t, t + this] (clipped to
+    # the segment/episode end). At 20 fps, 4.0 s ~= 80 frames; e.g. 1.0 s ~= 20.
+    subgoal_window_seconds: float = 4.0
     response_drop_prob: float = 0.3
     metadata_drop_all_prob: float = 0.15
     metadata_drop_each_prob: float = 0.05
