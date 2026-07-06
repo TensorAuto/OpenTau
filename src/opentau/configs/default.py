@@ -85,10 +85,11 @@ class DatasetConfig:
             ``mistake``, or a success-polarity column (e.g. DROID's
             ``is_episode_successful``) to ``success`` — polarity is expressed
             by which role you map, so no inversion flag is needed. When both
-            resolve, ``mistake`` wins (it is segment-grained). The ``success``
-            role also drives the value-function return bins; it may name a
-            per-frame column or a per-episode key in the episodes metadata.
-            Defaults to None.
+            resolve, ``mistake`` wins (it is segment-grained). ``mistake``
+            must name a per-frame column; for an episode-level outcome map
+            ``success`` instead, which resolves from a per-frame column or a
+            per-episode key in the episodes metadata and also drives the
+            value-function return bins. Defaults to None.
         robot_type: Optional override for the dataset's ``robot_type`` metadata
             field. When provided (including the empty string), takes precedence
             over the value loaded from ``meta/info.json``. ``None`` (default)

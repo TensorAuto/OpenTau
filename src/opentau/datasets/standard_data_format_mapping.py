@@ -47,7 +47,8 @@ Constants:
         - "prompt": Task descriptions or prompts
         - "response": Expected responses or labels
         - "mistake": Mistake-polarity signal (True/1 = something went wrong);
-          defaults to the literal "mistake" column written by
+          must name a per-frame column (episode-level outcomes belong on
+          "success"); defaults to the literal "mistake" column written by
           annotate_mistakes.py / attach_metadata.py
         - "success": Success-polarity signal (True = episode succeeded), e.g.
           DROID's "is_episode_successful". Resolved from the frame column or

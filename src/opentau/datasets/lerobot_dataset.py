@@ -2583,10 +2583,14 @@ class LeRobotDataset(BaseDataset):
         The mistake-polarity column (mapped via the ``mistake`` role in
         ``data_features_name_mapping``, defaulting to the literal ``mistake``
         column written by ``annotate_mistakes.py`` / ``attach_metadata.py``)
-        wins when present — it is segment-grained. Otherwise a resolved
-        ``success`` role (see :meth:`_resolve_episode_success`) is inverted
-        into an episode-constant ``mistake_raw``. With neither source no key
-        is attached, and ``_emit_optional_keys`` pads the field.
+        wins when present — it is segment-grained and deliberately resolved
+        as a frame column only: an episode-level mistake signal is just the
+        inverse of ``success``, so episode-metadata sources belong on the
+        ``success`` role (which gets the full frame -> episode-metadata ->
+        episodes-stats chain). Otherwise a resolved ``success`` role (see
+        :meth:`_resolve_episode_success`) is inverted into an
+        episode-constant ``mistake_raw``. With neither source no key is
+        attached, and ``_emit_optional_keys`` pads the field.
 
         Returns the resolved ``success`` value (or None) so ``__getitem__``
         can reuse it for the value-function return bins without re-resolving
