@@ -1020,7 +1020,11 @@ class BaseDataset(torch.utils.data.Dataset):
         # Provenance fields (part of the standard data format). `source` is the
         # dataset's identity (repo_id for LeRobotDataset, the dataset key for
         # VQA), so a sample's origin survives into the training batch — useful
-        # for debugging which dataset/frame produced an outlier. `episode_index`
+        # for debugging which dataset/frame produced an outlier. NOTE: two
+        # mixture entries sharing a repo_id and control_mode emit an identical
+        # `source`; per-entry attribution (e.g. the outlier-debug pipeline)
+        # must use the mixture-level `dataset_repo_id` that `_TaggedDataset`
+        # injects at the wrapping layer instead. `episode_index`
         # / `frame_index` are plain ints (default-collate to a (B,) int64
         # tensor); VQA / missing values emit the sentinel -1 so a heterogeneous
         # LeRobot+VQA batch stays schema-aligned under default collation.

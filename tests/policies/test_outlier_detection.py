@@ -159,3 +159,39 @@ class TestDetectStateActionOutliers:
         dim2 = [r for r in records if r["key"] == "state" and r["dim"] == 2]
         assert len(dim2) == 1
         assert dim2[0]["value"] == pytest.approx(88.0)
+
+    # -- per-entry attribution: dataset_repo_id wins over the shared source key --
+
+    def test_colliding_entries_distinguished_by_dataset_repo_id(self):
+        # Two mixture entries sharing a repo_id + control_mode (e.g. two camera
+        # views of lerobot/droid_1.0.1) emit an IDENTICAL sample-level `source`
+        # (the feature-mapping key), but `_TaggedDataset` injects the
+        # deduplicated per-entry name as `dataset_repo_id`. The detector must
+        # key records on the latter so the two entries' offenders stay
+        # distinguishable (`(source, key, dim)` merge keys differ).
+        batch = {
+            "state": torch.zeros(2, 8),
+            "source": ["lerobot/droid_1.0.1", "lerobot/droid_1.0.1"],
+            "dataset_repo_id": ["lerobot/droid_1.0.1#0", "lerobot/droid_1.0.1#1"],
+        }
+        batch["state"][0, 2] = 40.0  # entry #0 offends on dim 2
+        batch["state"][1, 2] = 88.0  # entry #1 offends on the SAME dim
+        records = detect_state_action_outliers(batch, 10.0)
+        dim2 = {r["source"]: r for r in records if r["key"] == "state" and r["dim"] == 2}
+        # Same-source merging would collapse these to one record; per-entry
+        # names keep one record per entry, each with its own worst value.
+        assert set(dim2) == {"lerobot/droid_1.0.1#0", "lerobot/droid_1.0.1#1"}
+        assert dim2["lerobot/droid_1.0.1#0"]["value"] == pytest.approx(40.0)
+        assert dim2["lerobot/droid_1.0.1#1"]["value"] == pytest.approx(88.0)
+
+    def test_source_fallback_without_dataset_repo_id(self):
+        # Batches that never went through the mixture wrapper (direct dataset
+        # use, VQA-only paths) carry no `dataset_repo_id`; `source` is used.
+        batch = {
+            "state": torch.zeros(2, 8),
+            "source": ["dsA", "dsB"],
+        }
+        batch["state"][1, 3] = 50.0
+        records = detect_state_action_outliers(batch, 10.0)
+        assert len(records) == 1
+        assert records[0]["source"] == "dsB"
