@@ -243,6 +243,10 @@ _DOWNLOAD_MAX_WORKERS = 16
 # instances within a single process (e.g., train + val constructed for the same repo).
 _CONTROL_MODE_WARNED: set[str] = set()
 
+# Datasets already warned about a within-episode-varying `success` role column
+# (one warning per repo_id per process; train/val splits instantiate twice).
+_SUCCESS_ROLE_WARNED: set[str] = set()
+
 # ``skip_timestamp_check`` is a mixture-wide decision (with optional per-dataset
 # override) that produces an identical warning for every dataset in the mixture.
 # For a 392-dataset pretraining run on 8 ranks, the naive per-dataset emission
@@ -929,7 +933,14 @@ class BaseDataset(torch.utils.data.Dataset):
         img_is_pad = self._standardize_images(item, standard_item, self.num_cams)
 
         for new_key, key in name_map.items():
-            if "camera" in new_key:
+            # Cameras were standardized above. `mistake`/`success` are
+            # optional-metadata roles: they may name a per-episode-only column
+            # (absent from `item`), and copying them here would leak a raw,
+            # per-dataset key into the sample schema — default collation
+            # across a mixture requires every dataset to emit the same keys.
+            # They are resolved in `__getitem__` (`_attach_mistake_raw`) and
+            # emitted uniformly by `_emit_optional_keys` instead.
+            if "camera" in new_key or new_key in ("mistake", "success"):
                 continue
             standard_item[new_key] = item[key]
 
@@ -1634,6 +1645,35 @@ class LeRobotDataset(BaseDataset):
                 "Please add `control_mode` ∈ {'joint', 'ee', 'mixed'} to keep the mixture sampler honest.",
                 self.repo_id,
             )
+
+        # The `success` role expects an episode-constant column: it feeds the
+        # value-function return bins and the derived `mistake` metadata, both
+        # episode-level outcomes. A genuinely per-frame column (e.g. a
+        # terminal-only success marker) would silently yield per-frame
+        # outcomes, so where genuinely per-episode min/max aggregates exist
+        # (v2.1+ `episodes_stats`; the v2.0 backward-compatible path only
+        # replicates the global aggregate), prove constancy at load time.
+        success_col = DATA_FEATURES_NAME_MAPPING.get(self._get_feature_mapping_key(), {}).get("success")
+        if (
+            success_col is not None
+            and self.meta._version >= packaging.version.parse("v2.1")
+            and getattr(self.meta, "episodes_stats", None)
+            and self.repo_id not in _SUCCESS_ROLE_WARNED
+        ):
+            varying, checked = self._count_success_role_varying_episodes(
+                self.meta.episodes_stats, success_col
+            )
+            if varying:
+                _SUCCESS_ROLE_WARNED.add(self.repo_id)
+                logging.warning(
+                    "Dataset %r: column %r mapped to the `success` role varies within %d/%d episodes. "
+                    "The role expects an episode-constant outcome; value-function return bins and the "
+                    "derived `mistake` metadata will follow whichever frame is sampled.",
+                    self.repo_id,
+                    success_col,
+                    varying,
+                    checked,
+                )
 
         # Resolve the effective episode set: `(episodes or all) - excluded`,
         # with `excluded_episodes` taking precedence (see
@@ -2437,6 +2477,136 @@ class LeRobotDataset(BaseDataset):
                 task = substitutes[torch.randint(len(substitutes), ()).item()]
         return task
 
+    @staticmethod
+    def _resolve_episode_success(
+        item: dict,
+        episodes_info: dict,
+        name_map: dict[str, str],
+        episode_stats: dict[str, dict] | None = None,
+    ) -> bool | None:
+        """Resolve the standard ``success`` role for the current sample.
+
+        ``success`` is the success-polarity counterpart of the ``mistake``
+        role: True means the episode succeeded. Resolution chain (first hit
+        wins):
+
+        1. the frame column mapped to ``success`` in
+           ``data_features_name_mapping`` (e.g. DROID's episode-constant
+           ``is_episode_successful``), read from ``item`` first and from the
+           per-episode ``meta.episodes`` entry second — so one mapping entry
+           covers both storage layouts;
+        2. the mapped column's per-episode ``mean`` aggregate in
+           ``episode_stats`` (one ``meta.episodes_stats`` entry, nested
+           ``{col: {"mean": ...}}``), thresholded at 0.5 — the role expects
+           an episode-constant signal, not a terminal-frame-only marker;
+        3. the OpenTau per-episode convention key ``success`` in
+           ``meta.episodes`` (written by e.g. RECAP-style annotation).
+
+        Args:
+            item: Raw frame dict from ``hf_dataset``.
+            episodes_info: This episode's ``meta.episodes`` record.
+            name_map: Standard-role -> dataset-column mapping.
+            episode_stats: This episode's ``meta.episodes_stats`` entry, or
+                None. Callers must pass only genuinely per-episode stats —
+                the v2.0 backward-compatible path replicates the *global*
+                aggregate per episode, which would resolve every episode to
+                the same outcome.
+
+        Returns None when no source is available, so callers can distinguish
+        "labeled as failed" from "unlabeled".
+        """
+        col = name_map.get("success")
+        if col is not None:
+            value = item.get(col)
+            if value is None:
+                value = episodes_info.get(col)
+            if value is not None:
+                return bool(np.asarray(value).reshape(-1)[0])
+            stat = (episode_stats or {}).get(col, {}).get("mean")
+            if stat is not None:
+                return float(np.asarray(stat).reshape(-1)[0]) >= 0.5
+        value = episodes_info.get("success")
+        if value is not None:
+            return bool(np.asarray(value).reshape(-1)[0])
+        return None
+
+    @staticmethod
+    def _count_success_role_varying_episodes(episodes_stats, success_col: str) -> tuple[int, int]:
+        """Count episodes whose mapped ``success`` column varies within the episode.
+
+        Best-effort constancy proof for the ``success`` role: compares the
+        per-episode ``min``/``max`` aggregates in ``meta.episodes_stats``
+        (nested ``{episode_index: {col: {"min": ..., "max": ...}}}``, the
+        shape emitted by ``load_episodes_stats`` / ``load_episodes_stats_v30``).
+        Episodes without aggregates for the column are skipped, so a zero
+        ``checked`` count means "nothing provable", not "all constant".
+        Callers must pass only genuinely per-episode stats — the v2.0
+        backward-compatible path replicates the *global* aggregate per
+        episode, whose min/max spread would be misread as within-episode
+        variation.
+
+        Args:
+            episodes_stats: Per-episode stats — a mapping keyed by episode
+                index or an iterable of per-episode stats dicts.
+            success_col: Dataset-specific column name mapped to ``success``.
+
+        Returns:
+            ``(varying, checked)`` episode counts.
+        """
+        varying = checked = 0
+        rows = episodes_stats.values() if hasattr(episodes_stats, "values") else episodes_stats
+        for row in rows:
+            entry = row.get(success_col) or {}
+            lo, hi = entry.get("min"), entry.get("max")
+            if lo is None or hi is None:
+                continue
+            checked += 1
+            if float(np.asarray(lo).reshape(-1)[0]) != float(np.asarray(hi).reshape(-1)[0]):
+                varying += 1
+        return varying, checked
+
+    def _episode_stats_for(self, ep_idx: int) -> dict[str, dict] | None:
+        """This episode's ``meta.episodes_stats`` entry, if genuinely per-episode.
+
+        Returns None for pre-v2.1 datasets: their backward-compatible
+        ``episodes_stats`` replicate the global aggregate per episode, which
+        must not be mistaken for an episode-level signal.
+        """
+        if self.meta._version < packaging.version.parse("v2.1"):
+            return None
+        episodes_stats = getattr(self.meta, "episodes_stats", None)
+        return episodes_stats.get(ep_idx) if episodes_stats else None
+
+    def _attach_mistake_raw(self, item: dict, episodes_info: dict, ep_idx: int) -> bool | None:
+        """Attach ``mistake_raw`` from the standard ``mistake``/``success`` roles.
+
+        The mistake-polarity column (mapped via the ``mistake`` role in
+        ``data_features_name_mapping``, defaulting to the literal ``mistake``
+        column written by ``annotate_mistakes.py`` / ``attach_metadata.py``)
+        wins when present — it is segment-grained and deliberately resolved
+        as a frame column only: an episode-level mistake signal is just the
+        inverse of ``success``, so episode-metadata sources belong on the
+        ``success`` role (which gets the full frame -> episode-metadata ->
+        episodes-stats chain). Otherwise a resolved ``success`` role (see
+        :meth:`_resolve_episode_success`) is inverted into an
+        episode-constant ``mistake_raw``. With neither source no key is
+        attached, and ``_emit_optional_keys`` pads the field.
+
+        Returns the resolved ``success`` value (or None) so ``__getitem__``
+        can reuse it for the value-function return bins without re-resolving
+        after ``_to_standard_data_format`` has dropped the raw columns.
+        """
+        name_map = DATA_FEATURES_NAME_MAPPING.get(self._get_feature_mapping_key(), {})
+        success = self._resolve_episode_success(
+            item, episodes_info, name_map, episode_stats=self._episode_stats_for(ep_idx)
+        )
+        mistake_col = name_map.get("mistake", "mistake")
+        if mistake_col in item:
+            item["mistake_raw"] = int(item[mistake_col])
+        elif success is not None:
+            item["mistake_raw"] = int(not success)
+        return success
+
     @retry_random_on_failure
     def __getitem__(self, idx) -> dict:
         item = self.hf_dataset[idx]
@@ -2505,8 +2675,7 @@ class LeRobotDataset(BaseDataset):
             item["frame_index"] = frame_in_ep
             if "memory" in item:
                 item["memory_raw"] = str(item["memory"])
-            if "mistake" in item:
-                item["mistake_raw"] = int(item["mistake"])
+            success = self._attach_mistake_raw(item, episodes_info, ep_idx)
             item["next_memory_raw"] = self._lookup_next_memory(ep_idx, frame_in_ep)
             quality = self.meta.episodes[ep_idx].get("quality")
             if quality is not None:
@@ -2522,7 +2691,9 @@ class LeRobotDataset(BaseDataset):
             else:
                 item["advantage"] = torch.tensor(0.0, dtype=torch.bfloat16)
 
-            success = episodes_info.get("success", True)
+            # Resolved by `_attach_mistake_raw` before the raw columns were
+            # dropped; unlabeled episodes count as successful for return bins.
+            success = success if success is not None else True
 
             # only add the below fields to item when training or evaluating the value fns
             if isinstance(self.cfg.policy, ValueConfig):

@@ -46,6 +46,16 @@ Constants:
         - "actions": Action outputs
         - "prompt": Task descriptions or prompts
         - "response": Expected responses or labels
+        - "mistake": Mistake-polarity signal (True/1 = something went wrong);
+          must name a per-frame column (episode-level outcomes belong on
+          "success"); defaults to the literal "mistake" column written by
+          annotate_mistakes.py / attach_metadata.py
+        - "success": Success-polarity signal (True = episode succeeded), e.g.
+          DROID's "is_episode_successful". Resolved from the frame column or
+          the per-episode metadata (including the per-episode "mean"
+          aggregate in episodes_stats, v2.1+) and inverted into "mistake"
+          when no mistake column exists; also drives the value-function
+          return bins
 
 Example:
     Access feature name mapping for a dataset:
