@@ -76,8 +76,19 @@ class DatasetConfig:
         video_backend: Video codec backend to use. Defaults to a safe default codec.
         stats: Dictionary of statistics for normalization, keyed by feature name.
             Each value is a dictionary with 'mean' and 'std' arrays. Defaults to None.
-        data_features_name_mapping: Optional mapping from dataset feature names to
-            standard feature names. Defaults to None.
+        data_features_name_mapping: Optional mapping from standard feature
+            names (``camera0``/``camera1``/..., ``state``, ``actions``,
+            ``prompt``, ``response``, ``mistake``, ``success``) to this
+            dataset's own column names. The ``mistake`` and ``success`` roles
+            feed the optional ``mistake`` metadata key: map a
+            mistake-polarity column (True/1 = something went wrong) to
+            ``mistake``, or a success-polarity column (e.g. DROID's
+            ``is_episode_successful``) to ``success`` — polarity is expressed
+            by which role you map, so no inversion flag is needed. When both
+            resolve, ``mistake`` wins (it is segment-grained). The ``success``
+            role also drives the value-function return bins; it may name a
+            per-frame column or a per-episode key in the episodes metadata.
+            Defaults to None.
         robot_type: Optional override for the dataset's ``robot_type`` metadata
             field. When provided (including the empty string), takes precedence
             over the value loaded from ``meta/info.json``. ``None`` (default)

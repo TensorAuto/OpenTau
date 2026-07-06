@@ -2437,6 +2437,68 @@ class LeRobotDataset(BaseDataset):
                 task = substitutes[torch.randint(len(substitutes), ()).item()]
         return task
 
+    @staticmethod
+    def _resolve_episode_success(item: dict, episodes_info: dict, name_map: dict[str, str]) -> bool | None:
+        """Resolve the standard ``success`` role for the current sample.
+
+        ``success`` is the success-polarity counterpart of the ``mistake``
+        role: True means the episode succeeded. Resolution chain (first hit
+        wins):
+
+        1. the frame column mapped to ``success`` in
+           ``data_features_name_mapping`` (e.g. DROID's episode-constant
+           ``is_episode_successful``), read from ``item`` first and from the
+           per-episode ``meta.episodes`` entry second — so one mapping entry
+           covers both storage layouts;
+        2. the mapped column's v3.0 flattened aggregate
+           ``stats/<col>/mean`` in ``meta.episodes`` (thresholded at 0.5 —
+           the role expects an episode-constant signal, not a
+           terminal-frame-only marker);
+        3. the OpenTau per-episode convention key ``success`` in
+           ``meta.episodes`` (written by e.g. RECAP-style annotation).
+
+        Returns None when no source is available, so callers can distinguish
+        "labeled as failed" from "unlabeled".
+        """
+        col = name_map.get("success")
+        if col is not None:
+            value = item.get(col)
+            if value is None:
+                value = episodes_info.get(col)
+            if value is not None:
+                return bool(np.asarray(value).reshape(-1)[0])
+            stat = episodes_info.get(f"stats/{col}/mean")
+            if stat is not None:
+                return float(np.asarray(stat).reshape(-1)[0]) >= 0.5
+        value = episodes_info.get("success")
+        if value is not None:
+            return bool(np.asarray(value).reshape(-1)[0])
+        return None
+
+    def _attach_mistake_raw(self, item: dict, episodes_info: dict) -> bool | None:
+        """Attach ``mistake_raw`` from the standard ``mistake``/``success`` roles.
+
+        The mistake-polarity column (mapped via the ``mistake`` role in
+        ``data_features_name_mapping``, defaulting to the literal ``mistake``
+        column written by ``annotate_mistakes.py`` / ``attach_metadata.py``)
+        wins when present — it is segment-grained. Otherwise a resolved
+        ``success`` role (see :meth:`_resolve_episode_success`) is inverted
+        into an episode-constant ``mistake_raw``. With neither source no key
+        is attached, and ``_emit_optional_keys`` pads the field.
+
+        Returns the resolved ``success`` value (or None) so ``__getitem__``
+        can reuse it for the value-function return bins without re-resolving
+        after ``_to_standard_data_format`` has dropped the raw columns.
+        """
+        name_map = DATA_FEATURES_NAME_MAPPING.get(self._get_feature_mapping_key(), {})
+        success = self._resolve_episode_success(item, episodes_info, name_map)
+        mistake_col = name_map.get("mistake", "mistake")
+        if mistake_col in item:
+            item["mistake_raw"] = int(item[mistake_col])
+        elif success is not None:
+            item["mistake_raw"] = int(not success)
+        return success
+
     @retry_random_on_failure
     def __getitem__(self, idx) -> dict:
         item = self.hf_dataset[idx]
@@ -2505,8 +2567,7 @@ class LeRobotDataset(BaseDataset):
             item["frame_index"] = frame_in_ep
             if "memory" in item:
                 item["memory_raw"] = str(item["memory"])
-            if "mistake" in item:
-                item["mistake_raw"] = int(item["mistake"])
+            success = self._attach_mistake_raw(item, episodes_info)
             item["next_memory_raw"] = self._lookup_next_memory(ep_idx, frame_in_ep)
             quality = self.meta.episodes[ep_idx].get("quality")
             if quality is not None:
@@ -2522,7 +2583,9 @@ class LeRobotDataset(BaseDataset):
             else:
                 item["advantage"] = torch.tensor(0.0, dtype=torch.bfloat16)
 
-            success = episodes_info.get("success", True)
+            # Resolved by `_attach_mistake_raw` before the raw columns were
+            # dropped; unlabeled episodes count as successful for return bins.
+            success = success if success is not None else True
 
             # only add the below fields to item when training or evaluating the value fns
             if isinstance(self.cfg.policy, ValueConfig):
