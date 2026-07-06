@@ -760,6 +760,36 @@ class BaseDataset(torch.utils.data.Dataset):
             ...         return "my-dataset"
     """
 
+    # Per-instance feature-name mapping. When set (LeRobotDataset receives it
+    # from the mixture entry's `data_features_name_mapping`), it wins over the
+    # process-global DATA_FEATURES_NAME_MAPPING registry — two mixture entries
+    # sharing a repo_id and control_mode would otherwise clobber each other's
+    # registry entry (last-wins) and silently read the same columns.
+    _data_features_name_mapping: dict[str, str] | None = None
+
+    def _get_name_map(self, strict: bool = True) -> dict[str, str]:
+        """Resolve this dataset's feature-name mapping.
+
+        The per-instance mapping (set from the config entry) takes precedence;
+        the global ``DATA_FEATURES_NAME_MAPPING`` registry is the fallback for
+        built-in defaults and direct constructions.
+
+        Args:
+            strict: When True, a dataset with neither a per-instance mapping
+                nor a registry entry raises ``KeyError`` (standardization
+                cannot proceed without a mapping). When False, returns an
+                empty dict instead — for optional-role lookups.
+
+        Returns:
+            Mapping from standard feature names to dataset-specific names.
+        """
+        if self._data_features_name_mapping is not None:
+            return self._data_features_name_mapping
+        key = self._get_feature_mapping_key()
+        if strict:
+            return DATA_FEATURES_NAME_MAPPING[key]
+        return DATA_FEATURES_NAME_MAPPING.get(key, {})
+
     def __init__(self, cfg: TrainPipelineConfig):
         super().__init__()
         # Standard Data Format parameters
@@ -881,7 +911,7 @@ class BaseDataset(torch.utils.data.Dataset):
         Returns:
             List of boolean values indicating which camera slots are padded.
         """
-        name_map = DATA_FEATURES_NAME_MAPPING[self._get_feature_mapping_key()]
+        name_map = self._get_name_map()
         image_is_pad = []
         for cam_idx in range(n_cams):
             std_key = f"camera{cam_idx}"
@@ -927,7 +957,7 @@ class BaseDataset(torch.utils.data.Dataset):
         Returns:
             Dictionary with standardized feature names and formats.
         """
-        name_map = DATA_FEATURES_NAME_MAPPING[self._get_feature_mapping_key()]
+        name_map = self._get_name_map()
 
         standard_item = {}
         img_is_pad = self._standardize_images(item, standard_item, self.num_cams)
@@ -1353,6 +1383,7 @@ class LeRobotDataset(BaseDataset):
         return_advantage_input: bool = False,
         skip_timestamp_check: bool = False,
         prompt_substitutions: dict[str, list[str]] | None = None,
+        data_features_name_mapping: dict[str, str] | None = None,
     ):
         """Initialize LeRobotDataset.
 
@@ -1492,10 +1523,20 @@ class LeRobotDataset(BaseDataset):
                 (gated by ``self.enable_prompt_substitution``); unmapped tasks pass
                 through unchanged. Keys matching no on-disk task string raise a
                 ``ValueError`` at init. Defaults to None.
+            data_features_name_mapping (dict[str, str] | None, optional): This
+                instance's standard-role -> dataset-column mapping. When set it
+                wins over the process-global ``DATA_FEATURES_NAME_MAPPING``
+                registry (see :meth:`BaseDataset._get_name_map`), so two
+                mixture entries sharing a ``repo_id`` and ``control_mode`` can
+                declare different mappings (e.g. two camera views of the same
+                repo) without clobbering each other. ``None`` (default) falls
+                back to the registry.
         """
         super().__init__(cfg)
         self.cfg = cfg
         self.repo_id = repo_id
+        if data_features_name_mapping is not None:
+            self._data_features_name_mapping = dict(data_features_name_mapping)
         self.root = Path(root) if root else HF_OPENTAU_HOME / repo_id
         self.image_transforms = image_transforms
         self.delta_timestamps_params = self.compute_delta_params(
@@ -1653,7 +1694,7 @@ class LeRobotDataset(BaseDataset):
         # outcomes, so where genuinely per-episode min/max aggregates exist
         # (v2.1+ `episodes_stats`; the v2.0 backward-compatible path only
         # replicates the global aggregate), prove constancy at load time.
-        success_col = DATA_FEATURES_NAME_MAPPING.get(self._get_feature_mapping_key(), {}).get("success")
+        success_col = self._get_name_map(strict=False).get("success")
         if (
             success_col is not None
             and self.meta._version >= packaging.version.parse("v2.1")
@@ -2418,7 +2459,7 @@ class LeRobotDataset(BaseDataset):
         # old ordering threw away 75% of decodes.
         if self.enable_optional_key_dropout and bool(torch.rand(()) < self.subgoal_drop_prob):
             return {}
-        name_map = DATA_FEATURES_NAME_MAPPING[self._get_feature_mapping_key()]
+        name_map = self._get_name_map()
         at_end = bool(torch.rand(()) < self.subgoal_end_of_segment_prob)
         subgoal_frame = self._sample_subgoal_frame(ep_idx, frame_in_ep, at_end_of_segment=at_end)
         ts = subgoal_frame / self.fps
@@ -2596,7 +2637,7 @@ class LeRobotDataset(BaseDataset):
         can reuse it for the value-function return bins without re-resolving
         after ``_to_standard_data_format`` has dropped the raw columns.
         """
-        name_map = DATA_FEATURES_NAME_MAPPING.get(self._get_feature_mapping_key(), {})
+        name_map = self._get_name_map(strict=False)
         success = self._resolve_episode_success(
             item, episodes_info, name_map, episode_stats=self._episode_stats_for(ep_idx)
         )

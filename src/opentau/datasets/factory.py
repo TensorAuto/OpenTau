@@ -140,11 +140,21 @@ def resolve_delta_timestamps(
 
     if dataset_cfg.repo_id is None:
         raise ValueError("dataset_cfg.repo_id must not be None when resolving delta timestamps.")
-    # Runs before `_apply_metadata_overrides`, so prefer the config's control_mode
-    # override, falling back to the on-disk value, to resolve dual-split columns.
-    control_mode = dataset_cfg.control_mode if dataset_cfg.control_mode is not None else ds_meta.control_mode
-    mkey = feature_mapping_key(dataset_cfg.repo_id, control_mode)
-    name_map = DATA_FEATURES_NAME_MAPPING[mkey if mkey in DATA_FEATURES_NAME_MAPPING else dataset_cfg.repo_id]
+    if dataset_cfg.data_features_name_mapping is not None:
+        # This entry's own mapping — the registry may hold another entry's
+        # mapping when two entries share a repo_id and control_mode (see
+        # BaseDataset._get_name_map for the fetch-time counterpart).
+        name_map = dataset_cfg.data_features_name_mapping
+    else:
+        # Runs before `_apply_metadata_overrides`, so prefer the config's control_mode
+        # override, falling back to the on-disk value, to resolve dual-split columns.
+        control_mode = (
+            dataset_cfg.control_mode if dataset_cfg.control_mode is not None else ds_meta.control_mode
+        )
+        mkey = feature_mapping_key(dataset_cfg.repo_id, control_mode)
+        name_map = DATA_FEATURES_NAME_MAPPING[
+            mkey if mkey in DATA_FEATURES_NAME_MAPPING else dataset_cfg.repo_id
+        ]
     reverse_name_map = {v: k for k, v in name_map.items()}
     for key in ds_meta.features:
         if key not in reverse_name_map:
@@ -273,6 +283,7 @@ def make_dataset(
             return_advantage_input=return_advantage_input,
             skip_timestamp_check=effective_skip,
             prompt_substitutions=cfg.prompt_substitutions,
+            data_features_name_mapping=cfg.data_features_name_mapping,
         )
     else:
         raise ValueError("Exactly one of `cfg.vqa` and `cfg.repo_id` should be provided.")

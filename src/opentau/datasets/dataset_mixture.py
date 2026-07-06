@@ -265,9 +265,23 @@ class DatasetMixtureMetadata:
         metadatas: List[DatasetMetadata],
         dataset_weights: List[float],
         dataset_names: List[str] | None = None,
+        name_maps: List[dict[str, str] | None] | None = None,
     ):
         self.cfg = cfg
         self._dataset_weights = list(dataset_weights)
+
+        # Per-entry feature-name mappings (aligned with `metadatas`). When an
+        # entry is None, resolution falls back to the global registry — which
+        # is ambiguous when two entries share a repo_id and control_mode, so
+        # WeightedDatasetMixture passes each dataset's own instance mapping.
+        if name_maps is None:
+            name_maps = [None] * len(metadatas)
+
+        def _entry_name_map(m: DatasetMetadata, own: dict[str, str] | None) -> dict[str, str]:
+            if own is not None:
+                return own
+            key = feature_mapping_key(m.repo_id, getattr(m, "info", {}).get("control_mode"))
+            return DATA_FEATURES_NAME_MAPPING[key if key in DATA_FEATURES_NAME_MAPPING else m.repo_id]
 
         # Snapshot raw state / action dims BEFORE `_to_standard_data_format`
         # pads the standardized stats. Used to surface incompatible-dim
@@ -275,9 +289,8 @@ class DatasetMixtureMetadata:
         # but with mismatched proprio / action widths). Done up front because
         # the standardize loop below clobbers `metadata.stats`.
         raw_dims: list[tuple[int, int]] = []
-        for m in metadatas:
-            key = feature_mapping_key(m.repo_id, getattr(m, "info", {}).get("control_mode"))
-            name_map = DATA_FEATURES_NAME_MAPPING[key if key in DATA_FEATURES_NAME_MAPPING else m.repo_id]
+        for m, own_map in zip(metadatas, name_maps, strict=True):
+            name_map = _entry_name_map(m, own_map)
             raw_dims.append(
                 (
                     int(m.stats[name_map["state"]]["mean"].shape[-1]),
@@ -286,9 +299,12 @@ class DatasetMixtureMetadata:
             )
 
         # convert each metadata stats to the standard data format
-        for metadata in metadatas:
+        for metadata, own_map in zip(metadatas, name_maps, strict=True):
             metadata.stats = self._to_standard_data_format(
-                metadata.repo_id, metadata.stats, getattr(metadata, "info", {}).get("control_mode")
+                metadata.repo_id,
+                metadata.stats,
+                getattr(metadata, "info", {}).get("control_mode"),
+                name_map=own_map,
             )
 
         # Per-dataset stats kept for diagnostic / back-compat consumers
@@ -475,7 +491,11 @@ class DatasetMixtureMetadata:
         return agg["actions"]
 
     def _to_standard_data_format(
-        self, repo_id: str, stats: dict[str, dict[str, np.ndarray]], control_mode: str | None = None
+        self,
+        repo_id: str,
+        stats: dict[str, dict[str, np.ndarray]],
+        control_mode: str | None = None,
+        name_map: dict[str, str] | None = None,
     ) -> dict[str, dict[str, np.ndarray]]:
         """Convert statistics to the standard data format.
 
@@ -489,6 +509,9 @@ class DatasetMixtureMetadata:
                 feature-name mapping, so dual-split entries (joint vs ee) pick
                 their own action column. ``None`` falls back to the plain
                 ``repo_id`` entry.
+            name_map: This entry's own feature-name mapping. When provided it
+                wins over the registry lookup — the registry is ambiguous when
+                two mixture entries share a ``repo_id`` and ``control_mode``.
 
         Returns:
             Statistics dictionary with standard feature names and padded vectors.
@@ -497,9 +520,13 @@ class DatasetMixtureMetadata:
             KeyError: If a required feature is missing from stats or if required
                 statistics (mean, std, min, max) are missing.
         """
-        key = feature_mapping_key(repo_id, control_mode)
-        name_map = DATA_FEATURES_NAME_MAPPING[key if key in DATA_FEATURES_NAME_MAPPING else repo_id]
-        features_without_stats = ["prompt", "response", "advantage"]
+        if name_map is None:
+            key = feature_mapping_key(repo_id, control_mode)
+            name_map = DATA_FEATURES_NAME_MAPPING[key if key in DATA_FEATURES_NAME_MAPPING else repo_id]
+        # `mistake`/`success` are optional-metadata roles, not normalization
+        # features — their columns may have stats on disk, but they must not
+        # enter the standardized stats schema.
+        features_without_stats = ["prompt", "response", "advantage", "mistake", "success"]
 
         standard_stats = {}
         for new_key, key in name_map.items():
@@ -736,11 +763,22 @@ class WeightedDatasetMixture:
         # `DatasetMixtureMetadata` clobbers `metadata.stats` via
         # `_to_standard_data_format`; this must run before any downstream
         # consumer that reads the raw per-feature stats.
+        # Thread each dataset's instance mapping through so colliding entries
+        # (same repo_id + control_mode, different mappings) standardize their
+        # stats against their own columns. `random_split` wrappers hold the
+        # real dataset one level deeper, same as the `.meta` lookup above.
+        def _instance_name_map(ds) -> dict[str, str] | None:
+            own = getattr(ds, "_data_features_name_mapping", None)
+            if own is None and hasattr(ds, "dataset"):
+                own = getattr(ds.dataset, "_data_features_name_mapping", None)
+            return own
+
         self.meta = DatasetMixtureMetadata(
             cfg,
             [ds.meta for ds in datasets],
             dataset_weights,
             dataset_names=self.dataset_names,
+            name_maps=[_instance_name_map(ds) for ds in datasets],
         )
 
         # Wrap every underlying dataset so __getitem__ injects
