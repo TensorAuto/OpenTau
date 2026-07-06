@@ -42,6 +42,11 @@ draccus.decode.register(np.ndarray, np.asarray)
 # For encoding to yaml
 draccus.encode.register(np.ndarray, lambda x: x.tolist())
 
+# DATA_FEATURES_NAME_MAPPING keys registered by a config entry this process.
+# Distinguishes a genuine mixture-entry collision (warn) from a single entry
+# overriding a built-in default mapping (legitimate, silent).
+_CONFIG_REGISTERED_MAPPING_KEYS: set[str] = set()
+
 
 @dataclass
 class DatasetConfig:
@@ -266,11 +271,20 @@ class DatasetConfig:
                 effective = feature_mapping_key(self.repo_id, self.control_mode)
                 keys = list(dict.fromkeys([self.repo_id, effective]))
             for key in keys:
-                # Only the effective (composite-or-plain) key is what this
-                # entry's datasets resolve; overwriting the plain repo_id
-                # back-compat slot from a different control mode is by design.
+                # Warn only on an entry-vs-entry conflict: the key must be the
+                # effective (composite-or-plain) key this entry's datasets
+                # resolve, AND the previous registration must come from
+                # another config entry. Overwriting the plain repo_id
+                # back-compat slot from a different control mode, or
+                # overriding a *built-in* default mapping, is by design and
+                # stays silent.
                 previous = DATA_FEATURES_NAME_MAPPING.get(key)
-                if key == effective and previous is not None and previous != self.data_features_name_mapping:
+                if (
+                    key == effective
+                    and key in _CONFIG_REGISTERED_MAPPING_KEYS
+                    and previous is not None
+                    and previous != self.data_features_name_mapping
+                ):
                     warnings.warn(
                         f"data_features_name_mapping: registry key {key!r} is being overwritten "
                         "with a different mapping (two mixture entries share this "
@@ -280,6 +294,7 @@ class DatasetConfig:
                         stacklevel=2,
                     )
                 DATA_FEATURES_NAME_MAPPING[key] = self.data_features_name_mapping
+                _CONFIG_REGISTERED_MAPPING_KEYS.add(key)
 
 
 @dataclass

@@ -33,7 +33,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from opentau.configs.default import DatasetConfig
+from opentau.configs.default import _CONFIG_REGISTERED_MAPPING_KEYS, DatasetConfig
 from opentau.datasets.dataset_mixture import DatasetMixtureMetadata
 from opentau.datasets.factory import make_dataset, resolve_delta_timestamps
 from opentau.datasets.lerobot_dataset import LeRobotDataset
@@ -50,10 +50,11 @@ _TEST_KEYS = [
 
 @pytest.fixture(autouse=True)
 def _clean_mapping_registration():
-    """Remove this module's keys from the process-global registry."""
+    """Remove this module's keys from the process-global registries."""
     yield
     for key in _TEST_KEYS:
         DATA_FEATURES_NAME_MAPPING.pop(key, None)
+        _CONFIG_REGISTERED_MAPPING_KEYS.discard(key)
 
 
 def _make_ds(instance_mapping: dict[str, str] | None) -> LeRobotDataset:
@@ -155,6 +156,20 @@ class TestConfigRegistrationWarning:
                 control_mode="ee",
                 data_features_name_mapping={"actions": "action_ee"},
             )
+
+    def test_overriding_builtin_default_does_not_warn(self):
+        """A single entry overriding a built-in registry default (a key never
+        registered by a config entry) is legitimate and stays silent."""
+        DATA_FEATURES_NAME_MAPPING["_tests/collision_repo"] = {"camera0": "builtin_cam"}
+        import warnings as _warnings
+
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("error")
+            DatasetConfig(
+                repo_id="_tests/collision_repo",
+                data_features_name_mapping={"camera0": "config_cam"},
+            )
+        assert DATA_FEATURES_NAME_MAPPING["_tests/collision_repo"]["camera0"] == "config_cam"
 
 
 def _colliding_configs() -> tuple[DatasetConfig, DatasetConfig]:
