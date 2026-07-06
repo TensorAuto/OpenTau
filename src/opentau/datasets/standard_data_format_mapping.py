@@ -51,9 +51,10 @@ Constants:
           annotate_mistakes.py / attach_metadata.py
         - "success": Success-polarity signal (True = episode succeeded), e.g.
           DROID's "is_episode_successful". Resolved from the frame column or
-          the per-episode metadata (including the v3.0 "stats/<col>/mean"
-          aggregate) and inverted into "mistake" when no mistake column
-          exists; also drives the value-function return bins
+          the per-episode metadata (including the per-episode "mean"
+          aggregate in episodes_stats, v2.1+) and inverted into "mistake"
+          when no mistake column exists; also drives the value-function
+          return bins
 
 Example:
     Access feature name mapping for a dataset:

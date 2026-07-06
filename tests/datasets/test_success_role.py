@@ -16,18 +16,28 @@
 
 Covers ``LeRobotDataset._resolve_episode_success`` (the resolution chain for
 success-polarity signals: mapped frame column -> mapped episode-metadata key
--> v3.0 flattened stats aggregate -> legacy per-episode ``success`` key) and
-``LeRobotDataset._attach_mistake_raw`` (deriving ``mistake_raw`` with the
-mistake-polarity column taking precedence over an inverted ``success`` role).
+-> per-episode ``episodes_stats`` mean aggregate -> legacy per-episode
+``success`` key), ``LeRobotDataset._attach_mistake_raw`` (deriving
+``mistake_raw`` with the mistake-polarity column taking precedence over an
+inverted ``success`` role), and the episode-constancy counting over
+``episodes_stats``. The stats-shaped tests go through the real
+``load_episodes_v30`` / ``load_episodes_stats_v30`` loaders so the helpers are
+exercised against loader-emitted structures, not hand-built dicts.
 """
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import numpy as np
+import packaging.version
+import pyarrow as pa
 import pytest
 import torch
 
 from opentau.datasets.lerobot_dataset import LeRobotDataset
 from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
+from opentau.datasets.utils import load_episodes_stats_v30, load_episodes_v30
 
 resolve = LeRobotDataset._resolve_episode_success
 
@@ -41,13 +51,38 @@ def _clean_mapping_registration():
     DATA_FEATURES_NAME_MAPPING.pop(_TEST_MAPPING_KEY, None)
 
 
-def _make_ds(mapping: dict[str, str]) -> LeRobotDataset:
+def _make_ds(
+    mapping: dict[str, str],
+    episodes_stats: dict | None = None,
+    version: str = "v3.0",
+) -> LeRobotDataset:
     """Minimal LeRobotDataset carrying just what _attach_mistake_raw reads."""
     DATA_FEATURES_NAME_MAPPING[_TEST_MAPPING_KEY] = mapping
     ds = object.__new__(LeRobotDataset)
     ds.repo_id = _TEST_MAPPING_KEY
     ds.control_mode = None
+    ds.meta = SimpleNamespace(_version=packaging.version.parse(version), episodes_stats=episodes_stats or {})
     return ds
+
+
+def _v30_episodes_table(success_stats: list[tuple[float, float, float]]) -> pa.Table:
+    """Build a v3.0 episodes-metadata Arrow table with flattened stats columns.
+
+    ``success_stats`` holds one ``(min, max, mean)`` triple per episode for a
+    column named ``ok`` — the same flattened ``stats/{feature}/{stat}`` layout
+    ``_read_v30_episodes_arrow`` produces from the metadata shards.
+    """
+    n = len(success_stats)
+    return pa.table(
+        {
+            "episode_index": pa.array(range(n), type=pa.int64()),
+            "length": pa.array([10] * n, type=pa.int64()),
+            "tasks": pa.array([["task"]] * n, type=pa.list_(pa.string())),
+            "stats/ok/min": pa.array([[lo] for lo, _, _ in success_stats], type=pa.list_(pa.float64())),
+            "stats/ok/max": pa.array([[hi] for _, hi, _ in success_stats], type=pa.list_(pa.float64())),
+            "stats/ok/mean": pa.array([[mu] for _, _, mu in success_stats], type=pa.list_(pa.float64())),
+        }
+    )
 
 
 class TestResolveEpisodeSuccess:
@@ -66,15 +101,17 @@ class TestResolveEpisodeSuccess:
         assert resolve({}, {"is_episode_successful": True}, nm) is True
         assert resolve({}, {"is_episode_successful": 0}, nm) is False
 
-    def test_mapped_stats_mean_fallback(self):
-        nm = {"success": "is_episode_successful"}
-        assert resolve({}, {"stats/is_episode_successful/mean": [1.0]}, nm) is True
-        assert resolve({}, {"stats/is_episode_successful/mean": [0.0]}, nm) is False
+    def test_episode_stats_mean_fallback_uses_loader_shape(self):
+        nm = {"success": "ok"}
+        stats = load_episodes_stats_v30(None, episodes_table=_v30_episodes_table([(1, 1, 1), (0, 0, 0)]))
+        assert resolve({}, {}, nm, episode_stats=stats[0]) is True
+        assert resolve({}, {}, nm, episode_stats=stats[1]) is False
 
     def test_frame_column_beats_episode_meta_and_stats(self):
         nm = {"success": "flag"}
-        info = {"flag": True, "stats/flag/mean": [1.0]}
-        assert resolve({"flag": torch.tensor(False)}, info, nm) is False
+        info = {"flag": True}
+        stats = {"flag": {"mean": np.array([1.0])}}
+        assert resolve({"flag": torch.tensor(False)}, info, nm, episode_stats=stats) is False
 
     def test_legacy_success_key_without_mapping(self):
         assert resolve({}, {"success": False}, {}) is False
@@ -93,69 +130,94 @@ class TestResolveEpisodeSuccess:
         assert resolve({}, {}, {"success": "absent_col"}) is None
 
 
+class TestEpisodeStatsFor:
+    def test_returns_entry_for_v21_plus(self):
+        stats = {0: {"ok": {"mean": np.array([1.0])}}}
+        ds = _make_ds({}, episodes_stats=stats, version="v3.0")
+        assert ds._episode_stats_for(0) is stats[0]
+        assert ds._episode_stats_for(99) is None
+
+    def test_v20_backward_compatible_stats_are_ignored(self):
+        # v2.0 episodes_stats replicate the *global* aggregate per episode —
+        # not an episode-level signal, so the lookup must return None.
+        stats = {0: {"ok": {"mean": np.array([0.5])}}}
+        ds = _make_ds({}, episodes_stats=stats, version="v2.0")
+        assert ds._episode_stats_for(0) is None
+
+
 class TestAttachMistakeRaw:
     def test_success_column_inverts_to_mistake(self):
         ds = _make_ds({"success": "is_episode_successful"})
         item = {"is_episode_successful": torch.tensor(False)}
-        assert ds._attach_mistake_raw(item, {}) is False
+        assert ds._attach_mistake_raw(item, {}, 0) is False
         assert item["mistake_raw"] == 1
 
         item = {"is_episode_successful": torch.tensor(True)}
-        assert ds._attach_mistake_raw(item, {}) is True
+        assert ds._attach_mistake_raw(item, {}, 0) is True
         assert item["mistake_raw"] == 0
 
     def test_mapped_mistake_column(self):
         ds = _make_ds({"mistake": "is_mistake"})
         item = {"is_mistake": torch.tensor(1)}
-        ds._attach_mistake_raw(item, {})
+        ds._attach_mistake_raw(item, {}, 0)
         assert item["mistake_raw"] == 1
 
     def test_mistake_column_wins_over_success_role(self):
         ds = _make_ds({"success": "ok_flag", "mistake": "seg_mistake"})
         item = {"seg_mistake": torch.tensor(1), "ok_flag": torch.tensor(True)}
-        assert ds._attach_mistake_raw(item, {}) is True
+        assert ds._attach_mistake_raw(item, {}, 0) is True
         assert item["mistake_raw"] == 1
 
     def test_literal_mistake_column_needs_no_mapping(self):
         ds = _make_ds({})
         item = {"mistake": torch.tensor(1)}
-        ds._attach_mistake_raw(item, {})
+        ds._attach_mistake_raw(item, {}, 0)
         assert item["mistake_raw"] == 1
 
-    def test_stats_aggregate_derives_mistake(self):
-        ds = _make_ds({"success": "is_episode_successful"})
+    def test_episode_stats_aggregate_derives_mistake(self):
+        stats = load_episodes_stats_v30(None, episodes_table=_v30_episodes_table([(0, 0, 0)]))
+        ds = _make_ds({"success": "ok"}, episodes_stats=stats)
         item = {}
-        assert ds._attach_mistake_raw(item, {"stats/is_episode_successful/mean": [0.0]}) is False
+        assert ds._attach_mistake_raw(item, {}, 0) is False
         assert item["mistake_raw"] == 1
+
+    def test_v20_stats_do_not_derive_mistake(self):
+        stats = {0: {"ok": {"mean": np.array([0.0])}}}
+        ds = _make_ds({"success": "ok"}, episodes_stats=stats, version="v2.0")
+        item = {}
+        assert ds._attach_mistake_raw(item, {}, 0) is None
+        assert "mistake_raw" not in item
 
     def test_unlabeled_attaches_nothing(self):
         ds = _make_ds({})
         item = {}
-        assert ds._attach_mistake_raw(item, {}) is None
+        assert ds._attach_mistake_raw(item, {}, 0) is None
         assert "mistake_raw" not in item
 
 
 class TestCountSuccessRoleVaryingEpisodes:
     count = staticmethod(LeRobotDataset._count_success_role_varying_episodes)
 
+    def _loader_stats(self, triples):
+        return load_episodes_stats_v30(None, episodes_table=_v30_episodes_table(triples))
+
     def test_constant_episodes_count_zero(self):
-        eps = {
-            0: {"stats/ok/min": [1.0], "stats/ok/max": [1.0]},
-            1: {"stats/ok/min": [0.0], "stats/ok/max": [0.0]},
-        }
-        assert self.count(eps, "ok") == (0, 2)
+        stats = self._loader_stats([(1, 1, 1), (0, 0, 0)])
+        assert self.count(stats, "ok") == (0, 2)
 
     def test_varying_episode_detected(self):
-        eps = {
-            0: {"stats/ok/min": [0.0], "stats/ok/max": [1.0]},
-            1: {"stats/ok/min": [1.0], "stats/ok/max": [1.0]},
-        }
-        assert self.count(eps, "ok") == (1, 2)
+        stats = self._loader_stats([(0, 1, 0.5), (1, 1, 1)])
+        assert self.count(stats, "ok") == (1, 2)
 
-    def test_missing_aggregates_are_skipped_not_flagged(self):
-        eps = {0: {"length": 10}, 1: {"stats/ok/min": [1.0], "stats/ok/max": [1.0]}}
-        assert self.count(eps, "ok") == (0, 1)
+    def test_missing_column_is_skipped_not_flagged(self):
+        stats = self._loader_stats([(1, 1, 1)])
+        assert self.count(stats, "other_col") == (0, 0)
 
-    def test_accepts_iterable_of_rows(self):
-        rows = [{"stats/ok/min": [0.0], "stats/ok/max": [1.0]}]
-        assert self.count(rows, "ok") == (1, 1)
+    def test_episodes_metadata_records_have_no_stats(self):
+        # `load_episodes_v30` strips every `stats/*` column from the episode
+        # records; the count must run on `episodes_stats`, not `episodes`.
+        table = _v30_episodes_table([(0, 1, 0.5)])
+        episodes = load_episodes_v30(None, episodes_table=table)
+        assert not any(k.startswith("stats/") for k in episodes[0])
+        stats = load_episodes_stats_v30(None, episodes_table=table)
+        assert self.count(stats, "ok") == (1, 1)
