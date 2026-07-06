@@ -933,7 +933,14 @@ class BaseDataset(torch.utils.data.Dataset):
         img_is_pad = self._standardize_images(item, standard_item, self.num_cams)
 
         for new_key, key in name_map.items():
-            if "camera" in new_key:
+            # Cameras were standardized above. `mistake`/`success` are
+            # optional-metadata roles: they may name a per-episode-only column
+            # (absent from `item`), and copying them here would leak a raw,
+            # per-dataset key into the sample schema — default collation
+            # across a mixture requires every dataset to emit the same keys.
+            # They are resolved in `__getitem__` (`_attach_mistake_raw`) and
+            # emitted uniformly by `_emit_optional_keys` instead.
+            if "camera" in new_key or new_key in ("mistake", "success"):
                 continue
             standard_item[new_key] = item[key]
 
