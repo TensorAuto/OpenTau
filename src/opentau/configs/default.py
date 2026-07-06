@@ -42,6 +42,13 @@ draccus.decode.register(np.ndarray, np.asarray)
 # For encoding to yaml
 draccus.encode.register(np.ndarray, lambda x: x.tolist())
 
+# Registry keys some config entry RESOLVES through (its effective key) this
+# process. Distinguishes a genuine mixture-entry collision (warn: an earlier
+# entry's registry consumers would silently see the new columns) from the
+# silent-by-design overwrites: a single entry overriding a built-in default,
+# and the plain repo_id back-compat slot in the joint/ee pattern.
+_CONFIG_EFFECTIVE_MAPPING_KEYS: set[str] = set()
+
 
 @dataclass
 class DatasetConfig:
@@ -89,7 +96,13 @@ class DatasetConfig:
             must name a per-frame column; for an episode-level outcome map
             ``success`` instead, which resolves from a per-frame column or a
             per-episode key in the episodes metadata and also drives the
-            value-function return bins. Defaults to None.
+            value-function return bins.
+            Two mixture entries may share a ``repo_id`` and ``control_mode``
+            while declaring different mappings (e.g. two camera views of one
+            repo): each dataset instance resolves its own entry's mapping.
+            The global registry keeps only the last registration for
+            annotation-script consumers — a warning fires when entries
+            disagree. Defaults to None.
         robot_type: Optional override for the dataset's ``robot_type`` metadata
             field. When provided (including the empty string), takes precedence
             over the value loaded from ``meta/info.json``. ``None`` (default)
@@ -243,17 +256,49 @@ class DatasetConfig:
         # two entries that share a repo_id but use different action columns
         # (e.g. control_mode="joint" -> action_joint vs control_mode="ee" ->
         # action_ee) coexist instead of the second silently clobbering the first.
+        # Dataset instances resolve their own entry's mapping per-instance
+        # (BaseDataset._get_name_map), so a same-key clobber here no longer
+        # affects training reads — but the registry stays the source for
+        # annotation scripts and direct constructions, so warn when two
+        # entries disagree on the same key.
         if self.data_features_name_mapping is not None:
             from opentau.datasets.standard_data_format_mapping import (
                 DATA_FEATURES_NAME_MAPPING,
                 feature_mapping_key,
             )
 
-            DATA_FEATURES_NAME_MAPPING[self.repo_id] = self.data_features_name_mapping
+            keys = []
+            effective = None
             if self.repo_id is not None:
-                key = feature_mapping_key(self.repo_id, self.control_mode)
-                if key != self.repo_id:
-                    DATA_FEATURES_NAME_MAPPING[key] = self.data_features_name_mapping
+                effective = feature_mapping_key(self.repo_id, self.control_mode)
+                keys = list(dict.fromkeys([self.repo_id, effective]))
+            for key in keys:
+                # Warn only when overwriting a key some earlier config entry
+                # RESOLVES through (its effective key) with a different
+                # mapping — that entry's registry consumers would silently
+                # see this entry's columns. Both the effective write and the
+                # plain-repo_id back-compat write are checked (a plain-key
+                # entry's effective registration can be clobbered by a later
+                # composite-key entry's back-compat write). Overwriting an
+                # un-tracked key — a built-in default, or the back-compat
+                # slot in the joint/ee pattern — stays silent by design.
+                previous = DATA_FEATURES_NAME_MAPPING.get(key)
+                if (
+                    key in _CONFIG_EFFECTIVE_MAPPING_KEYS
+                    and previous is not None
+                    and previous != self.data_features_name_mapping
+                ):
+                    warnings.warn(
+                        f"data_features_name_mapping: registry key {key!r} is being overwritten "
+                        "with a different mapping (another mixture entry resolves its mapping "
+                        "via this key). Each dataset instance still uses its own entry's "
+                        "mapping, but registry consumers (annotation scripts, direct "
+                        "constructions) will see only the last one registered.",
+                        stacklevel=2,
+                    )
+                DATA_FEATURES_NAME_MAPPING[key] = self.data_features_name_mapping
+            if effective is not None:
+                _CONFIG_EFFECTIVE_MAPPING_KEYS.add(effective)
 
 
 @dataclass
