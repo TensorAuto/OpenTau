@@ -243,6 +243,10 @@ _DOWNLOAD_MAX_WORKERS = 16
 # instances within a single process (e.g., train + val constructed for the same repo).
 _CONTROL_MODE_WARNED: set[str] = set()
 
+# Datasets already warned about a within-episode-varying `success` role column
+# (one warning per repo_id per process; train/val splits instantiate twice).
+_SUCCESS_ROLE_WARNED: set[str] = set()
+
 # ``skip_timestamp_check`` is a mixture-wide decision (with optional per-dataset
 # override) that produces an identical warning for every dataset in the mixture.
 # For a 392-dataset pretraining run on 8 ranks, the naive per-dataset emission
@@ -1635,6 +1639,31 @@ class LeRobotDataset(BaseDataset):
                 self.repo_id,
             )
 
+        # The `success` role expects an episode-constant column: it feeds the
+        # value-function return bins and the derived `mistake` metadata, both
+        # episode-level outcomes. A genuinely per-frame column (e.g. a
+        # terminal-only success marker) would silently yield per-frame
+        # outcomes, so where the episodes metadata carries per-episode
+        # min/max aggregates (v3.0 layouts), prove constancy at load time.
+        success_col = DATA_FEATURES_NAME_MAPPING.get(self._get_feature_mapping_key(), {}).get("success")
+        if (
+            success_col is not None
+            and self.meta.episodes is not None
+            and self.repo_id not in _SUCCESS_ROLE_WARNED
+        ):
+            varying, checked = self._count_success_role_varying_episodes(self.meta.episodes, success_col)
+            if varying:
+                _SUCCESS_ROLE_WARNED.add(self.repo_id)
+                logging.warning(
+                    "Dataset %r: column %r mapped to the `success` role varies within %d/%d episodes. "
+                    "The role expects an episode-constant outcome; value-function return bins and the "
+                    "derived `mistake` metadata will follow whichever frame is sampled.",
+                    self.repo_id,
+                    success_col,
+                    varying,
+                    checked,
+                )
+
         # Resolve the effective episode set: `(episodes or all) - excluded`,
         # with `excluded_episodes` taking precedence (see
         # `resolve_selected_episodes`). Done before the stats block below so the
@@ -2474,6 +2503,36 @@ class LeRobotDataset(BaseDataset):
         if value is not None:
             return bool(np.asarray(value).reshape(-1)[0])
         return None
+
+    @staticmethod
+    def _count_success_role_varying_episodes(episodes, success_col: str) -> tuple[int, int]:
+        """Count episodes whose mapped ``success`` column varies within the episode.
+
+        Best-effort constancy proof for the ``success`` role: relies on the
+        v3.0 flattened per-episode aggregates ``stats/<col>/min`` /
+        ``stats/<col>/max`` in the episodes metadata. Episodes without those
+        keys are skipped (v2.x layouts carry no flattened aggregates), so a
+        zero ``checked`` count means "nothing provable", not "all constant".
+
+        Args:
+            episodes: Per-episode metadata rows — a mapping keyed by episode
+                index or an iterable of row dicts.
+            success_col: Dataset-specific column name mapped to ``success``.
+
+        Returns:
+            ``(varying, checked)`` episode counts.
+        """
+        lo_key, hi_key = f"stats/{success_col}/min", f"stats/{success_col}/max"
+        varying = checked = 0
+        rows = episodes.values() if hasattr(episodes, "values") else episodes
+        for row in rows:
+            lo, hi = row.get(lo_key), row.get(hi_key)
+            if lo is None or hi is None:
+                continue
+            checked += 1
+            if float(np.asarray(lo).reshape(-1)[0]) != float(np.asarray(hi).reshape(-1)[0]):
+                varying += 1
+        return varying, checked
 
     def _attach_mistake_raw(self, item: dict, episodes_info: dict) -> bool | None:
         """Attach ``mistake_raw`` from the standard ``mistake``/``success`` roles.

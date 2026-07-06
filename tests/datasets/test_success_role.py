@@ -23,6 +23,7 @@ mistake-polarity column taking precedence over an inverted ``success`` role).
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from opentau.datasets.lerobot_dataset import LeRobotDataset
@@ -31,6 +32,13 @@ from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAP
 resolve = LeRobotDataset._resolve_episode_success
 
 _TEST_MAPPING_KEY = "_tests/success_role_dummy"
+
+
+@pytest.fixture(autouse=True)
+def _clean_mapping_registration():
+    """Remove the test's mapping key from the process-global registry."""
+    yield
+    DATA_FEATURES_NAME_MAPPING.pop(_TEST_MAPPING_KEY, None)
 
 
 def _make_ds(mapping: dict[str, str]) -> LeRobotDataset:
@@ -125,3 +133,29 @@ class TestAttachMistakeRaw:
         item = {}
         assert ds._attach_mistake_raw(item, {}) is None
         assert "mistake_raw" not in item
+
+
+class TestCountSuccessRoleVaryingEpisodes:
+    count = staticmethod(LeRobotDataset._count_success_role_varying_episodes)
+
+    def test_constant_episodes_count_zero(self):
+        eps = {
+            0: {"stats/ok/min": [1.0], "stats/ok/max": [1.0]},
+            1: {"stats/ok/min": [0.0], "stats/ok/max": [0.0]},
+        }
+        assert self.count(eps, "ok") == (0, 2)
+
+    def test_varying_episode_detected(self):
+        eps = {
+            0: {"stats/ok/min": [0.0], "stats/ok/max": [1.0]},
+            1: {"stats/ok/min": [1.0], "stats/ok/max": [1.0]},
+        }
+        assert self.count(eps, "ok") == (1, 2)
+
+    def test_missing_aggregates_are_skipped_not_flagged(self):
+        eps = {0: {"length": 10}, 1: {"stats/ok/min": [1.0], "stats/ok/max": [1.0]}}
+        assert self.count(eps, "ok") == (0, 1)
+
+    def test_accepts_iterable_of_rows(self):
+        rows = [{"stats/ok/min": [0.0], "stats/ok/max": [1.0]}]
+        assert self.count(rows, "ok") == (1, 1)
