@@ -326,7 +326,9 @@ def _build_tasks(args: Args) -> tuple[list[dict], dict, list[str]]:
     cols, dims = [], []
     max_s = max_a = 1
     for dc, m in zip(kept_cfgs, metadatas, strict=True):
-        nm = resolve_feature_mapping(dc.repo_id, m.info.get("control_mode"))
+        # Mirror training: the entry's own mapping wins over the registry
+        # (which is ambiguous when entries share a repo_id and control_mode).
+        nm = dc.data_features_name_mapping or resolve_feature_mapping(dc.repo_id, m.info.get("control_mode"))
         scol, acol = nm.get("state"), nm.get("actions")
         sdim = int(np.asarray(m.stats[scol]["mean"]).shape[-1]) if scol in m.stats else 0
         adim = int(np.asarray(m.stats[acol]["mean"]).shape[-1]) if acol in m.stats else 0
@@ -338,7 +340,13 @@ def _build_tasks(args: Args) -> tuple[list[dict], dict, list[str]]:
         max_state_dim=max_s, max_action_dim=max_a, num_cams=0, resolution=(224, 224), dataset_mixture=mix_cfg
     )
     names = WeightedDatasetMixture._make_dataset_names(cfg_shim, metadatas)
-    mm = DatasetMixtureMetadata(cfg_shim, metadatas, kept_w, dataset_names=names)
+    mm = DatasetMixtureMetadata(
+        cfg_shim,
+        metadatas,
+        kept_w,
+        dataset_names=names,
+        name_maps=[dc.data_features_name_mapping for dc in kept_cfgs],
+    )
     logger.info("%d (robot_type, control_mode) heads over %d datasets", len(mm.norm_keys), len(names))
 
     # Per-head meta stats, sliced to each head's native dim.

@@ -42,10 +42,12 @@ draccus.decode.register(np.ndarray, np.asarray)
 # For encoding to yaml
 draccus.encode.register(np.ndarray, lambda x: x.tolist())
 
-# DATA_FEATURES_NAME_MAPPING keys registered by a config entry this process.
-# Distinguishes a genuine mixture-entry collision (warn) from a single entry
-# overriding a built-in default mapping (legitimate, silent).
-_CONFIG_REGISTERED_MAPPING_KEYS: set[str] = set()
+# Registry keys some config entry RESOLVES through (its effective key) this
+# process. Distinguishes a genuine mixture-entry collision (warn: an earlier
+# entry's registry consumers would silently see the new columns) from the
+# silent-by-design overwrites: a single entry overriding a built-in default,
+# and the plain repo_id back-compat slot in the joint/ee pattern.
+_CONFIG_EFFECTIVE_MAPPING_KEYS: set[str] = set()
 
 
 @dataclass
@@ -271,30 +273,32 @@ class DatasetConfig:
                 effective = feature_mapping_key(self.repo_id, self.control_mode)
                 keys = list(dict.fromkeys([self.repo_id, effective]))
             for key in keys:
-                # Warn only on an entry-vs-entry conflict: the key must be the
-                # effective (composite-or-plain) key this entry's datasets
-                # resolve, AND the previous registration must come from
-                # another config entry. Overwriting the plain repo_id
-                # back-compat slot from a different control mode, or
-                # overriding a *built-in* default mapping, is by design and
-                # stays silent.
+                # Warn only when overwriting a key some earlier config entry
+                # RESOLVES through (its effective key) with a different
+                # mapping — that entry's registry consumers would silently
+                # see this entry's columns. Both the effective write and the
+                # plain-repo_id back-compat write are checked (a plain-key
+                # entry's effective registration can be clobbered by a later
+                # composite-key entry's back-compat write). Overwriting an
+                # un-tracked key — a built-in default, or the back-compat
+                # slot in the joint/ee pattern — stays silent by design.
                 previous = DATA_FEATURES_NAME_MAPPING.get(key)
                 if (
-                    key == effective
-                    and key in _CONFIG_REGISTERED_MAPPING_KEYS
+                    key in _CONFIG_EFFECTIVE_MAPPING_KEYS
                     and previous is not None
                     and previous != self.data_features_name_mapping
                 ):
                     warnings.warn(
                         f"data_features_name_mapping: registry key {key!r} is being overwritten "
-                        "with a different mapping (two mixture entries share this "
-                        "repo_id/control_mode). Each dataset instance still uses its own entry's "
+                        "with a different mapping (another mixture entry resolves its mapping "
+                        "via this key). Each dataset instance still uses its own entry's "
                         "mapping, but registry consumers (annotation scripts, direct "
                         "constructions) will see only the last one registered.",
                         stacklevel=2,
                     )
                 DATA_FEATURES_NAME_MAPPING[key] = self.data_features_name_mapping
-                _CONFIG_REGISTERED_MAPPING_KEYS.add(key)
+            if effective is not None:
+                _CONFIG_EFFECTIVE_MAPPING_KEYS.add(effective)
 
 
 @dataclass

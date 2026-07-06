@@ -33,7 +33,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from opentau.configs.default import _CONFIG_REGISTERED_MAPPING_KEYS, DatasetConfig
+from opentau.configs.default import _CONFIG_EFFECTIVE_MAPPING_KEYS, DatasetConfig
 from opentau.datasets.dataset_mixture import DatasetMixtureMetadata
 from opentau.datasets.factory import make_dataset, resolve_delta_timestamps
 from opentau.datasets.lerobot_dataset import LeRobotDataset
@@ -54,7 +54,7 @@ def _clean_mapping_registration():
     yield
     for key in _TEST_KEYS:
         DATA_FEATURES_NAME_MAPPING.pop(key, None)
-        _CONFIG_REGISTERED_MAPPING_KEYS.discard(key)
+        _CONFIG_EFFECTIVE_MAPPING_KEYS.discard(key)
 
 
 def _make_ds(instance_mapping: dict[str, str] | None) -> LeRobotDataset:
@@ -170,6 +170,38 @@ class TestConfigRegistrationWarning:
                 data_features_name_mapping={"camera0": "config_cam"},
             )
         assert DATA_FEATURES_NAME_MAPPING["_tests/collision_repo"]["camera0"] == "config_cam"
+
+    def test_explicit_then_missing_control_mode_does_not_warn(self):
+        """A plain-key entry after a composite-key entry only overwrites the
+        back-compat slot — the composite entry's effective key is intact."""
+        DatasetConfig(
+            repo_id="_tests/collision_repo",
+            control_mode="joint",
+            data_features_name_mapping={"camera0": "exterior_1_left"},
+        )
+        import warnings as _warnings
+
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("error")
+            DatasetConfig(
+                repo_id="_tests/collision_repo",
+                data_features_name_mapping={"camera0": "exterior_2_left"},
+            )
+        assert DATA_FEATURES_NAME_MAPPING["_tests/collision_repo::joint"]["camera0"] == "exterior_1_left"
+
+    def test_missing_then_explicit_control_mode_warns(self):
+        """A composite-key entry's back-compat write clobbers the plain key a
+        prior entry RESOLVES through — that must warn."""
+        DatasetConfig(
+            repo_id="_tests/collision_repo",
+            data_features_name_mapping={"camera0": "exterior_1_left"},
+        )
+        with pytest.warns(UserWarning, match="overwritten with a different mapping"):
+            DatasetConfig(
+                repo_id="_tests/collision_repo",
+                control_mode="joint",
+                data_features_name_mapping={"camera0": "exterior_2_left"},
+            )
 
 
 def _colliding_configs() -> tuple[DatasetConfig, DatasetConfig]:
