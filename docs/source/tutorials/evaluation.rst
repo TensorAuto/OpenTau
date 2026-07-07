@@ -23,6 +23,24 @@ For example, to evaluate a policy on the LIBERO 10, run:
    You can't pass in an DeepSpeed accelerate config file to ``eval.py`` as DeepSpeed expects optimizer and dataloader during ``accelerator.prepare()``, which we do not provide during eval. It is recommended to pass in a DDP config.
 
 .. note::
+   **In-training sim eval under DeepSpeed ZeRO-3.** In-training rollouts
+   (``eval_freq > 0``) work under ZeRO-3 even though every policy forward
+   all-gathers the sharded parameters per layer (a cross-rank collective):
+   rollouts run in *cross-rank lockstep* — each global round is one flag
+   all-reduce plus one ``select_action`` on every rank, and ranks whose episodes
+   or (round-robin-sharded) task shards finish early keep issuing sync-only
+   forwards on their last observation until every rank is done, so the
+   all-gather counts stay matched. This costs idle-rank compute proportional to
+   the episode-length / task-count imbalance, it forces
+   ``env.max_parallel_tasks`` to 1, and it requires every rank to hold at least
+   one task (world size must not exceed the eval task count). Three
+   configurations remain unsupported under parameter sharding and fail fast: the
+   AR discrete-action eval decode (``policy.eval_use_discrete_actions=true``,
+   whose per-rank forward count is data-dependent), subgoal-conditioned eval
+   (``env.subgoal_source`` / ``env.subgoal_frames_dirs``, whose per-rank subgoal
+   availability decides which submodules run inside a forward), and FSDP.
+
+.. note::
    Make sure that the ``EnvConfig`` and ``EvalConfig`` are set to the correct values for the simulation environment in your train config file.
 
 .. _evaluating-libero:

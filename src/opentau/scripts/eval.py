@@ -88,6 +88,7 @@ def rollout(
     render_callback: Callable[[gym.vector.VectorEnv], None] | None = None,
     subgoal_generator: SubgoalImageGenerator | None = None,
     capture_last_frames: bool = False,
+    lockstep: "_RolloutLockstep | None" = None,
 ) -> dict:
     """Run a batched policy rollout once through a batch of environments.
 
@@ -122,6 +123,14 @@ def rollout(
             ``"last_frames"`` as a per-env list of ``{camera_key: HxWx3 uint8}`` (or None for a
             zero-step env). Memory-cheap (only the final frame per env, not the whole sequence) and
             independent of ``return_observations``; used to harvest goal frames of successful rollouts.
+        lockstep: Cross-rank rollout synchronizer under parameter sharding (FSDP /
+            DeepSpeed ZeRO-3), where every policy forward all-gathers params per
+            layer. When set, the step loop runs in global rounds: each round is one
+            flag all-reduce plus one ``select_action`` on every rank, and a rank
+            whose envs are all done keeps replaying its last observation through
+            sync-only forwards (results discarded, no env interaction) until every
+            rank reports done — keeping the collective count matched across ranks.
+            None (default) keeps the per-rank-independent behavior.
     Returns:
         The dictionary described above.
     """
@@ -159,7 +168,26 @@ def rollout(
     # Per-env final raw camera frames ({camera_key: HxWx3 uint8}); only the frame at each env's
     # done-step is kept (updated every step the env is still live, then frozen).
     last_frames: list[dict[str, np.ndarray] | None] = [None] * env.num_envs
-    while not np.all(done) and step < max_steps:
+    # Last policy-format observation, replayed by lockstep sync-only forwards once
+    # this rank's envs are done. Seeded from the template so a rollout that is
+    # locally done at round 0 (max_steps == 0) can still participate.
+    sync_observation: dict | None = lockstep.observation_template if lockstep is not None else None
+    while True:
+        local_running = bool(not np.all(done) and step < max_steps)
+        if lockstep is None:
+            if not local_running:
+                break
+        else:
+            # Exactly one flag all-reduce per round on every rank; the all-reduced
+            # value is identical everywhere, so all ranks exit on the same round.
+            if not lockstep.any_rank_running(local_running):
+                break
+            if not local_running:
+                # Other ranks are still mid-rollout: replay the last observation
+                # through select_action so this rank issues the same sharded-param
+                # all-gathers, and discard the result.
+                _lockstep_sync_forward(policy, sync_observation)
+                continue
         # Numpy array to tensor and changing dictionary keys to OpenTau policy format.
         observation = preprocess_observation(observation, cfg=cfg)
         # Infer "task" from attributes of environments.
@@ -193,7 +221,19 @@ def rollout(
         elif eval_dataset_repo_id is not None:
             observation["dataset_repo_id"] = eval_dataset_repo_id
 
-        with torch.inference_mode():
+        if lockstep is not None:
+            # Remember the fully assembled policy input: sync-only rounds of this
+            # rollout replay it, and ghost rollouts on this rank reuse it as the
+            # template once the local task shard is exhausted.
+            sync_observation = observation
+            lockstep.observation_template = observation
+
+        # Under parameter sharding, use no_grad instead of inference_mode: the
+        # sharded backend re-assigns param storage from tensors allocated inside
+        # this context during its all-gathers, and inference-mode tensors that
+        # survive into module state trip version-counter checks on the next
+        # training step (in-training eval resumes training right after).
+        with torch.no_grad() if lockstep is not None else torch.inference_mode():
             action = policy.select_action(observation)
 
         # Convert to CPU / numpy.
@@ -344,6 +384,22 @@ def _rank_seed_offset(*, process_index: int, decorrelate: bool, per_rank_span: i
     return process_index * per_rank_span
 
 
+def _parse_seed_list(cfg: TrainPipelineConfig) -> list[int] | None:
+    """Parse the optional explicit eval scene-seed list (``cfg.eval.seed_list``).
+
+    Args:
+        cfg: The pipeline config.
+
+    Returns:
+        The parsed seed list when ``cfg.eval.seed_list`` is set (possibly empty),
+        else None. Config-derived, so identical on every rank.
+    """
+    _sl = getattr(cfg.eval, "seed_list", None)
+    if not _sl:
+        return None
+    return [int(s) for s in str(_sl).split(",") if s.strip() != ""]
+
+
 def eval_policy(
     env: gym.vector.VectorEnv,
     policy: PreTrainedPolicy,
@@ -355,6 +411,7 @@ def eval_policy(
     start_seed: int | None = None,
     grid_size: tuple[int, int] | None = None,
     subgoal_generator: SubgoalImageGenerator | None = None,
+    lockstep: "_RolloutLockstep | None" = None,
 ) -> dict:
     """
     Args:
@@ -369,6 +426,8 @@ def eval_policy(
         start_seed: The first seed to use for the first individual rollout. For all subsequent rollouts the
             seed is incremented by 1. If not provided, the environments are not manually seeded.
         grid_size: The grid size to use for rendering concatenated rollouts.
+        lockstep: Cross-rank rollout synchronizer under parameter sharding (see
+            ``_RolloutLockstep``); None for per-rank-independent rollouts.
     Returns:
         Dictionary with metrics and data regarding the rollouts.
     """
@@ -383,10 +442,8 @@ def eval_policy(
     # goal-frame backfill (re-run only the scenes a prior checkpoint failed). When set it overrides
     # n_episodes; the last batch is right-padded by repeating the final seed to fill env.num_envs
     # (the duplicate re-runs the same deterministic scene, so captured frames just overwrite — harmless).
-    explicit_seed_list: list[int] | None = None
-    _sl = getattr(cfg.eval, "seed_list", None)
-    if _sl:
-        explicit_seed_list = [int(s) for s in str(_sl).split(",") if s.strip() != ""]
+    explicit_seed_list: list[int] | None = _parse_seed_list(cfg)
+    if explicit_seed_list is not None:
         n_episodes = len(explicit_seed_list)
 
     # Determine how many batched rollouts we need to get n_episodes. Note that if n_episodes is not evenly
@@ -472,6 +529,7 @@ def eval_policy(
             render_callback=render_frame if max_episodes_rendered > 0 else None,
             subgoal_generator=subgoal_generator,
             capture_last_frames=capture_last_frames,
+            lockstep=lockstep,
         )
         # Figure out where in each rollout sequence the first done condition was encountered (results after
         # this won't be included).
@@ -651,43 +709,78 @@ def eval_policy(
 
     # Write a single goal-frame manifest CSV (one row per successful episode), so a downstream
     # aggregator can pick the best successful frame-set per (task, seed) across checkpoints.
-    # eval_policy runs on EVERY rank, so gather each rank's rows and let exactly one writer (rank 0)
-    # emit manifest.csv — concurrent appends from all ranks would interleave/duplicate rows and race
-    # on the header. gather_object is a collective; `capture_last_frames` is config-derived and
-    # identical on every rank, so all ranks reach it together.
+    # Multi-rank runs must NOT gather here: gather_object is a collective and eval_policy runs
+    # once per task, but per-rank task counts differ under round-robin sharding (ceil vs floor of
+    # n_tasks / world_size), so a per-task gather desyncs the collective order across ranks (rank
+    # A's manifest gather pairs with rank B's eval_info gather). Instead the rows ride back on
+    # `info` and eval_policy_all gathers them exactly ONCE per rank after all tasks (and, under
+    # lockstep, after the ghost-task drain) — matched regardless of shard imbalance or backend.
     if capture_last_frames:
         acc = get_proc_accelerator()
         if acc is not None and acc.num_processes > 1:
-            gathered_rows: list[dict] = []
-            for rank_rows in gather_object([goal_manifest_rows]):
-                gathered_rows.extend(rank_rows)
+            info["goal_manifest_rows"] = goal_manifest_rows
         else:
-            gathered_rows = goal_manifest_rows
-        if (acc is None or acc.is_main_process) and gathered_rows:
-            # Dedup by (task, seed, decoder): when ranks share seeds (decorrelate_rank_seeds off) the
-            # same scene is harvested once per rank; keep the first (its rank-suffixed PNG exists).
-            seen: set[tuple] = set()
-            rows: list[dict] = []
-            for r in gathered_rows:
-                key = (r["task"], r["seed"], r["decoder"])
-                if key in seen:
-                    continue
-                seen.add(key)
-                rows.append(r)
-            # Size fieldnames to the cameras actually harvested (not a fixed camera0/1/2) so configs
-            # with >3 cameras don't silently drop columns under extrasaction="ignore".
-            cam_cols = sorted({k for r in rows for k in r if k.startswith("camera")})
-            fieldnames = ["task", "seed", "decoder", "success", *cam_cols]
-            manifest_path = goal_frames_dir / "manifest.csv"
-            write_header = not manifest_path.exists()
-            with open(manifest_path, "a", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-                if write_header:
-                    writer.writeheader()
-                writer.writerows(rows)
-            info["goal_frames_saved"] = len(rows)
+            n_saved = _gather_and_write_goal_manifest(goal_manifest_rows, cfg, acc)
+            if n_saved is not None:
+                info["goal_frames_saved"] = n_saved
 
     return info
+
+
+def _gather_and_write_goal_manifest(
+    goal_manifest_rows: list[dict],
+    cfg: TrainPipelineConfig,
+    acc: Accelerator | None,
+) -> int | None:
+    """Gather each rank's goal-frame manifest rows and let rank 0 write manifest.csv.
+
+    One matched ``gather_object`` collective per call. Called from exactly one of
+    two places: single-process runs write directly from ``eval_policy`` (the
+    gather is an identity there), and multi-rank runs call it exactly once per
+    rank from ``eval_policy_all`` after every task (and any lockstep ghost-task
+    drain) has finished — so the collective count is rank-uniform even when the
+    round-robin task sharding is uneven.
+
+    Args:
+        goal_manifest_rows: This rank's manifest rows (may be empty).
+        cfg: The pipeline config; ``cfg.eval.goal_frames_dir`` must be set.
+        acc: The process-global accelerator (or None outside accelerate).
+
+    Returns:
+        The number of rows written on the writing (main) process, else None.
+    """
+    if acc is not None and acc.num_processes > 1:
+        gathered_rows: list[dict] = []
+        for rank_rows in gather_object([goal_manifest_rows]):
+            gathered_rows.extend(rank_rows)
+    else:
+        gathered_rows = goal_manifest_rows
+    if (acc is None or acc.is_main_process) and gathered_rows:
+        # Dedup by (task, seed, decoder): when ranks share seeds (decorrelate_rank_seeds off) the
+        # same scene is harvested once per rank; keep the first (its rank-suffixed PNG exists).
+        seen: set[tuple] = set()
+        rows: list[dict] = []
+        for r in gathered_rows:
+            key = (r["task"], r["seed"], r["decoder"])
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(r)
+        # Size fieldnames to the cameras actually harvested (not a fixed camera0/1/2) so configs
+        # with >3 cameras don't silently drop columns under extrasaction="ignore".
+        cam_cols = sorted({k for r in rows for k in r if k.startswith("camera")})
+        fieldnames = ["task", "seed", "decoder", "success", *cam_cols]
+        goal_frames_dir = Path(cfg.eval.goal_frames_dir)
+        goal_frames_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = goal_frames_dir / "manifest.csv"
+        write_header = not manifest_path.exists()
+        with open(manifest_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            if write_header:
+                writer.writeheader()
+            writer.writerows(rows)
+        return len(rows)
+    return None
 
 
 def create_grid_summary_video(
@@ -925,11 +1018,12 @@ def make_subgoal_generator(cfg: TrainPipelineConfig) -> SubgoalImageGenerator | 
 def _eval_uses_sharded_params(accelerator: Accelerator) -> bool:
     """Whether params are sharded across ranks (FSDP or DeepSpeed ZeRO-3).
 
-    The per-rank-independent sim-eval rollout fires no cross-rank collective of
-    its own, but under parameter sharding the policy forward all-gathers params
-    per layer; paired with a per-rank-divergent decode loop (the variable-length
-    AR discrete-action path) the ranks issue a different number of all-gathers
-    and hang at NCCL. Mirrors the in-training guard in ``train.py``.
+    Under parameter sharding the policy forward all-gathers params per layer —
+    a cross-rank collective — so eval rollouts must keep the number and order of
+    forwards matched across ranks. ``_make_rollout_lockstep`` uses this to decide
+    whether rollouts need cross-rank lockstep, and ``eval_main`` / ``train.py``
+    use it to reject the variable-length AR discrete-action decode (whose
+    per-rank data-dependent forward count lockstep cannot align).
 
     Args:
         accelerator: The active accelerate ``Accelerator``.
@@ -944,6 +1038,190 @@ def _eval_uses_sharded_params(accelerator: Accelerator) -> bool:
         ds_config = getattr(getattr(plugin, "hf_ds_config", None), "config", None) or {}
         return int(ds_config.get("zero_optimization", {}).get("stage", 0)) >= 3
     return False
+
+
+class _RolloutLockstep:
+    """Round-based cross-rank synchronizer for eval rollouts under parameter sharding.
+
+    Under FSDP / DeepSpeed ZeRO-3 every policy forward all-gathers parameters per
+    layer — a cross-rank collective. Sim-eval rollouts are per-rank independent
+    (episodes terminate at different steps, and the round-robin task sharding can
+    give ranks different task counts), so left alone the ranks issue different
+    numbers of all-gathers and hang at NCCL. This object serializes rollouts into
+    global "rounds": every rank performs exactly one ``any_rank_running`` flag
+    all-reduce followed by at most one ``select_action`` per round, and keeps
+    issuing sync-only forwards after its own envs are done until every rank
+    reports done (the ``synced_gpus`` pattern from HF ``generate``).
+
+    Why matching ``select_action`` counts is sufficient: every policy's
+    action-queue replenish cadence (the calls on which a model forward actually
+    fires) is a pure function of call-count-since-``reset()`` for a fixed config,
+    and ``reset()`` happens at rollout start, which lockstep aligns on a global
+    round boundary for every rank. Matching per-round ``select_action`` calls
+    therefore matches model-forward counts — and with them the sharded-param
+    all-gathers. Two eval paths break that invariant and are rejected up front
+    under sharding: the variable-length AR discrete-action decode
+    (data-dependent forward COUNT), and subgoal-conditioned eval (the
+    pi07-family ``embed_prefix`` takes a per-rank ``has_subgoal`` branch with
+    ``sync_across_ranks=False`` in eval, so rank-divergent subgoal availability
+    changes which submodules — and therefore which all-gathers — run inside a
+    single forward).
+    """
+
+    def __init__(self, accelerator: Accelerator):
+        self.accelerator = accelerator
+        # Last policy-format observation this rank fed to select_action.
+        # Recorded by rollout(); replayed by sync-only forwards and by
+        # _ghost_rollout on ranks that exhaust their task shard early. Given the
+        # guards above, the observation content is irrelevant to the collective
+        # schedule (weight all-gathers do not depend on batch content); it only
+        # has to be a structurally valid policy input.
+        self.observation_template: dict | None = None
+
+    def any_rank_running(self, local_running: bool) -> bool:
+        """One matched flag all-reduce per rollout round.
+
+        Args:
+            local_running: Whether this rank still has live envs this round.
+
+        Returns:
+            True while any rank is still rolling out; every rank sees the same
+            value, so all ranks exit a rollout's round loop together.
+        """
+        flag = torch.tensor([int(local_running)], dtype=torch.int32, device=self.accelerator.device)
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.SUM)
+        return bool(flag.item() > 0)
+
+    def task_plan_over_ranks(self, n_local_tasks: int) -> tuple[int, int]:
+        """One MAX all-reduce over ``[n, -n]`` -> per-rank task count (min, max).
+
+        The max sizes the ghost-task plan; the min lets every rank detect a
+        zero-task rank *together* (a one-sided raise later, while peers sit in a
+        round all-reduce, would hang the job instead of failing it). Must be
+        called at a globally aligned point (before any rollout round), otherwise
+        it would interleave with another rank's ``any_rank_running`` all-reduces
+        and mismatch the collective order.
+
+        Args:
+            n_local_tasks: Number of (task_group, task_id) pairs on this rank.
+
+        Returns:
+            ``(min_tasks, max_tasks)`` across all ranks.
+        """
+        counts = torch.tensor(
+            [n_local_tasks, -n_local_tasks], dtype=torch.int32, device=self.accelerator.device
+        )
+        torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.MAX)
+        return -int(counts[1].item()), int(counts[0].item())
+
+
+def _make_rollout_lockstep(accelerator: Accelerator | None) -> _RolloutLockstep | None:
+    """Build the rollout lockstep synchronizer when eval runs on sharded params.
+
+    Args:
+        accelerator: The process-global accelerator (or None outside accelerate).
+
+    Returns:
+        A ``_RolloutLockstep`` when rollout forwards fire cross-rank collectives
+        that must stay matched (multi-rank FSDP / DeepSpeed ZeRO-3), else None —
+        in which case rollouts keep their existing per-rank-independent behavior.
+    """
+    if accelerator is None or accelerator.num_processes <= 1:
+        return None
+    if not _eval_uses_sharded_params(accelerator):
+        return None
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        # Sharded backends always run on an initialized process group; this is
+        # defensive for partially mocked accelerators (e.g. unit tests).
+        return None
+    return _RolloutLockstep(accelerator)
+
+
+def _lockstep_sync_forward(policy: PreTrainedPolicy, observation: dict | None) -> None:
+    """One sync-only ``select_action``: fire the same collectives, discard the action.
+
+    Args:
+        policy: The (already unwrapped) policy.
+        observation: A policy-format observation to replay. Must not be None.
+    """
+    if observation is None:
+        raise RuntimeError(
+            "Lockstep eval has no observation to replay for a sync-only forward. "
+            "This rank reached a sync-only round before completing a single real "
+            "rollout step (e.g. an env with max_steps == 0)."
+        )
+    with torch.no_grad():
+        policy.select_action(observation)
+
+
+def _ghost_rollout(policy: PreTrainedPolicy, lockstep: _RolloutLockstep) -> None:
+    """Participate in one rollout's collectives without an env.
+
+    Mirrors ``rollout()``'s lockstep protocol for a rank whose task shard is
+    exhausted while other ranks still roll out: reset the policy on the same
+    global round boundary (so the action-queue replenish cadence stays aligned
+    across ranks), then issue one sync-only forward per round until every rank
+    reports done.
+
+    Args:
+        policy: The policy (possibly accelerator-wrapped).
+        lockstep: The active lockstep synchronizer.
+    """
+    acc = lockstep.accelerator
+    if not isinstance(policy, PreTrainedPolicy):
+        policy = acc.unwrap_model(policy)
+    observation = lockstep.observation_template
+    if observation is None:
+        # Defensive backstop: unreachable via eval_policy_all, whose task plan
+        # rejects zero-task ranks on every rank together at the aligned plan
+        # point (a one-sided raise here would strand peers in a collective).
+        raise RuntimeError(
+            "Lockstep ghost rollout has no observation template: this rank ran no "
+            "real rollout before draining ghost tasks (it was assigned zero eval "
+            "tasks). Reduce the world size to at most the number of eval tasks."
+        )
+    policy.reset()
+    while lockstep.any_rank_running(False):
+        _lockstep_sync_forward(policy, observation)
+    if hasattr(policy, "use_original_modules"):
+        policy.use_original_modules()
+
+
+def _drain_ghost_tasks(
+    *,
+    policy: PreTrainedPolicy,
+    cfg: TrainPipelineConfig,
+    lockstep: _RolloutLockstep,
+    n_ghost_tasks: int,
+    n_episodes: int,
+    num_envs: int,
+) -> None:
+    """Keep a rank participating in collectives after it exhausted its task shard.
+
+    Each ghost task mirrors one real ``eval_policy`` call rollout-for-rollout:
+    ``n_batches`` ghost rollouts, with the same batch plan every rank computes
+    from the rank-uniform config. (Goal-frame manifest gathering needs no ghost
+    slot: under multi-rank it is deferred to one gather per ``eval_policy_all``,
+    which every rank reaches regardless of its shard size.)
+
+    Args:
+        policy: The policy (possibly accelerator-wrapped).
+        cfg: The pipeline config (rank-uniform).
+        lockstep: The active lockstep synchronizer.
+        n_ghost_tasks: How many ghost tasks this rank owes (max task count over
+            ranks minus its local task count).
+        n_episodes: The same per-task episode count passed to ``eval_policy``.
+        num_envs: Envs per vectorized task env (``cfg.eval.batch_size``).
+    """
+    if n_ghost_tasks <= 0:
+        return
+    explicit_seed_list = _parse_seed_list(cfg)
+    if explicit_seed_list is not None:
+        n_episodes = len(explicit_seed_list)
+    n_batches = n_episodes // num_envs + int((n_episodes % num_envs) != 0)
+    for _ in range(n_ghost_tasks):
+        for _ in range(n_batches):
+            _ghost_rollout(policy, lockstep)
 
 
 @parser.wrap()
@@ -1047,6 +1325,7 @@ def eval_one(
     start_seed: int | None,
     grid_size: tuple[int, int] | None = None,
     subgoal_generator: SubgoalImageGenerator | None = None,
+    lockstep: "_RolloutLockstep | None" = None,
 ) -> tuple[TaskMetrics, dict]:
     """Evaluates one task_id of one suite using the provided vec env."""
 
@@ -1063,6 +1342,7 @@ def eval_one(
         start_seed=start_seed,
         grid_size=grid_size,
         subgoal_generator=subgoal_generator,
+        lockstep=lockstep,
     )
 
     per_episode = task_result["per_episode"]
@@ -1088,6 +1368,7 @@ def run_one(
     start_seed: int | None,
     grid_size: tuple[int, int] | None = None,
     subgoal_generator: SubgoalImageGenerator | None = None,
+    lockstep: "_RolloutLockstep | None" = None,
 ) -> tuple[str, int, TaskMetrics, dict]:
     """
     Run eval_one for a single (task_group, task_id, env).
@@ -1115,6 +1396,7 @@ def run_one(
         start_seed=start_seed,
         grid_size=grid_size,
         subgoal_generator=subgoal_generator,
+        lockstep=lockstep,
     )
     # ensure we always provide video_paths key to simplify accumulation
     if max_episodes_rendered > 0:
@@ -1171,6 +1453,54 @@ def eval_policy_all(
     # Flatten envs into list of (task_group, task_id, env)
     tasks = [(tg, tid, vec) for tg, group in envs.items() for tid, vec in group.items()]
 
+    # Under parameter sharding (FSDP / DeepSpeed ZeRO-3) every policy forward
+    # all-gathers params per layer, so rollouts must run in cross-rank lockstep
+    # (see _RolloutLockstep). Plan the ghost tasks (padding for ranks whose
+    # round-robin task shard is smaller than the largest one) BEFORE any rollout:
+    # the plan all-reduce below must sit at a globally aligned point — issued
+    # mid-eval it would interleave with other ranks' per-round flag all-reduces
+    # and mismatch the collective order.
+    lockstep = _make_rollout_lockstep(get_proc_accelerator())
+    n_ghost_tasks = 0
+    if lockstep is not None:
+        if subgoal_generator is not None:
+            # Config-derived and rank-uniform, so every rank raises together.
+            # pi07-family embed_prefix decides its subgoal branch from the LOCAL
+            # batch (sync_across_ranks=False in eval); per-scene subgoal
+            # availability diverges across ranks (e.g. partially harvested
+            # RoboCasa goal frames), making different submodules — and different
+            # sharded-param all-gathers — run inside a matched lockstep round.
+            raise ValueError(
+                "Subgoal-conditioned eval (env.subgoal_source / "
+                "env.subgoal_frames_dirs) is not supported under parameter "
+                "sharding (FSDP / DeepSpeed ZeRO-3): the policy's subgoal branch "
+                "is decided per rank from local subgoal availability, which "
+                "desyncs the sharded-param all-gathers across ranks. Run eval "
+                "with replicated params (single GPU / DDP / ZeRO-1/2), or unset "
+                "the subgoal source."
+            )
+        if max_parallel_tasks > 1:
+            logging.warning(
+                f"Parameter-sharded eval (FSDP / DeepSpeed ZeRO-3) runs rollouts in cross-rank "
+                f"lockstep, which is incompatible with threaded task execution; forcing "
+                f"max_parallel_tasks from {max_parallel_tasks} to 1."
+            )
+            max_parallel_tasks = 1
+        min_tasks, max_tasks = lockstep.task_plan_over_ranks(len(tasks))
+        if min_tasks == 0 and max_tasks > 0:
+            # Raised on EVERY rank at the aligned plan point: a rank with no task
+            # has no observation template for its ghost rollouts, and letting it
+            # raise alone later would strand the other ranks in a round
+            # all-reduce (NCCL hang) instead of failing the job cleanly.
+            raise ValueError(
+                f"Parameter-sharded eval requires every rank to hold at least one "
+                f"eval task, but the round-robin task sharding left some rank(s) "
+                f"empty (task counts across ranks: min={min_tasks}, "
+                f"max={max_tasks}). Reduce the world size to at most the number "
+                f"of eval tasks, or add tasks."
+            )
+        n_ghost_tasks = max_tasks - len(tasks)
+
     # accumulators: track metrics at both per-group level and across all groups
     group_acc: dict[str, dict[str, list]] = defaultdict(lambda: {k: [] for k in ACC_KEYS})
     overall: dict[str, list] = {k: [] for k in ACC_KEYS}
@@ -1212,6 +1542,7 @@ def eval_policy_all(
         start_seed=start_seed,
         grid_size=grid_size,
         subgoal_generator=subgoal_generator,
+        lockstep=lockstep,
     )
 
     task_results = []
@@ -1235,6 +1566,30 @@ def eval_policy_all(
                 task_results.append(tres)
                 _accumulate_to(tg, metrics)
                 per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
+
+    if lockstep is not None:
+        # Ranks with a smaller task shard keep participating in the collectives
+        # of ranks still evaluating: one ghost task per missing task, each
+        # mirroring a real eval_policy call rollout-for-rollout.
+        _drain_ghost_tasks(
+            policy=policy,
+            cfg=cfg,
+            lockstep=lockstep,
+            n_ghost_tasks=n_ghost_tasks,
+            n_episodes=n_episodes,
+            num_envs=tasks[0][2].num_envs if tasks else cfg.eval.batch_size,
+        )
+
+    # Multi-rank goal-frame manifest write: eval_policy defers its per-task rows
+    # here (see the comment at its manifest block), and every rank issues exactly
+    # ONE gather_object per eval_policy_all — after all tasks and any ghost-task
+    # drain — so the collective count/order is rank-uniform no matter how uneven
+    # the round-robin task shards are. Both gates are config-derived and
+    # identical on every rank.
+    _acc = get_proc_accelerator()
+    if getattr(cfg.eval, "goal_frames_dir", None) is not None and _acc is not None and _acc.num_processes > 1:
+        deferred_rows = [row for tres in task_results for row in tres.pop("goal_manifest_rows", [])]
+        _gather_and_write_goal_manifest(deferred_rows, cfg, _acc)
 
     if cfg.eval.recording_root is not None:
         acc = get_proc_accelerator()

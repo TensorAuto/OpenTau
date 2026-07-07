@@ -879,22 +879,57 @@ def train(cfg: TrainPipelineConfig):
     # On real-world data, no env is needed (eval runs outside train.py).
     eval_subgoal_generator = None
     if cfg.eval_freq > 0 and cfg.env is not None:
-        # Per-rank-independent eval rollouts require the eval forward to fire no
-        # cross-rank collective (``_global_or_branch_decisions`` is gated off in eval).
-        # Under parameter sharding the forward still all-gathers params per layer,
-        # which WOULD desync across the independent rollouts and hang at NCCL — fail
-        # fast instead of hanging hours into a run.
-        sharded_params = (
-            accelerator.distributed_type == accelerate.DistributedType.FSDP
-            or _deepspeed_zero_stage(accelerator) >= 3
-        )
-        if sharded_params:
+        # Under DeepSpeed ZeRO-3 the eval forward all-gathers params per layer —
+        # a cross-rank collective — while the rollouts themselves are per-rank
+        # independent. ``eval_policy_all`` reconciles the two by running rollouts
+        # in cross-rank lockstep (one flag all-reduce + one ``select_action`` per
+        # global round; ranks whose episodes / task shards finish early issue
+        # sync-only forwards) — see ``_RolloutLockstep`` in ``scripts/eval.py``.
+        # Three eval paths stay unsupported and fail fast at startup instead of
+        # hanging hours into a run: (a) FSDP, whose direct-submodule-call
+        # behavior in the policies' custom sample paths is unvalidated; (b) the
+        # AR discrete-action decode, whose per-rank forward COUNT is
+        # data-dependent (variable-length generation loop lockstep cannot
+        # align); (c) subgoal-conditioned eval, where the pi07-family
+        # ``embed_prefix`` decides its subgoal branch from the LOCAL batch
+        # (``sync_across_ranks=False`` in eval), so rank-divergent subgoal
+        # availability changes WHICH submodules (and all-gathers) run inside a
+        # matched round.
+        zero3_params = _deepspeed_zero_stage(accelerator) >= 3
+        if accelerator.distributed_type == accelerate.DistributedType.FSDP:
             raise ValueError(
                 "In-training simulation eval (eval_freq > 0 with a sim env) is not "
-                "supported under parameter sharding (DeepSpeed ZeRO-3 or FSDP): each "
-                "rank rolls out independently, so the sharded-param all-gathers in the "
-                "eval forward desync across ranks and hang at NCCL. Use ZeRO-1/2 (params "
-                "replicated), or run eval out-of-process on saved checkpoints."
+                "supported under FSDP: the sharded-param all-gathers in the eval "
+                "forward desync across ranks and hang at NCCL. Use DeepSpeed "
+                "(ZeRO-1/2/3) or DDP, or run eval out-of-process on saved checkpoints."
+            )
+        if zero3_params and getattr(cfg.policy, "eval_use_discrete_actions", False):
+            raise ValueError(
+                "AR discrete-action eval (policy.eval_use_discrete_actions=True) is not "
+                "supported under parameter sharding (DeepSpeed ZeRO-3): the per-rank "
+                "variable-length AR decode fires a different number of sharded-param "
+                "all-gathers per rank and hangs at NCCL. Run eval with replicated "
+                "params (single GPU / DDP / ZeRO-1/2), or disable "
+                "eval_use_discrete_actions."
+            )
+        subgoal_configured = (
+            getattr(cfg.env, "subgoal_source", None) is not None
+            or getattr(cfg.env, "subgoal_frames_dirs", None) is not None
+        )
+        if zero3_params and subgoal_configured:
+            raise ValueError(
+                "Subgoal-conditioned in-training eval (env.subgoal_source / "
+                "env.subgoal_frames_dirs) is not supported under parameter sharding "
+                "(DeepSpeed ZeRO-3): the policy's subgoal branch is decided per rank "
+                "from local subgoal availability, which desyncs the sharded-param "
+                "all-gathers across ranks. Run eval with replicated params (single "
+                "GPU / DDP / ZeRO-1/2), or unset the subgoal source."
+            )
+        if zero3_params:
+            logging.info(
+                "In-training sim eval under DeepSpeed ZeRO-3: rollouts will run in "
+                "cross-rank lockstep to keep the sharded-param all-gathers matched "
+                "across ranks."
             )
         eval_subgoal_generator = make_subgoal_generator(cfg)
 
