@@ -41,7 +41,10 @@ class OutlierRecord(TypedDict):
     ``value`` is the largest ``|normalized value|`` seen for this
     ``(source, key, dim)`` in the batch; ``source`` / ``episode`` / ``frame`` are
     the provenance of that worst sample (``None`` when the batch lacks the
-    field). Only plain Python scalars are stored so the list survives the
+    field). ``source`` is the mixture-level per-entry dataset name
+    (``dataset_repo_id``, unique across colliding mixture entries) when the
+    batch carries one, else the sample-level ``source`` feature-mapping key.
+    Only plain Python scalars are stored so the list survives the
     ``gather_object`` round-trip used to ship records to rank 0.
     """
 
@@ -104,8 +107,11 @@ def detect_state_action_outliers(batch: dict[str, Tensor], threshold: float | No
     A normalized value far from unit scale almost always means bad normalization
     stats (e.g. near-zero std on a constant dim) or corrupt data. This finds the
     offending dims so the training loop can warn about them, recording the
-    ``source`` / ``episode_index`` / ``frame_index`` (when present in the batch)
-    to trace a poorly-normalized dim back to the dataset/frame to inspect.
+    dataset identity / ``episode_index`` / ``frame_index`` (when present in the
+    batch) to trace a poorly-normalized dim back to the dataset/frame to
+    inspect. The dataset identity is ``dataset_repo_id`` (the mixture-level
+    per-entry name, unique even for colliding entries that share a repo_id and
+    control_mode) when present, else the sample-level ``source`` key.
 
     Pure and collective-free: it reads ``batch`` without mutating it, fires no
     collective, and does NO cross-step dedup or logging — so the ``forward``
@@ -153,7 +159,15 @@ def detect_state_action_outliers(batch: dict[str, Tensor], threshold: float | No
     if not bool(torch.cat([viol.flatten() for _, viol in per_key.values()]).any()):
         return []
 
-    src = batch.get("source")
+    # Prefer the mixture-level per-entry name (`dataset_repo_id`, injected by
+    # `_TaggedDataset`, unique per mixture entry) over the sample-level
+    # `source` feature-mapping key: two mixture entries sharing a repo_id and
+    # control_mode emit an identical `source`, which would merge their records
+    # into one (source, key, dim) offender and make the outlier unattributable
+    # to the specific entry/view.
+    src = batch.get("dataset_repo_id")
+    if src is None:
+        src = batch.get("source")
     ep = batch.get("episode_index")
     fr = batch.get("frame_index")
 
