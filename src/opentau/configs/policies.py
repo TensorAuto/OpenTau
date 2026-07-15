@@ -557,9 +557,14 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         letterboxed a second time inside the policy — downscaled and padded
         with black bars — which is almost never intended.
 
-        No-op when the policy has no ``resize_imgs_with_padding`` field, the
-        field is ``None`` (native pass-through), or no comparable image
-        feature is bound.
+        With ``resize_imgs_with_padding=None`` (native pass-through) there is
+        no target to compare against, but the bound cameras must then agree
+        with *each other* — with no in-policy resize step, a mixed-resolution
+        camera set has no single geometry the vision tower could be built
+        for, so that is flagged with the same strict/warn semantics.
+
+        No-op when the policy has no ``resize_imgs_with_padding`` field or no
+        comparable image feature is bound.
 
         Args:
             strict: ``True`` for training-shaped construction — raise on
@@ -571,25 +576,35 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
             ValueError: On mismatch when ``strict`` is ``True`` and
                 ``skip_input_resolution_check`` is ``False``.
         """
-        resize_target = getattr(self, "resize_imgs_with_padding", None)
+        if not hasattr(self, "resize_imgs_with_padding"):
+            return
+        resize_target = self.resize_imgs_with_padding
+        resolutions = self._bound_image_resolutions()
         if resize_target is None:
-            return
-        resize_target = tuple(resize_target)
-        mismatched = {
-            key: res for key, res in self._bound_image_resolutions().items() if res != resize_target
-        }
-        if not mismatched:
-            return
-        described = ", ".join(f"{key}={res}" for key, res in sorted(mismatched.items()))
-        message = (
-            f"resize_imgs_with_padding={resize_target} (H, W) does not match the resolution of the "
-            f"bound image features: {described}. The policy would silently letterbox every frame a "
-            "second time (aspect-preserving resample + black padding), degrading the vision input. "
-            "Set policy.resize_imgs_with_padding to the input resolution (and TrainPipelineConfig."
-            "resolution to the resolution you want to train at), or set it to null to pass frames "
-            "through at the bound resolution (PaliGemma-family policies only; the Gemma3-family "
-            "pi06/pi07 require the vision tower's square image_size)."
-        )
+            if len(set(resolutions.values())) <= 1:
+                return
+            described = ", ".join(f"{key}={res}" for key, res in sorted(resolutions.items()))
+            message = (
+                f"resize_imgs_with_padding is null (native pass-through) but the bound image "
+                f"features have mixed resolutions: {described}. With no in-policy resize step "
+                "every camera must arrive at one resolution; set resize_imgs_with_padding to a "
+                "single (H, W) target instead."
+            )
+        else:
+            resize_target = tuple(resize_target)
+            mismatched = {key: res for key, res in resolutions.items() if res != resize_target}
+            if not mismatched:
+                return
+            described = ", ".join(f"{key}={res}" for key, res in sorted(mismatched.items()))
+            message = (
+                f"resize_imgs_with_padding={resize_target} (H, W) does not match the resolution of "
+                f"the bound image features: {described}. The policy would silently letterbox every "
+                "frame a second time (aspect-preserving resample + black padding), degrading the "
+                "vision input. Set policy.resize_imgs_with_padding to the input resolution (and "
+                "TrainPipelineConfig.resolution to the resolution you want to train at), or set it "
+                "to null to pass frames through at the bound resolution (PaliGemma-family policies "
+                "only; the Gemma3-family pi06/pi07 require the vision tower's square image_size)."
+            )
         if strict and not self.skip_input_resolution_check:
             raise ValueError(
                 message + " If you are deliberately resuming a legacy checkpoint trained with this "

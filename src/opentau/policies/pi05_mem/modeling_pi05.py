@@ -1058,24 +1058,30 @@ class PI05MemFlowMatching(nn.Module):
         # while MRoPE assigned positions on the wrong raster. Fall back to
         # the sqrt check for encoders that only expose the flat count
         # (RLDXVideoEncoder, whose square-window motion module already
-        # constrains the grid).
+        # constrains the grid). ``_video_grid`` is only consumed on the MRoPE
+        # paths, so the squareness requirement is gated on ``rope_type`` —
+        # plain "rope" runs fine on a non-square grid.
         num_vid_tokens = self.video_encoder.num_video_tokens
         grid_hw = getattr(self.video_encoder, "grid_hw", None)
         if grid_hw is not None:
             grid_h, grid_w = grid_hw
-            if grid_h != grid_w:
+            if grid_h != grid_w and self.config.rope_type == "mrope_interleaved":
                 raise ValueError(
                     f"Interleaved MRoPE requires a square video patch grid; got {grid_h}x{grid_w} "
-                    "(from the input resolution). Use a square input resolution with pi05_mem, or "
-                    "a non-MRoPE rope_type."
+                    "(from the input resolution). Use a square input resolution with "
+                    "rope_type='mrope_interleaved', or set rope_type='rope'."
                 )
             self._video_grid = grid_h
         else:
             self._video_grid = int(round(num_vid_tokens**0.5))
-            if self._video_grid * self._video_grid != num_vid_tokens:
+            if (
+                self._video_grid * self._video_grid != num_vid_tokens
+                and self.config.rope_type == "mrope_interleaved"
+            ):
                 raise ValueError(
                     f"Interleaved MRoPE requires a square video patch grid; got "
-                    f"{num_vid_tokens} video tokens (not a perfect square)."
+                    f"{num_vid_tokens} video tokens (not a perfect square). Use a square input "
+                    "resolution with rope_type='mrope_interleaved', or set rope_type='rope'."
                 )
 
         # Per-timestep state projection: each of the T state vectors becomes one token

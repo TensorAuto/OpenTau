@@ -273,6 +273,12 @@ def patched_paligemma_model_get_image_features(self, pixel_values: torch.FloatTe
       and ``interpolate_pos_encoding`` is enabled whenever the resulting patch
       grid differs from the config grid. At the config resolution (224×224)
       both steps are no-ops and the output is bit-identical to before.
+      Determinism caveat: when the vision tower is trainable
+      (``freeze_vision_encoder=False``), the interpolation backprops into the
+      position-embedding table and CUDA's bicubic-interpolate backward is
+      non-deterministic (atomicAdd) — GPU native-resolution runs with an
+      unfrozen tower are not bit-reproducible. The default (frozen tower) and
+      the config-resolution path are unaffected.
 
     Args:
         self: The PaliGemmaModel instance.

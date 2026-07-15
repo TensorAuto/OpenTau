@@ -255,6 +255,18 @@ class TestValidateInputResolution:
     def test_none_resize_passes(self):
         self._config_with_camera(resize=None).validate_input_resolution(strict=True)
 
+    def test_none_resize_mixed_camera_resolutions_rejected(self, caplog):
+        # Native pass-through has no resize step to harmonize cameras, so a
+        # mixed-resolution camera set must be flagged rather than silently
+        # seeding the vision tower with whichever camera iterates first.
+        config = self._config_with_camera(resize=None)
+        config.input_features["camera1"] = PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224))
+        with pytest.raises(ValueError, match="mixed resolutions"):
+            config.validate_input_resolution(strict=True)
+        with caplog.at_level("WARNING"):
+            config.validate_input_resolution(strict=False)
+        assert any("mixed resolutions" in record.message for record in caplog.records)
+
     def test_empty_camera_placeholders_ignored(self):
         config = self._config_with_camera(resize=NATIVE_HW)
         # validate_features()-style placeholder with its historical hard-coded

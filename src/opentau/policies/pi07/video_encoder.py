@@ -501,7 +501,14 @@ class SpaceTimeSiglipVideoEncoder(nn.Module):
                 patch grid. ``num_video_tokens`` then reflects that grid, so
                 every consumer of the token count (skip-path zero fills,
                 temporal-mask expansion, per-layer shape checks) stays
-                consistent by construction.
+                consistent by construction. Determinism caveat: with
+                ``freeze_vision_encoder=False`` the interpolation backprops
+                into the trainable position-embedding table every step, and
+                CUDA's backward for bicubic ``F.interpolate`` is
+                non-deterministic (atomicAdd) — GPU native-resolution runs
+                with an *unfrozen* vision tower are therefore not
+                bit-reproducible. The default (frozen tower) is unaffected,
+                as is the config-resolution path (no interpolation).
         """
         super().__init__()
         if max_num_frames < 1:

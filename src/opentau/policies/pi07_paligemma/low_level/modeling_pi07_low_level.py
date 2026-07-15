@@ -82,10 +82,11 @@ class ContextItem:
             ``action``: noisy actions ``(B, chunk_size, max_action_dim)``.
         item_type: Dispatch key for which embedding path to take.
         pad_mask: Padding mask. ``(B,)`` per-sample is allowed for
-            ``video``/``image`` (the model expands it to
-            ``(B, num_image_tokens)``). All other types must pass ``(B, L)``
-            matching the embedded sequence length. ``True`` = real,
-            ``False`` = padded.
+            ``video``/``image`` (the model expands it to ``(B, n_tokens)``
+            with ``n_tokens`` the grid-derived
+            ``video_encoder.num_video_tokens``). All other types must pass
+            ``(B, L)`` matching the embedded sequence length. ``True`` =
+            real, ``False`` = padded.
         attention: 1-D attention pattern for this block:
             - ``"continue"``: ``[0]*L`` — token continues the previous
               block's attention scope (bidirectional with everything before).
@@ -2096,9 +2097,11 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
 
         The pad mask is broadcast/expanded so the returned mask matches
         the embedded sequence length: per-sample ``(B,)`` is allowed for
-        ``video`` (expanded to ``(B, num_video_tokens)``) and ``image``
-        (expanded to ``(B, num_image_tokens)``); all other types pass
-        through ``(B, L)`` unchanged.
+        ``video`` and ``image``, both expanded to
+        ``(B, video_encoder.num_video_tokens)`` — subgoal images share the
+        video encoder's tower and input resolution, so their token counts
+        agree by construction; all other types pass through ``(B, L)``
+        unchanged.
         """
         t = item.item_type
         if t == "text":
