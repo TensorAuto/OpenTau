@@ -22,6 +22,7 @@ configurations from pretrained models or local paths.
 
 import abc
 import json
+import logging
 import os
 import tempfile
 import warnings
@@ -294,6 +295,22 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
             inference. Honored by every policy whose ``from_pretrained`` (or ``_load_as_safetensor``)
             calls :py:meth:`~opentau.policies.pretrained.PreTrainedPolicy._strip_normalization_buffers_from_state_dict`.
             Defaults to ``False`` (no behaviour change).
+        skip_input_resolution_check: Escape hatch for
+            :py:meth:`validate_input_resolution`. When ``True``, a mismatch
+            between the policy's ``resize_imgs_with_padding`` and the ``(H, W)``
+            of the bound image features logs a loud warning instead of raising —
+            even on the strict (training) path. Intended for deliberately
+            resuming/finetuning a legacy checkpoint that was trained with the
+            mismatch (i.e. with the policy silently letterboxing a second time
+            inside ``prepare_images``/``prepare_videos``); leave ``False`` for
+            everything else. Eval-shaped policy construction never raises
+            regardless of this flag (it warns), so plain evaluation of legacy
+            checkpoints does not need it. Note that ``True`` persists into the
+            ``config.json`` of every checkpoint the run saves — coherent for
+            resuming that same mismatch-trained lineage, but set it back to
+            ``false`` when fine-tuning such a checkpoint against a *new*
+            dataset mixture, or a fresh mismatch there will only warn instead
+            of raising. Defaults to ``False``.
     """
 
     n_obs_steps: int = 1
@@ -327,6 +344,7 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
 
     pretrained_path: str | None = None
     skip_normalization_weights: bool = False
+    skip_input_resolution_check: bool = False
 
     # When False, `_save_pretrained` strips normalize_*.buffer_* / unnormalize_*.buffer_*
     # keys from the state_dict before writing model.safetensors. Reloading then requires
@@ -481,6 +499,106 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
             type VISUAL.
         """
         return {key: ft for key, ft in self.input_features.items() if ft.type is FeatureType.VISUAL}
+
+    def _bound_image_resolutions(self) -> dict[str, tuple[int, int]]:
+        """``(H, W)`` per bound image feature.
+
+        Skips the synthetic ``observation.images.empty_camera_*`` placeholders:
+        their hard-coded shape describes no real data — each policy's
+        ``prepare_images``/``prepare_videos`` fabricates those slots in-policy
+        as masked placeholder frames cloned at the shape of the processed real
+        camera tensors. Handles both the policy-side channels-first ``(C, H,
+        W)`` convention (mixture-bound features) and the raw dataset
+        channels-last ``(H, W, C)`` convention (bare
+        ``LeRobotDatasetMetadata``); shapes that are recognizably neither are
+        skipped rather than misread.
+        """
+        resolutions: dict[str, tuple[int, int]] = {}
+        for key, ft in self.image_features.items():
+            if key.startswith("observation.images.empty_camera"):
+                continue
+            shape = tuple(ft.shape)
+            if len(shape) != 3:
+                continue
+            if shape[0] in (1, 3, 4) and shape[2] not in (1, 3, 4):
+                resolutions[key] = (shape[1], shape[2])
+            elif shape[2] in (1, 3, 4) and shape[0] not in (1, 3, 4):
+                resolutions[key] = (shape[0], shape[1])
+            elif shape[0] in (1, 3, 4) and shape[2] in (1, 3, 4):
+                # Ambiguous (e.g. (3, H, 3)); prefer channels-first, the
+                # policy-side convention.
+                resolutions[key] = (shape[1], shape[2])
+        return resolutions
+
+    @property
+    def input_image_size(self) -> tuple[int, int] | None:
+        """``(H, W)`` the vision tower will actually receive.
+
+        This is ``resize_imgs_with_padding`` when the policy defines and sets
+        it (the in-policy letterbox target), else the resolution of the bound
+        image features (native pass-through), else ``None`` when neither is
+        known (e.g. a bare config before feature binding).
+        """
+        resize_target = getattr(self, "resize_imgs_with_padding", None)
+        if resize_target is not None:
+            return tuple(resize_target)
+        for resolution in self._bound_image_resolutions().values():
+            return resolution
+        return None
+
+    def validate_input_resolution(self, *, strict: bool) -> None:
+        """Check ``resize_imgs_with_padding`` against the bound image features.
+
+        The image features bound onto the config (from
+        ``TrainPipelineConfig.resolution`` via the dataset mixture at train
+        time, or carried inside a checkpoint's ``config.json`` at load time)
+        are the ``(H, W)`` the policy actually receives. A differing
+        ``resize_imgs_with_padding`` means every frame gets silently
+        letterboxed a second time inside the policy — downscaled and padded
+        with black bars — which is almost never intended.
+
+        No-op when the policy has no ``resize_imgs_with_padding`` field, the
+        field is ``None`` (native pass-through), or no comparable image
+        feature is bound.
+
+        Args:
+            strict: ``True`` for training-shaped construction — raise on
+                mismatch (unless ``skip_input_resolution_check``); ``False``
+                for eval/inference — warn loudly but keep loading, so legacy
+                checkpoints trained with the mismatch remain evaluable.
+
+        Raises:
+            ValueError: On mismatch when ``strict`` is ``True`` and
+                ``skip_input_resolution_check`` is ``False``.
+        """
+        resize_target = getattr(self, "resize_imgs_with_padding", None)
+        if resize_target is None:
+            return
+        resize_target = tuple(resize_target)
+        mismatched = {
+            key: res for key, res in self._bound_image_resolutions().items() if res != resize_target
+        }
+        if not mismatched:
+            return
+        described = ", ".join(f"{key}={res}" for key, res in sorted(mismatched.items()))
+        message = (
+            f"resize_imgs_with_padding={resize_target} (H, W) does not match the resolution of the "
+            f"bound image features: {described}. The policy would silently letterbox every frame a "
+            "second time (aspect-preserving resample + black padding), degrading the vision input. "
+            "Set policy.resize_imgs_with_padding to the input resolution (and TrainPipelineConfig."
+            "resolution to the resolution you want to train at), or set it to null to pass frames "
+            "through at the bound resolution (PaliGemma-family policies only; the Gemma3-family "
+            "pi06/pi07 require the vision tower's square image_size)."
+        )
+        if strict and not self.skip_input_resolution_check:
+            raise ValueError(
+                message + " If you are deliberately resuming a legacy checkpoint trained with this "
+                "mismatch, set policy.skip_input_resolution_check=true to downgrade this to a warning."
+            )
+        logging.warning(
+            message + " Proceeding because this is %s.",
+            "skip_input_resolution_check=true" if strict else "an eval/inference load",
+        )
 
     @property
     def action_feature(self) -> PolicyFeature | None:

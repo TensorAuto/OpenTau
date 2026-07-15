@@ -53,7 +53,14 @@ class PI07PaligemmaLowLevelConfig(PreTrainedConfig):
         max_state_dim: Maximum dimension for state vectors. Shorter vectors are padded. Defaults to 32.
         max_action_dim: Maximum dimension for action vectors. Shorter vectors are padded. Defaults to 32.
         resize_imgs_with_padding: Target size (height, width) for image resizing with padding.
-            Defaults to (224, 224).
+            Must match the resolution of the input images (``TrainPipelineConfig.resolution`` /
+            the bound image features) — training fails fast on a mismatch, since the policy
+            would silently letterbox every frame a second time
+            (``skip_input_resolution_check=true`` downgrades that to a warning for legacy
+            checkpoints). ``null`` passes frames through at the input resolution. Non-224
+            values are supported natively: frames are padded up to the next patch multiple
+            and the SigLIP position embeddings are interpolated to the resulting grid, so no
+            pixels are cropped and no letterboxing to 224x224 occurs. Defaults to (224, 224).
         empty_cameras: Number of empty camera inputs to add. Used for specific adaptations like
             Aloha simulation. Defaults to 0.
         prompt_max_length: Maximum length for tokenizer. Defaults to 256.

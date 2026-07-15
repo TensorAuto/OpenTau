@@ -175,6 +175,12 @@ def resize_with_pad(img: Tensor, width: int, height: int, pad_value: int = -1) -
 
     cur_height, cur_width = img.shape[2:]
 
+    # Explicit no-op when the input already matches the target — native-
+    # resolution inputs must pass through bit-identical, not survive a
+    # same-size bilinear round trip.
+    if (cur_height, cur_width) == (height, width):
+        return img
+
     ratio = max(cur_width / width, cur_height / height)
     resized_height = int(cur_height / ratio)
     resized_width = int(cur_width / ratio)
@@ -685,7 +691,11 @@ class PI06Policy(PreTrainedPolicy):
         for key in present_img_keys:
             img = batch[key]
             if self.config.resize_imgs_with_padding is not None:
-                img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
+                # The config tuple is (height, width); the function signature is
+                # (width, height) — unpack explicitly so non-square targets are not
+                # transposed (invisible at the square defaults).
+                target_h, target_w = self.config.resize_imgs_with_padding
+                img = resize_with_pad(img, width=target_w, height=target_h, pad_value=0)
 
             img = img * 2.0 - 1.0
 
@@ -819,6 +829,21 @@ class PI06FlowMatching(nn.Module):
             gradient_checkpointing=self.config.gradient_checkpointing,
         )
         self.gemma3_with_expert = Gemma3WithExpertModel(gemma3_with_expert_config)
+
+        # Native (non-square-448) input resolutions are not yet supported on
+        # the Gemma3 backbone (Gemma3MultiModalProjector hard-codes a square
+        # patch grid); fail fast with the real diagnosis instead of a reshape
+        # crash inside the projector at first forward.
+        vision_cfg = self.gemma3_with_expert._vision_tower().config
+        expected_hw = config.input_image_size
+        if expected_hw is not None and tuple(expected_hw) != (vision_cfg.image_size, vision_cfg.image_size):
+            raise ValueError(
+                f"input resolution {tuple(expected_hw)} (resize_imgs_with_padding, or the bound "
+                f"image-feature resolution when it is null) != the Gemma 3 vision tower's "
+                f"image_size ({vision_cfg.image_size}). Native resolutions are not yet supported "
+                "for the Gemma3-family policies; set resize_imgs_with_padding (and resolution) to "
+                f"({vision_cfg.image_size}, {vision_cfg.image_size})."
+            )
 
         # Action projections stay float32 for numerical stability; they're small.
         self.action_in_proj = nn.Linear(self.config.max_action_dim, self.config.proj_width)

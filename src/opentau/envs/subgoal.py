@@ -633,6 +633,10 @@ def _resize_with_pad(img: Tensor, width: int, height: int, pad_value: float = 0.
         raise ValueError(f"Expected (C,H,W) or (T,C,H,W), got shape {tuple(img.shape)}")
 
     cur_height, cur_width = img.shape[2:]
+    # Explicit no-op when the input already matches the target (mirrors
+    # BaseDataset.resize_with_pad).
+    if (cur_height, cur_width) == (height, width):
+        return img if batched else img.squeeze(0)
     ratio = max(cur_width / width, cur_height / height)
     resized_height = int(cur_height / ratio)
     resized_width = int(cur_width / ratio)

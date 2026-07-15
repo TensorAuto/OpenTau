@@ -702,8 +702,12 @@ class TestPI07PaligemmaLowLevelStateEmbedding:
         h = hidden_size
         model = object.__new__(PI07PaligemmaLowLevelFlowMatching)
 
-        # num_image_tokens mirrors embed_image's 4-token output below, so the
-        # image-tower skip path (zeros of that width) matches the run path.
+        # The image-tower skip path derives its zero-fill width from
+        # video_encoder.num_video_tokens (subgoal images share the video
+        # encoder's tower and input resolution, so their token counts agree
+        # by construction); text_config.num_image_tokens is no longer read
+        # there. The 4 here deliberately differs from num_video_tokens=6 so a
+        # regression back to the old num_image_tokens source is caught.
         _text_cfg = type("_TextConfig", (), {"hidden_size": h, "num_image_tokens": 4})()
         _pg_cfg = type("_PaliGemmaConfig", (), {"text_config": _text_cfg})()
         _stub_cfg = type("_StubConfig", (), {"paligemma_config": _pg_cfg})()
@@ -1277,8 +1281,12 @@ class TestPI07PaligemmaLowLevelResponseEmbedding:
         h = hidden_size
         model = object.__new__(PI07PaligemmaLowLevelFlowMatching)
 
-        # num_image_tokens mirrors embed_image's 4-token output below, so the
-        # image-tower skip path (zeros of that width) matches the run path.
+        # The image-tower skip path derives its zero-fill width from
+        # video_encoder.num_video_tokens (subgoal images share the video
+        # encoder's tower and input resolution, so their token counts agree
+        # by construction); text_config.num_image_tokens is no longer read
+        # there. The 4 here deliberately differs from num_video_tokens=6 so a
+        # regression back to the old num_image_tokens source is caught.
         _text_cfg = type("_TextConfig", (), {"hidden_size": h, "num_image_tokens": 4})()
         _pg_cfg = type("_PaliGemmaConfig", (), {"text_config": _text_cfg})()
         _stub_cfg = type("_StubConfig", (), {"paligemma_config": _pg_cfg})()
@@ -2301,10 +2309,12 @@ class TestPI07PaligemmaLowLevelSubgoalEmbedding:
     # ------------------------------------------------------------------ #
     def test_all_padded_subgoal_skips_image_tower(self):
         """All-padded subgoal mask → ``embed_image`` is not called and the image
-        block is zeros of width ``num_image_tokens``."""
+        block is zeros of width ``video_encoder.num_video_tokens`` (the shared
+        tower's grid-derived count — what ``embed_image`` emits at the
+        configured input resolution)."""
         bsz, h = 3, 8
         model = TestPI07PaligemmaLowLevelResponseEmbedding._make_mock_model(hidden_size=h)
-        n_img_tokens = model.paligemma_with_expert.config.paligemma_config.text_config.num_image_tokens
+        n_img_tokens = model.video_encoder.num_video_tokens
 
         calls: list[tuple[int, ...]] = []
 
@@ -2364,7 +2374,7 @@ class TestPI07PaligemmaLowLevelSubgoalEmbedding:
         actually control the per-item branch."""
         bsz, h = 3, 8
         model = TestPI07PaligemmaLowLevelResponseEmbedding._make_mock_model(hidden_size=h)
-        n_img_tokens = model.paligemma_with_expert.config.paligemma_config.text_config.num_image_tokens
+        n_img_tokens = model.video_encoder.num_video_tokens
         calls: list[tuple[int, ...]] = []
 
         def _capturing_embed_image(image):

@@ -50,7 +50,13 @@ class PI07HighLevelPlannerConfig(PreTrainedConfig):
         max_state_dim: Maximum dimension for state vectors. Shorter vectors
             are zero-padded. Defaults to 32.
         resize_imgs_with_padding: Target ``(height, width)`` for image
-            resizing with aspect-ratio-preserving padding. Defaults to
+            resizing with aspect-ratio-preserving padding. Must match the
+            resolution of the input images — training fails fast on a
+            mismatch (``skip_input_resolution_check=true`` downgrades it to
+            a warning for legacy checkpoints); ``null`` passes frames
+            through at the input resolution. Non-224 values run natively
+            (pad to the next patch multiple + interpolated position
+            embeddings), with no letterboxing to 224x224. Defaults to
             ``(224, 224)``.
         empty_cameras: Number of empty (zero-filled) camera inputs to add.
             Defaults to 0.

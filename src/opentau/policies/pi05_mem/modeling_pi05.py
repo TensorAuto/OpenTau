@@ -278,6 +278,12 @@ def resize_with_pad(img: Tensor, width: int, height: int, pad_value: int = -1) -
 
     cur_height, cur_width = img.shape[2:]
 
+    # Explicit no-op when the input already matches the target — native-
+    # resolution inputs must pass through bit-identical, not survive a
+    # same-size bilinear round trip.
+    if (cur_height, cur_width) == (height, width):
+        return img
+
     ratio = max(cur_width / width, cur_height / height)
     resized_height = int(cur_height / ratio)
     resized_width = int(cur_width / ratio)
@@ -918,7 +924,11 @@ class PI05MemPolicy(PreTrainedPolicy):
             if self.config.resize_imgs_with_padding is not None:
                 b, t_frames = vid.shape[:2]
                 flat = rearrange(vid, "B T C H W -> (B T) C H W")
-                flat = resize_with_pad(flat, *self.config.resize_imgs_with_padding, pad_value=0)
+                # The config tuple is (height, width); the function signature is
+                # (width, height) — unpack explicitly so non-square targets are not
+                # transposed (invisible at the square defaults).
+                target_h, target_w = self.config.resize_imgs_with_padding
+                flat = resize_with_pad(flat, width=target_w, height=target_h, pad_value=0)
                 vid = rearrange(flat, "(B T) C H W -> B T C H W", B=b, T=t_frames)
 
             bsize = vid.shape[0]
@@ -1032,19 +1042,41 @@ class PI05MemFlowMatching(nn.Module):
                 max_num_frames=config.n_obs_steps,
                 spacetime_layer_stride=config.spacetime_layer_stride,
                 gradient_checkpointing=config.gradient_checkpointing,
+                # (H, W) the tower will actually receive (resize target if
+                # set, else the bound image-feature resolution). Note the
+                # MRoPE square-grid check below still constrains pi05_mem to
+                # square inputs; non-square native resolutions need a
+                # follow-up there.
+                expected_image_size=config.input_image_size,
             )
 
         # Side length of the (square) video patch grid, used by interleaved
-        # MRoPE to give per-frame patches 2-D (height, width) positions. Both
-        # encoders expose ``num_video_tokens`` (a perfect square, e.g. 256 for
-        # a 224/14 grid).
+        # MRoPE to give per-frame patches 2-D (height, width) positions.
+        # Prefer the encoder's actual (grid_h, grid_w) when exposed — a
+        # non-square grid can still have a perfect-square token count (e.g.
+        # 16x4 = 64), which a sqrt-of-token-count check would wave through
+        # while MRoPE assigned positions on the wrong raster. Fall back to
+        # the sqrt check for encoders that only expose the flat count
+        # (RLDXVideoEncoder, whose square-window motion module already
+        # constrains the grid).
         num_vid_tokens = self.video_encoder.num_video_tokens
-        self._video_grid = int(round(num_vid_tokens**0.5))
-        if self._video_grid * self._video_grid != num_vid_tokens:
-            raise ValueError(
-                f"Interleaved MRoPE requires a square video patch grid; got "
-                f"{num_vid_tokens} video tokens (not a perfect square)."
-            )
+        grid_hw = getattr(self.video_encoder, "grid_hw", None)
+        if grid_hw is not None:
+            grid_h, grid_w = grid_hw
+            if grid_h != grid_w:
+                raise ValueError(
+                    f"Interleaved MRoPE requires a square video patch grid; got {grid_h}x{grid_w} "
+                    "(from the input resolution). Use a square input resolution with pi05_mem, or "
+                    "a non-MRoPE rope_type."
+                )
+            self._video_grid = grid_h
+        else:
+            self._video_grid = int(round(num_vid_tokens**0.5))
+            if self._video_grid * self._video_grid != num_vid_tokens:
+                raise ValueError(
+                    f"Interleaved MRoPE requires a square video patch grid; got "
+                    f"{num_vid_tokens} video tokens (not a perfect square)."
+                )
 
         # Per-timestep state projection: each of the T state vectors becomes one token
         self.state_proj = nn.Linear(self.config.max_state_dim, vlm_hidden_size)

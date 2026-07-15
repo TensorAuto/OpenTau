@@ -20,6 +20,7 @@ configuration, training hyperparameters, and evaluation settings.
 """
 
 import datetime as dt
+import logging
 import os
 import sys
 from dataclasses import dataclass, field
@@ -299,6 +300,34 @@ class TrainPipelineConfig(HubMixin):
             self.policy.max_state_dim = self.max_state_dim
             self.policy.max_action_state = self.max_action_dim
             self.policy.chunk_size = self.action_chunk
+
+            # The dataloader letterboxes every sample to ``self.resolution``
+            # before the policy sees it; a differing policy-side
+            # ``resize_imgs_with_padding`` means the policy silently
+            # letterboxes those frames a *second* time. Fail fast at
+            # train-config time (this method only runs for training —
+            # eval never calls validate(), so legacy checkpoints stay
+            # evaluable). ``None`` means native pass-through and is
+            # always consistent.
+            policy_resize = getattr(self.policy, "resize_imgs_with_padding", None)
+            if policy_resize is not None and tuple(policy_resize) != tuple(self.resolution):
+                message = (
+                    f"policy.resize_imgs_with_padding={tuple(policy_resize)} != "
+                    f"resolution={tuple(self.resolution)} (both (H, W)). The dataloader delivers "
+                    "frames at `resolution`, so the policy would letterbox them a second time "
+                    "(aspect-preserving resample + black padding) before the vision tower. Set the "
+                    "two fields to the same value (for the Gemma3-family policies — pi06/pi07 — "
+                    "both must equal the vision tower's image_size, e.g. 448), or set "
+                    "policy.resize_imgs_with_padding=null to feed frames to the vision tower at "
+                    "`resolution` directly (PaliGemma-family policies only)."
+                )
+                if getattr(self.policy, "skip_input_resolution_check", False):
+                    logging.warning(message + " Proceeding because skip_input_resolution_check=true.")
+                else:
+                    raise ValueError(
+                        message + " If you are deliberately resuming a legacy run trained with this "
+                        "mismatch, set policy.skip_input_resolution_check=true."
+                    )
 
             # The policy's ``n_obs_steps`` determines the T dimension its
             # encoder expects; the dataset_mixture's ``n_obs_history`` is

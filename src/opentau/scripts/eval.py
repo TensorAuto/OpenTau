@@ -982,6 +982,36 @@ def eval_main(cfg: TrainPipelineConfig):
 
     logging.info("Making policy.")
 
+    # ``preprocess_observation`` delivers env frames at exactly
+    # ``cfg.resolution``; the policy's vision tower expects
+    # ``cfg.policy.input_image_size`` (the resize target, or — when
+    # ``resize_imgs_with_padding`` is null — the resolution the checkpoint's
+    # image features were bound at). A mismatch with a resize target set
+    # merely reproduces the checkpoint's own (legacy) double letterbox, so it
+    # only warns inside ``make_policy``; with no resize target the tower
+    # would silently run at the wrong geometry, so fail fast here.
+    expected_hw = cfg.policy.input_image_size
+    if (
+        expected_hw is not None
+        and tuple(cfg.resolution) != tuple(expected_hw)
+        and getattr(cfg.policy, "resize_imgs_with_padding", None) is None
+    ):
+        if cfg.policy.skip_input_resolution_check:
+            logging.warning(
+                f"resolution={tuple(cfg.resolution)} != the policy's bound input resolution "
+                f"{tuple(expected_hw)} with resize_imgs_with_padding=null; env frames will reach "
+                "the vision tower at a different geometry than training. Proceeding because "
+                "skip_input_resolution_check=true."
+            )
+        else:
+            raise ValueError(
+                f"resolution={tuple(cfg.resolution)} but the policy was trained at "
+                f"{tuple(expected_hw)} with resize_imgs_with_padding=null (native pass-through): "
+                "env frames would reach the vision tower at the wrong geometry with nothing to "
+                "correct them. Set resolution to match the checkpoint, or set "
+                "policy.skip_input_resolution_check=true to proceed anyway."
+            )
+
     policy = make_policy(cfg=cfg.policy)
     policy.to(torch.bfloat16)
     policy = accelerator.prepare(policy)

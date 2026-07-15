@@ -263,6 +263,16 @@ def make_policy(
         cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
         cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
 
+    # Now that image features are bound, cross-check them against the policy's
+    # declared resize target. Training-shaped calls (ds_meta present) fail
+    # fast on a mismatch — it means every frame would be silently letterboxed
+    # a second time inside the policy. Eval/inference loads are handled by the
+    # warn-only check inside `PreTrainedPolicy.from_pretrained` (which also
+    # covers loaders that bypass this factory, e.g. the gRPC server), so
+    # legacy checkpoints trained with the mismatch keep loading.
+    if ds_meta is not None:
+        cfg.validate_input_resolution(strict=True)
+
     if stats is not None:
         # External opaque stats override. Accept either a single
         # dict-of-features (wrapped into a singleton list) or an

@@ -1229,6 +1229,12 @@ class BaseDataset(torch.utils.data.Dataset):
 
         cur_height, cur_width = img.shape[2:]
 
+        # Explicit no-op when the input already matches the target — native-
+        # resolution training must deliver untouched pixels, not a same-size
+        # bilinear round trip.
+        if (cur_height, cur_width) == (height, width):
+            return img if batched else img.squeeze(0)
+
         ratio = max(cur_width / width, cur_height / height)
         resized_height = int(cur_height / ratio)
         resized_width = int(cur_width / ratio)
