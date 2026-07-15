@@ -13,16 +13,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Extract the **reasoning tower** of NVIDIA ``Cosmos3-Super`` into a standalone
-Qwen3-VL-32B checkpoint for the cosmos3 policy backbone.
+"""Extract the **reasoning tower** of an NVIDIA ``Cosmos3`` omni model (``Cosmos3-Super``
+or ``Cosmos3-Nano``) into a standalone Qwen3-VL checkpoint for the cosmos3 /
+cosmos3_nano policy backbones.
 
-``nvidia/Cosmos3-Super`` (HF: ``cosmos3_omni`` / diffusers ``Cosmos3OmniTransformer``,
-~64.6B params, ungated) is an interleaved Mixture-of-Transformers: every one of its 64
-layers has **shared attention** plus **two MLPs** -- ``mlp`` (the autoregressive
-**reasoner / text** path) and ``mlp_moe_gen`` (the diffusion **generation** path) -- plus
-audio/action/video generation modules. Its text config is byte-for-byte Qwen3-VL-32B
-(hidden 5120, 64 layers, 64 heads, 8 KV, head_dim 128, intermediate 25600,
-mrope_section [24,20,20]), and its ``vision_encoder/`` is a stock ``Qwen3VLVisionModel``.
+The Cosmos3 omni models (HF: ``cosmos3_omni`` / diffusers ``Cosmos3OmniTransformer``,
+ungated) are interleaved Mixture-of-Transformers: every layer computes one joint
+attention over both token streams but carries **separate per-path weights** -- the
+autoregressive **reasoner / text** path (``mlp``, ``self_attn.to_*``) and the diffusion
+**generation** path (``mlp_moe_gen``, ``self_attn.add_*``/``*_moe_gen``) -- plus
+audio/action/video generation modules. The reasoner geometry is byte-for-byte the
+matching stock Qwen3-VL size -- Qwen3-VL-32B for Super (~64.6B total; hidden 5120, 64
+layers, 64 heads, 8 KV, head_dim 128, intermediate 25600), Qwen3-VL-8B for Nano
+(~15.75B total; hidden 4096, 36 layers, 32 heads, same 8 KV / head_dim 128) -- and the
+``vision_encoder/`` is a stock ``Qwen3VLVisionModel`` in both. The geometry is read from
+the snapshot's root ``config.json`` (``text_config`` / ``vision_config``), so the same
+script extracts every family member.
 
 This script keeps only the reasoner tower and drops the generation tower, producing a
 standard ``Qwen3VLForConditionalGeneration`` checkpoint:
@@ -46,19 +52,22 @@ standard ``Qwen3VLForConditionalGeneration`` checkpoint:
 
 Usage::
 
-    # one-time, on a box with the (ungated) Cosmos3-Super download + enough RAM/disk
-    huggingface-cli download nvidia/Cosmos3-Super --include "transformer/*" "vision_encoder/*" \
-        "text_tokenizer/*" "tokenizer_config.json" "preprocessor_config.json" \
-        "video_preprocessor_config.json"
+    # one-time, on a box with the (ungated) Cosmos3 download + enough RAM/disk
+    huggingface-cli download nvidia/Cosmos3-Nano --include "config.json" "transformer/*" \
+        "vision_encoder/*" "text_tokenizer/*" "tokenizer_config.json" \
+        "preprocessor_config.json" "video_preprocessor_config.json"
     python -m opentau.scripts.extract_cosmos3_reasoner \
         --cosmos3-path <hf-snapshot-dir> --out-dir <reasoner-checkpoint-dir>
 
-The resulting directory is a normal Qwen3-VL-32B checkpoint; point the cosmos3 policy at it
-via ``--policy.pretrained_backbone_repo_id=<reasoner-checkpoint-dir>``.
+(Same for ``nvidia/Cosmos3-Super``; the root ``config.json`` must be part of the
+download since it carries the reasoner geometry.) The resulting directory is a normal
+Qwen3-VL checkpoint; point the cosmos3 / cosmos3_nano policy at it via
+``--policy.pretrained_backbone_repo_id=<reasoner-checkpoint-dir>``.
 """
 
 import argparse
 import glob
+import json
 import os
 import re
 import shutil
@@ -131,50 +140,57 @@ def _iter_safetensors(folder: str):
                 yield key, f.get_tensor(key)
 
 
-def _qwen3vl_32b_config() -> Qwen3VLConfig:
+def _qwen3vl_config_from_snapshot(cosmos3_path: str) -> Qwen3VLConfig:
+    """Build the reasoner's ``Qwen3VLConfig`` from the snapshot's root ``config.json``.
+
+    The Cosmos3 omni root config carries the reasoner's ``text_config`` /
+    ``vision_config`` verbatim (byte-for-byte the matching stock Qwen3-VL size:
+    32B for Super, 8B for Nano) plus the Qwen3-VL special token ids. Reading the
+    geometry from the source instead of hardcoding one size lets this script extract
+    every family member -- and keeps source fields the old hardcoded config silently
+    defaulted (e.g. ``max_position_embeddings`` 262144, vs the transformers default
+    128000 that ``TensorAuto/cosmos3-reason-32b`` shipped with; harmless at our
+    prompt lengths, but source-verbatim is the safer default going forward).
+    """
+    cfg_path = os.path.join(cosmos3_path, "config.json")
+    if not os.path.exists(cfg_path):
+        raise FileNotFoundError(
+            f'{cfg_path} not found -- add "config.json" to the snapshot download includes; '
+            "the root Cosmos3 config carries the reasoner text/vision geometry."
+        )
+    with open(cfg_path) as f:
+        src = json.load(f)
+    for key in (
+        "text_config",
+        "vision_config",
+        "image_token_id",
+        "video_token_id",
+        "vision_start_token_id",
+        "vision_end_token_id",
+    ):
+        if key not in src:
+            raise KeyError(f"'{key}' missing from {cfg_path} -- not a Cosmos3 omni root config?")
     return Qwen3VLConfig(
-        text_config={
-            "model_type": "qwen3_vl_text",
-            "hidden_size": 5120,
-            "intermediate_size": 25600,
-            "num_hidden_layers": 64,
-            "num_attention_heads": 64,
-            "num_key_value_heads": 8,
-            "head_dim": 128,
-            "vocab_size": 151936,
-            "rms_norm_eps": 1e-6,
-            "rope_theta": 5_000_000,
-            "rope_scaling": {
-                "mrope_interleaved": True,
-                "mrope_section": [24, 20, 20],
-                "rope_type": "default",
-            },
-        },
-        vision_config={
-            "model_type": "qwen3_vl",
-            "hidden_size": 1152,
-            "intermediate_size": 4304,
-            "num_heads": 16,
-            "depth": 27,
-            "patch_size": 16,
-            "temporal_patch_size": 2,
-            "spatial_merge_size": 2,
-            "out_hidden_size": 5120,
-            "deepstack_visual_indexes": [8, 16, 24],
-            "num_position_embeddings": 2304,
-            "in_channels": 3,
-        },
-        image_token_id=151655,
-        video_token_id=151656,
-        vision_start_token_id=151652,
-        vision_end_token_id=151653,
-        tie_word_embeddings=False,
+        text_config=src["text_config"],
+        vision_config=src["vision_config"],
+        image_token_id=src["image_token_id"],
+        video_token_id=src["video_token_id"],
+        vision_start_token_id=src["vision_start_token_id"],
+        vision_end_token_id=src["vision_end_token_id"],
+        tie_word_embeddings=src.get("tie_word_embeddings", False),
         dtype="bfloat16",
     )
 
 
 def extract(cosmos3_path: str, out_dir: str, verify: bool = True) -> None:
-    """Build a Qwen3-VL-32B reasoner checkpoint from a Cosmos3-Super snapshot."""
+    """Build a standalone Qwen3-VL reasoner checkpoint from a Cosmos3 omni snapshot."""
+    # Derive the reasoner geometry first so a missing/bad root config.json fails fast,
+    # before the long tensor-loading pass over the multi-GB snapshot.
+    config = _qwen3vl_config_from_snapshot(cosmos3_path)
+    n_layers = config.text_config.num_hidden_layers
+    hidden = config.text_config.hidden_size
+    print(f"reasoner geometry from root config.json: {n_layers} layers, hidden {hidden}")
+
     transformer_dir = os.path.join(cosmos3_path, "transformer")
     vision_dir = os.path.join(cosmos3_path, "vision_encoder")
     state_dict: dict[str, torch.Tensor] = {}
@@ -195,7 +211,6 @@ def extract(cosmos3_path: str, out_dir: str, verify: bool = True) -> None:
         n_vis += 1
     print(f"vision_encoder/: mapped {n_vis} tensors -> model.visual.*")
 
-    config = _qwen3vl_32b_config()
     os.makedirs(out_dir, exist_ok=True)
 
     # Instantiate on meta (no real storage), then assign the loaded bf16 tensors directly.
@@ -252,13 +267,17 @@ def extract(cosmos3_path: str, out_dir: str, verify: bool = True) -> None:
     if os.path.isdir(tok_dir):
         for f in os.listdir(tok_dir):
             shutil.copy2(os.path.join(tok_dir, f), os.path.join(out_dir, f))
-    print(f"✓ wrote Qwen3-VL-32B reasoner checkpoint to {out_dir}")
+    print(f"✓ wrote Qwen3-VL reasoner checkpoint ({n_layers} layers, hidden {hidden}) to {out_dir}")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--cosmos3-path", required=True, help="Local snapshot dir of nvidia/Cosmos3-Super.")
-    ap.add_argument("--out-dir", required=True, help="Output dir for the extracted Qwen3-VL-32B reasoner.")
+    ap.add_argument(
+        "--cosmos3-path",
+        required=True,
+        help="Local snapshot dir of nvidia/Cosmos3-Super or nvidia/Cosmos3-Nano (must include the root config.json).",
+    )
+    ap.add_argument("--out-dir", required=True, help="Output dir for the extracted Qwen3-VL reasoner.")
     ap.add_argument("--no-verify", action="store_true", help="Skip the meta-device key-set verification.")
     args = ap.parse_args()
     extract(args.cosmos3_path, args.out_dir, verify=not args.no_verify)

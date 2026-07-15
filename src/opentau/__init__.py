@@ -170,6 +170,7 @@ available_policies = [
     "pi07_high_level",
     "pi07_low_level",
     "cosmos3",
+    "cosmos3_nano",
     "value",
 ]
 

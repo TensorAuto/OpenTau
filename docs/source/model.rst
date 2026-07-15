@@ -281,6 +281,17 @@ prefix and the trainable action expert to the flow-matching velocity head
      x_t += dt*v_t, then unnormalize -> executed action chunk.
 
 
+cosmos3_nano
+------------
+- cosmos3_nano is the cosmos3 recipe on the smaller **frozen Qwen3-VL-8B backbone** — the reasoning tower of NVIDIA `Cosmos3-Nano <https://huggingface.co/nvidia/Cosmos3-Nano>`_, extracted by the same ``src/opentau/scripts/extract_cosmos3_reasoner.py`` (the script reads the reasoner geometry from the snapshot's root ``config.json``, so it handles both family members). All modeling code is shared with cosmos3; the package only carries the nano defaults.
+- The Nano reasoner keeps the exact KV interface the action expert cross-attends to — the same **8 KV heads × head_dim 128** as the 32B tower — so the expert architecture and every hard constraint carry over unchanged. The only geometry change is the backbone depth: **36 layers** instead of 64, which the default ``expert_num_hidden_layers=36`` mirrors (per-layer conditioning). With the inherited expert widths the trainable expert + projections total ~0.51B parameters. ``condition_on_layer`` works exactly as in cosmos3 (range ``[-36, 35]``).
+- The extracted reasoner backbone is published at `TensorAuto/cosmos3-reason-8b <https://huggingface.co/TensorAuto/cosmos3-reason-8b>`_ (**private** — the default ``pretrained_backbone_repo_id``; the training environment needs an HF token with TensorAuto org read access, picked up from the ambient ``HF_TOKEN`` / ``~/.cache/huggingface/token``), ~17.5 GB in bf16 — it fits comfortably on a single 24–32 GB GPU for inference, where the 32B backbone needs an 80 GB-class card. To reproduce or re-host it, run the extraction script on the ungated ``nvidia/Cosmos3-Nano``.
+- See the implementation in `src/opentau/policies/cosmos3_nano/modeling_cosmos3_nano.py <https://github.com/TensorAuto/OpenTau/blob/main/src/opentau/policies/cosmos3_nano/modeling_cosmos3_nano.py>`_.
+- To spin up a training run, start from `configs/examples/cosmos3_nano_training_config.json <https://github.com/TensorAuto/OpenTau/blob/main/configs/examples/cosmos3_nano_training_config.json>`_.
+- Config selector: ``--policy.type=cosmos3_nano``.
+- Disclaimer: as with cosmos3, only the reasoner *backbone* is published — no trained cosmos3_nano *policy* checkpoint exists yet; the action expert is randomly initialized and produced by training.
+
+
 value
 -----
 - The value model is a vision-language model used to predict the value of the current state. It is used to train VLA policies with the RECAP framework.
