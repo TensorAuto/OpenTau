@@ -31,7 +31,7 @@ Whether you use the official OpenPi codebase or LeRobot’s reimplementation, yo
 - Dropout in the VLM to reduce overfitting
 - Authentic $\pi_{0.6}$ policy with a Gemma 3 4B backbone, 448×448 vision, and 5-step flow matching
 - Hierarchical $\pi_{0.7}$ policy: high-level planner + low-level controller with a SpaceTime SigLIP video encoder on a Gemma 3 backbone
-- `cosmos3` policy: the $\pi_{0.5}$ flow-matching recipe on a frozen Qwen3-VL-32B (NVIDIA Cosmos3-Super reasoner) backbone with a custom sub-1B action expert
+- `cosmos3` policy: the $\pi_{0.5}$ flow-matching recipe on a frozen Qwen3-VL-32B (NVIDIA Cosmos3-Super reasoner) backbone with a custom sub-1B action expert — plus a `cosmos3_nano` sibling on the smaller Qwen3-VL-8B (Cosmos3-Nano reasoner) backbone
 - A reinforcement learning pipeline described in $\pi^*_{0.6}$
 - And more...
 
@@ -69,7 +69,7 @@ To spin up a $\pi_{0.6}$ training run, start from [configs/examples/pi06_trainin
 
 $\pi_{0.7}$ splits the model into a high-level planner that proposes subgoals and a low-level controller that executes them. The current implementation pairs a Gemma 3 backbone with a SpaceTime SigLIP video encoder so the controller can attend over temporal context, and the two stages train independently. To train the low-level controller, start from [configs/examples/pi07_low_level_libero.json](https://github.com/TensorAuto/OpenTau/blob/main/configs/examples/pi07_low_level_libero.json) (select via `"type": "pi07_low_level"`); the high-level planner is registered as `"type": "pi07_high_level"`.
 
-`cosmos3` reuses the $\pi_{0.5}$ flow-matching recipe on a frozen Qwen3-VL-32B backbone (NVIDIA's Cosmos3-Super reasoner) paired with a custom sub-1B action expert. Select it with `"type": "cosmos3"` and start from [configs/examples/cosmos3_training_config.json](https://github.com/TensorAuto/OpenTau/blob/main/configs/examples/cosmos3_training_config.json); see the [model documentation](https://opentau.readthedocs.io/en/latest/model.html#cosmos3) for the design adjustments.
+`cosmos3` reuses the $\pi_{0.5}$ flow-matching recipe on a frozen Qwen3-VL-32B backbone (NVIDIA's Cosmos3-Super reasoner) paired with a custom sub-1B action expert. Select it with `"type": "cosmos3"` and start from [configs/examples/cosmos3_training_config.json](https://github.com/TensorAuto/OpenTau/blob/main/configs/examples/cosmos3_training_config.json); see the [model documentation](https://opentau.readthedocs.io/en/latest/model.html#cosmos3) for the design adjustments. `cosmos3_nano` is the same architecture on the smaller frozen Qwen3-VL-8B backbone (the Cosmos3-Nano reasoner, which keeps the identical 8-KV-head × 128-head-dim interface the expert reads) — select it with `"type": "cosmos3_nano"` and start from [configs/examples/cosmos3_nano_training_config.json](https://github.com/TensorAuto/OpenTau/blob/main/configs/examples/cosmos3_nano_training_config.json).
 
 ## Training Diagnostics
 
