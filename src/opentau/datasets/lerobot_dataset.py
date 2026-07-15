@@ -924,8 +924,16 @@ class BaseDataset(torch.utils.data.Dataset):
                     standard_item[std_key] = torch.zeros((3, *self.resolution))
                 image_is_pad.append(True)
             elif self.n_obs_history is not None:
+                img = item[key]
+                # n_obs_history == 1 produces a length-1 delta-timestamps
+                # query, which the fetch paths collapse to (C, H, W) —
+                # `_query_videos` for video keys, the single-delta squeeze in
+                # `__getitem__` for image columns. Restore the temporal dim so
+                # the (T, C, H, W) contract holds for T == 1.
+                if self.n_obs_history == 1 and img.ndim == 3:
+                    img = rearrange(img, "c h w -> 1 c h w")
                 standard_item[std_key] = self.resize_with_pad(
-                    item[key], self.resolution[1], self.resolution[0], pad_value=0
+                    img, self.resolution[1], self.resolution[0], pad_value=0
                 )
                 # Per-frame temporal padding info (from clamped episode boundaries) is
                 # tracked by obs_history_is_pad on the state side. Camera _is_pad only

@@ -326,6 +326,103 @@ def test_obs_history_is_pad_fallback_shape(lerobot_dataset_factory, info_factory
 
 
 # ---------------------------------------------------------------------------
+# Integration tests: video datasets with observation history
+# ---------------------------------------------------------------------------
+
+
+def _make_video_dataset_with_history(
+    lerobot_dataset_factory, tmp_path, monkeypatch, n_obs_history, frame_hw=(48, 64)
+):
+    """Create a LeRobotDataset with video cameras and observation history.
+
+    The fixture datasets declare video features but ship no mp4s, so
+    ``decode_video_frames`` is patched to synthesize ``(len(ts), 3, H, W)``
+    frames. Patching at the decode level (rather than ``_query_videos``)
+    keeps the real single-timestamp squeeze in ``_query_videos`` in play —
+    that squeeze is what makes ``n_obs_history=1`` regress to (C, H, W).
+    """
+    from opentau.datasets.lerobot_dataset import LeRobotDataset
+
+    monkeypatch.setitem(
+        DATA_FEATURES_NAME_MAPPING,
+        DUMMY_REPO_ID,
+        {
+            "camera0": "laptop",
+            "camera1": "phone",
+            "state": "state",
+            "actions": "action",
+            "prompt": "task",
+            "response": "response",
+        },
+    )
+
+    h, w = frame_hw
+
+    def _fake_decode(video_path, timestamps, tolerance_s, backend=None):
+        return torch.rand(len(timestamps), 3, h, w)
+
+    monkeypatch.setattr("opentau.datasets.lerobot_dataset.decode_video_frames", _fake_decode)
+
+    dataset = lerobot_dataset_factory(
+        root=tmp_path / f"obs_hist_video_{n_obs_history}",
+        repo_id=DUMMY_REPO_ID,
+        total_episodes=3,
+        total_frames=150,
+        total_tasks=1,
+    )
+
+    dataset.cfg.dataset_mixture.n_obs_history = n_obs_history
+    dataset.n_obs_history = n_obs_history
+    dataset.cfg.policy = DummyPolicyConfig(chunk_size=dataset.cfg.action_chunk)
+    # Disable the random-index retry wrapper so a failure surfaces at the
+    # queried index instead of being silently replaced by a random sample.
+    dataset._total_rand_attempts = 0
+
+    dt_info = resolve_delta_timestamps(dataset.cfg, dataset.cfg.dataset_mixture.datasets[0], dataset.meta)
+    dataset.delta_timestamps_params = LeRobotDataset.compute_delta_params(*dt_info)
+
+    return dataset
+
+
+@pytest.mark.parametrize("n_obs_history", [1, 3])
+def test_video_history_camera_shapes(lerobot_dataset_factory, tmp_path, monkeypatch, n_obs_history):
+    """Camera tensors keep the (T, 3, H, W) contract for any n_obs_history.
+
+    Regression test for n_obs_history=1 with video datasets: the length-1
+    delta-timestamps query is squeezed to (C, H, W) upstream, which used to
+    fail the (T, 3, H, W) shape assert in ``_standardize_images`` on every
+    sample fetch.
+    """
+    dataset = _make_video_dataset_with_history(
+        lerobot_dataset_factory, tmp_path, monkeypatch, n_obs_history=n_obs_history
+    )
+    item = dataset[25]
+    expected = (n_obs_history, 3, *dataset.cfg.resolution)
+    assert item["camera0"].shape == expected
+    assert item["camera1"].shape == expected
+    assert item["img_is_pad"].shape == (dataset.cfg.num_cams,)
+    assert not item["img_is_pad"].any()
+    assert item["obs_history_is_pad"].shape == (n_obs_history,)
+    # Deliberate asymmetry pinned: cameras keep the T=1 singleton, but state
+    # follows the generic length-1 delta squeeze and stays rank-1 — policies
+    # rank-normalize (B, D) -> (B, 1, D) themselves (see the n_obs_history
+    # docstring in configs/default.py).
+    if n_obs_history == 1:
+        assert item["state"].shape == (dataset.cfg.max_state_dim,)
+    else:
+        assert item["state"].shape == (n_obs_history, dataset.cfg.max_state_dim)
+
+
+def test_video_history_t1_batch_collates(lerobot_dataset_factory, tmp_path, monkeypatch):
+    """n_obs_history=1 items collate into a (B, 1, 3, H, W) camera batch."""
+    dataset = _make_video_dataset_with_history(
+        lerobot_dataset_factory, tmp_path, monkeypatch, n_obs_history=1
+    )
+    batch = torch.utils.data.default_collate([dataset[25], dataset[26]])
+    assert batch["camera0"].shape == (2, 1, 3, *dataset.cfg.resolution)
+
+
+# ---------------------------------------------------------------------------
 # Batched resize_with_pad tests
 # ---------------------------------------------------------------------------
 
