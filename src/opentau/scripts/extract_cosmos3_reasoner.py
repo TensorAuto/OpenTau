@@ -109,7 +109,7 @@ def _is_reasoner_key(key: str) -> bool:
 
 
 def _remap_transformer_key(key: str) -> str | None:
-    """Map a Cosmos3-Super ``transformer/`` key to its Qwen3-VL name, or None to drop it."""
+    """Map a Cosmos3 omni ``transformer/`` key to its Qwen3-VL name, or None to drop it."""
     if not _is_reasoner_key(key):
         return None
     if key == "embed_tokens.weight":
