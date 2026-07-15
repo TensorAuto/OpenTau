@@ -339,9 +339,12 @@ class DatasetMixtureConfig:
             returns shape ``(T, max_state_dim)``. When ``None``, the default
             single-step behavior is preserved with rank-3 camera tensors
             ``(C, H, W)`` and rank-1 state tensors ``(max_state_dim,)``.
-            Note that ``n_obs_history=1`` produces rank-4/rank-2 tensors with
-            a leading singleton dimension, so downstream consumers must handle
-            both rank conventions. Defaults to ``None``. The temporal stride
+            Note that ``n_obs_history=1`` produces rank-4 camera tensors
+            ``(1, C, H, W)`` with a leading singleton dimension, while state
+            collapses to rank-1 ``(max_state_dim,)`` (the length-1
+            delta-timestamps query is squeezed like the ``None`` case), so
+            downstream consumers must rank-normalize state themselves.
+            Defaults to ``None``. The temporal stride
             between sampled observations is read from the policy config's
             ``history_interval`` attribute (defaults to 1 when the policy
             doesn't define one), so observations are sampled at timesteps
