@@ -1373,6 +1373,9 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         Args:
             batch: Batch of data containing image/video tensors. May contain
                 ``obs_history_is_pad`` ``(B, T)`` marking padded history frames.
+                The current frame (t = T-1) is never zeroed, even when flagged:
+                the dataset's ``history_state_drop_prob`` augmentation marks
+                ``obs_history_is_pad`` all-True while keeping the current step.
 
         Returns:
             A tuple (videos, vid_masks) where each element is a list
@@ -1409,7 +1412,15 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
                 # Zero padded history frames at the pixel level (defense in
                 # depth alongside the encoder's temporal-attention mask) so the
                 # encoder never processes clamped/repeated content.
-                vid = vid * (~obs_history_is_pad)[:, :, None, None, None]
+                frame_keep = ~obs_history_is_pad  # (B, T) — `~` allocates a fresh tensor
+                # The current frame (t = T-1) is ALWAYS kept even when the
+                # dataset's history_state_drop_prob augmentation marks
+                # obs_history_is_pad all-True — the augmentation drops the
+                # *history* but keeps the current step, mirroring the state
+                # path's `state_mask[:, -1] = True` in embed_prefix. The fresh
+                # `~` tensor keeps the in-place write off the caller's mask.
+                frame_keep[:, -1] = True
+                vid = vid * frame_keep[:, :, None, None, None]  # (B, T, 1, 1, 1)
 
             if self.config.resize_imgs_with_padding is not None:
                 b, t_frames = vid.shape[:2]

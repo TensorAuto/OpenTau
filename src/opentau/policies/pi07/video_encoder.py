@@ -610,9 +610,10 @@ class SpaceTimeSiglipVideoEncoder(nn.Module):
                 marks padded history frames. Padded frames are blocked in
                 the temporal attention so the current frame cannot read
                 contaminated hidden states from them. When ``None`` and
-                ``T > 1``, falls back to "only the current frame is real"
-                (matches inference-time semantics where
-                ``_build_history_batch`` does not populate this mask).
+                ``T > 1``, falls back to "only the current frame is real" —
+                a defensive default for callers that omit the mask (the
+                built-in ``select_action -> _build_history_batch`` path
+                does emit it).
 
         Returns:
             ``(B, num_video_tokens, vlm_hidden_size)`` current-frame tokens,
@@ -648,11 +649,11 @@ class SpaceTimeSiglipVideoEncoder(nn.Module):
                     obs_history_is_pad, self.num_video_tokens, hidden.dtype
                 )
             else:
-                # Inference fallback: select_action -> _build_history_batch
-                # zero-pads missing slots but does NOT emit obs_history_is_pad.
+                # Defensive fallback for callers that omit obs_history_is_pad
+                # (the built-in select_action -> _build_history_batch path
+                # emits it, so this is not the normal inference route).
                 # Treat all history as padded so the current frame's
-                # representation is uncontaminated by the zero-pixel
-                # placeholders.
+                # representation is uncontaminated by unknown history content.
                 fallback_pad = torch.ones(b, t, dtype=torch.bool, device=hidden.device)
                 fallback_pad[:, -1] = False
                 temporal_attn_mask = self._build_temporal_attn_mask(

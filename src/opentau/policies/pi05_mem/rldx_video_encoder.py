@@ -173,8 +173,11 @@ class RLDXVideoEncoder(nn.Module):
                 (start-of-episode zero) frames. When given, padded frames are
                 replaced by the nearest real frame before the STSS correlation,
                 so they contribute "no motion" instead of spurious motion against
-                a blank frame. This mirrors the space-time encoder, which masks
-                exactly these frames out of temporal attention.
+                a blank frame. The current frame (t = T-1) is treated as real
+                even when flagged (the ``history_state_drop_prob`` augmentation
+                marks the whole mask True while keeping the current frame).
+                This mirrors the space-time encoder, which masks exactly these
+                frames out of temporal attention.
         Returns:
             ``(B*T, N, D)`` hidden states with the motion residual added.
         """
@@ -189,11 +192,17 @@ class RLDXVideoEncoder(nn.Module):
         # would otherwise read as motion. Padded frames are dropped after the
         # encoder anyway; this only protects the current frame's residual.
         if obs_history_is_pad is not None:
-            real = ~obs_history_is_pad  # (b, t)
+            real = ~obs_history_is_pad  # (b, t) — `~` allocates a fresh tensor
+            # The current frame (t = T-1) is ALWAYS real even when the
+            # dataset's history_state_drop_prob augmentation marks
+            # obs_history_is_pad all-True. Without this override, argmax over
+            # an all-False row would silently pick the zeroed frame 0 as the
+            # fill and replace the current frame's hidden state with it too.
+            real[:, -1] = True
             # First real index per row (argmax returns the first max=1 position).
             first_real = real.float().argmax(dim=1)  # (b,)
             fill = x[torch.arange(b, device=x.device), first_real]  # (b, n, d)
-            pad_mask = rearrange(obs_history_is_pad, "b t -> b t 1 1")
+            pad_mask = rearrange(~real, "b t -> b t 1 1")
             x = torch.where(pad_mask, rearrange(fill, "b n d -> b 1 n d"), x)
 
         # (B, T, N, D) -> (B*T*N, D), preserving the (b t h w) token order the
