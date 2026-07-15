@@ -881,7 +881,10 @@ class PI05MemPolicy(PreTrainedPolicy):
             obs_history_is_pad: Optional bool tensor (B, T) indicating which
                 temporal frames are padded. Padded frames are zeroed out before
                 encoding so the video encoder does not see clamped/repeated
-                content.
+                content. The current frame (t = T-1) is never zeroed, even
+                when flagged: the dataset's ``history_state_drop_prob``
+                augmentation marks ``obs_history_is_pad`` all-True while
+                keeping the current step.
 
         Returns:
             A tuple of (videos, vid_masks) lists.
@@ -912,8 +915,15 @@ class PI05MemPolicy(PreTrainedPolicy):
                 vid = vid.unsqueeze(1)  # (B, C, H, W) -> (B, 1, C, H, W)
 
             if obs_history_is_pad is not None:
-                frame_mask = (~obs_history_is_pad)[:, :, None, None, None]  # (B, T, 1, 1, 1)
-                vid = vid * frame_mask
+                frame_keep = ~obs_history_is_pad  # (B, T) — `~` allocates a fresh tensor
+                # The current frame (t = T-1) is ALWAYS kept even when the
+                # dataset's history_state_drop_prob augmentation marks
+                # obs_history_is_pad all-True — the augmentation drops the
+                # *history* but keeps the current step, mirroring the state
+                # path's `state_mask[:, -1] = True` in embed_prefix. The fresh
+                # `~` tensor keeps the in-place write off the caller's mask.
+                frame_keep[:, -1] = True
+                vid = vid * frame_keep[:, :, None, None, None]  # (B, T, 1, 1, 1)
 
             if self.config.resize_imgs_with_padding is not None:
                 b, t_frames = vid.shape[:2]
