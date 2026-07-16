@@ -63,7 +63,12 @@ from opentau.policies.pi07.low_level.configuration_pi07_low_level import (
 )
 from opentau.policies.pi07.video_encoder import SpaceTimeSiglipVideoEncoder
 from opentau.policies.pretrained import PreTrainedPolicy, ProjectionRemapError, T
-from opentau.policies.utils import PerSampleLoss, ce_per_sample, flow_matching_masked_mse
+from opentau.policies.utils import (
+    PerSampleLoss,
+    assert_gemma3_input_resolution,
+    ce_per_sample,
+    flow_matching_masked_mse,
+)
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
 
@@ -1403,16 +1408,9 @@ class PI07LowLevelFlowMatching(nn.Module):
         # so a non-default grid would crash deep inside the projector with an
         # unrelated-looking reshape error. Fail here with the real diagnosis.
         # (The PaliGemma-family policies support native resolutions.)
-        vision_cfg = self.gemma3_with_expert._vision_tower().config
-        expected_hw = config.input_image_size
-        if expected_hw is not None and tuple(expected_hw) != (vision_cfg.image_size, vision_cfg.image_size):
-            raise ValueError(
-                f"input resolution {tuple(expected_hw)} (resize_imgs_with_padding, or the bound "
-                f"image-feature resolution when it is null) != the Gemma 3 vision tower's "
-                f"image_size ({vision_cfg.image_size}). Native resolutions are not yet supported "
-                "for the Gemma3-family policies; set resize_imgs_with_padding (and resolution) to "
-                f"({vision_cfg.image_size}, {vision_cfg.image_size})."
-            )
+        assert_gemma3_input_resolution(
+            config.input_image_size, self.gemma3_with_expert._vision_tower().config.image_size
+        )
 
         self.video_encoder = SpaceTimeSiglipVideoEncoder(
             vision_tower=self.gemma3_with_expert._vision_tower(),

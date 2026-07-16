@@ -47,6 +47,8 @@ from opentau.policies.pi07_paligemma.low_level.configuration_pi07_low_level impo
     PI07PaligemmaLowLevelConfig,
 )
 from opentau.policies.pi07_paligemma.low_level.modeling_pi07_low_level import resize_with_pad
+from opentau.policies.utils import assert_gemma3_input_resolution
+from opentau.scripts.eval import validate_eval_input_resolution
 from opentau.utils.transformers_patch import patched_paligemma_model_get_image_features
 from opentau.utils.vision_utils import pad_to_patch_multiple, patch_grid_hw
 
@@ -288,6 +290,42 @@ class TestValidateInputResolution:
         config = PI07PaligemmaLowLevelConfig(resize_imgs_with_padding=None)
         config.input_features = {}
         assert config.input_image_size is None
+
+    def test_gemma3_guard_rejects_native_resolution(self):
+        # pi06/pi07 constructors call this: Gemma3MultiModalProjector
+        # hard-codes a square patch grid, so native input must fail with the
+        # real diagnosis instead of a projector reshape crash.
+        with pytest.raises(ValueError, match="Gemma3-family"):
+            assert_gemma3_input_resolution(NATIVE_HW, 448)
+
+    def test_gemma3_guard_passes_tower_resolution_and_unbound(self):
+        assert_gemma3_input_resolution((448, 448), 448)
+        assert_gemma3_input_resolution(None, 448)
+
+    def test_eval_guard_native_passthrough_mismatch_raises(self):
+        cfg = SimpleNamespace(
+            policy=self._config_with_camera(resize=None),
+            resolution=(224, 224),
+        )
+        with pytest.raises(ValueError, match="native pass-through"):
+            validate_eval_input_resolution(cfg)
+
+    def test_eval_guard_matching_and_resize_set_pass(self, caplog):
+        # Matching native resolution passes.
+        validate_eval_input_resolution(
+            SimpleNamespace(policy=self._config_with_camera(resize=None), resolution=NATIVE_HW)
+        )
+        # With a resize target set, the in-policy letterbox reproduces the
+        # checkpoint's training-time geometry; make_policy owns the warning.
+        validate_eval_input_resolution(
+            SimpleNamespace(policy=self._config_with_camera(resize=(224, 224)), resolution=(448, 448))
+        )
+        # Escape hatch downgrades the native-passthrough raise to a warning.
+        skip_policy = self._config_with_camera(resize=None)
+        skip_policy.skip_input_resolution_check = True
+        with caplog.at_level("WARNING"):
+            validate_eval_input_resolution(SimpleNamespace(policy=skip_policy, resolution=(224, 224)))
+        assert any("different geometry" in record.message for record in caplog.records)
 
     def test_channels_last_shapes_recognized(self):
         # Bare LeRobotDatasetMetadata binds raw (H, W, C) shapes; the strict

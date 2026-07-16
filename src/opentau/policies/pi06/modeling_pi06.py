@@ -51,7 +51,12 @@ from opentau.policies.pi06.gemma3_with_expert import (
     Gemma3WithExpertModel,
 )
 from opentau.policies.pretrained import PreTrainedPolicy, T
-from opentau.policies.utils import PerSampleLoss, ce_per_sample, flow_matching_masked_mse
+from opentau.policies.utils import (
+    PerSampleLoss,
+    assert_gemma3_input_resolution,
+    ce_per_sample,
+    flow_matching_masked_mse,
+)
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
 
@@ -834,16 +839,9 @@ class PI06FlowMatching(nn.Module):
         # the Gemma3 backbone (Gemma3MultiModalProjector hard-codes a square
         # patch grid); fail fast with the real diagnosis instead of a reshape
         # crash inside the projector at first forward.
-        vision_cfg = self.gemma3_with_expert._vision_tower().config
-        expected_hw = config.input_image_size
-        if expected_hw is not None and tuple(expected_hw) != (vision_cfg.image_size, vision_cfg.image_size):
-            raise ValueError(
-                f"input resolution {tuple(expected_hw)} (resize_imgs_with_padding, or the bound "
-                f"image-feature resolution when it is null) != the Gemma 3 vision tower's "
-                f"image_size ({vision_cfg.image_size}). Native resolutions are not yet supported "
-                "for the Gemma3-family policies; set resize_imgs_with_padding (and resolution) to "
-                f"({vision_cfg.image_size}, {vision_cfg.image_size})."
-            )
+        assert_gemma3_input_resolution(
+            config.input_image_size, self.gemma3_with_expert._vision_tower().config.image_size
+        )
 
         # Action projections stay float32 for numerical stability; they're small.
         self.action_in_proj = nn.Linear(self.config.max_action_dim, self.config.proj_width)
