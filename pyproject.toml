@@ -243,6 +243,13 @@ default.extend-ignore-identifiers-re = [
     # Qwen3-VL grid shape names (temporal/height/width): image_grid_thw, video_grid_thw, grid_thw.
     ".*grid_thw.*",
     "thw",
+    # Verbatim camera-column names from upstream community SO101 HF datasets
+    # (configs/examples/refs/so101_community_mixture.json data_features_name_mapping
+    # values) -- these must match the misspelled column exactly to resolve.
+    "righ",
+    "rigth",
+    "sholder",
+    "sence",
 ]
 
 [build-system]

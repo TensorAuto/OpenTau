@@ -34,6 +34,10 @@ repos:
     rev: v5.0.0
     hooks:
       - id: check-added-large-files
+        # so101_community_mixture.json is an intentionally large, reviewed
+        # per-repo camera-mapping list (3000+ community HF datasets) -- not
+        # an accidentally committed binary/artifact this hook guards against.
+        exclude: ^configs/examples/refs/so101_community_mixture\.json$
       - id: debug-statements
       - id: check-merge-conflict
       - id: check-case-conflict
