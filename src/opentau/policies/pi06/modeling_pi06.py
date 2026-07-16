@@ -51,7 +51,12 @@ from opentau.policies.pi06.gemma3_with_expert import (
     Gemma3WithExpertModel,
 )
 from opentau.policies.pretrained import PreTrainedPolicy, T
-from opentau.policies.utils import PerSampleLoss, ce_per_sample, flow_matching_masked_mse
+from opentau.policies.utils import (
+    PerSampleLoss,
+    assert_gemma3_input_resolution,
+    ce_per_sample,
+    flow_matching_masked_mse,
+)
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
 
@@ -174,6 +179,12 @@ def resize_with_pad(img: Tensor, width: int, height: int, pad_value: int = -1) -
         raise ValueError(f"(b,c,h,w) expected, but {img.shape}")
 
     cur_height, cur_width = img.shape[2:]
+
+    # Explicit no-op when the input already matches the target — native-
+    # resolution inputs must pass through bit-identical, not survive a
+    # same-size bilinear round trip.
+    if (cur_height, cur_width) == (height, width):
+        return img
 
     ratio = max(cur_width / width, cur_height / height)
     resized_height = int(cur_height / ratio)
@@ -685,7 +696,11 @@ class PI06Policy(PreTrainedPolicy):
         for key in present_img_keys:
             img = batch[key]
             if self.config.resize_imgs_with_padding is not None:
-                img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
+                # The config tuple is (height, width); the function signature is
+                # (width, height) — unpack explicitly so non-square targets are not
+                # transposed (invisible at the square defaults).
+                target_h, target_w = self.config.resize_imgs_with_padding
+                img = resize_with_pad(img, width=target_w, height=target_h, pad_value=0)
 
             img = img * 2.0 - 1.0
 
@@ -819,6 +834,14 @@ class PI06FlowMatching(nn.Module):
             gradient_checkpointing=self.config.gradient_checkpointing,
         )
         self.gemma3_with_expert = Gemma3WithExpertModel(gemma3_with_expert_config)
+
+        # Native (non-square-448) input resolutions are not yet supported on
+        # the Gemma3 backbone (Gemma3MultiModalProjector hard-codes a square
+        # patch grid); fail fast with the real diagnosis instead of a reshape
+        # crash inside the projector at first forward.
+        assert_gemma3_input_resolution(
+            config.input_image_size, self.gemma3_with_expert._vision_tower().config.image_size
+        )
 
         # Action projections stay float32 for numerical stability; they're small.
         self.action_in_proj = nn.Linear(self.config.max_action_dim, self.config.proj_width)

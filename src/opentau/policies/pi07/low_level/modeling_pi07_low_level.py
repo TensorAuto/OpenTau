@@ -63,7 +63,12 @@ from opentau.policies.pi07.low_level.configuration_pi07_low_level import (
 )
 from opentau.policies.pi07.video_encoder import SpaceTimeSiglipVideoEncoder
 from opentau.policies.pretrained import PreTrainedPolicy, ProjectionRemapError, T
-from opentau.policies.utils import PerSampleLoss, ce_per_sample, flow_matching_masked_mse
+from opentau.policies.utils import (
+    PerSampleLoss,
+    assert_gemma3_input_resolution,
+    ce_per_sample,
+    flow_matching_masked_mse,
+)
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
 
@@ -274,6 +279,12 @@ def resize_with_pad(img: Tensor, width: int, height: int, pad_value: int = -1) -
         raise ValueError(f"(b,c,h,w) expected, but {img.shape}")
 
     cur_height, cur_width = img.shape[2:]
+
+    # Explicit no-op when the input already matches the target — native-
+    # resolution inputs must pass through bit-identical, not survive a
+    # same-size bilinear round trip.
+    if (cur_height, cur_width) == (height, width):
+        return img
 
     ratio = max(cur_width / width, cur_height / height)
     resized_height = int(cur_height / ratio)
@@ -1073,7 +1084,11 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
             if self.config.resize_imgs_with_padding is not None:
                 b, t_frames = vid.shape[:2]
                 flat = rearrange(vid, "B T C H W -> (B T) C H W")
-                flat = resize_with_pad(flat, *self.config.resize_imgs_with_padding, pad_value=0)
+                # The config tuple is (height, width); the function signature is
+                # (width, height) — unpack explicitly so non-square targets are not
+                # transposed (invisible at the square defaults).
+                target_h, target_w = self.config.resize_imgs_with_padding
+                flat = resize_with_pad(flat, width=target_w, height=target_h, pad_value=0)
                 vid = rearrange(flat, "(B T) C H W -> B T C H W", B=b, T=t_frames)
 
             bsize = vid.shape[0]
@@ -1209,7 +1224,11 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
             subgoal_img = batch[key]
 
             if self.config.resize_imgs_with_padding is not None:
-                subgoal_img = resize_with_pad(subgoal_img, *self.config.resize_imgs_with_padding, pad_value=0)
+                # The config tuple is (height, width); the function signature is
+                # (width, height) — unpack explicitly so non-square targets are not
+                # transposed (invisible at the square defaults).
+                target_h, target_w = self.config.resize_imgs_with_padding
+                subgoal_img = resize_with_pad(subgoal_img, width=target_w, height=target_h, pad_value=0)
 
             # Normalize from range [0,1] to [-1,1] as expected by siglip
             subgoal_img = subgoal_img * 2.0 - 1.0
@@ -1393,6 +1412,16 @@ class PI07LowLevelFlowMatching(nn.Module):
             )
 
         vlm_hidden_size = self.gemma3_with_expert.config.gemma3_config.text_config.hidden_size
+
+        # Native (non-square-448) input resolutions are not yet supported on
+        # the Gemma3 backbone: Gemma3MultiModalProjector hard-codes a square
+        # `patches_per_image = image_size // patch_size` reshape + avg-pool,
+        # so a non-default grid would crash deep inside the projector with an
+        # unrelated-looking reshape error. Fail here with the real diagnosis.
+        # (The PaliGemma-family policies support native resolutions.)
+        assert_gemma3_input_resolution(
+            config.input_image_size, self.gemma3_with_expert._vision_tower().config.image_size
+        )
 
         self.video_encoder = SpaceTimeSiglipVideoEncoder(
             vision_tower=self.gemma3_with_expert._vision_tower(),

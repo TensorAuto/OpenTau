@@ -32,6 +32,36 @@ from einops import rearrange, reduce
 from torch import Tensor, nn
 
 
+def assert_gemma3_input_resolution(input_image_size: tuple[int, int] | None, tower_image_size: int) -> None:
+    """Fail fast when a Gemma3-family policy would run at a native resolution.
+
+    ``Gemma3MultiModalProjector`` hard-codes a square ``patches_per_image =
+    image_size // patch_size`` reshape + avg-pool, so a non-default patch
+    grid crashes deep inside the projector with an unrelated-looking reshape
+    error. The pi06/pi07 constructors call this to surface the real
+    diagnosis instead. (The PaliGemma-family policies support native
+    resolutions.)
+
+    Args:
+        input_image_size: ``(H, W)`` the vision tower will receive
+            (``PreTrainedConfig.input_image_size``), or ``None`` when
+            underivable (no check possible).
+        tower_image_size: The Gemma 3 SigLIP config's square ``image_size``.
+
+    Raises:
+        ValueError: When ``input_image_size`` is known and differs from the
+            tower's square resolution.
+    """
+    if input_image_size is not None and tuple(input_image_size) != (tower_image_size, tower_image_size):
+        raise ValueError(
+            f"input resolution {tuple(input_image_size)} (resize_imgs_with_padding, or the bound "
+            f"image-feature resolution when it is null) != the Gemma 3 vision tower's "
+            f"image_size ({tower_image_size}). Native resolutions are not yet supported "
+            "for the Gemma3-family policies; set resize_imgs_with_padding (and resolution) to "
+            f"({tower_image_size}, {tower_image_size})."
+        )
+
+
 def populate_queues(
     queues: dict[str, deque], batch: dict[str, torch.Tensor], exclude_keys: list[str] | None = None
 ) -> dict[str, deque]:

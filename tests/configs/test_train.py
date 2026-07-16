@@ -68,6 +68,61 @@ def test_validate_with_policy_param(policy_config, dataset_mixture_config, tmp_p
     cfg.validate()
 
 
+def test_validate_rejects_resize_resolution_mismatch(policy_config, dataset_mixture_config, tmp_path):
+    """policy.resize_imgs_with_padding must match resolution at train-config time."""
+    cfg = TrainPipelineConfig(
+        dataset_mixture=dataset_mixture_config,
+        policy=policy_config,
+        output_dir=str(tmp_path / "native_res_run"),
+        job_name="test_run",
+        seed=42,
+        batch_size=8,
+        use_policy_training_preset=True,
+        resolution=(180, 320),  # policy_config default resize stays (224, 224)
+    )
+
+    with pytest.raises(ValueError, match="resize_imgs_with_padding"):
+        cfg.validate()
+
+
+def test_validate_resize_resolution_mismatch_escape_hatch(
+    policy_config, dataset_mixture_config, tmp_path, caplog
+):
+    """skip_input_resolution_check downgrades the train-time mismatch to a warning."""
+    policy_config.skip_input_resolution_check = True
+    cfg = TrainPipelineConfig(
+        dataset_mixture=dataset_mixture_config,
+        policy=policy_config,
+        output_dir=str(tmp_path / "legacy_resume_run"),
+        job_name="test_run",
+        seed=42,
+        batch_size=8,
+        use_policy_training_preset=True,
+        resolution=(180, 320),
+    )
+
+    with caplog.at_level("WARNING"):
+        cfg.validate()
+    assert any("resize_imgs_with_padding" in record.message for record in caplog.records)
+
+
+def test_validate_native_resolution_with_matching_resize(policy_config, dataset_mixture_config, tmp_path):
+    """Matching non-224 resolution and resize target validates cleanly."""
+    policy_config.resize_imgs_with_padding = (180, 320)
+    cfg = TrainPipelineConfig(
+        dataset_mixture=dataset_mixture_config,
+        policy=policy_config,
+        output_dir=str(tmp_path / "native_match_run"),
+        job_name="test_run",
+        seed=42,
+        batch_size=8,
+        use_policy_training_preset=True,
+        resolution=(180, 320),
+    )
+
+    cfg.validate()
+
+
 def test_validate_file_exits(dataset_mixture_config, policy_config, tmp_path):
     """
     Tests if validate raises FileExistsError when empty policy is passed

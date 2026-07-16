@@ -287,6 +287,17 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                 **kwargs,
             )
         model_id = str(pretrained_name_or_path)
+
+        # Warn (never raise) when the checkpoint's resize target disagrees
+        # with its bound image features — the load-time symptom of a legacy
+        # checkpoint trained with the in-policy double letterbox. Placed here
+        # (mirroring `_check_norm_stats_loaded` below) so direct
+        # `from_pretrained` callers — the gRPC server, inference/export
+        # scripts, notebooks — get the same diagnostic as `make_policy`'s
+        # eval path; the strict train-time enforcement lives in
+        # `make_policy` (ds_meta path) and `TrainPipelineConfig.validate()`.
+        config.validate_input_resolution(strict=False)
+
         instance = cls(config, **kwargs)
         if os.path.isdir(model_id):
             print("Loading weights from local directory")

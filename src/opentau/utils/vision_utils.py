@@ -14,9 +14,17 @@
 
 """Vision-tower helpers reused across policies (pi06, pi07, ...).
 
-The current resident is :func:`bilinear_resample_pos_embed`, which adapts
-SigLIP / ViT-style learned position-embedding tables to a different patch
-count when the policy runs the vision tower at a non-published resolution.
+Residents:
+
+- :func:`bilinear_resample_pos_embed` adapts SigLIP / ViT-style learned
+  position-embedding tables to a different patch count when the policy runs
+  the vision tower at a non-published resolution (offline weight surgery).
+- :func:`patch_grid_hw` / :func:`pad_to_patch_multiple` support running the
+  SigLIP tower at native (non-square, non-patch-multiple) input resolutions
+  at forward time: the stride-``patch_size`` conv patch embedding silently
+  floor-crops any sub-patch remainder (e.g. 180×320 with patch 14 drops 12
+  pixel rows and 12 columns), so callers pad up to the next patch multiple
+  and enable ``interpolate_pos_encoding`` instead.
 
 Why this is its own module rather than inline in a policy: π0.6 uses Gemma
 3-4B at 448×448 (1024 patches) but `google/gemma-3-4b-pt` ships at 896×896
@@ -30,6 +38,55 @@ re-implementations.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F  # noqa: N812
+
+
+def patch_grid_hw(height: int, width: int, patch_size: int) -> tuple[int, int]:
+    """Patch-grid shape ``(grid_h, grid_w)`` that fully covers an image.
+
+    Uses ceiling division, so a resolution that does not divide
+    ``patch_size`` still gets a grid covering every pixel — the caller is
+    expected to pad the image up to ``grid * patch_size`` with
+    :func:`pad_to_patch_multiple` before the conv patch embedding (which
+    would otherwise floor-crop the remainder).
+
+    Args:
+        height: Image height in pixels.
+        width: Image width in pixels.
+        patch_size: ViT patch size (14 for SigLIP so400m).
+
+    Returns:
+        ``(grid_h, grid_w)`` patch counts per axis.
+    """
+    return -(-height // patch_size), -(-width // patch_size)
+
+
+def pad_to_patch_multiple(img: torch.Tensor, patch_size: int, pad_value: float = -1.0) -> torch.Tensor:
+    """Pad the trailing two (H, W) dims up to the next multiple of ``patch_size``.
+
+    Padding goes on the bottom and right so the image origin stays
+    pixel-aligned: every patch that contains real content keeps exactly the
+    pixels it would have at a divisible resolution, and only the last patch
+    row/column mixes in padding. The default ``pad_value=-1.0`` is black in
+    the ``[-1, 1]`` range SigLIP consumes; callers padding ``[0, 1]``-range
+    pixels should pass ``0.0``.
+
+    Args:
+        img: Image tensor of shape ``(..., H, W)``.
+        patch_size: ViT patch size to pad up to a multiple of.
+        pad_value: Fill value for the padded band.
+
+    Returns:
+        The input unchanged (no copy) when ``H`` and ``W`` are already
+        multiples of ``patch_size``, else a padded copy of shape
+        ``(..., ceil(H/p)*p, ceil(W/p)*p)``.
+    """
+    height, width = img.shape[-2:]
+    pad_h = -height % patch_size
+    pad_w = -width % patch_size
+    if pad_h == 0 and pad_w == 0:
+        return img
+    return F.pad(img, (0, pad_w, 0, pad_h), value=pad_value)
 
 
 def bilinear_resample_pos_embed(old_pos: torch.Tensor, target_num_patches: int) -> torch.Tensor:

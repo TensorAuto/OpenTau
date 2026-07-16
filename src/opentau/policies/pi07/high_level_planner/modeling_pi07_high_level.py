@@ -44,6 +44,7 @@ from opentau.policies.pi07.high_level_planner.configuration_pi07_high_level impo
     PI07HighLevelPlannerConfig,
 )
 from opentau.policies.pretrained import PreTrainedPolicy, T
+from opentau.policies.utils import assert_gemma3_input_resolution
 from opentau.utils.accelerate_utils import get_proc_accelerator
 
 
@@ -145,11 +146,16 @@ def resize_with_pad(img: Tensor, width: int, height: int, pad_value: int = -1) -
     Raises:
         ValueError: If the input image tensor does not have 4 dimensions.
     """
-    # assume no-op when width height fits already
     if img.ndim != 4:
         raise ValueError(f"(b,c,h,w) expected, but {img.shape}")
 
     cur_height, cur_width = img.shape[2:]
+
+    # Explicit no-op when the input already matches the target — native-
+    # resolution inputs must pass through bit-identical, not survive a
+    # same-size bilinear round trip.
+    if (cur_height, cur_width) == (height, width):
+        return img
 
     ratio = max(cur_width / width, cur_height / height)
     resized_height = int(cur_height / ratio)
@@ -652,7 +658,11 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
             img = batch[key]
 
             if self.config.resize_imgs_with_padding is not None:
-                img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
+                # The config tuple is (height, width); the function signature is
+                # (width, height) — unpack explicitly so non-square targets are not
+                # transposed (invisible at the square defaults).
+                target_h, target_w = self.config.resize_imgs_with_padding
+                img = resize_with_pad(img, width=target_w, height=target_h, pad_value=0)
 
             # Normalize from range [0,1] to [-1,1] as expected by siglip
             img = img * 2.0 - 1.0
@@ -923,6 +933,14 @@ class PI07HighLevelPlannerModel(nn.Module):
 
         self.config.vlm_config.discrete_action_vocab_size = discrete_action_vocab_size
         self.gemma3_with_expert = Gemma3WithExpertModel(self.config.vlm_config)
+
+        # Native (non-square-448) input resolutions are not yet supported on
+        # the Gemma3 backbone (Gemma3MultiModalProjector hard-codes a square
+        # patch grid); fail fast with the real diagnosis instead of a reshape
+        # crash inside the projector at first forward.
+        assert_gemma3_input_resolution(
+            config.input_image_size, self.gemma3_with_expert._vision_tower().config.image_size
+        )
 
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-4b-pt")
 

@@ -946,6 +946,51 @@ def _eval_uses_sharded_params(accelerator: Accelerator) -> bool:
     return False
 
 
+def validate_eval_input_resolution(cfg: TrainPipelineConfig) -> None:
+    """Fail fast when eval frames would reach the vision tower at the wrong geometry.
+
+    ``preprocess_observation`` delivers env frames at exactly
+    ``cfg.resolution``; the policy's vision tower expects
+    ``cfg.policy.input_image_size`` (the resize target, or — when
+    ``resize_imgs_with_padding`` is null — the resolution the checkpoint's
+    image features were bound at). A mismatch with a resize target set merely
+    reproduces the checkpoint's own (legacy) double letterbox, so it only
+    warns inside ``make_policy``; with no resize target the tower would
+    silently run at the wrong geometry, so this raises instead
+    (``policy.skip_input_resolution_check=true`` downgrades it to a warning).
+
+    Args:
+        cfg: The eval pipeline config (``resolution`` + ``policy``).
+
+    Raises:
+        ValueError: When ``resize_imgs_with_padding`` is ``None``, the
+            policy's bound input resolution is known, ``cfg.resolution``
+            differs from it, and the escape hatch is not set.
+    """
+    expected_hw = cfg.policy.input_image_size
+    if (
+        expected_hw is None
+        or tuple(cfg.resolution) == tuple(expected_hw)
+        or getattr(cfg.policy, "resize_imgs_with_padding", None) is not None
+    ):
+        return
+    if cfg.policy.skip_input_resolution_check:
+        logging.warning(
+            f"resolution={tuple(cfg.resolution)} != the policy's bound input resolution "
+            f"{tuple(expected_hw)} with resize_imgs_with_padding=null; env frames will reach "
+            "the vision tower at a different geometry than training. Proceeding because "
+            "skip_input_resolution_check=true."
+        )
+        return
+    raise ValueError(
+        f"resolution={tuple(cfg.resolution)} but the policy was trained at "
+        f"{tuple(expected_hw)} with resize_imgs_with_padding=null (native pass-through): "
+        "env frames would reach the vision tower at the wrong geometry with nothing to "
+        "correct them. Set resolution to match the checkpoint, or set "
+        "policy.skip_input_resolution_check=true to proceed anyway."
+    )
+
+
 @parser.wrap()
 def eval_main(cfg: TrainPipelineConfig):
     accelerator = Accelerator()
@@ -981,6 +1026,8 @@ def eval_main(cfg: TrainPipelineConfig):
     subgoal_generator = make_subgoal_generator(cfg)
 
     logging.info("Making policy.")
+
+    validate_eval_input_resolution(cfg)
 
     policy = make_policy(cfg=cfg.policy)
     policy.to(torch.bfloat16)

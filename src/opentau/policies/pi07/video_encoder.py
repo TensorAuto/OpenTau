@@ -75,6 +75,7 @@ from transformers.models.siglip.modeling_siglip import (
 # multi_modal_projector. Our forward must match that patched behavior for
 # single-frame invariance to hold.
 import opentau.utils.transformers_patch  # noqa: F401
+from opentau.utils.vision_utils import pad_to_patch_multiple, patch_grid_hw
 
 
 def _build_temporal_sinusoidal_pe(
@@ -485,7 +486,30 @@ class SpaceTimeSiglipVideoEncoder(nn.Module):
         max_num_frames: int,
         spacetime_layer_stride: int = 4,
         gradient_checkpointing: bool = False,
+        expected_image_size: tuple[int, int] | None = None,
     ):
+        """See the class docstring; only the non-obvious arg is documented here.
+
+        Args:
+            expected_image_size: ``(H, W)`` of the frames each forward will
+                receive. ``None`` (default) means the SigLIP config's square
+                ``image_size`` — the historical behaviour. A non-default value
+                enables native-resolution encoding: frames are padded up to
+                the next ``patch_size`` multiple (so the conv patch embedding
+                never floor-crops pixels) and the pretrained position
+                embeddings are bicubically interpolated to the resulting
+                patch grid. ``num_video_tokens`` then reflects that grid, so
+                every consumer of the token count (skip-path zero fills,
+                temporal-mask expansion, per-layer shape checks) stays
+                consistent by construction. Determinism caveat: with
+                ``freeze_vision_encoder=False`` the interpolation backprops
+                into the trainable position-embedding table every step, and
+                CUDA's backward for bicubic ``F.interpolate`` is
+                non-deterministic (atomicAdd) — GPU native-resolution runs
+                with an *unfrozen* vision tower are therefore not
+                bit-reproducible. The default (frozen tower) is unaffected,
+                as is the config-resolution path (no interpolation).
+        """
         super().__init__()
         if max_num_frames < 1:
             raise ValueError(f"max_num_frames ({max_num_frames}) must be >= 1.")
@@ -510,10 +534,30 @@ class SpaceTimeSiglipVideoEncoder(nn.Module):
         self._vision_tower_ref: list[SiglipVisionModel] = [vision_tower]
         self._multi_modal_projector_ref: list[nn.Module] = [multi_modal_projector]
 
-        # The number of output tokens is fixed by the SigLIP patch grid
-        # (e.g. 224/14 = 16 -> 16*16 = 256 patches for the default config).
+        # The number of output tokens is fixed by the patch grid covering the
+        # expected input resolution (e.g. 224/14 = 16 -> 16*16 = 256 patches
+        # for the default config; 180x320 -> ceil grids 13x23 = 299). Ceiling
+        # division pairs with the forward-time pad_to_patch_multiple so no
+        # pixel is ever floor-cropped by the conv patch embedding.
         vision_cfg = vision_tower.config
-        num_patches = (vision_cfg.image_size // vision_cfg.patch_size) ** 2
+        self.patch_size = vision_cfg.patch_size
+        if expected_image_size is None:
+            expected_image_size = (vision_cfg.image_size, vision_cfg.image_size)
+        self.expected_image_size = tuple(expected_image_size)
+        grid_h, grid_w = patch_grid_hw(*self.expected_image_size, self.patch_size)
+        num_patches = grid_h * grid_w
+        # Interpolate the pretrained position embeddings only when the grid
+        # differs from the config grid: at the config resolution the vanilla
+        # fixed-table add is used, keeping the default path bit-identical
+        # (and trace-stable — the flag is a construction-time constant).
+        default_grid = patch_grid_hw(vision_cfg.image_size, vision_cfg.image_size, self.patch_size)
+        self._interpolate_pos_encoding = (grid_h, grid_w) != default_grid
+        # (grid_h, grid_w) of the patch grid — exposed for consumers that
+        # need the 2-D layout, not just the flat token count (e.g. pi05_mem's
+        # interleaved MRoPE, which assigns per-patch 2-D positions and must
+        # know whether the grid is actually square — a non-square grid can
+        # still have a perfect-square token count, e.g. 16x4 = 64).
+        self.grid_hw = (grid_h, grid_w)
         self.num_video_tokens = num_patches
         self.siglip_hidden_size = vision_cfg.hidden_size
 
@@ -605,7 +649,8 @@ class SpaceTimeSiglipVideoEncoder(nn.Module):
         Args:
             video: ``(B, T, C, H, W)`` pixel values in ``[0, 1]``, with
                 ``1 <= T <= max_num_frames``, ``C == 3``, and spatial size
-                matching the SigLIP config (224x224 by default).
+                matching ``expected_image_size`` (the SigLIP config's square
+                ``image_size`` unless overridden at construction).
             obs_history_is_pad: Optional ``(B, T)`` bool mask where ``True``
                 marks padded history frames. Padded frames are blocked in
                 the temporal attention so the current frame cannot read
@@ -629,6 +674,14 @@ class SpaceTimeSiglipVideoEncoder(nn.Module):
                 f"Expected T <= max_num_frames ({self.max_num_frames}); got {t}. "
                 "Reinstantiate the encoder with a larger max_num_frames."
             )
+        if (h, w) != self.expected_image_size:
+            raise ValueError(
+                f"Video frames are {(h, w)} but the encoder was constructed for "
+                f"{self.expected_image_size}. The policy's `resize_imgs_with_padding` "
+                "(or, when it is None, the bound image-feature resolution) must match "
+                "the frames actually fed to the encoder — a mismatch here would desync "
+                "the precomputed token count from the real patch grid."
+            )
 
         # SigLIP expects pixel values in [-1, 1]. The dataset loader yields
         # [0, 1]; rescale here (keeps prepare_videos producer-agnostic).
@@ -637,8 +690,14 @@ class SpaceTimeSiglipVideoEncoder(nn.Module):
         # Flatten time into batch for the SigLIP pipeline.
         flat = rearrange(video, "b t c h w -> (b t) c h w")
 
-        # Patch embedding + learned spatial position embedding.
-        hidden = self.vision_tower.vision_model.embeddings(flat)
+        # Pad up to the next patch multiple (bottom/right, black in [-1, 1])
+        # so the stride-`patch_size` conv never floor-crops pixels, then patch
+        # embedding + spatial position embedding (interpolated to the actual
+        # grid when it differs from the config grid; no-op at the default).
+        flat = pad_to_patch_multiple(flat, self.patch_size, pad_value=-1.0)
+        hidden = self.vision_tower.vision_model.embeddings(
+            flat, interpolate_pos_encoding=self._interpolate_pos_encoding
+        )
 
         # Build temporal attention mask. Skipped at T=1 because the wrapper's
         # T=1 short-circuit bypasses temporal attention entirely.

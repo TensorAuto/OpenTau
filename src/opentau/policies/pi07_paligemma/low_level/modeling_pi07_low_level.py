@@ -82,10 +82,11 @@ class ContextItem:
             ``action``: noisy actions ``(B, chunk_size, max_action_dim)``.
         item_type: Dispatch key for which embedding path to take.
         pad_mask: Padding mask. ``(B,)`` per-sample is allowed for
-            ``video``/``image`` (the model expands it to
-            ``(B, num_image_tokens)``). All other types must pass ``(B, L)``
-            matching the embedded sequence length. ``True`` = real,
-            ``False`` = padded.
+            ``video``/``image`` (the model expands it to ``(B, n_tokens)``
+            with ``n_tokens`` the grid-derived
+            ``video_encoder.num_video_tokens``). All other types must pass
+            ``(B, L)`` matching the embedded sequence length. ``True`` =
+            real, ``False`` = padded.
         attention: 1-D attention pattern for this block:
             - ``"continue"``: ``[0]*L`` — token continues the previous
               block's attention scope (bidirectional with everything before).
@@ -273,11 +274,16 @@ def resize_with_pad(img: Tensor, width: int, height: int, pad_value: int = -1) -
     Raises:
         ValueError: If the input image tensor does not have 4 dimensions.
     """
-    # assume no-op when width height fits already
     if img.ndim != 4:
         raise ValueError(f"(b,c,h,w) expected, but {img.shape}")
 
     cur_height, cur_width = img.shape[2:]
+
+    # Explicit no-op when the input already matches the target — native-
+    # resolution inputs must pass through bit-identical, not survive a
+    # same-size bilinear round trip.
+    if (cur_height, cur_width) == (height, width):
+        return img
 
     ratio = max(cur_width / width, cur_height / height)
     resized_height = int(cur_height / ratio)
@@ -1424,8 +1430,9 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
 
             if self.config.resize_imgs_with_padding is not None:
                 b, t_frames = vid.shape[:2]
+                target_h, target_w = self.config.resize_imgs_with_padding
                 flat = rearrange(vid, "B T C H W -> (B T) C H W")
-                flat = resize_with_pad(flat, *self.config.resize_imgs_with_padding, pad_value=0)
+                flat = resize_with_pad(flat, width=target_w, height=target_h, pad_value=0)
                 vid = rearrange(flat, "(B T) C H W -> B T C H W", B=b, T=t_frames)
 
             bsize = vid.shape[0]
@@ -1511,7 +1518,10 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
             # the fill value inert (these tokens are masked out of attention), and
             # yield the same prefix as training with ``subgoal_is_pad=True``
             # everywhere (comma + ``Subgoal:`` + image tokens fully masked out).
-            h, w = self.config.resize_imgs_with_padding or (224, 224)
+            # Use the resolution the tower actually receives so the fabricated
+            # zeros embed to the same token count as real subgoals (the
+            # prefix length must not depend on which keys the batch carries).
+            h, w = self.config.input_image_size or (224, 224)
             for _ in subgoal_keys:
                 subgoal_images.append(torch.zeros(bsize, 3, h, w, device=device))
                 subgoal_img_masks.append(torch.zeros(bsize, dtype=torch.bool, device=device))
@@ -1524,7 +1534,8 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
             subgoal_img = batch[key]  # (B, C, H, W)
 
             if self.config.resize_imgs_with_padding is not None:
-                subgoal_img = resize_with_pad(subgoal_img, *self.config.resize_imgs_with_padding, pad_value=0)
+                target_h, target_w = self.config.resize_imgs_with_padding
+                subgoal_img = resize_with_pad(subgoal_img, width=target_w, height=target_h, pad_value=0)
 
             # Normalize from [0, 1] to [-1, 1] as expected by SigLIP.
             subgoal_img = subgoal_img * 2.0 - 1.0  # (B, C, H, W)
@@ -1920,6 +1931,11 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
             max_num_frames=self.config.n_obs_steps,
             spacetime_layer_stride=self.config.spacetime_layer_stride,
             gradient_checkpointing=self.config.gradient_checkpointing,
+            # (H, W) the tower will actually receive: the resize target if
+            # set, else the bound image-feature resolution. Non-default
+            # values enable native-resolution encoding (pad-to-patch-multiple
+            # + interpolated position embeddings) instead of letterboxing.
+            expected_image_size=self.config.input_image_size,
         )
 
         vlm_hidden_size = self.paligemma_with_expert.config.paligemma_config.text_config.hidden_size
@@ -2092,9 +2108,11 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
 
         The pad mask is broadcast/expanded so the returned mask matches
         the embedded sequence length: per-sample ``(B,)`` is allowed for
-        ``video`` (expanded to ``(B, num_video_tokens)``) and ``image``
-        (expanded to ``(B, num_image_tokens)``); all other types pass
-        through ``(B, L)`` unchanged.
+        ``video`` and ``image``, both expanded to
+        ``(B, video_encoder.num_video_tokens)`` — subgoal images share the
+        video encoder's tower and input resolution, so their token counts
+        agree by construction; all other types pass through ``(B, L)``
+        unchanged.
         """
         t = item.item_type
         if t == "text":
@@ -2140,10 +2158,15 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
             if run_image_tower:
                 emb = self.paligemma_with_expert.embed_image(image).to(dtype=dtype)
             else:
+                # Subgoal images share the video encoder's tower and input
+                # resolution, so its grid-derived token count is exactly what
+                # embed_image would emit — the run and skip paths MUST agree
+                # or ranks desync (the historical hard-coded
+                # `num_image_tokens=256` only held at 224x224).
                 pg_text_cfg = self.paligemma_with_expert.config.paligemma_config.text_config
                 emb = torch.zeros(
                     image.shape[0],
-                    pg_text_cfg.num_image_tokens,
+                    self.video_encoder.num_video_tokens,
                     pg_text_cfg.hidden_size,
                     device=image.device,
                     dtype=dtype,

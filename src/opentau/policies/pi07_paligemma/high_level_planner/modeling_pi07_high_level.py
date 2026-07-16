@@ -149,11 +149,16 @@ def resize_with_pad(img: Tensor, width: int, height: int, pad_value: int = -1) -
     Raises:
         ValueError: If the input image tensor does not have 4 dimensions.
     """
-    # assume no-op when width height fits already
     if img.ndim != 4:
         raise ValueError(f"(b,c,h,w) expected, but {img.shape}")
 
     cur_height, cur_width = img.shape[2:]
+
+    # Explicit no-op when the input already matches the target — native-
+    # resolution inputs must pass through bit-identical, not survive a
+    # same-size bilinear round trip.
+    if (cur_height, cur_width) == (height, width):
+        return img
 
     ratio = max(cur_width / width, cur_height / height)
     resized_height = int(cur_height / ratio)
@@ -639,7 +644,11 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
             img = batch[key]
 
             if self.config.resize_imgs_with_padding is not None:
-                img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
+                # The config tuple is (height, width); the function signature is
+                # (width, height) — unpack explicitly so non-square targets are not
+                # transposed (invisible at the square defaults).
+                target_h, target_w = self.config.resize_imgs_with_padding
+                img = resize_with_pad(img, width=target_w, height=target_h, pad_value=0)
 
             # Normalize from range [0,1] to [-1,1] as expected by siglip
             img = img * 2.0 - 1.0

@@ -25,6 +25,8 @@ from transformers.models.gemma import modeling_gemma
 from transformers.models.gemma.configuration_gemma import GemmaConfig
 from transformers.models.paligemma.modeling_paligemma import PaliGemmaModel
 
+from opentau.utils.vision_utils import pad_to_patch_multiple, patch_grid_hw
+
 # Monkey patch __init__ of GemmaConfig to fix or modify its behavior as needed.
 
 _original_gemma_config_init = GemmaConfig.__init__
@@ -259,15 +261,38 @@ modeling_gemma.GemmaPreTrainedModel._init_weights = patched_gemma_pretrained_mod
 def patched_paligemma_model_get_image_features(self, pixel_values: torch.FloatTensor) -> torch.Tensor:
     """Obtains image last hidden states from the vision tower and apply multimodal projection.
 
+    Two deviations from stock HuggingFace:
+
+    - Drops the ``/ sqrt(text_config.hidden_size)`` scaling applied after the
+      multi-modal projector (matching the original Pi0 fork).
+    - Supports native input resolutions. Stock SigLIP silently floor-crops any
+      sub-patch remainder in its stride-``patch_size`` conv (e.g. 180×320 with
+      patch 14 loses 12 pixel rows and columns) and then fails on the fixed
+      224×224 position-embedding table. Here the pixels are padded up to the
+      next patch multiple (bottom/right, black in the ``[-1, 1]`` input range)
+      and ``interpolate_pos_encoding`` is enabled whenever the resulting patch
+      grid differs from the config grid. At the config resolution (224×224)
+      both steps are no-ops and the output is bit-identical to before.
+      Determinism caveat: when the vision tower is trainable
+      (``freeze_vision_encoder=False``), the interpolation backprops into the
+      position-embedding table and CUDA's bicubic-interpolate backward is
+      non-deterministic (atomicAdd) — GPU native-resolution runs with an
+      unfrozen tower are not bit-reproducible. The default (frozen tower) and
+      the config-resolution path are unaffected.
+
     Args:
         self: The PaliGemmaModel instance.
-        pixel_values: The tensors corresponding to the input images.
-            Shape: (batch_size, channels, height, width).
+        pixel_values: The tensors corresponding to the input images, in
+            ``[-1, 1]``. Shape: (batch_size, channels, height, width).
 
     Returns:
         Image feature tensor of shape (num_images, image_length, embed_dim).
     """
-    image_outputs = self.vision_tower(pixel_values)
+    vision_cfg = self.vision_tower.config
+    pixel_values = pad_to_patch_multiple(pixel_values, vision_cfg.patch_size, pad_value=-1.0)
+    default_grid = patch_grid_hw(vision_cfg.image_size, vision_cfg.image_size, vision_cfg.patch_size)
+    actual_grid = patch_grid_hw(*pixel_values.shape[-2:], vision_cfg.patch_size)
+    image_outputs = self.vision_tower(pixel_values, interpolate_pos_encoding=actual_grid != default_grid)
     selected_image_feature = image_outputs.last_hidden_state
     image_features = self.multi_modal_projector(selected_image_feature)
     return image_features
