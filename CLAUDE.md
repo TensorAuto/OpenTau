@@ -114,6 +114,8 @@ Everything starts from a `TrainPipelineConfig` (`src/opentau/configs/train.py`) 
 
 Key invariant on `TrainPipelineConfig`: `batch_size == dataloader_batch_size * gradient_accumulation_steps`. When sweeping per-rank batch, override all three together — the validator will reject inconsistent combinations. When using DeepSpeed, `gradient_accumulation_steps` must also match the value in the DeepSpeed JSON.
 
+**Dataset mixture reference configs (`configs/examples/refs/`)**: curated Hub dataset mixtures (e.g. `so101_community_mixture*.json`) intentionally include private first-party `TensorAuto/*` datasets — anyone training these mixtures already uses the org HF token (the pretrained checkpoints live under the same org). When auditing entry reachability, an anonymous HTTP 401 does not mean an entry is dead: the Hub returns 401 to anonymous requests for both private and deleted repos, masking which is which. Only prune (or flag in review) an entry whose `meta/info.json` is unretrievable *with* org auth — a true 404, i.e. deleted or renamed (see #475).
+
 `PreTrainedConfig` (`configs/policies.py`) is the abstract base for policy configs. Subclasses register themselves via the `policy.type` choice key (draccus `CHOICE_TYPE_KEY`). To add a new policy: subclass `PreTrainedConfig`, subclass `PreTrainedPolicy`, register both in `policies/factory.py::get_policy_class` / `make_policy_config`, export the config from `policies/__init__.py`, and add the name to `available_policies` in `src/opentau/__init__.py` (checked by `tests/test_available.py`).
 
 ### Module layout (`src/opentau/`)
