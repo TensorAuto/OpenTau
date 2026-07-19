@@ -572,3 +572,77 @@ class TestSnapWarning:
             norm({"action": torch.tensor([[0.0, 0.0, 0.0, 5.0]])}, idx)
         msgs = [r.getMessage() for r in caplog.records if "zero-variance guard" in r.getMessage()]
         assert len(msgs) == 1 and "dim(s)=[3]" in msgs[0] and "action" in msgs[0]
+
+
+def _build_quantile_stats(num_datasets: int) -> list[dict[str, dict[str, torch.Tensor]]]:
+    """Distinct q01/q99 (and wider min/max) per dataset row."""
+    out = []
+    for d in range(num_datasets):
+        out.append(
+            {
+                "action": {
+                    "min": torch.full((3,), -10.0 * (d + 1)),
+                    "max": torch.full((3,), 10.0 * (d + 1)),
+                    "q01": torch.full((3,), -float(d + 1)),
+                    "q99": torch.full((3,), float(d + 1)),
+                },
+            }
+        )
+    return out
+
+
+def test_per_dataset_normalize_quantile_picks_right_row():
+    """QUANTILE scales with each row's q01/q99, not min/max: q99 maps to +1."""
+    num_ds = 3
+    features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(3,))}
+    norm_map = {"ACTION": NormalizationMode.QUANTILE}
+    norm = Normalize(features, norm_map, per_dataset_stats=_build_quantile_stats(num_ds))
+
+    dataset_index = torch.tensor([0, 1, 2], dtype=torch.long)
+    # feed each row its own q99 value -> must normalize to +1 for every row
+    action = torch.stack([torch.full((3,), float(d + 1)) for d in range(num_ds)])
+    out = norm({"action": action}, dataset_index)
+    torch.testing.assert_close(out["action"], torch.ones(num_ds, 3), atol=1e-5, rtol=1e-5)
+    # a value beyond q99 extends beyond +1 (no clamp)
+    out2 = norm({"action": torch.full((1, 3), 2.0)}, torch.tensor([0]))
+    assert bool((out2["action"] > 1.0).all())
+
+
+def test_quantile_round_trip():
+    """Unnormalize(Normalize(x)) recovers x under QUANTILE."""
+    features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(3,))}
+    norm_map = {"ACTION": NormalizationMode.QUANTILE}
+    stats = _build_quantile_stats(2)
+    norm = Normalize(features, norm_map, per_dataset_stats=stats)
+    unnorm = Unnormalize(features, norm_map, per_dataset_stats=stats)
+
+    idx = torch.tensor([0, 1], dtype=torch.long)
+    x = torch.tensor([[0.3, -1.7, 0.9], [3.0, -0.2, 1.4]])
+    y = unnorm(norm({"action": x}, idx), idx)["action"]
+    torch.testing.assert_close(y, x, atol=1e-5, rtol=1e-5)
+
+
+def test_quantile_fallback_to_min_max(caplog):
+    """Rows lacking q01/q99 fall back to min/max (converted-from-v2.1 datasets)."""
+    features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(3,))}
+    norm_map = {"ACTION": NormalizationMode.QUANTILE}
+    stats = _build_quantile_stats(2)
+    # strip quantiles from row 1 -> its buffer row must equal its min/max
+    del stats[1]["action"]["q01"]
+    del stats[1]["action"]["q99"]
+    with caplog.at_level(logging.WARNING):
+        norm = Normalize(features, norm_map, per_dataset_stats=stats)
+    assert any("fell back" in r.getMessage() for r in caplog.records)
+
+    # row 0 uses q99=1 -> value 1.0 normalizes to +1; row 1 uses max=20 -> value 20 -> +1
+    out = norm({"action": torch.tensor([[1.0] * 3, [20.0] * 3])}, torch.tensor([0, 1]))
+    torch.testing.assert_close(out["action"], torch.ones(2, 3), atol=1e-5, rtol=1e-5)
+
+
+def test_quantile_missing_all_raises():
+    """A row with neither the quantile nor its min/max fallback raises KeyError."""
+    features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(3,))}
+    norm_map = {"ACTION": NormalizationMode.QUANTILE}
+    stats = [{"action": {"mean": torch.zeros(3), "std": torch.ones(3)}}]
+    with pytest.raises(KeyError, match="q01"):
+        Normalize(features, norm_map, per_dataset_stats=stats)

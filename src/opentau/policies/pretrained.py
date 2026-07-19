@@ -590,7 +590,11 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                 trusted as-is and the caller is responsible for keeping
                 ``per_dataset_stats`` in the same order.
         """
-        from opentau.policies.normalize import _stat_to_float32_tensor
+        from opentau.policies.normalize import (
+            _stat_to_float32_tensor,
+            resolve_stat_row,
+            stat_names_for_mode,
+        )
 
         if dataset_names is not None:
             existing = getattr(self.config, "dataset_names", None)
@@ -623,9 +627,12 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                 buffer = getattr(module, buffer_attr, None)
                 if buffer is None:
                     continue
-                stat_names = ("mean", "std") if norm_mode.name == "MEAN_STD" else ("min", "max")
+                stat_names = stat_names_for_mode(norm_mode)
                 for stat in stat_names:
-                    rows = [_stat_to_float32_tensor(s[feature_key][stat]) for s in per_dataset_stats]
+                    rows = [
+                        _stat_to_float32_tensor(resolve_stat_row(s, feature_key, stat))
+                        for s in per_dataset_stats
+                    ]
                     new_tensor = torch.stack(rows, dim=0).to(
                         device=buffer[stat].device, dtype=buffer[stat].dtype
                     )

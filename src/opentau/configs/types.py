@@ -46,6 +46,13 @@ class NormalizationMode(str, Enum):
     """Normalize using min-max scaling."""
     MEAN_STD = "MEAN_STD"
     """Normalize using mean and standard deviation."""
+    QUANTILE = "QUANTILE"
+    """Normalize using the q01/q99 quantiles (robust min-max scaling).
+
+    Maps ``[q01, q99]`` to ``[-1, 1]``; values outside the quantile range
+    extend beyond ``[-1, 1]`` (no clamping). Datasets whose stats carry no
+    quantiles fall back to ``min``/``max`` for that dataset's row.
+    """
     IDENTITY = "IDENTITY"
     """No normalization (identity transformation)."""
 

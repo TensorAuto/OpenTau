@@ -544,12 +544,18 @@ class DatasetMixtureMetadata:
             else:
                 raise KeyError(f"Key '{key}' not found in stats. Available keys: {list(stats.keys())}")
 
-        # pad state and action vectors
+        # pad state and action vectors (quantiles included so the QUANTILE
+        # normalization buffers see the same padded dim as mean/std/min/max;
+        # the two dicts are padded independently because converted datasets
+        # may carry quantiles on one feature but not the other)
+        padded_stat_names = ["mean", "std", "min", "max", "q01", "q10", "q50", "q90", "q99"]
         for stat in standard_stats["state"]:
-            if stat in ["mean", "std", "min", "max"]:
+            if stat in padded_stat_names:
                 standard_stats["state"][stat] = pad_vector(
                     standard_stats["state"][stat], self.cfg.max_state_dim
                 )
+        for stat in standard_stats["actions"]:
+            if stat in padded_stat_names:
                 standard_stats["actions"][stat] = pad_vector(
                     standard_stats["actions"][stat], self.cfg.max_action_dim
                 )
