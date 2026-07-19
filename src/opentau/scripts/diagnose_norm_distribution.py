@@ -639,6 +639,18 @@ def main(args: Args) -> None:
     (out_dir / "report.json").write_text(json.dumps(report, indent=2))
     _write_csv(rows, out_dir / "report.csv")
     if args.emit_corrected_stats:
+        if args.norm_mode == "QUANTILE":
+            # The streaming accumulator holds moments and extremes, not order
+            # statistics, so corrected_stats.json cannot carry q01/q99. A
+            # QUANTILE policy fed this artifact would fall back to the
+            # data-derived global min/max — exactly the extreme-value scaling
+            # QUANTILE exists to avoid.
+            logger.warning(
+                "emit_corrected_stats with norm_mode=QUANTILE: corrected_stats.json contains only "
+                "mean/std/min/max (quantiles are not recoverable from the streaming accumulator). "
+                "Applying it to a QUANTILE policy downgrades every head to min/max scaling; prefer "
+                "recomputing quantiles from data if the metadata quantiles are stale."
+            )
         _emit_corrected_stats(merged, norm_keys, out_dir / "corrected_stats.json")
     if not args.no_plots:
         _plot(merged, head_info, norm_keys, rows, out_dir)

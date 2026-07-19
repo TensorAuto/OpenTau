@@ -330,12 +330,15 @@ def create_stats_buffers(
                         value = resolve_stat_row(ds_stats, key, name)
                     except KeyError as e:
                         raise KeyError(f"per_dataset_stats[{i}]: {e.args[0]}") from None
+                    source = name
                     if name not in ds_stats[key]:
                         fallback_rows.append(i)
+                        source = _QUANTILE_FALLBACK[name]
                     row = _stat_to_float32_tensor(value)
                     if tuple(row.shape) != shape:
+                        via = "" if source == name else f" (resolved for '{name}' via fallback)"
                         raise ValueError(
-                            f"per_dataset_stats[{i}]['{key}']['{name}'] has shape "
+                            f"per_dataset_stats[{i}]['{key}']['{source}']{via} has shape "
                             f"{tuple(row.shape)}, expected {shape}."
                         )
                     rows.append(row)
