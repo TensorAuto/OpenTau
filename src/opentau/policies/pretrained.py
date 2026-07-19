@@ -376,9 +376,12 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
             for child_name, child in module.named_children():
                 if not child_name.startswith("buffer_"):
                     continue
-                for stat_name in ("mean", "std", "min", "max"):
-                    if stat_name in child:
-                        return int(child[stat_name].shape[0])
+                # Every stat in a buffer shares the (num_datasets, ...) leading
+                # dim by construction, so any entry works — probing values()
+                # instead of a hardcoded name list keeps this correct for every
+                # NormalizationMode (QUANTILE buffers hold only q01/q99).
+                for param in child.values():
+                    return int(param.shape[0])
         return 1
 
     def _infer_batch_size_and_device(self, batch: dict[str, Tensor]) -> tuple[int, torch.device]:

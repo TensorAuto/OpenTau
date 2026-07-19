@@ -595,7 +595,9 @@ class DatasetMixtureMetadata:
         for data in standard_stats:
             if data.startswith("camera"):
                 continue
-            for stat_name in ("mean", "std", "min", "max"):
+            for stat_name in ("mean", "std", "min", "max", "q01", "q99"):
+                if stat_name not in standard_stats[data]:
+                    continue
                 arr = np.asarray(standard_stats[data][stat_name])
                 bad = np.flatnonzero(~np.isfinite(arr.ravel()))
                 if bad.size > 0:
