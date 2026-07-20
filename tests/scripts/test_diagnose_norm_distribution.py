@@ -53,6 +53,23 @@ class TestNormalize:
         z = _normalize(x, stat, "MIN_MAX")
         np.testing.assert_allclose(z, [[0.5 / (1 + EPS) * 2 - 1]], atol=1e-6)
 
+    def test_quantile(self):
+        x = np.array([[3.0]])
+        stat = {
+            "min": np.array([-100.0]),
+            "max": np.array([100.0]),
+            "q01": np.array([-3.0]),
+            "q99": np.array([3.0]),
+        }
+        z = _normalize(x, stat, "QUANTILE")
+        np.testing.assert_allclose(z, [[6.0 / (6.0 + EPS) * 2 - 1]], atol=1e-6)
+
+    def test_quantile_falls_back_to_min_max(self):
+        x = np.array([[1.0]])
+        stat = {"min": np.array([0.0]), "max": np.array([1.0])}
+        z = _normalize(x, stat, "QUANTILE")
+        np.testing.assert_allclose(z, _normalize(x, stat, "MIN_MAX"))
+
     def test_unknown_mode_raises(self):
         with pytest.raises(ValueError):
             _normalize(np.zeros((1, 1)), {}, "NOPE")

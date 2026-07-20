@@ -420,3 +420,72 @@ def test_aggregate_stats():
             results[fkey]["std"], expected_agg_stats[fkey]["std"], atol=1e-04, rtol=1e-04
         )
         np.testing.assert_allclose(results[fkey]["count"], expected_agg_stats[fkey]["count"])
+
+
+def test_aggregate_feature_stats_quantiles_weighted_mean():
+    """q01/q99 aggregate as the count-weighted mean of contributor quantiles."""
+    stats_ft = [
+        {
+            "min": np.array([0.0]),
+            "max": np.array([10.0]),
+            "mean": np.array([5.0]),
+            "std": np.array([1.0]),
+            "count": np.array([10]),
+            "q01": np.array([1.0]),
+            "q99": np.array([9.0]),
+        },
+        {
+            "min": np.array([0.0]),
+            "max": np.array([10.0]),
+            "mean": np.array([5.0]),
+            "std": np.array([1.0]),
+            "count": np.array([30]),
+            "q01": np.array([3.0]),
+            "q99": np.array([5.0]),
+        },
+    ]
+    agg = aggregate_feature_stats(stats_ft)
+    # weighted by counts 10:30 -> q01 = (1*10 + 3*30)/40 = 2.5 ; q99 = (9*10 + 5*30)/40 = 6.0
+    np.testing.assert_allclose(agg["q01"], [2.5])
+    np.testing.assert_allclose(agg["q99"], [6.0])
+
+
+def test_aggregate_feature_stats_quantile_fallback_to_extreme():
+    """A contributor without a stored quantile contributes its same-side extreme."""
+    stats_ft = [
+        {
+            "min": np.array([-8.0]),
+            "max": np.array([8.0]),
+            "mean": np.array([0.0]),
+            "std": np.array([1.0]),
+            "count": np.array([10]),
+            "q01": np.array([-2.0]),
+            "q99": np.array([2.0]),
+        },
+        {
+            # no quantiles (stats predating quantile support) -> min/max used
+            "min": np.array([-4.0]),
+            "max": np.array([4.0]),
+            "mean": np.array([0.0]),
+            "std": np.array([1.0]),
+            "count": np.array([10]),
+        },
+    ]
+    agg = aggregate_feature_stats(stats_ft)
+    np.testing.assert_allclose(agg["q01"], [(-2.0 - 4.0) / 2])
+    np.testing.assert_allclose(agg["q99"], [(2.0 + 4.0) / 2])
+
+
+def test_aggregate_feature_stats_no_quantiles_no_keys():
+    """When no contributor has quantiles, the aggregate has no quantile keys."""
+    stats_ft = [
+        {
+            "min": np.array([0.0]),
+            "max": np.array([1.0]),
+            "mean": np.array([0.5]),
+            "std": np.array([0.1]),
+            "count": np.array([5]),
+        }
+    ]
+    agg = aggregate_feature_stats(stats_ft)
+    assert "q01" not in agg and "q99" not in agg

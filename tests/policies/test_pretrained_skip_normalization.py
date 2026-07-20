@@ -655,3 +655,98 @@ class TestNormBufferInfGate:
         mean = policy.normalize_targets.buffer_action["mean"]
         for h in range(2):
             torch.testing.assert_close(mean[h], torch.full((3,), _NEW_BASE + h))
+
+
+class TestStackedNumDatasetsQuantile:
+    """`_stacked_num_datasets` must see the head count through QUANTILE-only
+    buffers (which hold q01/q99, not mean/std/min/max) — regression for the
+    silent row-0 fallback with the QUANTILE normalization_mapping."""
+
+    @pytest.mark.parametrize(
+        "norm_map, stat_row",
+        [
+            (
+                {"ACTION": NormalizationMode.QUANTILE},
+                {"q01": np.full((3,), -1.0, np.float32), "q99": np.full((3,), 1.0, np.float32)},
+            ),
+            (
+                {"ACTION": NormalizationMode.MEAN_STD},
+                {"mean": np.zeros((3,), np.float32), "std": np.ones((3,), np.float32)},
+            ),
+        ],
+        ids=["quantile", "mean_std"],
+    )
+    def test_probe_sees_all_modes(self, norm_map, stat_row):
+        from opentau.policies.pretrained import PreTrainedPolicy
+
+        features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(3,))}
+        stats = [{"action": dict(stat_row)} for _ in range(2)]
+
+        class _Shim:
+            pass
+
+        shim = _Shim()
+        shim.normalize_inputs = None
+        shim.normalize_targets = Normalize(features, norm_map, per_dataset_stats=stats)
+        shim.unnormalize_outputs = None
+        assert PreTrainedPolicy._stacked_num_datasets(shim) == 2
+
+
+class TestInjectStatsQuantile:
+    """`_inject_stats` on a QUANTILE policy: q01/q99 rows land in the buffers,
+    and stats without stored quantiles inject via the min/max fallback."""
+
+    def _quantile_policy(self, num_heads: int = 2):
+        policy = _make_multihead_policy([f"h::{i}" for i in range(num_heads)], base=_CKPT_BASE, skip=False)
+        # Rebuild the norm modules in QUANTILE mode on the same config/names.
+        in_features = {"observation.state": PolicyFeature(type=FeatureType.STATE, shape=(4,))}
+        out_features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(3,))}
+        norm_map = {"STATE": NormalizationMode.QUANTILE, "ACTION": NormalizationMode.QUANTILE}
+        names = list(policy.config.dataset_names)
+        stats = self._build_quantile_head_stats(num_heads, _CKPT_BASE)
+        policy.normalize_inputs = Normalize(
+            in_features, norm_map, per_dataset_stats=stats, dataset_names=names
+        )
+        policy.normalize_targets = Normalize(
+            out_features, norm_map, per_dataset_stats=stats, dataset_names=names
+        )
+        policy.unnormalize_outputs = Unnormalize(
+            out_features, norm_map, per_dataset_stats=stats, dataset_names=names
+        )
+        return policy
+
+    @staticmethod
+    def _build_quantile_head_stats(num_heads: int, base: float, with_quantiles: bool = True):
+        stats = []
+        for h in range(num_heads):
+            val = float(base + h)
+            row = {
+                "min": lambda v, d: np.full((d,), v - 10.0, np.float32),
+                "max": lambda v, d: np.full((d,), v + 10.0, np.float32),
+            }
+            entry = {}
+            for key, dim in (("observation.state", 4), ("action", 3)):
+                feat = {"min": row["min"](val, dim), "max": row["max"](val, dim)}
+                if with_quantiles:
+                    feat["q01"] = np.full((dim,), val - 1.0, np.float32)
+                    feat["q99"] = np.full((dim,), val + 1.0, np.float32)
+                entry[key] = feat
+            stats.append(entry)
+        return stats
+
+    def test_inject_quantile_stats_refreshes_buffers(self):
+        policy = self._quantile_policy()
+        new = self._build_quantile_head_stats(2, _NEW_BASE)
+        policy._inject_stats(new, dataset_names=["h::0", "h::1"])
+        buf = policy.normalize_targets.buffer_action
+        assert float(buf["q01"][1][0]) == _NEW_BASE + 1 - 1.0
+        assert float(buf["q99"][0][0]) == _NEW_BASE + 0 + 1.0
+
+    def test_inject_quantile_min_max_fallback(self):
+        policy = self._quantile_policy()
+        new = self._build_quantile_head_stats(2, _NEW_BASE, with_quantiles=False)
+        policy._inject_stats(new, dataset_names=["h::0", "h::1"])
+        buf = policy.normalize_targets.buffer_action
+        # fallback: q01 <- min = base - 10, q99 <- max = base + 10
+        assert float(buf["q01"][0][0]) == _NEW_BASE - 10.0
+        assert float(buf["q99"][1][0]) == _NEW_BASE + 1 + 10.0

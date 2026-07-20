@@ -144,6 +144,53 @@ class TestDatasetMixtureMetadata:
         assert "camera2" not in result
 
     @patch("opentau.datasets.dataset_mixture.DATA_FEATURES_NAME_MAPPING")
+    def test_to_standard_data_format_pads_quantiles(self, mock_name_mapping, train_pipeline_config, caplog):
+        """Quantile keys are padded like mean/std/min/max (pinning the
+        shape-mismatch fix for QUANTILE buffers), state/actions pad
+        independently when only one side carries quantiles, and a non-finite
+        quantile gets the per-repo warning."""
+        import logging
+
+        mock_name_mapping.__getitem__.return_value = {
+            "state": "state",
+            "actions": "actions",
+        }
+        train_pipeline_config.num_cams = 0
+
+        metadata_mixture = DatasetMixtureMetadata.__new__(DatasetMixtureMetadata)
+        metadata_mixture.cfg = train_pipeline_config
+
+        base = {
+            "mean": np.array([0.5, 0.3], dtype=np.float32),
+            "std": np.array([0.1, 0.05], dtype=np.float32),
+            "min": np.array([0.0, 0.0], dtype=np.float32),
+            "max": np.array([1.0, 1.0], dtype=np.float32),
+            "count": np.array([100], dtype=np.float32),
+        }
+        stats = {
+            # state carries quantiles (one of them NaN -> must warn)
+            "state": {
+                **{k: v.copy() for k, v in base.items()},
+                "q01": np.array([np.nan, 0.01], dtype=np.float32),
+                "q99": np.array([0.99, 0.99], dtype=np.float32),
+            },
+            # actions has no quantiles at all (converted-from-v2.1 shape)
+            "actions": {k: v.copy() for k, v in base.items()},
+        }
+
+        with caplog.at_level(logging.WARNING):
+            result = metadata_mixture._to_standard_data_format("test_dataset", stats)
+
+        # quantiles padded to max_state_dim like the other stats
+        assert result["state"]["q01"].shape[-1] == train_pipeline_config.max_state_dim
+        assert result["state"]["q99"].shape[-1] == train_pipeline_config.max_state_dim
+        # actions without quantiles still pads its own stats (independent loops)
+        assert "q01" not in result["actions"]
+        assert result["actions"]["mean"].shape[-1] == train_pipeline_config.max_action_dim
+        # the NaN q01 fired the non-finite sweep with the repo name
+        assert any("non-finite" in r.getMessage() and "q01" in r.getMessage() for r in caplog.records)
+
+    @patch("opentau.datasets.dataset_mixture.DATA_FEATURES_NAME_MAPPING")
     def test_to_standard_data_format_missing_key(self, mock_name_mapping, train_pipeline_config):
         """Test _to_standard_data_format with missing key."""
         # Mock the name mapping to include a key not in stats

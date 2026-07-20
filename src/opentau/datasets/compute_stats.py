@@ -354,13 +354,37 @@ def aggregate_feature_stats(
         agg_min = np.nanmin(mins_safe, axis=0)
         agg_max = np.nanmax(maxs_safe, axis=0)
 
-    return {
+    aggregated = {
         "min": agg_min,
         "max": agg_max,
         "mean": total_mean,
         "std": np.sqrt(total_variance),
         "count": total_count,
     }
+
+    # q01/q99 for QUANTILE normalization. Exact pooled quantiles are not
+    # recoverable from per-contributor quantiles, so use the count-weighted mean
+    # of the contributors' quantiles — a standard approximation that stays
+    # robust to a single contributor's extremes (unlike pooled min/max). A
+    # contributor without a stored quantile (stats predating quantile support)
+    # contributes its same-side extreme instead; non-finite entries are masked
+    # per dim like the mean.
+    for q_name, extreme in (("q01", "min"), ("q99", "max")):
+        if not any(q_name in s for s in stats_ft_list):
+            continue
+        q_vals = np.stack([s.get(q_name, s[extreme]) for s in stats_ft_list])
+        q_bad = ~np.isfinite(q_vals)
+        q_weights = np.where(q_bad, 0.0, counts).astype(np.float64)
+        q_weight_sum = q_weights.sum(axis=0)
+        safe_q = np.where(q_bad, 0.0, q_vals)
+        aggregated[q_name] = np.divide(
+            (safe_q * q_weights).sum(axis=0),
+            q_weight_sum,
+            out=np.full(q_weight_sum.shape, np.nan, dtype=np.float64),
+            where=q_weight_sum > 0,
+        )
+
+    return aggregated
 
 
 def aggregate_stats(

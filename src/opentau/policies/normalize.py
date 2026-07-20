@@ -185,6 +185,61 @@ def resolve_num_datasets(
     return 1
 
 
+def stat_names_for_mode(norm_mode: NormalizationMode) -> tuple[str, ...]:
+    """Return the stat buffer names a normalization mode reads.
+
+    Single source of truth shared by ``create_stats_buffers`` and
+    ``PreTrainedPolicy._inject_stats`` so the two cannot drift.
+
+    Args:
+        norm_mode: A non-IDENTITY normalization mode.
+
+    Raises:
+        ValueError: For IDENTITY (which has no stats) or an unknown mode.
+    """
+    if norm_mode is NormalizationMode.MEAN_STD:
+        return ("mean", "std")
+    if norm_mode is NormalizationMode.MIN_MAX:
+        return ("min", "max")
+    if norm_mode is NormalizationMode.QUANTILE:
+        return ("q01", "q99")
+    raise ValueError(norm_mode)
+
+
+# QUANTILE tolerates datasets whose stats predate quantile support (e.g. LeRobot
+# v3.0 repos converted from v2.1, whose stats.json has only min/max/mean/std):
+# the missing quantile falls back to the same-side extreme, degrading that
+# dataset's row to plain min-max scaling.
+_QUANTILE_FALLBACK = {"q01": "min", "q99": "max"}
+
+
+def resolve_stat_row(
+    ds_stats: dict[str, dict[str, Tensor | np.ndarray]], key: str, name: str
+) -> Tensor | np.ndarray:
+    """Fetch stat ``name`` for feature ``key`` from one dataset's stats.
+
+    Applies the QUANTILE fallback (``q01``→``min``, ``q99``→``max``) when the
+    quantile is absent, so converted-from-v2.1 datasets remain usable.
+
+    Raises:
+        KeyError: If the feature is missing, or the stat is missing and has no
+            fallback (or its fallback is also missing).
+    """
+    if key not in ds_stats:
+        raise KeyError(f"stats are missing feature '{key}'. Available keys: {list(ds_stats)}.")
+    feat_stats = ds_stats[key]
+    if name in feat_stats:
+        return feat_stats[name]
+    fallback = _QUANTILE_FALLBACK.get(name)
+    if fallback is not None and fallback in feat_stats:
+        return feat_stats[fallback]
+    raise KeyError(
+        f"stats['{key}'] is missing stat '{name}'"
+        + (f" and its fallback '{fallback}'" if fallback else "")
+        + f". Available stats: {list(feat_stats)}."
+    )
+
+
 def _stat_to_float32_tensor(value: np.ndarray | Tensor) -> Tensor:
     """Convert one per-dataset stat (np or torch) to a float32 ``Tensor``.
 
@@ -260,12 +315,7 @@ def create_stats_buffers(
 
         stacked_shape = (num_ds, *shape)
 
-        if norm_mode is NormalizationMode.MEAN_STD:
-            stat_names = ("mean", "std")
-        elif norm_mode is NormalizationMode.MIN_MAX:
-            stat_names = ("min", "max")
-        else:
-            raise ValueError(norm_mode)
+        stat_names = stat_names_for_mode(norm_mode)
 
         params: dict[str, nn.Parameter] = {}
         for name in stat_names:
@@ -274,24 +324,35 @@ def create_stats_buffers(
                 tensor = torch.full(stacked_shape, torch.inf, dtype=torch.float32)
             else:
                 rows = []
+                fallback_rows: list[int] = []
                 for i, ds_stats in enumerate(per_dataset_stats):
-                    if key not in ds_stats:
-                        raise KeyError(
-                            f"per_dataset_stats[{i}] is missing feature '{key}'. "
-                            f"Available keys: {list(ds_stats)}."
-                        )
+                    try:
+                        value = resolve_stat_row(ds_stats, key, name)
+                    except KeyError as e:
+                        raise KeyError(f"per_dataset_stats[{i}]: {e.args[0]}") from None
+                    source = name
                     if name not in ds_stats[key]:
-                        raise KeyError(
-                            f"per_dataset_stats[{i}]['{key}'] is missing stat '{name}'. "
-                            f"Available stats: {list(ds_stats[key])}."
-                        )
-                    row = _stat_to_float32_tensor(ds_stats[key][name])
+                        fallback_rows.append(i)
+                        source = _QUANTILE_FALLBACK[name]
+                    row = _stat_to_float32_tensor(value)
                     if tuple(row.shape) != shape:
+                        via = "" if source == name else f" (resolved for '{name}' via fallback)"
                         raise ValueError(
-                            f"per_dataset_stats[{i}]['{key}']['{name}'] has shape "
+                            f"per_dataset_stats[{i}]['{key}']['{source}']{via} has shape "
                             f"{tuple(row.shape)}, expected {shape}."
                         )
                     rows.append(row)
+                if fallback_rows:
+                    logging.warning(
+                        "Feature '%s': %d/%d dataset rows have no '%s' quantile; fell back to "
+                        "'%s' for rows %s (those rows use plain min-max scaling).",
+                        key,
+                        len(fallback_rows),
+                        len(per_dataset_stats),
+                        name,
+                        _QUANTILE_FALLBACK[name],
+                        fallback_rows[:10],
+                    )
                 tensor = torch.stack(rows, dim=0)
             params[name] = nn.Parameter(tensor, requires_grad=False)
 
@@ -409,8 +470,9 @@ class Normalize(nn.Module):
                 if bool((torch.isfinite(std) & (std.abs() < EPS)).any()):
                     active = True
                     break
-            elif norm_mode is NormalizationMode.MIN_MAX:
-                rng = _materialize(buffer["max"]) - _materialize(buffer["min"])
+            elif norm_mode in (NormalizationMode.MIN_MAX, NormalizationMode.QUANTILE):
+                lo_name, hi_name = stat_names_for_mode(norm_mode)
+                rng = _materialize(buffer[hi_name]) - _materialize(buffer[lo_name])
                 if bool((torch.isfinite(rng) & (rng.abs() < EPS)).any()):
                     active = True
                     break
@@ -466,11 +528,14 @@ class Normalize(nn.Module):
                     and self._snapping_possible()
                 ):
                     _warn_snapped_deviation(key, std_is_zero, deviation, dataset_index, self.dataset_names)
-            elif norm_mode is NormalizationMode.MIN_MAX:
-                min_ = _gather_and_broadcast(_materialize(buffer["min"]), dataset_index, batch_val)
-                max_ = _gather_and_broadcast(_materialize(buffer["max"]), dataset_index, batch_val)
-                assert not torch.isinf(min_).any(), _no_stats_error_str("min")
-                assert not torch.isinf(max_).any(), _no_stats_error_str("max")
+            elif norm_mode in (NormalizationMode.MIN_MAX, NormalizationMode.QUANTILE):
+                # QUANTILE is MIN_MAX arithmetic on the q01/q99 buffers: [q01, q99]
+                # maps to [-1, 1] and out-of-quantile values extend beyond (no clamp).
+                lo_name, hi_name = stat_names_for_mode(norm_mode)
+                min_ = _gather_and_broadcast(_materialize(buffer[lo_name]), dataset_index, batch_val)
+                max_ = _gather_and_broadcast(_materialize(buffer[hi_name]), dataset_index, batch_val)
+                assert not torch.isinf(min_).any(), _no_stats_error_str(lo_name)
+                assert not torch.isinf(max_).any(), _no_stats_error_str(hi_name)
                 # Snap a zero range (max == min: constant dim) to 1 — same blow-up class.
                 denom = max_ - min_
                 denom_is_zero = denom.abs() < EPS
@@ -556,12 +621,13 @@ class Unnormalize(nn.Module):
                 # x*EPS+mean would collapse it to ~mean. std >= EPS dims stay bit-identical.
                 std = torch.where(std.abs() < EPS, torch.ones_like(std), std)
                 batch[key] = batch_val * (std + EPS) + mean
-            elif norm_mode is NormalizationMode.MIN_MAX:
-                min_ = _gather_and_broadcast(_materialize(buffer["min"]), dataset_index, batch_val)
-                max_ = _gather_and_broadcast(_materialize(buffer["max"]), dataset_index, batch_val)
+            elif norm_mode in (NormalizationMode.MIN_MAX, NormalizationMode.QUANTILE):
+                lo_name, hi_name = stat_names_for_mode(norm_mode)
+                min_ = _gather_and_broadcast(_materialize(buffer[lo_name]), dataset_index, batch_val)
+                max_ = _gather_and_broadcast(_materialize(buffer[hi_name]), dataset_index, batch_val)
                 if not (torch.compiler.is_compiling() or torch.onnx.is_in_onnx_export()):
-                    assert not torch.isinf(min_).any(), _no_stats_error_str("min")
-                    assert not torch.isinf(max_).any(), _no_stats_error_str("max")
+                    assert not torch.isinf(min_).any(), _no_stats_error_str(lo_name)
+                    assert not torch.isinf(max_).any(), _no_stats_error_str(hi_name)
                 # Snap a zero range to 1 to mirror Normalize (keeps the round-trip exact).
                 denom = max_ - min_
                 denom = torch.where(denom.abs() < EPS, torch.ones_like(denom), denom)

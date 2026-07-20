@@ -100,7 +100,7 @@ class Args:
     num_workers: int | None = None  # default: cpu_count()
     frame_stride: int = 1  # subsample every Nth frame per episode (speed)
     max_episodes_per_dataset: int | None = None  # cap episodes/dataset (speed)
-    norm_mode: str = "MEAN_STD"  # MEAN_STD | MIN_MAX (must match the policy)
+    norm_mode: str = "MEAN_STD"  # MEAN_STD | MIN_MAX | QUANTILE (must match the policy)
     emit_corrected_stats: bool = True  # write data-derived per-head stats override
     top_n: int = 40  # console: worst-N dims by staleness
     no_plots: bool = False
@@ -214,13 +214,21 @@ def _normalize(x: np.ndarray, stat: dict, mode: str) -> np.ndarray:
         return (x - stat["mean"]) / (stat["std"] + EPS)
     if mode == "MIN_MAX":
         return (x - stat["min"]) / (stat["max"] - stat["min"] + EPS) * 2.0 - 1.0
+    if mode == "QUANTILE":
+        # Same fallback as `create_stats_buffers`: stats without stored
+        # quantiles degrade to min/max scaling for that head.
+        lo = stat["q01"] if "q01" in stat else stat["min"]
+        hi = stat["q99"] if "q99" in stat else stat["max"]
+        return (x - lo) / (hi - lo + EPS) * 2.0 - 1.0
     raise ValueError(f"unsupported norm_mode {mode!r}")
 
 
 def _slice_stat(stat: dict, dim: int) -> dict:
     """Slice a (possibly zero-padded) head stat dict down to a feature's native
-    dim, so workers normalize against the real columns only."""
-    return {k: np.asarray(stat[k], np.float64)[:dim].copy() for k in ("mean", "std", "min", "max")}
+    dim, so workers normalize against the real columns only. Quantile keys are
+    optional (absent for stats predating quantile support)."""
+    keys = [k for k in ("mean", "std", "min", "max", "q01", "q99") if k in stat]
+    return {k: np.asarray(stat[k], np.float64)[:dim].copy() for k in keys}
 
 
 # --------------------------------------------------------------------------- #
@@ -631,6 +639,18 @@ def main(args: Args) -> None:
     (out_dir / "report.json").write_text(json.dumps(report, indent=2))
     _write_csv(rows, out_dir / "report.csv")
     if args.emit_corrected_stats:
+        if args.norm_mode == "QUANTILE":
+            # The streaming accumulator holds moments and extremes, not order
+            # statistics, so corrected_stats.json cannot carry q01/q99. A
+            # QUANTILE policy fed this artifact would fall back to the
+            # data-derived global min/max — exactly the extreme-value scaling
+            # QUANTILE exists to avoid.
+            logger.warning(
+                "emit_corrected_stats with norm_mode=QUANTILE: corrected_stats.json contains only "
+                "mean/std/min/max (quantiles are not recoverable from the streaming accumulator). "
+                "Applying it to a QUANTILE policy downgrades every head to min/max scaling; prefer "
+                "recomputing quantiles from data if the metadata quantiles are stale."
+            )
         _emit_corrected_stats(merged, norm_keys, out_dir / "corrected_stats.json")
     if not args.no_plots:
         _plot(merged, head_info, norm_keys, rows, out_dir)
