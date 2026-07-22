@@ -19,9 +19,12 @@ Example:
     python -m opentau.scripts.so101.find_port
 """
 
+import os
 import platform
 import time
 from pathlib import Path
+
+from opentau.scripts.so101.device_paths import SERIAL_BY_ID_DIR, stable_link_map
 
 
 def find_available_ports() -> list[str]:
@@ -35,6 +38,9 @@ def find_available_ports() -> list[str]:
 def find_port() -> None:
     print("Finding all available ports for the MotorsBus.")
     ports_before = find_available_ports()
+    # A by-id symlink is removed along with its device, so snapshot the mapping
+    # now, while the bus we are about to identify is still plugged in.
+    links_before = stable_link_map(SERIAL_BY_ID_DIR)
     print("Ports before disconnecting:", ports_before)
 
     print("Remove the USB cable from your MotorsBus and press Enter when done.")
@@ -46,7 +52,16 @@ def find_port() -> None:
 
     if len(ports_diff) == 1:
         port = ports_diff[0]
-        print(f"The port of this MotorsBus is '{port}'")
+        stable_port = links_before.get(os.path.realpath(port))
+        if stable_port is not None:
+            print(f"The port of this MotorsBus is '{stable_port}'")
+            print(f"Use that path, not '{port}' — ACM/USB numbering shuffles across reboots.")
+        else:
+            print(f"The port of this MotorsBus is '{port}'")
+            print(
+                f"No {SERIAL_BY_ID_DIR} entry points at it, so this path may change "
+                "across reboots — re-run this script if the bus stops connecting."
+            )
         print("Reconnect the USB cable.")
     elif len(ports_diff) == 0:
         raise OSError(f"Could not detect the port. No difference was found ({ports_diff}).")

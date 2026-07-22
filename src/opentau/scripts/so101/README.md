@@ -25,8 +25,8 @@ All commands are also available as `opentau-so101-*` console scripts.
 python -m opentau.scripts.so101.find_port
 ```
 
-Prefer the stable `/dev/serial/by-id/...` paths over `/dev/ttyACM*` — ACM numbering
-swaps across reboots.
+Prints the arm's stable `/dev/serial/by-id/...` path whenever udev publishes one.
+Use that path everywhere below — `/dev/ttyACM*` numbering swaps across reboots.
 
 ### 1. Set motor IDs (only for freshly assembled arms; one motor connected at a time)
 
@@ -53,6 +53,11 @@ range, ENTER.
 ```bash
 python -m opentau.scripts.so101.find_cameras --save-dir /tmp/so101_cams
 ```
+
+Saves a test frame per camera and prints each one's stable `/dev/v4l/by-path/...`
+path — keyed by physical USB port. Configure cameras by that path, not by `by-id`:
+identical camera models often share a USB serial number, so their `by-id` links
+collide and point at whichever device enumerated last.
 
 ### 4. Teleoperate (leader drives follower)
 

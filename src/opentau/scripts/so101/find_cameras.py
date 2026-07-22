@@ -23,6 +23,7 @@ import argparse
 from pathlib import Path
 
 from opentau.scripts.so101.cameras.opencv.camera_opencv import OpenCVCamera
+from opentau.scripts.so101.device_paths import VIDEO_BY_PATH_DIR, stable_video_path
 
 
 def find_and_capture(save_dir: Path) -> None:
@@ -38,6 +39,13 @@ def find_and_capture(save_dir: Path) -> None:
     for info in cameras_info:
         print(f"  {info}")
         cam_id = info.get("id", info.get("index"))
+        stable_id = stable_video_path(cam_id)
+        if stable_id is not None:
+            # by-path is keyed by physical USB port; prefer it over by-id, which
+            # collides when two cameras of the same model share a serial number.
+            print(f"    configure this camera as: {stable_id}")
+        else:
+            print(f"    no {VIDEO_BY_PATH_DIR} entry; '{cam_id}' may change across reboots")
         cap = cv2.VideoCapture(cam_id)
         ok, frame = cap.read()
         if ok:
