@@ -1,0 +1,75 @@
+{
+  "teleop": {
+    "type": "bi_so_leader",
+    "id": "leader",
+    "calibration_dir": null,
+    "left_arm_config": {
+      "port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5C4C126288-if00",
+      "use_degrees": true
+    },
+    "right_arm_config": {
+      "port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5C4C125181-if00",
+      "use_degrees": true
+    }
+  },
+  "robot": {
+    "type": "bi_so_follower",
+    "id": "follower",
+    "calibration_dir": null,
+    "left_arm_config": {
+      "port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5C4C125545-if00",
+      "disable_torque_on_disconnect": true,
+      "max_relative_target": null,
+      "cameras": {
+        "front": {
+          "type": "opencv",
+          "fps": 30,
+          "width": 640,
+          "height": 480,
+          "index_or_path": "/dev/v4l/by-path/pci-0000:80:14.0-usb-0:3.2:1.0-video-index0",
+          "color_mode": "rgb",
+          "rotation": 0,
+          "warmup_s": 1,
+          "fourcc": "MJPG",
+          "backend": 200
+        },
+        "wrist_left": {
+          "type": "opencv",
+          "fps": 30,
+          "width": 640,
+          "height": 480,
+          "index_or_path": "/dev/v4l/by-path/pci-0000:80:14.0-usb-0:3.1:1.0-video-index0",
+          "color_mode": "rgb",
+          "rotation": 0,
+          "warmup_s": 1,
+          "fourcc": null,
+          "backend": 200
+        }
+      },
+      "use_degrees": true
+    },
+    "right_arm_config": {
+      "port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5C4C124663-if00",
+      "disable_torque_on_disconnect": true,
+      "max_relative_target": null,
+      "cameras": {
+        "wrist_right": {
+          "type": "opencv",
+          "fps": 30,
+          "width": 640,
+          "height": 480,
+          "index_or_path": "/dev/v4l/by-path/pci-0000:80:14.0-usb-0:2.2:1.0-video-index0",
+          "color_mode": "rgb",
+          "rotation": 0,
+          "warmup_s": 1,
+          "fourcc": "MJPG",
+          "backend": 200
+        }
+      },
+      "use_degrees": true
+    }
+  },
+  "fps": 30,
+  "teleop_time_s": null,
+  "display_data": false
+}
