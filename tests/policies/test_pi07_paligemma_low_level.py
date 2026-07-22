@@ -2779,7 +2779,7 @@ class TestDecodeDiscreteActionTokens:
     NONZERO_CHAR = chr(NONZERO_ORD)
 
     @classmethod
-    def _make_stub(cls, decode_map: dict, *, num_datasets: int, min_max):
+    def _make_stub(cls, decode_map: dict, *, num_datasets: int, min_max, zero_range_center: bool = False):
         """Build a stub policy object the UNBOUND method can be called on.
 
         Args:
@@ -2788,6 +2788,9 @@ class TestDecodeDiscreteActionTokens:
             num_datasets: number of rows in the MIN_MAX stat buffers.
             min_max: ``(min_tensor, max_tensor)`` each shaped
                 ``(num_datasets, max_action_dim)``.
+            zero_range_center: convention the inline inverse should apply on a
+                zero-range row (``config_version`` >= 1 -> True). No effect on a
+                real-range row (the numerator offset is 0 when ``max != min``).
         """
         import types
 
@@ -2804,7 +2807,9 @@ class TestDecodeDiscreteActionTokens:
             vocab_size=cls.VOCAB_SIZE,
             scale=cls.SCALE,
         )
-        norm = types.SimpleNamespace(buffer_actions={"min": min_t, "max": max_t})
+        norm = types.SimpleNamespace(
+            buffer_actions={"min": min_t, "max": max_t}, zero_range_center=zero_range_center
+        )
         return types.SimpleNamespace(
             config=types.SimpleNamespace(chunk_size=cls.CHUNK_SIZE, max_action_dim=cls.MAX_ACTION_DIM),
             discrete_action_processor=proc,
@@ -2909,12 +2914,19 @@ class TestDecodeDiscreteActionTokens:
         assert torch.isfinite(out).all()
         assert torch.allclose(out[0], out[1], atol=1e-6)
 
-    def test_zero_range_row_is_finite_and_uses_snapped_denom(self):
+    @pytest.mark.parametrize("zero_range_center", [False, True])
+    def test_zero_range_row_is_finite_and_uses_snapped_denom(self, zero_range_center):
         """A dataset row whose min == max (zero range) decodes to a finite
-        tensor (no NaN/inf) via the ``denom = where(|denom|<EPS, 1, denom)``
-        snap. For an all-zero-coefficient input (normalized == 0) the inverse
-        MIN_MAX gives ``min + 0.5*(denom_snapped + EPS)`` per dim — NOT ``min``
-        (that midpoint is what (normalized+1)/2 yields at normalized==0)."""
+        tensor (no NaN/inf) via the ``denom = where(|denom|<EPS, 1, denom)`` snap.
+
+        For an all-zero-coefficient input (normalized == 0) the zero-range row
+        decodes per the paired ``normalize_discrete_actions`` convention:
+          - legacy (config_version 0): ``min + 0.5*(denom_snapped + EPS)`` — the
+            midpoint ``(normalized+1)/2`` yields at normalized==0, NOT ``min``;
+          - config_version >= 1: the inline inverse subtracts the numerator
+            offset ``0.5*(denom - raw_range)`` = 0.5, recovering ``min`` — the
+            convention that maps a zero-padded action column to 0.0 in Normalize.
+        """
         from opentau.policies.normalize import EPS
 
         # Two datasets: row 0 has a real range, row 1 has zero range (min==max).
@@ -2922,20 +2934,29 @@ class TestDecodeDiscreteActionTokens:
         max_t = torch.tensor([[4.0, 4.0, 4.0], [2.5, 2.5, 2.5]])
         exact_zero = self.ZERO_CHAR * self.N_COEFFS  # all coeffs zero -> normalized 0
         decode_map = {(11,): exact_zero, (12,): exact_zero}
-        stub = self._make_stub(decode_map, num_datasets=2, min_max=(min_t, max_t))
+        stub = self._make_stub(
+            decode_map, num_datasets=2, min_max=(min_t, max_t), zero_range_center=zero_range_center
+        )
         dataset_index = torch.tensor([0, 1])  # row 1 hits the zero-range branch
         out = PI07PaligemmaLowLevelPolicy._decode_discrete_action_tokens(
             stub, [[11], [12]], dataset_index, torch.device("cpu")
         )
         assert torch.isfinite(out).all(), "zero-range row must not produce NaN/inf"
-        # Zero-range row: denom snaps to 1, normalized==0 -> min + 0.5*(1+EPS).
-        expected_zero_row = 2.5 + 0.5 * (1.0 + EPS)
-        assert torch.allclose(
-            out[1], torch.full((self.CHUNK_SIZE, self.MAX_ACTION_DIM), expected_zero_row), atol=1e-5
-        )
-        # Sanity: this is NOT equal to min (the common misconception).
-        assert not torch.allclose(out[1], torch.full_like(out[1], 2.5), atol=1e-3)
-        # And the real-range row matches the reference decode.
+        if zero_range_center:
+            # denom snaps to 1, offset 0.5 subtracted -> recovers min (2.5) + 0.5*EPS.
+            expected_zero_row = 2.5 + 0.5 * EPS
+            assert torch.allclose(
+                out[1], torch.full((self.CHUNK_SIZE, self.MAX_ACTION_DIM), expected_zero_row), atol=1e-5
+            )
+        else:
+            # Legacy: min + 0.5*(1+EPS), NOT min.
+            expected_zero_row = 2.5 + 0.5 * (1.0 + EPS)
+            assert torch.allclose(
+                out[1], torch.full((self.CHUNK_SIZE, self.MAX_ACTION_DIM), expected_zero_row), atol=1e-5
+            )
+            # Sanity: legacy is NOT equal to min (the common misconception).
+            assert not torch.allclose(out[1], torch.full_like(out[1], 2.5), atol=1e-3)
+        # And the real-range row matches the reference decode (offset is 0 there).
         ref0 = self._reference_decode([exact_zero], min_t, max_t, dataset_index[:1])
         assert torch.allclose(out[:1], ref0, atol=1e-5)
 

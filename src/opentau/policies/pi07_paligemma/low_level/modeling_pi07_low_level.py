@@ -366,12 +366,14 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
         num_datasets = _num_datasets(per_dataset_stats, dataset_names, config)
+        zero_range_center = config.zero_range_centers_on_zero()
         self.normalize_inputs = Normalize(
             config.input_features,
             config.normalization_mapping,
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
         )
         self.normalize_targets = Normalize(
             config.output_features,
@@ -379,6 +381,7 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
         )
         self.normalize_discrete_actions = Normalize(
             config.output_features,
@@ -386,6 +389,7 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
         )
         self.unnormalize_outputs = Unnormalize(
             config.output_features,
@@ -393,6 +397,7 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
         )
 
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
@@ -400,6 +405,11 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         self.discrete_action_processor = AutoProcessor.from_pretrained(
             config.discrete_action_tokenizer_path, trust_remote_code=True
         )
+        # Guard: a fitted FAST tokenizer bakes the discrete-action normalization
+        # convention into its BPE corpus; refuse a tokenizer whose convention
+        # disagrees with this policy's config_version (no-op for upstream/
+        # pre-versioning tokenizers, which carry no convention sidecar).
+        self._check_discrete_action_tokenizer_convention(config.discrete_action_tokenizer_path)
         # Get vocab size from processor
         discrete_action_vocab_size = getattr(self.discrete_action_processor, "vocab_size", None)
         self.model = PI07PaligemmaLowLevelFlowMatching(
@@ -1237,9 +1247,16 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         buffer = self.normalize_discrete_actions.buffer_actions
         min_ = _materialize(buffer["min"]).index_select(0, dataset_index).unsqueeze(1).to(device=device)
         max_ = _materialize(buffer["max"]).index_select(0, dataset_index).unsqueeze(1).to(device=device)
-        denom = max_ - min_
-        denom = torch.where(denom.abs() < EPS, torch.ones_like(denom), denom)
-        return (normalized + 1) / 2 * (denom + EPS) + min_
+        raw_range = max_ - min_
+        denom = torch.where(raw_range.abs() < EPS, torch.ones_like(raw_range), raw_range)
+        recovered = (normalized + 1) / 2 * (denom + EPS) + min_
+        # Mirror Unnormalize's zero_range_center inverse: subtract the numerator
+        # offset that the paired normalize_discrete_actions added (float-exact
+        # no-op on healthy dims). Gated on that module's flag so this inline path
+        # tracks the same config_version convention as the module it inverts.
+        if self.normalize_discrete_actions.zero_range_center:
+            recovered = recovered - 0.5 * (denom - raw_range)
+        return recovered
 
     def forward(
         self,

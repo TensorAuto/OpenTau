@@ -462,19 +462,25 @@ class TestZeroVarianceGuard:
         rec = unnorm({"observation.state": z}, idx)["observation.state"]
         torch.testing.assert_close(rec, original, atol=1e-5, rtol=1e-4)
 
-    def test_min_max_zero_range_is_bounded_and_round_trips(self):
+    @pytest.mark.parametrize("zero_range_center", [False, True])
+    def test_min_max_zero_range_is_bounded_and_round_trips(self, zero_range_center):
         features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(4,))}
         norm_map = {"ACTION": NormalizationMode.MIN_MAX}
         c = 2.0  # dim 3 is constant: min == max == c (a zero range)
         stats = [
             {"action": {"min": torch.tensor([-1.0, -1.0, -1.0, c]), "max": torch.tensor([1.0, 1.0, 1.0, c])}}
         ]
-        norm = Normalize(features, norm_map, per_dataset_stats=stats)
-        unnorm = Unnormalize(features, norm_map, per_dataset_stats=stats)
+        norm = Normalize(features, norm_map, per_dataset_stats=stats, zero_range_center=zero_range_center)
+        unnorm = Unnormalize(features, norm_map, per_dataset_stats=stats, zero_range_center=zero_range_center)
         idx = torch.zeros(1, dtype=torch.long)
         x = torch.tensor([[0.0, 0.0, 0.0, 5.0]])  # dim 3 = 5 deviates from the constant c
         z = norm({"action": x}, idx)["action"]
-        assert z[0, 3].abs().item() < 100.0  # bounded; without the snap ~ (5 - 2)/EPS ~ 3e8
+        # Bounded under both conventions; without the snap ~ (5 - 2)/EPS ~ 3e8.
+        # legacy: (3)/1*2-1 = 5; centered: (3+0.5)/1*2-1 = 6.
+        assert z[0, 3].abs().item() < 100.0
+        # Real-range dims 0..2 (x==0, min=-1, max=1) don't hit the zero-range
+        # branch, so they normalize to ~0 regardless of convention.
+        assert torch.allclose(z[0, :3], torch.zeros(3), atol=1e-6)
         rec = unnorm({"action": z}, idx)["action"]
         torch.testing.assert_close(rec, x, atol=1e-4, rtol=1e-4)
 

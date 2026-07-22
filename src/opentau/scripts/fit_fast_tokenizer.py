@@ -103,8 +103,10 @@ import draccus
 import numpy as np
 
 from opentau.configs.default import DatasetMixtureConfig
+from opentau.configs.policies import CURRENT_CONFIG_VERSION
 from opentau.configs.refs import resolve_refs_to_tempfile
 from opentau.datasets.dataset_mixture import compute_norm_key
+from opentau.policies.normalize import ACTION_NORM_META_FILE
 
 logger = logging.getLogger(__name__)
 
@@ -202,6 +204,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=8,
         help="Dataloader worker processes (passed to PyTorch DataLoader).",
+    )
+    p.add_argument(
+        "--config-version",
+        type=int,
+        default=CURRENT_CONFIG_VERSION,
+        help=(
+            "Normalization convention to fit the tokenizer under, matching a policy's "
+            "config_version. >= 1 (default) maps a zero-padded action column to 0.0; "
+            "0 is the legacy convention (-1.0). The chosen convention is written to the "
+            "tokenizer's `opentau_action_norm.json` sidecar and enforced at policy load."
+        ),
     )
     p.add_argument(
         "--use-mixture-dataloader",
@@ -764,6 +777,7 @@ def _normalize_chunks_per_head(
     per_dataset_chunks: list[int],
     per_ds_min: list[np.ndarray],
     per_ds_max: list[np.ndarray],
+    zero_range_center: bool = False,
 ) -> np.ndarray:
     """Apply per-dataset min/max to chunks in dataset-config order.
 
@@ -792,7 +806,7 @@ def _normalize_chunks_per_head(
         if count <= 0:
             continue
         out[offset : offset + count] = _normalize_chunks(
-            stacked[offset : offset + count], per_ds_min[i], per_ds_max[i]
+            stacked[offset : offset + count], per_ds_min[i], per_ds_max[i], zero_range_center
         )
         offset += count
     return out
@@ -1180,7 +1194,12 @@ def _extract_action_stats(mixture_meta: Any, action_dim: int) -> tuple[np.ndarra
 _NORMALIZE_EPS = 1e-8  # matches ``opentau.policies.normalize.EPS``.
 
 
-def _normalize_chunks(chunks: np.ndarray, action_min: np.ndarray, action_max: np.ndarray) -> np.ndarray:
+def _normalize_chunks(
+    chunks: np.ndarray,
+    action_min: np.ndarray,
+    action_max: np.ndarray,
+    zero_range_center: bool = False,
+) -> np.ndarray:
     """Min-max-normalize a stacked chunk tensor ``(N, T, D)`` to ``[-1, 1]``.
 
     Mirrors the formula in ``Normalize({"ACTION": NormalizationMode.MIN_MAX})``
@@ -1196,9 +1215,26 @@ def _normalize_chunks(chunks: np.ndarray, action_min: np.ndarray, action_max: np
     would actually crash the upstream DCT. We sanitize so a single bad chunk
     (e.g. a recording with a corrupted action sample) doesn't tank an hour-long
     fit; for non-NaN inputs this is a no-op.
+
+    ``zero_range_center`` selects the same convention as production
+    ``Normalize(zero_range_center=...)`` for a zero-range band (``max == min``:
+    a zero-padded action column). ``False`` (config_version 0) is byte-for-byte
+    the legacy formula, so an existing tokenizer re-fits identically. ``True``
+    (config_version >= 1) snaps the zero range to denom 1 and adds the ``0.5``
+    numerator offset, mapping a zero-padded column to ``0.0`` instead of
+    ``-1.0`` -- matching what a config_version >= 1 policy feeds the tokenizer.
+    Healthy dims are unchanged either way (the snap and offset are no-ops when
+    ``max - min`` >> EPS).
     """
-    span_with_eps = (action_max - action_min) + _NORMALIZE_EPS
-    norm = (chunks.astype(np.float64) - action_min) / span_with_eps * 2.0 - 1.0
+    x = chunks.astype(np.float64)
+    if not zero_range_center:
+        span_with_eps = (action_max - action_min) + _NORMALIZE_EPS
+        norm = (x - action_min) / span_with_eps * 2.0 - 1.0
+    else:
+        raw_range = action_max - action_min
+        denom = np.where(np.abs(raw_range) < _NORMALIZE_EPS, 1.0, raw_range)
+        dev = (x - action_min) + 0.5 * (denom - raw_range)
+        norm = dev / (denom + _NORMALIZE_EPS) * 2.0 - 1.0
     norm = np.nan_to_num(norm, nan=0.0, posinf=0.0, neginf=0.0)
     return norm.astype(np.float32)
 
@@ -1208,6 +1244,7 @@ def _drain_mixture(
     dataloader: Any,
     total_chunks: int,
     action_dim: int,
+    zero_range_center: bool = False,
 ) -> tuple[np.ndarray, int]:
     """Iterate the WeightedDatasetMixture dataloader, normalize, collect chunks.
 
@@ -1244,7 +1281,7 @@ def _drain_mixture(
         # max_action_dim, so D == action_dim here.
         if actions.ndim != 3:
             raise RuntimeError(f"Unexpected actions batch ndim={actions.ndim}, shape={actions.shape}")
-        normalized = _normalize_chunks(actions, action_min, action_max)
+        normalized = _normalize_chunks(actions, action_min, action_max, zero_range_center)
         take = min(normalized.shape[0], total_chunks - n_collected)
         collected.append(normalized[:take])
         n_collected += take
@@ -1426,6 +1463,16 @@ def main() -> int:
     args = parse_args()
     _setup_logging(args.log_level)
 
+    # Whether to fit under the config_version >= 1 zero-range convention (padded
+    # action column -> 0.0). Recorded in the tokenizer sidecar and enforced at
+    # policy load; see `_normalize_chunks`.
+    zero_range_center = args.config_version >= 1
+    logger.info(
+        "Fitting under config_version=%d (zero_range_center=%s).",
+        args.config_version,
+        zero_range_center,
+    )
+
     # The --use-mixture-dataloader path uses ``_extract_action_stats(mixture.meta, ...)``
     # which returns global aggregates; threading per-head normalization through
     # the dataloader-drained chunks would need per-sample dataset_index from
@@ -1507,7 +1554,9 @@ def main() -> int:
         )
         t_drain0 = time.perf_counter()
         dataloader = mixture.get_dataloader()
-        all_chunks, n_batches = _drain_mixture(mixture.meta, dataloader, args.total_chunks, args.action_dim)
+        all_chunks, n_batches = _drain_mixture(
+            mixture.meta, dataloader, args.total_chunks, args.action_dim, zero_range_center
+        )
         drain_time = time.perf_counter() - t_drain0
         logger.info(
             "Collected %d chunks in %.1fs (%d batches)",
@@ -1570,9 +1619,11 @@ def main() -> int:
             clip = min(c.shape[1], dim)
             stacked[i, :, :clip] = c[:, :clip]
         if args.per_head_norm:
-            all_chunks = _normalize_chunks_per_head(stacked, per_dataset_chunks, per_ds_min, per_ds_max)
+            all_chunks = _normalize_chunks_per_head(
+                stacked, per_dataset_chunks, per_ds_min, per_ds_max, zero_range_center
+            )
         else:
-            all_chunks = _normalize_chunks(stacked, action_min, action_max)
+            all_chunks = _normalize_chunks(stacked, action_min, action_max, zero_range_center)
         drain_time = time.perf_counter() - t_drain0
         logger.info(
             "Manual path: %d chunks normalized in %.1fs (norm=%s)",
@@ -1595,6 +1646,15 @@ def main() -> int:
         )
         # --- Phase 5: save ---
         _save_processor(processor, out_dir)
+        # Stamp the normalization convention this corpus was built under, so a
+        # policy loading this tokenizer can refuse a config_version mismatch
+        # (`PreTrainedPolicy._check_discrete_action_tokenizer_convention`).
+        (out_dir / ACTION_NORM_META_FILE).write_text(
+            json.dumps(
+                {"config_version": args.config_version, "zero_range_center": zero_range_center},
+                indent=2,
+            )
+        )
         # --- Phase 6: verify ---
         rng = np.random.default_rng(args.seed + 1)
         n_sample = min(256, all_chunks.shape[0])
@@ -1608,6 +1668,8 @@ def main() -> int:
         "action_freq": mixture_cfg.action_freq,
         "chunk_size": args.chunk_size,
         "action_dim": args.action_dim,
+        "config_version": args.config_version,
+        "zero_range_center": zero_range_center,
         "vocab_size": args.vocab_size,
         "scale": args.scale,
         "max_token_length": args.max_token_length,
