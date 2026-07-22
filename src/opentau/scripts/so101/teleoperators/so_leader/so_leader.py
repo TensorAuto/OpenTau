@@ -141,7 +141,10 @@ class SOLeader(Teleoperator):
     @check_if_not_connected
     def get_action(self) -> dict[str, float]:
         start = time.perf_counter()
-        action = self.bus.sync_read("Present_Position")
+        # num_retry: the CH343 usb-serial adapters intermittently drop a status
+        # packet (seen at the first read after connect and under multi-bus load);
+        # retrying re-transmits the read instead of killing the whole session.
+        action = self.bus.sync_read("Present_Position", num_retry=3)
         action = {f"{motor}.pos": val for motor, val in action.items()}
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read action: {dt_ms:.1f}ms")

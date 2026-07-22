@@ -250,7 +250,16 @@ def record(cfg: RecordConfig):
     listener = init_keyboard_listener(events)
 
     try:
-        recorded = 0
+        # `recorded` counts episodes already in the dataset, so num_episodes is the
+        # dataset TOTAL: a fresh dataset starts at 0; --resume continues where it
+        # left off (e.g. 9 done, num_episodes=50 -> records episodes 10..50).
+        recorded = dataset.num_episodes
+        if recorded >= cfg.dataset.num_episodes:
+            logging.warning(
+                "Dataset already has %d episode(s) >= --dataset.num_episodes=%d; nothing to record.",
+                recorded,
+                cfg.dataset.num_episodes,
+            )
         while recorded < cfg.dataset.num_episodes and not events["stop_recording"]:
             log_say(f"Recording episode {recorded + 1} of {cfg.dataset.num_episodes}", cfg.play_sounds)
             record_episode(
@@ -266,6 +275,11 @@ def record(cfg: RecordConfig):
             if events["rerecord_episode"]:
                 log_say("Re-recording episode", cfg.play_sounds)
                 events["rerecord_episode"] = False
+                # Drain the async image writer before deleting the episode's image
+                # dir: frames still in its queue land AFTER rmtree starts, leaving
+                # "Directory not empty" crashes and orphaned files.
+                if dataset.image_writer is not None:
+                    dataset.image_writer.wait_until_done()
                 dataset.clear_episode_buffer()
                 continue
 
@@ -281,14 +295,24 @@ def record(cfg: RecordConfig):
                     time.sleep(0.1)
                 events["exit_early"] = False
     except KeyboardInterrupt:
-        logging.info("Interrupted — stopping recording.")
+        logging.info("Interrupted — discarding the partial episode and stopping.")
+        # Drop the partially recorded episode cleanly: drain the async image
+        # writer, then delete its buffered frames + image dir so the dataset is
+        # left resume-ready (no orphaned episode_XXXXXX image folders).
+        try:
+            if dataset.image_writer is not None:
+                dataset.image_writer.wait_until_done()
+            if dataset.episode_buffer is not None and dataset.episode_buffer["size"] > 0:
+                dataset.clear_episode_buffer()
+        except Exception:
+            logging.warning("Partial-episode cleanup failed:", exc_info=True)
     finally:
         robot.disconnect()
         teleop.disconnect()
         if listener is not None:
             listener.stop()
 
-    log_say("Recording finished", cfg.play_sounds, blocking=True)
+    log_say("Recording finished", cfg.play_sounds)
     logging.info("Recorded %d episode(s) at %s", dataset.num_episodes, dataset.root)
 
     if cfg.dataset.push_to_hub:

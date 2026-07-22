@@ -66,10 +66,12 @@ def say(text: str, blocking: bool = False) -> None:
         return
     try:
         if blocking:
-            subprocess.run(cmd, check=False)
+            # timeout: spd-say --wait hangs indefinitely when no speech
+            # dispatcher is running; never let TTS wedge the caller.
+            subprocess.run(cmd, check=False, timeout=10)
         else:
             subprocess.Popen(cmd)
-    except FileNotFoundError:
+    except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
 
 
