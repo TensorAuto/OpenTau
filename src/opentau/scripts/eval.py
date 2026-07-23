@@ -68,6 +68,7 @@ from opentau.envs.utils import (
 )
 from opentau.policies.factory import make_policy
 from opentau.policies.pretrained import PreTrainedPolicy
+from opentau.policies.utils import to_dtype_preserving_siglip_float32
 from opentau.utils.accelerate_utils import acc_print, get_proc_accelerator, set_proc_accelerator
 from opentau.utils.io_utils import write_video
 from opentau.utils.libero_dataset_recorder import aggregate_task_results, consolidate_task_result
@@ -1030,7 +1031,10 @@ def eval_main(cfg: TrainPipelineConfig):
     validate_eval_input_resolution(cfg)
 
     policy = make_policy(cfg=cfg.policy)
-    policy.to(torch.bfloat16)
+    # Preserve the float32-pinned SigLIP embeddings across the bf16 cast (openpi parity);
+    # a plain policy.to(bfloat16) would round them back. Eval runs single-process / DDP, so
+    # this is safe (no ZeRO param partitioning). See to_dtype_preserving_siglip_float32.
+    to_dtype_preserving_siglip_float32(policy, dtype=torch.bfloat16)
     policy = accelerator.prepare(policy)
     policy.eval()
     with (

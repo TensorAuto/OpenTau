@@ -335,7 +335,33 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             self.paligemma.eval()
 
     def to_bfloat16_like_physical_intelligence(self) -> None:
-        """Casts specific model components to bfloat16 dtype."""
+        """Casts specific model components to bfloat16, keeping the SigLIP embeddings in float32.
+
+        Mirrors openpi's ``to_bfloat16_for_selected_params``: the bulk of the VLM runs in
+        bfloat16, but the SigLIP patch-embedding conv and the learned position-embedding table
+        are pinned to float32. The original JAX (Big Vision) SigLIP does patch extraction and
+        position embedding in float32 and only casts to the (bf16) encoder dtype afterwards
+        (``openpi/models/siglip.py``: "do patch extraction and posemb in float32"). Those two
+        tables are the only vision weights that are genuine float32 masters rather than bf16
+        masters upcast on checkpoint export, so loading their float32 values straight into
+        bf16 parameters rounds away real precision that a later ``.to(float32)`` cannot recover
+        (empirically ~0.4 max abs error in the projected image tokens). The float32 ->
+        encoder-dtype hand-off is done by the patched ``SiglipVisionTransformer.forward`` in
+        :mod:`opentau.utils.transformers_patch`.
+
+        These tables are used in the patch-conv / posemb *compute* in float32 only at
+        inference / serving / ONNX export: the inference entry points (the gRPC server,
+        ``scripts/inference.py``, ``eval.py``, ``benchmark_inference.py``,
+        ``high_level_planner_inference.py``, ``actions_mse_loss.py``) route their blanket
+        bfloat16 cast through :func:`opentau.policies.utils.to_dtype_preserving_siglip_float32`,
+        and ONNX export runs in float32. No *training* backend computes them in float32: DDP
+        and non-FSDP DeepSpeed blanket-cast the whole policy to bfloat16 (``train.py`` /
+        ``profile_step.py``), and FSDP keeps a float32 master but its
+        ``MixedPrecision(param_dtype=bfloat16)`` materializes bfloat16 compute params in the
+        all-gather. That gap is small (patch-conv compute differs ~0.14% in the image tokens,
+        ~1e-4 in the sampled actions; the default freezes the vision encoder) and is tracked
+        for a backend-specific, multi-rank-validated follow-up in issue #483.
+        """
         self.paligemma = self.paligemma.to(dtype=torch.bfloat16)
 
         params_to_change_dtype = [
@@ -347,6 +373,15 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         for name, param in self.named_parameters():
             if any(selector in name for selector in params_to_change_dtype):
                 param.data = param.data.to(dtype=torch.bfloat16)
+
+        params_to_keep_float32 = [
+            "vision_tower.vision_model.embeddings.patch_embedding.weight",
+            "vision_tower.vision_model.embeddings.patch_embedding.bias",
+            "vision_tower.vision_model.embeddings.position_embedding.weight",
+        ]
+        for name, param in self.named_parameters():
+            if any(selector in name for selector in params_to_keep_float32):
+                param.data = param.data.to(dtype=torch.float32)
 
     def embed_image(self, image: torch.Tensor) -> torch.Tensor:
         """Computes image embeddings.
