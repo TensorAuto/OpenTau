@@ -352,8 +352,8 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         The pinning is preserved by ONNX export (``scripts/export_to_onnx.py``, float32),
         FSDP training (``train.py`` skips the cast below under FSDP), and the inference /
         serving entry points (the gRPC server, ``scripts/inference.py``, ``eval.py``,
-        ``benchmark_inference.py``, ``high_level_planner_inference.py``), which do their
-        blanket bfloat16 cast through
+        ``benchmark_inference.py``, ``high_level_planner_inference.py``,
+        ``actions_mse_loss.py``), which do their blanket bfloat16 cast through
         :func:`opentau.policies.utils.to_dtype_preserving_siglip_float32` so these tables
         stay float32. The remaining gap is the non-FSDP training cast (``train.py`` /
         ``profile_step.py`` under DeepSpeed / DDP), which still blanket-casts to bfloat16:
