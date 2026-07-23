@@ -736,6 +736,15 @@ wheels = [
 ]
 
 [[package]]
+name = "feetech-servo-sdk"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pyserial" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5f/8e/c53d6f9a8bf3a86a635b58eeb675723f1b040f1665a0681467756c8989aa/feetech-servo-sdk-1.0.0.tar.gz", hash = "sha256:d4d3832e4b1b22a8222133a414db9f868224c2fb639426a1b11d96ddfe84e69c", size = 8392, upload-time = "2022-11-08T03:44:45.269Z" }
+
+[[package]]
 name = "filelock"
 version = "3.20.3"
 source = { registry = "https://pypi.org/simple" }
@@ -2250,6 +2259,9 @@ robocasa = [
     { name = "robocasa" },
     { name = "robosuite" },
 ]
+so101 = [
+    { name = "feetech-servo-sdk" },
+]
 trt = [
     { name = "tensorrt", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (platform_machine == 'x86_64' and sys_platform == 'win32')" },
 ]
@@ -2273,6 +2285,7 @@ requires-dist = [
     { name = "easydict", marker = "extra == 'libero'", specifier = "==1.9" },
     { name = "egl-probe", marker = "extra == 'libero'", git = "https://github.com/shuheng-liu/egl_probe?tag=v1.0.1-cmake4" },
     { name = "einops", specifier = ">=0.8.0" },
+    { name = "feetech-servo-sdk", marker = "extra == 'so101'", specifier = ">=1.0.0" },
     { name = "flask", specifier = ">=3.0.3" },
     { name = "future", marker = "extra == 'libero'", specifier = "==0.18.2" },
     { name = "gdown", specifier = ">=5.1.0" },
@@ -2345,7 +2358,7 @@ requires-dist = [
     { name = "wandb", specifier = ">=0.27.0" },
     { name = "zarr", specifier = ">=2.17.0" },
 ]
-provides-extras = ["dev", "libero", "robocasa", "urdf", "trt"]
+provides-extras = ["dev", "libero", "robocasa", "urdf", "trt", "so101"]
 
 [[package]]
 name = "orderly-set"
