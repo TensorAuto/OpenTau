@@ -145,13 +145,30 @@ class DatasetConfig:
             inlined with ``{"$ref": "path/to/fragment.json"}`` (see
             ``opentau/configs/refs.py``). Draws use the default torch RNG
             (see the ``DatasetMixtureConfig`` note). Defaults to None.
+        state_index: Original parquet column indices of ``state`` to keep, in
+            the order given (so this both subsets and permutes). ``None``
+            (default) keeps every dim in its original order. LeRobot-only.
+        action_index: Same as ``state_index``, for ``actions``. Applied before
+            the zero-pad to ``max_action_dim``, so ``real_action_dim`` counts
+            the kept dims. LeRobot-only. Defaults to None.
+        use_delta_joint_actions: Train on delta joint actions — subtract the
+            chunk-start state from each action in the chunk, matching openpi's
+            ``DeltaActions``. Requires ``delta_action_state_map``. Defaults to
+            False.
+        delta_action_state_map: ``{action_dim: state_dim}`` in **original
+            parquet index space**, not the reordered space ``action_index``
+            produces. Unmapped action dims stay absolute and keep absolute
+            stats, so one action vector can mix relative and absolute dims.
+            LeRobot-only. Defaults to None.
 
     Raises:
         ValueError: If both or neither of ``repo_id`` and ``vqa`` are set, if
-            ``tolerance_s`` or ``val_split_ratio`` is out of range, or if
+            ``tolerance_s`` or ``val_split_ratio`` is out of range, if
             ``prompt_substitutions`` is set on a VQA entry, maps a task
             literally named ``"$ref"``, has a non-string key, or contains an
-            empty substitute list or empty/non-string entries.
+            empty substitute list or empty/non-string entries, or if the
+            index / delta-action fields are malformed (see
+            ``_validate_index_and_delta``).
     """
 
     repo_id: str | None = None
@@ -202,10 +219,42 @@ class DatasetConfig:
     # `[0, 1]` when set. Only consulted when `TrainPipelineConfig.val_freq > 0`.
     val_split_ratio: float | None = None
 
+    # Which columns of this dataset's raw `state` / `actions` vectors to keep, given as
+    # **original parquet column indices**. The order is respected, so these both subset and
+    # permute: `state_index=[3, 0, 1]` emits a 3-dim state carrying raw dims 3, 0, 1 in that
+    # order. `None` (default) keeps every dim in its original order. Applied in
+    # `BaseDataset._to_standard_data_format` *before* the zero-pad to
+    # `max_state_dim`/`max_action_dim`, so `real_action_dim` counts the kept dims. The same
+    # indexing is applied to this dataset's normalization stats, so stats stay aligned.
+    #
+    # Use these to harmonize heterogeneous robots into one canonical layout — e.g. mapping two
+    # datasets whose parquet columns order the arm joints differently onto a shared action space.
+    state_index: list[int] | None = None
+    action_index: list[int] | None = None
+
+    # Train on delta (relative) joint actions instead of absolute ones: each action in the chunk
+    # has the chunk-start state subtracted, matching openpi's `DeltaActions` transform. Requires
+    # a non-empty `delta_action_state_map`. Action dims with no mapping stay absolute.
+    use_delta_joint_actions: bool = False
+
+    # `{action_dim: state_dim}` in **original parquet index space** (i.e. the same space as
+    # `action_index` / `state_index`, NOT the reordered positions those produce). For each entry,
+    # `actions[:, action_dim] -= state[state_dim]` using the single chunk-start state, broadcast
+    # across the whole action horizon. Unmapped action dims keep absolute values and absolute
+    # stats, so one action vector can mix relative and absolute dims (e.g. delta joints with an
+    # absolute gripper: `{0: 0, 1: 1, ..., 6: 6}` leaving dim 7 alone).
+    #
+    # NOTE the index-space distinction: this field is in parquet space, while the policy-side
+    # `delta_action_state_map` on the policy config is in post-index space. The dataset resolves
+    # one to the other via `opentau.datasets.action_indexing.resolve_delta_map`.
+    delta_action_state_map: dict[int, int] | None = None
+
     def __post_init__(self):
         """Validate dataset configuration and register custom mappings if provided."""
         if (self.repo_id is None) == (self.vqa is None):
             raise ValueError("Exactly one of `repo_id` or `vqa` for Dataset config should be set.")
+
+        self._validate_index_and_delta()
 
         if self.tolerance_s is not None and self.tolerance_s < 0:
             raise ValueError(
@@ -299,6 +348,73 @@ class DatasetConfig:
                 DATA_FEATURES_NAME_MAPPING[key] = self.data_features_name_mapping
             if effective is not None:
                 _CONFIG_EFFECTIVE_MAPPING_KEYS.add(effective)
+
+    def _validate_index_and_delta(self) -> None:
+        """Validate `state_index` / `action_index` / delta-action fields.
+
+        Also coerces `delta_action_state_map` keys and values to `int`: a JSON config
+        round-trips object keys as strings (`{"0": 0}`), so without this the map silently
+        matches no action dim and every dim trains absolute.
+        """
+        who = self.repo_id or self.vqa
+        for name in ("state_index", "action_index"):
+            index = getattr(self, name)
+            if index is None:
+                continue
+            if self.vqa is not None:
+                raise ValueError(
+                    f"`DatasetConfig.{name}` only applies to LeRobot datasets (`repo_id`); "
+                    f"VQA dataset {self.vqa!r} emits pre-shaped action tensors."
+                )
+            if not isinstance(index, list) or not index:
+                raise ValueError(
+                    f"`DatasetConfig.{name}` must be a non-empty list of column indices "
+                    f"(or None to keep every dim), got {index!r} for {who}."
+                )
+            if not all(isinstance(i, int) and not isinstance(i, bool) and i >= 0 for i in index):
+                raise ValueError(
+                    f"`DatasetConfig.{name}` entries must be non-negative ints, got {index!r} for {who}."
+                )
+            if len(set(index)) != len(index):
+                dupes = sorted({i for i in index if index.count(i) > 1})
+                raise ValueError(
+                    f"`DatasetConfig.{name}` contains duplicate indices {dupes} for {who}. "
+                    "Repeating a column is almost always a typo; list each index once."
+                )
+
+        if self.delta_action_state_map is not None:
+            if self.vqa is not None:
+                raise ValueError(
+                    "`DatasetConfig.delta_action_state_map` only applies to LeRobot datasets "
+                    f"(`repo_id`); VQA dataset {self.vqa!r} has no proprioceptive state."
+                )
+            try:
+                coerced = {int(a): int(s) for a, s in self.delta_action_state_map.items()}
+            except (TypeError, ValueError) as e:
+                raise ValueError(
+                    "`DatasetConfig.delta_action_state_map` must map int action dims to int "
+                    f"state dims, got {self.delta_action_state_map!r} for {who}."
+                ) from e
+            if any(a < 0 or s < 0 for a, s in coerced.items()):
+                raise ValueError(
+                    "`DatasetConfig.delta_action_state_map` indices must be non-negative, got "
+                    f"{self.delta_action_state_map!r} for {who}."
+                )
+            self.delta_action_state_map = coerced
+
+        if self.use_delta_joint_actions and not self.delta_action_state_map:
+            raise ValueError(
+                "`DatasetConfig.use_delta_joint_actions=True` requires a non-empty "
+                f"`delta_action_state_map` (at least one action dim), but none was given for "
+                f"{who}. Without a mapping there is nothing to make relative."
+            )
+        if self.delta_action_state_map and not self.use_delta_joint_actions:
+            raise ValueError(
+                "`DatasetConfig.delta_action_state_map` is set but "
+                f"`use_delta_joint_actions` is False for {who}, so the mapping would be "
+                "silently ignored and actions would train as absolute. Set the flag, or "
+                "remove the mapping."
+            )
 
 
 @dataclass

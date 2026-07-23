@@ -64,11 +64,28 @@ class TestNormalize:
         z = _normalize(x, stat, "QUANTILE")
         np.testing.assert_allclose(z, [[6.0 / (6.0 + EPS) * 2 - 1]], atol=1e-6)
 
-    def test_quantile_falls_back_to_min_max(self):
+    def test_quantile_without_quantiles_raises(self):
+        """QUANTILE has no min/max fallback: a head without q01/q99 is an error.
+
+        Falling back would report a distribution the policy never sees — the policy itself
+        raises on the same input (see `normalize.resolve_stat_row`).
+        """
         x = np.array([[1.0]])
         stat = {"min": np.array([0.0]), "max": np.array([1.0])}
-        z = _normalize(x, stat, "QUANTILE")
-        np.testing.assert_allclose(z, _normalize(x, stat, "MIN_MAX"))
+        with pytest.raises(KeyError, match="q01"):
+            _normalize(x, stat, "QUANTILE")
+
+    def test_quantile_uses_quantiles_not_extremes(self):
+        """q01/q99 drive the scaling even when min/max are present and wider."""
+        x = np.array([[2.0]])
+        stat = {
+            "min": np.array([-10.0]),
+            "max": np.array([10.0]),
+            "q01": np.array([0.0]),
+            "q99": np.array([4.0]),
+        }
+        # 2.0 sits at the midpoint of [q01, q99] -> 0.0, not the midpoint of [min, max].
+        np.testing.assert_allclose(_normalize(x, stat, "QUANTILE"), [[0.0]], atol=1e-6)
 
     def test_unknown_mode_raises(self):
         with pytest.raises(ValueError):
@@ -170,9 +187,11 @@ def test_worker_parquet_roundtrip(tmp_path):
     assert set(out) == {("franka::joint", "state"), ("franka::joint", "actions")}
     sacc = out[("franka::joint", "state")]
     assert int(sacc.count.sum()) == 40 * 3
-    # normalizing by the data's own mean/std => z ~ mean 0, std 1
-    np.testing.assert_allclose(sacc.z_mean(), 0.0, atol=1e-6)
-    np.testing.assert_allclose(sacc.z_std(), 1.0, atol=1e-6)
+    # Normalizing by the data's own mean/std => z ~ mean 0, std 1. The tolerance is 1e-5, not
+    # 1e-6: normalization divides by `std + EPS` with EPS=1e-6 (matching openpi), so the
+    # recovered std is `std/(std+EPS)` ~ 1 - 1e-6, which sits right on a 1e-6 bound.
+    np.testing.assert_allclose(sacc.z_mean(), 0.0, atol=1e-5)
+    np.testing.assert_allclose(sacc.z_std(), 1.0, atol=1e-5)
 
 
 @pytest.mark.slow

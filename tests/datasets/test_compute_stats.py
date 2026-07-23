@@ -450,8 +450,14 @@ def test_aggregate_feature_stats_quantiles_weighted_mean():
     np.testing.assert_allclose(agg["q99"], [6.0])
 
 
-def test_aggregate_feature_stats_quantile_fallback_to_extreme():
-    """A contributor without a stored quantile contributes its same-side extreme."""
+def test_aggregate_feature_stats_partial_quantiles_raises():
+    """Mixing contributors with and without quantiles is an error, not a min/max backfill.
+
+    Backfilling a missing q01 from that contributor's `min` pools two different scales into one
+    buffer: `min` sits however far outside the 1st percentile the tail reaches, so the pooled
+    band silently widens by an amount driven purely by outliers — exactly the sensitivity
+    QUANTILE exists to remove.
+    """
     stats_ft = [
         {
             "min": np.array([-8.0]),
@@ -463,7 +469,7 @@ def test_aggregate_feature_stats_quantile_fallback_to_extreme():
             "q99": np.array([2.0]),
         },
         {
-            # no quantiles (stats predating quantile support) -> min/max used
+            # no quantiles (stats predating quantile support)
             "min": np.array([-4.0]),
             "max": np.array([4.0]),
             "mean": np.array([0.0]),
@@ -471,9 +477,8 @@ def test_aggregate_feature_stats_quantile_fallback_to_extreme():
             "count": np.array([10]),
         },
     ]
-    agg = aggregate_feature_stats(stats_ft)
-    np.testing.assert_allclose(agg["q01"], [(-2.0 - 4.0) / 2])
-    np.testing.assert_allclose(agg["q99"], [(2.0 + 4.0) / 2])
+    with pytest.raises(KeyError, match="missing 'q01'"):
+        aggregate_feature_stats(stats_ft)
 
 
 def test_aggregate_feature_stats_no_quantiles_no_keys():

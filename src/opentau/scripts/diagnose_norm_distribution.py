@@ -66,7 +66,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-EPS = 1e-8  # must match opentau.policies.normalize.EPS
+EPS = 1e-6  # must match opentau.policies.normalize.EPS (and openpi's normalization epsilon)
 
 # Histogram bins on the NORMALIZED value z (std units): a dense linear core for
 # the shape near 0, symmetric log-spaced tails out to 1e5 std for outliers, and
@@ -215,11 +215,16 @@ def _normalize(x: np.ndarray, stat: dict, mode: str) -> np.ndarray:
     if mode == "MIN_MAX":
         return (x - stat["min"]) / (stat["max"] - stat["min"] + EPS) * 2.0 - 1.0
     if mode == "QUANTILE":
-        # Same fallback as `create_stats_buffers`: stats without stored
-        # quantiles degrade to min/max scaling for that head.
-        lo = stat["q01"] if "q01" in stat else stat["min"]
-        hi = stat["q99"] if "q99" in stat else stat["max"]
-        return (x - lo) / (hi - lo + EPS) * 2.0 - 1.0
+        # No min/max fallback, matching `create_stats_buffers`: a head without
+        # stored quantiles is an error, not a silent downgrade to min-max
+        # scaling (which would report a distribution the policy never sees).
+        if "q01" not in stat or "q99" not in stat:
+            raise KeyError(
+                "norm_mode=QUANTILE requires 'q01'/'q99' in the head stats, but this head has "
+                f"only {sorted(stat)}. Recompute the dataset's stats, or diagnose with "
+                "--norm_mode=MIN_MAX."
+            )
+        return (x - stat["q01"]) / (stat["q99"] - stat["q01"] + EPS) * 2.0 - 1.0
     raise ValueError(f"unsupported norm_mode {mode!r}")
 
 
@@ -641,15 +646,15 @@ def main(args: Args) -> None:
     if args.emit_corrected_stats:
         if args.norm_mode == "QUANTILE":
             # The streaming accumulator holds moments and extremes, not order
-            # statistics, so corrected_stats.json cannot carry q01/q99. A
-            # QUANTILE policy fed this artifact would fall back to the
-            # data-derived global min/max — exactly the extreme-value scaling
-            # QUANTILE exists to avoid.
+            # statistics, so corrected_stats.json cannot carry q01/q99. Since
+            # the min/max fallback was removed, a QUANTILE policy fed this
+            # artifact now *raises* rather than silently downgrading to
+            # extreme-value scaling.
             logger.warning(
                 "emit_corrected_stats with norm_mode=QUANTILE: corrected_stats.json contains only "
                 "mean/std/min/max (quantiles are not recoverable from the streaming accumulator). "
-                "Applying it to a QUANTILE policy downgrades every head to min/max scaling; prefer "
-                "recomputing quantiles from data if the metadata quantiles are stale."
+                "A QUANTILE policy fed this artifact will raise KeyError on the missing q01/q99 — "
+                "recompute quantiles from data if the metadata quantiles are stale."
             )
         _emit_corrected_stats(merged, norm_keys, out_dir / "corrected_stats.json")
     if not args.no_plots:

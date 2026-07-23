@@ -266,9 +266,29 @@ class DatasetMixtureMetadata:
         dataset_weights: List[float],
         dataset_names: List[str] | None = None,
         name_maps: List[dict[str, str] | None] | None = None,
+        column_indices: List[tuple[list[int] | None, list[int] | None]] | None = None,
+        delta_maps: List[dict[int, int] | None] | None = None,
+        delta_stats: List[dict[str, dict[str, np.ndarray]] | None] | None = None,
     ):
         self.cfg = cfg
         self._dataset_weights = list(dataset_weights)
+
+        # Per-entry `(state_index, action_index)` in PARQUET space, aligned with `metadatas`.
+        # The same selection the datasets apply in `__getitem__` must be applied to their stats
+        # here, or every normalization buffer addresses the wrong columns.
+        if column_indices is None:
+            column_indices = [(None, None)] * len(metadatas)
+        # Per-entry delta map in POST-INDEX space (already resolved by the dataset factory), or
+        # None for datasets training on absolute actions.
+        if delta_maps is None:
+            delta_maps = [None] * len(metadatas)
+        # Per-entry recomputed delta-action stats (post-index space), or None for datasets on
+        # absolute actions. These replace the on-disk action stats, which describe a
+        # distribution the policy no longer trains against.
+        if delta_stats is None:
+            delta_stats = [None] * len(metadatas)
+        self._column_indices = list(column_indices)
+        self._delta_maps = list(delta_maps)
 
         # Per-entry feature-name mappings (aligned with `metadatas`). When an
         # entry is None, resolution falls back to the global registry — which
@@ -283,28 +303,39 @@ class DatasetMixtureMetadata:
             key = feature_mapping_key(m.repo_id, getattr(m, "info", {}).get("control_mode"))
             return DATA_FEATURES_NAME_MAPPING[key if key in DATA_FEATURES_NAME_MAPPING else m.repo_id]
 
-        # Snapshot raw state / action dims BEFORE `_to_standard_data_format`
-        # pads the standardized stats. Used to surface incompatible-dim
-        # configurations (two datasets sharing a (robot_type, control_mode)
-        # but with mismatched proprio / action widths). Done up front because
-        # the standardize loop below clobbers `metadata.stats`.
+        # Snapshot state / action dims BEFORE `_to_standard_data_format` pads the standardized
+        # stats. Used to surface incompatible-dim configurations (two datasets sharing a
+        # (robot_type, control_mode) but with mismatched proprio / action widths). Done up front
+        # because the standardize loop below clobbers `metadata.stats`.
+        #
+        # These are the dims AFTER `state_index` / `action_index` selection, because that is the
+        # width the policy actually sees. Harmonizing two differently-shaped robots onto one head
+        # via the index fields is a supported use of this feature, so comparing raw parquet widths
+        # would reject exactly the configuration the indices exist to enable.
         raw_dims: list[tuple[int, int]] = []
-        for m, own_map in zip(metadatas, name_maps, strict=True):
+        for m, own_map, (s_idx, a_idx) in zip(metadatas, name_maps, column_indices, strict=True):
             name_map = _entry_name_map(m, own_map)
+            state_dim = int(m.stats[name_map["state"]]["mean"].shape[-1])
+            action_dim = int(m.stats[name_map["actions"]]["mean"].shape[-1])
             raw_dims.append(
                 (
-                    int(m.stats[name_map["state"]]["mean"].shape[-1]),
-                    int(m.stats[name_map["actions"]]["mean"].shape[-1]),
+                    len(s_idx) if s_idx is not None else state_dim,
+                    len(a_idx) if a_idx is not None else action_dim,
                 )
             )
 
         # convert each metadata stats to the standard data format
-        for metadata, own_map in zip(metadatas, name_maps, strict=True):
+        for metadata, own_map, (s_idx, a_idx), d_stats in zip(
+            metadatas, name_maps, column_indices, delta_stats, strict=True
+        ):
             metadata.stats = self._to_standard_data_format(
                 metadata.repo_id,
                 metadata.stats,
                 getattr(metadata, "info", {}).get("control_mode"),
                 name_map=own_map,
+                state_index=s_idx,
+                action_index=a_idx,
+                delta_stats=d_stats,
             )
 
         # Per-dataset stats kept for diagnostic / back-compat consumers
@@ -337,6 +368,58 @@ class DatasetMixtureMetadata:
             self.dataset_to_norm_index,
             self.norm_key_to_dataset_names,
         ) = self._build_norm_heads(metadatas, raw_dims)
+
+        # The single post-index delta map the policy will use to invert the transform at
+        # inference, or None when no dataset trains on delta actions.
+        self.delta_action_state_map: dict[int, int] | None = self._resolve_mixture_delta_map()
+
+    def _resolve_mixture_delta_map(self) -> dict[int, int] | None:
+        """Return the mixture's single post-index delta map, or ``None`` if unused.
+
+        The policy applies one inverse transform to whatever chunk it emits, so every
+        delta-enabled dataset in the mixture must agree on which action positions are relative
+        and which state positions they subtract. Datasets can reach that agreement from different
+        parquet layouts (that is what ``state_index`` / ``action_index`` are for), but the
+        *resolved* maps must be identical.
+
+        Mixing delta and absolute datasets in one mixture is also rejected: the policy would have
+        to know per-sample which convention produced a chunk, and at inference there is no such
+        signal.
+
+        Returns:
+            The shared ``{action_pos: state_pos}`` map, or ``None`` when no dataset uses deltas.
+
+        Raises:
+            ValueError: If delta-enabled datasets disagree, or if the mixture mixes
+                delta-action and absolute-action datasets.
+        """
+        enabled = [(n, m) for n, m in zip(self.dataset_names, self._delta_maps, strict=True) if m]
+        if not enabled:
+            return None
+        absolute = [n for n, m in zip(self.dataset_names, self._delta_maps, strict=True) if not m]
+        if absolute:
+            raise ValueError(
+                f"{len(enabled)} dataset(s) in this mixture use delta joint actions but "
+                f"{len(absolute)} do not ({absolute[:10]}). The policy applies one inverse "
+                "transform to every chunk it emits and has no per-sample signal for which "
+                "convention produced it, so a mixture must be all-delta or all-absolute. Set "
+                "use_delta_joint_actions consistently across the mixture."
+            )
+        first_name, first_map = enabled[0]
+        mismatched = [f"{n} -> {m}" for n, m in enabled[1:] if m != first_map]
+        if mismatched:
+            raise ValueError(
+                "Datasets disagree on the resolved (post-index) delta_action_state_map, so the "
+                "policy-side inverse would be ambiguous. Expected "
+                f"{first_name} -> {first_map}, but got: {mismatched[:10]}. Use state_index / "
+                "action_index to bring the datasets onto a common layout."
+            )
+        logging.info(
+            "Delta joint actions ON for all %d dataset(s); post-index map %s.",
+            len(enabled),
+            first_map,
+        )
+        return dict(first_map)
 
     def _build_norm_heads(
         self,
@@ -496,11 +579,15 @@ class DatasetMixtureMetadata:
         stats: dict[str, dict[str, np.ndarray]],
         control_mode: str | None = None,
         name_map: dict[str, str] | None = None,
+        state_index: list[int] | None = None,
+        action_index: list[int] | None = None,
+        delta_stats: dict[str, dict[str, np.ndarray]] | None = None,
     ) -> dict[str, dict[str, np.ndarray]]:
         """Convert statistics to the standard data format.
 
         Maps feature names from dataset-specific format to standard format,
-        pads state and action vectors, and ensures all required cameras are present.
+        selects/reorders columns, pads state and action vectors, and ensures all
+        required cameras are present.
 
         Args:
             repo_id: Repository ID used to look up feature name mapping.
@@ -512,6 +599,16 @@ class DatasetMixtureMetadata:
             name_map: This entry's own feature-name mapping. When provided it
                 wins over the registry lookup — the registry is ambiguous when
                 two mixture entries share a ``repo_id`` and ``control_mode``.
+            state_index: ``DatasetConfig.state_index`` (parquet space) for this
+                entry, applied to every per-dim state stat so the stats stay
+                aligned with the columns ``__getitem__`` emits. ``None`` keeps
+                all columns.
+            action_index: Same, for the action stats.
+            delta_stats: Pre-computed ``{"actions": ..., "state": ...}`` stats
+                for a delta-action dataset, already in post-index space. When
+                given, these replace the on-disk stats for those features
+                (which describe absolute per-frame actions and no longer match
+                the training targets) and skip the indexing step.
 
         Returns:
             Statistics dictionary with standard feature names and padded vectors.
@@ -544,11 +641,39 @@ class DatasetMixtureMetadata:
             else:
                 raise KeyError(f"Key '{key}' not found in stats. Available keys: {list(stats.keys())}")
 
+        # Select / reorder columns to match what `__getitem__` emits, BEFORE padding — the same
+        # order as the data path (`BaseDataset._apply_column_index_and_delta` runs ahead of
+        # `pad_vector`). `count` is a scalar and every per-dim stat is indexed, so a stat this
+        # loop doesn't know about would silently keep the raw layout; hence the explicit
+        # `padded_stat_names` reuse below rather than a blanket `for stat in ...`.
+        padded_stat_names = ["mean", "std", "min", "max", "q01", "q10", "q50", "q90", "q99"]
+        for feature, index in (("state", state_index), ("actions", action_index)):
+            if delta_stats and feature in delta_stats:
+                # Delta-action datasets: the on-disk stats describe absolute per-frame actions,
+                # which is the wrong distribution once the delta transform is on. These
+                # replacements were computed from the already-indexed columns, so they are
+                # substituted wholesale and must NOT be re-indexed here.
+                standard_stats[feature] = dict(delta_stats[feature])
+                continue
+            if index is None:
+                continue
+            for stat in list(standard_stats[feature]):
+                if stat not in padded_stat_names:
+                    continue
+                arr = standard_stats[feature][stat]
+                width = arr.shape[-1]
+                out_of_range = [i for i in index if i >= width]
+                if out_of_range:
+                    raise IndexError(
+                        f"{repo_id}: {feature}_index refers to column(s) {out_of_range} but the "
+                        f"'{stat}' stat has only {width} column(s) (valid range 0..{width - 1})."
+                    )
+                standard_stats[feature][stat] = arr[..., index]
+
         # pad state and action vectors (quantiles included so the QUANTILE
         # normalization buffers see the same padded dim as mean/std/min/max;
         # the two dicts are padded independently because converted datasets
         # may carry quantiles on one feature but not the other)
-        padded_stat_names = ["mean", "std", "min", "max", "q01", "q10", "q50", "q90", "q99"]
         for stat in standard_stats["state"]:
             if stat in padded_stat_names:
                 standard_stats["state"][stat] = pad_vector(
@@ -787,6 +912,11 @@ class WeightedDatasetMixture:
             dataset_weights,
             dataset_names=self.dataset_names,
             name_maps=[_instance_name_map(ds) for ds in datasets],
+            column_indices=[
+                (getattr(ds, "state_index", None), getattr(ds, "action_index", None)) for ds in datasets
+            ],
+            delta_maps=[getattr(ds, "delta_action_state_map", None) for ds in datasets],
+            delta_stats=[getattr(ds, "delta_action_stats", None) for ds in datasets],
         )
 
         # Wrap every underlying dataset so __getitem__ injects

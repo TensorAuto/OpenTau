@@ -191,6 +191,23 @@ class PI05Config(PreTrainedConfig):
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
 
+    # `{action_pos: state_pos}` in **post-index space** — positions within the action / state
+    # vectors the policy actually receives, i.e. after each dataset's `action_index` /
+    # `state_index` selection. This is NOT the parquet-space map on `DatasetConfig`: by the time
+    # a batch reaches the policy the raw columns are gone, so `make_policy` stores the map the
+    # mixture already resolved (`DatasetMixtureMetadata.delta_action_state_map`).
+    #
+    # Set automatically when training on a delta-action mixture, and persisted into the
+    # checkpoint config so serving reproduces the inverse. `sample_actions` uses it to add the
+    # conditioning state back onto the mapped dims — without it a policy trained on deltas emits
+    # deltas that the consumer reads as absolute joint targets.
+    delta_action_state_map: dict[int, int] | None = None
+
+    # Path to an openpi-style `norm_stats.json` whose stats replace the dataset-derived ones for
+    # every norm head. Intended for teacher-faithful replay of an openpi checkpoint; prefer
+    # baking correct stats into the checkpoint instead (a warning fires when this is used).
+    norm_stats_override_path: str | None = None
+
     def __post_init__(self):
         """Post-initialization validation."""
         super().__post_init__()
@@ -209,6 +226,22 @@ class PI05Config(PreTrainedConfig):
 
         if self.state_type not in ("discrete", "continuous"):
             raise ValueError(f"state_type must be 'discrete' or 'continuous', got '{self.state_type}'")
+
+        if self.delta_action_state_map is not None:
+            # A JSON config round-trips object keys as strings; without coercion the map would
+            # match no action position and the inverse would silently no-op at inference.
+            try:
+                self.delta_action_state_map = {int(a): int(s) for a, s in self.delta_action_state_map.items()}
+            except (AttributeError, TypeError, ValueError) as e:
+                raise ValueError(
+                    "`delta_action_state_map` must map int action positions to int state "
+                    f"positions, got {self.delta_action_state_map!r}."
+                ) from e
+            if any(a < 0 or s < 0 for a, s in self.delta_action_state_map.items()):
+                raise ValueError(
+                    "`delta_action_state_map` positions must be non-negative, got "
+                    f"{self.delta_action_state_map!r}."
+                )
 
         if self.attention_implementation == "flash_cuda":
             raise ValueError(

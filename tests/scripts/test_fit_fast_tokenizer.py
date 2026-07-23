@@ -368,14 +368,16 @@ class TestNormalizeEquivalenceVsProduction:
         batch = {"action": torch.from_numpy(stacked.reshape(n * t, d))}
         out_prod = normalize(batch, dataset_index)["action"].numpy().reshape(n, t, d)
 
-        # Both paths apply `(x - min) / (max - min + EPS) * 2 - 1` with EPS=1e-8.
-        # Production runs the whole expression in float32; the manual path
-        # computes in float64 then casts to float32 at the end, so low-bit
-        # rounding differs by ~1 ULP (1.19e-7) on a few entries. The DCT scale
-        # the BPE codec sees is O(1) so this is well below the threshold that
-        # would change the BPE token-id sequence. Padded slots become -1 in
-        # both (zero data, zero stats, +EPS divisor -> -1).
-        np.testing.assert_allclose(out_manual, out_prod, rtol=0, atol=2e-7)
+        # Both paths apply `(x - min) / (max - min + EPS) * 2 - 1` with EPS=1e-6
+        # (matching openpi's normalization epsilon). Production runs the whole
+        # expression in float32; the manual path computes in float64 then casts
+        # to float32 at the end, so the two differ by a few ULP where the larger
+        # EPS interacts with the float32 rounding — ~5e-7 on a handful of
+        # entries. The DCT scale the BPE codec sees is O(1) so this is well
+        # below the threshold that would change the BPE token-id sequence.
+        # Padded slots become -1 in both (zero data, zero stats, snapped
+        # divisor -> -1).
+        np.testing.assert_allclose(out_manual, out_prod, rtol=0, atol=2e-6)
         # Sanity: the padded suffix actually is -1 in both outputs.
         np.testing.assert_allclose(out_manual[0:3, :, 2:4], -1.0, atol=1e-7)
         np.testing.assert_allclose(out_manual[3:7, :, 3:4], -1.0, atol=1e-7)

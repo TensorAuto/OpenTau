@@ -742,11 +742,13 @@ class TestInjectStatsQuantile:
         assert float(buf["q01"][1][0]) == _NEW_BASE + 1 - 1.0
         assert float(buf["q99"][0][0]) == _NEW_BASE + 0 + 1.0
 
-    def test_inject_quantile_min_max_fallback(self):
+    def test_inject_quantile_without_quantiles_raises(self):
+        """Injecting head stats with no q01/q99 raises instead of falling back to min/max.
+
+        The injected stats would otherwise land in the quantile buffers on a min/max scale,
+        so the policy would silently normalize against extremes it was never trained on.
+        """
         policy = self._quantile_policy()
         new = self._build_quantile_head_stats(2, _NEW_BASE, with_quantiles=False)
-        policy._inject_stats(new, dataset_names=["h::0", "h::1"])
-        buf = policy.normalize_targets.buffer_action
-        # fallback: q01 <- min = base - 10, q99 <- max = base + 10
-        assert float(buf["q01"][0][0]) == _NEW_BASE - 10.0
-        assert float(buf["q99"][1][0]) == _NEW_BASE + 1 + 10.0
+        with pytest.raises(KeyError, match="q01"):
+            policy._inject_stats(new, dataset_names=["h::0", "h::1"])

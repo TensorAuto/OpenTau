@@ -31,11 +31,15 @@ from torch import Tensor, nn
 
 from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
 
-EPS = 1e-8  # Small epsilon value for numerical stability in normalization
+# Matches openpi's normalization epsilon (``1e-6`` in ``openpi.transforms.Normalize``), so a
+# policy trained here and one trained there agree to well under float32 resolution on the same
+# inputs. This was ``1e-8`` before; the change shifts MEAN_STD / MIN_MAX / QUANTILE outputs by
+# ~1e-6 relative (~10 ULP in float32) and widens the zero-variance snap threshold below by 100x.
+EPS = 1e-6  # Small epsilon value for numerical stability in normalization
 
 # A genuinely-zero std (|std| < EPS) marks a constant/padding feature dim. The guard in
 # ``Normalize`` / ``Unnormalize`` snaps such a std (or a zero MIN_MAX range) to 1 so a value
-# that *deviates* from that "constant" can't divide by ~EPS and blow up to ~1e8 (the
+# that *deviates* from that "constant" can't divide by ~EPS and blow up to ~1e6 (the
 # "Outlier normalized state" failure). When the dim is truly constant and its stats are
 # right, every value equals the mean, the deviation is 0, and the snap is a no-op.
 #
@@ -206,38 +210,34 @@ def stat_names_for_mode(norm_mode: NormalizationMode) -> tuple[str, ...]:
     raise ValueError(norm_mode)
 
 
-# QUANTILE tolerates datasets whose stats predate quantile support (e.g. LeRobot
-# v3.0 repos converted from v2.1, whose stats.json has only min/max/mean/std):
-# the missing quantile falls back to the same-side extreme, degrading that
-# dataset's row to plain min-max scaling.
-_QUANTILE_FALLBACK = {"q01": "min", "q99": "max"}
-
-
 def resolve_stat_row(
     ds_stats: dict[str, dict[str, Tensor | np.ndarray]], key: str, name: str
 ) -> Tensor | np.ndarray:
     """Fetch stat ``name`` for feature ``key`` from one dataset's stats.
 
-    Applies the QUANTILE fallback (``q01``→``min``, ``q99``→``max``) when the
-    quantile is absent, so converted-from-v2.1 datasets remain usable.
+    A missing stat is an error. QUANTILE deliberately does **not** fall back to
+    ``min``/``max``: openpi's quantile path has no such fallback, and silently
+    degrading one dataset's row to min-max scaling puts that row on a different
+    scale from its peers — exactly the class of bug QUANTILE exists to avoid.
+    Datasets whose ``stats.json`` predates quantile support (LeRobot v3.0 repos
+    converted from v2.1) must have their stats recomputed, or be loaded through
+    the delta-action stats pass, which computes quantiles for every dim.
 
     Raises:
-        KeyError: If the feature is missing, or the stat is missing and has no
-            fallback (or its fallback is also missing).
+        KeyError: If the feature is missing, or the stat is missing.
     """
     if key not in ds_stats:
         raise KeyError(f"stats are missing feature '{key}'. Available keys: {list(ds_stats)}.")
     feat_stats = ds_stats[key]
     if name in feat_stats:
         return feat_stats[name]
-    fallback = _QUANTILE_FALLBACK.get(name)
-    if fallback is not None and fallback in feat_stats:
-        return feat_stats[fallback]
-    raise KeyError(
-        f"stats['{key}'] is missing stat '{name}'"
-        + (f" and its fallback '{fallback}'" if fallback else "")
-        + f". Available stats: {list(feat_stats)}."
-    )
+    hint = ""
+    if name in ("q01", "q99"):
+        hint = (
+            " QUANTILE normalization requires quantile stats; recompute this dataset's stats "
+            "(or switch its normalization_mapping to MIN_MAX / MEAN_STD)."
+        )
+    raise KeyError(f"stats['{key}'] is missing stat '{name}'. Available stats: {list(feat_stats)}.{hint}")
 
 
 def _stat_to_float32_tensor(value: np.ndarray | Tensor) -> Tensor:
@@ -324,35 +324,18 @@ def create_stats_buffers(
                 tensor = torch.full(stacked_shape, torch.inf, dtype=torch.float32)
             else:
                 rows = []
-                fallback_rows: list[int] = []
                 for i, ds_stats in enumerate(per_dataset_stats):
                     try:
                         value = resolve_stat_row(ds_stats, key, name)
                     except KeyError as e:
                         raise KeyError(f"per_dataset_stats[{i}]: {e.args[0]}") from None
-                    source = name
-                    if name not in ds_stats[key]:
-                        fallback_rows.append(i)
-                        source = _QUANTILE_FALLBACK[name]
                     row = _stat_to_float32_tensor(value)
                     if tuple(row.shape) != shape:
-                        via = "" if source == name else f" (resolved for '{name}' via fallback)"
                         raise ValueError(
-                            f"per_dataset_stats[{i}]['{key}']['{source}']{via} has shape "
+                            f"per_dataset_stats[{i}]['{key}']['{name}'] has shape "
                             f"{tuple(row.shape)}, expected {shape}."
                         )
                     rows.append(row)
-                if fallback_rows:
-                    logging.warning(
-                        "Feature '%s': %d/%d dataset rows have no '%s' quantile; fell back to "
-                        "'%s' for rows %s (those rows use plain min-max scaling).",
-                        key,
-                        len(fallback_rows),
-                        len(per_dataset_stats),
-                        name,
-                        _QUANTILE_FALLBACK[name],
-                        fallback_rows[:10],
-                    )
                 tensor = torch.stack(rows, dim=0)
             params[name] = nn.Parameter(tensor, requires_grad=False)
 
