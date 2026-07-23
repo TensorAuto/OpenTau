@@ -407,6 +407,7 @@ class Cosmos3Policy(PreTrainedPolicy):
 
         num_datasets = _num_datasets(per_dataset_stats, dataset_names, config)
         zero_range_center = config.zero_range_centers_on_zero()
+        eps = config.normalization_epsilon()
         self.normalize_inputs = Normalize(
             config.input_features,
             config.normalization_mapping,
@@ -414,6 +415,7 @@ class Cosmos3Policy(PreTrainedPolicy):
             dataset_names=dataset_names,
             num_datasets=num_datasets,
             zero_range_center=zero_range_center,
+            eps=eps,
         )
         self.normalize_targets = Normalize(
             config.output_features,
@@ -422,6 +424,7 @@ class Cosmos3Policy(PreTrainedPolicy):
             dataset_names=dataset_names,
             num_datasets=num_datasets,
             zero_range_center=zero_range_center,
+            eps=eps,
         )
         self.unnormalize_outputs = Unnormalize(
             config.output_features,
@@ -430,6 +433,7 @@ class Cosmos3Policy(PreTrainedPolicy):
             dataset_names=dataset_names,
             num_datasets=num_datasets,
             zero_range_center=zero_range_center,
+            eps=eps,
         )
 
         # The Qwen3-VL processor (tokenizer + image processor) builds the multimodal

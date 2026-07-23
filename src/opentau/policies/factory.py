@@ -23,6 +23,8 @@ logic for creating fresh policies or loading pretrained ones, as well as
 parsing features from datasets or environments to properly configure the policies.
 """
 
+import json
+import logging
 import warnings
 from typing import Optional
 
@@ -180,6 +182,57 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         raise ValueError(f"Policy type '{policy_type}' is not available.")
 
 
+def _load_norm_stats_override(path: str, num_heads: int) -> list[dict[str, dict[str, np.ndarray]]]:
+    """Load an openpi-style ``norm_stats.json`` and replicate it across every norm head.
+
+    Intended for teacher-faithful replay of an openpi checkpoint: it swaps the dataset-derived
+    stats for the teacher's, so the pretrained weights see the input distribution they were
+    trained on. It is a blunt instrument — every head gets the *same* stats, so per-dataset
+    normalization is lost — hence the warning.
+
+    Args:
+        path: Path to a JSON file shaped ``{"norm_stats": {"state": {...}, "actions": {...}}}``
+            with ``mean``/``std`` and optionally ``q01``/``q99`` per feature.
+        num_heads: Number of norm-head rows to fill.
+
+    Returns:
+        ``num_heads`` copies of the loaded stats, one per row.
+
+    Raises:
+        KeyError: If the file lacks the expected ``norm_stats.state`` / ``norm_stats.actions``
+            structure.
+    """
+    logging.warning(
+        "norm_stats_override_path=%s is set: the dataset-derived normalization stats are being "
+        "REPLACED by this file for all %d norm head(s), so every head shares one scale and any "
+        "per-dataset normalization is lost. This is intended for teacher-faithful replay of an "
+        "openpi checkpoint. Prefer converting and uploading a checkpoint with the correct stats "
+        "baked in, then loading that instead.",
+        path,
+        num_heads,
+    )
+    with open(path) as f:
+        raw = json.load(f)["norm_stats"]
+
+    def _feature(name: str) -> dict[str, np.ndarray]:
+        if name not in raw:
+            raise KeyError(
+                f"norm_stats_override_path={path!r} has no '{name}' entry under 'norm_stats' "
+                f"(found {sorted(raw)})."
+            )
+        entry = raw[name]
+        return {
+            stat: np.asarray(entry[stat], dtype=np.float32)
+            for stat in ("mean", "std", "min", "max", "q01", "q99")
+            if stat in entry
+        }
+
+    head = {"state": _feature("state"), "actions": _feature("actions")}
+    # One dict per row, each a fresh shallow copy so a later in-place edit of one row's stats
+    # cannot silently mutate every other row.
+    return [{k: dict(v) for k, v in head.items()} for _ in range(num_heads)]
+
+
 def make_policy(
     cfg: PreTrainedConfig,
     ds_meta: LeRobotDatasetMetadata | None = None,
@@ -286,6 +339,36 @@ def make_policy(
         else:
             per_norm_key_stats = list(stats)
             norm_keys = norm_keys or [f"external_{i}" for i in range(len(per_norm_key_stats))]
+
+    # Delta-action mixtures publish one post-index map; persist it so `sample_actions` can
+    # invert the transform and so a reloaded checkpoint keeps doing it. Only set when the
+    # mixture actually resolved one — never clobber a map already on the config (the
+    # checkpoint-load path has no `ds_meta`).
+    mixture_delta_map = getattr(ds_meta, "delta_action_state_map", None)
+    if mixture_delta_map:
+        if not hasattr(cfg, "delta_action_state_map"):
+            # The dataset-side delta transform is policy-agnostic (`make_dataset` applies it
+            # regardless of policy type), but only pi05 carries the config field and the
+            # `sample_actions` inverse that turns the emitted deltas back into absolute actions.
+            # Silently dropping the map here would train `cfg.type` on delta targets while its
+            # inference emits raw displacements read as absolute joints — exactly the bug this
+            # PR fixes for pi05. Fail loudly instead.
+            raise ValueError(
+                f"The dataset mixture uses delta joint actions (post-index map "
+                f"{dict(mixture_delta_map)}), but policy type '{getattr(cfg, 'type', '?')}' has "
+                "no `delta_action_state_map` field and no inference-time inverse, so a policy "
+                "trained on it would emit deltas that are read as absolute actions. Delta joint "
+                "actions are currently supported only by pi05. Use policy.type=pi05, or remove "
+                "`use_delta_joint_actions` from the mixture."
+            )
+        cfg.delta_action_state_map = dict(mixture_delta_map)
+
+    override_path = getattr(cfg, "norm_stats_override_path", None)
+    if override_path:
+        per_norm_key_stats = _load_norm_stats_override(
+            override_path, num_heads=len(norm_keys) if norm_keys else 1
+        )
+        norm_keys = norm_keys or [f"override_{i}" for i in range(len(per_norm_key_stats))]
 
     if per_norm_key_stats is not None:
         # The Normalize / Unnormalize kwargs are named `per_dataset_stats` /

@@ -40,7 +40,7 @@ from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import NormalizationMode
 from opentau.policies.flash_attn_cuda import make_att_block_ids
 from opentau.policies.layers import PerGroupLinear
-from opentau.policies.normalize import EPS, Normalize, Unnormalize, _materialize
+from opentau.policies.normalize import Normalize, Unnormalize, _materialize
 from opentau.policies.normalize import resolve_num_datasets as _num_datasets
 from opentau.policies.outlier_utils import detect_state_action_outliers
 from opentau.policies.pi05.paligemma_with_expert import (
@@ -367,6 +367,7 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         self.config = config
         num_datasets = _num_datasets(per_dataset_stats, dataset_names, config)
         zero_range_center = config.zero_range_centers_on_zero()
+        eps = config.normalization_epsilon()
         self.normalize_inputs = Normalize(
             config.input_features,
             config.normalization_mapping,
@@ -374,6 +375,7 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
             dataset_names=dataset_names,
             num_datasets=num_datasets,
             zero_range_center=zero_range_center,
+            eps=eps,
         )
         self.normalize_targets = Normalize(
             config.output_features,
@@ -382,6 +384,7 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
             dataset_names=dataset_names,
             num_datasets=num_datasets,
             zero_range_center=zero_range_center,
+            eps=eps,
         )
         self.normalize_discrete_actions = Normalize(
             config.output_features,
@@ -390,6 +393,7 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
             dataset_names=dataset_names,
             num_datasets=num_datasets,
             zero_range_center=zero_range_center,
+            eps=eps,
         )
         self.unnormalize_outputs = Unnormalize(
             config.output_features,
@@ -398,6 +402,7 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
             dataset_names=dataset_names,
             num_datasets=num_datasets,
             zero_range_center=zero_range_center,
+            eps=eps,
         )
 
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
@@ -1248,8 +1253,13 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         min_ = _materialize(buffer["min"]).index_select(0, dataset_index).unsqueeze(1).to(device=device)
         max_ = _materialize(buffer["max"]).index_select(0, dataset_index).unsqueeze(1).to(device=device)
         raw_range = max_ - min_
-        denom = torch.where(raw_range.abs() < EPS, torch.ones_like(raw_range), raw_range)
-        recovered = (normalized + 1) / 2 * (denom + EPS) + min_
+        # Use the epsilon of the module we invert, not the module-level default: it is
+        # config_version-gated (1e-8 for a legacy checkpoint, 1e-6 at v1), so reading module `EPS`
+        # here would break the round-trip on a v0 checkpoint. Mirrors the `zero_range_center` read
+        # below — both track the convention of the paired `normalize_discrete_actions`.
+        eps = self.normalize_discrete_actions.eps
+        denom = torch.where(raw_range.abs() < eps, torch.ones_like(raw_range), raw_range)
+        recovered = (normalized + 1) / 2 * (denom + eps) + min_
         # Mirror Unnormalize's zero_range_center inverse: subtract the numerator
         # offset that the paired normalize_discrete_actions added (float-exact
         # no-op on healthy dims). Gated on that module's flag so this inline path

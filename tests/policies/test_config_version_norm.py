@@ -31,7 +31,13 @@ import torch
 from opentau.configs.policies import CURRENT_CONFIG_VERSION, PreTrainedConfig
 from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from opentau.policies.factory import make_policy_config
-from opentau.policies.normalize import ACTION_NORM_META_FILE, Normalize, Unnormalize
+from opentau.policies.normalize import (
+    ACTION_NORM_META_FILE,
+    LEGACY_EPS,
+    OPENPI_EPS,
+    Normalize,
+    Unnormalize,
+)
 from opentau.policies.pretrained import (
     PreTrainedPolicy,
     _extract_config_version,
@@ -69,6 +75,20 @@ def test_config_version_method_contract(config_version, expected_center, expecte
     cfg.config_version = config_version
     assert cfg.zero_range_centers_on_zero() is expected_center
     assert cfg.resolved_config_version() == expected_resolved
+
+
+@pytest.mark.parametrize(
+    "config_version, expected_eps",
+    [(None, OPENPI_EPS), (0, LEGACY_EPS), (1, OPENPI_EPS), (2, OPENPI_EPS)],
+)
+def test_normalization_epsilon_is_version_gated(config_version, expected_eps):
+    """The epsilon is bundled with zero-range-centering into the v1 openpi-parity behavior:
+    legacy (v0) keeps 1e-8, v1+ uses openpi's 1e-6, and an unresolved config runs current."""
+    cfg = make_policy_config("pi0")
+    cfg.config_version = config_version
+    assert cfg.normalization_epsilon() == expected_eps
+    # Epsilon and zero-range-centering flip together — both or nothing.
+    assert (cfg.normalization_epsilon() == OPENPI_EPS) == cfg.zero_range_centers_on_zero()
 
 
 def test_config_version_defaults_to_none_on_fresh_config():

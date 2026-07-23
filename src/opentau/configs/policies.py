@@ -87,9 +87,13 @@ draccus.decode.register(_HFPretrainedConfig, _decode_hf_pretrained_config, inclu
 # alters what the model sees/produces and must be gated so old checkpoints keep
 # their trained behavior. History lives in CHANGELOG.md.
 #   0  legacy: MIN_MAX/QUANTILE map a zero-range band (zero-padded tail dim, or a
-#      genuinely-constant real dim) to -1.0.
-#   1  a zero-range band maps to 0.0 (openpi's pad-after-normalize output), via
-#      `Normalize(zero_range_center=True)`. See `zero_range_centers_on_zero`.
+#      genuinely-constant real dim) to -1.0, and the normalization epsilon is 1e-8.
+#   1  openpi-faithful normalization: a zero-range band maps to 0.0 (openpi's
+#      pad-after-normalize output, via `Normalize(zero_range_center=True)`), AND
+#      the normalization epsilon is openpi's 1e-6 (`Normalize(eps=...)`). These
+#      two openpi-parity changes are bundled into one version — no checkpoint has
+#      been saved at v1 yet, so they are all-or-nothing rather than split across
+#      versions. See `zero_range_centers_on_zero` / `normalization_epsilon`.
 # A config that predates the field (`config_version is None`) is resolved to
 # CURRENT for a fresh run and to 0 (legacy) when loading pre-fix weights — see
 # `PreTrainedPolicy.from_pretrained`.
@@ -446,6 +450,17 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         ``Unnormalize`` this policy builds via the ``zero_range_center`` kwarg.
         """
         return self.resolved_config_version() >= 1
+
+    def normalization_epsilon(self) -> float:
+        """The epsilon ``Normalize``/``Unnormalize`` add to every denominator (and use as the
+        zero-range/zero-variance snap threshold): openpi's ``1e-6`` at config_version >= 1, the
+        legacy ``1e-8`` at config_version 0. Bundled with ``zero_range_centers_on_zero`` into the
+        v1 openpi-parity behavior. Threaded into every ``Normalize`` / ``Unnormalize`` this
+        policy builds via the ``eps`` kwarg.
+        """
+        from opentau.policies.normalize import LEGACY_EPS, OPENPI_EPS
+
+        return OPENPI_EPS if self.resolved_config_version() >= 1 else LEGACY_EPS
 
     @property
     def type(self) -> str:

@@ -35,6 +35,7 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import NormalizationMode
+from opentau.datasets.action_indexing import add_chunk_start_state, subtract_chunk_start_state
 from opentau.datasets.grounding.tokenizer_utils import ensure_loc_tokens
 from opentau.policies.normalize import Normalize, Unnormalize
 from opentau.policies.normalize import resolve_num_datasets as _num_datasets
@@ -266,6 +267,7 @@ class PI05Policy(PreTrainedPolicy):
         self.config = config
         num_datasets = _num_datasets(per_dataset_stats, dataset_names, config)
         zero_range_center = config.zero_range_centers_on_zero()
+        eps = config.normalization_epsilon()
         self.normalize_inputs = Normalize(
             config.input_features,
             config.normalization_mapping,
@@ -273,6 +275,7 @@ class PI05Policy(PreTrainedPolicy):
             dataset_names=dataset_names,
             num_datasets=num_datasets,
             zero_range_center=zero_range_center,
+            eps=eps,
         )
         self.normalize_targets = Normalize(
             config.output_features,
@@ -281,6 +284,7 @@ class PI05Policy(PreTrainedPolicy):
             dataset_names=dataset_names,
             num_datasets=num_datasets,
             zero_range_center=zero_range_center,
+            eps=eps,
         )
         self.normalize_discrete_actions = Normalize(
             config.output_features,
@@ -289,6 +293,7 @@ class PI05Policy(PreTrainedPolicy):
             dataset_names=dataset_names,
             num_datasets=num_datasets,
             zero_range_center=zero_range_center,
+            eps=eps,
         )
         self.unnormalize_outputs = Unnormalize(
             config.output_features,
@@ -297,6 +302,7 @@ class PI05Policy(PreTrainedPolicy):
             dataset_names=dataset_names,
             num_datasets=num_datasets,
             zero_range_center=zero_range_center,
+            eps=eps,
         )
 
         # The same PaliGemma tokenizer instance is shared with the inner
@@ -653,6 +659,10 @@ class PI05Policy(PreTrainedPolicy):
             )
 
         dataset_index = self._resolve_dataset_index(batch)
+        # Capture the RAW state before normalization. The delta transform is defined in raw
+        # units (openpi runs `DeltaActions` ahead of `Normalize`), so both the `action_prefix`
+        # conversion and the inverse at the end of this method need un-normalized values.
+        raw_state = self._raw_state_for_delta(batch)
         batch = self.normalize_inputs(batch, dataset_index)
 
         images, img_masks = self.prepare_images(batch)
@@ -668,6 +678,14 @@ class PI05Policy(PreTrainedPolicy):
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             action_prefix = torch.zeros(actions_shape, dtype=lang_tokens.dtype, device=lang_tokens.device)
         else:
+            # The prefix comes off `_action_queue`, which holds ABSOLUTE actions (this method
+            # returns absolute ones), so it must be converted back into the delta space the
+            # model was trained in before being normalized against the delta stats. Skipping
+            # this silently corrupts every queue replenish after the first chunk.
+            if raw_state is not None:
+                action_prefix = subtract_chunk_start_state(
+                    action_prefix, raw_state, self.config.delta_action_state_map
+                )
             # normalize action_prefix and pad chunk dimension to config.chunk_size
             action_prefix = self.normalize_targets({"actions": action_prefix}, dataset_index)["actions"]
             action_prefix = F.pad(  # noop if chunk_size is already the same as action_prefix.shape[1]
@@ -694,7 +712,42 @@ class PI05Policy(PreTrainedPolicy):
 
         actions = self.unnormalize_outputs({"actions": actions}, dataset_index)["actions"]
 
+        if raw_state is not None:
+            # openpi pairs `DeltaActions` on the input side with `AbsoluteActions` on the output
+            # side. Without this half the policy returns displacements that the consumer reads
+            # as absolute joint targets — a failure that looks like a badly-trained policy
+            # rather than a missing transform.
+            actions = add_chunk_start_state(actions, raw_state, self.config.delta_action_state_map)
+
         return actions
+
+    def _raw_state_for_delta(self, batch: dict[str, Tensor]) -> Tensor | None:
+        """Return the un-normalized state needed to invert the delta transform, or ``None``.
+
+        ``None`` means this policy trains on absolute actions and no inverse is required.
+
+        Args:
+            batch: The inference batch, before ``normalize_inputs`` has run.
+
+        Returns:
+            A detached copy of the raw ``state`` tensor, or ``None``.
+
+        Raises:
+            KeyError: If a delta map is configured but the batch carries no ``state``. The
+                inverse is impossible without it, and silently returning deltas would emit
+                actions in the wrong space rather than failing.
+        """
+        delta_map = getattr(self.config, "delta_action_state_map", None)
+        if not delta_map:
+            return None
+        if "state" not in batch:
+            raise KeyError(
+                "delta_action_state_map is configured, so sample_actions must add the "
+                "conditioning state back onto its output, but the batch has no 'state' key "
+                f"(got {sorted(batch)}). Without it the returned actions would be "
+                "displacements masquerading as absolute targets."
+            )
+        return batch["state"].detach().clone()
 
     def forward(
         self,

@@ -26,15 +26,28 @@ respect by substituting each dataset's native fps (same convention as
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from opentau.configs.default import DatasetConfig
 from opentau.scripts.fit_fast_tokenizer import (
     _normalize_chunks,
     _normalize_chunks_per_head,
+    _normalize_eps_for,
     _pool_per_head_stats,
     _sample_chunks_for_dataset_manual,
 )
 from tests.fixtures.constants import DEFAULT_FPS, DUMMY_REPO_ID
+
+
+@pytest.mark.parametrize("config_version, expected", [(0, 1e-8), (1, 1e-6), (2, 1e-6)])
+def test_normalize_eps_for_is_version_gated(config_version, expected):
+    """The tokenizer must fit its BPE corpus with the same epsilon the runtime policy uses:
+    legacy 1e-8 at config_version 0, openpi's 1e-6 at v1+ (matching `normalization_epsilon()`).
+    """
+    from opentau.policies.normalize import LEGACY_EPS, OPENPI_EPS
+
+    assert _normalize_eps_for(config_version) == expected
+    assert {_normalize_eps_for(0), _normalize_eps_for(1)} == {LEGACY_EPS, OPENPI_EPS}
 
 
 class TestSampleChunksManualActionFreq:
@@ -240,10 +253,12 @@ class TestNormalizeChunksPerHead:
 
         out = _normalize_chunks_per_head(stacked, per_dataset_chunks, per_ds_min, per_ds_max)
 
-        # First two rows -> all +1 (ds 0 at its raw_max)
-        np.testing.assert_allclose(out[0:2], 1.0, atol=1e-7)
-        # Third row -> all -1 (ds 2 at its raw_min)
-        np.testing.assert_allclose(out[2], -1.0, atol=1e-7)
+        # First two rows -> all +1 (ds 0 at its raw_max); third row -> all -1 (ds 2 at raw_min).
+        # atol=1e-5 (not 1e-7): the default epsilon is now openpi's 1e-6, so a raw extreme maps to
+        # +/-0.999999, not +/-1 to 1e-7. (`_normalize_chunks_per_head` defaults eps to the current
+        # openpi value; a legacy fit passes LEGACY_EPS explicitly.)
+        np.testing.assert_allclose(out[0:2], 1.0, atol=1e-5)
+        np.testing.assert_allclose(out[2], -1.0, atol=1e-5)
 
     def test_matches_global_when_all_datasets_share_one_head(self):
         """Per-head normalization with one shared (rt, cm) === global."""
@@ -368,14 +383,16 @@ class TestNormalizeEquivalenceVsProduction:
         batch = {"action": torch.from_numpy(stacked.reshape(n * t, d))}
         out_prod = normalize(batch, dataset_index)["action"].numpy().reshape(n, t, d)
 
-        # Both paths apply `(x - min) / (max - min + EPS) * 2 - 1` with EPS=1e-8.
-        # Production runs the whole expression in float32; the manual path
-        # computes in float64 then casts to float32 at the end, so low-bit
-        # rounding differs by ~1 ULP (1.19e-7) on a few entries. The DCT scale
-        # the BPE codec sees is O(1) so this is well below the threshold that
-        # would change the BPE token-id sequence. Padded slots become -1 in
-        # both (zero data, zero stats, +EPS divisor -> -1).
-        np.testing.assert_allclose(out_manual, out_prod, rtol=0, atol=2e-7)
+        # Both paths apply `(x - min) / (max - min + EPS) * 2 - 1` with EPS=1e-6
+        # (matching openpi's normalization epsilon). Production runs the whole
+        # expression in float32; the manual path computes in float64 then casts
+        # to float32 at the end, so the two differ by a few ULP where the larger
+        # EPS interacts with the float32 rounding — ~5e-7 on a handful of
+        # entries. The DCT scale the BPE codec sees is O(1) so this is well
+        # below the threshold that would change the BPE token-id sequence.
+        # Padded slots become -1 in both (zero data, zero stats, snapped
+        # divisor -> -1).
+        np.testing.assert_allclose(out_manual, out_prod, rtol=0, atol=2e-6)
         # Sanity: the padded suffix actually is -1 in both outputs.
         np.testing.assert_allclose(out_manual[0:3, :, 2:4], -1.0, atol=1e-7)
         np.testing.assert_allclose(out_manual[3:7, :, 3:4], -1.0, atol=1e-7)

@@ -10,14 +10,16 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-### Changed — normalization of zero-range (padded / constant) dims — **breaking, gated**
+### Changed — openpi-faithful normalization (zero-range dims + epsilon) — **breaking, gated**
 
-`config_version` **0 → 1.**
+`config_version` **0 → 1.** Two openpi-parity normalization changes are bundled
+into this one version (no checkpoint has been saved at `config_version` 1 yet, so
+they are all-or-nothing rather than split across versions).
 
-Under MIN_MAX and QUANTILE normalization, a zero-range band (`max == min`: a
-zero-padded action/state tail dim, or a genuinely-constant real dim) now maps to
-**`0.0`** instead of the legacy **`-1.0`**. This matches the output of the
-reference implementation
+**(1) Zero-range dims map to `0.0`.** Under MIN_MAX and QUANTILE normalization, a
+zero-range band (`max == min`: a zero-padded action/state tail dim, or a
+genuinely-constant real dim) now maps to **`0.0`** instead of the legacy
+**`-1.0`**. This matches the output of the reference implementation
 [openpi](https://github.com/Physical-Intelligence/openpi), which normalizes only
 the real dims (its `Normalize` slices `stats.q01[..., : x.shape[-1]]`) and
 zero-pads *after* normalization — so its padded columns are a `0.0` pad constant.
@@ -26,6 +28,15 @@ OpenTau keeps padding in the dataset and reproduces that output arithmetically: 
 healthy dims and cancels the `* 2 - 1` re-centering exactly where the zero-range
 guard fires. Healthy dims are bit-identical to before; `Unnormalize` round-trips
 exactly; MEAN_STD is unchanged (it already emitted `0.0` on a zero-std dim).
+
+**(2) Normalization epsilon is openpi's `1e-6`.** The epsilon added to every
+normalization denominator (and used as the zero-range / zero-variance snap
+threshold) changes from `1e-8` to openpi's `1e-6`
+(`openpi.transforms.Normalize`). At `config_version` 1 a policy trained here and
+one trained in openpi agree to well under float32 resolution on the same inputs.
+Threaded per-policy via `config.normalization_epsilon()` → `Normalize(eps=...)`,
+gated exactly like (1): legacy checkpoints (`config_version` 0) keep `1e-8`, so
+their weights normalize as trained.
 
 Where OpenTau still, deliberately, differs from openpi: on a genuinely-constant
 *real* dim whose value deviates from the constant, openpi divides by `~1e-6` and

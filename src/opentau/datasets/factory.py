@@ -62,6 +62,7 @@ Example:
 
 import copy
 import logging
+from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
@@ -75,7 +76,12 @@ import opentau.datasets.vqa.vsr  # noqa: F401
 from opentau import available_vqa_datasets
 from opentau.configs.default import DatasetConfig
 from opentau.configs.train import TrainPipelineConfig
+from opentau.datasets.action_indexing import resolve_delta_map
 from opentau.datasets.dataset_mixture import WeightedDatasetMixture
+from opentau.datasets.delta_action_stats import (
+    delta_stats_cache_key,
+    load_or_compute_delta_action_stats,
+)
 from opentau.datasets.lerobot_dataset import (
     BaseDataset,
     LeRobotDataset,
@@ -92,6 +98,125 @@ IMAGENET_STATS = {
     "mean": [[[0.485]], [[0.456]], [[0.406]]],  # (c,1,1)
     "std": [[[0.229]], [[0.224]], [[0.225]]],  # (c,1,1)
 }
+
+
+def _apply_column_index_and_delta_config(
+    dataset: BaseDataset, dataset_cfg: DatasetConfig, train_cfg: TrainPipelineConfig
+) -> None:
+    """Copy the per-dataset column-index / delta-action settings onto ``dataset``.
+
+    Translates ``DatasetConfig.delta_action_state_map`` from **parquet** index space into the
+    **post-index** space the dataset's emitted vectors use, so ``_apply_column_index_and_delta``
+    can address the reindexed columns directly. See
+    :mod:`opentau.datasets.action_indexing` for the two spaces.
+
+    Args:
+        dataset: The freshly-constructed dataset to configure.
+        dataset_cfg: Its per-dataset config entry.
+        train_cfg: Pipeline config, forwarded to the delta-stats computation.
+    """
+    if (
+        dataset_cfg.state_index is None
+        and dataset_cfg.action_index is None
+        and not dataset_cfg.use_delta_joint_actions
+    ):
+        return
+    dataset.state_index = dataset_cfg.state_index
+    dataset.action_index = dataset_cfg.action_index
+    if not dataset_cfg.use_delta_joint_actions:
+        return
+
+    # Width of the emitted action vector: the index length when subsetting, else the dataset's
+    # own raw action dim. Only used to warn about kept-but-unmapped dims.
+    action_dim = len(dataset_cfg.action_index) if dataset_cfg.action_index is not None else None
+    if action_dim is None:
+        feature = getattr(dataset, "meta", None)
+        shapes = getattr(feature, "features", None) or {}
+        name_map = dataset._get_name_map(strict=False)
+        raw_key = name_map.get("actions", "action")
+        raw_shape = (shapes.get(raw_key) or {}).get("shape")
+        if raw_shape:
+            action_dim = int(raw_shape[-1])
+
+    dataset.delta_action_state_map = resolve_delta_map(
+        dataset_cfg.delta_action_state_map,
+        dataset_cfg.action_index,
+        dataset_cfg.state_index,
+        who=str(dataset_cfg.repo_id),
+        action_dim=action_dim,
+    )
+    logging.info(
+        "%s: delta joint actions ON. parquet map %s -> post-index map %s (state_index=%s, action_index=%s).",
+        dataset_cfg.repo_id,
+        dataset_cfg.delta_action_state_map,
+        dataset.delta_action_state_map,
+        dataset_cfg.state_index,
+        dataset_cfg.action_index,
+    )
+    dataset.delta_action_stats = _compute_or_load_delta_stats(dataset, dataset_cfg, train_cfg)
+
+
+def _compute_or_load_delta_stats(
+    dataset: BaseDataset, dataset_cfg: DatasetConfig, train_cfg: TrainPipelineConfig
+) -> dict[str, dict[str, np.ndarray]]:
+    """Get this dataset's delta-action stats, from cache or by computing them.
+
+    The dataset's ``meta/stats.json`` describes *absolute*, per-frame actions, so once the delta
+    transform is on those numbers no longer describe the training targets and must be replaced.
+    See :mod:`opentau.datasets.delta_action_stats`.
+
+    Args:
+        dataset: The configured dataset (already carrying its resolved delta map).
+        dataset_cfg: Its config entry.
+        train_cfg: Pipeline config, read for ``num_workers``.
+
+    Returns:
+        ``{"actions": {...}, "state": {...}}`` in post-index space.
+    """
+    meta = dataset.meta
+    episodes = list(dataset.episodes) if dataset.episodes is not None else list(meta.episodes)
+    # One task per distinct data file: v3.0 consolidates many episodes into one parquet, so
+    # mapping episode -> path without dedup would re-read (and double-count) the same file.
+    parquet_paths = list(dict.fromkeys(str(meta.root / meta.get_data_file_path(ep)) for ep in episodes))
+
+    # The action horizon in frame-index space. `delta_timestamps_params[0]` holds the *mean*
+    # offsets; `get_delta_indices_soft` adds N(0, std) jitter per sample, so with a non-zero std
+    # these stats describe the mean horizon rather than any single draw — an approximation
+    # documented on the module.
+    dt_mean = dataset.delta_timestamps_params[0]
+    chunk_offsets = np.asarray(dt_mean["actions"], dtype=np.float64) * dataset.fps
+
+    name_map = dataset._get_name_map()
+    cache_key = delta_stats_cache_key(
+        state_index=dataset_cfg.state_index,
+        action_index=dataset_cfg.action_index,
+        delta_map=dataset.delta_action_state_map,
+        chunk_offsets=chunk_offsets,
+        vector_resample_strategy=dataset.vector_resample_strategy,
+        episodes=episodes,
+        excluded_episodes=dataset_cfg.excluded_episodes,
+        fps=dataset.fps,
+        revision=dataset_cfg.revision,
+    )
+    # Only the main process computes, so sizing the pool from the full `num_workers` neither
+    # oversubscribes the node nor leaves it idle.
+    max_workers = max(1, int(getattr(train_cfg, "num_workers", 1) or 1))
+    return load_or_compute_delta_action_stats(
+        root=Path(meta.root),
+        cache_key=cache_key,
+        compute_kwargs={
+            "parquet_paths": parquet_paths,
+            "state_col": name_map["state"],
+            "action_col": name_map["actions"],
+            "state_index": dataset_cfg.state_index,
+            "action_index": dataset_cfg.action_index,
+            "delta_map": dataset.delta_action_state_map,
+            "chunk_offsets": chunk_offsets,
+            "strategy": dataset.vector_resample_strategy,
+            "episodes": set(episodes),
+            "max_workers": max_workers,
+        },
+    )
 
 
 def _apply_metadata_overrides(dataset: BaseDataset, dataset_cfg: DatasetConfig) -> None:
@@ -288,6 +413,7 @@ def make_dataset(
     else:
         raise ValueError("Exactly one of `cfg.vqa` and `cfg.repo_id` should be provided.")
 
+    _apply_column_index_and_delta_config(dataset, cfg, train_cfg)
     _apply_metadata_overrides(dataset, cfg)
 
     # TODO vqa datasets implement stats in original feature names, but camera_keys are standardized names

@@ -31,7 +31,21 @@ from torch import Tensor, nn
 
 from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
 
-EPS = 1e-8  # Small epsilon value for numerical stability in normalization
+# Normalization epsilon, config_version-gated so existing checkpoints keep the value their
+# weights were trained under (see `PreTrainedConfig.normalization_epsilon`):
+#   * OPENPI_EPS (1e-6) — matches openpi's `openpi.transforms.Normalize`, used at
+#     config_version >= 1. A policy trained here and one trained in openpi then agree to well
+#     under float32 resolution on the same inputs.
+#   * LEGACY_EPS (1e-8) — the pre-openpi-parity value, used at config_version 0 so a legacy
+#     checkpoint normalizes exactly as its weights were trained.
+# The epsilon is added to every denominator AND used as the zero-range / zero-variance snap
+# threshold, so both move together with the version. `Normalize`/`Unnormalize` take it as the
+# `eps` kwarg (threaded from `config.normalization_epsilon()`); the module-level `EPS` is the
+# default for direct constructions that don't specify one (tests, tooling) and equals the
+# current openpi value.
+OPENPI_EPS = 1e-6
+LEGACY_EPS = 1e-8
+EPS = OPENPI_EPS  # Default epsilon for direct constructions that don't thread a version-gated one
 
 # Sidecar file a fitted FAST action tokenizer carries to record the zero-range
 # normalization convention its BPE corpus was built under (written by
@@ -43,7 +57,7 @@ ACTION_NORM_META_FILE = "opentau_action_norm.json"
 
 # A genuinely-zero std (|std| < EPS) marks a constant/padding feature dim. The guard in
 # ``Normalize`` / ``Unnormalize`` snaps such a std (or a zero MIN_MAX range) to 1 so a value
-# that *deviates* from that "constant" can't divide by ~EPS and blow up to ~1e8 (the
+# that *deviates* from that "constant" can't divide by ~EPS and blow up to ~1e6 (the
 # "Outlier normalized state" failure). When the dim is truly constant and its stats are
 # right, every value equals the mean, the deviation is 0, and the snap is a no-op.
 #
@@ -214,38 +228,34 @@ def stat_names_for_mode(norm_mode: NormalizationMode) -> tuple[str, ...]:
     raise ValueError(norm_mode)
 
 
-# QUANTILE tolerates datasets whose stats predate quantile support (e.g. LeRobot
-# v3.0 repos converted from v2.1, whose stats.json has only min/max/mean/std):
-# the missing quantile falls back to the same-side extreme, degrading that
-# dataset's row to plain min-max scaling.
-_QUANTILE_FALLBACK = {"q01": "min", "q99": "max"}
-
-
 def resolve_stat_row(
     ds_stats: dict[str, dict[str, Tensor | np.ndarray]], key: str, name: str
 ) -> Tensor | np.ndarray:
     """Fetch stat ``name`` for feature ``key`` from one dataset's stats.
 
-    Applies the QUANTILE fallback (``q01``→``min``, ``q99``→``max``) when the
-    quantile is absent, so converted-from-v2.1 datasets remain usable.
+    A missing stat is an error. QUANTILE deliberately does **not** fall back to
+    ``min``/``max``: openpi's quantile path has no such fallback, and silently
+    degrading one dataset's row to min-max scaling puts that row on a different
+    scale from its peers — exactly the class of bug QUANTILE exists to avoid.
+    Datasets whose ``stats.json`` predates quantile support (LeRobot v3.0 repos
+    converted from v2.1) must have their stats recomputed, or be loaded through
+    the delta-action stats pass, which computes quantiles for every dim.
 
     Raises:
-        KeyError: If the feature is missing, or the stat is missing and has no
-            fallback (or its fallback is also missing).
+        KeyError: If the feature is missing, or the stat is missing.
     """
     if key not in ds_stats:
         raise KeyError(f"stats are missing feature '{key}'. Available keys: {list(ds_stats)}.")
     feat_stats = ds_stats[key]
     if name in feat_stats:
         return feat_stats[name]
-    fallback = _QUANTILE_FALLBACK.get(name)
-    if fallback is not None and fallback in feat_stats:
-        return feat_stats[fallback]
-    raise KeyError(
-        f"stats['{key}'] is missing stat '{name}'"
-        + (f" and its fallback '{fallback}'" if fallback else "")
-        + f". Available stats: {list(feat_stats)}."
-    )
+    hint = ""
+    if name in ("q01", "q99"):
+        hint = (
+            " QUANTILE normalization requires quantile stats; recompute this dataset's stats "
+            "(or switch its normalization_mapping to MIN_MAX / MEAN_STD)."
+        )
+    raise KeyError(f"stats['{key}'] is missing stat '{name}'. Available stats: {list(feat_stats)}.{hint}")
 
 
 def _stat_to_float32_tensor(value: np.ndarray | Tensor) -> Tensor:
@@ -332,35 +342,18 @@ def create_stats_buffers(
                 tensor = torch.full(stacked_shape, torch.inf, dtype=torch.float32)
             else:
                 rows = []
-                fallback_rows: list[int] = []
                 for i, ds_stats in enumerate(per_dataset_stats):
                     try:
                         value = resolve_stat_row(ds_stats, key, name)
                     except KeyError as e:
                         raise KeyError(f"per_dataset_stats[{i}]: {e.args[0]}") from None
-                    source = name
-                    if name not in ds_stats[key]:
-                        fallback_rows.append(i)
-                        source = _QUANTILE_FALLBACK[name]
                     row = _stat_to_float32_tensor(value)
                     if tuple(row.shape) != shape:
-                        via = "" if source == name else f" (resolved for '{name}' via fallback)"
                         raise ValueError(
-                            f"per_dataset_stats[{i}]['{key}']['{source}']{via} has shape "
+                            f"per_dataset_stats[{i}]['{key}']['{name}'] has shape "
                             f"{tuple(row.shape)}, expected {shape}."
                         )
                     rows.append(row)
-                if fallback_rows:
-                    logging.warning(
-                        "Feature '%s': %d/%d dataset rows have no '%s' quantile; fell back to "
-                        "'%s' for rows %s (those rows use plain min-max scaling).",
-                        key,
-                        len(fallback_rows),
-                        len(per_dataset_stats),
-                        name,
-                        _QUANTILE_FALLBACK[name],
-                        fallback_rows[:10],
-                    )
                 tensor = torch.stack(rows, dim=0)
             params[name] = nn.Parameter(tensor, requires_grad=False)
 
@@ -417,6 +410,7 @@ class Normalize(nn.Module):
         dataset_names: list[str] | None = None,
         num_datasets: int | None = None,
         zero_range_center: bool = False,
+        eps: float = EPS,
     ):
         """Initializes the Normalize module.
 
@@ -444,11 +438,17 @@ class Normalize(nn.Module):
                 pre-existing behavior (and every test that builds ``Normalize``
                 directly) is unchanged. No effect on MEAN_STD, which already
                 emits ``0.0`` on a zero-std dim (it has no ``-1`` re-centering).
+            eps: Denominator / zero-range-snap epsilon. ``OPENPI_EPS`` (1e-6,
+                ``config_version`` >= 1, the module default) or ``LEGACY_EPS``
+                (1e-8, ``config_version`` 0). Resolved per-policy from
+                ``config.normalization_epsilon()`` and threaded in alongside
+                ``zero_range_center`` — the two form the v1 openpi-parity bundle.
         """
         super().__init__()
         self.features = features
         self.norm_map = norm_map
         self.zero_range_center = zero_range_center
+        self.eps = eps
         self.dataset_names = list(dataset_names) if dataset_names is not None else None
         if (
             per_dataset_stats is not None
@@ -488,13 +488,13 @@ class Normalize(nn.Module):
                 continue
             if norm_mode is NormalizationMode.MEAN_STD:
                 std = _materialize(buffer["std"])
-                if bool((torch.isfinite(std) & (std.abs() < EPS)).any()):
+                if bool((torch.isfinite(std) & (std.abs() < self.eps)).any()):
                     active = True
                     break
             elif norm_mode in (NormalizationMode.MIN_MAX, NormalizationMode.QUANTILE):
                 lo_name, hi_name = stat_names_for_mode(norm_mode)
                 rng = _materialize(buffer[hi_name]) - _materialize(buffer[lo_name])
-                if bool((torch.isfinite(rng) & (rng.abs() < EPS)).any()):
+                if bool((torch.isfinite(rng) & (rng.abs() < self.eps)).any()):
                     active = True
                     break
         self._snap_active = active
@@ -535,10 +535,10 @@ class Normalize(nn.Module):
                 assert not torch.isinf(std).any(), _no_stats_error_str("std")
                 # Snap a genuinely-zero std (constant/padding dim) to 1 so a deviating value
                 # can't become (x - mean)/EPS ~ 1e8. std >= EPS dims stay bit-identical.
-                std_is_zero = std.abs() < EPS
+                std_is_zero = std.abs() < self.eps
                 std = torch.where(std_is_zero, torch.ones_like(std), std)
                 deviation = batch_val - mean
-                batch[key] = deviation / (std + EPS)
+                batch[key] = deviation / (std + self.eps)
                 # Loud warning (deduped per (feature,dim), re-fired on a larger deviation), but
                 # only when the snap actually changed the output (a real deviation from a
                 # "constant" dim). The _SNAP_WARN_TOL>0 / compile / ONNX checks short-circuit before
@@ -559,7 +559,7 @@ class Normalize(nn.Module):
                 assert not torch.isinf(max_).any(), _no_stats_error_str(hi_name)
                 # Snap a zero range (max == min: constant dim) to 1 — same blow-up class.
                 raw_range = max_ - min_
-                denom_is_zero = raw_range.abs() < EPS
+                denom_is_zero = raw_range.abs() < self.eps
                 denom = torch.where(denom_is_zero, torch.ones_like(raw_range), raw_range)
                 deviation = batch_val - min_
                 # zero_range_center (config_version >= 1): on a zero-range band, add
@@ -575,7 +575,7 @@ class Normalize(nn.Module):
                 shifted = deviation
                 if self.zero_range_center:
                     shifted = deviation + 0.5 * (denom - raw_range)
-                batch[key] = shifted / (denom + EPS)
+                batch[key] = shifted / (denom + self.eps)
                 # normalize to [-1, 1]
                 batch[key] = batch[key] * 2 - 1
                 if (
@@ -600,16 +600,18 @@ class Unnormalize(nn.Module):
         dataset_names: list[str] | None = None,
         num_datasets: int | None = None,
         zero_range_center: bool = False,
+        eps: float = EPS,
     ):
         """See :class:`Normalize.__init__` for argument semantics.
 
-        ``zero_range_center`` must match the ``Normalize`` it inverts so
+        ``zero_range_center`` and ``eps`` must match the ``Normalize`` this inverts so
         ``Unnormalize(Normalize(x))`` round-trips exactly on a zero-range dim.
         """
         super().__init__()
         self.features = features
         self.norm_map = norm_map
         self.zero_range_center = zero_range_center
+        self.eps = eps
         self.dataset_names = list(dataset_names) if dataset_names is not None else None
         if (
             per_dataset_stats is not None
@@ -659,8 +661,8 @@ class Unnormalize(nn.Module):
                 # Mirror Normalize's guard so Unnormalize(Normalize(x)) round-trips on a snapped
                 # dim: with std=1 the inverse x*(1+EPS)+mean recovers the deviation; the legacy
                 # x*EPS+mean would collapse it to ~mean. std >= EPS dims stay bit-identical.
-                std = torch.where(std.abs() < EPS, torch.ones_like(std), std)
-                batch[key] = batch_val * (std + EPS) + mean
+                std = torch.where(std.abs() < self.eps, torch.ones_like(std), std)
+                batch[key] = batch_val * (std + self.eps) + mean
             elif norm_mode in (NormalizationMode.MIN_MAX, NormalizationMode.QUANTILE):
                 lo_name, hi_name = stat_names_for_mode(norm_mode)
                 min_ = _gather_and_broadcast(_materialize(buffer[lo_name]), dataset_index, batch_val)
@@ -670,9 +672,9 @@ class Unnormalize(nn.Module):
                     assert not torch.isinf(max_).any(), _no_stats_error_str(hi_name)
                 # Snap a zero range to 1 to mirror Normalize (keeps the round-trip exact).
                 raw_range = max_ - min_
-                denom = torch.where(raw_range.abs() < EPS, torch.ones_like(raw_range), raw_range)
+                denom = torch.where(raw_range.abs() < self.eps, torch.ones_like(raw_range), raw_range)
                 batch[key] = (batch_val + 1) / 2
-                batch[key] = batch[key] * (denom + EPS) + min_
+                batch[key] = batch[key] * (denom + self.eps) + min_
                 # Invert the zero_range_center numerator offset applied in Normalize
                 # (subtract what was added). Float-exact no-op on healthy dims, exactly
                 # cancels the `0.5 * (denom - raw_range)` shift on a zero-range band.

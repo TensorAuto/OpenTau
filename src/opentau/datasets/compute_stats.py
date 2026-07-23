@@ -365,14 +365,28 @@ def aggregate_feature_stats(
     # q01/q99 for QUANTILE normalization. Exact pooled quantiles are not
     # recoverable from per-contributor quantiles, so use the count-weighted mean
     # of the contributors' quantiles — a standard approximation that stays
-    # robust to a single contributor's extremes (unlike pooled min/max). A
-    # contributor without a stored quantile (stats predating quantile support)
-    # contributes its same-side extreme instead; non-finite entries are masked
-    # per dim like the mean.
-    for q_name, extreme in (("q01", "min"), ("q99", "max")):
-        if not any(q_name in s for s in stats_ft_list):
+    # robust to a single contributor's extremes (unlike pooled min/max).
+    # Non-finite entries are masked per dim like the mean.
+    #
+    # All-or-none: a contributor without the quantile is NOT backfilled from its
+    # same-side extreme. Mixing a true q01 with a min pools two different
+    # scales into one buffer, silently widening the band by however far the
+    # extreme sits outside the 1st percentile — precisely the outlier
+    # sensitivity QUANTILE exists to avoid. Recompute the offending dataset's
+    # stats instead.
+    for q_name in ("q01", "q99"):
+        have = [q_name in s for s in stats_ft_list]
+        if not any(have):
             continue
-        q_vals = np.stack([s.get(q_name, s[extreme]) for s in stats_ft_list])
+        if not all(have):
+            missing = [i for i, h in enumerate(have) if not h]
+            raise KeyError(
+                f"aggregate_feature_stats: {len(missing)}/{len(stats_ft_list)} contributors are "
+                f"missing '{q_name}' (indices {missing[:10]}), but the rest have it. Quantiles "
+                "are not backfilled from min/max because that would pool two different scales "
+                "into one buffer. Recompute stats for the listed contributors."
+            )
+        q_vals = np.stack([s[q_name] for s in stats_ft_list])
         q_bad = ~np.isfinite(q_vals)
         q_weights = np.where(q_bad, 0.0, counts).astype(np.float64)
         q_weight_sum = q_weights.sum(axis=0)

@@ -110,6 +110,7 @@ from huggingface_hub.errors import RevisionNotFoundError
 
 from opentau.configs.train import TrainPipelineConfig
 from opentau.constants import HF_OPENTAU_HOME
+from opentau.datasets.action_indexing import apply_column_index, subtract_chunk_start_state
 from opentau.datasets.compute_stats import aggregate_stats, compute_episode_stats
 from opentau.datasets.image_writer import AsyncImageWriter, write_image
 from opentau.datasets.speed_percentiles import (
@@ -752,6 +753,10 @@ class BaseDataset(torch.utils.data.Dataset):
         max_state_dim: Maximum dimension for state vectors.
         max_action_dim: Maximum dimension for action vectors.
         action_chunk: Number of actions processed in a chunk.
+        state_index: Parquet-space state columns to keep, or None for all.
+        action_index: Parquet-space action columns to keep, or None for all.
+        delta_action_state_map: Post-index ``{action_pos: state_pos}`` map, or
+            None when training on absolute actions.
 
     Example:
         Create a custom dataset:
@@ -759,6 +764,20 @@ class BaseDataset(torch.utils.data.Dataset):
             ...     def _get_feature_mapping_key(self):
             ...         return "my-dataset"
     """
+
+    # Column selection / delta-action transform, all no-ops by default. Declared at CLASS level
+    # (not in `__init__`) so every subclass and test double has them even when it bypasses
+    # `BaseDataset.__init__`; the values are immutable, so a shared class attribute is safe.
+    # `state_index` / `action_index` are in PARQUET space; `delta_action_state_map` is in
+    # POST-INDEX space, already translated by `resolve_delta_map`, because it is applied after
+    # the reindex. `make_dataset` sets these per instance from the entry's `DatasetConfig`; VQA
+    # datasets never do. See `opentau.datasets.action_indexing` for the two index spaces.
+    state_index: list[int] | None = None
+    action_index: list[int] | None = None
+    delta_action_state_map: dict[int, int] | None = None
+    # Recomputed delta-action stats (post-index space), attached by `make_dataset` for
+    # delta-action datasets and consumed by `DatasetMixtureMetadata`.
+    delta_action_stats: dict | None = None
 
     # Per-instance feature-name mapping. When set (LeRobotDataset receives it
     # from the mixture entry's `data_features_name_mapping`), it wins over the
@@ -982,6 +1001,12 @@ class BaseDataset(torch.utils.data.Dataset):
                 continue
             standard_item[new_key] = item[key]
 
+        # Column selection (parquet space), then the delta transform, both BEFORE
+        # `real_action_dim` and the zero-pad below — so `real_action_dim` counts the kept dims
+        # and the delta is formed in raw units, matching openpi's ordering (its `DeltaActions`
+        # runs in `data_transforms`, ahead of `Normalize` and `PadStatesAndActions`).
+        self._apply_column_index_and_delta(standard_item)
+
         # Record the real (pre-pad) action dimensionality so per-policy MSE on
         # the velocity field can mask out the zero-pad tail dims. For VQA-style
         # items where `actions` is already shaped `(chunk, max_action_dim)`,
@@ -1045,6 +1070,37 @@ class BaseDataset(torch.utils.data.Dataset):
         standard_item["frame_index"] = int(fr.item() if torch.is_tensor(fr) else fr) if fr is not None else -1
 
         return standard_item
+
+    def _apply_column_index_and_delta(self, standard_item: dict) -> None:
+        """Subset/reorder `state` and `actions`, then make mapped action dims relative.
+
+        Mutates ``standard_item`` in place. A no-op unless the dataset's ``DatasetConfig`` set
+        ``state_index`` / ``action_index`` / ``use_delta_joint_actions``, so datasets that don't
+        opt in pay one attribute check.
+
+        Order matters and mirrors openpi: reindex first (so the delta map, already translated to
+        post-index space by ``resolve_delta_map``, addresses the emitted columns), then subtract
+        the chunk-start state in raw units, and only afterwards zero-pad and normalize.
+
+        Args:
+            standard_item: The in-progress standard-format item, carrying ``state`` and
+                ``actions`` under their standard names.
+        """
+        if self.state_index is None and self.action_index is None and not self.delta_action_state_map:
+            return
+        who = getattr(self, "repo_id", None) or self._get_feature_mapping_key()
+        if "state" in standard_item:
+            standard_item["state"] = apply_column_index(
+                standard_item["state"], self.state_index, what="state", who=who
+            )
+        if "actions" in standard_item:
+            standard_item["actions"] = apply_column_index(
+                standard_item["actions"], self.action_index, what="action", who=who
+            )
+        if self.delta_action_state_map and "actions" in standard_item and "state" in standard_item:
+            standard_item["actions"] = subtract_chunk_start_state(
+                standard_item["actions"], standard_item["state"], self.delta_action_state_map
+            )
 
     def _emit_optional_keys(self, item: dict, standard_item: dict) -> None:
         """Emit optional memory/subgoal/metadata keys with training-time dropout.
