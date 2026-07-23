@@ -886,14 +886,17 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         bit rather than the exact version, so an unrelated future version bump
         doesn't invalidate a tokenizer whose convention is still current.
 
-        Reads the sidecar cache-only (``local_files_only=True``): a local
-        tokenizer directory reads the file directly, an HF-repo tokenizer reads
-        only an already-cached sidecar. It never makes a network call — so it
-        cannot slow or break offline/CPU-gated construction — and fails open (no
-        enforcement) for an HF-repo sidecar that was never fetched locally. Pass
-        ``local_files_only=False`` explicitly to force a network read.
+        Sidecar read is scoped by path type: a local tokenizer directory reads
+        the file directly (no network), while an HF-repo tokenizer attempts a
+        network read for the sidecar — ``AutoProcessor.from_pretrained`` fetches
+        only its own files, not this sidecar, so cache-only would silently
+        no-op exactly the shared/Hub-hosted fitted tokenizer where a mismatch is
+        most likely. The repo was already contacted to load the tokenizer, so
+        this adds no new dependency, and the reader fails open (any error →
+        ``None`` → no enforcement), so offline construction still can't break.
+        Pass ``local_files_only`` explicitly to override the per-path default.
         """
-        download_kwargs.setdefault("local_files_only", True)
+        download_kwargs.setdefault("local_files_only", os.path.isdir(str(tokenizer_path)))
         meta = _read_action_norm_meta(tokenizer_path, **download_kwargs)
         if meta is None or "zero_range_center" not in meta:
             return

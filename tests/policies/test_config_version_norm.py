@@ -272,3 +272,36 @@ def test_guard_raises_on_mismatch(policy_version, tok_center, tmp_path):
 def test_guard_is_noop_when_sidecar_absent(tmp_path):
     # v1 policy + tokenizer without a sidecar (upstream / pre-versioning): no raise.
     _run_guard(1, None, tmp_path)
+
+
+def test_guard_local_dir_never_hits_network(tmp_path, monkeypatch):
+    """A local tokenizer directory reads the sidecar off disk — no hf_hub_download."""
+    import opentau.policies.pretrained as pt
+
+    def _boom(*a, **k):
+        raise AssertionError("hf_hub_download must not be called for a local dir")
+
+    monkeypatch.setattr(pt, "hf_hub_download", _boom)
+    _write_sidecar(tmp_path, True)
+    stub = types.SimpleNamespace(config=_CfgStub(1))
+    pt.PreTrainedPolicy._check_discrete_action_tokenizer_convention(stub, tmp_path)  # no raise
+
+
+def test_guard_remote_repo_attempts_network_and_fails_open(monkeypatch):
+    """A non-local (Hub repo) tokenizer path attempts a network sidecar read; the
+    reader fails open, so an unreachable repo is a no-op, not a crash."""
+    import opentau.policies.pretrained as pt
+
+    calls = {"n": 0, "local_files_only": None}
+
+    def _fake_download(*a, local_files_only=False, **k):
+        calls["n"] += 1
+        calls["local_files_only"] = local_files_only
+        raise OSError("simulated offline")  # fail-open path
+
+    monkeypatch.setattr(pt, "hf_hub_download", _fake_download)
+    stub = types.SimpleNamespace(config=_CfgStub(1))
+    # "TensorAuto/some-fitted-tok" is not a local dir -> network attempt.
+    pt.PreTrainedPolicy._check_discrete_action_tokenizer_convention(stub, "TensorAuto/some-fitted-tok")
+    assert calls["n"] >= 1, "a remote repo path must attempt the network sidecar read"
+    assert calls["local_files_only"] is False
