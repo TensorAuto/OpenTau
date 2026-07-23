@@ -699,6 +699,18 @@ class SpaceTimeSiglipVideoEncoder(nn.Module):
             flat, interpolate_pos_encoding=self._interpolate_pos_encoding
         )
 
+        # The SigLIP patch/position embeddings may be pinned to float32 (openpi parity, see
+        # PaliGemmaWithExpertModel.to_bfloat16_like_physical_intelligence). This encoder
+        # hand-rolls the SigLIP forward, so it has to reproduce the patched
+        # SiglipVisionTransformer.forward bridge: cast the (possibly float32) embeddings to the
+        # encoder dtype before the encoder layers -- and before the temporal mask below, which
+        # is built from ``hidden.dtype``. No-op when the tower is single-dtype (e.g. the Gemma3
+        # pi07 towers, which are uniform bfloat16). ``post_layernorm`` is the unambiguous SigLIP
+        # encoder dtype (a wrapped SpaceTime layer's first parameter may be a temporal module).
+        encoder_dtype = self.vision_tower.vision_model.post_layernorm.weight.dtype
+        if hidden.dtype != encoder_dtype:
+            hidden = hidden.to(encoder_dtype)
+
         # Build temporal attention mask. Skipped at T=1 because the wrapper's
         # T=1 short-circuit bypasses temporal attention entirely.
         temporal_attn_mask: Tensor | None = None

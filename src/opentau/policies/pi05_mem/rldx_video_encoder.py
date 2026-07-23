@@ -248,11 +248,10 @@ class RLDXVideoEncoder(nn.Module):
         # SiglipVisionTransformer.forward, so it has to reproduce that forward's dtype
         # bridge here: cast the float32 embeddings to the (possibly bfloat16) encoder dtype
         # before the first encoder layer. No-op when the tower is single-dtype.
-        encoder_layers = self.vision_tower.vision_model.encoder.layers
-        if len(encoder_layers) > 0:
-            encoder_dtype = encoder_layers[0].self_attn.q_proj.weight.dtype
-            if hidden.dtype != encoder_dtype:
-                hidden = hidden.to(encoder_dtype)
+        # ``post_layernorm`` is the unambiguous SigLIP encoder dtype.
+        encoder_dtype = self.vision_tower.vision_model.post_layernorm.weight.dtype
+        if hidden.dtype != encoder_dtype:
+            hidden = hidden.to(encoder_dtype)
 
         use_ckpt = self.gradient_checkpointing and self.training
         # Motion runs only with a real time axis (T > 1). It is intentionally NOT

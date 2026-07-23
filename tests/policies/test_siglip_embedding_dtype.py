@@ -34,6 +34,7 @@ from transformers.models.paligemma.modeling_paligemma import PaliGemmaMultiModal
 # patched SiglipVisionTransformer.forward under test.
 import opentau.utils.transformers_patch  # noqa: F401
 from opentau.policies.pi05_mem.rldx_video_encoder import RLDXVideoEncoder
+from opentau.policies.pi07.video_encoder import SpaceTimeSiglipVideoEncoder
 
 # The three parameter names pinned to float32 by to_bfloat16_like_physical_intelligence.
 PINNED_SUFFIXES = (
@@ -122,3 +123,31 @@ def test_rldx_video_encoder_survives_mixed_dtype_tower():
     assert out.dtype == torch.bfloat16
     assert torch.isfinite(out.float()).all()
     assert out.shape[0] == 1
+
+
+def test_spacetime_video_encoder_survives_mixed_dtype_tower():
+    """The DEFAULT pi05_mem / pi07_paligemma encoder also hand-rolls the SigLIP forward."""
+    vt = _tiny_siglip()
+    projector = _tiny_projector().to(torch.bfloat16)
+    encoder = SpaceTimeSiglipVideoEncoder(vt, projector, max_num_frames=2).eval()
+
+    # SpaceTime wraps layers in place inside ``vt``; put the whole tower (incl. any temporal
+    # modules and the encoder object) in bfloat16, then pin the patch/position embeddings back
+    # to float32 — the mixed-dtype state the pinning + build leaves the encoder in.
+    vt.to(torch.bfloat16)
+    encoder.to(torch.bfloat16)
+    vt.vision_model.embeddings.patch_embedding.to(torch.float32)
+    vt.vision_model.embeddings.position_embedding.to(torch.float32)
+
+    with torch.no_grad():
+        # T=1 short-circuits temporal attention (isolates the embeddings -> encoder bridge);
+        # T=2 additionally builds the temporal mask, which is derived from the bridged dtype.
+        out_t1 = encoder(torch.rand(1, 1, 3, 224, 224))
+        out_t2 = encoder(
+            torch.rand(1, 2, 3, 224, 224), obs_history_is_pad=torch.zeros(1, 2, dtype=torch.bool)
+        )
+
+    for out in (out_t1, out_t2):
+        assert out.dtype == torch.bfloat16
+        assert torch.isfinite(out.float()).all()
+        assert out.shape[0] == 1
