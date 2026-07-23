@@ -263,6 +263,56 @@ class TestDatasetMixtureMetadata:
         )
 
 
+class TestResolveMixtureDeltaMap:
+    """Unit-test the delta-map uniformity resolution in isolation (no full mixture build)."""
+
+    def _meta(self, names, delta_maps, is_vqa):
+        """A bare DatasetMixtureMetadata carrying only what the resolver reads."""
+        m = DatasetMixtureMetadata.__new__(DatasetMixtureMetadata)
+        m.dataset_names = list(names)
+        m._delta_maps = list(delta_maps)
+        m._is_vqa = list(is_vqa)
+        return m
+
+    def test_none_when_no_dataset_uses_deltas(self):
+        m = self._meta(["a", "b"], [None, None], [False, False])
+        assert m._resolve_mixture_delta_map() is None
+
+    def test_returns_shared_map_when_all_agree(self):
+        m = self._meta(["a", "b"], [{0: 0, 1: 1}, {0: 0, 1: 1}], [False, False])
+        assert m._resolve_mixture_delta_map() == {0: 0, 1: 1}
+
+    def test_rejects_mixed_delta_and_absolute_robot_datasets(self):
+        m = self._meta(["a", "b"], [{0: 0}, None], [False, False])
+        with pytest.raises(ValueError, match="all-delta or all-absolute"):
+            m._resolve_mixture_delta_map()
+
+    def test_rejects_disagreeing_maps(self):
+        m = self._meta(["a", "b"], [{0: 0}, {0: 1}], [False, False])
+        with pytest.raises(ValueError, match="disagree"):
+            m._resolve_mixture_delta_map()
+
+    def test_vqa_entry_is_exempt_from_the_uniformity_check(self):
+        """A VQA entry has no actions and can't opt into deltas, so delta robot + VQA is fine."""
+        m = self._meta(["robot", "vqa"], [{0: 0, 1: 1}, None], [False, True])
+        assert m._resolve_mixture_delta_map() == {0: 0, 1: 1}
+
+    def test_only_pi05_carries_the_delta_field_the_factory_guard_relies_on(self):
+        """`make_policy` raises when a delta mixture meets a policy without the inverse. That
+        guard keys off `hasattr(cfg, "delta_action_state_map")`, so it stays correct only while
+        pi05 is the sole config with the field. Pin the invariant: if another policy gains the
+        field it must also gain the `sample_actions` inverse, or the guard silently lets a broken
+        delta-trained policy through.
+        """
+        from opentau.policies.pi0.configuration_pi0 import PI0Config
+        from opentau.policies.pi05.configuration_pi05 import PI05Config
+        from opentau.policies.pi06.configuration_pi06 import PI06Config
+
+        assert "delta_action_state_map" in PI05Config.__dataclass_fields__
+        assert "delta_action_state_map" not in PI0Config.__dataclass_fields__
+        assert "delta_action_state_map" not in PI06Config.__dataclass_fields__
+
+
 class TestWeightedDatasetMixture:
     """Test the WeightedDatasetMixture class."""
 
@@ -339,6 +389,27 @@ class TestWeightedDatasetMixture:
 
         with pytest.raises(ValueError, match="All datasets must have a 'meta' attribute"):
             WeightedDatasetMixture(train_pipeline_config, [dataset_without_meta], [1.0], 30.0)
+
+    @pytest.mark.slow  # 1 sec
+    def test_val_split_subset_wrapper_preserves_per_dataset_settings(
+        self, train_pipeline_config, datasets_factory
+    ):
+        """With ``val_freq > 0`` the mixture receives ``random_split`` ``Subset`` wrappers, and
+        ``Subset`` does not proxy attribute access. The mixture must still read the underlying
+        dataset's ``state_index`` / ``action_index`` (and delta settings) one level down, or the
+        stats silently keep the raw absolute layout while ``__getitem__`` reindexes the data.
+        """
+        ds = datasets_factory(1)[0]
+        ds.state_index = [1, 0]
+        ds.action_index = [0]
+        # Mimic factory's val split: a Subset over the whole dataset, with `.meta` copied onto
+        # the wrapper (Subset itself exposes neither `.meta` nor the new attributes).
+        subset = torch.utils.data.Subset(ds, list(range(len(ds))))
+        subset.meta = ds.meta
+
+        mixture = WeightedDatasetMixture(train_pipeline_config, [subset], [1.0], 30.0)
+        # Read through the Subset succeeded -> the column indices reached the metadata.
+        assert mixture.meta._column_indices[0] == ([1, 0], [0])
 
     @pytest.mark.slow  # 1 sec
     def test_calculate_sample_weights_normal(self, train_pipeline_config, datasets_factory):

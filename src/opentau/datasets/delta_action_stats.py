@@ -408,6 +408,17 @@ def _merge_running(parts: list[dict[str, dict[str, np.ndarray]]]) -> dict[str, d
     the same weighted-mean/variance rules as every other stats path — including the all-or-none
     quantile requirement, which holds trivially since every part is produced by
     :class:`RunningStats`.
+
+    Parity note: mean/std/min/max merge exactly. The **quantiles** are pooled as the
+    count-weighted mean of the per-file q01/q99 — the same approximation OpenTau already uses for
+    every cross-contributor stat merge — which is *not* identical to openpi's single histogram
+    over the whole dataset. For a **single-file** dataset (one part) the merge is a passthrough,
+    so the result matches openpi's estimator exactly; that is the common case here (the RoboLab
+    ``*_200`` repos are single-file). Only a genuinely multi-file (e.g. consolidated v3.0)
+    dataset incurs the weighted-mean approximation, and only on the two quantile rows. Making it
+    exact would require a global-min/max pre-pass so every file shares histogram bin edges and
+    the histograms can be summed — a worthwhile follow-up if multi-file quantile fidelity ever
+    matters, deliberately left out here to keep the change contained.
     """
     from opentau.datasets.compute_stats import aggregate_feature_stats
 
@@ -588,6 +599,20 @@ def load_or_compute_delta_action_stats(
                 return cached
             logging.warning("delta stats: ignoring unreadable/stale cache %s; recomputing.", path)
 
+        if distributed and not _cache_dir_writable(path.parent):
+            # A read-only root deadlocks a multi-rank run: rank 0 can't publish the file, its
+            # in-memory fallback returns, but the other ranks poll `_wait_for_main` for a file
+            # that never appears and rank 0's `finally` barrier then trips the NCCL watchdog.
+            # Every rank sees the same (shared) filesystem, so this check is uniform — all ranks
+            # raise together, reach the `finally` barrier together, and fail cleanly. (The
+            # single-process path keeps the in-memory fallback below; only distributed hangs.)
+            raise RuntimeError(
+                f"delta stats: cache directory {path.parent} is not writable, and this is a "
+                f"{acc.num_processes}-rank run. Non-main ranks would poll for a file rank 0 can "
+                "never publish, deadlocking until the NCCL watchdog fires. Point the dataset at a "
+                "writable root, or precompute the delta stats on a single process first."
+            )
+
         if not is_main_or_solo:
             return _wait_for_main(path)
 
@@ -611,6 +636,22 @@ def load_or_compute_delta_action_stats(
     finally:
         if distributed:
             acc.wait_for_everyone()
+
+
+def _cache_dir_writable(cache_dir: Path) -> bool:
+    """Whether ``cache_dir`` can be created and written to, probed with a temp file.
+
+    Used only to fail a distributed run fast when the dataset root is read-only (see
+    :func:`load_or_compute_delta_action_stats`); the probe file is removed immediately.
+    """
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        probe = cache_dir / f".write_probe_{uuid.uuid4().hex}"
+        probe.write_text("")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
 
 
 def _wait_for_main(path: Path) -> dict[str, dict[str, np.ndarray]]:

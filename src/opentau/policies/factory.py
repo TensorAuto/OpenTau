@@ -345,7 +345,22 @@ def make_policy(
     # mixture actually resolved one — never clobber a map already on the config (the
     # checkpoint-load path has no `ds_meta`).
     mixture_delta_map = getattr(ds_meta, "delta_action_state_map", None)
-    if mixture_delta_map and hasattr(cfg, "delta_action_state_map"):
+    if mixture_delta_map:
+        if not hasattr(cfg, "delta_action_state_map"):
+            # The dataset-side delta transform is policy-agnostic (`make_dataset` applies it
+            # regardless of policy type), but only pi05 carries the config field and the
+            # `sample_actions` inverse that turns the emitted deltas back into absolute actions.
+            # Silently dropping the map here would train `cfg.type` on delta targets while its
+            # inference emits raw displacements read as absolute joints — exactly the bug this
+            # PR fixes for pi05. Fail loudly instead.
+            raise ValueError(
+                f"The dataset mixture uses delta joint actions (post-index map "
+                f"{dict(mixture_delta_map)}), but policy type '{getattr(cfg, 'type', '?')}' has "
+                "no `delta_action_state_map` field and no inference-time inverse, so a policy "
+                "trained on it would emit deltas that are read as absolute actions. Delta joint "
+                "actions are currently supported only by pi05. Use policy.type=pi05, or remove "
+                "`use_delta_joint_actions` from the mixture."
+            )
         cfg.delta_action_state_map = dict(mixture_delta_map)
 
     override_path = getattr(cfg, "norm_stats_override_path", None)

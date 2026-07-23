@@ -372,3 +372,26 @@ class TestLoadOrCompute:
             root=tmp_path, cache_key="testkey_readonly", compute_kwargs=_kwargs(path)
         )
         assert stats["actions"]["count"].tolist() == [N_EP * T_PER_EP * HORIZON]
+
+    def test_readonly_root_multi_rank_fails_fast_instead_of_hanging(self, tmp_path, monkeypatch):
+        """A read-only root in a multi-rank run must raise, not deadlock.
+
+        Rank 0's in-memory fallback would return while the other ranks poll forever for a file
+        that never appears; rank 0's barrier then trips the NCCL watchdog. Every rank sees the
+        same read-only filesystem, so the fail-fast is uniform.
+        """
+        path, _, _ = _write_dataset(tmp_path)
+
+        class _FakeAcc:
+            num_processes = 4
+            is_main_process = True
+
+            def wait_for_everyone(self):
+                pass
+
+        monkeypatch.setattr("opentau.utils.accelerate_utils.get_proc_accelerator", lambda: _FakeAcc())
+        monkeypatch.setattr("opentau.datasets.delta_action_stats._cache_dir_writable", lambda _d: False)
+        with pytest.raises(RuntimeError, match="not writable.*rank"):
+            load_or_compute_delta_action_stats(
+                root=tmp_path, cache_key="testkey_ro_dist", compute_kwargs=_kwargs(path)
+            )

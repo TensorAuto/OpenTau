@@ -76,7 +76,7 @@ from torch.utils.data import ConcatDataset, DataLoader, Dataset, Sampler
 
 from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.compute_stats import aggregate_stats
-from opentau.datasets.lerobot_dataset import BaseDataset, DatasetMetadata
+from opentau.datasets.lerobot_dataset import BaseDataset, DatasetMetadata, VQADatasetMetadata
 from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING, feature_mapping_key
 
 
@@ -289,6 +289,11 @@ class DatasetMixtureMetadata:
             delta_stats = [None] * len(metadatas)
         self._column_indices = list(column_indices)
         self._delta_maps = list(delta_maps)
+        # VQA entries have no proprioceptive actions and config validation forbids them from
+        # setting `use_delta_joint_actions`, so they must be exempt from the all-delta-or-all-
+        # absolute uniformity check (they can never be delta, and counting them as "absolute"
+        # would make delta-action + VQA co-training impossible). See `_resolve_mixture_delta_map`.
+        self._is_vqa = [isinstance(m, VQADatasetMetadata) for m in metadatas]
 
         # Per-entry feature-name mappings (aligned with `metadatas`). When an
         # entry is None, resolution falls back to the global registry — which
@@ -382,28 +387,35 @@ class DatasetMixtureMetadata:
         parquet layouts (that is what ``state_index`` / ``action_index`` are for), but the
         *resolved* maps must be identical.
 
-        Mixing delta and absolute datasets in one mixture is also rejected: the policy would have
-        to know per-sample which convention produced a chunk, and at inference there is no such
-        signal.
+        Mixing delta and absolute *robot* datasets in one mixture is rejected: the policy would
+        have to know per-sample which convention produced a chunk, and at inference there is no
+        such signal. VQA entries are exempt — they emit no action chunks (their action loss is
+        masked to zero), so delta-action robot data can be co-trained with VQA freely.
 
         Returns:
             The shared ``{action_pos: state_pos}`` map, or ``None`` when no dataset uses deltas.
 
         Raises:
             ValueError: If delta-enabled datasets disagree, or if the mixture mixes
-                delta-action and absolute-action datasets.
+                delta-action and absolute-action *robot* datasets.
         """
         enabled = [(n, m) for n, m in zip(self.dataset_names, self._delta_maps, strict=True) if m]
         if not enabled:
             return None
-        absolute = [n for n, m in zip(self.dataset_names, self._delta_maps, strict=True) if not m]
+        # Non-VQA robot datasets without a delta map are the genuine "absolute" case. VQA entries
+        # never carry actions and cannot opt into deltas, so they are not a convention conflict.
+        absolute = [
+            n
+            for n, m, is_vqa in zip(self.dataset_names, self._delta_maps, self._is_vqa, strict=True)
+            if not m and not is_vqa
+        ]
         if absolute:
             raise ValueError(
                 f"{len(enabled)} dataset(s) in this mixture use delta joint actions but "
-                f"{len(absolute)} do not ({absolute[:10]}). The policy applies one inverse "
-                "transform to every chunk it emits and has no per-sample signal for which "
-                "convention produced it, so a mixture must be all-delta or all-absolute. Set "
-                "use_delta_joint_actions consistently across the mixture."
+                f"{len(absolute)} robot dataset(s) do not ({absolute[:10]}). The policy applies "
+                "one inverse transform to every chunk it emits and has no per-sample signal for "
+                "which convention produced it, so the robot datasets must be all-delta or "
+                "all-absolute. Set use_delta_joint_actions consistently. (VQA entries are exempt.)"
             )
         first_name, first_map = enabled[0]
         mismatched = [f"{n} -> {m}" for n, m in enabled[1:] if m != first_map]
@@ -900,11 +912,24 @@ class WeightedDatasetMixture:
         # (same repo_id + control_mode, different mappings) standardize their
         # stats against their own columns. `random_split` wrappers hold the
         # real dataset one level deeper, same as the `.meta` lookup above.
+        def _unwrapped_attr(ds, name: str):
+            """Read ``name`` off the dataset, transparently unwrapping a ``Subset``.
+
+            When ``val_freq > 0``, ``make_dataset`` hands us ``random_split`` ``Subset``
+            wrappers (``factory.py``), and ``Subset`` does not proxy attribute access. Reading
+            the per-dataset column-index / delta settings straight off the wrapper would return
+            ``None`` while the wrapped dataset still applies those transforms in ``__getitem__`` —
+            so the stats would silently keep the raw (absolute, un-reindexed) layout against
+            reindexed / delta'd data, and the mixture would never publish the delta map. Look one
+            level deeper, exactly as ``_instance_name_map`` and the ``.meta`` lookup above do.
+            """
+            val = getattr(ds, name, None)
+            if val is None and hasattr(ds, "dataset"):
+                val = getattr(ds.dataset, name, None)
+            return val
+
         def _instance_name_map(ds) -> dict[str, str] | None:
-            own = getattr(ds, "_data_features_name_mapping", None)
-            if own is None and hasattr(ds, "dataset"):
-                own = getattr(ds.dataset, "_data_features_name_mapping", None)
-            return own
+            return _unwrapped_attr(ds, "_data_features_name_mapping")
 
         self.meta = DatasetMixtureMetadata(
             cfg,
@@ -913,10 +938,10 @@ class WeightedDatasetMixture:
             dataset_names=self.dataset_names,
             name_maps=[_instance_name_map(ds) for ds in datasets],
             column_indices=[
-                (getattr(ds, "state_index", None), getattr(ds, "action_index", None)) for ds in datasets
+                (_unwrapped_attr(ds, "state_index"), _unwrapped_attr(ds, "action_index")) for ds in datasets
             ],
-            delta_maps=[getattr(ds, "delta_action_state_map", None) for ds in datasets],
-            delta_stats=[getattr(ds, "delta_action_stats", None) for ds in datasets],
+            delta_maps=[_unwrapped_attr(ds, "delta_action_state_map") for ds in datasets],
+            delta_stats=[_unwrapped_attr(ds, "delta_action_stats") for ds in datasets],
         )
 
         # Wrap every underlying dataset so __getitem__ injects

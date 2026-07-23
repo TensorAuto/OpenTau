@@ -33,8 +33,19 @@ from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
 
 # Matches openpi's normalization epsilon (``1e-6`` in ``openpi.transforms.Normalize``), so a
 # policy trained here and one trained there agree to well under float32 resolution on the same
-# inputs. This was ``1e-8`` before; the change shifts MEAN_STD / MIN_MAX / QUANTILE outputs by
-# ~1e-6 relative (~10 ULP in float32) and widens the zero-variance snap threshold below by 100x.
+# inputs. This was ``1e-8`` before.
+#
+# Impact on existing checkpoints (there is no ``config_version`` gate in this repo, and this is
+# immaterial rather than something to gate):
+#   * MEAN_STD / MIN_MAX / QUANTILE outputs shift by ~1e-6 relative (~10 ULP in float32) for any
+#     dim whose std/range is not near-degenerate — far below what changes a trained policy's
+#     behavior, and below the tolerance of the checkpoint round-trip tests.
+#   * The zero-variance snap threshold widens 100x, so a dim with std/range in the narrow band
+#     (1e-8, 1e-6) now snaps to 1 instead of dividing by ~1e-7. Such a dim is essentially
+#     constant (varies by ~1e-7); dividing by ~1e-7 would amplify noise toward the ~1e6
+#     "outlier normalized state" blow-up the snap guard exists to prevent, so snapping it is if
+#     anything safer, not a regression. Genuinely-constant padding dims (std == 0) are a no-op
+#     either way.
 EPS = 1e-6  # Small epsilon value for numerical stability in normalization
 
 # A genuinely-zero std (|std| < EPS) marks a constant/padding feature dim. The guard in
