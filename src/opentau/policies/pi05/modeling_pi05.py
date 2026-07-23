@@ -643,6 +643,14 @@ class PI05Policy(PreTrainedPolicy):
             )
 
         dataset_index = self._resolve_dataset_index(batch)
+        # Teacher-faithful state slice (opt-in): zero state dims >= state_keep_dims
+        # BEFORE normalization so a 13-dim RoboLab state matches the teacher's 8-dim
+        # DROID proprio [j0..j6, gripper=state[7]]. Matches OpenTau1 training.
+        if getattr(self.config, "state_keep_dims", None) is not None and "state" in batch:
+            batch = dict(batch)
+            _st = batch["state"].clone()
+            _st[..., int(self.config.state_keep_dims):] = 0
+            batch["state"] = _st
         batch = self.normalize_inputs(batch, dataset_index)
 
         images, img_masks = self.prepare_images(batch)
@@ -709,6 +717,14 @@ class PI05Policy(PreTrainedPolicy):
             "MSE_per_sample"/"CE_per_sample" when ``return_per_sample`` is True.
         """
         dataset_index = self._resolve_dataset_index(batch)
+        # Teacher-faithful state slice (opt-in): zero state dims >= state_keep_dims
+        # BEFORE normalization so a 13-dim RoboLab state matches the teacher's 8-dim
+        # DROID proprio [j0..j6, gripper=state[7]]. Matches OpenTau1 training.
+        if getattr(self.config, "state_keep_dims", None) is not None and "state" in batch:
+            batch = dict(batch)
+            _st = batch["state"].clone()
+            _st[..., int(self.config.state_keep_dims):] = 0
+            batch["state"] = _st
         batch = self.normalize_inputs(batch, dataset_index)
         batch["discrete_actions"] = self.normalize_discrete_actions(dict(batch), dataset_index)["actions"]
         batch = self.normalize_targets(batch, dataset_index)

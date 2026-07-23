@@ -191,6 +191,20 @@ class PI05Config(PreTrainedConfig):
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
 
+    # --- Teacher-faithful options (opt-in; default None/False = no behavior change) ---
+    # Zero every state dim at/after this index BEFORE normalization, reducing a
+    # 13-dim RoboLab observation.state to the teacher's DROID 8-dim proprio
+    # [j0..j6, gripper=state[7]]. None keeps the full state (default).
+    state_keep_dims: int | None = None
+    # Path to an openpi-style droid norm_stats.json (used only by make_policy at
+    # TRAIN time to build a single DROID head). Unused at inference: from_pretrained
+    # loads the baked norm buffers. Kept so teacher-faithful config.json parses.
+    norm_stats_override_path: str | None = None
+    # Model was trained on delta joint actions (action[:,:7] -= state[:7]; gripper
+    # absolute). At inference the model OUTPUTS deltas -> the serving layer must add
+    # state[:7] back. This flag only affects the training-target transform in modeling.
+    use_delta_joint_actions: bool = False
+
     def __post_init__(self):
         """Post-initialization validation."""
         super().__post_init__()

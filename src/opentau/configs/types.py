@@ -53,6 +53,14 @@ class NormalizationMode(str, Enum):
     extend beyond ``[-1, 1]`` (no clamping). Datasets whose stats carry no
     quantiles fall back to ``min``/``max`` for that dataset's row.
     """
+    QUANTILES = "QUANTILES"
+    """Teacher-faithful q01/q99 quantile normalization to ``[-1, 1]`` with CLIPPING.
+
+    Same ``[q01, q99] -> [-1, 1]`` mapping as :attr:`QUANTILE` but values outside
+    the band saturate at ``+/-1`` (matches the ``pi05_droid_jointpos`` teacher and
+    the OpenTau1 teacher-faithful training runs). Kept distinct from
+    :attr:`QUANTILE` so existing no-clamp checkpoints are unaffected.
+    """
     IDENTITY = "IDENTITY"
     """No normalization (identity transformation)."""
 

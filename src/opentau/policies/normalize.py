@@ -201,7 +201,7 @@ def stat_names_for_mode(norm_mode: NormalizationMode) -> tuple[str, ...]:
         return ("mean", "std")
     if norm_mode is NormalizationMode.MIN_MAX:
         return ("min", "max")
-    if norm_mode is NormalizationMode.QUANTILE:
+    if norm_mode in (NormalizationMode.QUANTILE, NormalizationMode.QUANTILES):
         return ("q01", "q99")
     raise ValueError(norm_mode)
 
@@ -470,7 +470,7 @@ class Normalize(nn.Module):
                 if bool((torch.isfinite(std) & (std.abs() < EPS)).any()):
                     active = True
                     break
-            elif norm_mode in (NormalizationMode.MIN_MAX, NormalizationMode.QUANTILE):
+            elif norm_mode in (NormalizationMode.MIN_MAX, NormalizationMode.QUANTILE, NormalizationMode.QUANTILES):
                 lo_name, hi_name = stat_names_for_mode(norm_mode)
                 rng = _materialize(buffer[hi_name]) - _materialize(buffer[lo_name])
                 if bool((torch.isfinite(rng) & (rng.abs() < EPS)).any()):
@@ -528,9 +528,10 @@ class Normalize(nn.Module):
                     and self._snapping_possible()
                 ):
                     _warn_snapped_deviation(key, std_is_zero, deviation, dataset_index, self.dataset_names)
-            elif norm_mode in (NormalizationMode.MIN_MAX, NormalizationMode.QUANTILE):
-                # QUANTILE is MIN_MAX arithmetic on the q01/q99 buffers: [q01, q99]
-                # maps to [-1, 1] and out-of-quantile values extend beyond (no clamp).
+            elif norm_mode in (NormalizationMode.MIN_MAX, NormalizationMode.QUANTILE, NormalizationMode.QUANTILES):
+                # QUANTILE/QUANTILES are MIN_MAX arithmetic on the q01/q99 buffers:
+                # [q01, q99] maps to [-1, 1]. QUANTILE lets out-of-band values extend
+                # beyond [-1, 1] (no clamp); QUANTILES CLIPS them to +/-1 (teacher-faithful).
                 lo_name, hi_name = stat_names_for_mode(norm_mode)
                 min_ = _gather_and_broadcast(_materialize(buffer[lo_name]), dataset_index, batch_val)
                 max_ = _gather_and_broadcast(_materialize(buffer[hi_name]), dataset_index, batch_val)
@@ -544,6 +545,8 @@ class Normalize(nn.Module):
                 batch[key] = deviation / (denom + EPS)
                 # normalize to [-1, 1]
                 batch[key] = batch[key] * 2 - 1
+                if norm_mode is NormalizationMode.QUANTILES:
+                    batch[key] = batch[key].clamp(-1.0, 1.0)
                 if (
                     _SNAP_WARN_TOL > 0
                     and not (torch.compiler.is_compiling() or torch.onnx.is_in_onnx_export())
@@ -621,7 +624,9 @@ class Unnormalize(nn.Module):
                 # x*EPS+mean would collapse it to ~mean. std >= EPS dims stay bit-identical.
                 std = torch.where(std.abs() < EPS, torch.ones_like(std), std)
                 batch[key] = batch_val * (std + EPS) + mean
-            elif norm_mode in (NormalizationMode.MIN_MAX, NormalizationMode.QUANTILE):
+            elif norm_mode in (NormalizationMode.MIN_MAX, NormalizationMode.QUANTILE, NormalizationMode.QUANTILES):
+                # Inverse of the [lo, hi] -> [-1, 1] map. QUANTILES' forward-side clip is
+                # not inverted here (unnormalizing an in-range action is unaffected).
                 lo_name, hi_name = stat_names_for_mode(norm_mode)
                 min_ = _gather_and_broadcast(_materialize(buffer[lo_name]), dataset_index, batch_val)
                 max_ = _gather_and_broadcast(_materialize(buffer[hi_name]), dataset_index, batch_val)
