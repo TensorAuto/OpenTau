@@ -35,6 +35,7 @@ from transformers.models.paligemma.modeling_paligemma import PaliGemmaMultiModal
 import opentau.utils.transformers_patch  # noqa: F401
 from opentau.policies.pi05_mem.rldx_video_encoder import RLDXVideoEncoder
 from opentau.policies.pi07.video_encoder import SpaceTimeSiglipVideoEncoder
+from opentau.policies.utils import to_dtype_preserving_siglip_float32
 
 # The three parameter names pinned to float32 by to_bfloat16_like_physical_intelligence.
 PINNED_SUFFIXES = (
@@ -151,3 +152,33 @@ def test_spacetime_video_encoder_survives_mixed_dtype_tower():
         assert out.dtype == torch.bfloat16
         assert torch.isfinite(out.float()).all()
         assert out.shape[0] == 1
+
+
+class _DummyPolicy(torch.nn.Module):
+    """Names the tower ``vision_tower`` so param names match the helper's suffixes."""
+
+    def __init__(self, vision_tower):
+        super().__init__()
+        self.vision_tower = vision_tower
+
+
+def test_to_dtype_helper_preserves_pinned_embeddings_across_bf16_cast():
+    """The serving/inference entry points cast through this helper to keep the float32 masters."""
+    policy = _DummyPolicy(_pin_embeddings_float32(_tiny_siglip()))
+    to_dtype_preserving_siglip_float32(policy, dtype=torch.bfloat16)
+
+    emb = policy.vision_tower.vision_model.embeddings
+    assert emb.patch_embedding.weight.dtype == torch.float32
+    assert emb.patch_embedding.bias.dtype == torch.float32
+    assert emb.position_embedding.weight.dtype == torch.float32
+    assert policy.vision_tower.vision_model.encoder.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16
+
+
+def test_to_dtype_helper_is_noop_for_uniform_bf16_tower():
+    """Gemma3-style tower: embeddings are not pinned, so the helper must not force float32."""
+    policy = _DummyPolicy(_tiny_siglip().to(torch.bfloat16))
+    to_dtype_preserving_siglip_float32(policy, dtype=torch.bfloat16)
+
+    emb = policy.vision_tower.vision_model.embeddings
+    assert emb.patch_embedding.weight.dtype == torch.bfloat16
+    assert emb.position_embedding.weight.dtype == torch.bfloat16

@@ -52,6 +52,7 @@ from opentau.configs import parser
 from opentau.configs.train import TrainPipelineConfig
 from opentau.policies.factory import make_policy
 from opentau.policies.normalize import NormalizationMode
+from opentau.policies.utils import to_dtype_preserving_siglip_float32
 from opentau.utils.random_utils import set_seed
 from opentau.utils.utils import (
     auto_torch_device,
@@ -207,7 +208,8 @@ def benchmark_main(cfg: TrainPipelineConfig):
 
     logging.info("Building policy via make_policy (features pre-set in config).")
     policy = make_policy(cfg.policy)
-    policy.to(device=device, dtype=torch.bfloat16)
+    # Preserve the float32-pinned SigLIP embeddings across the bf16 cast (openpi parity).
+    to_dtype_preserving_siglip_float32(policy, device=device, dtype=torch.bfloat16)
     policy.eval()
     policy.reset()
 

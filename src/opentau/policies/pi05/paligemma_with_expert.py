@@ -349,16 +349,16 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         encoder-dtype hand-off is done by the patched ``SiglipVisionTransformer.forward`` in
         :mod:`opentau.utils.transformers_patch`.
 
-        Caveat: this pinning only survives paths that keep the built model as-is — ONNX
-        export (``scripts/export_to_onnx.py``, which runs in float32) and FSDP training
-        (``train.py`` skips the cast below under FSDP). Every other entry point runs a
-        blanket ``policy.to(torch.bfloat16)`` after load that rounds these tables back to
-        bfloat16, undoing the pinning: the gRPC serving path (``scripts/grpc/server.py``),
-        ``scripts/inference.py``, ``eval.py``, ``benchmark_inference.py``,
-        ``high_level_planner_inference.py``, and non-FSDP ``train.py`` / ``profile_step.py``.
-        Making the float32 masters survive those casts (e.g. re-establishing them from the
-        checkpoint after the cast, without breaking DeepSpeed/DDP param handling) is a
-        follow-up.
+        The pinning is preserved by ONNX export (``scripts/export_to_onnx.py``, float32),
+        FSDP training (``train.py`` skips the cast below under FSDP), and the inference /
+        serving entry points (the gRPC server, ``scripts/inference.py``, ``eval.py``,
+        ``benchmark_inference.py``, ``high_level_planner_inference.py``), which do their
+        blanket bfloat16 cast through
+        :func:`opentau.policies.utils.to_dtype_preserving_siglip_float32` so these tables
+        stay float32. The remaining gap is the non-FSDP training cast (``train.py`` /
+        ``profile_step.py`` under DeepSpeed / DDP), which still blanket-casts to bfloat16:
+        re-introducing float32 params after the cast there would change how ZeRO / DDP
+        partition parameters and needs multi-rank validation (deferred to a follow-up).
         """
         self.paligemma = self.paligemma.to(dtype=torch.bfloat16)
 

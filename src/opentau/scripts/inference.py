@@ -22,6 +22,7 @@ import torch
 from opentau.configs import parser
 from opentau.configs.train import TrainPipelineConfig
 from opentau.policies.factory import get_policy_class
+from opentau.policies.utils import to_dtype_preserving_siglip_float32
 from opentau.utils.random_utils import set_seed
 from opentau.utils.utils import (
     attempt_torch_compile,
@@ -44,7 +45,8 @@ def inference_main(cfg: TrainPipelineConfig):
     logging.info("Creating policy")
     policy_class = get_policy_class(cfg.policy.type)
     policy = policy_class.from_pretrained(cfg.policy.pretrained_path, config=cfg.policy)
-    policy.to(device=device, dtype=torch.bfloat16)
+    # Preserve the float32-pinned SigLIP embeddings across the bf16 cast (openpi parity).
+    to_dtype_preserving_siglip_float32(policy, device=device, dtype=torch.bfloat16)
     policy.eval()
     policy.model.sample_actions = attempt_torch_compile(policy.model.sample_actions, device_hint=device)
 
