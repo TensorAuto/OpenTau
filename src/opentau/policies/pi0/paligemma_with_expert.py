@@ -284,6 +284,17 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         (empirically ~0.4 max abs error in the projected image tokens). The float32 ->
         encoder-dtype hand-off is done by the patched ``SiglipVisionTransformer.forward`` in
         :mod:`opentau.utils.transformers_patch`.
+
+        Caveat: this pinning survives paths that keep the built model as-is — the gRPC
+        serving path (``scripts/grpc/server.py``), ONNX export
+        (``scripts/export_to_onnx.py``), and FSDP training (``train.py`` skips the cast
+        below under FSDP). Several other entry points (``scripts/inference.py``,
+        ``eval.py``, ``benchmark_inference.py``, ``high_level_planner_inference.py``, and
+        non-FSDP ``train.py`` / ``profile_step.py``) run a blanket
+        ``policy.to(torch.bfloat16)`` after load that rounds these tables back to bfloat16;
+        making the float32 masters survive those casts (e.g. re-establishing them from the
+        checkpoint after the cast, without breaking DeepSpeed/DDP param handling) is a
+        follow-up.
         """
         self.paligemma = self.paligemma.to(dtype=torch.bfloat16)
 
