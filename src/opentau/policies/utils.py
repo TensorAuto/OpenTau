@@ -158,6 +158,16 @@ def to_dtype_preserving_siglip_float32(
     distributed-training cast path, where re-introducing float32 params after the cast would
     change how DeepSpeed/DDP partition parameters.
 
+    Known limitation (only the *weights* are kept float32, not the *input*): the serving entry
+    points still feed a bfloat16 image — e.g. ``grpc/server.py`` casts the decoded image to the
+    policy dtype — so the patch conv runs on bfloat16-precision pixels. HF
+    ``SiglipVisionEmbeddings.forward`` upcasts ``pixel_values`` to the (float32) weight dtype, so
+    there is no dtype mismatch, but the JAX recipe is a float32 *image* into the patch conv
+    ("do patch extraction and posemb in float32"). Empirically the bfloat16 image costs ~1%
+    (~1.5 max) on ``embed_image`` — larger than the ~0.14% weight-rounding this fix removes — so
+    full JAX-recipe fidelity would additionally require keeping the served image float32. Tracked
+    as a known limitation alongside issue #483.
+
     Args:
         module: The policy (or any module) to cast in place.
         dtype: Target dtype for the blanket cast.
