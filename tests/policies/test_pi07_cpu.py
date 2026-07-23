@@ -1505,7 +1505,10 @@ class TestPi07ConfigPlumbing:
             return stub
 
         # Patch AutoProcessor at its import site inside the modeling module so
-        # the real HF resolver never runs (this is a CPU test; no network).
+        # the real HF resolver never runs (this is a CPU test; no network). The
+        # remote tokenizer path also makes the discrete-action convention guard
+        # attempt a sidecar fetch, so stub that hub read too to keep it offline
+        # (it fails open, so this only avoids a needless network round-trip).
         with (
             mock.patch(
                 "opentau.policies.pi07.low_level.modeling_pi07_low_level.AutoProcessor.from_pretrained",
@@ -1519,6 +1522,7 @@ class TestPi07ConfigPlumbing:
                 "opentau.policies.pi07.low_level.modeling_pi07_low_level.PI07LowLevelFlowMatching",
                 return_value=mock.MagicMock(),
             ),
+            mock.patch("opentau.policies.pretrained.hf_hub_download", side_effect=OSError("offline")),
         ):
             PI07LowLevelPolicy(overridden)
 

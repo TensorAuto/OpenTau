@@ -208,8 +208,16 @@ class DimStats:
 
 
 def _normalize(x: np.ndarray, stat: dict, mode: str) -> np.ndarray:
-    """Apply the policy's normalization to ``x`` (n, D) — mirrors
-    ``opentau.policies.normalize.Normalize.forward``."""
+    """Apply the policy's base normalization formula to ``x`` (n, D).
+
+    Implements the MEAN_STD / MIN_MAX / QUANTILE arithmetic of
+    ``opentau.policies.normalize.Normalize.forward`` on the real (already
+    ``_slice_stat``-trimmed) dims. It intentionally omits the zero-range guard
+    (the ``denom -> 1`` snap and the ``config_version`` ``zero_range_center``
+    convention): padded columns are sliced out upstream, so the only dims where
+    this diverges from the model are genuinely-constant real dims (``max == min``
+    / ``std == 0``), whose diagnostic z-scores here are unbounded rather than
+    snapped — a deliberate signal that the dim is degenerate."""
     if mode == "MEAN_STD":
         return (x - stat["mean"]) / (stat["std"] + EPS)
     if mode == "MIN_MAX":

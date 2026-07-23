@@ -22,6 +22,7 @@ and safetensors for efficient serialization.
 """
 
 import abc
+import json
 import logging
 import os
 from collections.abc import Iterator
@@ -31,7 +32,7 @@ from typing import Type, TypeVar
 import numpy as np
 import torch
 from huggingface_hub import hf_hub_download
-from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
+from huggingface_hub.constants import CONFIG_NAME, SAFETENSORS_SINGLE_FILE
 from huggingface_hub.errors import HfHubHTTPError
 from safetensors.torch import save_model as save_model_as_safetensor
 from torch import Tensor, nn
@@ -68,6 +69,126 @@ NORM_BUFFER_PREFIXES: tuple[str, ...] = tuple(f"{name}.buffer_" for name in NORM
 def is_norm_buffer_key(key: str) -> bool:
     """Return True iff ``key`` names a Normalize/Unnormalize stat parameter."""
     return any(key.startswith(prefix) for prefix in NORM_BUFFER_PREFIXES)
+
+
+def _extract_config_version(data: object) -> int | None:
+    """Pull ``config_version`` from a raw config dict.
+
+    Looks at the top level (``config.json`` written by
+    ``PreTrainedConfig._save_pretrained``) and under a ``"policy"`` sub-dict
+    (``train_config.json`` written by ``TrainPipelineConfig._save_pretrained``).
+    Returns ``None`` when absent or malformed. ``bool`` is rejected explicitly
+    because it is an ``int`` subclass and a stray ``true`` should not read as 1.
+    """
+    if not isinstance(data, dict):
+        return None
+    for scope in (data, data.get("policy")):
+        if isinstance(scope, dict):
+            v = scope.get("config_version")
+            if isinstance(v, bool) or v is None:
+                continue
+            if isinstance(v, int):
+                return v
+    return None
+
+
+def _peek_config_version(
+    pretrained_name_or_path: str | Path,
+    *,
+    revision: str | None = None,
+    cache_dir: str | Path | None = None,
+    force_download: bool = False,
+    proxies: dict | None = None,
+    resume_download: bool | None = None,
+    token: str | bool | None = None,
+    local_files_only: bool = False,
+) -> int | None:
+    """Best-effort read of the ``config_version`` a weights source was saved with.
+
+    Reads ``config.json`` (HF-converted repos), then ``train_config.json``
+    (training checkpoints, which carry no ``config.json``), then
+    ``hf_config.json`` (the name the checkpoint convert-and-upload tooling gives
+    the train config it publishes to a ``TensorAuto/*`` repo — a full
+    passthrough of ``train_config.json``, so ``.policy.config_version`` rides
+    along) from a local directory or an HF repo. Reads ONLY the version int —
+    never the whole config — so it cannot override a caller-supplied ``config``.
+    Any failure (missing file, unreadable, no key) returns ``None``; the caller
+    then treats the source as pre-fix (legacy 0). Not ``$ref``-resolved:
+    checkpoints are written as flat dumps, and a version behind a ``$ref`` is a
+    non-issue.
+    """
+    # Lazy import avoids a configs.train <-> policies.pretrained import cycle.
+    from opentau.configs.train import TRAIN_CONFIG_NAME
+
+    model_id = str(pretrained_name_or_path)
+    dl_kwargs = {
+        "revision": revision,
+        "cache_dir": cache_dir,
+        "force_download": force_download,
+        "proxies": proxies,
+        "resume_download": resume_download,
+        "token": token,
+        "local_files_only": local_files_only,
+    }
+    # "hf_config.json" is not a repo constant — it is the filename the out-of-repo
+    # convert-and-upload script writes; kept as a literal so the loader stays
+    # self-contained (see CHANGELOG "Converted / uploaded checkpoints").
+    for filename in (CONFIG_NAME, TRAIN_CONFIG_NAME, "hf_config.json"):
+        try:
+            if os.path.isdir(model_id):
+                path = os.path.join(model_id, filename)
+                if not os.path.isfile(path):
+                    continue
+            else:
+                path = hf_hub_download(repo_id=model_id, filename=filename, **dl_kwargs)
+            with open(path) as f:
+                data = json.load(f)
+        except Exception:  # noqa: BLE001  # nosec B112 — provenance peek is strictly best-effort
+            continue
+        version = _extract_config_version(data)
+        if version is not None:
+            return version
+    return None
+
+
+def _read_action_norm_meta(
+    tokenizer_path: str | Path,
+    *,
+    revision: str | None = None,
+    cache_dir: str | Path | None = None,
+    token: str | bool | None = None,
+    local_files_only: bool = False,
+) -> dict | None:
+    """Best-effort read of a fitted FAST tokenizer's ``ACTION_NORM_META_FILE`` sidecar.
+
+    Returns the parsed dict (``{"config_version": int, "zero_range_center": bool}``)
+    or ``None`` when the sidecar is absent/unreadable — the case for upstream
+    tokenizers (e.g. ``physical-intelligence/fast``) and any tokenizer fit before
+    convention versioning. A ``None`` return means "makes no claim", which the
+    caller treats as a no-op rather than a mismatch.
+    """
+    from opentau.policies.normalize import ACTION_NORM_META_FILE
+
+    model_id = str(tokenizer_path)
+    try:
+        if os.path.isdir(model_id):
+            path = os.path.join(model_id, ACTION_NORM_META_FILE)
+            if not os.path.isfile(path):
+                return None
+        else:
+            path = hf_hub_download(
+                repo_id=model_id,
+                filename=ACTION_NORM_META_FILE,
+                revision=revision,
+                cache_dir=cache_dir,
+                token=token,
+                local_files_only=local_files_only,
+            )
+        with open(path) as f:
+            data = json.load(f)
+    except Exception:  # noqa: BLE001 — sidecar read is strictly best-effort
+        return None
+    return data if isinstance(data, dict) else None
 
 
 class ProjectionRemapError(ValueError):
@@ -287,6 +408,29 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                 **kwargs,
             )
         model_id = str(pretrained_name_or_path)
+
+        # Resolve the normalization-convention version from the weights being
+        # loaded, BEFORE `cls(config)` builds the Normalize modules off it (see
+        # `CURRENT_CONFIG_VERSION`). We are loading real weights, so an absent
+        # tag means a pre-fix checkpoint -> legacy 0; a tagged source is
+        # inherited; an explicitly-set `config_version` (a CLI/JSON escape hatch,
+        # or an already-resolved config) is honored untouched. This is the single
+        # chokepoint every weight load crosses — factory finetune, resume, gRPC
+        # serve, ONNX/TensorRT export — so keying the convention off the weights
+        # here also makes serving/exporting a published legacy checkpoint stay
+        # legacy without touching those scripts ("disk is truth").
+        if config.config_version is None:
+            peeked = _peek_config_version(
+                pretrained_name_or_path,
+                revision=revision,
+                cache_dir=cache_dir,
+                force_download=force_download,
+                proxies=proxies,
+                resume_download=resume_download,
+                token=token,
+                local_files_only=local_files_only,
+            )
+            config.config_version = peeked if peeked is not None else 0
 
         # Warn (never raise) when the checkpoint's resize target disagrees
         # with its bound image features — the load-time symptom of a legacy
@@ -721,6 +865,56 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                 f"buffers are still +inf: {bad}. Either re-save the checkpoint "
                 "with `save_normalization_stats=True`, or pass `ds_meta=` to "
                 "`make_policy(...)` so stats are injected after load."
+            )
+
+    def _check_discrete_action_tokenizer_convention(
+        self, tokenizer_path: str | Path, **download_kwargs
+    ) -> None:
+        """Raise if a fitted FAST tokenizer's zero-range convention disagrees with this policy.
+
+        A FAST tokenizer bakes the ``discrete_actions`` normalization convention
+        (``config_version`` 0: zero-range band -> -1.0; >= 1: -> 0.0) into its BPE
+        corpus, so a policy and its tokenizer MUST agree or the padded action
+        columns tokenize to values the corpus never saw. Called by every policy
+        that loads a ``discrete_action_processor`` after
+        ``AutoProcessor.from_pretrained``.
+
+        Only OUR fitted tokenizers carry the ``ACTION_NORM_META_FILE`` sidecar;
+        upstream tokenizers (``physical-intelligence/fast``) and pre-versioning
+        ones do not, and make no claim — those are a no-op (no raise), so this
+        never breaks the shipped default. The check keys off the ``zero_range_center``
+        bit rather than the exact version, so an unrelated future version bump
+        doesn't invalidate a tokenizer whose convention is still current.
+
+        Sidecar read is scoped by path type: a local tokenizer directory reads
+        the file directly (no network), while an HF-repo tokenizer attempts a
+        network read for the sidecar — ``AutoProcessor.from_pretrained`` fetches
+        only its own files, not this sidecar, so cache-only would silently
+        no-op exactly the shared/Hub-hosted fitted tokenizer where a mismatch is
+        most likely. The repo was already contacted to load the tokenizer, so
+        this adds no new dependency, and the reader fails open (any error →
+        ``None`` → no enforcement), so offline construction still can't break.
+        Pass ``local_files_only`` explicitly to override the per-path default.
+        """
+        download_kwargs.setdefault("local_files_only", os.path.isdir(str(tokenizer_path)))
+        meta = _read_action_norm_meta(tokenizer_path, **download_kwargs)
+        if meta is None or "zero_range_center" not in meta:
+            return
+        tokenizer_center = bool(meta["zero_range_center"])
+        policy_center = self.config.zero_range_centers_on_zero()
+        if tokenizer_center != policy_center:
+            raise ValueError(
+                "Discrete-action FAST tokenizer / policy normalization mismatch: "
+                f"tokenizer at '{tokenizer_path}' was fit with "
+                f"zero_range_center={tokenizer_center} (config_version "
+                f"{meta.get('config_version', '?')}), but this policy resolves to "
+                f"zero_range_center={policy_center} (config_version "
+                f"{self.config.resolved_config_version()}). Padded action columns "
+                "would tokenize against a corpus built for the other convention. "
+                "Fix by either re-fitting the tokenizer with "
+                f"`fit_fast_tokenizer.py --config-version {self.config.resolved_config_version()}`, "
+                "or pinning the policy to the tokenizer's convention with "
+                f"`--policy.config_version={meta.get('config_version', 0)}`."
             )
 
     def _promote_legacy_norm_buffers_in_state_dict(self, state_dict_to_load: dict) -> None:

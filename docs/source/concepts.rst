@@ -124,6 +124,13 @@ targets on the padded tail dims — under per-dataset normalization (where
 padded-dim stats are ``mean=0, std=0``) that signal is a clean "predict 0
 here" that contaminates samples in the same batch which do use those dims.
 
+The normalized *value* of a padded dim depends on the mode and the checkpoint's
+``config_version`` (see ``CHANGELOG.md``). MEAN_STD always yields ``0.0`` on a
+zero-std dim. MIN_MAX / QUANTILE yield ``0.0`` under ``config_version >= 1``
+(matching openpi's pad-after-normalize output) and ``-1.0`` under the legacy
+``config_version`` 0 that every pre-fix checkpoint was trained with; the version
+is resolved automatically from the loaded weights.
+
 The name parallels (not collides with) the static ``original_action_dim``
 local variable in each policy's inference path
 (``sample_actions`` / ``select_action``), which is
