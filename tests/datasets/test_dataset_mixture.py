@@ -297,20 +297,30 @@ class TestResolveMixtureDeltaMap:
         m = self._meta(["robot", "vqa"], [{0: 0, 1: 1}, None], [False, True])
         assert m._resolve_mixture_delta_map() == {0: 0, 1: 1}
 
-    def test_only_pi05_carries_the_delta_field_the_factory_guard_relies_on(self):
+    def test_only_delta_capable_policies_carry_the_field_the_factory_guard_relies_on(self):
         """`make_policy` raises when a delta mixture meets a policy without the inverse. That
         guard keys off `hasattr(cfg, "delta_action_state_map")`, so it stays correct only while
-        pi05 is the sole config with the field. Pin the invariant: if another policy gains the
-        field it must also gain the `sample_actions` inverse, or the guard silently lets a broken
-        delta-trained policy through.
-        """
-        from opentau.policies.pi0.configuration_pi0 import PI0Config
-        from opentau.policies.pi05.configuration_pi05 import PI05Config
-        from opentau.policies.pi06.configuration_pi06 import PI06Config
+        the config field and the `sample_actions` inverse travel together. Pin the invariant
+        across the WHOLE registry (not a hand-picked few): if any future config gains the field
+        without the inverse, this fails and forces the guard to be revisited.
 
-        assert "delta_action_state_map" in PI05Config.__dataclass_fields__
-        assert "delta_action_state_map" not in PI0Config.__dataclass_fields__
-        assert "delta_action_state_map" not in PI06Config.__dataclass_fields__
+        `pi05` is currently the only policy with the delta-action inference inverse.
+        """
+        from opentau import available_policies
+        from opentau.policies.factory import make_policy_config
+
+        delta_capable = {"pi05"}
+        have_field = {
+            t
+            for t in available_policies
+            if "delta_action_state_map" in type(make_policy_config(t)).__dataclass_fields__
+        }
+        assert have_field == delta_capable, (
+            f"policies with `delta_action_state_map` ({sorted(have_field)}) must exactly match "
+            f"those with the `sample_actions` delta inverse ({sorted(delta_capable)}). A new "
+            "entry here means a policy can be trained on delta actions but won't invert them at "
+            "inference — add the inverse (see PI05Policy.sample_actions) or drop the field."
+        )
 
 
 class TestWeightedDatasetMixture:

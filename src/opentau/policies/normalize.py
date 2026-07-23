@@ -31,22 +31,21 @@ from torch import Tensor, nn
 
 from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
 
-# Matches openpi's normalization epsilon (``1e-6`` in ``openpi.transforms.Normalize``), so a
-# policy trained here and one trained there agree to well under float32 resolution on the same
-# inputs. This was ``1e-8`` before.
-#
-# Impact on existing checkpoints (there is no ``config_version`` gate in this repo, and this is
-# immaterial rather than something to gate):
-#   * MEAN_STD / MIN_MAX / QUANTILE outputs shift by ~1e-6 relative (~10 ULP in float32) for any
-#     dim whose std/range is not near-degenerate — far below what changes a trained policy's
-#     behavior, and below the tolerance of the checkpoint round-trip tests.
-#   * The zero-variance snap threshold widens 100x, so a dim with std/range in the narrow band
-#     (1e-8, 1e-6) now snaps to 1 instead of dividing by ~1e-7. Such a dim is essentially
-#     constant (varies by ~1e-7); dividing by ~1e-7 would amplify noise toward the ~1e6
-#     "outlier normalized state" blow-up the snap guard exists to prevent, so snapping it is if
-#     anything safer, not a regression. Genuinely-constant padding dims (std == 0) are a no-op
-#     either way.
-EPS = 1e-6  # Small epsilon value for numerical stability in normalization
+# Normalization epsilon, config_version-gated so existing checkpoints keep the value their
+# weights were trained under (see `PreTrainedConfig.normalization_epsilon`):
+#   * OPENPI_EPS (1e-6) — matches openpi's `openpi.transforms.Normalize`, used at
+#     config_version >= 1. A policy trained here and one trained in openpi then agree to well
+#     under float32 resolution on the same inputs.
+#   * LEGACY_EPS (1e-8) — the pre-openpi-parity value, used at config_version 0 so a legacy
+#     checkpoint normalizes exactly as its weights were trained.
+# The epsilon is added to every denominator AND used as the zero-range / zero-variance snap
+# threshold, so both move together with the version. `Normalize`/`Unnormalize` take it as the
+# `eps` kwarg (threaded from `config.normalization_epsilon()`); the module-level `EPS` is the
+# default for direct constructions that don't specify one (tests, tooling) and equals the
+# current openpi value.
+OPENPI_EPS = 1e-6
+LEGACY_EPS = 1e-8
+EPS = OPENPI_EPS  # Default epsilon for direct constructions that don't thread a version-gated one
 
 # Sidecar file a fitted FAST action tokenizer carries to record the zero-range
 # normalization convention its BPE corpus was built under (written by
@@ -411,6 +410,7 @@ class Normalize(nn.Module):
         dataset_names: list[str] | None = None,
         num_datasets: int | None = None,
         zero_range_center: bool = False,
+        eps: float = EPS,
     ):
         """Initializes the Normalize module.
 
@@ -438,11 +438,17 @@ class Normalize(nn.Module):
                 pre-existing behavior (and every test that builds ``Normalize``
                 directly) is unchanged. No effect on MEAN_STD, which already
                 emits ``0.0`` on a zero-std dim (it has no ``-1`` re-centering).
+            eps: Denominator / zero-range-snap epsilon. ``OPENPI_EPS`` (1e-6,
+                ``config_version`` >= 1, the module default) or ``LEGACY_EPS``
+                (1e-8, ``config_version`` 0). Resolved per-policy from
+                ``config.normalization_epsilon()`` and threaded in alongside
+                ``zero_range_center`` — the two form the v1 openpi-parity bundle.
         """
         super().__init__()
         self.features = features
         self.norm_map = norm_map
         self.zero_range_center = zero_range_center
+        self.eps = eps
         self.dataset_names = list(dataset_names) if dataset_names is not None else None
         if (
             per_dataset_stats is not None
@@ -482,13 +488,13 @@ class Normalize(nn.Module):
                 continue
             if norm_mode is NormalizationMode.MEAN_STD:
                 std = _materialize(buffer["std"])
-                if bool((torch.isfinite(std) & (std.abs() < EPS)).any()):
+                if bool((torch.isfinite(std) & (std.abs() < self.eps)).any()):
                     active = True
                     break
             elif norm_mode in (NormalizationMode.MIN_MAX, NormalizationMode.QUANTILE):
                 lo_name, hi_name = stat_names_for_mode(norm_mode)
                 rng = _materialize(buffer[hi_name]) - _materialize(buffer[lo_name])
-                if bool((torch.isfinite(rng) & (rng.abs() < EPS)).any()):
+                if bool((torch.isfinite(rng) & (rng.abs() < self.eps)).any()):
                     active = True
                     break
         self._snap_active = active
@@ -529,10 +535,10 @@ class Normalize(nn.Module):
                 assert not torch.isinf(std).any(), _no_stats_error_str("std")
                 # Snap a genuinely-zero std (constant/padding dim) to 1 so a deviating value
                 # can't become (x - mean)/EPS ~ 1e8. std >= EPS dims stay bit-identical.
-                std_is_zero = std.abs() < EPS
+                std_is_zero = std.abs() < self.eps
                 std = torch.where(std_is_zero, torch.ones_like(std), std)
                 deviation = batch_val - mean
-                batch[key] = deviation / (std + EPS)
+                batch[key] = deviation / (std + self.eps)
                 # Loud warning (deduped per (feature,dim), re-fired on a larger deviation), but
                 # only when the snap actually changed the output (a real deviation from a
                 # "constant" dim). The _SNAP_WARN_TOL>0 / compile / ONNX checks short-circuit before
@@ -553,7 +559,7 @@ class Normalize(nn.Module):
                 assert not torch.isinf(max_).any(), _no_stats_error_str(hi_name)
                 # Snap a zero range (max == min: constant dim) to 1 — same blow-up class.
                 raw_range = max_ - min_
-                denom_is_zero = raw_range.abs() < EPS
+                denom_is_zero = raw_range.abs() < self.eps
                 denom = torch.where(denom_is_zero, torch.ones_like(raw_range), raw_range)
                 deviation = batch_val - min_
                 # zero_range_center (config_version >= 1): on a zero-range band, add
@@ -569,7 +575,7 @@ class Normalize(nn.Module):
                 shifted = deviation
                 if self.zero_range_center:
                     shifted = deviation + 0.5 * (denom - raw_range)
-                batch[key] = shifted / (denom + EPS)
+                batch[key] = shifted / (denom + self.eps)
                 # normalize to [-1, 1]
                 batch[key] = batch[key] * 2 - 1
                 if (
@@ -594,16 +600,18 @@ class Unnormalize(nn.Module):
         dataset_names: list[str] | None = None,
         num_datasets: int | None = None,
         zero_range_center: bool = False,
+        eps: float = EPS,
     ):
         """See :class:`Normalize.__init__` for argument semantics.
 
-        ``zero_range_center`` must match the ``Normalize`` it inverts so
+        ``zero_range_center`` and ``eps`` must match the ``Normalize`` this inverts so
         ``Unnormalize(Normalize(x))`` round-trips exactly on a zero-range dim.
         """
         super().__init__()
         self.features = features
         self.norm_map = norm_map
         self.zero_range_center = zero_range_center
+        self.eps = eps
         self.dataset_names = list(dataset_names) if dataset_names is not None else None
         if (
             per_dataset_stats is not None
@@ -653,8 +661,8 @@ class Unnormalize(nn.Module):
                 # Mirror Normalize's guard so Unnormalize(Normalize(x)) round-trips on a snapped
                 # dim: with std=1 the inverse x*(1+EPS)+mean recovers the deviation; the legacy
                 # x*EPS+mean would collapse it to ~mean. std >= EPS dims stay bit-identical.
-                std = torch.where(std.abs() < EPS, torch.ones_like(std), std)
-                batch[key] = batch_val * (std + EPS) + mean
+                std = torch.where(std.abs() < self.eps, torch.ones_like(std), std)
+                batch[key] = batch_val * (std + self.eps) + mean
             elif norm_mode in (NormalizationMode.MIN_MAX, NormalizationMode.QUANTILE):
                 lo_name, hi_name = stat_names_for_mode(norm_mode)
                 min_ = _gather_and_broadcast(_materialize(buffer[lo_name]), dataset_index, batch_val)
@@ -664,9 +672,9 @@ class Unnormalize(nn.Module):
                     assert not torch.isinf(max_).any(), _no_stats_error_str(hi_name)
                 # Snap a zero range to 1 to mirror Normalize (keeps the round-trip exact).
                 raw_range = max_ - min_
-                denom = torch.where(raw_range.abs() < EPS, torch.ones_like(raw_range), raw_range)
+                denom = torch.where(raw_range.abs() < self.eps, torch.ones_like(raw_range), raw_range)
                 batch[key] = (batch_val + 1) / 2
-                batch[key] = batch[key] * (denom + EPS) + min_
+                batch[key] = batch[key] * (denom + self.eps) + min_
                 # Invert the zero_range_center numerator offset applied in Normalize
                 # (subtract what was added). Float-exact no-op on healthy dims, exactly
                 # cancels the `0.5 * (denom - raw_range)` shift on a zero-range band.

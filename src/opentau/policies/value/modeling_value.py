@@ -209,12 +209,14 @@ class ValueFunction(PreTrainedPolicy):
             self._dataset_to_norm_index = surviving or {kept[0]: 0}
         num_datasets = 1
         zero_range_center = config.zero_range_centers_on_zero()
+        eps = config.normalization_epsilon()
         self.normalize_inputs = Normalize(
             config.input_features,
             config.normalization_mapping,
             per_dataset_stats=per_dataset_stats,
             num_datasets=num_datasets,
             zero_range_center=zero_range_center,
+            eps=eps,
         )
 
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-270m")

@@ -364,6 +364,7 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
         self.config = config
         num_datasets = _num_datasets(per_dataset_stats, dataset_names, config)
         zero_range_center = config.zero_range_centers_on_zero()
+        eps = config.normalization_epsilon()
         self.normalize_inputs = Normalize(
             config.input_features,
             config.normalization_mapping,
@@ -371,6 +372,7 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
             dataset_names=dataset_names,
             num_datasets=num_datasets,
             zero_range_center=zero_range_center,
+            eps=eps,
         )
         self.normalize_targets = Normalize(
             config.output_features,
@@ -379,6 +381,7 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
             dataset_names=dataset_names,
             num_datasets=num_datasets,
             zero_range_center=zero_range_center,
+            eps=eps,
         )
         self.normalize_discrete_actions = Normalize(
             config.output_features,
@@ -387,6 +390,7 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
             dataset_names=dataset_names,
             num_datasets=num_datasets,
             zero_range_center=zero_range_center,
+            eps=eps,
         )
         self.unnormalize_outputs = Unnormalize(
             config.output_features,
@@ -395,6 +399,7 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
             dataset_names=dataset_names,
             num_datasets=num_datasets,
             zero_range_center=zero_range_center,
+            eps=eps,
         )
 
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-4b-pt")
