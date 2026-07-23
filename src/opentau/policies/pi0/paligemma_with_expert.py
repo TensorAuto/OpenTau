@@ -285,16 +285,18 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         encoder-dtype hand-off is done by the patched ``SiglipVisionTransformer.forward`` in
         :mod:`opentau.utils.transformers_patch`.
 
-        The pinning is preserved by ONNX export (``scripts/export_to_onnx.py``, float32),
-        FSDP training (``train.py`` skips the cast below under FSDP), and the inference /
-        serving entry points (the gRPC server, ``scripts/inference.py``, ``eval.py``,
-        ``benchmark_inference.py``, ``high_level_planner_inference.py``,
-        ``actions_mse_loss.py``), which do their blanket bfloat16 cast through
-        :func:`opentau.policies.utils.to_dtype_preserving_siglip_float32` so these tables
-        stay float32. The remaining gap is the non-FSDP training cast (``train.py`` /
-        ``profile_step.py`` under DeepSpeed / DDP), which still blanket-casts to bfloat16:
-        re-introducing float32 params after the cast there would change how ZeRO / DDP
-        partition parameters and needs multi-rank validation (deferred to a follow-up).
+        These tables are used in the patch-conv / posemb *compute* in float32 only at
+        inference / serving / ONNX export: the inference entry points (the gRPC server,
+        ``scripts/inference.py``, ``eval.py``, ``benchmark_inference.py``,
+        ``high_level_planner_inference.py``, ``actions_mse_loss.py``) route their blanket
+        bfloat16 cast through :func:`opentau.policies.utils.to_dtype_preserving_siglip_float32`,
+        and ONNX export runs in float32. No *training* backend computes them in float32: DDP
+        and non-FSDP DeepSpeed blanket-cast the whole policy to bfloat16 (``train.py`` /
+        ``profile_step.py``), and FSDP keeps a float32 master but its
+        ``MixedPrecision(param_dtype=bfloat16)`` materializes bfloat16 compute params in the
+        all-gather. That gap is small (patch-conv compute differs ~0.14% in the image tokens,
+        ~1e-4 in the sampled actions; the default freezes the vision encoder) and is tracked
+        for a backend-specific, multi-rank-validated follow-up in issue #483.
         """
         self.paligemma = self.paligemma.to(dtype=torch.bfloat16)
 
