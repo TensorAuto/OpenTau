@@ -26,15 +26,28 @@ respect by substituting each dataset's native fps (same convention as
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from opentau.configs.default import DatasetConfig
 from opentau.scripts.fit_fast_tokenizer import (
     _normalize_chunks,
     _normalize_chunks_per_head,
+    _normalize_eps_for,
     _pool_per_head_stats,
     _sample_chunks_for_dataset_manual,
 )
 from tests.fixtures.constants import DEFAULT_FPS, DUMMY_REPO_ID
+
+
+@pytest.mark.parametrize("config_version, expected", [(0, 1e-8), (1, 1e-6), (2, 1e-6)])
+def test_normalize_eps_for_is_version_gated(config_version, expected):
+    """The tokenizer must fit its BPE corpus with the same epsilon the runtime policy uses:
+    legacy 1e-8 at config_version 0, openpi's 1e-6 at v1+ (matching `normalization_epsilon()`).
+    """
+    from opentau.policies.normalize import LEGACY_EPS, OPENPI_EPS
+
+    assert _normalize_eps_for(config_version) == expected
+    assert {_normalize_eps_for(0), _normalize_eps_for(1)} == {LEGACY_EPS, OPENPI_EPS}
 
 
 class TestSampleChunksManualActionFreq:

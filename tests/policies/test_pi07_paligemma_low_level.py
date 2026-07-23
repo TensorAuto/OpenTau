@@ -2868,6 +2868,32 @@ class TestDecodeDiscreteActionTokens:
         assert out.shape == (2, self.CHUNK_SIZE, self.MAX_ACTION_DIM)
         assert torch.isfinite(out).all()
 
+    def test_inline_inverse_honors_the_modules_version_gated_eps(self):
+        """The inline inverse must read the paired module's version-gated ``eps``, not a
+        hardcoded module constant. Mutation-killer for the fix: a range of ``1e-7`` sits between
+        ``LEGACY_EPS`` (1e-8) and ``OPENPI_EPS`` (1e-6), so a v0 checkpoint (``eps=1e-8``) does
+        NOT snap it (divides by ~1e-7) while a v1 checkpoint (``eps=1e-6``) snaps it to denom 1.
+        Same tokens → outputs differing by orders of magnitude. Reverting the inverse to module
+        ``EPS`` would make both use 1e-6 and this assertion fails.
+        """
+        from opentau.policies.normalize import LEGACY_EPS, OPENPI_EPS
+
+        min_t = torch.zeros(1, self.MAX_ACTION_DIM)
+        max_t = torch.full((1, self.MAX_ACTION_DIM), 1e-7)  # range between the two epsilons
+        decode_map = {(1,): self.NONZERO_CHAR * self.N_COEFFS}
+        dataset_index = torch.tensor([0])
+        kwargs = {"num_datasets": 1, "min_max": (min_t, max_t)}
+        out_v0 = PI07PaligemmaLowLevelPolicy._decode_discrete_action_tokens(
+            self._make_stub(decode_map, eps=LEGACY_EPS, **kwargs), [[1]], dataset_index, torch.device("cpu")
+        )
+        out_v1 = PI07PaligemmaLowLevelPolicy._decode_discrete_action_tokens(
+            self._make_stub(decode_map, eps=OPENPI_EPS, **kwargs), [[1]], dataset_index, torch.device("cpu")
+        )
+        # v0 divides by ~1e-7 (no snap) -> tiny magnitude; v1 snaps to denom 1 -> O(1). The two
+        # differ by ~7 orders of magnitude, so they cannot be close.
+        assert not torch.allclose(out_v0, out_v1), "inline inverse ignored the module's eps"
+        assert out_v0.abs().max() < out_v1.abs().max()
+
     def test_over_length_stream_is_truncated(self):
         """Extra chars beyond n_coeffs are ignored (truncated): a stream of
         n_coeffs zero-coeff chars followed by NON-zero chars must decode
