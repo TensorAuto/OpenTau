@@ -778,6 +778,7 @@ def _normalize_chunks_per_head(
     per_ds_min: list[np.ndarray],
     per_ds_max: list[np.ndarray],
     zero_range_center: bool = False,
+    eps: float = 1e-6,
 ) -> np.ndarray:
     """Apply per-dataset min/max to chunks in dataset-config order.
 
@@ -806,7 +807,7 @@ def _normalize_chunks_per_head(
         if count <= 0:
             continue
         out[offset : offset + count] = _normalize_chunks(
-            stacked[offset : offset + count], per_ds_min[i], per_ds_max[i], zero_range_center
+            stacked[offset : offset + count], per_ds_min[i], per_ds_max[i], zero_range_center, eps
         )
         offset += count
     return out
@@ -1191,7 +1192,14 @@ def _extract_action_stats(mixture_meta: Any, action_dim: int) -> tuple[np.ndarra
     return action_min, action_max
 
 
-_NORMALIZE_EPS = 1e-8  # matches ``opentau.policies.normalize.EPS``.
+def _normalize_eps_for(config_version: int) -> float:
+    """The normalization epsilon a policy at ``config_version`` uses, so the BPE corpus is
+    normalized with the same epsilon the runtime policy will (``LEGACY_EPS`` at v0,
+    ``OPENPI_EPS`` at v1+). Mirrors how ``zero_range_center`` is selected off the same version.
+    """
+    from opentau.policies.normalize import LEGACY_EPS, OPENPI_EPS
+
+    return OPENPI_EPS if config_version >= 1 else LEGACY_EPS
 
 
 def _normalize_chunks(
@@ -1199,6 +1207,7 @@ def _normalize_chunks(
     action_min: np.ndarray,
     action_max: np.ndarray,
     zero_range_center: bool = False,
+    eps: float = 1e-6,
 ) -> np.ndarray:
     """Min-max-normalize a stacked chunk tensor ``(N, T, D)`` to ``[-1, 1]``.
 
@@ -1228,13 +1237,13 @@ def _normalize_chunks(
     """
     x = chunks.astype(np.float64)
     if not zero_range_center:
-        span_with_eps = (action_max - action_min) + _NORMALIZE_EPS
+        span_with_eps = (action_max - action_min) + eps
         norm = (x - action_min) / span_with_eps * 2.0 - 1.0
     else:
         raw_range = action_max - action_min
-        denom = np.where(np.abs(raw_range) < _NORMALIZE_EPS, 1.0, raw_range)
+        denom = np.where(np.abs(raw_range) < eps, 1.0, raw_range)
         dev = (x - action_min) + 0.5 * (denom - raw_range)
-        norm = dev / (denom + _NORMALIZE_EPS) * 2.0 - 1.0
+        norm = dev / (denom + eps) * 2.0 - 1.0
     norm = np.nan_to_num(norm, nan=0.0, posinf=0.0, neginf=0.0)
     return norm.astype(np.float32)
 
@@ -1245,6 +1254,7 @@ def _drain_mixture(
     total_chunks: int,
     action_dim: int,
     zero_range_center: bool = False,
+    eps: float = 1e-6,
 ) -> tuple[np.ndarray, int]:
     """Iterate the WeightedDatasetMixture dataloader, normalize, collect chunks.
 
@@ -1281,7 +1291,7 @@ def _drain_mixture(
         # max_action_dim, so D == action_dim here.
         if actions.ndim != 3:
             raise RuntimeError(f"Unexpected actions batch ndim={actions.ndim}, shape={actions.shape}")
-        normalized = _normalize_chunks(actions, action_min, action_max, zero_range_center)
+        normalized = _normalize_chunks(actions, action_min, action_max, zero_range_center, eps)
         take = min(normalized.shape[0], total_chunks - n_collected)
         collected.append(normalized[:take])
         n_collected += take
@@ -1465,12 +1475,16 @@ def main() -> int:
 
     # Whether to fit under the config_version >= 1 zero-range convention (padded
     # action column -> 0.0). Recorded in the tokenizer sidecar and enforced at
-    # policy load; see `_normalize_chunks`.
+    # policy load; see `_normalize_chunks`. The normalization epsilon is gated off
+    # the same version so the BPE corpus is normalized with the exact epsilon the
+    # runtime policy will use (1e-8 at v0, openpi's 1e-6 at v1).
     zero_range_center = args.config_version >= 1
+    norm_eps = _normalize_eps_for(args.config_version)
     logger.info(
-        "Fitting under config_version=%d (zero_range_center=%s).",
+        "Fitting under config_version=%d (zero_range_center=%s, eps=%g).",
         args.config_version,
         zero_range_center,
+        norm_eps,
     )
 
     # The --use-mixture-dataloader path uses ``_extract_action_stats(mixture.meta, ...)``
@@ -1555,7 +1569,7 @@ def main() -> int:
         t_drain0 = time.perf_counter()
         dataloader = mixture.get_dataloader()
         all_chunks, n_batches = _drain_mixture(
-            mixture.meta, dataloader, args.total_chunks, args.action_dim, zero_range_center
+            mixture.meta, dataloader, args.total_chunks, args.action_dim, zero_range_center, norm_eps
         )
         drain_time = time.perf_counter() - t_drain0
         logger.info(
@@ -1620,10 +1634,10 @@ def main() -> int:
             stacked[i, :, :clip] = c[:, :clip]
         if args.per_head_norm:
             all_chunks = _normalize_chunks_per_head(
-                stacked, per_dataset_chunks, per_ds_min, per_ds_max, zero_range_center
+                stacked, per_dataset_chunks, per_ds_min, per_ds_max, zero_range_center, norm_eps
             )
         else:
-            all_chunks = _normalize_chunks(stacked, action_min, action_max, zero_range_center)
+            all_chunks = _normalize_chunks(stacked, action_min, action_max, zero_range_center, norm_eps)
         drain_time = time.perf_counter() - t_drain0
         logger.info(
             "Manual path: %d chunks normalized in %.1fs (norm=%s)",

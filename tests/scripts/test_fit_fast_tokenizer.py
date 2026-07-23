@@ -240,10 +240,12 @@ class TestNormalizeChunksPerHead:
 
         out = _normalize_chunks_per_head(stacked, per_dataset_chunks, per_ds_min, per_ds_max)
 
-        # First two rows -> all +1 (ds 0 at its raw_max)
-        np.testing.assert_allclose(out[0:2], 1.0, atol=1e-7)
-        # Third row -> all -1 (ds 2 at its raw_min)
-        np.testing.assert_allclose(out[2], -1.0, atol=1e-7)
+        # First two rows -> all +1 (ds 0 at its raw_max); third row -> all -1 (ds 2 at raw_min).
+        # atol=1e-5 (not 1e-7): the default epsilon is now openpi's 1e-6, so a raw extreme maps to
+        # +/-0.999999, not +/-1 to 1e-7. (`_normalize_chunks_per_head` defaults eps to the current
+        # openpi value; a legacy fit passes LEGACY_EPS explicitly.)
+        np.testing.assert_allclose(out[0:2], 1.0, atol=1e-5)
+        np.testing.assert_allclose(out[2], -1.0, atol=1e-5)
 
     def test_matches_global_when_all_datasets_share_one_head(self):
         """Per-head normalization with one shared (rt, cm) === global."""

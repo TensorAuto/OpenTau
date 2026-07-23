@@ -2779,7 +2779,15 @@ class TestDecodeDiscreteActionTokens:
     NONZERO_CHAR = chr(NONZERO_ORD)
 
     @classmethod
-    def _make_stub(cls, decode_map: dict, *, num_datasets: int, min_max, zero_range_center: bool = False):
+    def _make_stub(
+        cls,
+        decode_map: dict,
+        *,
+        num_datasets: int,
+        min_max,
+        zero_range_center: bool = False,
+        eps: float = 1e-6,
+    ):
         """Build a stub policy object the UNBOUND method can be called on.
 
         Args:
@@ -2791,6 +2799,10 @@ class TestDecodeDiscreteActionTokens:
             zero_range_center: convention the inline inverse should apply on a
                 zero-range row (``config_version`` >= 1 -> True). No effect on a
                 real-range row (the numerator offset is 0 when ``max != min``).
+            eps: the version-gated normalization epsilon the paired
+                ``normalize_discrete_actions`` carries (``config_version`` 0 ->
+                1e-8, >= 1 -> 1e-6). The inline inverse reads it off the stub, so
+                the mock mirrors the real ``Normalize.eps`` attribute.
         """
         import types
 
@@ -2808,7 +2820,9 @@ class TestDecodeDiscreteActionTokens:
             scale=cls.SCALE,
         )
         norm = types.SimpleNamespace(
-            buffer_actions={"min": min_t, "max": max_t}, zero_range_center=zero_range_center
+            buffer_actions={"min": min_t, "max": max_t},
+            zero_range_center=zero_range_center,
+            eps=eps,
         )
         return types.SimpleNamespace(
             config=types.SimpleNamespace(chunk_size=cls.CHUNK_SIZE, max_action_dim=cls.MAX_ACTION_DIM),
