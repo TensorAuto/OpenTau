@@ -21,9 +21,11 @@ from typing import Optional, Tuple
 
 import torch
 from torch import nn
+from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.models.gemma import modeling_gemma
 from transformers.models.gemma.configuration_gemma import GemmaConfig
 from transformers.models.paligemma.modeling_paligemma import PaliGemmaModel
+from transformers.models.siglip.modeling_siglip import SiglipVisionTransformer
 
 from opentau.utils.vision_utils import pad_to_patch_multiple, patch_grid_hw
 
@@ -299,6 +301,51 @@ def patched_paligemma_model_get_image_features(self, pixel_values: torch.FloatTe
 
 
 PaliGemmaModel.get_image_features = patched_paligemma_model_get_image_features
+
+
+def patched_siglip_vision_transformer_forward(
+    self,
+    pixel_values,
+    interpolate_pos_encoding: bool = False,
+    **kwargs,
+):
+    """SigLIP vision-tower forward that bridges a float32 embedding stage into a bf16 encoder.
+
+    The original JAX (Big Vision) SigLIP — and openpi's PyTorch port — keep the patch-embedding
+    conv and the position-embedding table in float32 and cast to the (potentially bfloat16)
+    encoder dtype only *after* adding position embeddings. OpenTau pins those two tables to
+    float32 in ``to_bfloat16_like_physical_intelligence`` so their float32-master precision is
+    not rounded away on checkpoint load; stock HuggingFace
+    ``SiglipVisionTransformer.forward`` feeds the embeddings straight into the encoder without a
+    dtype cast, which would raise a dtype mismatch when the encoder is bfloat16. This patched
+    forward inserts that hand-off.
+
+    The cast is skipped whenever the tower is single-dtype (float32 everywhere as in the parity
+    harness / ONNX export, or bfloat16 everywhere as for the Gemma3 policies), so the patch is a
+    strict no-op except in the intended float32-embeddings -> bfloat16-encoder configuration.
+    Everything else mirrors the stock transformers forward.
+    """
+    hidden_states = self.embeddings(pixel_values, interpolate_pos_encoding=interpolate_pos_encoding)
+
+    if len(self.encoder.layers) > 0:
+        encoder_dtype = self.encoder.layers[0].self_attn.q_proj.weight.dtype
+        if hidden_states.dtype != encoder_dtype:
+            hidden_states = hidden_states.to(encoder_dtype)
+
+    encoder_outputs = self.encoder(inputs_embeds=hidden_states, **kwargs)
+
+    last_hidden_state = encoder_outputs.last_hidden_state
+    last_hidden_state = self.post_layernorm(last_hidden_state)
+
+    pooler_output = self.head(last_hidden_state) if self.use_head else None
+
+    return BaseModelOutputWithPooling(
+        last_hidden_state=last_hidden_state,
+        pooler_output=pooler_output,
+    )
+
+
+SiglipVisionTransformer.forward = patched_siglip_vision_transformer_forward
 
 
 # Re-export the PaliGemma entrypoint from this module so downstream code that

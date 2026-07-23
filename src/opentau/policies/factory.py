@@ -31,7 +31,7 @@ from typing import Optional
 import numpy as np
 from torch import nn
 
-from opentau.configs.policies import PreTrainedConfig
+from opentau.configs.policies import CURRENT_CONFIG_VERSION, PreTrainedConfig
 from opentau.configs.types import FeatureType
 from opentau.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from opentau.datasets.utils import dataset_to_policy_features
@@ -399,6 +399,17 @@ def make_policy(
         policy = policy_cls(**kwargs)
 
     assert isinstance(policy, nn.Module)
+
+    # Concretize the normalization-convention version so any checkpoint this
+    # policy later saves self-describes (a peeked `null` would be read as "no
+    # tag" -> legacy by a future fine-tune). The pretrained path already had it
+    # resolved to a concrete int by `from_pretrained` (inherited or legacy 0),
+    # so this only fires for a fresh/scratch policy, which is CURRENT by
+    # definition. Behavior is unchanged either way — the Normalize modules were
+    # already built reading `zero_range_centers_on_zero()`, which treats an
+    # unresolved `None` as CURRENT.
+    if cfg.config_version is None:
+        cfg.config_version = CURRENT_CONFIG_VERSION
 
     # If the checkpoint was saved with save_normalization_stats=False the
     # buffers loaded back as +inf — repopulate from the caller's stats if we

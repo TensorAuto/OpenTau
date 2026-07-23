@@ -1,0 +1,60 @@
+{
+  "robot": {
+    "type": "so101_follower",
+    "port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5C4C125545-if00",
+    "disable_torque_on_disconnect": true,
+    "max_relative_target": null,
+    "cameras": {
+      "front": {
+        "type": "opencv",
+        "fps": 30,
+        "width": 640,
+        "height": 480,
+        "index_or_path": "/dev/v4l/by-path/pci-0000:80:14.0-usb-0:3.2:1.0-video-index0",
+        "color_mode": "rgb",
+        "rotation": 0,
+        "warmup_s": 1,
+        "fourcc": "MJPG",
+        "backend": 200
+      },
+      "wrist_left": {
+        "type": "opencv",
+        "fps": 30,
+        "width": 640,
+        "height": 480,
+        "index_or_path": "/dev/v4l/by-path/pci-0000:80:14.0-usb-0:3.1:1.0-video-index0",
+        "color_mode": "rgb",
+        "rotation": 0,
+        "warmup_s": 1,
+        "fourcc": null,
+        "backend": 200
+      }
+    },
+    "use_degrees": true,
+    "id": "follower_left",
+    "calibration_dir": null
+  },
+  "teleop": {
+    "type": "so101_leader",
+    "port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5C4C126288-if00",
+    "use_degrees": true,
+    "id": "leader_left",
+    "calibration_dir": null
+  },
+  "dataset": {
+    "repo_id": "TensorAuto/CHANGE_ME",
+    "single_task": "CHANGE ME task description",
+    "root": null,
+    "fps": 30,
+    "episode_time_s": 60,
+    "reset_time_s": 10,
+    "num_episodes": 50,
+    "video": true,
+    "push_to_hub": false,
+    "private": true,
+    "num_image_writer_processes": 0,
+    "num_image_writer_threads_per_camera": 4
+  },
+  "resume": false,
+  "play_sounds": true
+}

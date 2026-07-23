@@ -103,6 +103,12 @@ opentau-train = "opentau.scripts.launch:train"
 opentau-eval = "opentau.scripts.launch:eval"
 opentau-export = "opentau.scripts.launch:export"
 opentau-dataset-viz = "opentau.scripts.launch:visualize"
+opentau-so101-calibrate = "opentau.scripts.so101.calibrate:main"
+opentau-so101-teleoperate = "opentau.scripts.so101.teleoperate:main"
+opentau-so101-record = "opentau.scripts.so101.record:main"
+opentau-so101-setup-motors = "opentau.scripts.so101.setup_motors:main"
+opentau-so101-find-port = "opentau.scripts.so101.find_port:main"
+opentau-so101-find-cameras = "opentau.scripts.so101.find_cameras:main"
 
 [project.optional-dependencies]
 dev = ["pre-commit>=3.7.0",
@@ -164,6 +170,9 @@ urdf = [
 ]
 trt = [
     "tensorrt>=10.15.1.29 ; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and (platform_machine == 'AMD64' or platform_machine == 'x86_64'))",
+]
+so101 = [
+    "feetech-servo-sdk>=1.0.0",
 ]
 
 [tool.uv.sources]

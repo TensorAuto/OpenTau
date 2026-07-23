@@ -242,6 +242,17 @@ class RLDXVideoEncoder(nn.Module):
         flat = rearrange(video, "b t c h w -> (b t) c h w")
         hidden = self.vision_tower.vision_model.embeddings(flat)
 
+        # The SigLIP patch/position embeddings are pinned to float32 (openpi parity, see
+        # PaliGemmaWithExpertModel.to_bfloat16_like_physical_intelligence). This encoder
+        # hand-rolls the SigLIP forward instead of routing through the patched
+        # SiglipVisionTransformer.forward, so it has to reproduce that forward's dtype
+        # bridge here: cast the float32 embeddings to the (possibly bfloat16) encoder dtype
+        # before the first encoder layer. No-op when the tower is single-dtype.
+        # ``post_layernorm`` is the unambiguous SigLIP encoder dtype.
+        encoder_dtype = self.vision_tower.vision_model.post_layernorm.weight.dtype
+        if hidden.dtype != encoder_dtype:
+            hidden = hidden.to(encoder_dtype)
+
         use_ckpt = self.gradient_checkpointing and self.training
         # Motion runs only with a real time axis (T > 1). It is intentionally NOT
         # gradient-checkpointed: its BatchNorm3d (default) running stats would be

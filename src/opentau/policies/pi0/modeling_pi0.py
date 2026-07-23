@@ -193,12 +193,14 @@ class PI0Policy(PreTrainedPolicy):
         # stats passed but the config remembers the trained-on dataset list)
         # and to 1 as the legacy single-dataset default.
         num_datasets = _num_datasets(per_dataset_stats, dataset_names, config)
+        zero_range_center = config.zero_range_centers_on_zero()
         self.normalize_inputs = Normalize(
             config.input_features,
             config.normalization_mapping,
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
         )
         self.normalize_targets = Normalize(
             config.output_features,
@@ -206,6 +208,7 @@ class PI0Policy(PreTrainedPolicy):
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
         )
         self.unnormalize_outputs = Unnormalize(
             config.output_features,
@@ -213,6 +216,7 @@ class PI0Policy(PreTrainedPolicy):
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
         )
 
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")

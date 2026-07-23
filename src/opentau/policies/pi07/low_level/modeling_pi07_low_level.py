@@ -363,12 +363,14 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
         num_datasets = _num_datasets(per_dataset_stats, dataset_names, config)
+        zero_range_center = config.zero_range_centers_on_zero()
         self.normalize_inputs = Normalize(
             config.input_features,
             config.normalization_mapping,
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
         )
         self.normalize_targets = Normalize(
             config.output_features,
@@ -376,6 +378,7 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
         )
         self.normalize_discrete_actions = Normalize(
             config.output_features,
@@ -383,6 +386,7 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
         )
         self.unnormalize_outputs = Unnormalize(
             config.output_features,
@@ -390,6 +394,7 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
         )
 
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-4b-pt")
@@ -397,6 +402,11 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
         self.discrete_action_processor = AutoProcessor.from_pretrained(
             config.discrete_action_tokenizer_path, trust_remote_code=True
         )
+        # Guard: a fitted FAST tokenizer bakes the discrete-action normalization
+        # convention into its BPE corpus; refuse a tokenizer whose convention
+        # disagrees with this policy's config_version (no-op for upstream/
+        # pre-versioning tokenizers, which carry no convention sidecar).
+        self._check_discrete_action_tokenizer_convention(config.discrete_action_tokenizer_path)
         discrete_action_vocab_size = getattr(self.discrete_action_processor, "vocab_size", None)
         self.model = PI07LowLevelFlowMatching(
             config, discrete_action_vocab_size=discrete_action_vocab_size, num_datasets=num_datasets

@@ -48,6 +48,14 @@ from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
 #     either way.
 EPS = 1e-6  # Small epsilon value for numerical stability in normalization
 
+# Sidecar file a fitted FAST action tokenizer carries to record the zero-range
+# normalization convention its BPE corpus was built under (written by
+# `scripts/fit_fast_tokenizer.py`, read by
+# `PreTrainedPolicy._check_discrete_action_tokenizer_convention`). Absent on
+# upstream / pre-versioning tokenizers, which are then treated as no-op (a
+# tokenizer without this sidecar makes no claim about its convention).
+ACTION_NORM_META_FILE = "opentau_action_norm.json"
+
 # A genuinely-zero std (|std| < EPS) marks a constant/padding feature dim. The guard in
 # ``Normalize`` / ``Unnormalize`` snaps such a std (or a zero MIN_MAX range) to 1 so a value
 # that *deviates* from that "constant" can't divide by ~EPS and blow up to ~1e6 (the
@@ -402,6 +410,7 @@ class Normalize(nn.Module):
         per_dataset_stats: list[dict[str, dict[str, Tensor | np.ndarray]]] | None = None,
         dataset_names: list[str] | None = None,
         num_datasets: int | None = None,
+        zero_range_center: bool = False,
     ):
         """Initializes the Normalize module.
 
@@ -418,10 +427,22 @@ class Normalize(nn.Module):
                 buffer (strings aren't tensors). Persisted into ``config.json``
                 via ``PreTrainedConfig.dataset_names``.
             num_datasets: Required when ``per_dataset_stats is None``.
+            zero_range_center: MIN_MAX/QUANTILE convention for a zero-range band
+                (``max == min``: a zero-padded tail dim, or a genuinely-constant
+                real dim). ``False`` (legacy, ``config_version`` 0) maps such a
+                dim to ``-1.0`` — every checkpoint trained before the fix learned
+                that constant. ``True`` (``config_version`` >= 1) maps it to
+                ``0.0``, matching openpi's pad-after-normalize output. The bit is
+                resolved per-policy from ``config.config_version`` and passed in
+                by each policy; direct constructions default to legacy so
+                pre-existing behavior (and every test that builds ``Normalize``
+                directly) is unchanged. No effect on MEAN_STD, which already
+                emits ``0.0`` on a zero-std dim (it has no ``-1`` re-centering).
         """
         super().__init__()
         self.features = features
         self.norm_map = norm_map
+        self.zero_range_center = zero_range_center
         self.dataset_names = list(dataset_names) if dataset_names is not None else None
         if (
             per_dataset_stats is not None
@@ -531,11 +552,24 @@ class Normalize(nn.Module):
                 assert not torch.isinf(min_).any(), _no_stats_error_str(lo_name)
                 assert not torch.isinf(max_).any(), _no_stats_error_str(hi_name)
                 # Snap a zero range (max == min: constant dim) to 1 — same blow-up class.
-                denom = max_ - min_
-                denom_is_zero = denom.abs() < EPS
-                denom = torch.where(denom_is_zero, torch.ones_like(denom), denom)
+                raw_range = max_ - min_
+                denom_is_zero = raw_range.abs() < EPS
+                denom = torch.where(denom_is_zero, torch.ones_like(raw_range), raw_range)
                 deviation = batch_val - min_
-                batch[key] = deviation / (denom + EPS)
+                # zero_range_center (config_version >= 1): on a zero-range band, add
+                # half the snap correction to the numerator so the `* 2 - 1` below lands
+                # on 0.0 instead of -1.0 (openpi's pad-after-normalize output). The offset
+                # is `0.5 * (denom - raw_range)` — float-exact 0 on every healthy dim (both
+                # come from the same `raw_range`, so the subtraction cancels bit-for-bit and
+                # trained behavior is untouched), and 0.5 exactly where the snap fired. A
+                # value deviating from the "constant" still shows: it maps to `2 * deviation`
+                # (bounded, invertible) rather than being flattened to 0. Legacy
+                # (config_version 0) keeps `-1.0` — every pre-fix checkpoint learned it.
+                # MEAN_STD needs no analog: it has no `-1` re-centering.
+                shifted = deviation
+                if self.zero_range_center:
+                    shifted = deviation + 0.5 * (denom - raw_range)
+                batch[key] = shifted / (denom + EPS)
                 # normalize to [-1, 1]
                 batch[key] = batch[key] * 2 - 1
                 if (
@@ -559,11 +593,17 @@ class Unnormalize(nn.Module):
         per_dataset_stats: list[dict[str, dict[str, Tensor | np.ndarray]]] | None = None,
         dataset_names: list[str] | None = None,
         num_datasets: int | None = None,
+        zero_range_center: bool = False,
     ):
-        """See :class:`Normalize.__init__` for argument semantics."""
+        """See :class:`Normalize.__init__` for argument semantics.
+
+        ``zero_range_center`` must match the ``Normalize`` it inverts so
+        ``Unnormalize(Normalize(x))`` round-trips exactly on a zero-range dim.
+        """
         super().__init__()
         self.features = features
         self.norm_map = norm_map
+        self.zero_range_center = zero_range_center
         self.dataset_names = list(dataset_names) if dataset_names is not None else None
         if (
             per_dataset_stats is not None
@@ -623,10 +663,15 @@ class Unnormalize(nn.Module):
                     assert not torch.isinf(min_).any(), _no_stats_error_str(lo_name)
                     assert not torch.isinf(max_).any(), _no_stats_error_str(hi_name)
                 # Snap a zero range to 1 to mirror Normalize (keeps the round-trip exact).
-                denom = max_ - min_
-                denom = torch.where(denom.abs() < EPS, torch.ones_like(denom), denom)
+                raw_range = max_ - min_
+                denom = torch.where(raw_range.abs() < EPS, torch.ones_like(raw_range), raw_range)
                 batch[key] = (batch_val + 1) / 2
                 batch[key] = batch[key] * (denom + EPS) + min_
+                # Invert the zero_range_center numerator offset applied in Normalize
+                # (subtract what was added). Float-exact no-op on healthy dims, exactly
+                # cancels the `0.5 * (denom - raw_range)` shift on a zero-range band.
+                if self.zero_range_center:
+                    batch[key] = batch[key] - 0.5 * (denom - raw_range)
             else:
                 raise ValueError(norm_mode)
         return batch

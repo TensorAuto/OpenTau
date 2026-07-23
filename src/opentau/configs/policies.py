@@ -82,6 +82,19 @@ def _decode_hf_pretrained_config(cls, raw_value, path=()):
 draccus.encode.register(_HFPretrainedConfig, lambda obj: obj.to_dict(), include_subclasses=True)
 draccus.decode.register(_HFPretrainedConfig, _decode_hf_pretrained_config, include_subclasses=True)
 
+# Monotonic schema version for the *behavioral conventions* a checkpoint's
+# weights were trained under (NOT the package version). Bump only when a change
+# alters what the model sees/produces and must be gated so old checkpoints keep
+# their trained behavior. History lives in CHANGELOG.md.
+#   0  legacy: MIN_MAX/QUANTILE map a zero-range band (zero-padded tail dim, or a
+#      genuinely-constant real dim) to -1.0.
+#   1  a zero-range band maps to 0.0 (openpi's pad-after-normalize output), via
+#      `Normalize(zero_range_center=True)`. See `zero_range_centers_on_zero`.
+# A config that predates the field (`config_version is None`) is resolved to
+# CURRENT for a fresh run and to 0 (legacy) when loading pre-fix weights — see
+# `PreTrainedPolicy.from_pretrained`.
+CURRENT_CONFIG_VERSION = 1
+
 _DEPRECATED_LATENCY_FIELDS = (
     "cloud_vlm_latency_mean",
     "cloud_vlm_latency_std",
@@ -371,6 +384,27 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
     # per-dataset list (identity mapping) for inference-time lookup.
     dataset_to_norm_index: dict[str, int] | None = None
 
+    # Schema version of the behavioral conventions this checkpoint's weights were
+    # trained under (see `CURRENT_CONFIG_VERSION`). `None` is the "unresolved"
+    # sentinel — a config that predates the field. It is resolved to a concrete
+    # int in one of two directions depending on provenance, and NEVER in
+    # `__post_init__` (which would erase the "was it absent?" signal the loader
+    # needs to tell a fresh run from a pre-fix checkpoint):
+    #   - loading pre-fix weights whose source carries no tag -> 0 (legacy), in
+    #     `PreTrainedPolicy.from_pretrained`;
+    #   - a fresh run / scratch policy -> CURRENT, in `factory.make_policy` and
+    #     defensively at save time.
+    # `None` behaves as CURRENT for normalization (`zero_range_centers_on_zero`),
+    # so a config carrying `null` still runs new-behavior; the concretization
+    # only matters so a *saved* checkpoint self-describes for later fine-tunes.
+    config_version: int | None = None
+
+    # Informational only — the `opentau` package version that last wrote this
+    # config. Never read by any branch (it is "unknown" for a non-installed
+    # source checkout, so it is a debugging hint, not a fact). Excluded from any
+    # exact-config-equality assertion.
+    opentau_version: str | None = None
+
     # Deprecated: latency fields are no longer used. Kept for backward-compatible
     # loading of old JSON configs. Must remain 0.0; non-zero values will raise.
     cloud_vlm_latency_mean: float = 0.0
@@ -395,6 +429,23 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
                     f"Deprecated config field '{field_name}' must be 0.0, got {value}. "
                     "Non-zero latency config fields are no longer supported."
                 )
+
+    def resolved_config_version(self) -> int:
+        """Concrete config version, treating the unresolved ``None`` as CURRENT.
+
+        Behavior (not persistence) reads through this: an unresolved config runs
+        new-behavior. The stored ``config_version`` stays ``None`` until a save or
+        an explicit provenance resolution concretizes it.
+        """
+        return self.config_version if self.config_version is not None else CURRENT_CONFIG_VERSION
+
+    def zero_range_centers_on_zero(self) -> bool:
+        """Whether ``Normalize``/``Unnormalize`` should map a zero-range MIN_MAX /
+        QUANTILE band to ``0.0`` (config_version >= 1) rather than the legacy
+        ``-1.0`` (config_version 0). Threaded into every ``Normalize`` /
+        ``Unnormalize`` this policy builds via the ``zero_range_center`` kwarg.
+        """
+        return self.resolved_config_version() >= 1
 
     @property
     def type(self) -> str:
@@ -645,6 +696,19 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         # dump path; the difference is the `declared_type` arg, which feeds
         # draccus's `encode_choice` code path (see draccus.parsers.encoding).
         data = draccus.encode(self, declared_type=PreTrainedConfig)
+        # Concretize the version so the saved checkpoint self-describes for later
+        # fine-tunes (a peeked `null` would be read as "no tag" -> legacy). A
+        # config that reached save without provenance resolution is a fresh run,
+        # hence CURRENT. Also stamp the informational package version.
+        data["config_version"] = self.resolved_config_version()
+        from opentau.__version__ import __version__ as _opentau_version
+
+        # Stamp the current (last) writer, per the field's contract. Falls back to
+        # any prior value only when this checkout can't report its own version
+        # ("unknown" for a non-installed source tree), so the hint isn't lost.
+        data["opentau_version"] = (
+            _opentau_version if _opentau_version != "unknown" else (self.opentau_version or _opentau_version)
+        )
         with open(config_path, "w") as f:
             json.dump(data, f, indent=4)
         strip_deprecated_fields_from_json(config_path)

@@ -69,6 +69,7 @@ from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.lerobot_dataset import BaseDataset
 from opentau.planner.gemini_er_planner import GeminiERPlanner
 from opentau.policies.factory import get_policy_class
+from opentau.policies.utils import to_dtype_preserving_siglip_float32
 from opentau.scripts.grpc import auth, robot_inference_pb2, robot_inference_pb2_grpc
 from opentau.utils.random_utils import set_seed
 from opentau.utils.utils import (
@@ -265,7 +266,9 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
 
         policy_class = get_policy_class(self.cfg.policy.type)
         self.policy = policy_class.from_pretrained(self.cfg.policy.pretrained_path, config=self.cfg.policy)
-        self.policy.to(device=self.device, dtype=self.dtype)
+        # Preserve the float32-pinned SigLIP embeddings across the bf16 cast (openpi parity);
+        # a plain .to(bfloat16) would round them back. Serving is single-process, so this is safe.
+        to_dtype_preserving_siglip_float32(self.policy, device=self.device, dtype=self.dtype)
         self.policy.eval()
         self.policy.model.sample_actions = attempt_torch_compile(
             self.policy.model.sample_actions, device_hint=self.device

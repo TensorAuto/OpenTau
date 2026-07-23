@@ -208,11 +208,13 @@ class ValueFunction(PreTrainedPolicy):
             # Both want the identity mapping for the kept name.
             self._dataset_to_norm_index = surviving or {kept[0]: 0}
         num_datasets = 1
+        zero_range_center = config.zero_range_centers_on_zero()
         self.normalize_inputs = Normalize(
             config.input_features,
             config.normalization_mapping,
             per_dataset_stats=per_dataset_stats,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
         )
 
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-270m")

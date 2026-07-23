@@ -266,12 +266,14 @@ class PI05Policy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
         num_datasets = _num_datasets(per_dataset_stats, dataset_names, config)
+        zero_range_center = config.zero_range_centers_on_zero()
         self.normalize_inputs = Normalize(
             config.input_features,
             config.normalization_mapping,
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
         )
         self.normalize_targets = Normalize(
             config.output_features,
@@ -279,6 +281,7 @@ class PI05Policy(PreTrainedPolicy):
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
         )
         self.normalize_discrete_actions = Normalize(
             config.output_features,
@@ -286,6 +289,7 @@ class PI05Policy(PreTrainedPolicy):
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
         )
         self.unnormalize_outputs = Unnormalize(
             config.output_features,
@@ -293,6 +297,7 @@ class PI05Policy(PreTrainedPolicy):
             per_dataset_stats=per_dataset_stats,
             dataset_names=dataset_names,
             num_datasets=num_datasets,
+            zero_range_center=zero_range_center,
         )
 
         # The same PaliGemma tokenizer instance is shared with the inner
@@ -304,6 +309,11 @@ class PI05Policy(PreTrainedPolicy):
         self.discrete_action_processor = AutoProcessor.from_pretrained(
             config.discrete_action_tokenizer_path, trust_remote_code=True
         )
+        # Guard: a fitted FAST tokenizer bakes the discrete-action normalization
+        # convention into its BPE corpus; refuse a tokenizer whose convention
+        # disagrees with this policy's config_version (no-op for upstream/
+        # pre-versioning tokenizers, which carry no convention sidecar).
+        self._check_discrete_action_tokenizer_convention(config.discrete_action_tokenizer_path)
         # Get vocab size from processor
         discrete_action_vocab_size = getattr(self.discrete_action_processor, "vocab_size", None)
         self.model = PI05FlowMatching(
