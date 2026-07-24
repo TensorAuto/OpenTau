@@ -356,6 +356,7 @@ class Qwen3VLWithExpertModel(nn.Module):
         attention_implementation: str,
         freeze_vision_encoder: bool = True,
         train_expert_only: bool = True,
+        train_vision_encoder_only: bool = False,
         gradient_checkpointing: bool = False,
         load_pretrained_backbone_repo: str | None = None,
         condition_on_layer: int | None = None,
@@ -363,6 +364,7 @@ class Qwen3VLWithExpertModel(nn.Module):
         super().__init__()
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
+        self.train_vision_encoder_only = train_vision_encoder_only
 
         # Deepcopy so the layer-count / attn-impl mutations below stay local and never
         # corrupt the caller's config object (e.g. a shared tiny config across tests).
@@ -460,11 +462,33 @@ class Qwen3VLWithExpertModel(nn.Module):
             self.backbone.eval()
             for p in self.backbone.parameters():
                 p.requires_grad = False
+        if self.train_vision_encoder_only:
+            # Mirror image of train_expert_only: freeze the whole backbone (Qwen3-VL
+            # LLM + lm_head) AND the action expert; leave ONLY the vision tower
+            # trainable. The multimodal projector (``merger`` + ``deepstack_merger_list``)
+            # lives *inside* ``backbone.model.visual``, so it trains together with the
+            # ViT trunk. Frozen modules still transmit gradients, and because
+            # train_expert_only is False (enforced by config validation) the backbone
+            # forward in ``run_prefix`` keeps its graph, so the vision tower's loss
+            # reaches it.
+            self.backbone.eval()
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+            self.expert.eval()
+            for p in self.expert.parameters():
+                p.requires_grad = False
+            for p in self.backbone.model.visual.parameters():
+                p.requires_grad = True
 
     def train(self, mode: bool = True):
         super().train(mode)
         if self.train_expert_only:
             self.backbone.eval()
+        elif self.train_vision_encoder_only:
+            # Only the vision tower trains; the backbone LLM and the expert stay frozen.
+            self.backbone.eval()
+            self.expert.eval()
+            self.backbone.model.visual.train(mode)
         elif self.freeze_vision_encoder:
             self.backbone.model.visual.eval()
         return self
@@ -505,9 +529,16 @@ class Qwen3VLWithExpertModel(nn.Module):
         When ``train_expert_only`` (the default), the backbone is fully frozen: the forward
         runs under ``no_grad`` and the cached KV is ``.detach()``'d, so the expert reads it
         as a constant. When ``train_expert_only`` is False (partial unfreeze, e.g. a
-        trainable text tower with a frozen vision encoder), the forward keeps its graph and
-        the KV is **not** detached, so the expert's loss backpropagates into the (unfrozen)
-        backbone — otherwise unfreezing would be a silent no-op.
+        trainable text tower with a frozen vision encoder, or ``train_vision_encoder_only``
+        with a trainable vision tower and a frozen text tower), the forward keeps its graph
+        and the KV is **not** detached, so the expert's loss backpropagates into the
+        (unfrozen part of the) backbone — otherwise unfreezing would be a silent no-op.
+
+        This ctx MUST stay keyed on ``train_expert_only`` alone: ``train_vision_encoder_only``
+        is mutually exclusive with it (config validation), so it always takes the
+        ``nullcontext`` branch and gradients reach ``backbone.model.visual``. OR-ing
+        ``train_vision_encoder_only`` into the ``no_grad`` predicate would silently detach the
+        vision tower and make vision-only training a no-op.
         """
         ctx = torch.no_grad() if self.train_expert_only else nullcontext()
         with ctx:

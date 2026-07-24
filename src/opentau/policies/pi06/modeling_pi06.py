@@ -56,6 +56,7 @@ from opentau.policies.utils import (
     assert_gemma3_input_resolution,
     ce_per_sample,
     flow_matching_masked_mse,
+    freeze_policy_level_params_for_vision_only,
 )
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
@@ -843,6 +844,7 @@ class PI06FlowMatching(nn.Module):
         gemma3_with_expert_config = Gemma3WithExpertConfig(
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=self.config.train_expert_only,
+            train_vision_encoder_only=self.config.train_vision_encoder_only,
             attention_implementation=self.config.attention_implementation,
             discrete_action_vocab_size=discrete_action_vocab_size,
             dropout=self.config.dropout,
@@ -879,6 +881,11 @@ class PI06FlowMatching(nn.Module):
         # weights (above), so the original 256K rows survive and only the 1024
         # new rows are freshly initialized.
         ensure_loc_tokens(self.language_tokenizer, model=self.gemma3_with_expert.gemma3)
+
+        if self.config.train_vision_encoder_only:
+            # Freeze every policy-level projection (action/time) so ONLY the vision
+            # encoder inside gemma3_with_expert trains.
+            freeze_policy_level_params_for_vision_only(self, self.gemma3_with_expert)
 
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
         """Standard Gaussian noise (float32)."""

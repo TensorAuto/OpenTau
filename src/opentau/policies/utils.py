@@ -396,3 +396,35 @@ def log_model_loading_keys(missing_keys: list[str], unexpected_keys: list[str]) 
     if unexpected_keys:
         # DO NOT UPDATE THIS MESSAGE WITHOUT UPDATING THE REGEX IN .gitlab/scripts/check_pi0_state_keys.py
         logging.warning(f"Unexpected key(s) when loading model: {unexpected_keys}")
+
+
+def freeze_policy_level_params_for_vision_only(
+    policy_module: nn.Module, with_expert_module: nn.Module
+) -> None:
+    """Freeze the policy-level (outer) parameters for ``train_vision_encoder_only``.
+
+    The vision/video encoder — the SigLIP / Gemma3 / Qwen3-VL tower plus its
+    multimodal projector — lives *inside* ``with_expert_module``; its
+    ``set_requires_grad`` has already left exactly that pathway trainable and frozen
+    the LLM backbone, action expert and discrete heads. What remains are the
+    *policy-level* projections that live on the enclosing flow-matching module
+    (``state_proj`` / ``action_in_proj`` / ``action_out_proj`` / ``time_mlp_*`` /
+    ``action_time_mlp_*`` / ``adarms_proj`` / optional modality embeddings). Those
+    must be frozen so that **only** the vision/video encoder trains.
+
+    Rather than enumerate every projection per policy (a single omission would let a
+    head silently keep training and quietly break the "vision only" contract), this
+    freezes every outer parameter that is neither part of ``with_expert_module`` nor
+    a video-encoder ``motion_module`` — the pi05_mem RLDX encoder's own temporal
+    block, which *is* part of the video encoder and stays trainable.
+
+    Args:
+        policy_module: the enclosing flow-matching / planner ``nn.Module``.
+        with_expert_module: the inner ``*WithExpertModel`` submodule whose own
+            ``set_requires_grad`` has already configured the vision pathway.
+    """
+    protected = {id(p) for p in with_expert_module.parameters()}
+    for name, param in policy_module.named_parameters():
+        if id(param) in protected or "motion_module" in name:
+            continue
+        param.requires_grad = False

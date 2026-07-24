@@ -80,6 +80,11 @@ class PI06Config(PreTrainedConfig):
             compatibility but logs a warning and falls back to eager.
         freeze_vision_encoder: Whether to freeze the vision encoder. Defaults to True.
         train_expert_only: Whether to train only the expert module. Defaults to False.
+        train_vision_encoder_only: Mirror image of ``train_expert_only`` — train ONLY the
+            vision encoder (SigLIP tower + multimodal projector) and freeze the Gemma 3
+            backbone, the action expert, and all heads/projections. Requires
+            ``freeze_vision_encoder=False`` and is incompatible with ``train_expert_only=True``.
+            Defaults to False.
         optimizer_lr: AdamW learning rate. Defaults to 2.5e-5.
         optimizer_betas: AdamW betas. Defaults to (0.9, 0.95).
         optimizer_eps: AdamW epsilon. Defaults to 1e-8.
@@ -148,6 +153,7 @@ class PI06Config(PreTrainedConfig):
     # Finetuning settings
     freeze_vision_encoder: bool = True
     train_expert_only: bool = False
+    train_vision_encoder_only: bool = False
 
     # Knowledge insulation (π0.5): when True (default), the prefix/VLM KV cache
     # is detached before the action expert reads it, so the flow-matching action
@@ -181,6 +187,15 @@ class PI06Config(PreTrainedConfig):
         """Post-initialization validation."""
         super().__post_init__()
 
+        if self.train_vision_encoder_only and self.train_expert_only:
+            raise ValueError(
+                "`train_vision_encoder_only=True` and `train_expert_only=True` are mutually exclusive."
+            )
+        if self.train_vision_encoder_only and self.freeze_vision_encoder:
+            raise ValueError(
+                "`train_vision_encoder_only=True` requires `freeze_vision_encoder=False` — the vision "
+                "encoder cannot be both frozen and the only trained component."
+            )
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "

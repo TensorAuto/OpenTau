@@ -898,6 +898,7 @@ class PI07HighLevelPlannerModel(nn.Module):
         paligemma_with_expert_config = PaliGemmaWithExpertConfig(
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=False,
+            train_vision_encoder_only=self.config.train_vision_encoder_only,
             attention_implementation=self.config.attention_implementation,
             load_pretrained_paligemma=False,
             discrete_action_vocab_size=discrete_action_vocab_size,
