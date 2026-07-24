@@ -82,6 +82,11 @@ class Cosmos3Config(PreTrainedConfig):
         freeze_vision_encoder: Freeze the Qwen3-VL vision tower. Defaults to True.
         train_expert_only: Freeze the entire backbone; train only the expert +
             projections. Defaults to True (cosmos3's intended regime).
+        train_vision_encoder_only: Mirror image of ``train_expert_only`` — train ONLY the
+            Qwen3-VL vision tower (its ``merger`` / ``deepstack_merger_list`` projector lives
+            inside the tower, so it trains too) and freeze the LLM backbone, the action
+            expert, and all projections. Requires ``freeze_vision_encoder=False`` and
+            ``train_expert_only=False`` (they are mutually exclusive). Defaults to False.
         gradient_checkpointing: Checkpoint the expert decoder layers to trade
             compute for activation memory. Defaults to False.
         dropout: Dropout probability inside the expert. Defaults to 0.1.
@@ -156,6 +161,7 @@ class Cosmos3Config(PreTrainedConfig):
     attention_implementation: str = "sdpa"
     freeze_vision_encoder: bool = True
     train_expert_only: bool = True
+    train_vision_encoder_only: bool = False
     gradient_checkpointing: bool = False
     dropout: float = 0.1
 
@@ -193,6 +199,16 @@ class Cosmos3Config(PreTrainedConfig):
         """Validate the configuration."""
         super().__post_init__()
 
+        if self.train_vision_encoder_only and self.train_expert_only:
+            raise ValueError(
+                "`train_vision_encoder_only=True` and `train_expert_only=True` are mutually exclusive. "
+                "cosmos3 defaults `train_expert_only=True`; set it to False to train the vision tower only."
+            )
+        if self.train_vision_encoder_only and self.freeze_vision_encoder:
+            raise ValueError(
+                "`train_vision_encoder_only=True` requires `freeze_vision_encoder=False` — the vision "
+                "encoder cannot be both frozen and the only trained component."
+            )
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 "The chunk size is the upper bound for the number of action steps per model "

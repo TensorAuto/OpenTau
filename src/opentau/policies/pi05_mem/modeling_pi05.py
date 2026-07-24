@@ -57,7 +57,12 @@ from opentau.policies.pi05_mem.configuration_pi05 import PI05MemConfig
 from opentau.policies.pi05_mem.rldx_video_encoder import RLDXVideoEncoder
 from opentau.policies.pi07.video_encoder import SpaceTimeSiglipVideoEncoder
 from opentau.policies.pretrained import PreTrainedPolicy, T
-from opentau.policies.utils import PerSampleLoss, ce_per_sample, flow_matching_masked_mse
+from opentau.policies.utils import (
+    PerSampleLoss,
+    ce_per_sample,
+    flow_matching_masked_mse,
+    freeze_policy_level_params_for_vision_only,
+)
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
 
@@ -1025,6 +1030,7 @@ class PI05MemFlowMatching(nn.Module):
         paligemma_with_expert_config = PaliGemmaWithExpertConfig(
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=self.config.train_expert_only,
+            train_vision_encoder_only=self.config.train_vision_encoder_only,
             attention_implementation=self.config.attention_implementation,
             discrete_action_vocab_size=discrete_action_vocab_size,
             dropout=self.config.dropout,
@@ -1117,6 +1123,14 @@ class PI05MemFlowMatching(nn.Module):
 
         self.time_mlp_in = nn.Linear(self.config.proj_width, self.config.proj_width)
         self.time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
+
+        if self.config.train_vision_encoder_only:
+            # Freeze every policy-level projection (state/action/time) so ONLY the video
+            # encoder trains. The RLDX ``video_encoder.motion_module`` is part of the video
+            # encoder and is left trainable by the helper (matched by name); the SigLIP
+            # tower + projector live under paligemma_with_expert and are already configured
+            # by its own set_requires_grad.
+            freeze_policy_level_params_for_vision_only(self, self.paligemma_with_expert)
 
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
         return torch.normal(mean=0.0, std=1.0, size=shape, dtype=torch.float32, device=device)

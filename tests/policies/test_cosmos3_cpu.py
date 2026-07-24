@@ -532,3 +532,75 @@ def test_cosmos3_partial_unfreeze_backbone_receives_grad():
     assert any(p.grad is not None for p in text_backbone.parameters()), (
         "unfrozen text backbone must receive gradients via the (non-detached) cached KV"
     )
+
+
+def test_cosmos3_train_vision_encoder_only_config_validation():
+    # cosmos3 defaults train_expert_only=True, so the bare combo is mutually exclusive.
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _tiny_cosmos3_config(train_vision_encoder_only=True)
+    # With the expert-only regime off, the vision encoder must be unfrozen.
+    with pytest.raises(ValueError, match="freeze_vision_encoder"):
+        _tiny_cosmos3_config(train_expert_only=False, train_vision_encoder_only=True)
+
+
+def test_cosmos3_train_vision_encoder_only_freezes_all_but_visual():
+    model = _build_model(
+        train_expert_only=False,
+        freeze_vision_encoder=False,
+        train_vision_encoder_only=True,
+    )
+    we = model.qwen3vl_with_expert
+
+    # The Qwen3-VL vision tower (its merger / deepstack projector lives inside it) trains ...
+    assert all(p.requires_grad for p in we.backbone.model.visual.parameters())
+    # ... the LLM backbone and the action expert are frozen ...
+    assert not any(p.requires_grad for p in we.backbone.model.language_model.parameters())
+    assert not any(p.requires_grad for p in we.expert.parameters())
+    # ... and every policy-level projection is frozen.
+    for proj in (
+        model.action_in_proj,
+        model.action_out_proj,
+        model.time_mlp_in,
+        model.time_mlp_out,
+        model.adarms_proj,
+        model.state_proj,
+    ):
+        assert not any(p.requires_grad for p in proj.parameters())
+
+    # Nothing trainable lives outside the visual tower.
+    visual_ids = {id(p) for p in we.backbone.model.visual.parameters()}
+    for name, p in model.named_parameters():
+        if p.requires_grad:
+            assert id(p) in visual_ids, f"{name} unexpectedly trainable"
+
+
+def test_cosmos3_train_vision_encoder_only_grad_flows_to_visual():
+    """The no_grad ctx in run_prefix must stay off (train_expert_only=False), so the
+    vision tower's loss backpropagates into ``backbone.model.visual``."""
+    model = _build_model(
+        train_expert_only=False,
+        freeze_vision_encoder=False,
+        train_vision_encoder_only=True,
+    )
+    input_ids, attention_mask, pixel_values, image_grid_thw = _image_inputs()
+    bsize = input_ids.shape[0]
+    state = torch.randn(bsize, MAX_STATE_DIM)
+    actions = torch.randn(bsize, CHUNK, MAX_ACTION_DIM)
+    out = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        pixel_values=pixel_values,
+        image_grid_thw=image_grid_thw,
+        state=state,
+        actions=actions,
+        noise=torch.randn_like(actions),
+        time=torch.rand(bsize),
+    )
+    out["MSE"].backward()
+
+    we = model.qwen3vl_with_expert
+    assert any(p.grad is not None for p in we.backbone.model.visual.parameters()), (
+        "vision tower must receive gradients under train_vision_encoder_only"
+    )
+    assert all(p.grad is None for p in we.expert.parameters())
+    assert all(p.grad is None for p in we.backbone.model.language_model.parameters())

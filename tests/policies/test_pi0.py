@@ -529,3 +529,82 @@ class TestPI0ExecutionHorizon:
         pad_masks, att_masks = out[1], out[2]
         # one state token + chunk_size action tokens.
         assert pad_masks.shape[1] == att_masks.shape[1] == 1 + cfg.chunk_size
+
+
+class TestTrainVisionEncoderOnly:
+    """`train_vision_encoder_only` — mirror image of `train_expert_only`.
+
+    Only the vision pathway (SigLIP tower + multimodal projector) trains; the
+    Gemma LLM backbone and the action expert are frozen. PaliGemma backbone; pi0
+    is continuous-only, so there are no discrete-action heads.
+    """
+
+    def test_config_rejects_combo_with_train_expert_only(self):
+        # freeze_vision_encoder=True so the pre-existing train_expert_only guard
+        # does not preempt the mutual-exclusion check.
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            PaliGemmaWithExpertConfig(
+                freeze_vision_encoder=True,
+                train_expert_only=True,
+                train_vision_encoder_only=True,
+            )
+
+    def test_config_requires_unfrozen_vision(self):
+        with pytest.raises(ValueError, match="freeze_vision_encoder"):
+            PaliGemmaWithExpertConfig(
+                freeze_vision_encoder=True,
+                train_expert_only=False,
+                train_vision_encoder_only=True,
+            )
+
+    def test_policy_config_rejects_frozen_vision(self):
+        with pytest.raises(ValueError, match="freeze_vision_encoder"):
+            PI0Config(train_vision_encoder_only=True, freeze_vision_encoder=True)
+
+    def test_policy_config_rejects_combo_with_train_expert_only(self):
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            PI0Config(
+                train_vision_encoder_only=True,
+                train_expert_only=True,
+                freeze_vision_encoder=False,
+            )
+
+    @staticmethod
+    def _vision_only_engine():
+        cfg = _make_tiny_pi0_engine_config()
+        cfg.freeze_vision_encoder = False
+        cfg.train_expert_only = False
+        cfg.train_vision_encoder_only = True
+        return PaliGemmaWithExpertModel(cfg)
+
+    def test_only_vision_pathway_is_trainable(self):
+        model = self._vision_only_engine()
+
+        vision_tower = model.paligemma.vision_tower
+        projector = model._multi_modal_projector()
+        assert projector is not None, "PaliGemma should expose a multimodal projector"
+
+        # The vision pathway trains ...
+        assert all(p.requires_grad for p in vision_tower.parameters())
+        assert all(p.requires_grad for p in projector.parameters())
+
+        # ... and nothing else does (LLM backbone + action expert frozen).
+        allowed = {id(p) for p in vision_tower.parameters()}
+        allowed |= {id(p) for p in projector.parameters()}
+        for name, p in model.named_parameters():
+            if id(p) in allowed:
+                continue
+            assert not p.requires_grad, f"{name} should be frozen under train_vision_encoder_only"
+
+        # The action expert is definitely frozen.
+        assert not any(p.requires_grad for p in model.gemma_expert.parameters())
+
+    def test_train_mode_keeps_backbone_and_expert_in_eval(self):
+        model = self._vision_only_engine()
+        model.train(True)
+        # Vision pathway follows the requested training mode ...
+        assert model.paligemma.vision_tower.training is True
+        assert model._multi_modal_projector().training is True
+        # ... while the frozen bulk stays in eval regardless of train(True).
+        assert model.paligemma.training is False
+        assert model.gemma_expert.training is False

@@ -423,3 +423,48 @@ class TestRLDXMotionConfig:
         # Bad motion settings are ignored entirely when use_motion is False.
         c = self._cfg(use_motion=False, motion_norm="nonsense", n_obs_steps=1)
         assert c.use_motion is False
+
+
+def test_freeze_vision_only_keeps_real_rldx_motion_module_trainable():
+    """Pin the name contract that ``freeze_policy_level_params_for_vision_only`` relies
+    on against a REAL ``RLDXVideoEncoder``.
+
+    The helper keeps pi05_mem's temporal block trainable purely via a
+    ``"motion_module" in name`` match. If ``RLDXVideoEncoder.motion_module`` is ever
+    renamed, the helper would silently freeze it — this test (which exercises the real
+    module, not a fake) breaks in that case, so the contract can't drift unnoticed.
+    """
+    from torch import nn
+
+    from opentau.policies.utils import freeze_policy_level_params_for_vision_only
+
+    vision_tower, projector = _build_tiny_siglip_and_projector()
+    encoder = _make_encoder((vision_tower, projector))
+
+    # Minimal pi05_mem-shaped tree: the with-expert model owns the SigLIP tower +
+    # projector; the video encoder holds them by reference and owns motion_module;
+    # an action projection stands in for the frozen policy-level heads.
+    class _WithExpert(nn.Module):
+        def __init__(self, tower, proj):
+            super().__init__()
+            self.vision_tower = tower
+            self.multi_modal_projector = proj
+
+    class _Policy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.paligemma_with_expert = _WithExpert(vision_tower, projector)
+            self.video_encoder = encoder
+            self.action_in_proj = nn.Linear(8, 8)
+
+    policy = _Policy()
+    freeze_policy_level_params_for_vision_only(policy, policy.paligemma_with_expert)
+
+    # The REAL motion_module stays trainable ...
+    motion_params = list(encoder.motion_module.parameters())
+    assert motion_params, "RLDXVideoEncoder.motion_module has no parameters — contract broken"
+    assert all(p.requires_grad for p in motion_params)
+    # ... the "motion_module" name match still fires for the real module ...
+    assert any("motion_module" in name for name, _ in encoder.named_parameters())
+    # ... and a sibling policy-level projection is frozen.
+    assert not any(p.requires_grad for p in policy.action_in_proj.parameters())

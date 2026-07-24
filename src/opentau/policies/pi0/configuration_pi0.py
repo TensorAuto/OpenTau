@@ -72,6 +72,11 @@ class PI0Config(PreTrainedConfig):
             for backward compatibility but logs a warning and falls back to "eager".
         freeze_vision_encoder: Whether to freeze the vision encoder during fine-tuning. Defaults to True.
         train_expert_only: Whether to train only the expert module. Defaults to False.
+        train_vision_encoder_only: Mirror image of ``train_expert_only`` — train ONLY the
+            vision encoder (SigLIP tower + multimodal projector) and freeze the LLM
+            backbone, the action expert, and all action/state/time projections. Requires
+            ``freeze_vision_encoder=False`` and is incompatible with ``train_expert_only=True``.
+            Defaults to False.
         train_state_proj: Whether to train the state projection layer. Defaults to True.
         optimizer_lr: Learning rate for the optimizer. Defaults to 2.5e-5.
         optimizer_betas: Beta parameters for AdamW optimizer. Defaults to (0.9, 0.95).
@@ -135,6 +140,7 @@ class PI0Config(PreTrainedConfig):
     # Finetuning settings
     freeze_vision_encoder: bool = True
     train_expert_only: bool = False
+    train_vision_encoder_only: bool = False
     train_state_proj: bool = True
 
     # Wrap each transformer-layer forward in torch.utils.checkpoint to trade
@@ -170,6 +176,15 @@ class PI0Config(PreTrainedConfig):
 
         # TODO(Steven): Validate device and amp? in all policy configs?
         """Input validation (not exhaustive)."""
+        if self.train_vision_encoder_only and self.train_expert_only:
+            raise ValueError(
+                "`train_vision_encoder_only=True` and `train_expert_only=True` are mutually exclusive."
+            )
+        if self.train_vision_encoder_only and self.freeze_vision_encoder:
+            raise ValueError(
+                "`train_vision_encoder_only=True` requires `freeze_vision_encoder=False` — the vision "
+                "encoder cannot be both frozen and the only trained component."
+            )
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "

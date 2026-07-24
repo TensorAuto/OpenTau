@@ -2359,3 +2359,82 @@ class TestGlobalOrBranchDecisions:
                 field_names=("a", "b", "c"),
                 device=torch.device("cpu"),
             )
+
+
+class TestTrainVisionEncoderOnly:
+    """`train_vision_encoder_only` on the Gemma 3 backbone — mirror of
+    `train_expert_only`. Only the SigLIP tower + multimodal projector train; the
+    Gemma 3 backbone (including the reparented interleaved layers), the action
+    expert, and the discrete-action heads are frozen."""
+
+    def test_config_rejects_combo_with_train_expert_only(self):
+        # freeze_vision_encoder=True so the pre-existing train_expert_only guard
+        # does not preempt the mutual-exclusion check.
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            Gemma3WithExpertConfig(
+                freeze_vision_encoder=True,
+                train_expert_only=True,
+                train_vision_encoder_only=True,
+            )
+
+    def test_config_requires_unfrozen_vision(self):
+        # freeze_vision_encoder defaults True; train_expert_only must be off first.
+        with pytest.raises(ValueError, match="freeze_vision_encoder"):
+            Gemma3WithExpertConfig(train_expert_only=False, train_vision_encoder_only=True)
+
+    @staticmethod
+    def _vision_only_model():
+        cfg = _make_tiny_g3we_cfg()
+        cfg.freeze_vision_encoder = False
+        cfg.train_expert_only = False
+        cfg.train_vision_encoder_only = True
+        return Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+
+    def test_only_vision_pathway_is_trainable(self):
+        model = self._vision_only_model()
+        vision_tower = model._vision_tower()
+        projector = model._multi_modal_projector()
+        assert vision_tower is not None and projector is not None
+
+        assert all(p.requires_grad for p in vision_tower.parameters())
+        assert all(p.requires_grad for p in projector.parameters())
+
+        allowed = {id(p) for p in vision_tower.parameters()}
+        allowed |= {id(p) for p in projector.parameters()}
+        for name, p in model.named_parameters():
+            if id(p) in allowed:
+                continue
+            assert not p.requires_grad, f"{name} should be frozen under train_vision_encoder_only"
+
+        # The reparented interleaved backbone layers are frozen; the expert too.
+        for layer in model.interleaved_layers:
+            assert not any(p.requires_grad for p in layer.backbone_layer.parameters())
+        assert not any(p.requires_grad for p in model.da_head.parameters())
+        assert not any(p.requires_grad for p in model.discrete_action_embedding.parameters())
+
+    def test_train_mode_keeps_backbone_and_interleaved_in_eval(self):
+        model = self._vision_only_model()
+        model.train(True)
+        assert model._vision_tower().training is True
+        assert model.gemma3.training is False
+        for layer in model.interleaved_layers:
+            assert layer.backbone_layer.training is False
+
+    def test_vlm_config_train_vision_encoder_only_warns_under_knowledge_insulation(self, caplog):
+        # pi07 exposes the flag on vlm_config; the policy config reads it from there and
+        # must warn that knowledge_insulation (default True) severs the MSE loss path.
+        import logging
+
+        from opentau.policies.pi07.low_level.configuration_pi07_low_level import PI07LowLevelConfig
+
+        vlm = Gemma3WithExpertConfig(
+            train_vision_encoder_only=True,
+            freeze_vision_encoder=False,
+            train_expert_only=False,
+        )
+        with caplog.at_level(logging.WARNING):
+            PI07LowLevelConfig(vlm_config=vlm)  # knowledge_insulation defaults True
+        assert any(
+            "knowledge_insulation" in r.message and "train_vision_encoder_only" in r.message
+            for r in caplog.records
+        )

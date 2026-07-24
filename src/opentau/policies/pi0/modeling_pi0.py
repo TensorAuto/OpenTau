@@ -37,7 +37,12 @@ from opentau.policies.pi0.paligemma_with_expert import (
     PaliGemmaWithExpertModel,
 )
 from opentau.policies.pretrained import PreTrainedPolicy
-from opentau.policies.utils import PerSampleLoss, log_model_loading_keys, make_action_dim_mask
+from opentau.policies.utils import (
+    PerSampleLoss,
+    freeze_policy_level_params_for_vision_only,
+    log_model_loading_keys,
+    make_action_dim_mask,
+)
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
 
@@ -713,6 +718,7 @@ class PI0FlowMatching(nn.Module):
         paligemma_with_export_config = PaliGemmaWithExpertConfig(
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=self.config.train_expert_only,
+            train_vision_encoder_only=self.config.train_vision_encoder_only,
             attention_implementation=self.config.attention_implementation,
             dropout=self.config.dropout,
             gradient_checkpointing=self.config.gradient_checkpointing,
@@ -733,6 +739,12 @@ class PI0FlowMatching(nn.Module):
         """Sets the requires_grad attribute for state projection parameters."""
         for params in self.state_proj.parameters():
             params.requires_grad = self.config.train_state_proj
+
+        if self.config.train_vision_encoder_only:
+            # Freeze every policy-level projection (state/action/time) so ONLY the
+            # vision encoder (inside paligemma_with_expert, already configured by its
+            # own set_requires_grad) trains. Overrides the train_state_proj setting above.
+            freeze_policy_level_params_for_vision_only(self, self.paligemma_with_expert)
 
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
         """Samples Gaussian noise.

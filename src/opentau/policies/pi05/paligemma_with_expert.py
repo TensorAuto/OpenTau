@@ -115,6 +115,7 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
         gemma_expert_config: dict | None = None,
         freeze_vision_encoder: bool = True,
         train_expert_only: bool = True,
+        train_vision_encoder_only: bool = False,
         attention_implementation: str = "eager",
         discrete_action_vocab_size: int | None = None,
         dropout: float = 0.1,
@@ -128,6 +129,11 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
             gemma_expert_config: Configuration dictionary for the Gemma expert model.
             freeze_vision_encoder: Whether to freeze the vision encoder. Defaults to True.
             train_expert_only: Whether to train only the expert model. Defaults to True.
+            train_vision_encoder_only: Mirror image of ``train_expert_only`` — freeze the
+                Gemma LLM backbone, the action expert, and the discrete-action heads, and
+                train ONLY the vision pathway (the SigLIP tower + the multimodal projector).
+                Requires ``freeze_vision_encoder=False`` and is incompatible with
+                ``train_expert_only=True``. Defaults to False.
             attention_implementation: Attention implementation to use ("eager", "sdpa",
                 or "fa2"). Defaults to "eager".
             discrete_action_vocab_size: Vocabulary size for discrete actions.
@@ -143,6 +149,7 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
         """
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
+        self.train_vision_encoder_only = train_vision_encoder_only
         self.attention_implementation = attention_implementation
         self.discrete_action_vocab_size = discrete_action_vocab_size
         self.dropout = dropout
@@ -241,6 +248,16 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
             raise ValueError(
                 "You set `freeze_vision_encoder=False` and `train_expert_only=True` which are not compatible."
             )
+        if self.train_vision_encoder_only and self.train_expert_only:
+            raise ValueError(
+                "`train_vision_encoder_only=True` and `train_expert_only=True` are mutually exclusive."
+            )
+        if self.train_vision_encoder_only and self.freeze_vision_encoder:
+            raise ValueError(
+                "You set `train_vision_encoder_only=True` and `freeze_vision_encoder=True` which are not "
+                "compatible — the vision encoder cannot be both frozen and the only trained component. "
+                "Set `freeze_vision_encoder=False`."
+            )
 
         if self.attention_implementation not in ["eager", "sdpa", "fa2", "flash_cuda"]:
             raise ValueError(
@@ -304,6 +321,22 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             self.to_bfloat16_like_physical_intelligence()
         self.set_requires_grad()
 
+    def _multi_modal_projector(self):
+        """Return the multimodal projector, tolerating the ``.model.`` nesting that
+        varies across transformers versions (mirrors ``embed_image``'s resolution)."""
+        for path in ("multi_modal_projector", "model.multi_modal_projector"):
+            obj = self.paligemma
+            ok = True
+            for part in path.split("."):
+                if hasattr(obj, part):
+                    obj = getattr(obj, part)
+                else:
+                    ok = False
+                    break
+            if ok:
+                return obj
+        return None
+
     def set_requires_grad(self) -> None:
         """Sets the requires_grad attribute for model parameters based on configuration."""
         if self.config.freeze_vision_encoder:
@@ -320,6 +353,29 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             for param in self.discrete_action_embedding.parameters():
                 param.requires_grad = False
 
+        if self.config.train_vision_encoder_only:
+            # Mirror image of ``train_expert_only``: freeze the Gemma LLM backbone,
+            # the action expert, and the discrete-action heads; leave ONLY the vision
+            # pathway (SigLIP tower + multimodal projector) trainable. The frozen
+            # modules still transmit gradients, so the vision pathway's loss reaches it.
+            self.paligemma.eval()
+            for params in self.paligemma.parameters():
+                params.requires_grad = False
+            self.gemma_expert.eval()
+            for param in self.gemma_expert.parameters():
+                param.requires_grad = False
+            for param in self.da_head.parameters():
+                param.requires_grad = False
+            for param in self.discrete_action_embedding.parameters():
+                param.requires_grad = False
+            # Re-enable the vision pathway (SigLIP tower + multimodal projector).
+            for params in self.paligemma.vision_tower.parameters():
+                params.requires_grad = True
+            projector = self._multi_modal_projector()
+            if projector is not None:
+                for params in projector.parameters():
+                    params.requires_grad = True
+
     def train(self, mode: bool = True) -> None:
         """Sets the module in training mode.
 
@@ -333,6 +389,18 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
 
         if self.config.train_expert_only:
             self.paligemma.eval()
+
+        if self.config.train_vision_encoder_only:
+            # Everything except the vision pathway is frozen -> keep it in eval so
+            # dropout etc. do not perturb the frozen backbone/expert forward.
+            self.paligemma.eval()
+            self.gemma_expert.eval()
+            self.da_head.eval()
+            self.discrete_action_embedding.eval()
+            self.paligemma.vision_tower.train(mode)
+            projector = self._multi_modal_projector()
+            if projector is not None:
+                projector.train(mode)
 
     def to_bfloat16_like_physical_intelligence(self) -> None:
         """Casts specific model components to bfloat16, keeping the SigLIP embeddings in float32.

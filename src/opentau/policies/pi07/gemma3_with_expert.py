@@ -111,6 +111,7 @@ class Gemma3WithExpertConfig(PretrainedConfig):
         gemma_expert_config: dict | None = None,
         freeze_vision_encoder: bool = True,
         train_expert_only: bool = True,
+        train_vision_encoder_only: bool = False,
         attention_implementation: str = "eager",
         load_pretrained_gemma3: bool = False,
         discrete_action_vocab_size: int | None = None,
@@ -129,6 +130,12 @@ class Gemma3WithExpertConfig(PretrainedConfig):
                 Defaults to a ~860M-parameter Gemma with AdaRMS enabled.
             freeze_vision_encoder: Freeze the SigLIP tower during training.
             train_expert_only: Only update the expert and its heads.
+            train_vision_encoder_only: Mirror image of ``train_expert_only`` — freeze the
+                Gemma 3 backbone (including the reparented interleaved backbone layers),
+                the action expert, and the discrete-action heads, and train ONLY the vision
+                pathway (the SigLIP tower + the multimodal projector). Requires
+                ``freeze_vision_encoder=False`` and is incompatible with
+                ``train_expert_only=True``.
             attention_implementation: "eager", "sdpa", or "fa2". "fa2" is not
                 implemented and falls back to eager with a warning. "sdpa"
                 dispatches to ``torch.nn.functional.scaled_dot_product_attention``;
@@ -172,6 +179,7 @@ class Gemma3WithExpertConfig(PretrainedConfig):
         """
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
+        self.train_vision_encoder_only = train_vision_encoder_only
         self.attention_implementation = attention_implementation
         self.load_pretrained_gemma3 = load_pretrained_gemma3
         self.discrete_action_vocab_size = discrete_action_vocab_size
@@ -283,6 +291,16 @@ class Gemma3WithExpertConfig(PretrainedConfig):
                 "`train_expert_only=True` would then have nothing to train. Set "
                 "`train_expert_only=False` (the high-level-planner default) when "
                 "`disable_action_expert=True`."
+            )
+        if self.train_vision_encoder_only and self.train_expert_only:
+            raise ValueError(
+                "`train_vision_encoder_only=True` and `train_expert_only=True` are mutually exclusive."
+            )
+        if self.train_vision_encoder_only and self.freeze_vision_encoder:
+            raise ValueError(
+                "You set `train_vision_encoder_only=True` and `freeze_vision_encoder=True` which are not "
+                "compatible — the vision encoder cannot be both frozen and the only trained component. "
+                "Set `freeze_vision_encoder=False`."
             )
         if self.attention_implementation not in ["eager", "sdpa", "fa2"]:
             raise ValueError(
@@ -701,6 +719,20 @@ class Gemma3WithExpertModel(PreTrainedModel):
             for param in self.discrete_action_embedding.parameters():
                 param.requires_grad = False
 
+        if self.config.train_vision_encoder_only:
+            # Mirror image of train_expert_only: leave ONLY the vision pathway
+            # (SigLIP tower + multimodal projector) trainable. Freeze every param
+            # first — this covers gemma3, the reparented interleaved backbone AND
+            # expert layers, gemma_expert, da_head, discrete_action_embedding — then
+            # re-enable the vision pathway. Frozen modules still transmit gradients,
+            # so the vision pathway's loss reaches it.
+            for params in self.parameters():
+                params.requires_grad = False
+            for module in (self._vision_tower(), self._multi_modal_projector()):
+                if module is not None:
+                    for params in module.parameters():
+                        params.requires_grad = True
+
     def train(self, mode: bool = True):
         super().train(mode)
         if self.config.freeze_vision_encoder:
@@ -713,6 +745,22 @@ class Gemma3WithExpertModel(PreTrainedModel):
             # explicitly so dropout / etc. honour the frozen state.
             for layer in self._iter_interleaved_layers():
                 layer.backbone_layer.eval()
+        if self.config.train_vision_encoder_only:
+            # Everything except the vision pathway is frozen -> eval. The reparented
+            # interleaved layers live outside gemma3, so eval them explicitly too.
+            self.gemma3.eval()
+            if self.gemma_expert is not None:
+                self.gemma_expert.eval()
+            for layer in self._iter_interleaved_layers():
+                layer.backbone_layer.eval()
+                if getattr(layer, "expert_layer", None) is not None:
+                    layer.expert_layer.eval()
+            self.da_head.eval()
+            self.discrete_action_embedding.eval()
+            # Put the vision pathway back into `mode`.
+            for module in (self._vision_tower(), self._multi_modal_projector()):
+                if module is not None:
+                    module.train(mode)
         return self
 
     def to_bfloat16_like_physical_intelligence(self) -> None:

@@ -81,6 +81,9 @@ class PI07HighLevelPlannerConfig(PreTrainedConfig):
             ``"fa2"`` (Flash Attention 2). Defaults to ``"eager"``.
         freeze_vision_encoder: Whether to freeze the SigLIP vision encoder
             during fine-tuning. Defaults to True.
+        train_vision_encoder_only: Train ONLY the vision encoder (SigLIP tower +
+            multimodal projector) and freeze the Gemma LLM backbone (the planner has no
+            action expert). Requires ``freeze_vision_encoder=False``. Defaults to False.
         optimizer_lr: Peak learning rate for AdamW. Defaults to 2.5e-5.
         optimizer_betas: Beta parameters for AdamW. Defaults to (0.9, 0.95).
         optimizer_eps: Epsilon for AdamW. Defaults to 1e-8.
@@ -141,6 +144,7 @@ class PI07HighLevelPlannerConfig(PreTrainedConfig):
 
     # Finetuning settings
     freeze_vision_encoder: bool = True
+    train_vision_encoder_only: bool = False
 
     # Training presets
     optimizer_lr: float = 2.5e-5
@@ -160,6 +164,11 @@ class PI07HighLevelPlannerConfig(PreTrainedConfig):
         """
         super().__post_init__()
 
+        if self.train_vision_encoder_only and self.freeze_vision_encoder:
+            raise ValueError(
+                "`train_vision_encoder_only=True` requires `freeze_vision_encoder=False` — the vision "
+                "encoder cannot be both frozen and the only trained component."
+            )
         if self.n_obs_steps != 1:
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"

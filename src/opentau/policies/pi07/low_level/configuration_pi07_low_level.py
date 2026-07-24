@@ -23,6 +23,7 @@ separable attention) as a video encoder, processes temporal state sequences
 subgoal image, and metadata conditioning.
 """
 
+import logging
 from dataclasses import dataclass, field
 
 from opentau.configs.policies import PreTrainedConfig
@@ -294,6 +295,18 @@ class PI07LowLevelConfig(PreTrainedConfig):
             self.vlm_config.attention_implementation = self.attention_implementation
         if self.gradient_checkpointing:
             self.vlm_config.gradient_checkpointing = self.gradient_checkpointing
+
+        # pi07 exposes ``train_vision_encoder_only`` on ``vlm_config`` (like
+        # ``freeze_vision_encoder`` / ``train_expert_only``), so read it from there.
+        if self.vlm_config.train_vision_encoder_only and self.knowledge_insulation:
+            logging.warning(
+                "vlm_config.train_vision_encoder_only=True with knowledge_insulation=True: knowledge "
+                "insulation detaches the VLM prefix KV cache before the action expert, so the "
+                "flow-matching action (MSE) loss does not reach the video encoder — it trains on the "
+                "CE loss only, and if the CE loss weight is 0 the step has no gradient path to any "
+                "trainable parameter. Set knowledge_insulation=False to train the video encoder from "
+                "the action loss."
+            )
 
         if not isinstance(self.n_obs_steps, int) or self.n_obs_steps < 1:
             raise ValueError(f"`n_obs_steps` must be a positive integer, got {self.n_obs_steps}.")
