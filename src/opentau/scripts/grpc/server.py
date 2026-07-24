@@ -55,7 +55,7 @@ import traceback
 from concurrent import futures
 from dataclasses import asdict
 from pprint import pformat
-from typing import Iterator
+from typing import Callable, Iterator
 
 import numpy as np
 import torch
@@ -80,6 +80,12 @@ from opentau.utils.utils import (
 
 logger = logging.getLogger(__name__)
 
+RequestHook = Callable[[str], None]
+
+
+def _noop_request_hook(_method: str) -> None:
+    """Default request hook used when an embedding application supplies none."""
+
 
 class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
     """gRPC servicer implementing the RobotPolicyService.
@@ -92,14 +98,22 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
     policy inference.
     """
 
-    def __init__(self, cfg: TrainPipelineConfig):
+    def __init__(
+        self,
+        cfg: TrainPipelineConfig,
+        request_hook: RequestHook | None = None,
+    ):
         """Initialize the servicer with model and configuration.
 
         Args:
             cfg: Training pipeline configuration including policy, server and
                 planner settings.
+            request_hook: Optional non-blocking callback invoked for every
+                accepted inference request. Hook failures are logged and never
+                fail the RPC.
         """
         self.cfg = cfg
+        self._request_hook = request_hook or _noop_request_hook
         self.device = auto_torch_device()
         self.dtype = torch.bfloat16
 
@@ -110,6 +124,13 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
 
         # Optionally spin up the high-level planner
         self._init_planner(cfg.planner)
+
+    def _notify_request(self, method: str) -> None:
+        """Run the embedding application's request hook without affecting RPCs."""
+        try:
+            self._request_hook(method)
+        except Exception:
+            logger.exception("gRPC request hook failed for %s", method)
 
     def _init_planner(self, pcfg):
         """Set up the high-level planner and start its background loop (if enabled)."""
@@ -450,6 +471,7 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
         Returns:
             ActionChunkResponse containing the predicted action chunk.
         """
+        self._notify_request("GetActionChunk")
         start_time = time.perf_counter()
         response = robot_inference_pb2.ActionChunkResponse()
         response.request_id = request.request_id
@@ -537,11 +559,12 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
         return response
 
 
-def serve(cfg: TrainPipelineConfig):
+def serve(cfg: TrainPipelineConfig, request_hook: RequestHook | None = None):
     """Start the gRPC server.
 
     Args:
         cfg: Training pipeline configuration including server settings.
+        request_hook: Optional callback invoked for each inference request.
     """
     server_cfg = cfg.server
 
@@ -562,7 +585,7 @@ def serve(cfg: TrainPipelineConfig):
         ],
     )
 
-    servicer = RobotPolicyServicer(cfg)
+    servicer = RobotPolicyServicer(cfg, request_hook=request_hook)
     robot_inference_pb2_grpc.add_RobotPolicyServiceServicer_to_server(servicer, server)
 
     server.add_insecure_port(f"[::]:{server_cfg.port}")
