@@ -23,6 +23,7 @@ architecture), and processes temporal state sequences (one continuous token
 per timestep).
 """
 
+import logging
 from dataclasses import dataclass, field
 
 from opentau.configs.policies import PreTrainedConfig
@@ -80,7 +81,10 @@ class PI05MemConfig(PreTrainedConfig):
             video encoder (SigLIP tower + multimodal projector + the RLDX
             ``motion_module``) and freeze the LLM backbone, the action expert, and all
             heads/projections. Requires ``freeze_vision_encoder=False`` and is incompatible
-            with ``train_expert_only=True``. Defaults to False.
+            with ``train_expert_only=True``. Note: with ``knowledge_insulation=True`` (the
+            default) the action (MSE) loss is detached from the VLM, so the video encoder
+            trains on the CE loss only — set ``knowledge_insulation=False`` to train it from
+            the action loss. Defaults to False.
         spacetime_layer_stride: Every ``stride``-th SigLIP encoder layer gets
             the temporal self-attention sublayer added. Defaults to 4, matching
             the MEM paper. The video encoder introduces no new learnable
@@ -258,6 +262,15 @@ class PI05MemConfig(PreTrainedConfig):
             raise ValueError(
                 "`train_vision_encoder_only=True` requires `freeze_vision_encoder=False` — the vision "
                 "encoder cannot be both frozen and the only trained component."
+            )
+        if self.train_vision_encoder_only and self.knowledge_insulation:
+            logging.warning(
+                "train_vision_encoder_only=True with knowledge_insulation=True: knowledge insulation "
+                "detaches the VLM prefix KV cache before the action expert, so the flow-matching "
+                "action (MSE) loss does not reach the video encoder — it trains on the CE loss only, "
+                "and if the CE loss weight is 0 the step has no gradient path to any trainable "
+                "parameter. Set knowledge_insulation=False to train the video encoder from the "
+                "action loss."
             )
         if not isinstance(self.n_obs_steps, int) or self.n_obs_steps < 1:
             raise ValueError(f"`n_obs_steps` must be a positive integer, got {self.n_obs_steps}.")

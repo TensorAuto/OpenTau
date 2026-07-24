@@ -20,6 +20,7 @@ for the PI05 Vision-Language-Action Flow Model. It includes settings for the mod
 optimization, scheduling, and data processing.
 """
 
+import logging
 import warnings
 from dataclasses import dataclass, field
 from typing import Literal
@@ -72,7 +73,9 @@ class PI05Config(PreTrainedConfig):
             vision encoder (SigLIP tower + multimodal projector) and freeze the LLM
             backbone, the action expert, and all heads/projections. Requires
             ``freeze_vision_encoder=False`` and is incompatible with ``train_expert_only=True``.
-            Defaults to False.
+            Note: with ``knowledge_insulation=True`` (the default) the action (MSE) loss is
+            detached from the VLM, so the vision encoder trains on the CE loss only — set
+            ``knowledge_insulation=False`` to train it from the action loss. Defaults to False.
         optimizer_lr: Learning rate for the optimizer. Defaults to 2.5e-5.
         optimizer_betas: Beta parameters for AdamW optimizer. Defaults to (0.9, 0.95).
         optimizer_eps: Epsilon parameter for AdamW optimizer. Defaults to 1e-8.
@@ -228,6 +231,15 @@ class PI05Config(PreTrainedConfig):
             raise ValueError(
                 "`train_vision_encoder_only=True` requires `freeze_vision_encoder=False` — the vision "
                 "encoder cannot be both frozen and the only trained component."
+            )
+        if self.train_vision_encoder_only and self.knowledge_insulation:
+            logging.warning(
+                "train_vision_encoder_only=True with knowledge_insulation=True: knowledge insulation "
+                "detaches the VLM prefix KV cache before the action expert, so the flow-matching "
+                "action (MSE) loss does not reach the vision encoder — it trains on the CE loss only, "
+                "and if the CE loss weight is 0 the step has no gradient path to any trainable "
+                "parameter. Set knowledge_insulation=False to train the vision encoder from the "
+                "action loss."
             )
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
