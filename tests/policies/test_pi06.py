@@ -24,6 +24,8 @@ resizing, and discrete-action padding.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 import torch
 
@@ -358,6 +360,25 @@ class TestPI06Config:
     def test_n_action_steps_larger_than_chunk_size_raises(self):
         with pytest.raises(ValueError, match="chunk size"):
             PI06Config(chunk_size=4, n_action_steps=8)
+
+    def test_train_vision_encoder_only_warns_under_knowledge_insulation(self, caplog):
+        # knowledge_insulation defaults True -> the action (MSE) loss can't reach the
+        # vision encoder, so training it vision-only must emit the severing warning.
+        with caplog.at_level(logging.WARNING):
+            PI06Config(train_vision_encoder_only=True, freeze_vision_encoder=False)
+        assert any(
+            "knowledge_insulation" in r.message and "train_vision_encoder_only" in r.message
+            for r in caplog.records
+        )
+
+    def test_train_vision_encoder_only_no_warn_without_knowledge_insulation(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            PI06Config(
+                train_vision_encoder_only=True,
+                freeze_vision_encoder=False,
+                knowledge_insulation=False,
+            )
+        assert not any("knowledge_insulation" in r.message for r in caplog.records)
 
     def test_max_delay_larger_than_chunk_size_raises(self):
         with pytest.raises(ValueError, match="max delay"):

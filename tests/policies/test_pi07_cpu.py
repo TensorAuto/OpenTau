@@ -2419,3 +2419,22 @@ class TestTrainVisionEncoderOnly:
         assert model.gemma3.training is False
         for layer in model.interleaved_layers:
             assert layer.backbone_layer.training is False
+
+    def test_vlm_config_train_vision_encoder_only_warns_under_knowledge_insulation(self, caplog):
+        # pi07 exposes the flag on vlm_config; the policy config reads it from there and
+        # must warn that knowledge_insulation (default True) severs the MSE loss path.
+        import logging
+
+        from opentau.policies.pi07.low_level.configuration_pi07_low_level import PI07LowLevelConfig
+
+        vlm = Gemma3WithExpertConfig(
+            train_vision_encoder_only=True,
+            freeze_vision_encoder=False,
+            train_expert_only=False,
+        )
+        with caplog.at_level(logging.WARNING):
+            PI07LowLevelConfig(vlm_config=vlm)  # knowledge_insulation defaults True
+        assert any(
+            "knowledge_insulation" in r.message and "train_vision_encoder_only" in r.message
+            for r in caplog.records
+        )
