@@ -107,9 +107,11 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
         Args:
             cfg: Training pipeline configuration including policy, server and
                 planner settings.
-            request_hook: Optional non-blocking callback invoked for every
-                accepted inference request. Hook failures are logged and never
-                fail the RPC.
+            request_hook: Optional callback invoked synchronously on the RPC
+                handler thread for every accepted inference request. Must be
+                fast and thread-safe (the server may call it concurrently from
+                multiple ThreadPoolExecutor workers). Hook failures are logged
+                and never fail the RPC.
         """
         self.cfg = cfg
         self._request_hook = request_hook or _noop_request_hook
@@ -562,6 +564,8 @@ def serve(cfg: TrainPipelineConfig, request_hook: RequestHook | None = None):
     Args:
         cfg: Training pipeline configuration including server settings.
         request_hook: Optional callback invoked for each inference request.
+            Must be fast and thread-safe; see ``RobotPolicyServicer`` for
+            failure semantics.
     """
     server_cfg = cfg.server
 

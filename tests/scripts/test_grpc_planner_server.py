@@ -19,6 +19,7 @@ loading is patched out and the Gemini planner is replaced with a controllable
 fake. CPU-only, no network.
 """
 
+import logging
 import threading
 import time
 from types import SimpleNamespace
@@ -109,13 +110,28 @@ class TestRequestHook:
 
         assert calls == ["GetActionChunk"]
 
-    def test_hook_failure_does_not_escape(self, make_servicer):
+    def test_hook_failure_does_not_escape(self, make_servicer, caplog):
         def failing_hook(_method):
             raise RuntimeError("reporter unavailable")
 
         servicer, _ = make_servicer(enabled=False, request_hook=failing_hook)
 
-        servicer._notify_request("GetActionChunk")
+        with caplog.at_level(logging.ERROR, logger="opentau.scripts.grpc.server"):
+            servicer._notify_request("GetActionChunk")
+
+        assert "gRPC request hook failed for GetActionChunk" in caplog.text
+
+    def test_get_action_chunk_notifies_hook(self, make_servicer):
+        calls = []
+        servicer, _ = make_servicer(enabled=False, request_hook=calls.append)
+
+        servicer._prepare_observation = MagicMock(return_value=({}, None, None))
+        servicer.policy = MagicMock()
+        servicer.policy.sample_actions.return_value = torch.zeros((1, 2, 3))
+
+        servicer.GetActionChunk(_request(), MagicMock())
+
+        assert calls == ["GetActionChunk"]
 
 
 class TestPlannerEnabled:
