@@ -621,8 +621,13 @@ def compute_delta_action_stats(
     Raises:
         ValueError: If ``max_rows`` is non-positive, or if no file produced usable samples.
     """
-    if max_rows is not None and max_rows < 1:
-        raise ValueError(f"compute_delta_action_stats: max_rows must be >= 1 or None, got {max_rows}.")
+    # `bool` is an `int` subclass, so `max_rows=True` passes a bare `>= 1` check and caps the
+    # pass at one anchor row — which does not raise, it silently returns stats fitted to two
+    # samples. Reject it here as well as at the config layer: this function is exported and the
+    # module is meant to be driven directly (e.g. the openpi parity harness), so the config
+    # validator is not the only path in.
+    if max_rows is not None and (isinstance(max_rows, bool) or max_rows < 1):
+        raise ValueError(f"compute_delta_action_stats: max_rows must be >= 1 or None, got {max_rows!r}.")
 
     if not parquet_paths:
         raise ValueError("compute_delta_action_stats: no parquet paths given.")

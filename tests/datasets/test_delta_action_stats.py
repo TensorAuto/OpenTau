@@ -393,10 +393,18 @@ class TestRowCap:
         selected = _select_anchor_rows([(e * T_PER_EP, (e + 1) * T_PER_EP) for e in range(N_EP)], 100)
         assert len(selected) == N_EP
 
-    def test_non_positive_cap_raises(self, tmp_path):
+    @pytest.mark.parametrize("bad", [0, -1, True])
+    def test_invalid_cap_raises(self, tmp_path, bad):
+        """`True` is in the list because `bool` is an `int` subclass.
+
+        A bare `>= 1` check lets `max_rows=True` through as 1, which does not raise — it caps the
+        pass at one anchor row and silently returns stats fitted to two samples (a measured std
+        of 0.13 where the true value is 0.99). The config layer rejects bools, but this function
+        is exported and the module is documented as usable directly, so guard it here too.
+        """
         path, _, _ = _write_dataset(tmp_path)
         with pytest.raises(ValueError, match="max_rows must be >= 1"):
-            compute_delta_action_stats(**_kwargs(path, max_rows=0))
+            compute_delta_action_stats(**_kwargs(path, max_rows=bad))
 
     def test_multiprocess_matches_inline_under_a_cap(self, tmp_path):
         """The cap must be applied identically on both execution paths."""
