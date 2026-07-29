@@ -15,6 +15,9 @@
 
 """On-the-fly delta-action statistics and their disk cache."""
 
+from pathlib import Path
+from types import SimpleNamespace
+
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -23,6 +26,9 @@ import pytest
 from opentau.datasets.delta_action_stats import (
     CACHE_SUBDIR,
     RunningStats,
+    _allocate_row_budgets,
+    _merge_running,
+    _select_anchor_rows,
     compute_delta_action_stats,
     delta_stats_cache_key,
     load_or_compute_delta_action_stats,
@@ -273,6 +279,257 @@ class TestComputeDeltaActionStats:
         np.testing.assert_allclose(inline["mean"], pooled["mean"])
 
 
+class TestRowCap:
+    """`max_rows` bounds the O(frames x horizon) pass without biasing the sample."""
+
+    def test_cap_is_a_hard_bound_on_anchor_rows(self):
+        """Never more than the cap, for every span layout and every cap."""
+        layouts = [
+            [(0, 100)],
+            [(0, 10), (10, 20), (20, 30)],
+            [(0, 1), (1, 2), (2, 3), (3, 400)],
+            [(5, 7), (100, 101)],
+        ]
+        for spans in layouts:
+            total = sum(hi - lo for lo, hi in spans)
+            for cap in range(1, total + 3):
+                kept = sum(len(rows) for rows, _, _ in _select_anchor_rows(spans, cap))
+                assert kept <= cap, f"spans={spans} cap={cap} kept={kept}"
+
+    def test_uncapped_keeps_every_row(self):
+        spans = [(0, 4), (4, 9)]
+        assert [rows.tolist() for rows, _, _ in _select_anchor_rows(spans, None)] == [
+            [0, 1, 2, 3],
+            [4, 5, 6, 7, 8],
+        ]
+
+    def test_cap_at_or_above_the_row_count_keeps_every_row(self):
+        spans = [(0, 4), (4, 9)]
+        for cap in (9, 10, 10_000):
+            selected = _select_anchor_rows(spans, cap)
+            assert sum(len(rows) for rows, _, _ in selected) == 9
+
+    def test_stride_phase_continues_across_episode_boundaries(self):
+        """Anchors must not restart at frame 0 of every episode.
+
+        A per-span restart would anchor every episode at its first frame, over-sampling the
+        episode-start transient (which `_gather_chunks` already treats specially by clipping).
+        """
+        spans = [(0, 10), (10, 20), (20, 30)]
+        selected = _select_anchor_rows(spans, 10)  # stride 3
+        assert [rows.tolist() for rows, _, _ in selected] == [
+            [0, 3, 6, 9],
+            [12, 15, 18],
+            [21, 24, 27],
+        ]
+        starts = [int(rows[0]) - lo for rows, lo, _ in selected]
+        assert len(set(starts)) > 1, "every episode was anchored at the same in-episode phase"
+
+    def test_true_episode_bounds_survive_subsampling(self):
+        """Clipping still uses the real episode extent, not the sampled rows' extent."""
+        selected = _select_anchor_rows([(0, 100), (100, 200)], 4)
+        assert [(lo, hi) for _, lo, hi in selected] == [(0, 100), (100, 200)]
+
+    def test_cap_bounds_the_accumulated_sample_count(self, tmp_path):
+        path, _, _ = _write_dataset(tmp_path)
+        cap = 200
+        stats = compute_delta_action_stats(**_kwargs(path, max_rows=cap))
+        assert stats["state"]["count"].tolist()[0] <= cap
+        assert stats["actions"]["count"].tolist()[0] <= cap * HORIZON
+        # And it really did bind — the uncapped pass sees far more.
+        assert stats["state"]["count"].tolist()[0] < N_EP * T_PER_EP
+
+    def test_cap_above_the_dataset_size_is_a_no_op(self, tmp_path):
+        """A cap the dataset never reaches must produce bit-identical stats to no cap."""
+        path, _, _ = _write_dataset(tmp_path)
+        uncapped = compute_delta_action_stats(**_kwargs(path))["actions"]
+        capped = compute_delta_action_stats(**_kwargs(path, max_rows=10 * N_EP * T_PER_EP))["actions"]
+        for stat in ("mean", "std", "min", "max", "q01", "q99", "count"):
+            np.testing.assert_array_equal(uncapped[stat], capped[stat])
+
+    def test_cap_samples_the_whole_dataset_not_a_prefix(self, tmp_path):
+        """The tail of the dataset must still reach the stats.
+
+        Truncating to the first N rows is the obvious wrong implementation and would be invisible
+        in a mean/std check on smooth data. Here the LAST episode is shifted far away, so its
+        contribution shows up in `max` — a prefix sample would miss it entirely.
+        """
+        rng = np.random.default_rng(7)
+        states, actions, episodes = [], [], []
+        for e in range(N_EP):
+            walk = np.cumsum(rng.normal(size=(T_PER_EP, DIM_S)) * 0.1, axis=0)
+            act = np.concatenate([walk[:, : DIM_A - 1], rng.uniform(0, 1, size=(T_PER_EP, 1))], axis=1)
+            if e == N_EP - 1:
+                act = act + 50.0  # only the final episode reaches this scale
+            states.append(walk)
+            actions.append(act)
+            episodes.append(np.full(T_PER_EP, e))
+        states, actions, episodes = map(np.concatenate, (states, actions, episodes))
+        path = tmp_path / "data.parquet"
+        pq.write_table(
+            pa.table(
+                {
+                    "observation.state": [r.tolist() for r in states],
+                    "action": [r.tolist() for r in actions],
+                    "episode_index": episodes.tolist(),
+                }
+            ),
+            path,
+        )
+        got = compute_delta_action_stats(**_kwargs(path, max_rows=40))["actions"]
+        assert float(got["max"][0]) > 40.0
+
+    def test_capped_mean_tracks_the_uncapped_mean(self, tmp_path):
+        """A uniform stride is an unbiased sample, so a generous cap barely moves the mean."""
+        path, _, _ = _write_dataset(tmp_path)
+        full = compute_delta_action_stats(**_kwargs(path))["actions"]
+        capped = compute_delta_action_stats(**_kwargs(path, max_rows=N_EP * T_PER_EP // 2))["actions"]
+        for dim in range(DIM_A):
+            spread = float(full["std"][dim])
+            assert abs(float(capped["mean"][dim]) - float(full["mean"][dim])) < 0.25 * spread
+
+    def test_every_episode_still_contributes_under_a_loose_cap(self):
+        """Striding across spans keeps whole episodes from dropping out."""
+        selected = _select_anchor_rows([(e * T_PER_EP, (e + 1) * T_PER_EP) for e in range(N_EP)], 100)
+        assert len(selected) == N_EP
+
+    def test_non_positive_cap_raises(self, tmp_path):
+        path, _, _ = _write_dataset(tmp_path)
+        with pytest.raises(ValueError, match="max_rows must be >= 1"):
+            compute_delta_action_stats(**_kwargs(path, max_rows=0))
+
+    def test_multiprocess_matches_inline_under_a_cap(self, tmp_path):
+        """The cap must be applied identically on both execution paths."""
+        path, _, _ = _write_dataset(tmp_path)
+        inline = compute_delta_action_stats(**_kwargs(path, max_rows=137, max_workers=1))["actions"]
+        pooled = compute_delta_action_stats(**_kwargs(path, max_rows=137, max_workers=4))["actions"]
+        np.testing.assert_allclose(inline["mean"], pooled["mean"])
+        np.testing.assert_array_equal(inline["count"], pooled["count"])
+
+
+class TestRowBudgetAllocation:
+    """Splitting a dataset-wide cap across a multi-file dataset."""
+
+    def _write(self, path, n_rows, n_ep=2):
+        rng = np.random.default_rng(0)
+        episodes = np.repeat(np.arange(n_ep), n_rows // n_ep)
+        n = len(episodes)
+        pq.write_table(
+            pa.table(
+                {
+                    "observation.state": [r.tolist() for r in rng.normal(size=(n, DIM_S))],
+                    "action": [r.tolist() for r in rng.normal(size=(n, DIM_A))],
+                    "episode_index": episodes.tolist(),
+                }
+            ),
+            path,
+        )
+        return str(path)
+
+    def test_uncapped_gives_every_file_no_budget(self, tmp_path):
+        paths = [self._write(tmp_path / f"{i}.parquet", 100) for i in range(3)]
+        assert _allocate_row_budgets(paths, None) == [None, None, None]
+
+    def test_cap_larger_than_the_dataset_does_not_bind(self, tmp_path):
+        paths = [self._write(tmp_path / f"{i}.parquet", 100) for i in range(3)]
+        assert _allocate_row_budgets(paths, 10_000) == [None, None, None]
+
+    def test_budgets_track_file_sizes(self, tmp_path):
+        """Proportional, not even — `_merge_running` weights each file by what it contributes,
+        so an even split would over-weight a small shard in the pooled mean."""
+        big = self._write(tmp_path / "big.parquet", 900)
+        small = self._write(tmp_path / "small.parquet", 100)
+        budgets = _allocate_row_budgets([big, small], 100)
+        assert sum(budgets) <= 100
+        assert budgets[0] == 90 and budgets[1] == 10
+
+    def test_unreadable_file_does_not_starve_the_rest(self, tmp_path):
+        """A footer we can't read is sized at the mean, so the readable files keep sane budgets."""
+        good = self._write(tmp_path / "good.parquet", 1000)
+        missing = str(tmp_path / "nope.parquet")
+        budgets = _allocate_row_budgets([good, missing], 100)
+        assert budgets[0] >= 40
+        assert all(b >= 2 for b in budgets)
+
+    def test_budgets_track_selected_rows_under_an_episode_filter(self, tmp_path):
+        """Sizes count the rows the run will *use*, not every row in the file.
+
+        Two same-size files, but the episode filter keeps 1 of 10 episodes in the first and all
+        10 in the second. Sizing by the parquet footer would call them equal and hand each half
+        the cap, over-weighting the barely-selected file 10x in the pooled merge.
+        """
+        a = self._write(tmp_path / "a.parquet", 1000, n_ep=10)  # episodes 0-9
+        b = self._write(tmp_path / "b.parquet", 1000, n_ep=10)  # episodes 0-9
+        # `episodes` is matched on the value in the column, so this keeps 1/10 of each file...
+        budgets = _allocate_row_budgets([a, b], 110, episodes={0})
+        assert budgets == [55, 55], "equal selections must still split equally"
+        # ...whereas an asymmetric selection has to shift the split. Rebuild `b` with a single
+        # episode index so every one of its rows is selected.
+        b_all = self._write(tmp_path / "b_all.parquet", 1000, n_ep=1)  # all rows are episode 0
+        budgets = _allocate_row_budgets([a, b_all], 110, episodes={0})
+        assert sum(budgets) <= 110
+        assert budgets[1] > 5 * budgets[0], f"expected a ~10:1 split by selected rows, got {budgets}"
+
+    def test_every_file_clears_the_two_sample_minimum(self, tmp_path):
+        """A tiny cap must not silently drop whole shards below `RunningStats`' minimum."""
+        paths = [self._write(tmp_path / f"{i}.parquet", 200) for i in range(8)]
+        assert all(b >= 2 for b in _allocate_row_budgets(paths, 4))
+
+    def test_multi_file_dataset_respects_the_cap_end_to_end(self, tmp_path):
+        paths = [self._write(tmp_path / f"{i}.parquet", 600) for i in range(3)]
+        stats = compute_delta_action_stats(**_kwargs(paths[0], parquet_paths=paths, max_rows=300))
+        assert stats["state"]["count"].tolist()[0] <= 300
+
+    def _write_at(self, path, n_rows, centre):
+        """A file whose rows all sit near `centre`, so its share of the pool is visible."""
+        rng = np.random.default_rng(int(centre))
+        eps = np.repeat(np.arange(2), n_rows // 2)
+        n = len(eps)
+        pq.write_table(
+            pa.table(
+                {
+                    "observation.state": [r.tolist() for r in rng.normal(size=(n, DIM_S)) * 0.1 + centre],
+                    "action": [r.tolist() for r in rng.normal(size=(n, DIM_A)) * 0.1 + centre],
+                    "episode_index": eps.tolist(),
+                }
+            ),
+            path,
+        )
+        return str(path)
+
+    def test_capping_preserves_the_ratio_between_files(self, tmp_path):
+        """A 9:1 pair of files must still pool 9:1 after the cap.
+
+        `_merge_running` pools the per-file results weighted by the counts they contribute, so
+        the budget split *is* the mixture ratio within a dataset. An even split — the obvious
+        alternative — would re-weight a 9:1 dataset to 1:1 and drag the pooled mean most of the
+        way to the small file's distribution.
+        """
+        big = self._write_at(tmp_path / "big.parquet", 9000, 0.0)
+        small = self._write_at(tmp_path / "small.parquet", 1000, 10.0)
+        # No delta map and a 1-step horizon: the action stats are then just the raw rows, so the
+        # pooled mean reads directly as each file's share of the sample.
+        kw = {"delta_map": {}, "chunk_offsets": np.array([0.0])}
+
+        full = compute_delta_action_stats(**_kwargs(big, parquet_paths=[big, small], **kw))["actions"]
+        capped = compute_delta_action_stats(**_kwargs(big, parquet_paths=[big, small], max_rows=500, **kw))[
+            "actions"
+        ]
+
+        # True pooled mean is 0.9 * 0 + 0.1 * 10 == 1.0.
+        assert abs(float(full["mean"][0]) - 1.0) < 0.1
+        assert abs(float(capped["mean"][0]) - float(full["mean"][0])) < 0.1
+
+        # Pin the counterfactual: had the budgets been split evenly, the pool would land ~5.0.
+        even = _merge_running(
+            [
+                compute_delta_action_stats(**_kwargs(big, parquet_paths=[big], max_rows=250, **kw)),
+                compute_delta_action_stats(**_kwargs(small, parquet_paths=[small], max_rows=250, **kw)),
+            ]
+        )
+        assert abs(float(even["actions"]["mean"][0]) - 1.0) > 3.0
+
+
 class TestCacheKey:
     def _key(self, **overrides):
         base = {
@@ -310,10 +567,82 @@ class TestCacheKey:
             {"excluded_episodes": [3]},
             {"fps": 30.0},
             {"revision": "v2"},
+            {"max_rows": 100_000},
         ],
     )
     def test_every_input_that_changes_the_stats_changes_the_key(self, override):
         assert self._key(**override) != self._key()
+
+    def test_an_absent_cap_keeps_the_pre_cap_digest(self):
+        """Uncapped configs must keep the key they had before `max_rows` existed.
+
+        Their cache files hold the expensive all-rows result; folding an always-present
+        `max_rows: null` into the payload would invalidate every one of them on upgrade.
+        """
+        assert self._key(max_rows=None) == self._key()
+        # Pinned against the digest this input produced before `max_rows` existed. Any future
+        # payload change that would orphan existing cache files has to break this line first.
+        assert self._key() == "f4c5d10ec6db"
+
+    def test_distinct_caps_do_not_collide(self):
+        assert self._key(max_rows=1000) != self._key(max_rows=2000)
+
+
+class TestFactoryWiring:
+    """`DatasetMixtureConfig.delta_stats_max_rows` has to reach BOTH consumers.
+
+    Threading it into the compute but not the cache key would serve a previously-cached uncapped
+    (or differently-capped) result forever; threading it into the key but not the compute would
+    recompute the identical numbers under a new key. Neither failure raises.
+    """
+
+    def _fake_dataset(self, root):
+        meta = SimpleNamespace(
+            root=root,
+            episodes=[0, 1],
+            get_data_file_path=lambda ep: Path("data.parquet"),
+        )
+        return SimpleNamespace(
+            meta=meta,
+            episodes=None,
+            delta_timestamps_params=[{"actions": [0.0, 0.05]}],
+            fps=20.0,
+            vector_resample_strategy="nearest",
+            delta_action_state_map={0: 0},
+            _get_name_map=lambda: {"state": "observation.state", "actions": "action"},
+        )
+
+    def _run(self, tmp_path, monkeypatch, max_rows):
+        from opentau.configs.default import DatasetConfig, DatasetMixtureConfig
+        from opentau.datasets import factory
+
+        seen = {}
+
+        def _capture(*, root, cache_key, compute_kwargs):
+            seen.update(cache_key=cache_key, compute_kwargs=compute_kwargs)
+            return {"actions": {}, "state": {}}
+
+        monkeypatch.setattr(factory, "load_or_compute_delta_action_stats", _capture)
+        factory._compute_or_load_delta_stats(
+            self._fake_dataset(tmp_path),
+            DatasetConfig(repo_id="fake/ds", use_delta_joint_actions=True, delta_action_state_map={0: 0}),
+            SimpleNamespace(
+                num_workers=2, dataset_mixture=DatasetMixtureConfig(delta_stats_max_rows=max_rows)
+            ),
+        )
+        return seen
+
+    def test_cap_reaches_the_compute(self, tmp_path, monkeypatch):
+        assert self._run(tmp_path, monkeypatch, 1234)["compute_kwargs"]["max_rows"] == 1234
+
+    def test_cap_reaches_the_cache_key(self, tmp_path, monkeypatch):
+        capped = self._run(tmp_path, monkeypatch, 1234)["cache_key"]
+        other = self._run(tmp_path, monkeypatch, 5678)["cache_key"]
+        uncapped = self._run(tmp_path, monkeypatch, None)["cache_key"]
+        assert len({capped, other, uncapped}) == 3
+
+    def test_default_is_uncapped(self, tmp_path, monkeypatch):
+        assert self._run(tmp_path, monkeypatch, None)["compute_kwargs"]["max_rows"] is None
 
 
 class TestLoadOrCompute:

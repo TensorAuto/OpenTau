@@ -228,6 +228,26 @@ def test_invalid_negative_bare_dataset_tolerance_raises():
         DatasetConfig(repo_id="foo/bar", tolerance_s=-1.0)
 
 
+def test_delta_stats_max_rows_defaults_to_uncapped():
+    """The on-the-fly delta-stats row cap is opt-in: `None` keeps the exact all-rows pass."""
+    assert DatasetMixtureConfig().delta_stats_max_rows is None
+
+
+def test_delta_stats_max_rows_accepts_a_positive_int():
+    assert DatasetMixtureConfig(delta_stats_max_rows=250_000).delta_stats_max_rows == 250_000
+
+
+@pytest.mark.parametrize("bad", [0, -1, 1.5, True])
+def test_invalid_delta_stats_max_rows_raises(bad):
+    """Zero / negative / non-int caps are rejected up front, not at first dataset load.
+
+    `True` is in the list because `bool` is an `int` subclass: `delta_stats_max_rows=True` would
+    otherwise pass the `>= 1` check and silently cap the pass at one row.
+    """
+    with pytest.raises(ValueError, match=r"`delta_stats_max_rows` must be None"):
+        DatasetMixtureConfig(delta_stats_max_rows=bad)
+
+
 class TestWandBConfig:
     """Cover the ``disable_video`` flag and the ``on_resume`` fork/continue behavior.
 

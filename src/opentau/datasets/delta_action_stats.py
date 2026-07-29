@@ -29,13 +29,17 @@ displacement over a chunk is far smaller than its absolute range.
 
 Recomputing them is unavoidably more work than reading a file: a chunk of length ``H`` turns each
 frame into ``H`` delta values, so the pass is ``H`` times the data volume of a per-frame stats
-pass. Two things keep that affordable:
+pass. Three things keep that affordable:
 
 * **No video decode.** Only the numeric ``state`` / ``action`` columns are read, straight out of
   parquet. Video is never touched, which is what makes an ``H``-fold pass tractable at all.
 * **Disk cache.** Results are written under each dataset's own root, keyed by a hash of
   everything that affects them (column indices, delta map, chunk length, resample settings, ...),
   so the cost is paid once per configuration rather than once per run.
+* **Optional row cap.** ``DatasetMixtureConfig.delta_stats_max_rows`` bounds how many anchor
+  frames each dataset contributes, so a million-episode source costs the same first-run wait as a
+  small one. The cap subsamples with a uniform stride over the whole dataset rather than reading a
+  prefix, so the estimate stays representative — see :func:`_select_anchor_rows`.
 
 Distribution: the compute is rank-0-only, and other ranks wait by **polling the filesystem**
 rather than sitting in a collective — see :func:`load_or_compute_delta_action_stats`.
@@ -223,6 +227,7 @@ def delta_stats_cache_key(
     excluded_episodes: Sequence[int] | None,
     fps: float | None,
     revision: str | None,
+    max_rows: int | None = None,
 ) -> str:
     """Hash everything that changes the computed stats into a short cache key.
 
@@ -241,6 +246,7 @@ def delta_stats_cache_key(
         excluded_episodes: Dropped episode indices, or ``None``.
         fps: Dataset frame rate.
         revision: Dataset revision when pinned.
+        max_rows: Anchor-row cap the stats were computed under, or ``None`` for uncapped.
 
     Returns:
         A 12-character hex digest.
@@ -261,6 +267,11 @@ def delta_stats_cache_key(
         "fps": round(float(fps), 6) if fps is not None else None,
         "revision": revision,
     }
+    # Folded in only when set, so an uncapped config keeps the digest it had before the cap
+    # existed and its cache file — the expensive one, computed over every row — stays valid.
+    # An absent key and `max_rows=None` mean the same thing, so they cannot collide.
+    if max_rows is not None:
+        payload["max_rows"] = int(max_rows)
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(blob).hexdigest()[:12]
 
@@ -306,6 +317,133 @@ def _gather_chunks(
         hi = values[ceil]
         return lo + frac[..., None] * (hi - lo)
     raise ValueError(f"Unsupported vector_resample_strategy: {strategy!r}. Use 'linear' or 'nearest'.")
+
+
+def _select_anchor_rows(
+    spans: Sequence[tuple[int, int]], max_rows: int | None
+) -> list[tuple[np.ndarray, int, int]]:
+    """Pick which frames anchor a chunk, honoring an optional cap on how many.
+
+    Uncapped, every row of every selected episode is an anchor. Capped, a single uniform stride
+    runs *across* the concatenated spans:
+
+    * **Strided, not truncated.** Keeping a prefix would describe only the first few episodes of
+      a dataset whose later episodes are the ones that widen the delta range. A stride samples
+      the whole file, so the estimate degrades in precision as the cap tightens rather than
+      collapsing onto one region of the data.
+    * **Phase-continuous across episodes.** The stride does not restart at each span, so
+      consecutive episodes get their anchors at different in-episode phases. Restarting would
+      anchor every episode at frame 0 — over-sampling the episode-start transient that
+      ``_gather_chunks``' clipping already treats specially.
+
+    The episode bounds travel alongside the rows because clipping must still use the *true*
+    extent: a chunk anchored near the end of an episode repeats that episode's last frame
+    whether or not the frames in between survived the stride.
+
+    Args:
+        spans: ``(start, end)`` row ranges of the selected episodes, in file order.
+        max_rows: At most this many anchor rows across all spans; ``None`` disables the cap.
+
+    Returns:
+        ``(rows, ep_start, ep_end)`` per span that kept at least one anchor.
+    """
+    if max_rows is None:
+        return [(np.arange(lo, hi, dtype=np.int64), lo, hi) for lo, hi in spans]
+    total = sum(hi - lo for lo, hi in spans)
+    if total <= max_rows:
+        return [(np.arange(lo, hi, dtype=np.int64), lo, hi) for lo, hi in spans]
+    # Ceiling division: `ceil(total / stride) <= max_rows` for every `total > max_rows >= 1`,
+    # so the cap is a hard bound rather than an approximate one.
+    stride = -(-total // max_rows)
+    selected, seen = [], 0
+    for lo, hi in spans:
+        rows = np.arange(lo + (-seen) % stride, hi, stride, dtype=np.int64)
+        seen += hi - lo
+        if rows.size:
+            selected.append((rows, lo, hi))
+    return selected
+
+
+def _parquet_selected_rows(path: str, episodes: set[int] | None) -> int | None:
+    """How many rows of ``path`` this run will actually use, or ``None`` if it can't be read.
+
+    Without an episode selection this is the parquet footer's row count — metadata only, so it
+    costs a seek rather than a read of the (potentially multi-GB) columns.
+
+    With one, the footer count is *wrong* for budgeting: a file may hold 10,000 rows of which 10
+    are selected, and sizing its share of the cap by 10,000 would over-weight it in the pooled
+    merge. So read the one narrow ``episode_index`` column and count the rows that survive. That
+    column is a single int64 per row — a few percent of the state/action volume this pass reads
+    anyway — and the cost is only paid when a cap and an episode filter are both in play.
+    """
+    import pyarrow.parquet as pq  # lazy, like `_process_parquet_file`
+
+    try:
+        if episodes is None:
+            return int(pq.ParquetFile(path).metadata.num_rows)
+        column = pq.read_table(path, columns=["episode_index"])["episode_index"].to_numpy()
+        wanted = np.fromiter(episodes, dtype=np.int64, count=len(episodes))
+        return int(np.isin(column, wanted).sum())
+    except Exception as e:  # noqa: BLE001 - mirrors the read path: one bad shard is survivable
+        logging.warning("delta stats: could not read the row count of %s (%r).", path, e)
+        return None
+
+
+def _allocate_row_budgets(
+    parquet_paths: Sequence[str], max_rows: int | None, episodes: set[int] | None = None
+) -> list[int | None]:
+    """Split a dataset-wide anchor-row cap across its files, proportional to their sizes.
+
+    Proportional rather than even because the per-file results are pooled by
+    :func:`_merge_running` **weighted by the counts they contribute**: giving a 10-episode shard
+    the same budget as a 10,000-episode one would weight them equally in the merged mean, which
+    is a different (and wrong) distribution. Proportional budgets keep the merge weights tracking
+    the true file sizes, so a capped dataset pools in the same ratio an uncapped one would.
+
+    Sizes count only the rows ``episodes`` selects (see :func:`_parquet_selected_rows`), so the
+    ratio holds under episode filtering too, not just for whole-dataset runs.
+
+    One deliberate deviation: each file gets a floor of 2 rows so a tiny shard still clears
+    :class:`RunningStats`' two-sample minimum instead of silently dropping out. With more files
+    than half the cap the floors dominate and the realized total exceeds the cap; that is logged
+    rather than enforced, since the alternative is discarding whole shards.
+
+    Args:
+        parquet_paths: The dataset's deduplicated data files.
+        max_rows: Dataset-wide anchor-row cap, or ``None`` for uncapped.
+        episodes: Selected episode indices, or ``None`` for all.
+
+    Returns:
+        One per-file cap (or ``None`` for uncapped), positionally aligned with ``parquet_paths``.
+    """
+    if max_rows is None:
+        return [None] * len(parquet_paths)
+
+    counts = [_parquet_selected_rows(p, episodes) for p in parquet_paths]
+    known = [c for c in counts if c is not None]
+    if not known:
+        # Nothing readable up front. These files will almost certainly fail the real read too,
+        # but an even split keeps the cap in force if any of them surprises us.
+        return [max(2, max_rows // len(parquet_paths))] * len(parquet_paths)
+
+    # Size an unreadable file at the mean known count rather than 0, so a footer quirk can't
+    # starve a file that the full read does manage to open.
+    fallback = max(1, sum(known) // len(known))
+    sizes = [fallback if c is None else c for c in counts]
+    total = sum(sizes)
+    if total <= max_rows:
+        return [None] * len(parquet_paths)
+
+    budgets = [max(2, (max_rows * s) // total) for s in sizes]
+    if sum(budgets) > max_rows:
+        logging.info(
+            "delta stats: %d file(s) share a %d-row cap, so the per-file floor of 2 rows raises "
+            "the realized total to %d. Raise the cap to sample proportionally.",
+            len(parquet_paths),
+            max_rows,
+            sum(budgets),
+        )
+    return budgets
 
 
 def _process_parquet_file(task: dict[str, Any]) -> dict[str, dict[str, np.ndarray]] | None:
@@ -363,10 +501,15 @@ def _process_parquet_file(task: dict[str, Any]) -> dict[str, dict[str, np.ndarra
     if not spans:
         return None
 
+    # Anchors, after the optional row cap. The cap is what keeps a huge source's first-run cost
+    # bounded; `None` (the default) keeps every row, i.e. the uncapped behavior.
+    anchors = _select_anchor_rows(spans, task.get("max_rows"))
+    if not anchors:
+        return None
+
     def _iter_delta_chunks():
         """Yield ``(frames, horizon, dim)`` delta-action blocks, episode by episode."""
-        for ep_start, ep_end in spans:
-            rows = np.arange(ep_start, ep_end, dtype=np.int64)
+        for rows, ep_start, ep_end in anchors:
             for begin in range(0, len(rows), block):
                 frame_rows = rows[begin : begin + block]
                 chunk = _gather_chunks(actions, frame_rows, offsets, ep_start, ep_end, task["strategy"])
@@ -391,7 +534,9 @@ def _process_parquet_file(task: dict[str, Any]) -> dict[str, dict[str, np.ndarra
     for chunk in _iter_delta_chunks():
         action_acc.update(chunk)
 
-    state_rows = np.concatenate([np.arange(lo_, hi_, dtype=np.int64) for lo_, hi_ in spans])
+    # State stats read the same anchors, so both features describe one sample set and a capped
+    # run bounds this pass' peak memory too (it materializes `rows x dim` float64 at once).
+    state_rows = np.concatenate([rows for rows, _, _ in anchors])
     state_values = states[state_rows]
     state_acc = RunningStats(bounds=(state_values.min(axis=0), state_values.max(axis=0)))
     state_acc.update(state_values)
@@ -444,6 +589,7 @@ def compute_delta_action_stats(
     episodes: set[int] | None,
     max_workers: int = 1,
     block_frames: int = 4096,
+    max_rows: int | None = None,
 ) -> dict[str, dict[str, np.ndarray]]:
     """Compute delta-action (and state) stats for one dataset from its parquet files.
 
@@ -462,13 +608,26 @@ def compute_delta_action_stats(
             and avoids pool overhead for a single small file.
         block_frames: Chunk anchors processed per gather, bounding peak memory at roughly
             ``block_frames x len(chunk_offsets) x dim`` float64 values.
+        max_rows: Cap on how many anchor frames this dataset contributes, split across its files
+            in proportion to their selected-row counts (see :func:`_allocate_row_budgets`) and
+            sampled with a uniform stride (see :func:`_select_anchor_rows`), so a capped dataset
+            pools in the same file ratio an uncapped one would. ``None`` (default) reads every row.
+            Trades estimator precision for a bounded first-run wait on very large sources; the
+            columns are still read in full, so this caps compute, not I/O.
 
     Returns:
         ``{"actions": {...}, "state": {...}}`` in OpenTau's per-feature stats layout.
 
     Raises:
-        ValueError: If no file produced usable samples.
+        ValueError: If ``max_rows`` is non-positive, or if no file produced usable samples.
     """
+    if max_rows is not None and max_rows < 1:
+        raise ValueError(f"compute_delta_action_stats: max_rows must be >= 1 or None, got {max_rows}.")
+
+    if not parquet_paths:
+        raise ValueError("compute_delta_action_stats: no parquet paths given.")
+
+    budgets = _allocate_row_budgets([str(p) for p in parquet_paths], max_rows, episodes)
     tasks = [
         {
             "path": str(p),
@@ -481,11 +640,10 @@ def compute_delta_action_stats(
             "strategy": strategy,
             "episodes": episodes,
             "block_frames": block_frames,
+            "max_rows": budget,
         }
-        for p in parquet_paths
+        for p, budget in zip(parquet_paths, budgets, strict=True)
     ]
-    if not tasks:
-        raise ValueError("compute_delta_action_stats: no parquet paths given.")
 
     if max_workers <= 1 or len(tasks) == 1:
         parts = [_process_parquet_file(t) for t in tasks]
@@ -495,9 +653,19 @@ def compute_delta_action_stats(
 
     usable = [p for p in parts if p]
     if not usable:
+        # A file also drops out when it yields fewer than two samples, which a tight `max_rows`
+        # can cause on its own — call that out rather than blaming the data. Only when the cap
+        # actually bound: budgets are all `None` when the dataset was smaller than the cap.
+        bound = [b for b in budgets if b is not None]
+        cap_hint = (
+            f" max_rows={max_rows} was in force, leaving each file at most {max(bound)} anchor "
+            "row(s); a cap that tight can starve every file below the two-sample minimum."
+            if bound
+            else ""
+        )
         raise ValueError(
             "compute_delta_action_stats: every parquet file was empty, unreadable, or excluded "
-            f"by the episode selection ({len(tasks)} file(s) tried)."
+            f"by the episode selection ({len(tasks)} file(s) tried).{cap_hint}"
         )
     return _merge_running(usable)
 

@@ -168,7 +168,8 @@ def _compute_or_load_delta_stats(
     Args:
         dataset: The configured dataset (already carrying its resolved delta map).
         dataset_cfg: Its config entry.
-        train_cfg: Pipeline config, read for ``num_workers``.
+        train_cfg: Pipeline config, read for ``num_workers`` and
+            ``dataset_mixture.delta_stats_max_rows``.
 
     Returns:
         ``{"actions": {...}, "state": {...}}`` in post-index space.
@@ -187,6 +188,9 @@ def _compute_or_load_delta_stats(
     chunk_offsets = np.asarray(dt_mean["actions"], dtype=np.float64) * dataset.fps
 
     name_map = dataset._get_name_map()
+    # Bounds the O(frames x chunk_size) pass on very large sources. In the cache key too, so
+    # flipping the cap recomputes instead of serving stats from a different sampling budget.
+    max_rows = getattr(train_cfg.dataset_mixture, "delta_stats_max_rows", None)
     cache_key = delta_stats_cache_key(
         state_index=dataset_cfg.state_index,
         action_index=dataset_cfg.action_index,
@@ -197,6 +201,7 @@ def _compute_or_load_delta_stats(
         excluded_episodes=dataset_cfg.excluded_episodes,
         fps=dataset.fps,
         revision=dataset_cfg.revision,
+        max_rows=max_rows,
     )
     # Only the main process computes, so sizing the pool from the full `num_workers` neither
     # oversubscribes the node nor leaves it idle.
@@ -215,6 +220,7 @@ def _compute_or_load_delta_stats(
             "strategy": dataset.vector_resample_strategy,
             "episodes": set(episodes),
             "max_workers": max_workers,
+            "max_rows": max_rows,
         },
     )
 
