@@ -108,6 +108,8 @@ We provide fully functioning $\pi_{0.5}$ checkpoints trained with high success r
 | $\pi_{0.7}$ checkpoints       | Coming soon — the hierarchical `pi07_high_level` + `pi07_low_level` policies are implemented and ready to train from scratch; first TensorAuto-published checkpoint will appear here once released. | N/A |
 | More coming soon...           |                                                                                                               |                                                                    |
 
+A published training run lives in one repo with **each saved step as a git tag** and `main` at the highest step, so a checkpoint path can pin an exact step — `--policy.path=TensorAuto/<repo>@6000` — while a bare repo id gives the latest. The suffix works for `--policy.path`, `--config_path` and `policy.pretrained_path`; see the [training tutorial](https://opentau.readthedocs.io/en/latest/tutorials/training.html).
+
 ## Acknowledgements
 
 This project builds on the $\pi$ series of [papers][3] and many other open-source efforts—especially [LeRobot][4]—for re-implementing the $\pi$ models and helping standardize training infrastructure. OpenTau extends these foundations to provide a more accessible, comprehensive toolchain for training vision-language-action agents.

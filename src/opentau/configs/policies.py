@@ -33,17 +33,31 @@ from typing import Type, TypeVar
 import draccus
 from huggingface_hub import hf_hub_download
 from huggingface_hub.constants import CONFIG_NAME
-from huggingface_hub.errors import HfHubHTTPError
+from huggingface_hub.errors import HfHubHTTPError, RevisionNotFoundError
 from transformers import PretrainedConfig as _HFPretrainedConfig
 
 from opentau.configs.refs import resolve_refs
 from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from opentau.optim.optimizers import OptimizerConfig
 from opentau.optim.schedulers import LRSchedulerConfig
-from opentau.utils.hub import HubMixin
+from opentau.utils.hub import HubMixin, split_repo_revision
 
 # Generic variable that is either PreTrainedConfig or a subclass thereof
 T = TypeVar("T", bound="PreTrainedConfig")
+
+#: Filename a training checkpoint's whole-pipeline config is saved under.
+#: Defined here rather than in ``configs.train`` so the policy-config loader can
+#: fall back to it without importing ``configs.train`` (which imports this
+#: module); ``configs.train`` re-exports it for its existing importers.
+TRAIN_CONFIG_NAME = "train_config.json"
+
+#: Filename the out-of-repo convert-and-upload tooling gives the train config it
+#: publishes to a ``TensorAuto/*`` checkpoint repo. It is a full passthrough of
+#: ``train_config.json`` (minus ``output_dir``), so its ``.policy`` sub-object is
+#: a valid policy config. Uploaded checkpoints historically carried *only* this
+#: file, so both config loaders fall back to it — see
+#: ``PreTrainedConfig.from_pretrained`` and ``TrainPipelineConfig.from_pretrained``.
+HF_CONFIG_NAME = "hf_config.json"
 
 
 # --- transformers.PretrainedConfig <-> draccus codec ---
@@ -775,30 +789,63 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
             FileNotFoundError: If the configuration file is not found on the
                 HuggingFace Hub or in the local path.
         """
-        model_id = str(pretrained_name_or_path)
+        # "<repo_id>@<revision>" selects a published step by its git tag; a local
+        # path (even one containing "@") is returned untouched.
+        model_id, revision = split_repo_revision(pretrained_name_or_path, revision)
+        model_id = str(model_id)
         config_file: str | None = None
+        # `hf_config.json` / `train_config.json` are whole-pipeline configs, so the
+        # policy config is their `.policy` sub-object rather than the root.
+        nested_under_policy = False
         if Path(model_id).is_dir():
-            if CONFIG_NAME in os.listdir(model_id):
-                config_file = os.path.join(model_id, CONFIG_NAME)
+            for filename in (CONFIG_NAME, HF_CONFIG_NAME, TRAIN_CONFIG_NAME):
+                candidate = os.path.join(model_id, filename)
+                if os.path.isfile(candidate):
+                    config_file = candidate
+                    nested_under_policy = filename != CONFIG_NAME
+                    break
             else:
                 print(f"{CONFIG_NAME} not found in {Path(model_id).resolve()}")
         else:
-            try:
-                config_file = hf_hub_download(
-                    repo_id=model_id,
-                    filename=CONFIG_NAME,
-                    revision=revision,
-                    cache_dir=cache_dir,
-                    force_download=force_download,
-                    proxies=proxies,
-                    resume_download=resume_download,
-                    token=token,
-                    local_files_only=local_files_only,
-                )
-            except HfHubHTTPError as e:
+            # Uploaded checkpoint repos carry `hf_config.json` and (since the
+            # step-tag rollout) `config.json` + `train_config.json`; older ones
+            # carry `hf_config.json` alone. Try each so a published checkpoint is
+            # loadable by repo id regardless of when it was uploaded.
+            last_error: HfHubHTTPError | None = None
+            for filename in (CONFIG_NAME, HF_CONFIG_NAME, TRAIN_CONFIG_NAME):
+                try:
+                    config_file = hf_hub_download(
+                        repo_id=model_id,
+                        filename=filename,
+                        revision=revision,
+                        cache_dir=cache_dir,
+                        force_download=force_download,
+                        proxies=proxies,
+                        resume_download=resume_download,
+                        token=token,
+                        local_files_only=local_files_only,
+                    )
+                except RevisionNotFoundError as e:
+                    # Bail immediately: the revision is the problem, not the
+                    # filename, so the remaining candidates would fail the same
+                    # way and bury the real cause under "no config file found".
+                    raise FileNotFoundError(
+                        f"Revision {revision!r} does not exist in HuggingFace repo {model_id!r}. "
+                        f"Training steps are published as git tags named by step number — list "
+                        f"them at https://huggingface.co/{model_id}/tags . Omit the '@<step>' "
+                        f"suffix to load the latest step (main)."
+                    ) from e
+                except HfHubHTTPError as e:
+                    last_error = e
+                    continue
+                nested_under_policy = filename != CONFIG_NAME
+                break
+            if config_file is None:
+                source = model_id if revision is None else f"{model_id}@{revision}"
                 raise FileNotFoundError(
-                    f"{CONFIG_NAME} not found on the HuggingFace Hub in {model_id}"
-                ) from e
+                    f"None of {CONFIG_NAME}, {HF_CONFIG_NAME}, {TRAIN_CONFIG_NAME} were found "
+                    f"on the HuggingFace Hub in {source}"
+                ) from last_error
 
         # HACK: this is very ugly, ideally we'd like to be able to do that natively with draccus
         # something like --policy.path (in addition to --policy.type)
@@ -810,6 +857,14 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         # Resolve $refs once and reuse — the warn helpers and the strip step
         # would otherwise each walk the full ref tree from disk.
         config_data = load_resolved_config_dict(config_file)
+        if nested_under_policy:
+            policy_data = config_data.get("policy")
+            if not isinstance(policy_data, dict):
+                raise FileNotFoundError(
+                    f"{config_file} carries no 'policy' object, so it cannot be read as a "
+                    f"policy config for {model_id}."
+                )
+            config_data = policy_data
         warn_deprecated_latency_fields_from_dict(config_data, config_file)
         warn_removed_policy_fields_from_dict(config_data, config_file)
         # Strip deprecated/removed keys via a temp file rather than mutating the

@@ -19,7 +19,7 @@ from unittest.mock import patch
 import pytest
 from draccus.utils import ParsingError
 from huggingface_hub.constants import CONFIG_NAME
-from huggingface_hub.errors import RepositoryNotFoundError
+from huggingface_hub.errors import EntryNotFoundError, RepositoryNotFoundError, RevisionNotFoundError
 
 from opentau.configs.policies import (
     PreTrainedConfig,
@@ -158,6 +158,70 @@ def test_from_pretrained_path_does_not_exits():
         pytest.raises(FileNotFoundError),
     ):
         PreTrainedConfig.from_pretrained(pretrained_name_or_path="bert123")
+
+
+def test_from_pretrained_splits_the_revision_suffix(tmp_path):
+    """``repo@6000`` must reach the Hub as repo ``repo`` at revision ``6000``."""
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump(train_config["policy"], f, indent=4)
+
+    with patch("opentau.configs.policies.hf_hub_download", return_value=tmp_path / "config.json") as download:
+        PreTrainedConfig.from_pretrained(pretrained_name_or_path="ML_GOD/test@6000")
+
+    assert download.call_args.kwargs["repo_id"] == "ML_GOD/test"
+    assert download.call_args.kwargs["revision"] == "6000"
+
+
+def test_from_pretrained_reads_hf_config_json_when_config_json_is_absent(tmp_path):
+    """Uploaded checkpoint repos carry only ``hf_config.json`` — read its ``.policy``."""
+    with open(tmp_path / "hf_config.json", "w") as f:
+        json.dump(train_config, f, indent=4)
+
+    def _download(*, filename, **kwargs):
+        if filename != "hf_config.json":
+            raise EntryNotFoundError(f"{filename} absent")
+        return tmp_path / "hf_config.json"
+
+    with patch("opentau.configs.policies.hf_hub_download", side_effect=_download):
+        loaded = PreTrainedConfig.from_pretrained(pretrained_name_or_path="TensorAuto/some-run@6000")
+
+    assert loaded.type == train_config["policy"]["type"]
+
+
+def test_from_pretrained_local_dir_containing_at_is_read_from_disk(tmp_path):
+    """A real directory named ``run@6000`` is a path, not a repo-plus-tag."""
+    ckpt = tmp_path / "run@6000"
+    ckpt.mkdir()
+    with open(ckpt / "config.json", "w") as f:
+        json.dump(train_config["policy"], f, indent=4)
+
+    def _boom(**kwargs):
+        raise AssertionError("a local checkpoint directory must not hit the Hub")
+
+    with patch("opentau.configs.policies.hf_hub_download", side_effect=_boom):
+        loaded = PreTrainedConfig.from_pretrained(pretrained_name_or_path=str(ckpt))
+
+    assert loaded.type == train_config["policy"]["type"]
+
+
+def test_from_pretrained_unknown_revision_blames_the_revision(tmp_path):
+    """A bad tag must not surface as "no config file found".
+
+    Every candidate filename fails identically when the revision does not exist,
+    so trying them all buries the real cause.
+    """
+    with (
+        patch(
+            "opentau.configs.policies.hf_hub_download",
+            side_effect=RevisionNotFoundError("no such revision"),
+        ),
+        pytest.raises(FileNotFoundError) as excinfo,
+    ):
+        PreTrainedConfig.from_pretrained(pretrained_name_or_path="TensorAuto/some-run@99999")
+
+    message = str(excinfo.value)
+    assert "99999" in message
+    assert "huggingface.co/TensorAuto/some-run/tags" in message
 
 
 def test_strip_keys_top_level_and_nested():

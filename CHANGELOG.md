@@ -72,6 +72,31 @@ carry a concrete `config_version` (and an informational `opentau_version`).
 
 ### Added
 
+* **`repo_id@revision` checkpoint specs.** `--policy.path`, `--config_path` and
+  `policy.pretrained_path` accept a revision suffix, so a published checkpoint can
+  be pinned to one training step:
+
+  ```bash
+  --policy.path=TensorAuto/<runid>-<runname>@6000   # the "6000" tag
+  --policy.path=TensorAuto/<runid>-<runname>        # main = the latest step
+  ```
+
+  Published checkpoints are now one repo per run with each saved step as a git
+  tag, rather than one repo per step. Bare repo ids are unaffected (no `@`, no
+  split, `main` as before), so previously published `<run>-<step>` repos keep
+  working. **A local path is never split**, even one containing `@` — an existing
+  path short-circuits, and a path-shaped string (leading `/`, `.`, `~`, a
+  backslash, or more than one `/`) is left alone so it still fails as a path
+  rather than as a bogus repo id. Parsed by `split_repo_revision` in
+  `opentau/utils/hub.py`; passing both an `@` suffix and a conflicting
+  `revision=` raises rather than silently picking one.
+* **Published checkpoints are loadable by repo id.** Uploaded repos carried only
+  `hf_config.json`, so `--policy.path=<repo>` failed on the missing `config.json`
+  and `--config_path=<repo>` on the missing `train_config.json`; you had to fetch
+  `hf_config.json` by hand. `PreTrainedConfig.from_pretrained` and
+  `TrainPipelineConfig.from_pretrained` now fall back to `hf_config.json` (reading
+  its `.policy` sub-object for the former), which also fixes every checkpoint
+  already on the Hub.
 * `config_version: int | None` and `opentau_version: str | None` on
   `PreTrainedConfig`. `config_version` is a monotonic schema version for
   behavioral conventions; `opentau_version` is an informational package-version
@@ -84,8 +109,64 @@ carry a concrete `config_version` (and an informational `opentau_version`).
   disagrees with its `config_version`. Upstream / pre-versioning tokenizers
   (e.g. `physical-intelligence/fast`) carry no sidecar and are a no-op.
 
+### Fixed
+
+* **The `config_version` normalization gate now actually runs for every policy.**
+  It is documented above as the convention a checkpoint's weights were trained
+  under, resolved at load time by `PreTrainedPolicy.from_pretrained` — described
+  as "the single chokepoint every weight load crosses". It was not: the seven
+  policies that override `from_pretrained` (pi05, pi05_mem, pi06, both pi07
+  low/high levels, both pi07_paligemma low/high levels — i.e. every policy in
+  production use) never peeked the version, and `make_policy` always passes
+  `config=`, so their config-loading branch never ran either. A **pre-versioning
+  checkpoint loaded through any of them therefore normalized with the *current*
+  convention instead of the legacy one it was trained under** — silent, since the
+  weights load cleanly and only the numbers are wrong. Extracted as
+  `resolve_checkpoint_provenance` (`policies/pretrained.py`) and called by all
+  eight loaders immediately before `cls(config)` — the Normalize/Unnormalize
+  modules read `config_version` at construction, so resolving it later is too
+  late. Pinned by AST tests over the whole policy registry, including
+  call-ordering. `validate_input_resolution` was missing from the same seven and
+  is resolved alongside it.
+* **A failed weight load no longer returns a randomly-initialized policy.** All
+  seven per-policy `from_pretrained` overrides (pi05, pi05_mem, pi06, both pi07
+  low/high levels, both pi07_paligemma low/high levels) wrapped weight resolution
+  in a bare `except Exception` that logged a warning and returned the freshly
+  constructed model. An unknown repo, an unknown revision, a permissions error or
+  a failed download therefore produced an *untrained* model that looked like a
+  successful load until the loss curve said otherwise. These now raise. The one
+  case still tolerated is a **local directory with no `model.safetensors`** —
+  the DeepSpeed/ZeRO resume shape, where `accelerator.load_state` supplies the
+  weights immediately afterwards — and it is now a distinct
+  `CheckpointWeightsNotFoundError` rather than "any exception at all", logged as
+  a warning that says the policy is otherwise randomly initialized.
+* **Download arguments reached the Hub.** Five of those seven overrides read
+  their own parameters back as `kwargs.get("revision")`, `kwargs.get("token")`,
+  `kwargs.get("cache_dir")` and so on. Those are *keyword-only parameters*, so
+  they never appear in `**kwargs` and every one of the six lookups was
+  unconditionally `None`: `revision` was silently ignored, and private-repo loads
+  worked only via an ambient `HF_TOKEN`. All seven now resolve weights through a
+  single shared `resolve_pretrained_weights_file`, which is pinned by AST tests
+  over the whole policy registry.
+* Hub failures now carry actionable messages — an unknown revision names the
+  repo's `/tags` page and points out that omitting `@<step>` loads the latest.
+* Weights are resolved *before* the model is constructed, so a typo'd repo or tag
+  fails in milliseconds instead of after a multi-billion-parameter init.
+* `export_to_onnx.py` no longer creates a `./<org>/<repo>/` directory under the
+  current working directory for a Hub checkpoint (which an `@<step>` suffix would
+  have turned into a directory named after a git ref). Hub exports go to
+  `<output_dir>/onnx/<spec>/`; local checkpoint dirs are unchanged.
+
 ### Migration notes
 
+* **Legacy checkpoints served through pi05 / pi05_mem / pi06 / pi07 /
+  pi07_paligemma change numerically.** Because those policies never resolved
+  `config_version` (see Fixed), a pre-versioning checkpoint was being normalized
+  with the current convention. It is now correctly read as legacy `0` — matching
+  what the weights were trained under, and matching what the base-class policies
+  (pi0, value, cosmos3) already did. Expect small output differences on such a
+  checkpoint; they are the *correction*. To deliberately keep the previous
+  behavior, set `--policy.config_version=1` explicitly, which is honored untouched.
 * **Discrete-action (FAST) runs at `config_version` 1 need a tokenizer re-fit.**
   A `config_version` 1 policy pointed at a tokenizer fit under the old convention
   raises a clear error. Re-fit with `fit_fast_tokenizer.py --config-version 1`,

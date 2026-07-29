@@ -62,7 +62,14 @@ from opentau.policies.pi07.low_level.configuration_pi07_low_level import (
     PI07LowLevelConfig,
 )
 from opentau.policies.pi07.video_encoder import SpaceTimeSiglipVideoEncoder
-from opentau.policies.pretrained import PreTrainedPolicy, ProjectionRemapError, T
+from opentau.policies.pretrained import (
+    CheckpointWeightsNotFoundError,
+    PreTrainedPolicy,
+    ProjectionRemapError,
+    T,
+    resolve_checkpoint_provenance,
+    resolve_pretrained_weights_file,
+)
 from opentau.policies.utils import (
     PerSampleLoss,
     assert_gemma3_input_resolution,
@@ -71,6 +78,7 @@ from opentau.policies.utils import (
     freeze_policy_level_params_for_vision_only,
 )
 from opentau.utils.accelerate_utils import get_proc_accelerator
+from opentau.utils.hub import format_repo_revision, split_repo_revision
 from opentau.utils.utils import get_safe_dtype
 
 
@@ -447,9 +455,13 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
         if pretrained_name_or_path is None:
             raise ValueError("pretrained_name_or_path is required")
 
+        # "<repo_id>@<revision>" selects a published step by its git tag; a local
+        # path (even one containing "@") is returned untouched.
+        repo_id, revision = split_repo_revision(pretrained_name_or_path, revision)
+
         if config is None:
             config = PreTrainedConfig.from_pretrained(
-                pretrained_name_or_path=pretrained_name_or_path,
+                pretrained_name_or_path=repo_id,
                 force_download=force_download,
                 resume_download=resume_download if resume_download is not None else False,
                 proxies=proxies,
@@ -460,10 +472,55 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
                 **kwargs,
             )
 
-        model = cls(config, **kwargs)
-
         acc = get_proc_accelerator()
         is_main_process = acc.is_main_process if acc else True
+
+        # Resolve the weights BEFORE building the (multi-billion-parameter) model, so
+        # a typo'd repo id or an unknown tag fails in milliseconds rather than after a
+        # full init. A missing local `model.safetensors` is the one tolerated failure —
+        # everything else (unknown repo/revision, no access, failed download) raises,
+        # because silently returning a randomly-initialized policy is indistinguishable
+        # from a successful load until the loss curve says otherwise.
+        try:
+            weights_file: str | None = resolve_pretrained_weights_file(
+                repo_id,
+                revision=revision,
+                cache_dir=cache_dir,
+                force_download=force_download,
+                resume_download=resume_download,
+                proxies=proxies,
+                token=token,
+                local_files_only=local_files_only,
+            )
+        except CheckpointWeightsNotFoundError as e:
+            if is_main_process:
+                logging.warning(
+                    "%s Building the policy WITHOUT pretrained weights — expected only when "
+                    "resuming a DeepSpeed/ZeRO run, where accelerator.load_state restores them "
+                    "next. Otherwise this policy is randomly initialized.",
+                    e,
+                )
+            weights_file = None
+
+        # Key the config to the conventions these weights were trained under,
+        # BEFORE `cls(config)` builds the Normalize modules off `config_version`.
+        # `make_policy` always passes `config=`, so the `config is None` branch
+        # above never fires there and this is the only place it gets resolved.
+        resolve_checkpoint_provenance(
+            config,
+            repo_id,
+            revision=revision,
+            cache_dir=cache_dir,
+            force_download=force_download,
+            resume_download=resume_download,
+            proxies=proxies,
+            token=token,
+            local_files_only=local_files_only,
+        )
+
+        model = cls(config, **kwargs)
+        if weights_file is None:
+            return model
         # When per-group projections are on, reconcile projection rows by group
         # name. The checkpoint's own group ordering is its `dataset_names`; seed
         # with the already-loaded `config.dataset_names` — which on an inference
@@ -479,7 +536,7 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
             old_dataset_names = list(seeded) if seeded else None
             try:
                 source_config = PreTrainedConfig.from_pretrained(
-                    pretrained_name_or_path=pretrained_name_or_path,
+                    pretrained_name_or_path=repo_id,
                     force_download=force_download,
                     resume_download=resume_download,
                     proxies=proxies,
@@ -500,35 +557,15 @@ class PI07LowLevelPolicy(PreTrainedPolicy):
         # used outside the try/except to gate the inf-buffer guard so the
         # ValueError is not swallowed by the broad except below.
         stripped_keys: frozenset[str] = frozenset()
+        if is_main_process:
+            logging.info("Loading model from: %s", format_repo_revision(repo_id, revision))
+        from safetensors.torch import load_file
+
+        original_state_dict = load_file(weights_file)
+        if is_main_process:
+            logging.info("Loaded state dict from model.safetensors")
+
         try:
-            if is_main_process:
-                logging.info("Loading model from: %s", pretrained_name_or_path)
-            try:
-                from transformers.utils.hub import cached_file
-
-                resolved_file = cached_file(
-                    pretrained_name_or_path,
-                    "model.safetensors",
-                    cache_dir=cache_dir,
-                    force_download=force_download,
-                    resume_download=resume_download,
-                    proxies=proxies,
-                    token=token,
-                    revision=revision,
-                    local_files_only=local_files_only,
-                )
-                assert resolved_file is not None, "cached_file returned None"
-                from safetensors.torch import load_file
-
-                original_state_dict = load_file(resolved_file)
-                if is_main_process:
-                    logging.info("Loaded state dict from model.safetensors")
-            except Exception as e:
-                if is_main_process:
-                    logging.warning("Could not load state dict from remote files: %s", e)
-                    logging.info("Returning model without loading pretrained weights")
-                return model
-
             fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
 
             remapped_state_dict = {}

@@ -43,9 +43,16 @@ from opentau.policies.pi07.gemma3_with_expert import (
 from opentau.policies.pi07.high_level_planner.configuration_pi07_high_level import (
     PI07HighLevelPlannerConfig,
 )
-from opentau.policies.pretrained import PreTrainedPolicy, T
+from opentau.policies.pretrained import (
+    CheckpointWeightsNotFoundError,
+    PreTrainedPolicy,
+    T,
+    resolve_checkpoint_provenance,
+    resolve_pretrained_weights_file,
+)
 from opentau.policies.utils import assert_gemma3_input_resolution
 from opentau.utils.accelerate_utils import get_proc_accelerator
+from opentau.utils.hub import format_repo_revision, split_repo_revision
 
 
 def _preferred_dtype() -> torch.dtype:
@@ -275,10 +282,14 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
         if pretrained_name_or_path is None:
             raise ValueError("pretrained_name_or_path is required")
 
+        # "<repo_id>@<revision>" selects a published step by its git tag; a local
+        # path (even one containing "@") is returned untouched.
+        repo_id, revision = split_repo_revision(pretrained_name_or_path, revision)
+
         # Use provided config if available, otherwise create default config
         if config is None:
             config = PreTrainedConfig.from_pretrained(
-                pretrained_name_or_path=pretrained_name_or_path,
+                pretrained_name_or_path=repo_id,
                 force_download=force_download,
                 resume_download=resume_download,
                 proxies=proxies,
@@ -289,47 +300,72 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
                 **kwargs,
             )
 
+        acc = get_proc_accelerator()
+        is_main_process = acc.is_main_process if acc else True
+
+        # Resolve the weights BEFORE building the (multi-billion-parameter) model, so
+        # a typo'd repo id or an unknown tag fails in milliseconds rather than after a
+        # full init. A missing local `model.safetensors` is the one tolerated failure —
+        # everything else (unknown repo/revision, no access, failed download) raises,
+        # because silently returning a randomly-initialized policy is indistinguishable
+        # from a successful load until the loss curve says otherwise.
+        try:
+            weights_file: str | None = resolve_pretrained_weights_file(
+                repo_id,
+                revision=revision,
+                cache_dir=cache_dir,
+                force_download=force_download,
+                resume_download=resume_download,
+                proxies=proxies,
+                token=token,
+                local_files_only=local_files_only,
+            )
+        except CheckpointWeightsNotFoundError as e:
+            if is_main_process:
+                logging.warning(
+                    "%s Building the policy WITHOUT pretrained weights — expected only when "
+                    "resuming a DeepSpeed/ZeRO run, where accelerator.load_state restores them "
+                    "next. Otherwise this policy is randomly initialized.",
+                    e,
+                )
+            weights_file = None
+
+        # Key the config to the conventions these weights were trained under,
+        # BEFORE `cls(config)` builds the Normalize modules off `config_version`.
+        # `make_policy` always passes `config=`, so the `config is None` branch
+        # above never fires there and this is the only place it gets resolved.
+        resolve_checkpoint_provenance(
+            config,
+            repo_id,
+            revision=revision,
+            cache_dir=cache_dir,
+            force_download=force_download,
+            resume_download=resume_download,
+            proxies=proxies,
+            token=token,
+            local_files_only=local_files_only,
+        )
+
         # Initialize model without loading weights
         # Check if dataset_stats were provided in kwargs
         model = cls(config, **kwargs)
+        if weights_file is None:
+            return model
 
         # Now manually load and remap the state dict
-        acc = get_proc_accelerator()
-        is_main_process = acc.is_main_process if acc else True
+        if is_main_process:
+            print(f"Loading model from: {format_repo_revision(repo_id, revision)}")
+        from safetensors.torch import load_file
+
+        original_state_dict = load_file(weights_file)
+        if is_main_process:
+            print("✓ Loaded state dict from model.safetensors")
+
         # Populated inside the try block when skip_normalization_weights fires;
         # used outside the try/except to gate the inf-buffer guard so the
         # ValueError is not swallowed by the broad except below.
         stripped_keys: frozenset[str] = frozenset()
         try:
-            # Try to load the pytorch_model.bin or model.safetensors file
-            if is_main_process:
-                print(f"Loading model from: {pretrained_name_or_path}")
-            try:
-                from transformers.utils import cached_file
-
-                # Try safetensors first
-                resolved_file = cached_file(
-                    pretrained_name_or_path,
-                    "model.safetensors",
-                    cache_dir=kwargs.get("cache_dir"),
-                    force_download=kwargs.get("force_download", False),
-                    resume_download=kwargs.get("resume_download"),
-                    proxies=kwargs.get("proxies"),
-                    use_auth_token=kwargs.get("use_auth_token"),
-                    revision=kwargs.get("revision"),
-                    local_files_only=kwargs.get("local_files_only", False),
-                )
-                from safetensors.torch import load_file
-
-                original_state_dict = load_file(resolved_file)
-                if is_main_process:
-                    print("✓ Loaded state dict from model.safetensors")
-            except Exception as e:
-                if is_main_process:
-                    print(f"Could not load state dict from remote files: {e}")
-                    print("Returning model without loading pretrained weights")
-                return model
-
             # First, fix any key differences # see openpi `model.py, _fix_pytorch_state_dict_keys`
             fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
 

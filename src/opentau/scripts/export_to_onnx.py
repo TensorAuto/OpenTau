@@ -41,6 +41,7 @@ from opentau.configs import parser
 from opentau.configs.train import TrainPipelineConfig
 from opentau.policies.factory import get_policy_class
 from opentau.policies.pi05.modeling_pi05 import PI05Policy
+from opentau.utils.hub import format_repo_revision, split_repo_revision
 from opentau.utils.monkey_patch import (
     torch_cumsum_patch,
     torch_full_patch,
@@ -229,8 +230,16 @@ def main(cfg: TrainPipelineConfig):
     args = (lang_tokens, lang_masks, noise, action_prefix, delay) + tuple(images)
 
     logging.info("Exporting model to ONNX with Dynamo exporter...")
-    output_path = Path(cfg.policy.pretrained_path) / "model.onnx"
-    output_path = output_path.resolve()
+    # A local checkpoint dir gets the export written beside its weights. A Hub
+    # spec is not a path: writing `./<org>/<repo>/` under cwd was already
+    # surprising, and an "@<step>" tag suffix would name a directory after a git
+    # ref, so those land under the run's output_dir instead.
+    export_repo_id, export_revision = split_repo_revision(cfg.policy.pretrained_path)
+    export_dir = Path(str(export_repo_id))
+    if not export_dir.is_dir():
+        slug = format_repo_revision(export_repo_id, export_revision).replace("/", "__")
+        export_dir = Path(cfg.output_dir or ".") / "onnx" / slug
+    output_path = (export_dir / "model.onnx").resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     # External data file is saved alongside the .onnx file with .onnx.data suffix
     weights_path = output_path.with_suffix(".onnx.data")

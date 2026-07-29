@@ -69,3 +69,34 @@ Training can be resumed by running:
 
 .. note::
    When resuming training from a checkpoint, the training step count will continue from the checkpoint's step, but the dataloader will be reset.
+
+Loading a Published Checkpoint by Step
+--------------------------------------
+
+A published training run lives in a single Hugging Face repo, with **each saved
+step as a git tag** and ``main`` pointing at the highest step. Select a step with
+an ``@`` suffix:
+
+.. code-block:: bash
+
+    # a specific training step (the "6000" tag)
+    opentau-train --policy.path=TensorAuto/<runid>-<runname>@6000 ...
+
+    # no suffix -> main -> the latest step
+    opentau-train --policy.path=TensorAuto/<runid>-<runname> ...
+
+The suffix works anywhere a checkpoint is named — ``--policy.path``,
+``--config_path``, and the ``policy.pretrained_path`` field of a config JSON. Each
+tag carries the weights alongside ``config.json`` / ``train_config.json`` /
+``hf_config.json``, so a repo id is enough on its own; a downloaded config records
+the exact ``<repo>@<step>`` it came from rather than floating on ``main``.
+
+An unknown tag raises immediately and points at the repo's tag list. Note that a
+**local path is never interpreted as a revision**, even one containing ``@`` (for
+example ``outputs/train/run@6000/checkpoints/000040``) — only Hub repo ids are
+split.
+
+.. note::
+   Checkpoints published before this scheme used one repo per step
+   (``<runid>-<runname>-<step>``). Those ids still resolve and need no ``@``
+   suffix.

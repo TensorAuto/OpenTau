@@ -29,12 +29,14 @@ from typing import Type
 
 import draccus
 from huggingface_hub import hf_hub_download
-from huggingface_hub.errors import HfHubHTTPError
+from huggingface_hub.errors import HfHubHTTPError, RevisionNotFoundError
 
 from opentau.configs import parser
 from opentau.configs.default import DatasetMixtureConfig, EvalConfig, WandBConfig
 from opentau.configs.deployment import PlannerConfig, ServerConfig
 from opentau.configs.policies import (
+    HF_CONFIG_NAME,
+    TRAIN_CONFIG_NAME,
     PreTrainedConfig,
     load_resolved_config_dict,
     strip_deprecated_fields_from_json,
@@ -45,9 +47,11 @@ from opentau.configs.policies import (
 from opentau.envs.configs import EnvConfig
 from opentau.optim import OptimizerConfig
 from opentau.optim.schedulers import LRSchedulerConfig
-from opentau.utils.hub import HubMixin
+from opentau.utils.hub import HubMixin, split_repo_revision
 
-TRAIN_CONFIG_NAME = "train_config.json"
+# `TRAIN_CONFIG_NAME` is defined in `configs.policies` — the lower-level module,
+# which needs it for its own config-file fallback and cannot import this one —
+# but has always been imported from here, so it stays importable from both.
 
 
 # Somehow, calling `logging.warning()` sets the logger level to WARNING.
@@ -504,32 +508,60 @@ class TrainPipelineConfig(HubMixin):
             FileNotFoundError: If the configuration file is not found on the
                 HuggingFace Hub or in the local path.
         """
-        model_id = str(pretrained_name_or_path)
+        # "<repo_id>@<revision>" selects a published step by its git tag; a local
+        # path (even one containing "@") is returned untouched.
+        model_id, revision = split_repo_revision(pretrained_name_or_path, revision)
+        model_id = str(model_id)
         config_file: str | None = None
         if Path(model_id).is_dir():
-            if TRAIN_CONFIG_NAME in os.listdir(model_id):
-                config_file = os.path.join(model_id, TRAIN_CONFIG_NAME)
+            for filename in (TRAIN_CONFIG_NAME, HF_CONFIG_NAME):
+                candidate = os.path.join(model_id, filename)
+                if os.path.isfile(candidate):
+                    config_file = candidate
+                    break
             else:
                 print(f"{TRAIN_CONFIG_NAME} not found in {Path(model_id).resolve()}")
         elif Path(model_id).is_file():
             config_file = model_id
         else:
-            try:
-                config_file = hf_hub_download(
-                    repo_id=model_id,
-                    filename=TRAIN_CONFIG_NAME,
-                    revision=revision,
-                    cache_dir=cache_dir,
-                    force_download=force_download,
-                    proxies=proxies,
-                    resume_download=resume_download,
-                    token=token,
-                    local_files_only=local_files_only,
-                )
-            except HfHubHTTPError as e:
+            # Checkpoint repos uploaded before the step-tag rollout carry only
+            # `hf_config.json` — a full passthrough of this same config minus
+            # `output_dir` — so fall back to it rather than 404ing on every
+            # published checkpoint.
+            last_error: HfHubHTTPError | None = None
+            for filename in (TRAIN_CONFIG_NAME, HF_CONFIG_NAME):
+                try:
+                    config_file = hf_hub_download(
+                        repo_id=model_id,
+                        filename=filename,
+                        revision=revision,
+                        cache_dir=cache_dir,
+                        force_download=force_download,
+                        proxies=proxies,
+                        resume_download=resume_download,
+                        token=token,
+                        local_files_only=local_files_only,
+                    )
+                except RevisionNotFoundError as e:
+                    # Bail immediately: the revision is the problem, not the
+                    # filename, so the remaining candidate would fail the same
+                    # way and bury the real cause under "no config file found".
+                    raise FileNotFoundError(
+                        f"Revision {revision!r} does not exist in HuggingFace repo {model_id!r}. "
+                        f"Training steps are published as git tags named by step number — list "
+                        f"them at https://huggingface.co/{model_id}/tags . Omit the '@<step>' "
+                        f"suffix to load the latest step (main)."
+                    ) from e
+                except HfHubHTTPError as e:
+                    last_error = e
+                    continue
+                break
+            if config_file is None:
+                source = model_id if revision is None else f"{model_id}@{revision}"
                 raise FileNotFoundError(
-                    f"{TRAIN_CONFIG_NAME} not found on the HuggingFace Hub in {model_id}"
-                ) from e
+                    f"Neither {TRAIN_CONFIG_NAME} nor {HF_CONFIG_NAME} was found on the "
+                    f"HuggingFace Hub in {source}"
+                ) from last_error
 
         cli_args = kwargs.pop("cli_args", [])
 

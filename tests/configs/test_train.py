@@ -21,6 +21,7 @@ from unittest.mock import patch
 import draccus
 import pytest
 from draccus.utils import ParsingError
+from huggingface_hub.errors import EntryNotFoundError, RevisionNotFoundError
 
 from opentau.configs import parser
 from opentau.configs.policies import PreTrainedConfig
@@ -354,6 +355,70 @@ def test_from_pretrained_model_exits(tmp_path):
             TrainPipelineConfig.from_pretrained(pretrained_name_or_path=repo_id)
         except Exception as e:
             pytest.fail(f"The pytests failed due to {e}")
+
+
+def test_from_pretrained_splits_the_revision_suffix(tmp_path):
+    """``--config_path=repo@6000`` must fetch repo ``repo`` at revision ``6000``."""
+    with open(tmp_path / "train_config.json", "w") as f:
+        json.dump(train_config, f, indent=4)
+
+    with patch(
+        "opentau.configs.train.hf_hub_download", return_value=tmp_path / "train_config.json"
+    ) as download:
+        TrainPipelineConfig.from_pretrained(pretrained_name_or_path="ML_GOD/test@6000")
+
+    assert download.call_args.kwargs["repo_id"] == "ML_GOD/test"
+    assert download.call_args.kwargs["revision"] == "6000"
+
+
+def test_from_pretrained_reads_hf_config_json_when_train_config_is_absent(tmp_path):
+    """Published checkpoints carry `hf_config.json`; `--config_path=<repo>` must work."""
+    with open(tmp_path / "hf_config.json", "w") as f:
+        json.dump(train_config, f, indent=4)
+
+    def _download(*, filename, **kwargs):
+        if filename != "hf_config.json":
+            raise EntryNotFoundError(f"{filename} absent")
+        return tmp_path / "hf_config.json"
+
+    with patch("opentau.configs.train.hf_hub_download", side_effect=_download):
+        try:
+            TrainPipelineConfig.from_pretrained(pretrained_name_or_path="TensorAuto/some-run@6000")
+        except Exception as e:
+            pytest.fail(f"loading a published checkpoint config failed: {e}")
+
+
+def test_from_pretrained_unknown_revision_blames_the_revision():
+    """A bad tag must not surface as "no config file found"."""
+    with (
+        patch(
+            "opentau.configs.train.hf_hub_download",
+            side_effect=RevisionNotFoundError("no such revision"),
+        ),
+        pytest.raises(FileNotFoundError) as excinfo,
+    ):
+        TrainPipelineConfig.from_pretrained(pretrained_name_or_path="TensorAuto/some-run@99999")
+
+    message = str(excinfo.value)
+    assert "99999" in message
+    assert "huggingface.co/TensorAuto/some-run/tags" in message
+
+
+def test_from_pretrained_local_file_under_a_directory_containing_at(tmp_path):
+    """A real path is never split, even when a component looks like ``name@rev``."""
+    run_dir = tmp_path / "run@6000"
+    run_dir.mkdir()
+    with open(run_dir / "train_config.json", "w") as f:
+        json.dump(train_config, f, indent=4)
+
+    def _boom(**kwargs):
+        raise AssertionError("a local config path must not hit the Hub")
+
+    with patch("opentau.configs.train.hf_hub_download", side_effect=_boom):
+        try:
+            TrainPipelineConfig.from_pretrained(pretrained_name_or_path=run_dir)
+        except Exception as e:
+            pytest.fail(f"loading a local config under an '@' directory failed: {e}")
 
 
 # ---------------------------------------------------------------------------

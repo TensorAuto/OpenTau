@@ -39,6 +39,12 @@ Example of important config fields for inference with autoregressive response pr
     ...
    }
 
+``pretrained_path`` accepts a local checkpoint directory, a Hub repo id, or a Hub
+repo id pinned to one training step with an ``@`` suffix
+(``"TensorAuto/<runid>-<runname>@6000"``). Without a suffix, a Hub repo resolves
+to ``main`` — the run's latest step. See
+:doc:`training` for details.
+
 
 Running inference with ONNX and TensorRT
 ----------------------------------------
@@ -52,7 +58,7 @@ You can export a trained PI05 policy to ONNX and run inference with ONNX Runtime
 
 **Step 1: Export the model to ONNX**
 
-Export uses the same train config as training. The ONNX model is written to the directory given by ``policy.pretrained_path`` in that config (typically your checkpoint directory). Two files are produced: ``model.onnx`` (graph) and ``model.onnx.data`` (weights; used for models with large weights).
+Export uses the same train config as training. When ``policy.pretrained_path`` is a local checkpoint directory, the ONNX model is written there. When it is a Hub repo id (with or without an ``@<step>`` suffix), the export goes to ``<output_dir>/onnx/<spec>/`` instead — where ``<spec>`` is the checkpoint spec with ``/`` replaced by ``__``, e.g. ``TensorAuto__my-run@6000`` — since a repo id is not a writable path. Two files are produced: ``model.onnx`` (graph) and ``model.onnx.data`` (weights; used for models with large weights).
 
 .. code-block:: bash
 

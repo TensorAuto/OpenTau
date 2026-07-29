@@ -33,14 +33,19 @@ import numpy as np
 import torch
 from huggingface_hub import hf_hub_download
 from huggingface_hub.constants import CONFIG_NAME, SAFETENSORS_SINGLE_FILE
-from huggingface_hub.errors import HfHubHTTPError
+from huggingface_hub.errors import (
+    GatedRepoError,
+    HfHubHTTPError,
+    RepositoryNotFoundError,
+    RevisionNotFoundError,
+)
 from safetensors.torch import save_model as save_model_as_safetensor
 from torch import Tensor, nn
 
-from opentau.configs.policies import PreTrainedConfig
+from opentau.configs.policies import HF_CONFIG_NAME, TRAIN_CONFIG_NAME, PreTrainedConfig
 from opentau.policies.normalize import _materialize
 from opentau.policies.utils import log_model_loading_keys
-from opentau.utils.hub import HubMixin
+from opentau.utils.hub import HubMixin, format_repo_revision, split_repo_revision
 
 T = TypeVar("T", bound="PreTrainedPolicy")
 
@@ -117,10 +122,8 @@ def _peek_config_version(
     checkpoints are written as flat dumps, and a version behind a ``$ref`` is a
     non-issue.
     """
-    # Lazy import avoids a configs.train <-> policies.pretrained import cycle.
-    from opentau.configs.train import TRAIN_CONFIG_NAME
-
-    model_id = str(pretrained_name_or_path)
+    model_id, revision = split_repo_revision(pretrained_name_or_path, revision)
+    model_id = str(model_id)
     dl_kwargs = {
         "revision": revision,
         "cache_dir": cache_dir,
@@ -130,10 +133,7 @@ def _peek_config_version(
         "token": token,
         "local_files_only": local_files_only,
     }
-    # "hf_config.json" is not a repo constant — it is the filename the out-of-repo
-    # convert-and-upload script writes; kept as a literal so the loader stays
-    # self-contained (see CHANGELOG "Converted / uploaded checkpoints").
-    for filename in (CONFIG_NAME, TRAIN_CONFIG_NAME, "hf_config.json"):
+    for filename in (CONFIG_NAME, TRAIN_CONFIG_NAME, HF_CONFIG_NAME):
         try:
             if os.path.isdir(model_id):
                 path = os.path.join(model_id, filename)
@@ -149,6 +149,146 @@ def _peek_config_version(
         if version is not None:
             return version
     return None
+
+
+def resolve_checkpoint_provenance(
+    config: PreTrainedConfig,
+    pretrained_name_or_path: str | Path,
+    *,
+    revision: str | None = None,
+    cache_dir: str | Path | None = None,
+    force_download: bool = False,
+    resume_download: bool | None = None,
+    proxies: dict | None = None,
+    token: str | bool | None = None,
+    local_files_only: bool = False,
+) -> None:
+    """Key a policy config to the conventions the weights it is about to load were trained under.
+
+    Must be called by **every** ``from_pretrained``, immediately before
+    ``cls(config)`` — the Normalize/Unnormalize modules are built from
+    ``config_version`` at construction time, so resolving it afterwards is too
+    late. Mutates ``config`` in place.
+
+    Resolves two things:
+
+    * ``config_version`` — we are loading real weights, so an absent tag on the
+      source means a pre-versioning checkpoint (legacy ``0``); a tagged source is
+      inherited; an already-set value (a CLI/JSON escape hatch, or a config that
+      has been resolved once already) is honored untouched. Keying off the
+      weights is what makes serving or exporting a published legacy checkpoint
+      stay legacy without any of those scripts knowing about it ("disk is truth").
+    * a warning (never a raise) when the checkpoint's resize target disagrees with
+      its bound image features — the load-time symptom of a legacy checkpoint
+      trained with the in-policy double letterbox. Strict train-time enforcement
+      lives in ``make_policy`` and ``TrainPipelineConfig.validate()``.
+
+    Extracted from ``PreTrainedPolicy.from_pretrained`` because the seven policy
+    subclasses that override ``from_pretrained`` did not do either of these, and
+    ``make_policy`` always passes ``config=``, so their
+    ``if config is None: PreTrainedConfig.from_pretrained(...)`` branch never
+    fires. Every production policy therefore skipped the normalization gate
+    entirely and silently used the *current* convention on legacy weights.
+    ``tests/policies/test_from_pretrained_revision_overrides.py`` pins that all of
+    them call this.
+    """
+    if config.config_version is None:
+        peeked = _peek_config_version(
+            pretrained_name_or_path,
+            revision=revision,
+            cache_dir=cache_dir,
+            force_download=force_download,
+            proxies=proxies,
+            resume_download=resume_download,
+            token=token,
+            local_files_only=local_files_only,
+        )
+        config.config_version = peeked if peeked is not None else 0
+
+    config.validate_input_resolution(strict=False)
+
+
+class CheckpointWeightsNotFoundError(FileNotFoundError):
+    """The checkpoint source resolved, but carries no ``model.safetensors``.
+
+    Deliberately distinct from "no such repo", "no such revision", "no access"
+    and "the download failed" — those are hard errors with no legitimate caller.
+    This one is tolerated by the per-policy ``from_pretrained`` overrides **for a
+    local directory only**, because that is exactly the DeepSpeed/ZeRO resume
+    shape: ``accelerator.save_state`` writes sharded ZeRO state and no
+    ``model.safetensors``, and ``accelerator.load_state`` supplies the real
+    weights immediately after ``make_policy`` returns. Resuming from the Hub is
+    rejected outright in ``TrainPipelineConfig.validate()``, so a Hub source can
+    never legitimately be missing its weights.
+    """
+
+
+def resolve_pretrained_weights_file(
+    pretrained_name_or_path: str | Path,
+    *,
+    revision: str | None = None,
+    cache_dir: str | Path | None = None,
+    force_download: bool = False,
+    resume_download: bool | None = None,
+    proxies: dict | None = None,
+    token: str | bool | None = None,
+    local_files_only: bool = False,
+) -> str:
+    """Resolve ``model.safetensors`` for a local dir or a ``repo_id[@revision]``.
+
+    The single place any policy turns a checkpoint spec into a weights file, so
+    ``@<step>`` tag support and the Hub error messages exist once rather than
+    once per policy. Every failure surfaces as ``FileNotFoundError`` (which is
+    what the base loader and both config loaders already raise), so no caller's
+    ``except`` clause changes.
+
+    Raises:
+        CheckpointWeightsNotFoundError: A local directory with no
+            ``model.safetensors`` — the DeepSpeed/ZeRO resume shape.
+        FileNotFoundError: Anything else: unknown repo, unknown revision, no
+            access, or a failed download.
+    """
+    repo_id, revision = split_repo_revision(pretrained_name_or_path, revision)
+    model_id = str(repo_id)
+    if os.path.isdir(model_id):
+        path = os.path.join(model_id, SAFETENSORS_SINGLE_FILE)
+        if not os.path.isfile(path):
+            raise CheckpointWeightsNotFoundError(
+                f"{SAFETENSORS_SINGLE_FILE} not found in local checkpoint directory "
+                f"{model_id!r}. If this is a DeepSpeed/ZeRO checkpoint, consolidate it "
+                "first (see scripts/convert_checkpoint.sh)."
+            )
+        return path
+
+    source = format_repo_revision(model_id, revision)
+    try:
+        return hf_hub_download(
+            repo_id=model_id,
+            filename=SAFETENSORS_SINGLE_FILE,
+            revision=revision,
+            cache_dir=cache_dir,
+            force_download=force_download,
+            proxies=proxies,
+            resume_download=resume_download,
+            token=token,
+            local_files_only=local_files_only,
+        )
+    # Order matters: GatedRepoError <: RepositoryNotFoundError <: HfHubHTTPError,
+    # and RevisionNotFoundError <: HfHubHTTPError too, so the specific ones first.
+    except RevisionNotFoundError as e:
+        raise FileNotFoundError(
+            f"Revision {revision!r} does not exist in HuggingFace repo {model_id!r} "
+            f"(resolved from {source!r}). Training steps are published as git tags named "
+            f"by step number — list them at https://huggingface.co/{model_id}/tags . "
+            "Omit the '@<step>' suffix to load the latest step (main)."
+        ) from e
+    except (GatedRepoError, RepositoryNotFoundError) as e:
+        raise FileNotFoundError(
+            f"HuggingFace repo {model_id!r} (from {source!r}) was not found, or the token in "
+            "use lacks read access to it. Check the id, and that HF_TOKEN is set."
+        ) from e
+    except HfHubHTTPError as e:
+        raise FileNotFoundError(f"{SAFETENSORS_SINGLE_FILE} could not be fetched from {source!r}: {e}") from e
 
 
 def _read_action_norm_meta(
@@ -395,9 +535,13 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         Raises:
             FileNotFoundError: If the model file is not found.
         """
+        # "<repo_id>@<revision>" selects a published step by its git tag; a local
+        # path (even one containing "@") is returned untouched. Split once here so
+        # every downstream fetch — config, provenance peek, weights — agrees.
+        repo_id, revision = split_repo_revision(pretrained_name_or_path, revision)
         if config is None:
             config = PreTrainedConfig.from_pretrained(
-                pretrained_name_or_path=pretrained_name_or_path,
+                pretrained_name_or_path=repo_id,
                 force_download=force_download,
                 resume_download=resume_download,
                 proxies=proxies,
@@ -407,64 +551,37 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                 revision=revision,
                 **kwargs,
             )
-        model_id = str(pretrained_name_or_path)
+        model_id = str(repo_id)
 
-        # Resolve the normalization-convention version from the weights being
-        # loaded, BEFORE `cls(config)` builds the Normalize modules off it (see
-        # `CURRENT_CONFIG_VERSION`). We are loading real weights, so an absent
-        # tag means a pre-fix checkpoint -> legacy 0; a tagged source is
-        # inherited; an explicitly-set `config_version` (a CLI/JSON escape hatch,
-        # or an already-resolved config) is honored untouched. This is the single
-        # chokepoint every weight load crosses — factory finetune, resume, gRPC
-        # serve, ONNX/TensorRT export — so keying the convention off the weights
-        # here also makes serving/exporting a published legacy checkpoint stay
-        # legacy without touching those scripts ("disk is truth").
-        if config.config_version is None:
-            peeked = _peek_config_version(
-                pretrained_name_or_path,
-                revision=revision,
-                cache_dir=cache_dir,
-                force_download=force_download,
-                proxies=proxies,
-                resume_download=resume_download,
-                token=token,
-                local_files_only=local_files_only,
-            )
-            config.config_version = peeked if peeked is not None else 0
+        # Key the config to the conventions these weights were trained under,
+        # BEFORE `cls(config)` builds the Normalize modules off `config_version`.
+        resolve_checkpoint_provenance(
+            config,
+            repo_id,
+            revision=revision,
+            cache_dir=cache_dir,
+            force_download=force_download,
+            proxies=proxies,
+            resume_download=resume_download,
+            token=token,
+            local_files_only=local_files_only,
+        )
 
-        # Warn (never raise) when the checkpoint's resize target disagrees
-        # with its bound image features — the load-time symptom of a legacy
-        # checkpoint trained with the in-policy double letterbox. Placed here
-        # (mirroring `_check_norm_stats_loaded` below) so direct
-        # `from_pretrained` callers — the gRPC server, inference/export
-        # scripts, notebooks — get the same diagnostic as `make_policy`'s
-        # eval path; the strict train-time enforcement lives in
-        # `make_policy` (ds_meta path) and `TrainPipelineConfig.validate()`.
-        config.validate_input_resolution(strict=False)
-
+        # Resolve the weights BEFORE building the (multi-billion-parameter) model,
+        # so a typo'd repo id or an unknown tag fails in milliseconds rather than
+        # after a full init.
+        model_file = resolve_pretrained_weights_file(
+            model_id,
+            revision=revision,
+            cache_dir=cache_dir,
+            force_download=force_download,
+            proxies=proxies,
+            resume_download=resume_download,
+            token=token,
+            local_files_only=local_files_only,
+        )
         instance = cls(config, **kwargs)
-        if os.path.isdir(model_id):
-            print("Loading weights from local directory")
-            model_file = os.path.join(model_id, SAFETENSORS_SINGLE_FILE)
-            policy = cls._load_as_safetensor(instance, model_file, config.device, strict)
-        else:
-            try:
-                model_file = hf_hub_download(
-                    repo_id=model_id,
-                    filename=SAFETENSORS_SINGLE_FILE,
-                    revision=revision,
-                    cache_dir=cache_dir,
-                    force_download=force_download,
-                    proxies=proxies,
-                    resume_download=resume_download,
-                    token=token,
-                    local_files_only=local_files_only,
-                )
-                policy = cls._load_as_safetensor(instance, model_file, config.device, strict)
-            except HfHubHTTPError as e:
-                raise FileNotFoundError(
-                    f"{SAFETENSORS_SINGLE_FILE} not found on the HuggingFace Hub in {model_id}"
-                ) from e
+        policy = cls._load_as_safetensor(instance, model_file, config.device, strict)
 
         # Surface the stats-less-checkpoint round-trip mistake at
         # policy-construction time rather than at first forward. This catches
