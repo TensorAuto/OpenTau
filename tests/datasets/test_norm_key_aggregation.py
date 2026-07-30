@@ -357,6 +357,79 @@ class TestDatasetMixtureMetadataNormAggregation:
         np.testing.assert_allclose(head["state"]["mean"][0], expected_mean, atol=1e-5)
         np.testing.assert_allclose(head["state"]["std"][0], np.sqrt(expected_var), atol=1e-5)
 
+    def test_pooling_weight_is_total_frames_not_the_stats_count(self):
+        """A head pools by `info["total_frames"]`, ignoring the `count` inside the stats.
+
+        Every other pooling test sets `count == total_frames`, so the two are indistinguishable
+        there and dropping the explicit `weights=` argument would stay green. They are NOT equal
+        for a dataset whose stats were **subsampled** — which is exactly what
+        `DatasetMixtureConfig.delta_stats_max_rows` produces: a capped dataset carries a `count`
+        of the sampled rows while still representing all of its frames.
+
+        If pooling ever fell back to `count`, capping one dataset would silently shrink its share
+        of a shared normalization head — a mixture-ratio change with no error and no log line.
+        So make `count` disagree with `total_frames` and pin which one wins.
+        """
+        _patch_name_mapping(["repo/a", "repo/b"])
+        cfg = _make_cfg(max_state_dim=4, max_action_dim=4)
+        # `repo/a` is 9x the data but its stats were sampled 90x more thinly than `repo/b`'s,
+        # so `count` and `total_frames` point in opposite directions.
+        frames_a, frames_b = 9000, 1000
+        sampled_a, sampled_b = 100, 1000
+        mean_a, mean_b = 0.0, 10.0
+
+        def stats_for(mean: float, n: int) -> dict:
+            per_feature = {
+                "mean": np.full((4,), mean, dtype=np.float32),
+                "std": np.full((4,), 1.0, dtype=np.float32),
+                "min": np.full((4,), mean - 5.0, dtype=np.float32),
+                "max": np.full((4,), mean + 5.0, dtype=np.float32),
+                "count": np.array([n], dtype=np.int64),
+            }
+            return {
+                "state": dict(per_feature),
+                "actions": dict(per_feature),
+                "camera0": {
+                    "mean": np.full((3, 1, 1), 0.5, dtype=np.float32),
+                    "std": np.full((3, 1, 1), 0.5, dtype=np.float32),
+                    "min": np.zeros((3, 1, 1), dtype=np.float32),
+                    "max": np.ones((3, 1, 1), dtype=np.float32),
+                    "count": np.array([n], dtype=np.int64),
+                },
+            }
+
+        meta = DatasetMixtureMetadata(
+            cfg,
+            [
+                _make_metadata(
+                    "repo/a",
+                    info={
+                        "robot_type": "franka",
+                        "control_mode": "joint",
+                        "total_frames": frames_a,
+                    },
+                    stats=stats_for(mean_a, sampled_a),
+                ),
+                _make_metadata(
+                    "repo/b",
+                    info={
+                        "robot_type": "franka",
+                        "control_mode": "joint",
+                        "total_frames": frames_b,
+                    },
+                    stats=stats_for(mean_b, sampled_b),
+                ),
+            ],
+            dataset_weights=[0.5, 0.5],
+            dataset_names=["repo/a", "repo/b"],
+        )
+        head = meta.per_norm_key_stats[0]
+
+        by_frames = (frames_a * mean_a + frames_b * mean_b) / (frames_a + frames_b)  # 1.0
+        by_count = (sampled_a * mean_a + sampled_b * mean_b) / (sampled_a + sampled_b)  # ~9.09
+        np.testing.assert_allclose(head["state"]["mean"][0], by_frames, atol=1e-5)
+        assert abs(float(head["state"]["mean"][0]) - by_count) > 1.0
+
     def test_norm_head_summary_logged(self, caplog):
         _patch_name_mapping(["repo/a", "repo/b", "repo/c"])
         cfg = _make_cfg()

@@ -546,6 +546,36 @@ class DatasetMixtureConfig:
             load. Defaults to ``False``. A per-dataset
             ``DatasetConfig.skip_timestamp_check`` overrides this value when
             set. Does not affect the record-time check inside ``add_episode``.
+        delta_stats_max_rows: Cap on how many anchor frames each
+            ``use_delta_joint_actions`` dataset contributes to its on-the-fly
+            delta-action normalization stats. ``None`` (default) reads every
+            frame — exact, but an ``O(frames x chunk_size)`` first-run pass
+            that costs hours on a million-episode source. A positive int caps
+            that pass: rows are subsampled with a uniform stride over the
+            whole dataset (never a prefix, so the sample stays
+            representative), split across the dataset's parquet files in
+            proportion to the rows each actually contributes — so a capped
+            dataset pools in the same file ratio an uncapped one would.
+            Cross-dataset pooling into a shared normalization head is
+            unaffected: that path weights members by
+            ``info["total_frames"]``, not by the sampled ``count``, so
+            capping changes a dataset's estimator *precision*, never its
+            share of the head. Applies **per dataset**, not as a
+            shared budget across the mixture, so one value bounds the worst
+            case for a heterogeneous mixture while leaving datasets smaller
+            than the cap untouched. Ignored by datasets that don't set
+            ``use_delta_joint_actions``. The value is folded into the stats
+            cache key, so changing it recomputes rather than reusing stale
+            numbers. Must be ``>= 1`` when set.
+
+            What degrades as the cap tightens, measured on a 100k-frame /
+            50-step-horizon source: ``mean``/``std`` and ``q01``/``q99`` hold up
+            well (at 5k rows — a 20x subsample — they land within 0.02 and 0.05
+            standard deviations of the uncapped values), but ``min``/``max`` are
+            the first casualty (~0.9 sd off at the same cap) because a
+            subsample simply doesn't see the extremes. So MEAN_STD and QUANTILE
+            normalization tolerate a tight cap far better than MIN_MAX, whose
+            buffers *are* the pooled extremes.
 
     Note:
         Dropout rolls use the default torch RNG. PyTorch DataLoader workers
@@ -621,6 +651,13 @@ class DatasetMixtureConfig:
     tolerance_s: float = 1e-4
     skip_timestamp_check: bool = False
 
+    # Cap on the anchor frames each `use_delta_joint_actions` dataset feeds into its on-the-fly
+    # delta-action stats (`opentau.datasets.delta_action_stats`). `None` reads every frame; a
+    # positive int strides uniformly over the whole dataset to hit that budget, trading estimator
+    # precision for a bounded first-run wait. Per dataset, not a shared mixture budget. Part of
+    # the stats cache key, so changing it recomputes.
+    delta_stats_max_rows: int | None = None
+
     def __post_init__(self):
         """Validate dataset mixture configuration."""
         if self.weights is not None and len(self.datasets) != len(self.weights):
@@ -643,6 +680,15 @@ class DatasetMixtureConfig:
             not isinstance(self.n_obs_history, int) or self.n_obs_history < 1
         ):
             raise ValueError(f"`n_obs_history` must be None or a positive integer, got {self.n_obs_history}.")
+        if self.delta_stats_max_rows is not None and (
+            not isinstance(self.delta_stats_max_rows, int)
+            or isinstance(self.delta_stats_max_rows, bool)
+            or self.delta_stats_max_rows < 1
+        ):
+            raise ValueError(
+                "`delta_stats_max_rows` must be None (uncapped) or a positive integer, got "
+                f"{self.delta_stats_max_rows!r}."
+            )
         for name in (
             "history_state_drop_prob",
             "subgoal_drop_prob",

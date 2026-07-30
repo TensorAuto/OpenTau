@@ -183,3 +183,42 @@ carry a concrete `config_version` (and an informational `opentau_version`).
   `hf_config.json`. Tooling that instead writes a HuggingFace `config.json` from a
   hand-built dict must re-emit it from the loaded config, or the tag is absent and
   the checkpoint is read as legacy.
+
+### Added — row cap for on-the-fly delta-action stats — *opt-in, no default change*
+
+`DatasetMixtureConfig.delta_stats_max_rows: int | None` (default `None`) caps how
+many anchor frames each `use_delta_joint_actions` dataset contributes to the
+delta-action normalization stats computed on the fly at dataset load
+(`opentau/datasets/delta_action_stats.py`). That pass is `O(frames x chunk_size)`
+— an `H`-fold blow-up over a per-frame stats pass — so on a very large source the
+first run (before the disk cache is warm) can cost hours.
+
+Set a positive int to bound it. Rows are subsampled with a **uniform stride over
+the whole dataset**, never a prefix, and the stride's phase carries across episode
+boundaries so episodes aren't all anchored at frame 0; a dataset's cap is split
+across its parquet files in proportion to the rows each actually contributes
+(counting only what an `episodes` / `excluded_episodes` filter selects), so a
+capped dataset pools in the same file ratio an uncapped one would. Cross-dataset
+pooling into a shared normalization head is unaffected either way — that path
+weights members by `info["total_frames"]`, not by the sampled `count`, so capping
+changes a dataset's estimator *precision*, never its share of the head. The cap
+applies **per dataset**, so
+one value bounds the worst case across a heterogeneous mixture while leaving
+datasets smaller than the cap byte-identical to before.
+
+The cap is folded into the stats cache key, so changing it recomputes instead of
+serving numbers from a different sampling budget. It is folded in **only when
+set**, so uncapped configs keep the digest — and therefore the already-computed
+cache files — they had before this change.
+
+Cost and fidelity, measured on a 100k-frame / 50-step-horizon source: the capped
+run drops the accumulation from `O(frames x chunk_size)` to `O(cap x chunk_size)`
+(2.10s → 0.23s of compute at a 20x subsample; 7.36s → 0.44s at a 200-step
+horizon), leaving only the parquet column read, which the cap does not shrink.
+`mean`/`std` and `q01`/`q99` stay within 0.02 / 0.05 standard deviations of the
+uncapped values at that subsample; `min`/`max` degrade first (~0.9 sd), since a
+subsample doesn't see the extremes — so MIN_MAX normalization is the mode most
+sensitive to a tight cap, and MEAN_STD / QUANTILE the least.
+
+Default `None` reads every row, exactly as before; nothing changes unless you set
+the field.
