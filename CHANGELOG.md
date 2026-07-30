@@ -128,18 +128,28 @@ carry a concrete `config_version` (and an informational `opentau_version`).
   late. Pinned by AST tests over the whole policy registry, including
   call-ordering. `validate_input_resolution` was missing from the same seven and
   is resolved alongside it.
-* **A failed weight load no longer returns a randomly-initialized policy.** All
-  seven per-policy `from_pretrained` overrides (pi05, pi05_mem, pi06, both pi07
-  low/high levels, both pi07_paligemma low/high levels) wrapped weight resolution
-  in a bare `except Exception` that logged a warning and returned the freshly
-  constructed model. An unknown repo, an unknown revision, a permissions error or
-  a failed download therefore produced an *untrained* model that looked like a
-  successful load until the loss curve said otherwise. These now raise. The one
-  case still tolerated is a **local directory with no `model.safetensors`** —
-  the DeepSpeed/ZeRO resume shape, where `accelerator.load_state` supplies the
-  weights immediately afterwards — and it is now a distinct
-  `CheckpointWeightsNotFoundError` rather than "any exception at all", logged as
-  a warning that says the policy is otherwise randomly initialized.
+* **A failed weight *resolution* no longer returns a randomly-initialized policy.**
+  All seven per-policy `from_pretrained` overrides (pi05, pi05_mem, pi06, both
+  pi07 low/high levels, both pi07_paligemma low/high levels) wrapped weight
+  resolution in a bare `except Exception` that logged a warning and returned the
+  freshly constructed model. An unknown repo, an unknown revision, a permissions
+  error or a failed download therefore produced an *untrained* model that looked
+  like a successful load until the loss curve said otherwise. These now raise.
+  The one case still tolerated is a **local directory with no
+  `model.safetensors`** — the DeepSpeed/ZeRO resume shape, where
+  `accelerator.load_state` supplies the weights immediately afterwards — and it is
+  now a distinct `CheckpointWeightsNotFoundError` rather than "any exception at
+  all", logged as a warning that says the policy is otherwise randomly
+  initialized.
+
+  **Scope:** this covers *resolving and reading* the weights file. The later
+  key-remap / `load_state_dict` stage in those same seven overrides is still
+  wrapped in a broad `except Exception` that logs "Could not remap state dict
+  keys" and returns a partially-loaded model — pre-existing, unchanged here, and
+  a narrower hazard (`load_state_dict(strict=False)` already absorbs key
+  mismatches, so what it hides is a genuine shape conflict). Tightening it is
+  deliberately left to its own change, since it can unmask the documented
+  partial-load warm-start paths.
 * **Download arguments reached the Hub.** Five of those seven overrides read
   their own parameters back as `kwargs.get("revision")`, `kwargs.get("token")`,
   `kwargs.get("cache_dir")` and so on. Those are *keyword-only parameters*, so

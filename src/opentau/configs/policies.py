@@ -805,7 +805,12 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
                     nested_under_policy = filename != CONFIG_NAME
                     break
             else:
-                print(f"{CONFIG_NAME} not found in {Path(model_id).resolve()}")
+                # `draccus.parse(cls, None)` below turns this into a ParsingError;
+                # name every candidate so the message matches what was tried.
+                print(
+                    f"None of {CONFIG_NAME}, {HF_CONFIG_NAME}, {TRAIN_CONFIG_NAME} found in "
+                    f"{Path(model_id).resolve()}"
+                )
         else:
             # Uploaded checkpoint repos carry `hf_config.json` and (since the
             # step-tag rollout) `config.json` + `train_config.json`; older ones
