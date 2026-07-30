@@ -90,13 +90,24 @@ carry a concrete `config_version` (and an informational `opentau_version`).
   rather than as a bogus repo id. Parsed by `split_repo_revision` in
   `opentau/utils/hub.py`; passing both an `@` suffix and a conflicting
   `revision=` raises rather than silently picking one.
-* **Published checkpoints are loadable by repo id.** Uploaded repos carried only
-  `hf_config.json`, so `--policy.path=<repo>` failed on the missing `config.json`
-  and `--config_path=<repo>` on the missing `train_config.json`; you had to fetch
-  `hf_config.json` by hand. `PreTrainedConfig.from_pretrained` and
+* **`--policy.path=<repo>` works against a published checkpoint.** Uploaded repos
+  carried only `hf_config.json`, so `--policy.path=<repo>` failed on the missing
+  `config.json` and `--config_path=<repo>` on the missing `train_config.json`; you
+  had to fetch `hf_config.json` by hand. `PreTrainedConfig.from_pretrained` and
   `TrainPipelineConfig.from_pretrained` now fall back to `hf_config.json` (reading
-  its `.policy` sub-object for the former), which also fixes every checkpoint
-  already on the Hub.
+  its `.policy` sub-object for the former), so the file is always found.
+
+  **Scope:** finding the file is not the same as decoding it. `--policy.path` reads
+  only the `.policy` sub-object and works on checkpoints going back as far as we
+  have tested. `--config_path` decodes the *whole* pipeline config, so it still
+  fails on a checkpoint whose train config predates an unrelated schema change —
+  verified against a real 2-step consolidated repo, where
+  `dataset_mixture.datasets[].grounding` (renamed to `vqa` in #124) raises a
+  `DecodingError`. That is deliberate: `grounding` was renamed, not deleted, so
+  stripping it would silently load the config with `vqa` at its default and lose a
+  setting the run was actually trained with. Failing loudly is the correct
+  behavior; use `--policy.path` for old checkpoints, or hand-edit the fetched
+  config.
 * `config_version: int | None` and `opentau_version: str | None` on
   `PreTrainedConfig`. `config_version` is a monotonic schema version for
   behavioral conventions; `opentau_version` is an informational package-version
