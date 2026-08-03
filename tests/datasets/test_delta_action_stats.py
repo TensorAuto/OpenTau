@@ -604,7 +604,21 @@ class TestFactoryWiring:
     recompute the identical numbers under a new key. Neither failure raises.
     """
 
-    def _fake_dataset(self, root):
+    def _fake_dataset(self, root, action_col="action"):
+        """A stand-in dataset whose delta-timestamp keys match its own name map.
+
+        ``resolve_delta_timestamps`` keys its output by RAW on-disk column names, so a fake
+        whose ``_get_name_map`` reports ``action_col`` must key ``delta_timestamps_params``
+        by ``action_col`` too. Keying it by the ``"actions"`` alias instead would model no
+        real dataset and would hide a wrong lookup in the code under test.
+
+        Args:
+            root: Dataset root the fake metadata should report.
+            action_col: Raw on-disk name of the action column.
+
+        Returns:
+            A ``SimpleNamespace`` exposing the attributes ``_compute_or_load_delta_stats`` reads.
+        """
         meta = SimpleNamespace(
             root=root,
             episodes=[0, 1],
@@ -613,14 +627,14 @@ class TestFactoryWiring:
         return SimpleNamespace(
             meta=meta,
             episodes=None,
-            delta_timestamps_params=[{"actions": [0.0, 0.05]}],
+            delta_timestamps_params=[{action_col: [0.0, 0.05]}],
             fps=20.0,
             vector_resample_strategy="nearest",
             delta_action_state_map={0: 0},
-            _get_name_map=lambda: {"state": "observation.state", "actions": "action"},
+            _get_name_map=lambda: {"state": "observation.state", "actions": action_col},
         )
 
-    def _run(self, tmp_path, monkeypatch, max_rows):
+    def _run(self, tmp_path, monkeypatch, max_rows, action_col="action"):
         from opentau.configs.default import DatasetConfig, DatasetMixtureConfig
         from opentau.datasets import factory
 
@@ -632,7 +646,7 @@ class TestFactoryWiring:
 
         monkeypatch.setattr(factory, "load_or_compute_delta_action_stats", _capture)
         factory._compute_or_load_delta_stats(
-            self._fake_dataset(tmp_path),
+            self._fake_dataset(tmp_path, action_col=action_col),
             DatasetConfig(repo_id="fake/ds", use_delta_joint_actions=True, delta_action_state_map={0: 0}),
             SimpleNamespace(
                 num_workers=2, dataset_mixture=DatasetMixtureConfig(delta_stats_max_rows=max_rows)
@@ -651,6 +665,29 @@ class TestFactoryWiring:
 
     def test_default_is_uncapped(self, tmp_path, monkeypatch):
         assert self._run(tmp_path, monkeypatch, None)["compute_kwargs"]["max_rows"] is None
+
+    # `delta_timestamps_params` is keyed by the dataset's RAW action column, so the horizon
+    # lookup must go through the name map. Hard-coding the `"actions"` alias raised
+    # `KeyError: 'actions'` at dataset build for every delta run on a repo whose column is
+    # named `action` — which is the LeRobot standard, and most of the registered mappings.
+    @pytest.mark.parametrize("action_col", ["action", "actions"])
+    def test_action_horizon_is_read_under_the_raw_column_name(self, tmp_path, monkeypatch, action_col):
+        chunk_offsets = self._run(tmp_path, monkeypatch, None, action_col=action_col)["compute_kwargs"][
+            "chunk_offsets"
+        ]
+        # [0.0s, 0.05s] at 20 fps -> frame offsets [0, 1].
+        np.testing.assert_allclose(chunk_offsets, [0.0, 1.0])
+
+    def test_raw_column_name_does_not_change_the_cache_key(self, tmp_path, monkeypatch):
+        """Same horizon, different on-disk spelling -> same stats, so the same key.
+
+        The key is built from `chunk_offsets`, not the column name; a rename that reached the
+        key would orphan every cached result for no numerical reason.
+        """
+        assert (
+            self._run(tmp_path, monkeypatch, None, action_col="action")["cache_key"]
+            == self._run(tmp_path, monkeypatch, None, action_col="actions")["cache_key"]
+        )
 
 
 class TestLoadOrCompute:

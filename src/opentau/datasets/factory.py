@@ -185,9 +185,12 @@ def _compute_or_load_delta_stats(
     # these stats describe the mean horizon rather than any single draw — an approximation
     # documented on the module.
     dt_mean = dataset.delta_timestamps_params[0]
-    chunk_offsets = np.asarray(dt_mean["actions"], dtype=np.float64) * dataset.fps
-
     name_map = dataset._get_name_map()
+    # `resolve_delta_timestamps` keys its output by RAW on-disk column names (it iterates
+    # `ds_meta.features`), so the action horizon must be looked up under this dataset's own
+    # action column — `"action"` for a standard LeRobot repo — not the `"actions"` alias.
+    chunk_offsets = np.asarray(dt_mean[name_map["actions"]], dtype=np.float64) * dataset.fps
+
     # Bounds the O(frames x chunk_size) pass on very large sources. In the cache key too, so
     # flipping the cap recomputes instead of serving stats from a different sampling budget.
     max_rows = getattr(train_cfg.dataset_mixture, "delta_stats_max_rows", None)
