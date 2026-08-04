@@ -211,6 +211,18 @@ def set_seed(seed, accelerator: accelerate.Accelerator = None) -> None:
         accelerator: Optional Accelerator instance. If provided, each process
             gets a different seed offset to ensure reproducibility in distributed
             settings.
+
+    Note:
+        The per-process offset is intentional: it decorrelates the *per-sample*
+        draws (image augmentation, optional-key dropout, prompt substitution)
+        across ranks, so the global batch is not eight copies of the same
+        augmentation stream. The consequence is that **the global RNG is
+        rank-dependent by construction**, so any decision that must agree across
+        ranks — a dataset-level partition, a branch that fires a collective —
+        must never be taken off it. Use an explicit generator seeded from
+        ``cfg.seed`` alone; see
+        :func:`opentau.datasets.factory.val_split_generator` for the train/val
+        split, which regressed exactly this way.
     """
     # before setting the seed, we check if we are using an accelerator and ensure every process gets a different seed
     if seed is not None and accelerator is not None:

@@ -961,6 +961,302 @@ def test_make_dataset_per_dataset_val_split_ratio_zero_opts_out(train_pipeline_c
         cleanup()
 
 
+def _val_indices_for_rank(train_pipeline_config, rank, num_processes=8, dataset_len=5000, after_seed=None):
+    """Run `make_dataset`'s split the way rank `rank` of an 8-rank job would.
+
+    Mirrors the production ordering in `scripts/train.py`: `set_seed(cfg.seed,
+    accelerator=accelerator)` — which offsets the global RNG by
+    `process_index * 12345` — immediately followed by dataset construction,
+    including train.py's `if cfg.seed is not None` guard. When `cfg.seed` is
+    None nothing seeds the global RNG, so each real process would be running on
+    its own entropy-derived state; that is emulated here with an arbitrary
+    per-rank seed.
+
+    `after_seed` is an optional no-arg callable run between the seeding and the
+    dataset construction, standing in for everything in `train.py` that consumes
+    the global RNG in that window.
+
+    Returns the val `Subset`'s index list.
+    """
+    from opentau.utils.random_utils import set_seed
+
+    dataset_cfg = train_pipeline_config.dataset_mixture.datasets[0]
+    cleanup = _register_mapping(dataset_cfg.repo_id)
+    try:
+        if train_pipeline_config.seed is not None:
+            set_seed(
+                train_pipeline_config.seed,
+                accelerator=MagicMock(process_index=rank, num_processes=num_processes),
+            )
+        else:
+            torch.manual_seed(0xC0FFEE + rank)
+        if after_seed is not None:
+            after_seed()
+        with (
+            patch("opentau.datasets.factory.LeRobotDatasetMetadata") as mock_meta_cls,
+            patch("opentau.datasets.factory.LeRobotDataset") as mock_ds_cls,
+        ):
+            mock_meta_cls.return_value = MagicMock(features=[])
+            mock_ds = MagicMock(meta=MagicMock(info={}, stats={}, camera_keys=[]))
+            mock_ds.__len__.return_value = dataset_len
+            mock_ds.shallow_copy_with_dropout.return_value = mock_ds
+            mock_ds_cls.return_value = mock_ds
+
+            _, val_dataset = make_dataset(dataset_cfg, train_pipeline_config)
+        return list(val_dataset.indices)
+    finally:
+        cleanup()
+
+
+@pytest.mark.parametrize("seed", [1000, None])
+def test_val_split_is_identical_across_ranks(train_pipeline_config, seed):
+    """The train/val split must be byte-identical on every rank.
+
+    Regression test. `set_seed(seed, accelerator=...)` offsets the global torch
+    RNG by `process_index * 12345` on purpose, to decorrelate per-sample draws
+    (augmentation, optional-key dropout, prompt substitution) across ranks. The
+    split used to be taken off that same global RNG with no explicit generator,
+    so each rank partitioned the dataset differently: every rank held out a
+    *different* 2%, and each rank's validation frames sat in some other rank's
+    training set. The gathered `Validation/*` metrics were therefore measured on
+    partly-memorized data (optimistically biased), and `running_best` checkpoint
+    selection was driven by that contaminated number.
+
+    The `seed=None` case matters just as much: `train.py` then never calls
+    `set_seed` at all, so each process would otherwise split off its own
+    entropy-seeded RNG — the same bug by a different route.
+    """
+    train_pipeline_config.seed = seed
+    train_pipeline_config.dataset_mixture.val_split_ratio = 0.02
+    train_pipeline_config.val_freq = 1
+
+    per_rank = {rank: _val_indices_for_rank(train_pipeline_config, rank) for rank in range(8)}
+
+    assert len(per_rank[0]) == 100  # int(5000 * 0.02); a non-trivial split, not an empty one
+    for rank, indices in per_rank.items():
+        assert indices == per_rank[0], f"rank {rank} split differs from rank 0"
+
+
+def test_val_split_is_independent_of_world_size(train_pipeline_config):
+    """Resuming on a different number of GPUs must not re-partition the data.
+
+    Checkpoint selection (`running_best`) compares validation numbers across the
+    resume boundary, so the split has to be a function of `cfg.seed` alone — not
+    of `num_processes`.
+    """
+    train_pipeline_config.seed = 1000
+    train_pipeline_config.dataset_mixture.val_split_ratio = 0.02
+    train_pipeline_config.val_freq = 1
+
+    eight_gpu = _val_indices_for_rank(train_pipeline_config, rank=0, num_processes=8)
+    four_gpu = _val_indices_for_rank(train_pipeline_config, rank=3, num_processes=4)
+    single_gpu = _val_indices_for_rank(train_pipeline_config, rank=0, num_processes=1)
+
+    assert eight_gpu == four_gpu == single_gpu
+
+
+def test_val_split_is_independent_of_prior_global_rng_consumption(train_pipeline_config):
+    """The split must not depend on how much global RNG ran before it.
+
+    Guards the fix against a subtler re-regression than the rank offset: with an
+    implicit generator the partition also shifts whenever an unrelated change
+    adds or removes a draw earlier in the process (model init, a new transform),
+    silently invalidating comparisons against every previously-trained
+    checkpoint. An explicit generator makes the split reproducible regardless.
+    """
+    train_pipeline_config.seed = 1000
+    train_pipeline_config.dataset_mixture.val_split_ratio = 0.02
+    train_pipeline_config.val_freq = 1
+
+    baseline = _val_indices_for_rank(train_pipeline_config, rank=0)
+    perturbed = _val_indices_for_rank(
+        train_pipeline_config,
+        rank=0,
+        # Runs after `set_seed` and before the split, exactly where an added
+        # model-init or transform draw would land.
+        after_seed=lambda: torch.rand(12345),
+    )
+
+    assert perturbed == baseline
+
+
+def test_val_split_changes_with_seed(train_pipeline_config):
+    """`cfg.seed` must actually reach the split generator.
+
+    Without this, a generator hard-coded to a constant would satisfy every
+    cross-rank assertion above while quietly ignoring the run's seed, making the
+    split unchangeable and every run's held-out set identical.
+    """
+    train_pipeline_config.dataset_mixture.val_split_ratio = 0.02
+    train_pipeline_config.val_freq = 1
+
+    train_pipeline_config.seed = 1000
+    first = _val_indices_for_rank(train_pipeline_config, rank=0)
+    train_pipeline_config.seed = 2000
+    second = _val_indices_for_rank(train_pipeline_config, rank=0)
+
+    assert first != second
+
+
+def test_val_split_generator_ignores_process_index(train_pipeline_config):
+    """`val_split_generator` derives its seed from `cfg.seed` only.
+
+    Pins the invariant at the source, so a future "make the split depend on the
+    rank/world size" edit fails here rather than only in the end-to-end tests.
+    """
+    from opentau.datasets.factory import DEFAULT_VAL_SPLIT_SEED, val_split_generator
+
+    train_pipeline_config.seed = 1000
+    assert val_split_generator(train_pipeline_config).initial_seed() == 1000
+
+    train_pipeline_config.seed = None
+    assert val_split_generator(train_pipeline_config).initial_seed() == DEFAULT_VAL_SPLIT_SEED
+
+
+def _write_checkpoint_train_config(tmp_path, cfg_dict):
+    from opentau.configs.policies import TRAIN_CONFIG_NAME
+
+    (tmp_path / TRAIN_CONFIG_NAME).write_text(json.dumps(cfg_dict))
+    return tmp_path
+
+
+def test_warn_if_resumed_split_differs_flags_a_changed_seed(train_pipeline_config, tmp_path, caplog):
+    """A CLI `--seed` override on resume silently re-partitions every dataset.
+
+    On resume the train config is loaded from the checkpoint's
+    `train_config.json` and CLI overrides are layered on top, so the split
+    inputs can drift without the user noticing. The resumed run then validates
+    on frames the checkpoint trained on.
+    """
+    from opentau.datasets.factory import warn_if_resumed_split_differs
+
+    train_pipeline_config.seed = 2000
+    train_pipeline_config.val_freq = 1
+    train_pipeline_config.resume = True
+    train_pipeline_config.checkpoint_path = _write_checkpoint_train_config(
+        tmp_path, {"seed": 1000, "dataset_mixture": {"val_split_ratio": 0.02, "datasets": []}}
+    )
+
+    with caplog.at_level(logging.WARNING, logger="opentau.datasets.factory"):
+        warn_if_resumed_split_differs(train_pipeline_config)
+
+    assert "seed: 1000 -> 2000" in caplog.text
+
+
+def test_warn_if_resumed_split_differs_is_quiet_when_split_is_unchanged(
+    train_pipeline_config, tmp_path, caplog
+):
+    """An ordinary resume must not warn — otherwise the warning is noise."""
+    from opentau.datasets.factory import warn_if_resumed_split_differs
+
+    train_pipeline_config.seed = 1000
+    train_pipeline_config.val_freq = 1
+    train_pipeline_config.resume = True
+    train_pipeline_config.dataset_mixture.val_split_ratio = 0.02
+    saved = {
+        "seed": 1000,
+        "dataset_mixture": {
+            "val_split_ratio": 0.02,
+            "datasets": [
+                {"val_split_ratio": ds.val_split_ratio}
+                for ds in train_pipeline_config.dataset_mixture.datasets
+            ],
+        },
+    }
+    train_pipeline_config.checkpoint_path = _write_checkpoint_train_config(tmp_path, saved)
+
+    with caplog.at_level(logging.WARNING, logger="opentau.datasets.factory"):
+        warn_if_resumed_split_differs(train_pipeline_config)
+
+    assert caplog.text == ""
+
+
+def test_warn_if_resumed_split_differs_reads_a_real_saved_train_config(
+    train_pipeline_config, tmp_path, caplog
+):
+    """Round-trip against a config written by `save_pretrained`, not a hand-built dict.
+
+    The drift check reads `seed`, `dataset_mixture.val_split_ratio` and
+    `dataset_mixture.datasets[i].val_split_ratio` out of the checkpoint's
+    serialized `train_config.json`. If the serialization ever nests those
+    differently, every lookup returns `None` and the check goes permanently
+    silent — a warning that never fires looks exactly like a healthy resume.
+    """
+    from opentau.datasets.factory import warn_if_resumed_split_differs
+
+    train_pipeline_config.seed = 1000
+    train_pipeline_config.val_freq = 1
+    train_pipeline_config.save_pretrained(tmp_path)
+
+    train_pipeline_config.resume = True
+    train_pipeline_config.checkpoint_path = tmp_path
+
+    # Unchanged config round-tripped through the real serializer: no warning.
+    with caplog.at_level(logging.WARNING, logger="opentau.datasets.factory"):
+        warn_if_resumed_split_differs(train_pipeline_config)
+    assert caplog.text == ""
+
+    # Now drift a per-dataset ratio, which lives at the deepest of the three paths.
+    train_pipeline_config.dataset_mixture.datasets[0].val_split_ratio = 0.5
+    with caplog.at_level(logging.WARNING, logger="opentau.datasets.factory"):
+        warn_if_resumed_split_differs(train_pipeline_config)
+    assert "dataset_mixture.datasets[0].val_split_ratio" in caplog.text
+
+
+def test_warn_if_resumed_split_differs_warns_once_not_once_per_rank(train_pipeline_config, tmp_path, caplog):
+    """Every rank builds the dataset, so the warning is main-process only."""
+    from opentau.datasets.factory import warn_if_resumed_split_differs
+
+    train_pipeline_config.seed = 2000
+    train_pipeline_config.val_freq = 1
+    train_pipeline_config.resume = True
+    train_pipeline_config.checkpoint_path = _write_checkpoint_train_config(
+        tmp_path, {"seed": 1000, "dataset_mixture": {"val_split_ratio": 0.02, "datasets": []}}
+    )
+
+    with (
+        patch(
+            "opentau.datasets.factory.get_proc_accelerator",
+            return_value=MagicMock(is_main_process=False),
+        ),
+        caplog.at_level(logging.WARNING, logger="opentau.datasets.factory"),
+    ):
+        warn_if_resumed_split_differs(train_pipeline_config)
+
+    assert caplog.text == ""
+
+
+@pytest.mark.parametrize(
+    ("resume", "val_freq", "write_config"),
+    [
+        (False, 1, True),  # not resuming: nothing to compare against
+        (True, 0, True),  # validation disabled: no split is taken
+        (True, 1, False),  # checkpoint has no train_config.json
+    ],
+)
+def test_warn_if_resumed_split_differs_no_ops(
+    train_pipeline_config, tmp_path, caplog, resume, val_freq, write_config
+):
+    """A best-effort diagnostic must stay silent — and must never raise — when it
+    has nothing to say or nothing to read.
+    """
+    from opentau.datasets.factory import warn_if_resumed_split_differs
+
+    train_pipeline_config.seed = 2000  # would drift, if the check ran at all
+    train_pipeline_config.resume = resume
+    train_pipeline_config.val_freq = val_freq
+    train_pipeline_config.checkpoint_path = (
+        _write_checkpoint_train_config(tmp_path, {"seed": 1000, "dataset_mixture": {}})
+        if write_config
+        else tmp_path
+    )
+
+    with caplog.at_level(logging.WARNING, logger="opentau.datasets.factory"):
+        warn_if_resumed_split_differs(train_pipeline_config)
+
+    assert caplog.text == ""
+
+
 def test_subset_meta_shares_episode_metadata_but_isolates_stats():
     """`_subset_meta` shares the large read-only per-episode metadata by reference
     while giving each subset an independent aggregated `stats`.

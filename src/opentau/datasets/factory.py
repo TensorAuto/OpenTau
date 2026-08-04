@@ -46,6 +46,10 @@ Functions:
         TrainPipelineConfig containing multiple dataset configurations.
     resolve_delta_timestamps: Resolves delta timestamps configuration based
         on TrainPipelineConfig settings, mapping features to temporal groups.
+    val_split_generator: Builds the rank-independent RNG that partitions a
+        dataset into its train and validation halves.
+    warn_if_resumed_split_differs: Warns when a resumed run's config would
+        partition the data differently than the checkpoint it resumes from.
 
 Constants:
     IMAGENET_STATS: ImageNet normalization statistics (mean, std, min, max)
@@ -61,9 +65,10 @@ Example:
 """
 
 import copy
+import json
 import logging
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -75,6 +80,7 @@ import opentau.datasets.vqa.dummy  # noqa: F401
 import opentau.datasets.vqa.vsr  # noqa: F401
 from opentau import available_vqa_datasets
 from opentau.configs.default import DatasetConfig
+from opentau.configs.policies import TRAIN_CONFIG_NAME
 from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.action_indexing import resolve_delta_map
 from opentau.datasets.dataset_mixture import WeightedDatasetMixture
@@ -91,6 +97,9 @@ from opentau.datasets.lerobot_dataset import (
 from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING, feature_mapping_key
 from opentau.datasets.transforms import ImageTransforms
 from opentau.datasets.utils import DeltaTimestampInfo
+from opentau.utils.accelerate_utils import get_proc_accelerator
+
+logger = logging.getLogger(__name__)
 
 IMAGENET_STATS = {
     "min": [[[0.0]], [[0.0]], [[0.0]]],  # (c,1,1)
@@ -313,6 +322,152 @@ def resolve_delta_timestamps(
     return dt_mean, {}, {}, {}
 
 
+# Fallback base seed for the train/val split when `cfg.seed is None`. The split
+# must be identical on every rank, so it cannot fall back to the global RNG:
+# without `cfg.seed`, `train.py` never calls `set_seed` at all and each process
+# starts from its own entropy-derived torch seed. An arbitrary but fixed
+# constant keeps the split reproducible in that case too.
+DEFAULT_VAL_SPLIT_SEED = 8_675_309
+
+
+def val_split_generator(train_cfg: TrainPipelineConfig) -> torch.Generator:
+    """Build the rank-independent RNG that partitions a dataset into train/val.
+
+    The train/val split **must** be identical on every rank. Each rank builds
+    its own copy of the dataset and its own ``Subset`` views, so if the ranks
+    disagree on the partition, one rank's validation frames are another rank's
+    training frames — the gathered ``Validation/*`` metrics are then measured
+    partly on memorized data and are optimistically biased, and the
+    ``running_best`` checkpoint selection is driven by that contaminated number.
+
+    Taking the split off the *global* torch RNG does exactly that, because
+    :func:`opentau.utils.random_utils.set_seed` deliberately offsets the seed by
+    ``process_index * 12345`` so that per-sample draws (augmentation, dropout,
+    prompt substitution) are decorrelated across ranks. That offset is correct
+    for per-sample draws and is intentionally left alone; the split is simply
+    moved off the global RNG onto this dedicated, rank-independent generator.
+
+    Stability contract — the split is a pure function of exactly three inputs:
+
+    * ``train_cfg.seed`` (never ``process_index``, never ``num_processes``),
+    * ``len(dataset)``,
+    * the effective ``val_split_ratio`` for that dataset.
+
+    Consequences that are deliberate:
+
+    * **World-size change** (resuming on 4 GPUs instead of 8, or vice versa)
+      leaves the split untouched, so validation numbers stay comparable across
+      the resume boundary and across runs with different world sizes.
+    * **Resume** reproduces the same split as long as those three inputs are
+      unchanged. ``--config_path`` points at the checkpoint's ``train_config.json``
+      on resume, so ``seed`` and ``val_split_ratio`` carry over automatically —
+      but a CLI override of either, or a dataset whose length changed since the
+      checkpoint (re-uploaded episodes, a changed ``episodes`` /
+      ``excluded_episodes`` filter), silently re-partitions the data.
+      :func:`warn_if_resumed_split_differs` warns about the config half of that.
+    * **Mixture composition is irrelevant**: every dataset draws from a
+      generator seeded the same way, so adding or reordering datasets does not
+      reshuffle the splits of the others. Two datasets of equal length get the
+      same permutation, which is harmless (frame *i* of one dataset has nothing
+      to do with frame *i* of another) and is in fact what you want when the
+      same underlying data is listed twice under different configs — the shared
+      permutation keeps the val frames aligned instead of leaking each entry's
+      val half into the other's train half.
+
+    Args:
+        train_cfg: The training config supplying the base ``seed``.
+
+    Returns:
+        A fresh ``torch.Generator`` seeded identically on every rank.
+    """
+    seed = train_cfg.seed if train_cfg.seed is not None else DEFAULT_VAL_SPLIT_SEED
+    return torch.Generator().manual_seed(int(seed))
+
+
+def _split_determining_fields(cfg: TrainPipelineConfig) -> dict[str, Any]:
+    """Return the config values the train/val split depends on.
+
+    Kept next to :func:`val_split_generator` so a new split-determining field is
+    added in one place rather than being silently omitted from the resume check.
+    """
+    return {
+        "seed": cfg.seed,
+        "dataset_mixture.val_split_ratio": cfg.dataset_mixture.val_split_ratio,
+        **{
+            f"dataset_mixture.datasets[{i}].val_split_ratio": ds.val_split_ratio
+            for i, ds in enumerate(cfg.dataset_mixture.datasets)
+        },
+    }
+
+
+def warn_if_resumed_split_differs(cfg: TrainPipelineConfig) -> None:
+    """Warn when a resumed run would partition its data differently than before.
+
+    On resume the whole train config is loaded from the checkpoint's
+    ``train_config.json`` and CLI overrides are layered on top, so a stray
+    ``--seed=...`` or ``--dataset_mixture.val_split_ratio=...`` silently
+    re-partitions every dataset. The resumed run then reports validation on
+    frames the checkpoint was trained on, and its ``running_best`` numbers are
+    not comparable to the pre-resume ones.
+
+    Only the *config* half of the contract is checkable here: a dataset whose
+    length changed since the checkpoint also re-partitions the data, and that is
+    not recorded anywhere in the checkpoint. See :func:`val_split_generator` for
+    the full contract.
+
+    No-ops when not resuming, when validation is off, or when the checkpoint's
+    ``train_config.json`` is missing or unreadable — a best-effort diagnostic
+    must never be the thing that fails a resume. Every rank runs this (the
+    dataset is built on all of them), so the message is emitted on the main
+    process only rather than once per GPU.
+
+    Args:
+        cfg: The resolved training config for the run being started.
+    """
+    if not cfg.resume or cfg.val_freq <= 0 or cfg.checkpoint_path is None:
+        return
+
+    # None outside a training run (tests, offline scripts) — warn in that case.
+    accelerator = get_proc_accelerator()
+    if accelerator is not None and not accelerator.is_main_process:
+        return
+
+    saved_path = Path(cfg.checkpoint_path) / TRAIN_CONFIG_NAME
+    try:
+        with open(saved_path) as f:
+            saved = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.debug("Could not read %s for the val-split drift check: %s", saved_path, exc)
+        return
+
+    saved_datasets = saved.get("dataset_mixture", {}).get("datasets", [])
+    saved_fields = {
+        "seed": saved.get("seed"),
+        "dataset_mixture.val_split_ratio": saved.get("dataset_mixture", {}).get("val_split_ratio"),
+        **{
+            f"dataset_mixture.datasets[{i}].val_split_ratio": ds.get("val_split_ratio")
+            for i, ds in enumerate(saved_datasets)
+        },
+    }
+
+    current_fields = _split_determining_fields(cfg)
+    drifted = {
+        key: (saved_fields[key], value)
+        for key, value in current_fields.items()
+        if key in saved_fields and saved_fields[key] != value
+    }
+    if drifted:
+        logger.warning(
+            "Resuming with train/val split settings that differ from the checkpoint at %s: %s. "
+            "The split is a pure function of (seed, dataset length, val_split_ratio), so the "
+            "resumed run validates on a different subset than the checkpoint was trained "
+            "against — its Validation/* metrics and `running_best` are not comparable to the "
+            "pre-resume ones, and frames held out before are now trained on.",
+            cfg.checkpoint_path,
+            ", ".join(f"{k}: {before!r} -> {after!r}" for k, (before, after) in sorted(drifted.items())),
+        )
+
+
 def _subset_meta(meta: LeRobotDatasetMetadata) -> LeRobotDatasetMetadata:
     """Per-subset metadata copy that shares read-only per-episode structures.
 
@@ -352,6 +507,10 @@ def make_dataset(
     The validation dataset is created by splitting the train dataset into train and validation sets based on the
     effective split ratio: the per-dataset `cfg.val_split_ratio` when set, otherwise the mixture-wide
     `train_cfg.dataset_mixture.val_split_ratio` (the per-dataset value `None` inherits the mixture default).
+
+    The split is drawn from a dedicated, rank-independent generator rather than the global torch RNG
+    (which `set_seed` offsets per process), so every rank partitions the dataset identically and the
+    validation half is held out from *all* ranks' training data. See `val_split_generator`.
 
     Args:
         cfg (DatasetConfig): A DatasetConfig used to create a LeRobotDataset.
@@ -451,7 +610,15 @@ def make_dataset(
         )
         val_size = int(len(dataset) * effective_val_split)
         train_size = len(dataset) - val_size
-        train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+        # Explicit, rank-independent generator: the global torch RNG is seeded
+        # per-rank on purpose (`set_seed(..., accelerator=...)` offsets by
+        # `process_index * 12345`), so splitting off it gives every rank a
+        # different partition and the reported validation metrics end up
+        # measured on other ranks' training frames. See `val_split_generator`
+        # for the full stability contract.
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            dataset, [train_size, val_size], generator=val_split_generator(train_cfg)
+        )
         # Share the large, read-only per-episode metadata (`episodes`,
         # `episodes_stats`) across the two halves; deep-copy only the small
         # aggregated `stats`. A blanket `deepcopy(meta)` here is tens of GB of
@@ -475,9 +642,6 @@ def make_dataset(
         return train_dataset, val_dataset  # type: ignore[return-value]
 
     return dataset
-
-
-logger = logging.getLogger(__name__)
 
 
 def _resolve_weights(
@@ -555,6 +719,8 @@ def make_dataset_mixture(
     Returns:
         WeightedDatasetMixture or Tuple[WeightedDatasetMixture, WeightedDatasetMixture]: An instance of WeightedDatasetMixture containing the datasets, or a tuple of (train_mixture, val_mixture) if val_freq > 0.
     """
+    warn_if_resumed_split_differs(cfg)
+
     datasets = []
     val_datasets = []
     for dataset_cfg in cfg.dataset_mixture.datasets:
