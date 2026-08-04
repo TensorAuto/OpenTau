@@ -777,14 +777,18 @@ class HierarchicalSampler(Sampler[int]):
     samples uniformly within that dataset. This avoids multinomial over a huge number of categories (over 2^24)
     by operating at the dataset level.
 
-    Seeding, in order of precedence: an explicit ``generator``, else ``seed``
-    applied to a fresh generator, else a bare ``torch.Generator()``. That last
-    fallback is **not** unseeded — PyTorch default-constructs generators with a
-    fixed constant — so it is deterministic and identical in every process, but
-    it is a PyTorch implementation detail rather than a documented guarantee and
-    it ignores the run's seed entirely. Callers on the training path pass
-    ``seed=cfg.seed`` so the sample stream is reproducible *and* controlled by
-    the run's own seed; see ``WeightedDatasetMixture.get_dataloader``.
+    Seeding. ``generator`` supplies the RNG *object* and ``seed`` sets its
+    state, so when both are given **``seed`` wins** — it is applied to the
+    passed-in generator via ``manual_seed``, re-seeding the caller's object
+    **in place**. Passing only ``generator`` uses it as-is; passing only
+    ``seed`` applies it to a fresh generator; passing neither leaves a bare
+    ``torch.Generator()``. That last fallback is **not** unseeded — PyTorch
+    default-constructs generators with a fixed constant — so it is
+    deterministic and identical in every process, but it is a PyTorch
+    implementation detail rather than a documented guarantee and it ignores the
+    run's seed entirely. Callers on the training path pass ``seed=cfg.seed`` so
+    the sample stream is reproducible *and* controlled by the run's own seed;
+    see ``WeightedDatasetMixture.get_dataloader``.
 
     Whatever the source, the seed must be **rank-independent**: `accelerate`
     shards this stream by having every rank iterate it and keep the batches at

@@ -324,8 +324,8 @@ class TestHierarchicalSamplerSeeding:
         )
         assert self._stream(seed=None) == list(legacy)
 
-    def test_explicit_generator_wins_over_seed(self):
-        """`generator` takes precedence, so a caller can supply its own RNG."""
+    def test_explicit_generator_alone_drives_the_stream(self):
+        """A caller can supply its own RNG instead of a seed."""
         gen = torch.Generator().manual_seed(7)
         sampler = HierarchicalSampler(
             dataset_lengths=self.LENGTHS,
@@ -334,6 +334,30 @@ class TestHierarchicalSamplerSeeding:
             generator=gen,
         )
         assert list(sampler) == self._stream(seed=7)
+
+    def test_seed_beats_generator_and_reseeds_it_in_place(self):
+        """When both are passed, `seed` wins -- and it mutates the caller's generator.
+
+        `__init__` adopts `generator` as the RNG object and then applies
+        `manual_seed(seed)` to it, so `seed` overrides the generator's state
+        rather than the other way round, and the caller's object is re-seeded as
+        a side effect. Pinned because it is the surprising direction: a reader
+        reasonably expects an explicitly-constructed generator to win, and a
+        future refactor could silently flip it.
+        """
+        caller_gen = torch.Generator().manual_seed(7)
+        sampler = HierarchicalSampler(
+            dataset_lengths=self.LENGTHS,
+            dataset_probs=self.PROBS,
+            num_samples=128,
+            generator=caller_gen,
+            seed=1000,
+        )
+
+        stream = list(sampler)
+        assert stream == self._stream(seed=1000)  # seed wins...
+        assert stream != self._stream(seed=7)  # ...not the generator's own state
+        assert caller_gen.initial_seed() == 1000  # re-seeded in place
 
 
 class TestResolveMixtureDeltaMap:
