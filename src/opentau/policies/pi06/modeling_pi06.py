@@ -62,6 +62,7 @@ from opentau.policies.utils import (
     assert_gemma3_input_resolution,
     ce_per_sample,
     flow_matching_masked_mse,
+    freeze_policy_level_params_for_state_action_representation_only,
     freeze_policy_level_params_for_vision_only,
 )
 from opentau.utils.accelerate_utils import get_proc_accelerator
@@ -883,6 +884,7 @@ class PI06FlowMatching(nn.Module):
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=self.config.train_expert_only,
             train_vision_encoder_only=self.config.train_vision_encoder_only,
+            train_state_action_representation_only=self.config.train_state_action_representation_only,
             attention_implementation=self.config.attention_implementation,
             discrete_action_vocab_size=discrete_action_vocab_size,
             dropout=self.config.dropout,
@@ -924,6 +926,15 @@ class PI06FlowMatching(nn.Module):
             # Freeze every policy-level projection (action/time) so ONLY the vision
             # encoder inside gemma3_with_expert trains.
             freeze_policy_level_params_for_vision_only(self, self.gemma3_with_expert)
+
+        if self.config.train_state_action_representation_only:
+            # Keep ONLY the action projections trainable at the policy level; the
+            # discrete-action representation inside gemma3_with_expert is already
+            # handled by its own set_requires_grad. time_mlp_in/out are frozen. π0.6
+            # builds no `state_proj` (state is binned into text tokens), which the
+            # helper tolerates — so the outer trainable set is action_in_proj and
+            # action_out_proj alone.
+            freeze_policy_level_params_for_state_action_representation_only(self, self.gemma3_with_expert)
 
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
         """Standard Gaussian noise (float32)."""

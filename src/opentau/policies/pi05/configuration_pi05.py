@@ -32,6 +32,7 @@ from opentau.optim.schedulers import (
     CosineDecayWithWarmupSchedulerConfig,
     LRSchedulerConfig,
 )
+from opentau.policies.utils import validate_state_action_representation_only_config
 
 
 @PreTrainedConfig.register_subclass("pi05")
@@ -76,6 +77,13 @@ class PI05Config(PreTrainedConfig):
             Note: with ``knowledge_insulation=True`` (the default) the action (MSE) loss is
             detached from the VLM, so the vision encoder trains on the CE loss only — set
             ``knowledge_insulation=False`` to train it from the action loss. Defaults to False.
+        train_state_action_representation_only: Train ONLY the dataset-specific
+            state/action representation of an otherwise generic checkpoint — the
+            discrete-action embedding table + its logit head, and ``state_proj`` (only when
+            ``state_type='continuous'``) / ``action_in_proj`` / ``action_out_proj``. The VLM,
+            the vision encoder and the action expert are frozen, as are ``time_mlp_in/out``
+            and the optional modality embeddings. Mutually exclusive with
+            ``train_expert_only`` and ``train_vision_encoder_only``. Defaults to False.
         optimizer_lr: Learning rate for the optimizer. Defaults to 2.5e-5.
         optimizer_betas: Beta parameters for AdamW optimizer. Defaults to (0.9, 0.95).
         optimizer_eps: Epsilon parameter for AdamW optimizer. Defaults to 1e-8.
@@ -165,6 +173,14 @@ class PI05Config(PreTrainedConfig):
     train_expert_only: bool = False
     train_vision_encoder_only: bool = False
 
+    # Train ONLY the dataset-specific state/action representation of an otherwise
+    # generic checkpoint: the discrete-action embedding table + its logit head, and
+    # the state/action projections that bridge this robot's raw vector space and the
+    # model's hidden space. The VLM, the vision encoder and the action expert are all
+    # frozen. Excludes time_mlp_in/out (hidden-size-only, fed by flow-matching time)
+    # and the optional modality embeddings. Defaults to False.
+    train_state_action_representation_only: bool = False
+
     # Knowledge insulation (π0.5): when True (default), the prefix/VLM KV cache
     # is detached before the action expert reads it, so the flow-matching action
     # loss does NOT backpropagate into the VLM backbone. Set False to let the
@@ -240,6 +256,16 @@ class PI05Config(PreTrainedConfig):
                 "and if the CE loss weight is 0 the step has no gradient path to any trainable "
                 "parameter. Set knowledge_insulation=False to train the vision encoder from the "
                 "action loss."
+            )
+        validate_state_action_representation_only_config(
+            self, policy_name=self.type, has_discrete_actions=True
+        )
+        if self.train_state_action_representation_only and self.state_type == "discrete":
+            logging.warning(
+                "train_state_action_representation_only=True with state_type='discrete': there is "
+                "no state_proj to train (discrete state is binned into text tokens read through "
+                "the frozen VLM embedding table), so the trainable set is the discrete-action "
+                "embedding + head and action_in_proj / action_out_proj only."
             )
         if self.n_action_steps > self.chunk_size:
             raise ValueError(

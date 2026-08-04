@@ -34,6 +34,7 @@ from opentau.optim.schedulers import (
     LRSchedulerConfig,
 )
 from opentau.policies.pi07.gemma3_with_expert import Gemma3WithExpertConfig
+from opentau.policies.utils import validate_state_action_representation_only_config
 
 
 @PreTrainedConfig.register_subclass("pi07_low_level")
@@ -114,6 +115,10 @@ class PI07LowLevelConfig(PreTrainedConfig):
             Defaults to True.
         train_expert_only: Whether to train only the action expert.
             Defaults to False.
+        train_state_action_representation_only: Train ONLY the dataset-specific
+            state/action representation of an otherwise generic checkpoint;
+            everything else is frozen. Pushed down into ``vlm_config`` in
+            ``__post_init__``. Defaults to False.
         vlm_config: Bundled :class:`Gemma3WithExpertConfig` for the Gemma 3
             VLM backbone + Gemma-v1 action expert.
         spacetime_layer_stride: Wrap every Nth SigLIP encoder layer with
@@ -213,6 +218,18 @@ class PI07LowLevelConfig(PreTrainedConfig):
     freeze_vision_encoder: bool = True
     train_expert_only: bool = False
 
+    # Train ONLY the dataset-specific state/action representation of an otherwise
+    # generic checkpoint: the discrete-action embedding table + its logit head, and
+    # the state/action projections that bridge this robot's raw vector space and the
+    # model's hidden space (per (robot_type, control_mode) copies of those three when
+    # `per_group_projection` is on). The Gemma 3 VLM, the SpaceTime video encoder and
+    # the action expert are all frozen. Excludes time_mlp_in/out (hidden-size-only,
+    # fed by flow-matching time). Unlike `train_vision_encoder_only`, which pi07
+    # carries on `vlm_config` alone, this one is declared here and pushed down in
+    # `__post_init__` so `--policy.train_state_action_representation_only` is the same
+    # CLI spelling on every policy. Defaults to False.
+    train_state_action_representation_only: bool = False
+
     # Knowledge insulation (π0.5): when True (default), the prefix/VLM KV cache
     # is detached before the action expert reads it, so the flow-matching action
     # loss does NOT backpropagate into the VLM backbone. Set False to let the
@@ -280,14 +297,19 @@ class PI07LowLevelConfig(PreTrainedConfig):
     def __post_init__(self):
         """Post-initialization validation and policy → vlm_config plumbing.
 
-        Plumbs the policy-level ``attention_implementation`` and
-        ``gradient_checkpointing`` flags into ``vlm_config`` so a single
-        ``--policy.attention_implementation`` / ``--policy.gradient_checkpointing``
+        Plumbs the policy-level ``attention_implementation``,
+        ``gradient_checkpointing`` and ``train_state_action_representation_only``
+        flags into ``vlm_config`` so a single ``--policy.attention_implementation``
+        / ``--policy.gradient_checkpointing`` /
+        ``--policy.train_state_action_representation_only``
         CLI override reaches the engine. The video-encoder half of
         ``gradient_checkpointing`` is plumbed separately at model construction
         time (see ``modeling_pi07_low_level.py``). Direct overrides on
         ``--policy.vlm_config.*`` still work and are honoured as-is when the
-        policy-level field is at its default.
+        policy-level field is at its default — except for
+        ``train_state_action_representation_only``, whose two halves must agree, so
+        the policy-level field is authoritative and is pushed down in both
+        directions (see the comment at the push-down site).
         """
         super().__post_init__()
 
@@ -307,6 +329,55 @@ class PI07LowLevelConfig(PreTrainedConfig):
                 "trainable parameter. Set knowledge_insulation=False to train the video encoder from "
                 "the action loss."
             )
+
+        validate_state_action_representation_only_config(
+            self, policy_name=self.type, has_discrete_actions=True
+        )
+        if self.train_state_action_representation_only:
+            # The shared validator reads the sibling "train only X" flags off the policy
+            # config, but on pi07 the ones the engine actually obeys live on
+            # ``vlm_config`` — ``train_vision_encoder_only`` is only declared there, and
+            # the policy-level ``train_expert_only`` is never plumbed down. Re-check both
+            # against ``vlm_config`` here; ``Gemma3WithExpertConfig.__init__`` cannot
+            # catch the conflict itself because the push-down below happens after it ran.
+            for conflicting in ("train_expert_only", "train_vision_encoder_only"):
+                if getattr(self.vlm_config, conflicting):
+                    raise ValueError(
+                        f"`train_state_action_representation_only=True` and "
+                        f"`vlm_config.{conflicting}=True` are mutually exclusive on pi07_low_level: "
+                        f"this mode freezes the VLM, the video encoder and the action expert, so it "
+                        f"cannot be combined with a mode that trains one of them."
+                    )
+        # Push the flag down UNCONDITIONALLY — the policy-level field is the single
+        # source of truth. The True-only shape used by `attention_implementation` and
+        # `gradient_checkpointing` above is safe for those (performance knobs, and a
+        # stale True is harmless), but it is not safe here, because this flag decides
+        # what trains AND `vlm_config` is serialized into the saved config.json. A
+        # one-way push-down leaves two silent half-frozen states:
+        #   * reload an adapter-trained checkpoint with
+        #     `--policy.train_state_action_representation_only=false` to fully finetune:
+        #     the policy-level flag clears but the serialized `vlm_config` one stays
+        #     True, so the VLM and expert stay frozen while the outer projections
+        #     unfreeze — a mode nobody asked for, with no error;
+        #   * set only `--policy.vlm_config.train_state_action_representation_only=true`:
+        #     the trunk freezes but `freeze_policy_level_params_...` never runs, so
+        #     `time_mlp_*` and every other outer parameter keep training.
+        # Warn only when clearing an inner True the policy level did not ask for —
+        # either an inner-only override, or a stale value deserialized from a config
+        # saved by an earlier adapter run. The False -> True direction is the ordinary
+        # push-down and says nothing worth logging.
+        if (
+            self.vlm_config.train_state_action_representation_only
+            and not self.train_state_action_representation_only
+        ):
+            logging.warning(
+                "vlm_config.train_state_action_representation_only=True is cleared because the "
+                "policy-level train_state_action_representation_only=False is authoritative. Set "
+                "the flag on the policy (`--policy.train_state_action_representation_only`), not "
+                "on `vlm_config` — the two halves of this mode must agree, and a half-applied "
+                "freeze would train the outer projections against a frozen VLM silently."
+            )
+        self.vlm_config.train_state_action_representation_only = self.train_state_action_representation_only
 
         if not isinstance(self.n_obs_steps, int) or self.n_obs_steps < 1:
             raise ValueError(f"`n_obs_steps` must be a positive integer, got {self.n_obs_steps}.")

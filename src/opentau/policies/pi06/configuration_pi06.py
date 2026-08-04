@@ -32,6 +32,7 @@ from opentau.optim.schedulers import (
     CosineDecayWithWarmupSchedulerConfig,
     LRSchedulerConfig,
 )
+from opentau.policies.utils import validate_state_action_representation_only_config
 
 
 @PreTrainedConfig.register_subclass("pi06")
@@ -88,6 +89,13 @@ class PI06Config(PreTrainedConfig):
             Note: with ``knowledge_insulation=True`` (the default) the action (MSE) loss is
             detached from the VLM, so the vision encoder trains on the CE loss only — set
             ``knowledge_insulation=False`` to train it from the action loss. Defaults to False.
+        train_state_action_representation_only: Train ONLY the dataset-specific
+            state/action representation of an otherwise generic checkpoint — the
+            discrete-action embedding table + its logit head, plus ``action_in_proj`` /
+            ``action_out_proj``. π0.6 bins state into text tokens and has no ``state_proj``,
+            so there is none to train. The Gemma 3 backbone, the vision encoder and the
+            action expert are frozen, as are ``time_mlp_in/out``. Mutually exclusive with
+            ``train_expert_only`` and ``train_vision_encoder_only``. Defaults to False.
         optimizer_lr: AdamW learning rate. Defaults to 2.5e-5.
         optimizer_betas: AdamW betas. Defaults to (0.9, 0.95).
         optimizer_eps: AdamW epsilon. Defaults to 1e-8.
@@ -158,6 +166,16 @@ class PI06Config(PreTrainedConfig):
     train_expert_only: bool = False
     train_vision_encoder_only: bool = False
 
+    # Train ONLY the dataset-specific state/action representation of an otherwise
+    # generic checkpoint: the discrete-action embedding table + its logit head, and
+    # the projections that bridge this robot's raw action vector space and the model's
+    # hidden space. The Gemma 3 backbone, the vision encoder and the action expert are
+    # all frozen. Note π0.6 has no `state_proj` at all — the state is binned into text
+    # tokens read through the frozen backbone embedding table — so the trainable set
+    # here is narrower than on π0.5: action_in_proj / action_out_proj only. Excludes
+    # time_mlp_in/out (hidden-size-only, fed by flow-matching time). Defaults to False.
+    train_state_action_representation_only: bool = False
+
     # Knowledge insulation (π0.5): when True (default), the prefix/VLM KV cache
     # is detached before the action expert reads it, so the flow-matching action
     # loss does NOT backpropagate into the VLM backbone. Set False to let the
@@ -208,6 +226,9 @@ class PI06Config(PreTrainedConfig):
                 "parameter. Set knowledge_insulation=False to train the vision encoder from the "
                 "action loss."
             )
+        validate_state_action_representation_only_config(
+            self, policy_name=self.type, has_discrete_actions=True
+        )
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "

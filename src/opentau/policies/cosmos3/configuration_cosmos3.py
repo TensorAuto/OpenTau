@@ -42,6 +42,7 @@ from opentau.optim.schedulers import (
     CosineDecayWithWarmupSchedulerConfig,
     LRSchedulerConfig,
 )
+from opentau.policies.utils import validate_state_action_representation_only_config
 
 
 @PreTrainedConfig.register_subclass("cosmos3")
@@ -87,6 +88,16 @@ class Cosmos3Config(PreTrainedConfig):
             inside the tower, so it trains too) and freeze the LLM backbone, the action
             expert, and all projections. Requires ``freeze_vision_encoder=False`` and
             ``train_expert_only=False`` (they are mutually exclusive). Defaults to False.
+        train_state_action_representation_only: Train ONLY the dataset-specific state/action
+            representation -- ``state_proj`` / ``action_in_proj`` / ``action_out_proj``, the three
+            projections whose shape is a function of the robot rather than of the architecture --
+            and freeze everything else: the Qwen3-VL backbone, the vision tower, the action expert,
+            and the flow-matching time conditioning (``time_mlp_in`` / ``time_mlp_out`` /
+            ``adarms_proj``). cosmos3 has no FAST discrete-action branch, so unlike π0.5 there is no
+            discrete-action embedding or logit head to train and the mode degenerates to the three
+            projections alone (warned about by the shared validator). Because cosmos3 defaults
+            ``train_expert_only=True``, this flag must be paired with ``train_expert_only=False``.
+            Defaults to False.
         gradient_checkpointing: Checkpoint the expert decoder layers to trade
             compute for activation memory. Defaults to False.
         dropout: Dropout probability inside the expert. Defaults to 0.1.
@@ -162,6 +173,14 @@ class Cosmos3Config(PreTrainedConfig):
     freeze_vision_encoder: bool = True
     train_expert_only: bool = True
     train_vision_encoder_only: bool = False
+
+    # Train ONLY the dataset-specific state/action projections of an otherwise generic
+    # checkpoint; the backbone, the vision tower, the action expert and the flow-matching
+    # time conditioning are all frozen. There is no discrete-action pathway here, so this
+    # is the whole trainable set. Must be paired with train_expert_only=False, which
+    # cosmos3 defaults to True. Defaults to False.
+    train_state_action_representation_only: bool = False
+
     gradient_checkpointing: bool = False
     dropout: float = 0.1
 
@@ -209,6 +228,20 @@ class Cosmos3Config(PreTrainedConfig):
                 "`train_vision_encoder_only=True` requires `freeze_vision_encoder=False` — the vision "
                 "encoder cannot be both frozen and the only trained component."
             )
+        if self.train_state_action_representation_only and self.train_expert_only:
+            # The shared validator rejects this pair too, but its message is generic and
+            # cosmos3 is the one policy that defaults `train_expert_only=True` — so the
+            # collision fires for a user who overrode nothing but the new flag, and a
+            # message about a conflict they never asked for reads like a bug. Name the fix.
+            raise ValueError(
+                "`train_state_action_representation_only=True` and `train_expert_only=True` are "
+                "mutually exclusive, and cosmos3 defaults `train_expert_only=True` — so this flag on "
+                "its own always collides. Set `train_expert_only=False` as well (e.g. "
+                "`--policy.train_expert_only=false`) to train the state/action projections only."
+            )
+        validate_state_action_representation_only_config(
+            self, policy_name=self.type, has_discrete_actions=False
+        )
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 "The chunk size is the upper bound for the number of action steps per model "

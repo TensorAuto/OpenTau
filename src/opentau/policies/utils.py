@@ -428,3 +428,232 @@ def freeze_policy_level_params_for_vision_only(
         if id(param) in protected or "motion_module" in name:
             continue
         param.requires_grad = False
+
+
+#: Policy-level projections that bridge a *dataset's* raw state/action vector space
+#: and the model's hidden space. Their in- or out-features are ``max_state_dim`` /
+#: ``max_action_dim``, so they are the only outer projections whose shape is a
+#: function of the robot rather than of the architecture — which is exactly what
+#: makes them dataset-specific. Deliberately excludes ``time_mlp_in``/``time_mlp_out``
+#: (and pi0's ``action_time_mlp_*``, cosmos3's ``adarms_proj``): those are
+#: hidden-size-to-hidden-size, are fed a sinusoidal embedding of flow-matching time
+#: alone, and condition the action expert — the same line ``per_group_projection``
+#: already draws when it gives per-(robot_type, control_mode) copies to these three
+#: and notes that "time_mlp_in/out stay shared".
+STATE_ACTION_PROJECTION_ATTRS: tuple[str, ...] = ("state_proj", "action_in_proj", "action_out_proj")
+
+#: With-expert-level modules holding the discrete-action (FAST token) representation:
+#: the input embedding table and the untied head producing logits over the action
+#: vocabulary. Both are pure functions of the fitted FAST tokenizer's vocabulary and
+#: are invalidated by the same event (a tokenizer re-fit), so they move as one unit —
+#: as every existing freeze flag already treats them.
+DISCRETE_ACTION_REPRESENTATION_ATTRS: tuple[str, ...] = ("discrete_action_embedding", "da_head")
+
+
+def validate_state_action_representation_only_config(
+    config: object, *, policy_name: str, has_discrete_actions: bool
+) -> None:
+    """Validate ``train_state_action_representation_only`` on a policy config.
+
+    Shared by every policy config's ``__post_init__`` so the rules cannot drift, and
+    so a policy added later gets them by calling one function rather than by copying
+    a block (the copy-a-block approach is how ``train_vision_encoder_only`` ended up
+    reaching the pi07_paligemma planner but not the pi07 one).
+
+    Enforces mutual exclusion with the two other "train only X" modes, and warns —
+    rather than raises — in the two situations where the flag is legal but trains
+    less than a reader might expect:
+
+    * **No discrete-action pathway** (pi0, cosmos3/cosmos3_nano): bucket (1) is empty
+      and the flag degenerates to "train the state/action projections only". That is
+      a real and useful mode, so it is allowed, but a user who set the flag expecting
+      embedding training must be told.
+    * **Knowledge insulation on** (the default): KI detaches the prefix KV cache
+      before the action expert, which splits the trainable set across two losses —
+      ``state_proj`` and the discrete-action modules are reachable only from CE, while
+      ``action_in_proj``/``action_out_proj`` are reachable only from MSE. Zeroing
+      either ``loss_weighting`` term starves one group entirely.
+
+    Args:
+        config: the policy config being validated (read via ``getattr`` so configs
+            that do not declare a given sibling flag are handled).
+        policy_name: policy name used in the messages, e.g. ``"pi05"``.
+        has_discrete_actions: whether this policy has a discrete-action pathway at
+            all. A static per-policy fact, passed explicitly so the empty-bucket
+            warning cannot be silently skipped by an attribute lookup returning None.
+
+    Raises:
+        ValueError: if combined with ``train_expert_only`` or ``train_vision_encoder_only``.
+    """
+    if not getattr(config, "train_state_action_representation_only", False):
+        return
+
+    for conflicting in ("train_expert_only", "train_vision_encoder_only"):
+        if getattr(config, conflicting, False):
+            raise ValueError(
+                f"`train_state_action_representation_only=True` and `{conflicting}=True` are mutually "
+                f"exclusive on {policy_name}: this mode freezes the VLM, the vision encoder and the "
+                f"action expert, so it cannot be combined with a mode that trains one of them."
+            )
+
+    if not has_discrete_actions:
+        logging.warning(
+            "train_state_action_representation_only=True on %s, which has no discrete-action "
+            "pathway: there is no discrete-action embedding or logit head to train, so this run "
+            "trains ONLY the state/action projections (state_proj / action_in_proj / "
+            "action_out_proj). That is a supported mode, but if you expected the discrete-action "
+            "embeddings to train, you want one of the policies that has a FAST discrete-action "
+            "branch (pi05, pi05_mem, pi06, pi07_low_level, pi07_paligemma_low_level).",
+            policy_name,
+        )
+
+    if getattr(config, "knowledge_insulation", False):
+        logging.warning(
+            "train_state_action_representation_only=True with knowledge_insulation=True on %s: "
+            "knowledge insulation detaches the VLM prefix KV cache before the action expert, so "
+            "the trainable parameters split across two losses — state_proj and the discrete-action "
+            "embedding/head receive gradient ONLY from the CE loss, while action_in_proj and "
+            "action_out_proj receive gradient ONLY from the flow-matching MSE loss. If either "
+            "`loss_weighting` term is 0, that half of the trainable set gets no gradient at all.",
+            policy_name,
+        )
+
+
+def _param_ids_of_attrs(module: nn.Module, attrs: tuple[str, ...]) -> set[int]:
+    """Collect ``id()`` of every parameter under ``attrs`` that exists on ``module``.
+
+    Resolution is by *module object*, never by parameter name. Name matching is
+    unsafe here: ``Normalize``/``Unnormalize`` register their per-dataset statistics
+    as ``nn.Parameter(..., requires_grad=False)`` (see :mod:`opentau.policies.normalize`),
+    so they appear in ``named_parameters()`` as ``normalize_*.buffer_state`` /
+    ``buffer_actions``. Any pattern matching ``state`` or ``action`` would flip those
+    normalization statistics into learned parameters, and the optimizer factory —
+    which selects on ``requires_grad`` alone — would happily optimize them.
+
+    Args:
+        module: the module to resolve attributes against.
+        attrs: attribute names to look up; missing attributes are skipped, since
+            which projections/heads exist varies by policy (pi06 has no
+            ``state_proj`` at all, pi05 only builds one for ``state_type="continuous"``).
+
+    Returns:
+        The set of ``id()`` values of the collected parameters.
+    """
+    ids: set[int] = set()
+    for attr in attrs:
+        submodule = getattr(module, attr, None)
+        if isinstance(submodule, nn.Module):
+            ids.update(id(p) for p in submodule.parameters())
+    return ids
+
+
+def freeze_with_expert_params_for_state_action_representation_only(
+    with_expert_module: nn.Module,
+) -> list[str]:
+    """Freeze the whole VLM/vision/expert stack, keeping only the discrete-action
+    representation trainable, for ``train_state_action_representation_only``.
+
+    This is the inner half of the flag: it configures the ``*WithExpertModel``
+    wrapper. Everything it owns — the VLM backbone and its tied ``lm_head``, the
+    SigLIP/Gemma3/Qwen3-VL vision tower, the multimodal projector, the action expert
+    and its AdaRMS conditioning — is frozen, and only
+    :data:`DISCRETE_ACTION_REPRESENTATION_ATTRS` is left trainable.
+
+    The polarity is deliberately *default-deny*: every parameter is set to
+    ``requires_grad = id(param) in keep`` in one pass, rather than freezing an
+    enumerated list of submodules. Enumerating is how a head silently keeps training
+    when a new module is added — and it is why ``freeze_vision_encoder`` leaves the
+    multimodal projector trainable to this day (it freezes ``vision_tower`` only).
+    Here the projector is covered for free.
+
+    Args:
+        with_expert_module: the ``*WithExpertModel`` wrapper (PaliGemma, Gemma 3 or
+            Qwen3-VL flavour).
+
+    Returns:
+        Sorted names of the parameters left trainable, for logging and tests. Empty
+        for policies with no discrete-action pathway (pi0, cosmos3), which is a
+        supported — and warned-about — degenerate case.
+    """
+    keep = _param_ids_of_attrs(with_expert_module, DISCRETE_ACTION_REPRESENTATION_ATTRS)
+    trainable: list[str] = []
+    for name, param in with_expert_module.named_parameters():
+        param.requires_grad = id(param) in keep
+        if param.requires_grad:
+            trainable.append(name)
+    return sorted(trainable)
+
+
+def set_with_expert_train_mode_for_state_action_representation_only(
+    with_expert_module: nn.Module, mode: bool
+) -> None:
+    """Pin every frozen submodule of the wrapper to ``eval()`` under the flag.
+
+    ``requires_grad=False`` stops weights from updating but does **not** stop
+    ``nn.Dropout`` from firing inside the frozen trunk, and ``update_policy`` calls
+    ``policy.train()`` on every step. Under this flag the trainable set is a single
+    embedding table plus one linear head, so trunk dropout is pure variance injected
+    between the frozen features and the tiny head that reads them — with no
+    regularization benefit, since no trunk weight can move. The wrapper's own
+    ``self.dropout`` (applied to attention and MLP outputs inside the decoder loop)
+    is therefore pinned to eval as well, which means ``config.dropout`` has no effect
+    under this flag.
+
+    Every direct child is evaluated and only the discrete-action modules follow
+    ``mode`` — correct by construction, because under this flag everything that is
+    not a discrete-action module is frozen.
+
+    Args:
+        with_expert_module: the ``*WithExpertModel`` wrapper.
+        mode: the training mode requested by the caller's ``train(mode)``.
+    """
+    for child in with_expert_module.children():
+        child.eval()
+    for attr in DISCRETE_ACTION_REPRESENTATION_ATTRS:
+        submodule = getattr(with_expert_module, attr, None)
+        if isinstance(submodule, nn.Module):
+            submodule.train(mode)
+
+
+def freeze_policy_level_params_for_state_action_representation_only(
+    policy_module: nn.Module, with_expert_module: nn.Module
+) -> list[str]:
+    """Freeze the policy-level (outer) parameters for
+    ``train_state_action_representation_only``, keeping only the state/action
+    projections trainable.
+
+    This is the outer half of the flag, and the mirror image of
+    :func:`freeze_policy_level_params_for_vision_only`: the inner wrapper's
+    ``set_requires_grad`` has already frozen everything it owns except the
+    discrete-action representation, and what remains are the projections and other
+    modules that live on the enclosing flow-matching module. Only
+    :data:`STATE_ACTION_PROJECTION_ATTRS` survives; ``time_mlp_*`` /
+    ``action_time_mlp_*``, the optional modality embeddings, and any video-encoder
+    parameters are frozen.
+
+    Note that unlike :func:`freeze_policy_level_params_for_vision_only` this function
+    has **no ``motion_module`` carve-out**. The pi05_mem RLDX temporal block is part
+    of the video encoder, and it is the one module a generic pretrained checkpoint
+    does *not* contain — it loads fresh and zero-gated. Inheriting the carve-out would
+    silently train a randomly-initialized temporal block in a run whose entire premise
+    is that only the dataset-facing adapters move.
+
+    Args:
+        policy_module: the enclosing flow-matching ``nn.Module``.
+        with_expert_module: the inner ``*WithExpertModel`` submodule, already
+            configured by its own ``set_requires_grad``; its parameters are left
+            untouched here.
+
+    Returns:
+        Sorted names of the outer parameters left trainable, for logging and tests.
+    """
+    protected = {id(p) for p in with_expert_module.parameters()}
+    keep = _param_ids_of_attrs(policy_module, STATE_ACTION_PROJECTION_ATTRS)
+    trainable: list[str] = []
+    for name, param in policy_module.named_parameters():
+        if id(param) in protected:
+            continue
+        param.requires_grad = id(param) in keep
+        if param.requires_grad:
+            trainable.append(name)
+    return sorted(trainable)

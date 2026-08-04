@@ -39,6 +39,7 @@ from opentau.policies.pi0.paligemma_with_expert import (
 from opentau.policies.pretrained import PreTrainedPolicy
 from opentau.policies.utils import (
     PerSampleLoss,
+    freeze_policy_level_params_for_state_action_representation_only,
     freeze_policy_level_params_for_vision_only,
     log_model_loading_keys,
     make_action_dim_mask,
@@ -719,6 +720,7 @@ class PI0FlowMatching(nn.Module):
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=self.config.train_expert_only,
             train_vision_encoder_only=self.config.train_vision_encoder_only,
+            train_state_action_representation_only=self.config.train_state_action_representation_only,
             attention_implementation=self.config.attention_implementation,
             dropout=self.config.dropout,
             gradient_checkpointing=self.config.gradient_checkpointing,
@@ -745,6 +747,15 @@ class PI0FlowMatching(nn.Module):
             # vision encoder (inside paligemma_with_expert, already configured by its
             # own set_requires_grad) trains. Overrides the train_state_proj setting above.
             freeze_policy_level_params_for_vision_only(self, self.paligemma_with_expert)
+
+        if self.config.train_state_action_representation_only:
+            # Keep ONLY state_proj / action_in_proj / action_out_proj trainable and
+            # freeze action_time_mlp_in/out — nn.Linear defaults to requires_grad=True,
+            # so the two action projections and the time MLPs are never touched by the
+            # train_state_proj loop above and would otherwise stay trainable. Runs last
+            # so it wins; the config already rejects the one combination where the two
+            # would disagree (train_state_proj=False).
+            freeze_policy_level_params_for_state_action_representation_only(self, self.paligemma_with_expert)
 
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
         """Samples Gaussian noise.

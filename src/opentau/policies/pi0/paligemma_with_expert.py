@@ -36,6 +36,11 @@ from transformers import (
 )
 from transformers.models.auto import CONFIG_MAPPING
 
+from opentau.policies.utils import (
+    freeze_with_expert_params_for_state_action_representation_only,
+    set_with_expert_train_mode_for_state_action_representation_only,
+)
+
 
 def apply_rope(x: torch.Tensor, positions: torch.Tensor, max_wavelength: int = 10_000) -> torch.Tensor:
     """Applies RoPE positions to the input tensor.
@@ -83,6 +88,7 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
         freeze_vision_encoder: bool = True,
         train_expert_only: bool = True,
         train_vision_encoder_only: bool = False,
+        train_state_action_representation_only: bool = False,
         attention_implementation: str = "eager",
         dropout: float = 0.1,
         gradient_checkpointing: bool = False,
@@ -100,6 +106,13 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
                 (the SigLIP tower + the multimodal projector). Requires
                 ``freeze_vision_encoder=False`` and is incompatible with
                 ``train_expert_only=True``. Defaults to False.
+            train_state_action_representation_only: Freeze everything this wrapper owns —
+                the Gemma LLM backbone, the vision pathway (tower *and* multimodal
+                projector) and the action expert. pi0 has no discrete-action embedding or
+                logit head, so nothing here stays trainable; the state/action projections
+                the mode does train live on the enclosing flow-matching module. Mutually
+                exclusive with ``train_expert_only`` and ``train_vision_encoder_only``.
+                Defaults to False.
             attention_implementation: Attention implementation to use ("eager", "sdpa",
                 or "fa2"). Defaults to "eager".
             dropout: Dropout probability. Defaults to 0.1.
@@ -115,6 +128,7 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
         self.train_vision_encoder_only = train_vision_encoder_only
+        self.train_state_action_representation_only = train_state_action_representation_only
         self.attention_implementation = attention_implementation
         self.dropout = dropout
         self.gradient_checkpointing = gradient_checkpointing
@@ -215,6 +229,15 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
                 "compatible — the vision encoder cannot be both frozen and the only trained component. "
                 "Set `freeze_vision_encoder=False`."
             )
+        if self.train_state_action_representation_only and (
+            self.train_expert_only or self.train_vision_encoder_only
+        ):
+            raise ValueError(
+                "`train_state_action_representation_only=True` is mutually exclusive with "
+                "`train_expert_only=True` and `train_vision_encoder_only=True` — it freezes the "
+                "action expert and the vision encoder, so it cannot be combined with a mode that "
+                "trains one of them."
+            )
         if self.attention_implementation not in ["eager", "sdpa", "fa2"]:
             raise ValueError(
                 f"Wrong value provided for `attention_implementation` ({self.attention_implementation}). "
@@ -308,6 +331,23 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
                 for params in projector.parameters():
                     params.requires_grad = True
 
+        if self.config.train_state_action_representation_only:
+            # Freeze the VLM (tower, projector and Gemma LLM) and the action expert:
+            # pi0 has no discrete-action embedding or head, so this wrapper keeps
+            # nothing trainable and the whole trainable set is the state/action
+            # projections on the enclosing flow-matching module. Default-deny in one
+            # pass rather than an enumerated freeze list, so a module added later
+            # cannot silently keep training — and so the multimodal projector, which
+            # `freeze_vision_encoder` misses, is covered for free.
+            self.paligemma.eval()
+            self.gemma_expert.eval()
+            freeze_with_expert_params_for_state_action_representation_only(self)
+            # `__init__` leaves the module in training mode, so pin the frozen trunk to
+            # eval right away rather than waiting for the first `train()` call — the
+            # explicit evals above miss this wrapper's own `self.dropout`, a direct child
+            # that fires inside the decoder loop.
+            set_with_expert_train_mode_for_state_action_representation_only(self, self.training)
+
     def train(self, mode: bool = True) -> None:
         """Sets the module in training mode.
 
@@ -330,6 +370,14 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             projector = self._multi_modal_projector()
             if projector is not None:
                 projector.train(mode)
+
+        if self.config.train_state_action_representation_only:
+            # Nothing this wrapper owns is trainable, so pin all of it to eval —
+            # including this wrapper's own `self.dropout`, which fires on the attention
+            # and MLP outputs inside the decoder loop. Trunk dropout under this flag is
+            # pure variance between frozen features and the projections that read them,
+            # with no regularization benefit, so `config.dropout` has no effect here.
+            set_with_expert_train_mode_for_state_action_representation_only(self, mode)
 
     def to_bfloat16_like_physical_intelligence(self) -> None:
         """Casts specific model components to bfloat16, keeping the SigLIP embeddings in float32.

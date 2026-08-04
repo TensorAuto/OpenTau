@@ -64,6 +64,7 @@ from opentau.policies.utils import (
     PerSampleLoss,
     ce_per_sample,
     flow_matching_masked_mse,
+    freeze_policy_level_params_for_state_action_representation_only,
     freeze_policy_level_params_for_vision_only,
 )
 from opentau.utils.accelerate_utils import get_proc_accelerator
@@ -1985,6 +1986,7 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=self.config.train_expert_only,
             train_vision_encoder_only=self.config.train_vision_encoder_only,
+            train_state_action_representation_only=self.config.train_state_action_representation_only,
             attention_implementation=self.config.attention_implementation,
             load_pretrained_paligemma=False,
             discrete_action_vocab_size=discrete_action_vocab_size,
@@ -2036,6 +2038,15 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
             # the SigLIP tower under paligemma_with_expert, already configured by its own
             # set_requires_grad).
             freeze_policy_level_params_for_vision_only(self, self.paligemma_with_expert)
+
+        if self.config.train_state_action_representation_only:
+            # Keep ONLY the state/action projections trainable at the policy level;
+            # the discrete-action representation inside paligemma_with_expert is
+            # already handled by its own set_requires_grad. time_mlp_in/out are
+            # frozen. This resolves the projections by module identity, so the
+            # PerGroupLinear copies `per_group_projection` builds stay trainable
+            # exactly like the plain nn.Linear ones.
+            freeze_policy_level_params_for_state_action_representation_only(self, self.paligemma_with_expert)
 
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
         """Samples Gaussian noise.

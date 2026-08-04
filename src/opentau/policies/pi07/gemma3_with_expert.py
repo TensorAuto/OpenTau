@@ -47,6 +47,11 @@ from transformers import (
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
 
+from opentau.policies.utils import (
+    freeze_with_expert_params_for_state_action_representation_only,
+    set_with_expert_train_mode_for_state_action_representation_only,
+)
+
 # Ensure the Gemma-v1 AdaRMS / gated-residual patches are live before we
 # construct an action expert. Import for side effects only.
 from opentau.utils import transformers_patch  # noqa: F401
@@ -112,6 +117,7 @@ class Gemma3WithExpertConfig(PretrainedConfig):
         freeze_vision_encoder: bool = True,
         train_expert_only: bool = True,
         train_vision_encoder_only: bool = False,
+        train_state_action_representation_only: bool = False,
         attention_implementation: str = "eager",
         load_pretrained_gemma3: bool = False,
         discrete_action_vocab_size: int | None = None,
@@ -136,6 +142,16 @@ class Gemma3WithExpertConfig(PretrainedConfig):
                 pathway (the SigLIP tower + the multimodal projector). Requires
                 ``freeze_vision_encoder=False`` and is incompatible with
                 ``train_expert_only=True``.
+            train_state_action_representation_only: Freeze the Gemma 3 backbone
+                (including the reparented interleaved backbone layers), the vision
+                pathway (SigLIP tower *and* multimodal projector) and the action
+                expert, and train ONLY the discrete-action representation — the
+                embedding table and its logit head. The policy-level state/action
+                projections are handled by the enclosing flow-matching module.
+                Mutually exclusive with ``train_expert_only`` and
+                ``train_vision_encoder_only``. Set from the policy config's
+                top-level flag of the same name (plumbed in its ``__post_init__``),
+                not overridden directly. Defaults to False.
             attention_implementation: "eager", "sdpa", or "fa2". "fa2" is not
                 implemented and falls back to eager with a warning. "sdpa"
                 dispatches to ``torch.nn.functional.scaled_dot_product_attention``;
@@ -180,6 +196,7 @@ class Gemma3WithExpertConfig(PretrainedConfig):
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
         self.train_vision_encoder_only = train_vision_encoder_only
+        self.train_state_action_representation_only = train_state_action_representation_only
         self.attention_implementation = attention_implementation
         self.load_pretrained_gemma3 = load_pretrained_gemma3
         self.discrete_action_vocab_size = discrete_action_vocab_size
@@ -301,6 +318,15 @@ class Gemma3WithExpertConfig(PretrainedConfig):
                 "You set `train_vision_encoder_only=True` and `freeze_vision_encoder=True` which are not "
                 "compatible — the vision encoder cannot be both frozen and the only trained component. "
                 "Set `freeze_vision_encoder=False`."
+            )
+        if self.train_state_action_representation_only and (
+            self.train_expert_only or self.train_vision_encoder_only
+        ):
+            raise ValueError(
+                "`train_state_action_representation_only=True` is mutually exclusive with "
+                "`train_expert_only=True` and `train_vision_encoder_only=True` — it freezes the "
+                "action expert and the vision encoder, so it cannot be combined with a mode that "
+                "trains one of them."
             )
         if self.attention_implementation not in ["eager", "sdpa", "fa2"]:
             raise ValueError(
@@ -733,6 +759,22 @@ class Gemma3WithExpertModel(PreTrainedModel):
                     for params in module.parameters():
                         params.requires_grad = True
 
+        if self.config.train_state_action_representation_only:
+            # Mirror image of both modes above: freeze the Gemma 3 backbone, the vision
+            # pathway and the action expert, leaving ONLY the discrete-action
+            # representation — the embedding table and its logit head — trainable.
+            # Default-deny in one pass rather than an enumerated freeze list, so a module
+            # added later cannot silently keep training; the sweep is over
+            # ``named_parameters()``, which already sees the reparented interleaved
+            # layers wherever they now live.
+            freeze_with_expert_params_for_state_action_representation_only(self)
+            # ``__init__`` leaves the module in training mode, so pin the frozen trunk to
+            # eval right away rather than waiting for the first ``train()`` call. Routed
+            # through the same helper because the backbone/expert layers no longer live
+            # under ``self.gemma3`` / ``self.gemma_expert`` — eval-ing those two by name
+            # would miss them.
+            set_with_expert_train_mode_for_state_action_representation_only(self, self.training)
+
     def train(self, mode: bool = True):
         super().train(mode)
         if self.config.freeze_vision_encoder:
@@ -761,6 +803,14 @@ class Gemma3WithExpertModel(PreTrainedModel):
             for module in (self._vision_tower(), self._multi_modal_projector()):
                 if module is not None:
                     module.train(mode)
+        if self.config.train_state_action_representation_only:
+            # Only the discrete-action representation trains, so pin the whole frozen
+            # trunk — including this wrapper's own ``self.dropout``, which fires inside
+            # the interleaved decoder loop — to eval; ``config.dropout`` therefore has no
+            # effect under this flag. Eval-ing every direct child reaches the reparented
+            # interleaved layers through the ModuleList without calling into their
+            # sub-components, so FSDP's all-gather unit stays whole (CLAUDE.md rule 5).
+            set_with_expert_train_mode_for_state_action_representation_only(self, mode)
         return self
 
     def to_bfloat16_like_physical_intelligence(self) -> None:

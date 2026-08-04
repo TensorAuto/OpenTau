@@ -31,6 +31,7 @@ from opentau.optim.schedulers import (
     CosineDecayWithWarmupSchedulerConfig,
     LRSchedulerConfig,
 )
+from opentau.policies.utils import validate_state_action_representation_only_config
 
 
 @PreTrainedConfig.register_subclass("pi0")
@@ -78,6 +79,13 @@ class PI0Config(PreTrainedConfig):
             ``freeze_vision_encoder=False`` and is incompatible with ``train_expert_only=True``.
             Defaults to False.
         train_state_proj: Whether to train the state projection layer. Defaults to True.
+        train_state_action_representation_only: Train ONLY the dataset-specific
+            state/action representation of an otherwise generic checkpoint, freezing the
+            VLM, the vision encoder and the action expert. pi0 has no discrete-action
+            pathway, so this reduces to training ``state_proj`` / ``action_in_proj`` /
+            ``action_out_proj``; ``action_time_mlp_in/out`` stay frozen. Mutually exclusive
+            with ``train_expert_only`` and ``train_vision_encoder_only``, and requires
+            ``train_state_proj=True``. Defaults to False.
         optimizer_lr: Learning rate for the optimizer. Defaults to 2.5e-5.
         optimizer_betas: Beta parameters for AdamW optimizer. Defaults to (0.9, 0.95).
         optimizer_eps: Epsilon parameter for AdamW optimizer. Defaults to 1e-8.
@@ -143,6 +151,16 @@ class PI0Config(PreTrainedConfig):
     train_vision_encoder_only: bool = False
     train_state_proj: bool = True
 
+    # Train ONLY the dataset-specific state/action representation of an otherwise
+    # generic checkpoint: the state/action projections that bridge this robot's raw
+    # vector space and the model's hidden space. The VLM, the vision encoder and the
+    # action expert are all frozen, and so are action_time_mlp_in/out (hidden-size to
+    # hidden-size, fed a sinusoidal embedding of flow-matching time alone). pi0 has no
+    # discrete-action pathway, so unlike the π0.5-family policies there is no embedding
+    # table or logit head to train here and the mode degenerates to "train the three
+    # projections"; the shared validator warns about that. Defaults to False.
+    train_state_action_representation_only: bool = False
+
     # Wrap each transformer-layer forward in torch.utils.checkpoint to trade
     # ~25-33%% same-batch compute for ~30-40 GB of activation memory per rank,
     # typically netting +10-25%% throughput once the freed memory is spent on
@@ -184,6 +202,19 @@ class PI0Config(PreTrainedConfig):
             raise ValueError(
                 "`train_vision_encoder_only=True` requires `freeze_vision_encoder=False` — the vision "
                 "encoder cannot be both frozen and the only trained component."
+            )
+        validate_state_action_representation_only_config(
+            self, policy_name=self.type, has_discrete_actions=False
+        )
+        if self.train_state_action_representation_only and not self.train_state_proj:
+            # Contradictory rather than merely narrower: the state projection is one of
+            # the three parameters this mode exists to train, and pi0 is the only policy
+            # that can even express "freeze it" (`train_state_proj` is pi0-only). Raising
+            # beats silently overriding one flag with the other in either direction.
+            raise ValueError(
+                "`train_state_action_representation_only=True` requires `train_state_proj=True`: "
+                "the state projection is part of the state/action representation this mode trains, "
+                "so asking for it to be frozen at the same time is self-contradictory."
             )
         if self.n_action_steps > self.chunk_size:
             raise ValueError(

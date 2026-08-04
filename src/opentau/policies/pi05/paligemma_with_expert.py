@@ -39,6 +39,10 @@ from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
 
 from opentau.policies import flash_attn_cuda
+from opentau.policies.utils import (
+    freeze_with_expert_params_for_state_action_representation_only,
+    set_with_expert_train_mode_for_state_action_representation_only,
+)
 
 
 def _preferred_dtype():
@@ -116,6 +120,7 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
         freeze_vision_encoder: bool = True,
         train_expert_only: bool = True,
         train_vision_encoder_only: bool = False,
+        train_state_action_representation_only: bool = False,
         attention_implementation: str = "eager",
         discrete_action_vocab_size: int | None = None,
         dropout: float = 0.1,
@@ -134,6 +139,12 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
                 train ONLY the vision pathway (the SigLIP tower + the multimodal projector).
                 Requires ``freeze_vision_encoder=False`` and is incompatible with
                 ``train_expert_only=True``. Defaults to False.
+            train_state_action_representation_only: Freeze the VLM backbone, the vision
+                pathway (tower *and* multimodal projector) and the action expert, and
+                train ONLY the discrete-action representation — the embedding table and
+                its logit head. The policy-level state/action projections are handled by
+                the enclosing flow-matching module. Mutually exclusive with
+                ``train_expert_only`` and ``train_vision_encoder_only``. Defaults to False.
             attention_implementation: Attention implementation to use ("eager", "sdpa",
                 or "fa2"). Defaults to "eager".
             discrete_action_vocab_size: Vocabulary size for discrete actions.
@@ -150,6 +161,7 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
         self.train_vision_encoder_only = train_vision_encoder_only
+        self.train_state_action_representation_only = train_state_action_representation_only
         self.attention_implementation = attention_implementation
         self.discrete_action_vocab_size = discrete_action_vocab_size
         self.dropout = dropout
@@ -238,6 +250,22 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
 
             cfg_cls = CONFIG_MAPPING[paligemma_config["model_type"]]
             self.gemma_expert_config = cfg_cls(**gemma_expert_config)
+
+        # NOTE: the `__post_init__` below is dead code — `PretrainedConfig` is not a
+        # dataclass, so nothing ever calls it. New validation therefore goes here, in
+        # `__init__`, where it actually runs. (The pre-existing checks are left in
+        # place rather than moved: promoting them to live checks could reject configs
+        # that have been constructed this way for a long time, which belongs in its
+        # own change.)
+        if self.train_state_action_representation_only and (
+            self.train_expert_only or self.train_vision_encoder_only
+        ):
+            raise ValueError(
+                "`train_state_action_representation_only=True` is mutually exclusive with "
+                "`train_expert_only=True` and `train_vision_encoder_only=True` — it freezes the "
+                "action expert and the vision encoder, so it cannot be combined with a mode that "
+                "trains one of them."
+            )
 
         super().__init__(**kwargs)
 
@@ -376,6 +404,21 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
                 for params in projector.parameters():
                     params.requires_grad = True
 
+        if self.config.train_state_action_representation_only:
+            # Mirror image of both modes above: freeze the VLM (tower, projector and
+            # Gemma LLM) and the action expert, leaving ONLY the discrete-action
+            # representation — the embedding table and its logit head — trainable.
+            # Default-deny in one pass rather than an enumerated freeze list, so a
+            # module added later cannot silently keep training.
+            self.paligemma.eval()
+            self.gemma_expert.eval()
+            freeze_with_expert_params_for_state_action_representation_only(self)
+            # `__init__` leaves the module in training mode, so pin the frozen trunk to
+            # eval right away rather than waiting for the first `train()` call — the
+            # explicit evals above miss this wrapper's own `self.dropout`, a direct child
+            # that fires inside the decoder loop.
+            set_with_expert_train_mode_for_state_action_representation_only(self, self.training)
+
     def train(self, mode: bool = True) -> None:
         """Sets the module in training mode.
 
@@ -401,6 +444,12 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             projector = self._multi_modal_projector()
             if projector is not None:
                 projector.train(mode)
+
+        if self.config.train_state_action_representation_only:
+            # Only the discrete-action representation trains, so pin the entire frozen
+            # trunk — including this wrapper's own `self.dropout`, which fires inside
+            # the decoder loop — to eval. `config.dropout` has no effect under this flag.
+            set_with_expert_train_mode_for_state_action_representation_only(self, mode)
 
     def to_bfloat16_like_physical_intelligence(self) -> None:
         """Casts specific model components to bfloat16, keeping the SigLIP embeddings in float32.

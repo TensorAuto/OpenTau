@@ -33,6 +33,7 @@ from opentau.optim.schedulers import (
     CosineDecayWithWarmupSchedulerConfig,
     LRSchedulerConfig,
 )
+from opentau.policies.utils import validate_state_action_representation_only_config
 
 
 @PreTrainedConfig.register_subclass("pi05_mem")
@@ -85,6 +86,13 @@ class PI05MemConfig(PreTrainedConfig):
             default) the action (MSE) loss is detached from the VLM, so the video encoder
             trains on the CE loss only — set ``knowledge_insulation=False`` to train it from
             the action loss. Defaults to False.
+        train_state_action_representation_only: Train ONLY the dataset-specific
+            state/action representation of an otherwise generic checkpoint — the
+            discrete-action embedding table + its logit head, and ``state_proj`` /
+            ``action_in_proj`` / ``action_out_proj``. The VLM, the video encoder and the
+            action expert are frozen, as are ``time_mlp_in/out`` and — unlike
+            ``train_vision_encoder_only`` — the RLDX ``motion_module``. Mutually exclusive
+            with ``train_expert_only`` and ``train_vision_encoder_only``. Defaults to False.
         spacetime_layer_stride: Every ``stride``-th SigLIP encoder layer gets
             the temporal self-attention sublayer added. Defaults to 4, matching
             the MEM paper. The video encoder introduces no new learnable
@@ -170,6 +178,17 @@ class PI05MemConfig(PreTrainedConfig):
     freeze_vision_encoder: bool = True
     train_expert_only: bool = False
     train_vision_encoder_only: bool = False
+
+    # Train ONLY the dataset-specific state/action representation of an otherwise
+    # generic checkpoint: the discrete-action embedding table + its logit head, and
+    # the state/action projections that bridge this robot's raw vector space and the
+    # model's hidden space. The VLM, the video encoder and the action expert are all
+    # frozen. Excludes time_mlp_in/out (hidden-size-only, fed by flow-matching time)
+    # and — unlike train_vision_encoder_only — the RLDX ``video_encoder.motion_module``:
+    # it is the one module a generic checkpoint does not carry, so it would start from
+    # a fresh zero-gated init in a run whose premise is that only the dataset-facing
+    # adapters move. Defaults to False.
+    train_state_action_representation_only: bool = False
 
     # Knowledge insulation (π0.5): when True (default), the prefix/VLM KV cache
     # is detached before the action expert reads it, so the flow-matching action
@@ -272,6 +291,9 @@ class PI05MemConfig(PreTrainedConfig):
                 "parameter. Set knowledge_insulation=False to train the video encoder from the "
                 "action loss."
             )
+        validate_state_action_representation_only_config(
+            self, policy_name=self.type, has_discrete_actions=True
+        )
         if not isinstance(self.n_obs_steps, int) or self.n_obs_steps < 1:
             raise ValueError(f"`n_obs_steps` must be a positive integer, got {self.n_obs_steps}.")
         if not isinstance(self.history_interval, int) or self.history_interval < 1:

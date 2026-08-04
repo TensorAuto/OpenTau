@@ -47,6 +47,11 @@ from transformers import (
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
 
+from opentau.policies.utils import (
+    freeze_with_expert_params_for_state_action_representation_only,
+    set_with_expert_train_mode_for_state_action_representation_only,
+)
+
 # Ensure the Gemma-v1 AdaRMS / gated-residual patches are live before we
 # construct an action expert. Import for side effects only.
 from opentau.utils import transformers_patch  # noqa: F401
@@ -112,6 +117,7 @@ class Gemma3WithExpertConfig(PretrainedConfig):
         freeze_vision_encoder: bool = True,
         train_expert_only: bool = True,
         train_vision_encoder_only: bool = False,
+        train_state_action_representation_only: bool = False,
         attention_implementation: str = "eager",
         discrete_action_vocab_size: int | None = None,
         dropout: float = 0.1,
@@ -132,6 +138,12 @@ class Gemma3WithExpertConfig(PretrainedConfig):
                 train ONLY the vision pathway (the SigLIP tower + the multimodal
                 projector). Requires ``freeze_vision_encoder=False`` and is incompatible
                 with ``train_expert_only=True``.
+            train_state_action_representation_only: Freeze the Gemma 3 backbone, the
+                vision pathway (tower *and* multimodal projector) and the action expert,
+                and train ONLY the discrete-action representation — the embedding table
+                and its logit head. The policy-level action projections are handled by
+                the enclosing flow-matching module. Mutually exclusive with
+                ``train_expert_only`` and ``train_vision_encoder_only``.
             attention_implementation: "eager", "sdpa", or "fa2". "fa2" is not
                 implemented and falls back to eager with a warning. "sdpa"
                 dispatches to ``torch.nn.functional.scaled_dot_product_attention``;
@@ -153,6 +165,7 @@ class Gemma3WithExpertConfig(PretrainedConfig):
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
         self.train_vision_encoder_only = train_vision_encoder_only
+        self.train_state_action_representation_only = train_state_action_representation_only
         self.attention_implementation = attention_implementation
         self.discrete_action_vocab_size = discrete_action_vocab_size
         self.dropout = dropout
@@ -265,6 +278,15 @@ class Gemma3WithExpertConfig(PretrainedConfig):
                 "compatible — the vision encoder cannot be both frozen and the only trained component. "
                 "Set `freeze_vision_encoder=False`."
             )
+        if self.train_state_action_representation_only and (
+            self.train_expert_only or self.train_vision_encoder_only
+        ):
+            raise ValueError(
+                "`train_state_action_representation_only=True` is mutually exclusive with "
+                "`train_expert_only=True` and `train_vision_encoder_only=True` — it freezes the "
+                "action expert and the vision encoder, so it cannot be combined with a mode that "
+                "trains one of them."
+            )
         if self.attention_implementation not in ["eager", "sdpa", "fa2"]:
             raise ValueError(
                 f"Wrong value provided for `attention_implementation` ({self.attention_implementation}). "
@@ -372,6 +394,22 @@ class Gemma3WithExpertModel(PreTrainedModel):
                     for params in module.parameters():
                         params.requires_grad = True
 
+        if self.config.train_state_action_representation_only:
+            # Mirror image of both modes above: freeze the Gemma 3 backbone (SigLIP
+            # tower, multimodal projector and text stack) and the action expert,
+            # leaving ONLY the discrete-action representation — the embedding table
+            # and its logit head — trainable. Default-deny in one pass rather than an
+            # enumerated freeze list, so a module added later cannot silently keep
+            # training.
+            self.gemma3.eval()
+            self.gemma_expert.eval()
+            freeze_with_expert_params_for_state_action_representation_only(self)
+            # `__init__` leaves the module in training mode, so pin the frozen trunk to
+            # eval right away rather than waiting for the first `train()` call — the
+            # explicit evals above miss this wrapper's own `self.dropout`, a direct child
+            # that fires inside the decoder loop.
+            set_with_expert_train_mode_for_state_action_representation_only(self, self.training)
+
     def train(self, mode: bool = True):
         super().train(mode)
         if self.config.freeze_vision_encoder:
@@ -389,6 +427,12 @@ class Gemma3WithExpertModel(PreTrainedModel):
             for module in (self._vision_tower(), self._multi_modal_projector()):
                 if module is not None:
                     module.train(mode)
+        if self.config.train_state_action_representation_only:
+            # Only the discrete-action representation trains, so pin the entire frozen
+            # trunk — including this wrapper's own `self.dropout`, which fires on every
+            # attention and MLP output inside the decoder loop — to eval.
+            # `config.dropout` therefore has no effect under this flag.
+            set_with_expert_train_mode_for_state_action_representation_only(self, mode)
         return self
 
     def to_bfloat16_like_physical_intelligence(self) -> None:

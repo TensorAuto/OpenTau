@@ -69,6 +69,11 @@ from torch import Tensor, nn
 from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration
 from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb
 
+from opentau.policies.utils import (
+    freeze_with_expert_params_for_state_action_representation_only,
+    set_with_expert_train_mode_for_state_action_representation_only,
+)
+
 
 def _repeat_kv(x: Tensor, n_rep: int) -> Tensor:
     """Expand GQA key/value heads. ``x`` is (B, n_kv, S, hd) -> (B, n_kv*n_rep, S, hd)."""
@@ -357,6 +362,7 @@ class Qwen3VLWithExpertModel(nn.Module):
         freeze_vision_encoder: bool = True,
         train_expert_only: bool = True,
         train_vision_encoder_only: bool = False,
+        train_state_action_representation_only: bool = False,
         gradient_checkpointing: bool = False,
         load_pretrained_backbone_repo: str | None = None,
         condition_on_layer: int | None = None,
@@ -365,6 +371,18 @@ class Qwen3VLWithExpertModel(nn.Module):
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
         self.train_vision_encoder_only = train_vision_encoder_only
+        self.train_state_action_representation_only = train_state_action_representation_only
+
+        # This wrapper is also constructed directly (CPU tests, bespoke harnesses), where
+        # the policy config's validation never runs — and `train_expert_only` defaults to
+        # True here too, so the collision is the likely mistake rather than an exotic one.
+        if train_state_action_representation_only and (train_expert_only or train_vision_encoder_only):
+            raise ValueError(
+                "`train_state_action_representation_only=True` is mutually exclusive with "
+                "`train_expert_only=True` and `train_vision_encoder_only=True` — it freezes the "
+                "backbone, the vision tower and the action expert, so it cannot be combined with a "
+                "mode that trains one of them. Pass `train_expert_only=False` (it defaults to True)."
+            )
 
         # Deepcopy so the layer-count / attn-impl mutations below stay local and never
         # corrupt the caller's config object (e.g. a shared tiny config across tests).
@@ -479,6 +497,21 @@ class Qwen3VLWithExpertModel(nn.Module):
                 p.requires_grad = False
             for p in self.backbone.model.visual.parameters():
                 p.requires_grad = True
+        if self.train_state_action_representation_only:
+            # Everything this wrapper owns is frozen: the Qwen3-VL backbone (vision tower,
+            # LLM and the never-called lm_head alike) and the action expert. Only the
+            # policy-level state/action projections train, and those live on the enclosing
+            # Cosmos3FlowMatching. The shared default-deny helper would keep a
+            # discrete-action embedding/head trainable, but cosmos3 has neither — so here it
+            # returns an empty trainable set, which is the documented degenerate case.
+            self.backbone.eval()
+            self.expert.eval()
+            freeze_with_expert_params_for_state_action_representation_only(self)
+            # `__init__` leaves the module in training mode, so pin the frozen trunk to
+            # eval right away rather than waiting for the first `train()` call — the
+            # explicit evals above miss this wrapper's own `self.dropout`, a direct child
+            # that fires inside the decoder loop.
+            set_with_expert_train_mode_for_state_action_representation_only(self, self.training)
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -489,6 +522,11 @@ class Qwen3VLWithExpertModel(nn.Module):
             self.backbone.eval()
             self.expert.eval()
             self.backbone.model.visual.train(mode)
+        elif self.train_state_action_representation_only:
+            # Nothing inside the wrapper trains, so pin it all to eval — otherwise the
+            # expert's `nn.Dropout` would keep firing and inject pure variance between the
+            # frozen features and the tiny projections reading them.
+            set_with_expert_train_mode_for_state_action_representation_only(self, mode)
         elif self.freeze_vision_encoder:
             self.backbone.model.visual.eval()
         return self
@@ -528,19 +566,28 @@ class Qwen3VLWithExpertModel(nn.Module):
 
         When ``train_expert_only`` (the default), the backbone is fully frozen: the forward
         runs under ``no_grad`` and the cached KV is ``.detach()``'d, so the expert reads it
-        as a constant. When ``train_expert_only`` is False (partial unfreeze, e.g. a
-        trainable text tower with a frozen vision encoder, or ``train_vision_encoder_only``
-        with a trainable vision tower and a frozen text tower), the forward keeps its graph
-        and the KV is **not** detached, so the expert's loss backpropagates into the
-        (unfrozen part of the) backbone — otherwise unfreezing would be a silent no-op.
+        as a constant. When the backbone is (partially) unfrozen — e.g. a trainable text
+        tower with a frozen vision encoder, or ``train_vision_encoder_only`` with a trainable
+        vision tower and a frozen text tower — the forward keeps its graph and the KV is
+        **not** detached, so the expert's loss backpropagates into the (unfrozen part of
+        the) backbone; otherwise unfreezing would be a silent no-op.
 
-        This ctx MUST stay keyed on ``train_expert_only`` alone: ``train_vision_encoder_only``
-        is mutually exclusive with it (config validation), so it always takes the
-        ``nullcontext`` branch and gradients reach ``backbone.model.visual``. OR-ing
-        ``train_vision_encoder_only`` into the ``no_grad`` predicate would silently detach the
-        vision tower and make vision-only training a no-op.
+        The predicate below therefore tracks exactly one question — *is any backbone
+        parameter trainable?* — and the two "train only X" flags fall on opposite sides of
+        it, for opposite reasons:
+
+        * ``train_vision_encoder_only`` must **never** be OR-ed in. It trains
+          ``backbone.model.visual``, so detaching would make vision-only training a silent
+          no-op. It is mutually exclusive with ``train_expert_only`` (config validation), so
+          it always reaches the ``nullcontext`` branch.
+        * ``train_state_action_representation_only`` **must** be OR-ed in. It freezes the
+          entire backbone (and the expert), so nothing behind the KV can consume a gradient;
+          without it the 32B tower would build and retain a full activation graph for a
+          backward that never reaches it — no crash, just an order-of-magnitude activation
+          memory bill for nothing.
         """
-        ctx = torch.no_grad() if self.train_expert_only else nullcontext()
+        backbone_is_frozen = self.train_expert_only or self.train_state_action_representation_only
+        ctx = torch.no_grad() if backbone_is_frozen else nullcontext()
         with ctx:
             out = self.backbone.model(
                 input_ids=input_ids,
@@ -554,7 +601,7 @@ class Qwen3VLWithExpertModel(nn.Module):
         cached = []
         for i in range(self.num_layers):
             key, value = pkv[i]
-            if self.train_expert_only:
+            if backbone_is_frozen:
                 key, value = key.detach(), value.detach()
             cached.append((key, value))
         return cached

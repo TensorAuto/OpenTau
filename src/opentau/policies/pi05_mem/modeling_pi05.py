@@ -67,6 +67,7 @@ from opentau.policies.utils import (
     PerSampleLoss,
     ce_per_sample,
     flow_matching_masked_mse,
+    freeze_policy_level_params_for_state_action_representation_only,
     freeze_policy_level_params_for_vision_only,
 )
 from opentau.utils.accelerate_utils import get_proc_accelerator
@@ -1068,6 +1069,7 @@ class PI05MemFlowMatching(nn.Module):
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=self.config.train_expert_only,
             train_vision_encoder_only=self.config.train_vision_encoder_only,
+            train_state_action_representation_only=self.config.train_state_action_representation_only,
             attention_implementation=self.config.attention_implementation,
             discrete_action_vocab_size=discrete_action_vocab_size,
             dropout=self.config.dropout,
@@ -1168,6 +1170,16 @@ class PI05MemFlowMatching(nn.Module):
             # tower + projector live under paligemma_with_expert and are already configured
             # by its own set_requires_grad.
             freeze_policy_level_params_for_vision_only(self, self.paligemma_with_expert)
+
+        if self.config.train_state_action_representation_only:
+            # Keep ONLY the state/action projections trainable at the policy level; the
+            # discrete-action representation inside paligemma_with_expert is already
+            # handled by its own set_requires_grad. time_mlp_in/out are frozen, and so
+            # is the RLDX ``video_encoder.motion_module`` — the helper deliberately drops
+            # the name carve-out ``freeze_policy_level_params_for_vision_only`` applies
+            # above, because a fresh zero-gated temporal block is exactly what this mode
+            # must not start learning.
+            freeze_policy_level_params_for_state_action_representation_only(self, self.paligemma_with_expert)
 
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
         return torch.normal(mean=0.0, std=1.0, size=shape, dtype=torch.float32, device=device)

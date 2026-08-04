@@ -30,6 +30,7 @@ from opentau.optim.schedulers import (
     CosineDecayWithWarmupSchedulerConfig,
     LRSchedulerConfig,
 )
+from opentau.policies.utils import validate_state_action_representation_only_config
 
 
 @PreTrainedConfig.register_subclass("pi07_paligemma_low_level")
@@ -90,6 +91,13 @@ class PI07PaligemmaLowLevelConfig(PreTrainedConfig):
             Note: with ``knowledge_insulation=True`` (the default) the action (MSE) loss is
             detached from the VLM, so the encoder trains on the CE loss only — set
             ``knowledge_insulation=False`` to train it from the action loss. Defaults to False.
+        train_state_action_representation_only: Train ONLY the dataset-specific state/action
+            representation of an otherwise generic checkpoint — the discrete-action embedding
+            table and its logit head, plus ``state_proj`` / ``action_in_proj`` /
+            ``action_out_proj`` (per-group copies included when ``per_group_projection`` is
+            on). The VLM backbone, the SigLIP tower, the multimodal projector and the action
+            expert are frozen, as are ``time_mlp_in``/``time_mlp_out``. Mutually exclusive with
+            ``train_expert_only`` and ``train_vision_encoder_only``. Defaults to False.
         optimizer_lr: Learning rate for the optimizer. Defaults to 2.5e-5.
         optimizer_betas: Beta parameters for AdamW optimizer. Defaults to (0.9, 0.95).
         optimizer_eps: Epsilon parameter for AdamW optimizer. Defaults to 1e-8.
@@ -200,6 +208,17 @@ class PI07PaligemmaLowLevelConfig(PreTrainedConfig):
     train_expert_only: bool = False
     train_vision_encoder_only: bool = False
 
+    # Train ONLY the dataset-specific state/action representation of an otherwise
+    # generic checkpoint: the discrete-action embedding table + its logit head, and
+    # the state/action projections that bridge this robot's raw vector space and the
+    # model's hidden space (per-group copies included when per_group_projection is
+    # on). The VLM, the vision encoder and the action expert are all frozen, as are
+    # time_mlp_in/out (hidden-size-only, fed by flow-matching time). Note that on
+    # this policy `da_head` is not a training-only head: with
+    # eval_use_discrete_actions=True the AR decode argmaxes its logits and re-embeds
+    # the result, so this flag moves serving behavior directly. Defaults to False.
+    train_state_action_representation_only: bool = False
+
     # Knowledge insulation (π0.5): when True (default), the prefix/VLM KV cache
     # is detached before the action expert reads it, so the flow-matching action
     # loss does NOT backpropagate into the VLM backbone. Set False to let the
@@ -275,6 +294,9 @@ class PI07PaligemmaLowLevelConfig(PreTrainedConfig):
                 "only, and if the CE loss weight is 0 the step has no gradient path to any trainable "
                 "parameter. Set knowledge_insulation=False to train the encoder from the action loss."
             )
+        validate_state_action_representation_only_config(
+            self, policy_name=self.type, has_discrete_actions=True
+        )
         if not isinstance(self.n_obs_steps, int) or self.n_obs_steps < 1:
             raise ValueError(f"`n_obs_steps` must be a positive integer, got {self.n_obs_steps}.")
         if not isinstance(self.history_interval, int) or self.history_interval < 1:

@@ -75,6 +75,7 @@ from opentau.policies.utils import (
     assert_gemma3_input_resolution,
     ce_per_sample,
     flow_matching_masked_mse,
+    freeze_policy_level_params_for_state_action_representation_only,
     freeze_policy_level_params_for_vision_only,
 )
 from opentau.utils.accelerate_utils import get_proc_accelerator
@@ -1521,6 +1522,17 @@ class PI07LowLevelFlowMatching(nn.Module):
             # its own set_requires_grad. The SpaceTime video_encoder is param-less
             # (it reuses the tower), so nothing extra stays trainable there.
             freeze_policy_level_params_for_vision_only(self, self.gemma3_with_expert)
+
+        if self.config.train_state_action_representation_only:
+            # Keep ONLY the state/action projections trainable at the policy level.
+            # Here they may be PerGroupLinear — one (weight, bias) per (robot_type,
+            # control_mode) — which is the most dataset-specific state in the model and
+            # exactly what this mode exists to fit; the helper resolves them by module,
+            # so both flavours are covered. time_mlp_in/out are frozen, and so is the
+            # video encoder: it is param-less and its tower/projector live under
+            # gemma3_with_expert, already frozen by that module's own set_requires_grad
+            # along with everything but the discrete-action representation.
+            freeze_policy_level_params_for_state_action_representation_only(self, self.gemma3_with_expert)
 
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
         return torch.normal(mean=0.0, std=1.0, size=shape, dtype=torch.float32, device=device)

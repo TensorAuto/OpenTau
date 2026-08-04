@@ -52,6 +52,7 @@ from opentau.policies.pretrained import PreTrainedPolicy
 from opentau.policies.utils import (
     PerSampleLoss,
     flow_matching_masked_mse,
+    freeze_policy_level_params_for_state_action_representation_only,
     freeze_policy_level_params_for_vision_only,
 )
 
@@ -151,6 +152,7 @@ class Cosmos3FlowMatching(nn.Module):
             freeze_vision_encoder=config.freeze_vision_encoder,
             train_expert_only=config.train_expert_only,
             train_vision_encoder_only=config.train_vision_encoder_only,
+            train_state_action_representation_only=config.train_state_action_representation_only,
             gradient_checkpointing=config.gradient_checkpointing,
             load_pretrained_backbone_repo=(
                 config.pretrained_backbone_repo_id if config.load_pretrained_backbone else None
@@ -187,6 +189,15 @@ class Cosmos3FlowMatching(nn.Module):
             # backbone.model.visual, already configured by qwen3vl_with_expert's own
             # set_requires_grad.
             freeze_policy_level_params_for_vision_only(self, self.qwen3vl_with_expert)
+
+        if config.train_state_action_representation_only:
+            # Keep ONLY the state/action projections (state_proj / action_in_proj /
+            # action_out_proj) trainable; time_mlp_in/out and adarms_proj are frozen with
+            # everything else, since they map hidden->hidden off the flow-matching time and
+            # condition the (frozen) expert rather than adapting this robot's vector space.
+            # qwen3vl_with_expert has already frozen everything it owns, so this is the
+            # whole trainable set of the policy.
+            freeze_policy_level_params_for_state_action_representation_only(self, self.qwen3vl_with_expert)
 
     # ----- flow-matching sampling utilities (identical to pi05) -----
 
