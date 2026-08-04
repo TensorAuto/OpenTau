@@ -708,6 +708,9 @@ def test_cosmos3_state_action_representation_only_grad_reaches_only_projections(
     we = model.qwen3vl_with_expert
     assert model.action_in_proj.weight.grad is not None
     assert model.action_out_proj.weight.grad is not None
+    # state_proj is the third trainable projection and the only one whose path runs
+    # through embed_suffix into the (frozen) expert rather than straight to the loss.
+    assert model.state_proj.weight.grad is not None
     assert model.time_mlp_in.weight.grad is None
     assert all(p.grad is None for p in we.backbone.parameters())
     assert all(p.grad is None for p in we.expert.parameters())
