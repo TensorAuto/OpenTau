@@ -17,7 +17,7 @@
 
 import logging
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -26,6 +26,7 @@ import torch
 from opentau.configs.default import DatasetConfig, DatasetMixtureConfig
 from opentau.datasets.dataset_mixture import (
     DatasetMixtureMetadata,
+    HierarchicalSampler,
     WeightedDatasetMixture,
     pad_vector,
 )
@@ -263,6 +264,78 @@ class TestDatasetMixtureMetadata:
         )
 
 
+class TestHierarchicalSamplerSeeding:
+    """Seeding contract of the training sampler, in isolation (no full mixture build)."""
+
+    LENGTHS = [1000, 3000]
+    PROBS = [0.7, 0.3]
+
+    def _stream(self, seed=None, n=128):
+        sampler = HierarchicalSampler(
+            dataset_lengths=self.LENGTHS,
+            dataset_probs=self.PROBS,
+            num_samples=n,
+            seed=seed,
+        )
+        return list(sampler)
+
+    def test_same_seed_reproduces_the_stream(self):
+        """A seeded run must be replayable."""
+        assert self._stream(seed=1000) == self._stream(seed=1000)
+
+    def test_different_seeds_give_different_streams(self):
+        """The point of threading `cfg.seed` through: a seed sweep must actually
+        vary the data order, not just model init and augmentation."""
+        assert self._stream(seed=1000) != self._stream(seed=2000)
+
+    def test_stream_ignores_the_global_rng(self):
+        """The sampler must not read the global RNG.
+
+        `set_seed(seed, accelerator=...)` offsets the global torch RNG by
+        `process_index * 12345`, so a sampler that consulted it would hand each
+        rank a different stream. `accelerate` shards by having every rank walk
+        the whole stream and keep the batches at its own offset, which only
+        partitions the data while the ranks agree on the sequence -- otherwise
+        ranks silently re-draw each other's samples within a step.
+        """
+        from opentau.utils.random_utils import set_seed
+
+        streams = []
+        for rank in range(4):
+            set_seed(1000, accelerator=MagicMock(process_index=rank))
+            streams.append(self._stream(seed=1000))
+
+        for rank, stream in enumerate(streams):
+            assert stream == streams[0], f"rank {rank} stream differs from rank 0"
+
+    def test_seed_none_preserves_the_legacy_default_generator_stream(self):
+        """`seed=None` must stay bit-compatible with the pre-change behavior.
+
+        `cfg.seed` is optional; when it is unset the sampler falls back to a bare
+        `torch.Generator()`, which is what every run used before the seed was
+        threaded through. Pinning it keeps a `seed=None` run's data order
+        unchanged by this fix.
+        """
+        legacy = HierarchicalSampler(
+            dataset_lengths=self.LENGTHS,
+            dataset_probs=self.PROBS,
+            num_samples=128,
+            generator=torch.Generator(),  # exactly the old fallback
+        )
+        assert self._stream(seed=None) == list(legacy)
+
+    def test_explicit_generator_wins_over_seed(self):
+        """`generator` takes precedence, so a caller can supply its own RNG."""
+        gen = torch.Generator().manual_seed(7)
+        sampler = HierarchicalSampler(
+            dataset_lengths=self.LENGTHS,
+            dataset_probs=self.PROBS,
+            num_samples=128,
+            generator=gen,
+        )
+        assert list(sampler) == self._stream(seed=7)
+
+
 class TestResolveMixtureDeltaMap:
     """Unit-test the delta-map uniformity resolution in isolation (no full mixture build)."""
 
@@ -478,6 +551,25 @@ class TestWeightedDatasetMixture:
         assert dataloader is not None
         assert dataloader.batch_size == train_pipeline_config.batch_size
         assert dataloader.num_workers == train_pipeline_config.num_workers
+
+    def test_get_dataloader_seeds_the_sampler_from_cfg_seed(self, train_pipeline_config, datasets_factory):
+        """`cfg.seed` must actually reach the training sampler.
+
+        `HierarchicalSampler` was constructed with neither `seed` nor
+        `generator`, so it fell back to a bare `torch.Generator()`. That is not
+        unseeded -- PyTorch default-constructs generators with a fixed constant
+        -- so the stream was deterministic, but identical for every run of a
+        given mixture regardless of `cfg.seed`: a seed sweep varied model init
+        and augmentation while feeding all its runs the same samples in the same
+        order. It also rested on a PyTorch implementation detail, so a change to
+        that constant would have silently shifted every run's data order.
+        """
+        train_pipeline_config.seed = 4242
+        mixture = WeightedDatasetMixture(train_pipeline_config, datasets_factory(2), [0.7, 0.3], 30.0)
+
+        sampler = mixture.get_dataloader().sampler
+
+        assert sampler._gen.initial_seed() == 4242
 
     def test_get_combined_val_dataloader(self, train_pipeline_config, datasets_factory):
         """One deterministic sequential loader over the whole mixture (the

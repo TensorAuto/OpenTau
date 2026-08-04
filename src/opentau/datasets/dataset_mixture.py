@@ -776,6 +776,29 @@ class HierarchicalSampler(Sampler[int]):
     r"""With-replacement sampler for a ConcatDataset that first samples a dataset according to `dataset_probs`, and then
     samples uniformly within that dataset. This avoids multinomial over a huge number of categories (over 2^24)
     by operating at the dataset level.
+
+    Seeding, in order of precedence: an explicit ``generator``, else ``seed``
+    applied to a fresh generator, else a bare ``torch.Generator()``. That last
+    fallback is **not** unseeded — PyTorch default-constructs generators with a
+    fixed constant — so it is deterministic and identical in every process, but
+    it is a PyTorch implementation detail rather than a documented guarantee and
+    it ignores the run's seed entirely. Callers on the training path pass
+    ``seed=cfg.seed`` so the sample stream is reproducible *and* controlled by
+    the run's own seed; see ``WeightedDatasetMixture.get_dataloader``.
+
+    Whatever the source, the seed must be **rank-independent**: `accelerate`
+    shards this stream by having every rank iterate it and keep the batches at
+    its own offset, which only partitions the data while the ranks agree on the
+    sequence.
+
+    Note:
+        The sampler's position is not checkpointed. `accelerate.save_state`
+        persists sampler state only for its own ``SeedableRandomSampler``, so a
+        resumed run rebuilds this sampler and restarts the stream from the
+        beginning rather than continuing it. Sampling is i.i.d. with
+        replacement, so the resumed run is still drawing from the right
+        distribution — but it replays the sample sequence the run already
+        consumed before the interruption instead of seeing fresh draws.
     """
 
     def __init__(
@@ -1122,10 +1145,18 @@ class WeightedDatasetMixture:
 
         # Hierarchical sampling: choose dataset by weight, then uniform within it (both with replacement)
         ds_lengths = [len(ds) for ds in self.datasets]
+        # `cfg.seed` verbatim — never `process_index`. Under `accelerate.prepare`
+        # with the default `dispatch_batches=False`, every rank iterates this
+        # whole stream and keeps the batches at its own offset, so the global
+        # batch is a partition of one shared sequence only while the ranks agree
+        # on it. A rank-dependent seed here would silently make ranks re-draw
+        # each other's samples within a step (see `factory.val_split_generator`
+        # for the same contract on the train/val split).
         sampler = HierarchicalSampler(
             dataset_lengths=ds_lengths,
             dataset_probs=self.dataset_weights,
             num_samples=num_samples_per_epoch,
+            seed=self.cfg.seed,
         )
 
         dataloader = DataLoader(
