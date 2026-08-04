@@ -360,11 +360,13 @@ def val_split_generator(train_cfg: TrainPipelineConfig) -> torch.Generator:
       the resume boundary and across runs with different world sizes.
     * **Resume** reproduces the same split as long as those three inputs are
       unchanged. ``--config_path`` points at the checkpoint's ``train_config.json``
-      on resume, so ``seed`` and ``val_split_ratio`` carry over automatically —
-      but a CLI override of either, or a dataset whose length changed since the
-      checkpoint (re-uploaded episodes, a changed ``episodes`` /
-      ``excluded_episodes`` filter), silently re-partitions the data.
-      :func:`warn_if_resumed_split_differs` warns about the config half of that.
+      on resume, so they carry over automatically — but a CLI override of
+      ``seed``, of a ``val_split_ratio``, or of the fields that decide how many
+      frames a dataset yields (``episodes``, ``excluded_episodes``, ``revision``)
+      silently re-partitions the data. :func:`warn_if_resumed_split_differs`
+      catches all of those. The one case it cannot catch is an out-of-band
+      length change — the same repo at the same revision re-uploaded with more
+      episodes — since the checkpoint records no length to compare against.
     * **Mixture composition is irrelevant**: every dataset draws from a
       generator seeded the same way, so adding or reordering datasets does not
       reshuffle the splits of the others. Two datasets of equal length get the
@@ -384,20 +386,60 @@ def val_split_generator(train_cfg: TrainPipelineConfig) -> torch.Generator:
     return torch.Generator().manual_seed(int(seed))
 
 
-def _split_determining_fields(cfg: TrainPipelineConfig) -> dict[str, Any]:
-    """Return the config values the train/val split depends on.
+def _split_determining_fields(cfg_dict: dict[str, Any]) -> dict[str, Any]:
+    """Extract the values the train/val split depends on from a *serialized* config.
 
-    Kept next to :func:`val_split_generator` so a new split-determining field is
-    added in one place rather than being silently omitted from the resume check.
+    Takes an encoded config dict rather than a ``TrainPipelineConfig`` so that
+    the live run and the checkpoint's ``train_config.json`` are read by the same
+    code. Two separate extractors would drift, and a key present on only one
+    side is silently dropped from the comparison — i.e. it fails open, which for
+    a diagnostic is indistinguishable from a healthy resume.
+
+    Covers the config half of all three inputs in the split contract (see
+    :func:`val_split_generator`):
+
+    * ``seed`` directly;
+    * the **effective** ``val_split_ratio`` per dataset, resolving the
+      ``None``-inherits-the-mixture-default rule the way ``make_dataset`` does,
+      so a ratio moving between ``None`` and an explicit value equal to the
+      default is correctly seen as no change;
+    * the fields that determine ``len(dataset)`` without changing the dataset's
+      identity — ``episodes`` / ``excluded_episodes`` select and drop episodes,
+      and ``revision`` pins which version of the repo is read. ``repo_id`` comes
+      along so that the positional per-dataset comparison is only made between
+      like and like.
+
+    Args:
+        cfg_dict: A ``TrainPipelineConfig`` encoded via ``to_dict()``, or a
+            ``train_config.json`` parsed from a checkpoint.
+
+    Returns:
+        A flat ``{field path: value}`` mapping, ready to diff against another
+        config's mapping.
     """
-    return {
-        "seed": cfg.seed,
-        "dataset_mixture.val_split_ratio": cfg.dataset_mixture.val_split_ratio,
-        **{
-            f"dataset_mixture.datasets[{i}].val_split_ratio": ds.val_split_ratio
-            for i, ds in enumerate(cfg.dataset_mixture.datasets)
-        },
-    }
+    mixture = cfg_dict.get("dataset_mixture") or {}
+    default_ratio = mixture.get("val_split_ratio")
+
+    fields: dict[str, Any] = {"seed": cfg_dict.get("seed")}
+    for i, ds in enumerate(mixture.get("datasets") or []):
+        ratio = ds.get("val_split_ratio")
+        # The mixture-wide default is folded in here rather than compared on its
+        # own: changing it is a no-op for any dataset that overrides it.
+        fields[f"datasets[{i}].val_split_ratio"] = default_ratio if ratio is None else ratio
+        for key in ("repo_id", "revision", "episodes", "excluded_episodes"):
+            fields[f"datasets[{i}].{key}"] = ds.get(key)
+    return fields
+
+
+def _describe_drift(field: str, before: Any, after: Any) -> str:
+    """Render one drifted field for the warning, keeping episode lists readable."""
+
+    def fmt(value: Any) -> str:
+        if isinstance(value, (list, tuple)) and len(value) > 4:
+            return f"[{len(value)} items]"
+        return repr(value)
+
+    return f"{field}: {fmt(before)} -> {fmt(after)}"
 
 
 def warn_if_resumed_split_differs(cfg: TrainPipelineConfig) -> None:
@@ -410,10 +452,13 @@ def warn_if_resumed_split_differs(cfg: TrainPipelineConfig) -> None:
     frames the checkpoint was trained on, and its ``running_best`` numbers are
     not comparable to the pre-resume ones.
 
-    Only the *config* half of the contract is checkable here: a dataset whose
-    length changed since the checkpoint also re-partitions the data, and that is
-    not recorded anywhere in the checkpoint. See :func:`val_split_generator` for
-    the full contract.
+    Checks the *config* half of the contract, which includes the config-visible
+    determinants of ``len(dataset)`` — ``episodes``, ``excluded_episodes`` and
+    ``revision`` are all serialized into the checkpoint, so overriding them on
+    resume is caught. What remains undetectable is an **out-of-band** length
+    change: the same ``repo_id`` at the same ``revision`` re-uploaded with more
+    episodes. Nothing in the checkpoint records the length it observed, so that
+    case is documented on :func:`val_split_generator` rather than warned about.
 
     No-ops when not resuming, when validation is off, or when the checkpoint's
     ``train_config.json`` is missing or unreadable — a best-effort diagnostic
@@ -440,22 +485,15 @@ def warn_if_resumed_split_differs(cfg: TrainPipelineConfig) -> None:
         logger.debug("Could not read %s for the val-split drift check: %s", saved_path, exc)
         return
 
-    saved_datasets = saved.get("dataset_mixture", {}).get("datasets", [])
-    saved_fields = {
-        "seed": saved.get("seed"),
-        "dataset_mixture.val_split_ratio": saved.get("dataset_mixture", {}).get("val_split_ratio"),
-        **{
-            f"dataset_mixture.datasets[{i}].val_split_ratio": ds.get("val_split_ratio")
-            for i, ds in enumerate(saved_datasets)
-        },
-    }
-
-    current_fields = _split_determining_fields(cfg)
-    drifted = {
-        key: (saved_fields[key], value)
+    saved_fields = _split_determining_fields(saved)
+    current_fields = _split_determining_fields(cfg.to_dict())
+    # Intersect on keys: a mixture that gained or lost a dataset changes far more
+    # than the split, and comparing shifted positions would only add noise.
+    drifted = [
+        _describe_drift(key, saved_fields[key], value)
         for key, value in current_fields.items()
         if key in saved_fields and saved_fields[key] != value
-    }
+    ]
     if drifted:
         logger.warning(
             "Resuming with train/val split settings that differ from the checkpoint at %s: %s. "
@@ -464,7 +502,7 @@ def warn_if_resumed_split_differs(cfg: TrainPipelineConfig) -> None:
             "against — its Validation/* metrics and `running_best` are not comparable to the "
             "pre-resume ones, and frames held out before are now trained on.",
             cfg.checkpoint_path,
-            ", ".join(f"{k}: {before!r} -> {after!r}" for k, (before, after) in sorted(drifted.items())),
+            ", ".join(sorted(drifted)),
         )
 
 

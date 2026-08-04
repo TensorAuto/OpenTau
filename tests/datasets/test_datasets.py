@@ -1151,24 +1151,98 @@ def test_warn_if_resumed_split_differs_is_quiet_when_split_is_unchanged(
 
     train_pipeline_config.seed = 1000
     train_pipeline_config.val_freq = 1
-    train_pipeline_config.resume = True
     train_pipeline_config.dataset_mixture.val_split_ratio = 0.02
-    saved = {
-        "seed": 1000,
-        "dataset_mixture": {
-            "val_split_ratio": 0.02,
-            "datasets": [
-                {"val_split_ratio": ds.val_split_ratio}
-                for ds in train_pipeline_config.dataset_mixture.datasets
-            ],
-        },
-    }
-    train_pipeline_config.checkpoint_path = _write_checkpoint_train_config(tmp_path, saved)
+    train_pipeline_config.save_pretrained(tmp_path)
+
+    train_pipeline_config.resume = True
+    train_pipeline_config.checkpoint_path = tmp_path
 
     with caplog.at_level(logging.WARNING, logger="opentau.datasets.factory"):
         warn_if_resumed_split_differs(train_pipeline_config)
 
     assert caplog.text == ""
+
+
+def test_warn_if_resumed_split_differs_flags_a_changed_episode_filter(
+    train_pipeline_config, tmp_path, caplog
+):
+    """`episodes` / `excluded_episodes` decide `len(dataset)` — the split's third input.
+
+    They are serialized into the checkpoint, so overriding one on resume is
+    detectable and must be caught: it changes both the val size and the whole
+    permutation while `seed` and `val_split_ratio` look untouched.
+    """
+    from opentau.datasets.factory import warn_if_resumed_split_differs
+
+    train_pipeline_config.seed = 1000
+    train_pipeline_config.val_freq = 1
+    train_pipeline_config.save_pretrained(tmp_path)
+
+    train_pipeline_config.resume = True
+    train_pipeline_config.checkpoint_path = tmp_path
+    train_pipeline_config.dataset_mixture.datasets[0].excluded_episodes = [3, 7]
+
+    with caplog.at_level(logging.WARNING, logger="opentau.datasets.factory"):
+        warn_if_resumed_split_differs(train_pipeline_config)
+
+    assert "datasets[0].excluded_episodes" in caplog.text
+
+
+def test_warn_if_resumed_split_differs_compares_effective_not_raw_ratios(
+    train_pipeline_config, tmp_path, caplog
+):
+    """A per-dataset `None` and an explicit value equal to the mixture default are
+    the same split, and must not warn.
+
+    `make_dataset` resolves `None` to the mixture-wide default, so comparing raw
+    values reports drift where the effective ratio is identical. A diagnostic
+    that cries wolf gets tuned out, which costs exactly the real detection it
+    exists for.
+    """
+    from opentau.datasets.factory import warn_if_resumed_split_differs
+
+    train_pipeline_config.seed = 1000
+    train_pipeline_config.val_freq = 1
+    train_pipeline_config.dataset_mixture.val_split_ratio = 0.02
+    train_pipeline_config.dataset_mixture.datasets[0].val_split_ratio = None  # inherit
+    train_pipeline_config.save_pretrained(tmp_path)
+
+    train_pipeline_config.resume = True
+    train_pipeline_config.checkpoint_path = tmp_path
+    # Spell out the value it was already inheriting: same effective split.
+    train_pipeline_config.dataset_mixture.datasets[0].val_split_ratio = 0.02
+
+    with caplog.at_level(logging.WARNING, logger="opentau.datasets.factory"):
+        warn_if_resumed_split_differs(train_pipeline_config)
+
+    assert caplog.text == ""
+
+    # ...but a genuinely different effective ratio still warns.
+    train_pipeline_config.dataset_mixture.datasets[0].val_split_ratio = 0.2
+    with caplog.at_level(logging.WARNING, logger="opentau.datasets.factory"):
+        warn_if_resumed_split_differs(train_pipeline_config)
+
+    assert "datasets[0].val_split_ratio: 0.02 -> 0.2" in caplog.text
+
+
+def test_warn_if_resumed_split_differs_summarizes_long_episode_lists(train_pipeline_config, tmp_path, caplog):
+    """Episode lists can hold thousands of entries; the warning must stay readable."""
+    from opentau.datasets.factory import warn_if_resumed_split_differs
+
+    train_pipeline_config.seed = 1000
+    train_pipeline_config.val_freq = 1
+    train_pipeline_config.dataset_mixture.datasets[0].episodes = list(range(500))
+    train_pipeline_config.save_pretrained(tmp_path)
+
+    train_pipeline_config.resume = True
+    train_pipeline_config.checkpoint_path = tmp_path
+    train_pipeline_config.dataset_mixture.datasets[0].episodes = list(range(400))
+
+    with caplog.at_level(logging.WARNING, logger="opentau.datasets.factory"):
+        warn_if_resumed_split_differs(train_pipeline_config)
+
+    assert "datasets[0].episodes: [500 items] -> [400 items]" in caplog.text
+    assert "499" not in caplog.text  # the lists themselves are not dumped
 
 
 def test_warn_if_resumed_split_differs_reads_a_real_saved_train_config(
@@ -1200,7 +1274,7 @@ def test_warn_if_resumed_split_differs_reads_a_real_saved_train_config(
     train_pipeline_config.dataset_mixture.datasets[0].val_split_ratio = 0.5
     with caplog.at_level(logging.WARNING, logger="opentau.datasets.factory"):
         warn_if_resumed_split_differs(train_pipeline_config)
-    assert "dataset_mixture.datasets[0].val_split_ratio" in caplog.text
+    assert "datasets[0].val_split_ratio" in caplog.text
 
 
 def test_warn_if_resumed_split_differs_warns_once_not_once_per_rank(train_pipeline_config, tmp_path, caplog):
