@@ -580,11 +580,14 @@ class Qwen3VLWithExpertModel(nn.Module):
           ``backbone.model.visual``, so detaching would make vision-only training a silent
           no-op. It is mutually exclusive with ``train_expert_only`` (config validation), so
           it always reaches the ``nullcontext`` branch.
-        * ``train_state_action_representation_only`` **must** be OR-ed in. It freezes the
-          entire backbone (and the expert), so nothing behind the KV can consume a gradient;
-          without it the 32B tower would build and retain a full activation graph for a
-          backward that never reaches it — no crash, just an order-of-magnitude activation
-          memory bill for nothing.
+        * ``train_state_action_representation_only`` is OR-ed in as **belt-and-braces**,
+          not because it changes behaviour today. It freezes every backbone parameter, so
+          with no leaf requiring grad autograd already builds no graph and retains no
+          activations — ``no_grad`` and ``nullcontext`` are observably identical under it
+          (verified: the cached KV has ``grad_fn=None`` and ``requires_grad=False`` either
+          way). Including it keeps the predicate a truthful answer to the question above
+          rather than an accident of which flags happen to freeze what, so it stays correct
+          if the mode's freeze set is ever narrowed.
         """
         backbone_is_frozen = self.train_expert_only or self.train_state_action_representation_only
         ctx = torch.no_grad() if backbone_is_frozen else nullcontext()

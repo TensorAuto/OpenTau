@@ -604,3 +604,123 @@ def test_cosmos3_train_vision_encoder_only_grad_flows_to_visual():
     )
     assert all(p.grad is None for p in we.expert.parameters())
     assert all(p.grad is None for p in we.backbone.model.language_model.parameters())
+
+
+# --------------------------------------------------- train_state_action_representation_only
+
+
+def _tiny_repr_only_model():
+    """Tiny cosmos3 with the state/action-representation-only regime enabled.
+
+    ``train_expert_only`` defaults to True on cosmos3 and is mutually exclusive with
+    this flag, so it has to be turned off explicitly.
+    """
+    torch.manual_seed(0)
+    cfg = _tiny_cosmos3_config(
+        train_expert_only=False,
+        freeze_vision_encoder=True,
+        train_state_action_representation_only=True,
+    )
+    return Cosmos3FlowMatching(cfg, qwen3vl_config=_tiny_qwen3vl_config())
+
+
+def test_cosmos3_state_action_representation_only_trainable_set():
+    """cosmos3 has no FAST discrete-action branch, so the mode reduces to the three
+    dataset-facing projections; the time MLPs and adarms_proj stay frozen."""
+    model = _tiny_repr_only_model()
+
+    trainable = sorted(n for n, p in model.named_parameters() if p.requires_grad)
+
+    assert trainable == [
+        "action_in_proj.bias",
+        "action_in_proj.weight",
+        "action_out_proj.bias",
+        "action_out_proj.weight",
+        "state_proj.bias",
+        "state_proj.weight",
+    ]
+    # The wrapper itself ends fully frozen — including the never-called `lm_head`,
+    # which stays trainable if `backbone.model` is frozen instead of `backbone`.
+    assert not any(p.requires_grad for p in model.qwen3vl_with_expert.parameters())
+
+
+def test_cosmos3_state_action_representation_only_pins_trunk_to_eval():
+    model = _tiny_repr_only_model()
+
+    model.train(True)
+
+    we = model.qwen3vl_with_expert
+    assert not we.backbone.training
+    assert not we.expert.training
+    assert not any(m.training for m in we.modules() if isinstance(m, torch.nn.Dropout))
+
+
+def test_cosmos3_state_action_representation_only_prefix_kv_carries_no_graph():
+    """The prefix KV reaching the expert carries no autograd graph under this flag.
+
+    Note what this does and does not pin. It pins the *observable contract* — the
+    expert reads the prefix as a constant, so no gradient can flow back into the
+    backbone. It deliberately does NOT claim to be a regression guard on the
+    ``backbone_is_frozen`` predicate in ``run_prefix``: because the flag freezes every
+    backbone parameter, no leaf requires grad and autograd builds no graph whether the
+    forward runs under ``no_grad`` or ``nullcontext``. Reverting that predicate to
+    ``train_expert_only`` alone leaves this assertion passing, by design — the OR is
+    belt-and-braces, not load-bearing (see the ``run_prefix`` docstring). The real
+    guards on this mode are the trainable-set and gradient-reachability tests above.
+    """
+    model = _tiny_repr_only_model()
+    input_ids, attention_mask, _, _ = _text_batch()
+
+    prefix_position_ids, _ = model.qwen3vl_with_expert.get_rope_index(
+        input_ids=input_ids, image_grid_thw=None, attention_mask=attention_mask
+    )
+    cached = model.qwen3vl_with_expert.run_prefix(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=prefix_position_ids,
+        pixel_values=None,
+        image_grid_thw=None,
+    )
+
+    for key, value in cached:
+        assert key.grad_fn is None, "prefix KV must be detached when the backbone is frozen"
+        assert value.grad_fn is None
+        assert not key.requires_grad
+        assert not value.requires_grad
+
+
+def test_cosmos3_state_action_representation_only_grad_reaches_only_projections():
+    model = _tiny_repr_only_model()
+    input_ids, attention_mask, state, actions = _text_batch()
+
+    out = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        pixel_values=None,
+        image_grid_thw=None,
+        state=state,
+        actions=actions,
+        noise=torch.randn_like(actions),
+        time=torch.rand(actions.shape[0]),
+    )
+    out["MSE"].backward()
+
+    we = model.qwen3vl_with_expert
+    assert model.action_in_proj.weight.grad is not None
+    assert model.action_out_proj.weight.grad is not None
+    assert model.time_mlp_in.weight.grad is None
+    assert all(p.grad is None for p in we.backbone.parameters())
+    assert all(p.grad is None for p in we.expert.parameters())
+
+
+def test_cosmos3_state_action_representation_only_config_validation():
+    # cosmos3 defaults train_expert_only=True, so the bare flag collides.
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _tiny_cosmos3_config(train_state_action_representation_only=True)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _tiny_cosmos3_config(
+            train_expert_only=False,
+            freeze_vision_encoder=False,
+            train_vision_encoder_only=True,
+            train_state_action_representation_only=True,
+        )
