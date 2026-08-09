@@ -512,7 +512,17 @@ class DatasetMixtureMetadata:
             member_weights = [
                 float(getattr(metadatas[i], "info", {}).get("total_frames", 1) or 1) for i in member_indices
             ]
-            per_norm_key_stats.append(aggregate_stats(member_stats, weights=member_weights))
+            # Names + head label so a partial-quantile head (some members
+            # migrated to q01/q10/q50/q90/q99, some not) warns with the
+            # unmigrated dataset's repo id rather than a bare list index.
+            per_norm_key_stats.append(
+                aggregate_stats(
+                    member_stats,
+                    weights=member_weights,
+                    contributor_names=[self.dataset_names[i] for i in member_indices],
+                    context=f"norm head {k!r}",
+                )
+            )
 
         # One aggregated warning for fallback datasets, capped at 10 names
         # so a 30-dataset mixture without tags doesn't spam the log.
@@ -570,9 +580,11 @@ class DatasetMixtureMetadata:
         # `per_dataset_stats[1]` lacked actions — the BPE codec would then
         # fit a weighted mean using dataset 0's weight applied to dataset 2's
         # action distribution.
-        filtered: list[tuple[dict[str, np.ndarray], float]] = [
-            ({"actions": s["actions"]}, w)
-            for s, w in zip(self.per_dataset_stats, self._dataset_weights, strict=True)
+        filtered: list[tuple[dict[str, np.ndarray], float, str]] = [
+            ({"actions": s["actions"]}, w, name)
+            for s, w, name in zip(
+                self.per_dataset_stats, self._dataset_weights, self.dataset_names, strict=True
+            )
             if "actions" in s
         ]
         if not filtered:
@@ -580,8 +592,10 @@ class DatasetMixtureMetadata:
                 "No dataset in the mixture exposes 'actions' stats; aggregated_action_stats() is undefined."
             )
         agg = aggregate_stats(
-            [s for s, _ in filtered],
-            weights=[w for _, w in filtered],
+            [s for s, _, _ in filtered],
+            weights=[w for _, w, _ in filtered],
+            contributor_names=[name for _, _, name in filtered],
+            context="mixture-wide action stats",
         )
         return agg["actions"]
 

@@ -654,6 +654,40 @@ def test_quantile_missing_all_raises():
         Normalize(features, norm_map, per_dataset_stats=stats)
 
 
+def test_quantile_error_names_the_offending_row_and_the_aggregate_drop():
+    """The QUANTILE error must name the row and explain how it lost its quantiles.
+
+    A head loses quantiles two ways: its own dataset never had them, or it is an *aggregate*
+    whose members disagree — since #503-era fleet migration, `aggregate_feature_stats` drops a
+    quantile the whole head cannot cover instead of raising. Both land here as the same missing
+    key, so an operator staring at `per_dataset_stats[1]` alone cannot tell which datasets to
+    recompute. The row name (the norm-head key) plus the pointer to the aggregation warning that
+    names the members is what makes the failure actionable.
+    """
+    features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(3,))}
+    norm_map = {"ACTION": NormalizationMode.QUANTILE}
+    stats = _build_quantile_stats(2)
+    del stats[1]["action"]["q01"]
+    del stats[1]["action"]["q99"]
+
+    with pytest.raises(KeyError) as excinfo:
+        Normalize(
+            features,
+            norm_map,
+            per_dataset_stats=stats,
+            dataset_names=["franka::joint", "so101::joint_position"],
+        )
+    message = excinfo.value.args[0]
+    assert "per_dataset_stats[1] ('so101::joint_position')" in message
+    assert "franka::joint" not in message
+    assert "aggregate_feature_stats" in message and "dropping" in message
+
+    # Without names the row is still identified positionally, and the hint still fires.
+    with pytest.raises(KeyError) as unnamed:
+        Normalize(features, norm_map, per_dataset_stats=stats)
+    assert "per_dataset_stats[1]:" in unnamed.value.args[0]
+
+
 def test_quantile_does_not_clamp():
     """Out-of-band values extend beyond [-1, 1] rather than saturating.
 

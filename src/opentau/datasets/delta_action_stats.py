@@ -550,9 +550,10 @@ def _merge_running(parts: list[dict[str, dict[str, np.ndarray]]]) -> dict[str, d
     """Combine per-file statistics into one set via the existing weighted aggregator.
 
     Reuses :func:`opentau.datasets.compute_stats.aggregate_feature_stats` so pooling here obeys
-    the same weighted-mean/variance rules as every other stats path — including the all-or-none
-    quantile requirement, which holds trivially since every part is produced by
-    :class:`RunningStats`.
+    the same weighted-mean/variance rules as every other stats path — including the all-or-skip
+    quantile requirement (partial coverage drops the quantile rather than backfilling it), which
+    never triggers here since every part is produced by :class:`RunningStats` and so carries the
+    same quantile keys.
 
     Parity note: mean/std/min/max merge exactly. The **quantiles** are pooled as the
     count-weighted mean of the per-file q01/q99 — the same approximation OpenTau already uses for

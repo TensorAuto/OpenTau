@@ -241,6 +241,11 @@ def resolve_stat_row(
     converted from v2.1) must have their stats recomputed, or be loaded through
     the delta-action stats pass, which computes quantiles for every dim.
 
+    A row can also lack quantiles because it is an *aggregated* norm head whose
+    member datasets disagree: ``aggregate_feature_stats`` drops a quantile the
+    whole head cannot cover rather than backfilling it from min/max, so one
+    unmigrated dataset removes quantiles from every dataset sharing its head.
+
     Raises:
         KeyError: If the feature is missing, or the stat is missing.
     """
@@ -250,10 +255,13 @@ def resolve_stat_row(
     if name in feat_stats:
         return feat_stats[name]
     hint = ""
-    if name in ("q01", "q99"):
+    if name.startswith("q") and name[1:].isdigit():
         hint = (
             " QUANTILE normalization requires quantile stats; recompute this dataset's stats "
-            "(or switch its normalization_mapping to MIN_MAX / MEAN_STD)."
+            "(or switch its normalization_mapping to MIN_MAX / MEAN_STD). If this row is an "
+            "aggregated norm head, the datasets that lack quantiles are named in the earlier "
+            "'aggregate_feature_stats ...: dropping ...' warning — recomputing those is enough "
+            "to restore quantiles for the whole head."
         )
     raise KeyError(f"stats['{key}'] is missing stat '{name}'. Available stats: {list(feat_stats)}.{hint}")
 
@@ -273,11 +281,24 @@ def _stat_to_float32_tensor(value: np.ndarray | Tensor) -> Tensor:
     raise ValueError(f"np.ndarray or torch.Tensor expected, but type is '{type(value)}' instead.")
 
 
+def row_label(dataset_names: list[str] | None, index: int) -> str:
+    """``per_dataset_stats[2] ('so101|joint_position')`` — index plus name when known.
+
+    The row identifier is what an operator needs to act on a stats error: for a
+    mixture it is the norm-head key, whose member datasets are listed in the
+    ``Norm-head aggregation`` log line emitted at mixture build time.
+    """
+    if dataset_names is not None and 0 <= index < len(dataset_names):
+        return f"per_dataset_stats[{index}] ('{dataset_names[index]}')"
+    return f"per_dataset_stats[{index}]"
+
+
 def create_stats_buffers(
     features: dict[str, PolicyFeature],
     norm_map: dict[str, NormalizationMode],
     per_dataset_stats: list[dict[str, dict[str, Tensor | np.ndarray]]] | None = None,
     num_datasets: int | None = None,
+    dataset_names: list[str] | None = None,
 ) -> dict[str, dict[str, nn.ParameterDict]]:
     """Create per-feature stat buffers shaped ``(D, *feat_shape)``.
 
@@ -291,6 +312,9 @@ def create_stats_buffers(
             or ``_inject_stats`` overwrites them.
         num_datasets: Required when ``per_dataset_stats is None``; ignored
             otherwise. Sets the leading dim of the inf-init buffers.
+        dataset_names: Optional row identifiers parallel to
+            ``per_dataset_stats``, used only to name the offending row when a
+            stat is missing or misshapen.
 
     Returns:
         dict feature_name -> nn.ParameterDict({"mean": param, "std": param}) etc.
@@ -343,15 +367,15 @@ def create_stats_buffers(
             else:
                 rows = []
                 for i, ds_stats in enumerate(per_dataset_stats):
+                    label = row_label(dataset_names, i)
                     try:
                         value = resolve_stat_row(ds_stats, key, name)
                     except KeyError as e:
-                        raise KeyError(f"per_dataset_stats[{i}]: {e.args[0]}") from None
+                        raise KeyError(f"{label}: {e.args[0]}") from None
                     row = _stat_to_float32_tensor(value)
                     if tuple(row.shape) != shape:
                         raise ValueError(
-                            f"per_dataset_stats[{i}]['{key}']['{name}'] has shape "
-                            f"{tuple(row.shape)}, expected {shape}."
+                            f"{label}['{key}']['{name}'] has shape {tuple(row.shape)}, expected {shape}."
                         )
                     rows.append(row)
                 tensor = torch.stack(rows, dim=0)
@@ -460,7 +484,11 @@ class Normalize(nn.Module):
                 f"{len(per_dataset_stats)} vs {len(dataset_names)}."
             )
         stats_buffers = create_stats_buffers(
-            features, norm_map, per_dataset_stats=per_dataset_stats, num_datasets=num_datasets
+            features,
+            norm_map,
+            per_dataset_stats=per_dataset_stats,
+            num_datasets=num_datasets,
+            dataset_names=dataset_names,
         )
         for key, buffer in stats_buffers.items():
             setattr(self, "buffer_" + key.replace(".", "_"), buffer)
@@ -623,7 +651,11 @@ class Unnormalize(nn.Module):
                 f"{len(per_dataset_stats)} vs {len(dataset_names)}."
             )
         stats_buffers = create_stats_buffers(
-            features, norm_map, per_dataset_stats=per_dataset_stats, num_datasets=num_datasets
+            features,
+            norm_map,
+            per_dataset_stats=per_dataset_stats,
+            num_datasets=num_datasets,
+            dataset_names=dataset_names,
         )
         for key, buffer in stats_buffers.items():
             setattr(self, "buffer_" + key.replace(".", "_"), buffer)

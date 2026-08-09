@@ -23,6 +23,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from opentau.datasets.compute_stats import QUANTILE_STAT_NAMES
 from opentau.datasets.dataset_mixture import DatasetMixtureMetadata, compute_norm_key
 from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
 
@@ -223,6 +224,55 @@ class TestDatasetMixtureMetadataNormAggregation:
         ]
         assert len(fallback_warnings) == 1
         assert "repo/b" in fallback_warnings[0].getMessage()
+
+    @pytest.mark.parametrize("migrated_repo", ["repo/a", "repo/b"])
+    def test_partial_quantile_coverage_in_a_head_warns_and_keeps_building(self, migrated_repo, caplog):
+        """A head straddling the fleet's incremental quantile migration must still build.
+
+        This is the end-to-end shape of the breakage: `aggregate_stats` used to raise, so the
+        first mixture pairing a migrated dataset with an unmigrated one killed the training job
+        at startup — before the checkpoint was even loaded, and regardless of whether the job
+        used QUANTILE normalization at all. The failure was symmetric in the ordering, so both
+        directions are exercised here.
+        """
+        repos = ["repo/a", "repo/b"]
+        _patch_name_mapping(repos)
+        cfg = _make_cfg(max_state_dim=8, max_action_dim=8)
+        metadatas = []
+        for repo_id, value in zip(repos, (1.0, 3.0), strict=True):
+            stats = _make_stats(6, 7, value=value, count=100)
+            if repo_id == migrated_repo:
+                for feature, dim in (("state", 6), ("actions", 7)):
+                    for q_name, offset in zip(QUANTILE_STAT_NAMES, (-2, -1, 0, 1, 2), strict=True):
+                        stats[feature][q_name] = np.full((dim,), float(offset), dtype=np.float32)
+            metadatas.append(
+                _make_metadata(
+                    repo_id,
+                    info={"robot_type": "franka", "control_mode": "joint", "total_frames": 100},
+                    stats=stats,
+                )
+            )
+
+        with caplog.at_level(logging.WARNING):
+            meta = DatasetMixtureMetadata(cfg, metadatas, dataset_weights=[0.5, 0.5], dataset_names=repos)
+
+        # One head, built successfully, with the ordinary stats still pooled.
+        assert meta.norm_keys == ["franka::joint"]
+        head = meta.per_norm_key_stats[0]
+        np.testing.assert_allclose(head["state"]["mean"][0], 2.0, atol=1e-6)
+        # ... and no quantiles, because the head cannot cover them for every member.
+        for feature in ("state", "actions"):
+            assert not set(QUANTILE_STAT_NAMES) & set(head[feature])
+
+        # The warning names the unmigrated repo and the head it belongs to — the two facts an
+        # operator needs to know which dataset to recompute.
+        unmigrated_repo = next(r for r in repos if r != migrated_repo)
+        dropped = [r.getMessage() for r in caplog.records if "dropping" in r.getMessage()]
+        assert len(dropped) == 2  # one per pooled feature (state, actions); cameras have no quantiles
+        for message in dropped:
+            assert unmigrated_repo in message
+            assert migrated_repo not in message
+            assert "norm head 'franka::joint'" in message
 
     def test_pooled_stats_closed_form(self):
         """Pooled mean/variance per the Chan-style weighted formula."""

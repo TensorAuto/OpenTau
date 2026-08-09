@@ -14,12 +14,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 from unittest.mock import patch
 
 import numpy as np
 import pytest
 
 from opentau.datasets.compute_stats import (
+    QUANTILE_STAT_NAMES,
     _assert_type_and_shape,
     aggregate_feature_stats,
     aggregate_stats,
@@ -422,6 +424,25 @@ def test_aggregate_stats():
         np.testing.assert_allclose(results[fkey]["count"], expected_agg_stats[fkey]["count"])
 
 
+def _base_stats(count: int = 10) -> dict[str, np.ndarray]:
+    """Non-quantile stats every contributor in the quantile tests shares."""
+    return {
+        "min": np.array([-8.0]),
+        "max": np.array([8.0]),
+        "mean": np.array([0.0]),
+        "std": np.array([1.0]),
+        "count": np.array([count]),
+    }
+
+
+def _with_quantiles(count: int, scale: float) -> dict[str, np.ndarray]:
+    """`_base_stats` plus the full quantile set, spread symmetrically around 0."""
+    stats = _base_stats(count)
+    for q_name, offset in zip(QUANTILE_STAT_NAMES, (-2.0, -1.0, 0.0, 1.0, 2.0), strict=True):
+        stats[q_name] = np.array([offset * scale])
+    return stats
+
+
 def test_aggregate_feature_stats_quantiles_weighted_mean():
     """q01/q99 aggregate as the count-weighted mean of contributor quantiles."""
     stats_ft = [
@@ -450,47 +471,141 @@ def test_aggregate_feature_stats_quantiles_weighted_mean():
     np.testing.assert_allclose(agg["q99"], [6.0])
 
 
-def test_aggregate_feature_stats_partial_quantiles_raises():
-    """Mixing contributors with and without quantiles is an error, not a min/max backfill.
+def test_aggregate_feature_stats_full_quantile_set_aggregates(caplog):
+    """(a) Every contributor has every quantile -> all five land in the aggregate, no warning.
 
-    Backfilling a missing q01 from that contributor's `min` pools two different scales into one
-    buffer: `min` sits however far outside the 1st percentile the tail reaches, so the pooled
-    band silently widens by an amount driven purely by outliers — exactly the sensitivity
-    QUANTILE exists to remove.
+    Pins the inner quantiles too: the loop used to cover only q01/q99, so q10/q50/q90 — which
+    fleet stats now carry and `_to_standard_data_format` already pads — were silently dropped
+    from every aggregated norm head.
     """
-    stats_ft = [
-        {
-            "min": np.array([-8.0]),
-            "max": np.array([8.0]),
-            "mean": np.array([0.0]),
-            "std": np.array([1.0]),
-            "count": np.array([10]),
-            "q01": np.array([-2.0]),
-            "q99": np.array([2.0]),
-        },
-        {
-            # no quantiles (stats predating quantile support)
-            "min": np.array([-4.0]),
-            "max": np.array([4.0]),
-            "mean": np.array([0.0]),
-            "std": np.array([1.0]),
-            "count": np.array([10]),
-        },
-    ]
-    with pytest.raises(KeyError, match="missing 'q01'"):
-        aggregate_feature_stats(stats_ft)
+    stats_ft = [_with_quantiles(count=10, scale=1.0), _with_quantiles(count=30, scale=2.0)]
+    with caplog.at_level(logging.WARNING):
+        agg = aggregate_feature_stats(stats_ft)
+    assert set(QUANTILE_STAT_NAMES) <= set(agg)
+    # count-weighted 10:30 of scale 1 and 2 -> effective scale 1.75
+    np.testing.assert_allclose(agg["q01"], [-3.5])
+    np.testing.assert_allclose(agg["q10"], [-1.75])
+    np.testing.assert_allclose(agg["q50"], [0.0])
+    np.testing.assert_allclose(agg["q90"], [1.75])
+    np.testing.assert_allclose(agg["q99"], [3.5])
+    assert not [r for r in caplog.records if "dropping" in r.getMessage()]
 
 
-def test_aggregate_feature_stats_no_quantiles_no_keys():
-    """When no contributor has quantiles, the aggregate has no quantile keys."""
-    stats_ft = [
-        {
-            "min": np.array([0.0]),
-            "max": np.array([1.0]),
-            "mean": np.array([0.5]),
-            "std": np.array([0.1]),
-            "count": np.array([5]),
-        }
-    ]
-    agg = aggregate_feature_stats(stats_ft)
-    assert "q01" not in agg and "q99" not in agg
+def test_aggregate_feature_stats_no_quantiles_no_keys(caplog):
+    """(b) No contributor has quantiles -> keys absent, and no warning noise.
+
+    The overwhelmingly common case today (nothing in the mixture is migrated yet); warning on it
+    would fire on nearly every job and train operators to ignore the message that matters.
+    """
+    stats_ft = [_base_stats(count=5), _base_stats(count=7)]
+    with caplog.at_level(logging.WARNING):
+        agg = aggregate_feature_stats(stats_ft)
+    assert not set(QUANTILE_STAT_NAMES) & set(agg)
+    assert caplog.records == []
+
+
+@pytest.mark.parametrize("migrated_index", [0, 1])
+def test_aggregate_feature_stats_partial_quantiles_skips_and_warns(migrated_index, caplog):
+    """(c) Partial coverage in BOTH directions -> quantiles dropped, warned, never raised.
+
+    The failure this replaces was symmetric: the old KeyError fired whether the migrated dataset
+    came first or second, killing any job whose mixture straddled the incremental fleet migration
+    before it even loaded a checkpoint. Parametrizing the position is what makes this a pin —
+    a fix that only handled "new dataset last" would pass a single-ordering test.
+
+    Backfilling is still refused: `min` sits however far outside the 1st percentile the tail
+    reaches, so pooling it with a true q01 would widen the band by an outlier-driven amount —
+    exactly the sensitivity QUANTILE exists to remove. Declining to publish a quantile at all is
+    the only safe option, and non-QUANTILE jobs over the same mixture are unaffected.
+    """
+    stats_ft = [_base_stats(count=10), _base_stats(count=10)]
+    stats_ft[migrated_index] = _with_quantiles(count=10, scale=1.0)
+    unmigrated_index = 1 - migrated_index
+
+    with caplog.at_level(logging.WARNING):
+        agg = aggregate_feature_stats(
+            stats_ft, contributor_names=["TensorAuto/migrated", "TensorAuto/legacy"]
+        )
+
+    # No exception, and the non-quantile stats still aggregate normally.
+    assert not set(QUANTILE_STAT_NAMES) & set(agg)
+    np.testing.assert_allclose(agg["mean"], [0.0])
+    np.testing.assert_allclose(agg["count"], [20])
+
+    # Exactly one warning, naming the unmigrated contributor and every dropped quantile.
+    warnings_logged = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings_logged) == 1
+    message = warnings_logged[0]
+    assert ["TensorAuto/migrated", "TensorAuto/legacy"][unmigrated_index] in message
+    assert ["TensorAuto/migrated", "TensorAuto/legacy"][migrated_index] not in message
+    for q_name in QUANTILE_STAT_NAMES:
+        assert q_name in message
+    assert "1/2 contributors" in message
+
+
+def test_aggregate_feature_stats_partial_quantiles_groups_by_missing_set(caplog):
+    """Quantiles missing from *different* contributors warn separately, not as one blurred line.
+
+    A dataset migrated to q01/q99 only, alongside one with the full set, drops q10/q50/q90 for a
+    different reason than a dataset with no quantiles at all drops q01/q99 — telling the operator
+    which recompute fixes which gap requires keeping the two groups apart.
+    """
+    full = _with_quantiles(count=10, scale=1.0)
+    outer_only = _base_stats(count=10) | {"q01": np.array([-2.0]), "q99": np.array([2.0])}
+    none_at_all = _base_stats(count=10)
+
+    with caplog.at_level(logging.WARNING):
+        agg = aggregate_feature_stats(
+            [full, outer_only, none_at_all], contributor_names=["full", "outer_only", "none_at_all"]
+        )
+
+    assert not set(QUANTILE_STAT_NAMES) & set(agg)
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(messages) == 2
+    # q01/q99 are missing from one contributor; q10/q50/q90 from two.
+    outer = next(m for m in messages if "'q01'" in m)
+    inner = next(m for m in messages if "'q10'" in m)
+    assert "1/3 contributors" in outer and "none_at_all" in outer and "outer_only" not in outer
+    assert "2/3 contributors" in inner and "none_at_all" in inner and "outer_only" in inner
+
+
+def test_aggregate_feature_stats_partial_quantiles_falls_back_to_indices(caplog):
+    """Without contributor names the warning still points somewhere: the list index."""
+    with caplog.at_level(logging.WARNING):
+        aggregate_feature_stats([_with_quantiles(count=10, scale=1.0), _base_stats(count=10)])
+    message = next(r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+    assert "indices [1]" in message
+
+
+def test_aggregate_feature_stats_rejects_misaligned_contributor_names():
+    """A names list that isn't parallel would name the wrong dataset — reject it up front."""
+    with pytest.raises(ValueError, match="parallel"):
+        aggregate_feature_stats([_base_stats(), _base_stats()], contributor_names=["only-one"])
+
+
+def test_aggregate_stats_names_the_offending_dataset_per_feature(caplog):
+    """`aggregate_stats` forwards names/context per feature, keeping both aligned to the filter.
+
+    `state` is present on both contributors while `actions` is present on only one, so the two
+    features aggregate over different contributor subsets. The names (and weights) must be
+    filtered by the same positions, or the warning would accuse whichever dataset happens to sit
+    at that index in the unfiltered list.
+    """
+    migrated = {"state": _with_quantiles(count=10, scale=1.0), "actions": _with_quantiles(10, 1.0)}
+    legacy = {"state": _base_stats(count=10)}
+
+    with caplog.at_level(logging.WARNING):
+        agg = aggregate_stats(
+            [migrated, legacy],
+            weights=[1.0, 3.0],
+            contributor_names=["TensorAuto/migrated", "TensorAuto/legacy"],
+            context="norm head 'so101|joint_position'",
+        )
+
+    # `actions` has a single contributor, so its quantiles survive; `state` loses them.
+    assert set(QUANTILE_STAT_NAMES) <= set(agg["actions"])
+    assert not set(QUANTILE_STAT_NAMES) & set(agg["state"])
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(messages) == 1
+    assert "TensorAuto/legacy" in messages[0]
+    assert "norm head 'so101|joint_position'" in messages[0] and "feature 'state'" in messages[0]

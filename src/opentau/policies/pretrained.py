@@ -857,6 +857,7 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         from opentau.policies.normalize import (
             _stat_to_float32_tensor,
             resolve_stat_row,
+            row_label,
             stat_names_for_mode,
         )
 
@@ -879,6 +880,12 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                     "have the same length."
                 )
 
+        # Row identity (norm-head name when known) so a stats gap — e.g. a
+        # QUANTILE policy over a head whose aggregate dropped quantiles — names
+        # the offending row instead of failing with a bare stat name, matching
+        # `create_stats_buffers`.
+        names_for_rows = dataset_names or getattr(self.config, "dataset_names", None)
+
         for module_attr in NORM_MODULE_NAMES:
             module = getattr(self, module_attr, None)
             if module is None:
@@ -893,10 +900,12 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                     continue
                 stat_names = stat_names_for_mode(norm_mode)
                 for stat in stat_names:
-                    rows = [
-                        _stat_to_float32_tensor(resolve_stat_row(s, feature_key, stat))
-                        for s in per_dataset_stats
-                    ]
+                    rows = []
+                    for i, s in enumerate(per_dataset_stats):
+                        try:
+                            rows.append(_stat_to_float32_tensor(resolve_stat_row(s, feature_key, stat)))
+                        except KeyError as e:
+                            raise KeyError(f"{row_label(names_for_rows, i)}: {e.args[0]}") from None
                     new_tensor = torch.stack(rows, dim=0).to(
                         device=buffer[stat].device, dtype=buffer[stat].dtype
                     )

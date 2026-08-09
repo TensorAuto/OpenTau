@@ -71,12 +71,25 @@ Example:
         >>> aggregated = aggregate_stats(stats_list, weights=weights)
 """
 
+import logging
 import warnings
 from typing import Optional
 
 import numpy as np
 
 from opentau.datasets.utils import load_image_as_numpy
+
+# Quantile stats a contributor may carry, in the order they are aggregated.
+# `q01`/`q99` are the pair QUANTILE normalization reads; the inner three are
+# carried through for diagnostics (`scripts/diagnose_norm_distribution.py`) and
+# for future conventions. Datasets whose stats predate quantile support carry
+# none of them, and the fleet migration that adds them is incremental — hence
+# the partial-coverage handling in `aggregate_feature_stats`.
+QUANTILE_STAT_NAMES: tuple[str, ...] = ("q01", "q10", "q50", "q90", "q99")
+
+# Cap on how many contributors a partial-coverage warning names, so a
+# 30-dataset mixture missing quantiles everywhere doesn't produce a wall of log.
+_MAX_NAMED_CONTRIBUTORS = 10
 
 
 def estimate_num_samples(
@@ -279,8 +292,48 @@ def _assert_type_and_shape(stats_list: list[dict[str, dict]]) -> None:
                     raise ValueError(f"Shape of '{k}' must be (3,1,1), but is {v.shape} instead.")
 
 
+def _describe_contributors(indices: tuple[int, ...], contributor_names: Optional[list[str]]) -> str:
+    """Render the offending contributors for a log line: names when known, else indices."""
+    shown = list(indices[:_MAX_NAMED_CONTRIBUTORS])
+    suffix = f", ... and {len(indices) - len(shown)} more" if len(indices) > len(shown) else ""
+    if contributor_names:
+        return f"{[str(contributor_names[i]) for i in shown]}{suffix}"
+    return f"indices {shown}{suffix}"
+
+
+def _warn_dropped_quantiles(
+    dropped: dict[tuple[int, ...], list[str]],
+    num_contributors: int,
+    contributor_names: Optional[list[str]],
+    context: Optional[str],
+) -> None:
+    """Log one warning per distinct set of contributors missing quantile stats.
+
+    Grouping by the missing set keeps the common case — one unmigrated dataset
+    that carries none of the five quantiles — to a single line instead of five.
+    """
+    where = f" [{context}]" if context else ""
+    for indices, q_names in dropped.items():
+        logging.warning(
+            "aggregate_feature_stats%s: dropping %s from the aggregated stats because "
+            "%d/%d contributors are missing them: %s. Quantiles are never backfilled from "
+            "min/max (that would pool two different scales into one buffer), so the aggregate "
+            "carries no quantiles at all. MEAN_STD / MIN_MAX normalization is unaffected; "
+            "QUANTILE normalization over these stats will fail until the listed contributors' "
+            "stats are recomputed with quantiles.",
+            where,
+            sorted(q_names),
+            len(indices),
+            num_contributors,
+            _describe_contributors(indices, contributor_names),
+        )
+
+
 def aggregate_feature_stats(
-    stats_ft_list: list[dict[str, dict]], weights: Optional[list[float]] = None
+    stats_ft_list: list[dict[str, dict]],
+    weights: Optional[list[float]] = None,
+    contributor_names: Optional[list[str]] = None,
+    context: Optional[str] = None,
 ) -> dict[str, dict[str, np.ndarray]]:
     """Aggregate statistics for a single feature across multiple episodes/datasets.
 
@@ -301,14 +354,35 @@ def aggregate_feature_stats(
     ``std``). ``count`` is unconditional: the sum of contributors' counts, not a
     per-dim effective contributor count.
 
+    Quantiles (:data:`QUANTILE_STAT_NAMES`) are aggregated only when *every*
+    contributor carries them. Partial coverage drops that quantile from the
+    output and logs a warning naming the contributors that lack it — it is never
+    backfilled from ``min``/``max``. See the inline comment at the quantile loop
+    for why the drop is preferred over raising.
+
     Args:
         stats_ft_list: List of statistics dictionaries for the same feature.
         weights: Optional weights for each statistics entry. If None, uses
             count values as weights.
+        contributor_names: Optional names parallel to ``stats_ft_list``, used
+            only to name the offenders in the partial-quantile-coverage
+            warning. Without it the warning falls back to list indices.
+        context: Optional label prefixed to that warning (e.g. the norm head
+            and feature the contributors are being pooled for).
 
     Returns:
-        Aggregated statistics dictionary with min, max, mean, std, and count.
+        Aggregated statistics dictionary with min, max, mean, std, count, and
+        any quantile every contributor carries.
+
+    Raises:
+        ValueError: If ``contributor_names`` is not parallel to ``stats_ft_list``.
     """
+    if contributor_names is not None and len(contributor_names) != len(stats_ft_list):
+        raise ValueError(
+            f"contributor_names ({len(contributor_names)}) must be parallel to stats_ft_list "
+            f"({len(stats_ft_list)}); a misaligned list would name the wrong dataset in the "
+            "partial-quantile-coverage warning."
+        )
     means = np.stack([s["mean"] for s in stats_ft_list])
     variances = np.stack([s["std"] ** 2 for s in stats_ft_list])
     mins = np.stack([s["min"] for s in stats_ft_list])
@@ -362,30 +436,31 @@ def aggregate_feature_stats(
         "count": total_count,
     }
 
-    # q01/q99 for QUANTILE normalization. Exact pooled quantiles are not
-    # recoverable from per-contributor quantiles, so use the count-weighted mean
-    # of the contributors' quantiles — a standard approximation that stays
-    # robust to a single contributor's extremes (unlike pooled min/max).
-    # Non-finite entries are masked per dim like the mean.
+    # Quantiles for QUANTILE normalization (and for diagnostics). Exact pooled
+    # quantiles are not recoverable from per-contributor quantiles, so use the
+    # count-weighted mean of the contributors' quantiles — a standard
+    # approximation that stays robust to a single contributor's extremes
+    # (unlike pooled min/max). Non-finite entries are masked per dim like the
+    # mean.
     #
-    # All-or-none: a contributor without the quantile is NOT backfilled from its
+    # All-or-skip: a contributor without the quantile is NOT backfilled from its
     # same-side extreme. Mixing a true q01 with a min pools two different
     # scales into one buffer, silently widening the band by however far the
     # extreme sits outside the 1st percentile — precisely the outlier
-    # sensitivity QUANTILE exists to avoid. Recompute the offending dataset's
-    # stats instead.
-    for q_name in ("q01", "q99"):
+    # sensitivity QUANTILE exists to avoid. Partial coverage therefore drops the
+    # quantile from the aggregate entirely (with a warning) rather than raising:
+    # the fleet's quantile migration is incremental, so a mixture that pairs a
+    # migrated dataset with an unmigrated one is a normal transient state, and
+    # every non-QUANTILE job over that mixture is unaffected by the gap.
+    dropped_quantiles: dict[tuple[int, ...], list[str]] = {}
+    for q_name in QUANTILE_STAT_NAMES:
         have = [q_name in s for s in stats_ft_list]
         if not any(have):
             continue
         if not all(have):
-            missing = [i for i, h in enumerate(have) if not h]
-            raise KeyError(
-                f"aggregate_feature_stats: {len(missing)}/{len(stats_ft_list)} contributors are "
-                f"missing '{q_name}' (indices {missing[:10]}), but the rest have it. Quantiles "
-                "are not backfilled from min/max because that would pool two different scales "
-                "into one buffer. Recompute stats for the listed contributors."
-            )
+            missing = tuple(i for i, h in enumerate(have) if not h)
+            dropped_quantiles.setdefault(missing, []).append(q_name)
+            continue
         q_vals = np.stack([s[q_name] for s in stats_ft_list])
         q_bad = ~np.isfinite(q_vals)
         q_weights = np.where(q_bad, 0.0, counts).astype(np.float64)
@@ -398,11 +473,17 @@ def aggregate_feature_stats(
             where=q_weight_sum > 0,
         )
 
+    if dropped_quantiles:
+        _warn_dropped_quantiles(dropped_quantiles, len(stats_ft_list), contributor_names, context)
+
     return aggregated
 
 
 def aggregate_stats(
-    stats_list: list[dict[str, dict]], weights: Optional[list[float]] = None
+    stats_list: list[dict[str, dict]],
+    weights: Optional[list[float]] = None,
+    contributor_names: Optional[list[str]] = None,
+    context: Optional[str] = None,
 ) -> dict[str, dict[str, np.ndarray]]:
     """Aggregate stats from multiple compute_stats outputs into a single set of stats.
 
@@ -413,15 +494,44 @@ def aggregate_stats(
     - new_max = max(max_dataset_0, max_dataset_1, ...)
     - new_mean = (mean of all data, weighted by counts)
     - new_std = (std of all data)
+
+    Args:
+        stats_list: One stats dict (feature -> stat -> array) per contributor.
+        weights: Optional per-contributor weights; ``None`` uses each entry's
+            ``count``.
+        contributor_names: Optional names parallel to ``stats_list``, forwarded
+            to :func:`aggregate_feature_stats` so a partial-quantile-coverage
+            warning names the offending datasets instead of bare indices.
+        context: Optional label prefixed to those warnings; the feature key is
+            appended automatically.
+
+    Raises:
+        ValueError: If ``contributor_names``/``weights`` are not parallel to
+            ``stats_list``.
     """
 
     _assert_type_and_shape(stats_list)
+
+    for label, parallel in (("contributor_names", contributor_names), ("weights", weights)):
+        if parallel is not None and len(parallel) != len(stats_list):
+            raise ValueError(f"{label} ({len(parallel)}) must be parallel to stats_list ({len(stats_list)}).")
 
     data_keys = {key for stats in stats_list for key in stats}
     aggregated_stats = {key: {} for key in data_keys}
 
     for key in data_keys:
-        stats_with_key = [stats[key] for stats in stats_list if key in stats]
-        aggregated_stats[key] = aggregate_feature_stats(stats_with_key, weights)
+        # A feature absent from some contributors narrows the contributor set
+        # for that feature only; `weights` and `contributor_names` are indexed
+        # by the same positions so every parallel list stays aligned with it.
+        present = [i for i, stats in enumerate(stats_list) if key in stats]
+        stats_with_key = [stats_list[i][key] for i in present]
+        weights_with_key = [weights[i] for i in present] if weights is not None else None
+        names_with_key = [contributor_names[i] for i in present] if contributor_names is not None else None
+        aggregated_stats[key] = aggregate_feature_stats(
+            stats_with_key,
+            weights_with_key,
+            contributor_names=names_with_key,
+            context=f"{context}, feature {key!r}" if context else f"feature {key!r}",
+        )
 
     return aggregated_stats
