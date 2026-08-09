@@ -362,8 +362,8 @@ def aggregate_feature_stats(
 
     Args:
         stats_ft_list: List of statistics dictionaries for the same feature.
-        weights: Optional weights for each statistics entry. If None, uses
-            count values as weights.
+        weights: Optional weights for each statistics entry, parallel to
+            ``stats_ft_list``. If None, uses count values as weights.
         contributor_names: Optional names parallel to ``stats_ft_list``, used
             only to name the offenders in the partial-quantile-coverage
             warning. Without it the warning falls back to list indices.
@@ -375,8 +375,20 @@ def aggregate_feature_stats(
         any quantile every contributor carries.
 
     Raises:
-        ValueError: If ``contributor_names`` is not parallel to ``stats_ft_list``.
+        ValueError: If ``weights`` or ``contributor_names`` is not parallel to
+            ``stats_ft_list``.
     """
+    # `weights` replaces the per-contributor `count`, so a misaligned list is not
+    # a broadcast error you'd notice — with a single-entry `stats_ft_list` numpy
+    # happily broadcasts the extra weights and inflates `count` (and skews every
+    # weighted stat) silently. Reject it here as well as in `aggregate_stats`,
+    # whose own check runs before the per-feature filter and so catches a
+    # different misalignment.
+    if weights is not None and len(weights) != len(stats_ft_list):
+        raise ValueError(
+            f"weights ({len(weights)}) must be parallel to stats_ft_list ({len(stats_ft_list)}); "
+            "a misaligned list silently inflates 'count' and skews every weighted stat."
+        )
     if contributor_names is not None and len(contributor_names) != len(stats_ft_list):
         raise ValueError(
             f"contributor_names ({len(contributor_names)}) must be parallel to stats_ft_list "

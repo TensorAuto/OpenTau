@@ -577,19 +577,33 @@ def test_aggregate_feature_stats_partial_quantiles_falls_back_to_indices(caplog)
     assert "indices [1]" in message
 
 
-def test_aggregate_feature_stats_rejects_misaligned_contributor_names():
-    """A names list that isn't parallel would name the wrong dataset — reject it up front."""
+@pytest.mark.parametrize("kwargs", [{"contributor_names": ["only-one"]}, {"weights": [1.0]}])
+def test_aggregate_feature_stats_rejects_misaligned_parallel_args(kwargs):
+    """A non-parallel `weights`/`contributor_names` list is rejected, not silently broadcast.
+
+    Both fail quietly rather than loudly: a short names list names the wrong dataset, and a
+    misaligned `weights` list (which *replaces* `count`) broadcasts against the stats stack and
+    inflates `count` while skewing every weighted stat — the same silent-misalignment class this
+    change fixes one level up in `aggregate_stats`.
+    """
     with pytest.raises(ValueError, match="parallel"):
-        aggregate_feature_stats([_base_stats(), _base_stats()], contributor_names=["only-one"])
+        aggregate_feature_stats([_base_stats(), _base_stats()], **kwargs)
 
 
-def test_aggregate_stats_names_the_offending_dataset_per_feature(caplog):
-    """`aggregate_stats` forwards names/context per feature, keeping both aligned to the filter.
+def test_aggregate_stats_filters_names_and_weights_with_the_feature(caplog):
+    """`aggregate_stats` narrows names *and* weights to the contributors a feature actually has.
 
     `state` is present on both contributors while `actions` is present on only one, so the two
-    features aggregate over different contributor subsets. The names (and weights) must be
-    filtered by the same positions, or the warning would accuse whichever dataset happens to sit
-    at that index in the unfiltered list.
+    features aggregate over different contributor subsets. Both parallel lists must be indexed by
+    the same positions as the stats:
+
+    - names: an unfiltered list accuses whichever dataset sits at that index in the full list;
+    - weights: an unfiltered list is broadcast against the shorter stats stack, so `actions`
+      reports the whole mixture's weight (4.0) instead of its single contributor's (1.0) — and
+      every weighted stat is pooled against that inflated denominator.
+
+    The `count` assertions are what pin the weights half; the quantile/warning assertions alone
+    pass either way, since both contributors' means are identical here.
     """
     migrated = {"state": _with_quantiles(count=10, scale=1.0), "actions": _with_quantiles(10, 1.0)}
     legacy = {"state": _base_stats(count=10)}
@@ -601,6 +615,10 @@ def test_aggregate_stats_names_the_offending_dataset_per_feature(caplog):
             contributor_names=["TensorAuto/migrated", "TensorAuto/legacy"],
             context="norm head 'so101|joint_position'",
         )
+
+    # Weights follow the filter: `state` pools both (1.0 + 3.0), `actions` only the one it has.
+    np.testing.assert_allclose(agg["state"]["count"], 4.0)
+    np.testing.assert_allclose(agg["actions"]["count"], 1.0)
 
     # `actions` has a single contributor, so its quantiles survive; `state` loses them.
     assert set(QUANTILE_STAT_NAMES) <= set(agg["actions"])
