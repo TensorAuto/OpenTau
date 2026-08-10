@@ -467,9 +467,10 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         :mod:`opentau.utils.transformers_patch`.
 
         These tables are used in the patch-conv / posemb *compute* in float32 only at
-        inference / serving / ONNX export: the inference entry points (the gRPC server,
-        ``scripts/inference.py``, ``eval.py``, ``benchmark_inference.py``,
-        ``high_level_planner_inference.py``, ``actions_mse_loss.py``) route their blanket
+        inference / serving / ONNX export: the inference entry points (the gRPC server, the
+        RoboCasa WebSocket server, ``scripts/inference.py``, ``eval.py``,
+        ``benchmark_inference.py``, ``high_level_planner_inference.py``,
+        ``actions_mse_loss.py``) route their blanket
         bfloat16 cast through :func:`opentau.policies.utils.to_dtype_preserving_siglip_float32`,
         and ONNX export runs in float32. No *training* backend computes them in float32: DDP
         and non-FSDP DeepSpeed blanket-cast the whole policy to bfloat16 (``train.py`` /

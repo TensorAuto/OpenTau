@@ -66,6 +66,7 @@ import websockets
 from opentau.configs import parser
 from opentau.configs.train import TrainPipelineConfig
 from opentau.policies.factory import get_policy_class
+from opentau.policies.utils import to_dtype_preserving_siglip_float32
 from opentau.utils.random_utils import set_seed
 from opentau.utils.utils import attempt_torch_compile, auto_torch_device, init_logging
 
@@ -281,7 +282,9 @@ class OpenTauRoboCasaPolicy:
         logger.info("Loading OpenTau policy type=%s from %s", cfg.policy.type, cfg.policy.pretrained_path)
         policy_class = get_policy_class(cfg.policy.type)
         self.policy = policy_class.from_pretrained(cfg.policy.pretrained_path, config=cfg.policy)
-        self.policy.to(device=self.device, dtype=self.dtype)
+        # Preserve the float32-pinned SigLIP embeddings across the bf16 cast (openpi parity);
+        # a plain .to(bfloat16) would round them back. Serving is single-process, so this is safe.
+        to_dtype_preserving_siglip_float32(self.policy, device=self.device, dtype=self.dtype)
         self.policy.eval()
 
         if compile_model:
