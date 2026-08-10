@@ -201,7 +201,7 @@ def test_to_dtype_helper_is_noop_for_uniform_bf16_tower():
 # embeddings — which is exactly how ``scripts/robocasa/server.py`` stayed unrouted from #151
 # through #482's six-file sweep. These two AST tests are the pin: one asserts the known
 # entry points still call the helper, the other fails when a *new* script grows an unlisted
-# ``policy.to(dtype=...)``, so the next omission is loud instead of silent.
+# blanket policy cast, so the next omission is loud instead of silent.
 # --------------------------------------------------------------------------------------
 
 _SCRIPTS_ROOT = Path(opentau.__file__).parent / "scripts"
@@ -253,20 +253,56 @@ def _is_dtype_arg(node: ast.expr) -> bool:
     return name is not None and "dtype" in name.lower()
 
 
+def _policy_bound_names(tree: ast.Module) -> set[str]:
+    """Names bound from a policy-constructing call, e.g. ``model = make_policy(...)``.
+
+    Without this, a script that binds the policy to a name not containing "policy" would
+    walk straight past the receiver heuristic below.
+    """
+    bound = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)):
+            continue
+        if _receiver_name(node.value.func) not in {"make_policy", "from_pretrained"}:
+            continue
+        bound.update(name for name in map(_receiver_name, node.targets) if name is not None)
+    return bound
+
+
+def _is_policy_receiver(node: ast.expr, bound: set[str]) -> bool:
+    """Whether a call receiver plausibly denotes a policy rather than a tensor."""
+    name = _receiver_name(node)
+    if name is None:
+        return False
+    return "policy" in name.lower() or "model" in name.lower() or name in bound
+
+
 def _policy_dtype_casts(path: Path) -> list[int]:
-    """Line numbers of ``<...>policy.to(<dtype>)`` calls in ``path``."""
+    """Line numbers of blanket policy dtype casts in ``path``.
+
+    Covers ``policy.to(<dtype>)`` plus the equivalent method-call forms — ``.half()``,
+    ``.bfloat16()``, ``.type(<dtype>)`` — which are the same downcast by another spelling.
+    Upcasts (``.float()``, ``.double()``) are not flagged: they cannot round the pinned tables.
+    """
+    tree = ast.parse(path.read_text())
+    bound = _policy_bound_names(tree)
     hits = []
-    for node in ast.walk(ast.parse(path.read_text())):
+    for node in ast.walk(tree):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
             continue
-        if node.func.attr != "to":
+        if not _is_policy_receiver(node.func.value, bound):
             continue
-        receiver = _receiver_name(node.func.value)
-        if receiver is None or "policy" not in receiver.lower():
+        method = node.func.attr
+        if method == "to":
+            casts_dtype = any(kw.arg == "dtype" for kw in node.keywords) or any(
+                _is_dtype_arg(arg) for arg in node.args
+            )
+        elif method in {"half", "bfloat16"}:
+            casts_dtype = True
+        elif method == "type":
+            casts_dtype = any(_is_dtype_arg(arg) for arg in node.args)
+        else:
             continue
-        casts_dtype = any(kw.arg == "dtype" for kw in node.keywords) or any(
-            _is_dtype_arg(arg) for arg in node.args
-        )
         if casts_dtype:
             hits.append(node.lineno)
     return hits
@@ -316,6 +352,31 @@ def test_no_unlisted_script_casts_a_policy_dtype_directly():
     # A stale allowlist entry hides a regression as effectively as a missing one.
     stale = set(_UNROUTED_CAST_IS_INTENTIONAL) - set(offenders)
     assert not stale, f"_UNROUTED_CAST_IS_INTENTIONAL lists non-casting script(s): {stale}"
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("policy.to(device=device, dtype=torch.bfloat16)", True),
+        ("self.policy.to(device=self.device, dtype=self.dtype)", True),  # the bug this PR fixes
+        ("policy.to(torch.bfloat16)", True),
+        ("policy.to(dtype=dtype)", True),
+        ("policy.half()", True),
+        ("policy.bfloat16()", True),
+        ("policy.type(torch.bfloat16)", True),
+        ("model = make_policy(cfg)\nmodel.to(torch.bfloat16)", True),  # receiver not named policy
+        ("policy.to(device)", False),  # device move, not a dtype cast
+        ("policy.to(dtype=torch.float32)", True),  # a cast is a cast; float32 is allowlisted
+        ("policy.float()", False),  # upcast cannot round the pinned tables
+        ('batch["state"].to(device=device, dtype=dtype)', False),  # tensor cast
+        ("hidden.to(dtype=torch.bfloat16)", False),  # tensor cast
+    ],
+)
+def test_cast_detector_covers_the_spellings_a_future_entry_point_could_use(source, expected, tmp_path):
+    """The guard is only as good as its detector, so pin what it does and does not flag."""
+    probe = tmp_path / "probe.py"
+    probe.write_text(source + "\n")
+    assert bool(_policy_dtype_casts(probe)) is expected, source
 
 
 def test_onnx_export_exemption_is_a_float32_upcast_not_a_downcast():
