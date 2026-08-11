@@ -14,8 +14,8 @@
 
 """Policy WebSocket server for RoboCasa ``client.py`` / ``client_async.py`` with OpenTau loading.
 
-Implements the same wire protocol as ``robocasa_server``, plus **batched** messages for
-``robocasa.scripts.client_async``:
+Implements the single-observation wire protocol used by ``robocasa.scripts.client``, plus
+**batched** messages for ``robocasa.scripts.client_async``:
 
     Single request:
 
@@ -36,7 +36,7 @@ full predicted chunk per environment: shape ``(n_action_steps, action_dim)`` (tr
 
 Run::
 
-    python -m opentau.scripts.robocasa_server_async \\
+    python -m opentau.scripts.robocasa.server \\
         --config_path /path/to/train_config.json \\
         --robocasa_action_dim 16 --robocasa_port 8765
 
