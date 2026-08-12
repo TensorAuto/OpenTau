@@ -26,6 +26,13 @@ from opentau.policies.pi07.low_level.modeling_pi07_low_level import (
     _global_or_branch_decisions,
     make_att_2d_masks,
 )
+from tests.utils import require_vram_gib, to_cuda_bf16
+
+# VRAM floor for the end-to-end tests below, which build the tiny VLM on CUDA
+# and run a full forward at 448x448 with T=2. Measured peak on an RTX 5090:
+# 0.71 GiB reserved. The floor is the card size we require, so it carries
+# generous headroom over that for the CUDA context and fragmentation.
+MIN_VRAM_GIB = 4.0
 
 # Tiny VLM config so that the full forward pass fits within 24 GB GPU memory.
 # Backbone: 2 text layers × 512 hidden, 2 KV heads × 128 head_dim (=256 total).
@@ -353,7 +360,7 @@ class TestPI07LowLevelIntegration:
     # Main integration test
     # ------------------------------------------------------------------
 
-    @pytest.mark.skip(reason="Requires too much memory, does not fit on RTX 3090 24GB")
+    @require_vram_gib(MIN_VRAM_GIB)
     @pytest.mark.gpu
     @pytest.mark.slow
     def test_complete_pi07_low_level_pipeline(self, lerobot_dataset_metadata):
@@ -386,16 +393,14 @@ class TestPI07LowLevelIntegration:
                 ],
                 dim=1,
             ),
+            # The dataloader always emits this alongside the T-dimensioned
+            # camera/state tensors; `forward` only warns when it is absent, so
+            # omitting it would leave the masking path untested.
+            "obs_history_is_pad": torch.zeros(batch_size, N_OBS_STEPS, dtype=torch.bool),
         }
 
         policy.to(dtype=torch.bfloat16, device="cuda")
-        batch_cuda = {
-            key: value.to("cuda", non_blocking=True, dtype=torch.bfloat16)
-            if isinstance(value, torch.Tensor)
-            else value
-            for key, value in batch.items()
-        }
-        batch_cuda["action_is_pad"] = batch_cuda["action_is_pad"].to(dtype=torch.bool)
+        batch_cuda = to_cuda_bf16(batch)
 
         # ── Monkey-patch to capture intermediate tensors ──────────────
         captured = {}
@@ -547,13 +552,16 @@ class TestPI07LowLevelIntegration:
         policy.model.embed_prefix = capture_embed_prefix_infer
         policy.model.embed_suffix = capture_embed_suffix_infer
 
-        # Inference batch: SpaceTimeSiglip requires T == n_obs_steps frames, so
-        # videos stay 5-D (B, T, C, H, W) and state stays 3-D (B, T, D).
+        # Inference batch: `select_action` takes ONE observation per step and
+        # builds the temporal window itself (`_build_history_batch` buffers the
+        # frames and emits `obs_history_is_pad`), so cameras are 4-D
+        # (B, C, H, W) and state is 2-D (B, D). Handing it the already-stacked
+        # training tensors makes it stack a second time, yielding 6-D videos.
         infer_batch = {
-            "camera0": batch_cuda["camera0"],  # (B, T, C, H, W)
-            "camera1": batch_cuda["camera1"],
+            "camera0": batch_cuda["camera0"][:, -1],  # current frame, (B, C, H, W)
+            "camera1": batch_cuda["camera1"][:, -1],
             "subgoal0": batch_cuda["subgoal0"],  # already (B, C, H, W)
-            "state": batch_cuda["state"],  # (B, T, D)
+            "state": batch_cuda["state"][:, -1],  # current step, (B, D)
             "prompt": ["Pick up the red block"],
             "response": ["Grasp the red block"],
             "speed": torch.tensor([50], device="cuda"),
@@ -619,7 +627,7 @@ class TestPI07LowLevelIntegration:
 
         assert action.shape == (1, MAX_ACTION_DIM)
 
-    @pytest.mark.skip(reason="Requires too much memory, does not fit on RTX 3090 24GB")
+    @require_vram_gib(MIN_VRAM_GIB)
     @pytest.mark.gpu
     @pytest.mark.slow
     def test_no_optionals_path_on_real_gemma3(self, lerobot_dataset_metadata):
@@ -670,17 +678,7 @@ class TestPI07LowLevelIntegration:
         }
 
         policy.to(dtype=torch.bfloat16, device="cuda")
-        batch_cuda = {
-            key: value.to("cuda", non_blocking=True, dtype=torch.bfloat16)
-            if isinstance(value, torch.Tensor)
-            else value
-            for key, value in batch.items()
-        }
-        batch_cuda["action_is_pad"] = batch_cuda["action_is_pad"].to(dtype=torch.bool)
-        batch_cuda["speed_is_pad"] = batch_cuda["speed_is_pad"].to(dtype=torch.bool)
-        batch_cuda["quality_is_pad"] = batch_cuda["quality_is_pad"].to(dtype=torch.bool)
-        batch_cuda["mistake_is_pad"] = batch_cuda["mistake_is_pad"].to(dtype=torch.bool)
-        batch_cuda["subgoal_is_pad"] = batch_cuda["subgoal_is_pad"].to(dtype=torch.bool)
+        batch_cuda = to_cuda_bf16(batch)
 
         captured = {}
         original_embed_prefix = policy.model.embed_prefix
@@ -767,7 +765,7 @@ class TestPI07LowLevelRegression:
             "mistake_is_pad": torch.tensor([False] * batch_size, device="cuda"),
         }
 
-    @pytest.mark.skip(reason="Requires too much memory, does not fit on RTX 3090 24GB")
+    @require_vram_gib(MIN_VRAM_GIB)
     @pytest.mark.gpu
     @pytest.mark.slow
     def test_prepare_metadata_always_returns_tensors(self, lerobot_dataset_metadata):

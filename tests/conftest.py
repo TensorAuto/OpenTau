@@ -15,9 +15,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import os
 
 import pytest
+import torch
 from huggingface_hub import HfApi
 
 from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
@@ -75,6 +77,30 @@ def patch_builtins_input(monkeypatch):
             print(text)
 
     monkeypatch.setattr("builtins.input", print_text)
+
+
+@pytest.fixture(autouse=True)
+def release_cuda_memory_after_gpu_test(request):
+    """Drop a finished GPU test's CUDA memory before the next one allocates.
+
+    `pytest -m gpu -n 0` runs every GPU test in one process. PyTorch frees its
+    own cached blocks when an allocation fails, but it never runs a Python GC,
+    so the reference cycles inside a just-finished test's `nn.Module` graph keep
+    whole models resident. Peaks that should overlap add up instead. Measured:
+    the four pi06/pi07 policy files OOM on a 24 GiB budget without this sweep
+    and pass with it, though no single test in them exceeds 19.6 GiB.
+
+    The marker check keeps this off the ~2600 CPU tests, where it would be pure
+    overhead. On a failing test pytest still holds the frame for the traceback,
+    so the sweep only reliably reclaims after a pass — which is the case that
+    matters for the tests that follow.
+    """
+    yield
+    if request.node.get_closest_marker("gpu") is None:
+        return
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 @pytest.fixture(scope="session")

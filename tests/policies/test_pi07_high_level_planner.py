@@ -23,6 +23,17 @@ from opentau.policies.pi07.high_level_planner.modeling_pi07_high_level import (
     PI07HighLevelPlannerPolicy,
     make_att_2d_masks,
 )
+from tests.utils import require_vram_gib
+
+# VRAM floor for the end-to-end test below, which builds the Gemma 3 backbone
+# on CUDA and runs a full forward at 448x448. Measured peak in a fresh process
+# on an RTX 5090: 17.3 GiB reserved, against 11.6 GiB for the heaviest
+# pre-existing GPU test. The floor is deliberately set above a 24 GB card
+# rather than just above the peak: this runs late in `pytest -m gpu -n 0`, and
+# whether 17.3 GiB plus the suite's residue clears a 24 GB card could not be
+# verified (the only >24 GB card available was under contention from other
+# workloads). Lower it to ~20 once someone can confirm on a quiet 24 GB card.
+MIN_VRAM_GIB = 24.0
 
 # Config defaults used across the test.
 NUM_CAMERAS = 2
@@ -149,7 +160,7 @@ class TestPI07HighLevelPlannerIntegration:
     # Main integration test
     # ------------------------------------------------------------------
 
-    @pytest.mark.skip(reason="Requires too much memory, does not fit on RTX 3090 24GB")
+    @require_vram_gib(MIN_VRAM_GIB)
     @pytest.mark.gpu
     @pytest.mark.slow
     def test_complete_pi07_high_level_planner_pipeline(self, lerobot_dataset_metadata):

@@ -44,6 +44,17 @@ from opentau.policies.pi06.modeling_pi06 import (
     resize_with_pad,
 )
 from opentau.policies.utils import PerSampleLoss, ce_per_sample
+from tests.utils import require_vram_gib
+
+# VRAM floor for the end-to-end tests below, which build the full Gemma 3 4B
+# backbone on CUDA. Measured peak in a fresh process on an RTX 5090: 19.6 GiB
+# reserved — by far the heaviest tests in the GPU suite (everything else tops
+# out at 11.6 GiB). The floor is deliberately set above a 24 GB card rather
+# than just above the peak: these run late in `pytest -m gpu -n 0`, and whether
+# 19.6 GiB plus the suite's residue clears a 24 GB card could not be verified
+# (the only >24 GB card available was under contention from other workloads).
+# Lower it to ~21 once someone can confirm on a quiet 24 GB card.
+MIN_VRAM_GIB = 24.0
 
 # Block-causal attention mask (pi05 / π0.6 prefix-LM pattern)
 
@@ -956,7 +967,7 @@ class TestPi06GradCkptEquivalence:
 # End-to-end integration — guarded because Gemma 3 4B is huge.
 
 
-@pytest.mark.skip(reason="Requires too much memory, does not fit on RTX 3090 24GB")
+@require_vram_gib(MIN_VRAM_GIB)
 @pytest.mark.gpu
 @pytest.mark.slow
 def test_complete_pi06_pipeline_integration_smoke(lerobot_dataset_metadata):
@@ -1028,7 +1039,7 @@ def test_complete_pi06_pipeline_integration_smoke(lerobot_dataset_metadata):
     assert all(v.isfinite() for v in loss.values())
 
 
-@pytest.mark.skip(reason="Requires too much memory, does not fit on RTX 3090 24GB")
+@require_vram_gib(MIN_VRAM_GIB)
 @pytest.mark.gpu
 @pytest.mark.slow
 def test_pi06_loc_tokens_extend_vocab_and_resize_embeddings(lerobot_dataset_metadata):

@@ -27,6 +27,14 @@ from opentau.policies.pi07_paligemma.low_level.modeling_pi07_low_level import (
     PI07PaligemmaLowLevelPolicy,
     make_att_2d_masks,
 )
+from tests.utils import require_vram_gib, to_cuda_bf16
+
+# VRAM floor for the end-to-end test below, which builds the PaliGemma VLM on
+# CUDA and runs a full forward at 224x224 with T=8. Measured peak in a fresh
+# process on an RTX 5090: 13.9 GiB reserved. That is the new ceiling of the GPU
+# suite on a 24 GB card (the heaviest pre-existing test peaks at 11.6 GiB), so
+# enabling it raises the suite's requirement by ~2 GiB, well inside budget.
+MIN_VRAM_GIB = 18.0
 
 
 def _legacy_embed_prefix(
@@ -124,7 +132,11 @@ def _legacy_embed_prefix(
 # Config defaults used across the test.
 NUM_CAMERAS = 2
 SIGLIP_TOKENS_PER_CAMERA = 256
-NUM_SUBGOAL_CAMERAS = 1
+# `prepare_subgoal_images` always emits one slot per `image_features` entry —
+# it pads the missing `subgoal{k}` keys with masked placeholders so the prefix
+# length cannot depend on which subgoal keys a batch happens to carry. So the
+# subgoal block is always NUM_CAMERAS images wide, not one.
+NUM_SUBGOAL_CAMERAS = NUM_CAMERAS
 SIGLIP_TOKENS_PER_SUBGOAL = 256
 PROMPT_MAX_LENGTH = 256
 RESPONSE_MAX_LENGTH = 52
@@ -139,10 +151,12 @@ N_OBS_STEPS = 8
 
 VIDEO_TOKENS = NUM_CAMERAS * SIGLIP_TOKENS_PER_CAMERA  # 512
 LANG_START = VIDEO_TOKENS  # 512
-SUBGOAL_TOKENS = NUM_SUBGOAL_CAMERAS * SIGLIP_TOKENS_PER_SUBGOAL  # 256
+SUBGOAL_TOKENS = NUM_SUBGOAL_CAMERAS * SIGLIP_TOKENS_PER_SUBGOAL  # 512
 
-# For inference: no discrete actions; state is 1 timestep for embed_prefix.
-INFER_STATE_TOKENS = 1
+# For inference: no discrete actions. `select_action` -> `_build_history_batch`
+# expands the single-step observation back to the full T = n_obs_steps window,
+# so the state block is the same width as in training.
+INFER_STATE_TOKENS = N_OBS_STEPS
 
 
 class TestPI07PaligemmaLowLevelIntegration:
@@ -277,6 +291,13 @@ class TestPI07PaligemmaLowLevelIntegration:
 
             self._check_ones_before_zeros(suffix_pad_masks[i])
 
+    @classmethod
+    def _num_cross_att_tokens(cls, prefix_pad_masks, tokenizer) -> int:
+        """Training-mode ``num_cross_att_tokens``: prefix minus the trailing
+        ``"Action: "`` indicator and the discrete-action span."""
+        action_lead_len = cls._indicator_lens(tokenizer)["action_lead"]
+        return prefix_pad_masks.shape[1] - action_lead_len - DISCRETE_ACTION_MAX_LENGTH
+
     def _verify_position_ids(
         self,
         prefix_position_ids,
@@ -292,7 +313,11 @@ class TestPI07PaligemmaLowLevelIntegration:
         if inference_mode:
             prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
         else:
-            prefix_offsets = torch.sum(prefix_pad_masks[:, :-DISCRETE_ACTION_MAX_LENGTH], dim=-1)[:, None]
+            # `embed_prefix` drops every `exclude_from_cross_attention` item
+            # from `num_cross_att_tokens`, which is the trailing "Action: "
+            # indicator *and* the discrete-action span — not the span alone.
+            num_cross = self._num_cross_att_tokens(prefix_pad_masks, tokenizer)
+            prefix_offsets = torch.sum(prefix_pad_masks[:, :num_cross], dim=-1)[:, None]
 
         expected_suffix = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
         assert torch.equal(suffix_position_ids, expected_suffix)
@@ -313,12 +338,13 @@ class TestPI07PaligemmaLowLevelIntegration:
         prefix_pad_masks,
         suffix_pad_masks,
         suffix_att_masks,
+        tokenizer,
         inference_mode=False,
     ):
         if inference_mode:
             num_cross = prefix_pad_masks.shape[1]
         else:
-            num_cross = prefix_pad_masks.shape[1] - DISCRETE_ACTION_MAX_LENGTH
+            num_cross = self._num_cross_att_tokens(prefix_pad_masks, tokenizer)
 
         expected = make_att_2d_masks(
             suffix_pad_masks,
@@ -335,7 +361,7 @@ class TestPI07PaligemmaLowLevelIntegration:
     # Main integration test
     # ------------------------------------------------------------------
 
-    @pytest.mark.skip(reason="Requires too much memory, does not fit on RTX 3090 24GB")
+    @require_vram_gib(MIN_VRAM_GIB)
     @pytest.mark.gpu
     @pytest.mark.slow
     def test_complete_pi07_low_level_pipeline(self, lerobot_dataset_metadata):
@@ -349,7 +375,11 @@ class TestPI07PaligemmaLowLevelIntegration:
         batch = {
             "camera0": torch.randn(batch_size, N_OBS_STEPS, 3, 224, 224),
             "camera1": torch.randn(batch_size, N_OBS_STEPS, 3, 224, 224),
+            # One subgoal per camera, as the dataloader emits (see the
+            # NUM_SUBGOAL_CAMERAS note): with only `subgoal0` the second slot
+            # is a masked placeholder and the sg block is not fully attended.
             "subgoal0": torch.randn(batch_size, 3, 224, 224),
+            "subgoal1": torch.randn(batch_size, 3, 224, 224),
             "state": torch.randn(batch_size, N_OBS_STEPS, MAX_STATE_DIM),
             "actions": torch.randn(batch_size, CHUNK_SIZE, MAX_ACTION_DIM),
             "prompt": ["Pick up the red block"],
@@ -373,13 +403,7 @@ class TestPI07PaligemmaLowLevelIntegration:
         }
 
         policy.to(dtype=torch.bfloat16, device="cuda")
-        batch_cuda = {
-            key: value.to("cuda", non_blocking=True, dtype=torch.bfloat16)
-            if isinstance(value, torch.Tensor)
-            else value
-            for key, value in batch.items()
-        }
-        batch_cuda["action_is_pad"] = batch_cuda["action_is_pad"].to(dtype=torch.bool)
+        batch_cuda = to_cuda_bf16(batch)
 
         # ── Monkey-patch to capture intermediate tensors ──────────────
         captured = {}
@@ -488,6 +512,7 @@ class TestPI07PaligemmaLowLevelIntegration:
             captured["prefix_pad_masks"],
             captured["suffix_pad_masks"],
             captured["suffix_att_masks"],
+            tokenizer,
         )
 
         assert isinstance(loss, dict)
@@ -535,6 +560,7 @@ class TestPI07PaligemmaLowLevelIntegration:
             "camera0": batch_cuda["camera0"][:, 0],  # (B, C, H, W)
             "camera1": batch_cuda["camera1"][:, 0],
             "subgoal0": batch_cuda["subgoal0"],  # already (B, C, H, W)
+            "subgoal1": batch_cuda["subgoal1"],
             "state": batch_cuda["state"][:, 0],  # (B, D)
             "prompt": ["Pick up the red block"],
             "response": ["Grasp the red block"],
@@ -595,6 +621,7 @@ class TestPI07PaligemmaLowLevelIntegration:
             captured_infer["prefix_pad_masks"],
             captured_infer["suffix_pad_masks"],
             captured_infer["suffix_att_masks"],
+            tokenizer,
             inference_mode=True,
         )
 
@@ -1929,8 +1956,14 @@ class TestPI07PaligemmaLowLevelSubgoalEmbedding:
         include_tensors: bool,
         subgoal_is_pad: torch.Tensor | bool,
         fill: float = 0.42,
+        present_keys: tuple[str, ...] = ("subgoal0", "subgoal1"),
     ) -> dict:
-        """Build a batch dict for ``prepare_subgoal_images``."""
+        """Build a batch dict for ``prepare_subgoal_images``.
+
+        ``present_keys`` selects which ``subgoal{k}`` tensors the batch carries
+        (only meaningful when ``include_tensors``); pass a subset to exercise
+        the mixed present/missing path.
+        """
         device = torch.device("cpu")
         batch: dict = {"state": torch.zeros(bsz, 1, MAX_STATE_DIM, device=device)}
         pad = torch.as_tensor(subgoal_is_pad, dtype=torch.bool, device=device).reshape(-1)
@@ -1939,8 +1972,9 @@ class TestPI07PaligemmaLowLevelSubgoalEmbedding:
         batch["subgoal_is_pad"] = pad
         if include_tensors:
             img = torch.full((bsz, 3, 224, 224), fill, device=device)
-            batch["subgoal0"] = img
-            batch["subgoal1"] = img * 0.9
+            per_key = {"subgoal0": img, "subgoal1": img * 0.9}
+            for key in present_keys:
+                batch[key] = per_key[key]
         return batch
 
     @classmethod
@@ -2107,6 +2141,68 @@ class TestPI07PaligemmaLowLevelSubgoalEmbedding:
             subgoal_vid_masks=m_pad,
         )
         assert torch.equal(pm_a, pm_b)
+
+    # ------------------------------------------------------------------ #
+    # Only SOME subgoal keys present — slots padded, prefix width unchanged
+    # ------------------------------------------------------------------ #
+    def test_partial_subgoal_keys_pad_out_to_one_slot_per_camera(self):
+        """A batch carrying ``subgoal0`` but not ``subgoal1`` must still produce
+        one slot per camera, with the fabricated slot masked off.
+
+        This is the case `prepare_subgoal_images`'s padding loop exists for:
+        with ``empty_cameras=0`` that loop is the only thing keeping the prefix
+        length independent of which ``subgoal{k}`` keys a batch happens to
+        carry. The all-present and no-key cases (covered above) both stay
+        correct if the loop is deleted — they have nothing missing to pad — so
+        without this test a regression that dropped it would pass the suite.
+
+        The comparison is against the all-present batch, not the no-key one:
+        a batch with no subgoal at all also carries no response and no
+        metadata, so it takes the no-optional-content branch and its trailing
+        block legitimately differs. `test_subgoal_tensors_all_is_pad_matches_
+        missing_keys` is what pins that path.
+        """
+        bsz = 1
+        v_part, m_part = self._prepare_subgoal(
+            self._subgoal_batch(
+                bsz,
+                include_tensors=True,
+                subgoal_is_pad=False,
+                present_keys=("subgoal0",),
+            )
+        )
+        assert len(v_part) == 2, f"missing subgoal key must still occupy a slot, got {len(v_part)}"
+        assert m_part[0].all(), "the supplied subgoal must stay attended"
+        assert not m_part[1].any(), "the fabricated slot must be masked off"
+
+        rt, rm, mt, mm = self._empty_response_metadata(bsz)
+
+        def embed(videos, masks):
+            return self._call_embed_prefix_with_subgoals(
+                bsize=bsz,
+                response_tokens=rt,
+                response_masks=rm,
+                metadata_tokens=mt,
+                metadata_masks=mm,
+                subgoal_videos=videos,
+                subgoal_vid_masks=masks,
+            )
+
+        v_all, m_all = self._prepare_subgoal(
+            self._subgoal_batch(bsz, include_tensors=True, subgoal_is_pad=False)
+        )
+        pm_part, sl = embed(v_part, m_part)
+        pm_all, sl_all = embed(v_all, m_all)
+
+        assert pm_part.shape[1] == pm_all.shape[1], "partial-key prefix width differs from all-present"
+        assert (sl["sg_vid_lo"], sl["sg_vid_hi"]) == (sl_all["sg_vid_lo"], sl_all["sg_vid_hi"])
+
+        # The placeholder occupies real prefix positions but is masked out of
+        # attention, so the supplied subgoal keeps its own slot's tokens.
+        real = pm_part[:, sl["sg_vid_lo"] : sl["sg_vid_lo"] + self._N_SG_TOKENS]
+        placeholder = pm_part[:, sl["sg_vid_lo"] + self._N_SG_TOKENS : sl["sg_vid_hi"]]
+        assert real.all(), "the supplied subgoal's tokens must be attended"
+        assert not placeholder.any(), "the fabricated slot's tokens must be masked out"
 
     # ------------------------------------------------------------------ #
     # Mixed batch — per-sample subgoal_is_pad
