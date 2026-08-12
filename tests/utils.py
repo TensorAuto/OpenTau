@@ -122,12 +122,17 @@ def require_vram_gib(min_gib: float):
 
 
 def to_cuda_bf16(batch: dict, device: str = "cuda") -> dict:
-    """Move a test batch to ``device``, casting tensors to bfloat16 but keeping bool masks bool.
+    """Move a test batch to ``device``, casting only its float tensors to bfloat16.
 
-    A blanket ``.to(dtype=torch.bfloat16)`` over the whole batch silently turns
-    ``*_is_pad`` masks into floats, which real dataloaders never do — the model
-    then fails on `~mask` (bitwise-not is integer/bool only) or, worse, on paths
-    where a float mask happens to broadcast and quietly changes semantics.
+    A blanket ``.to(dtype=torch.bfloat16)`` over the whole batch silently
+    rewrites the dtype of everything a real dataloader emits as bool or int:
+    ``*_is_pad`` masks become floats and the model fails on `~mask` (bitwise-not
+    is integer/bool only), while integer fields get rounded — the dataloader
+    emits ``speed``/``quality`` as ``torch.long`` and ``mistake`` as
+    ``torch.bool``, so casting them changes what ``prepare_metadata``
+    stringifies. Preserving every non-floating dtype keeps the batch shaped like
+    the real thing and keeps a future token-id tensor safe from the same
+    rounding.
 
     Args:
         batch: Batch dict; tensor values are moved and cast, everything else
@@ -135,11 +140,11 @@ def to_cuda_bf16(batch: dict, device: str = "cuda") -> dict:
         device: Target device for the tensor values.
 
     Returns:
-        A new dict with float tensors cast to bfloat16 on ``device`` and bool
-        tensors moved but left bool.
+        A new dict with floating-point tensors cast to bfloat16 on ``device``
+        and every other tensor moved with its dtype intact.
     """
     return {
-        key: value.to(device, non_blocking=True, dtype=None if value.dtype == torch.bool else torch.bfloat16)
+        key: value.to(device, non_blocking=True, dtype=torch.bfloat16 if value.is_floating_point() else None)
         if isinstance(value, torch.Tensor)
         else value
         for key, value in batch.items()
