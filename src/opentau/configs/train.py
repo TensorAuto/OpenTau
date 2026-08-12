@@ -23,7 +23,7 @@ import datetime as dt
 import logging
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Type
 
@@ -67,6 +67,24 @@ def warn(*args, **kwargs):
         **kwargs: Arbitrary keyword arguments passed to print().
     """
     print("WARNING:", *args, **kwargs, file=sys.stderr)
+
+
+# Pipeline-level Standard Data Format field -> the policy-config field it drives.
+#
+# The dataloader is the source of truth for tensor widths: ``WeightedDatasetMixture``
+# pads every ``state``/``actions`` row to ``cfg.max_state_dim`` / ``cfg.max_action_dim``
+# and emits chunks of ``cfg.action_chunk`` (``datasets/dataset_mixture.py``,
+# ``datasets/lerobot_dataset.py``). The policy's projections are sized from its *own*
+# fields, so the pipeline values must be pushed onto the policy config or the model is
+# built for a shape the dataloader never produces. Consequently the pipeline value
+# always wins -- including over a value that came from a pretrained checkpoint, which is
+# why ``validate()`` re-applies this after reloading ``self.policy`` from
+# ``--policy.path``.
+PIPELINE_TO_POLICY_SHAPE_FIELDS: dict[str, str] = {
+    "max_state_dim": "max_state_dim",
+    "max_action_dim": "max_action_dim",
+    "action_chunk": "chunk_size",
+}
 
 
 @dataclass
@@ -235,13 +253,54 @@ class TrainPipelineConfig(HubMixin):
         )
 
         if self.policy:
-            self.policy.max_state_dim = self.max_state_dim
-            self.policy.max_action_state = self.max_action_dim
-            self.policy.chunk_size = self.action_chunk
+            self._propagate_shape_fields_to_policy()
         if self.job_name:
             warn(
                 "cfg.job_name is deprecated and ignored. Set cfg.wandb.project and/or cfg.wandb.name instead."
             )
+
+    def _propagate_shape_fields_to_policy(self):
+        """Force the policy config to agree with the pipeline's Standard Data Format.
+
+        Copies each entry of :data:`PIPELINE_TO_POLICY_SHAPE_FIELDS` from ``self`` onto
+        ``self.policy``. The three widths must move together: the dataloader shapes
+        ``state``, ``actions`` and the action chunk from the *pipeline* fields, so a
+        policy left on a different value is built for tensors it will never be fed.
+
+        Contract, verified by ``tests/configs/test_shape_field_propagation.py``:
+
+        - **The pipeline value always wins**, overwriting whatever the policy config
+          held -- including a width deserialized from a pretrained checkpoint. To train
+          a 6-DoF checkpoint, set the *pipeline* ``max_state_dim`` / ``max_action_dim`` /
+          ``action_chunk``; setting only ``policy.*`` is silently overridden.
+        - **A field the policy dataclass does not declare is skipped, never created.**
+          ``PreTrainedConfig`` subclasses are plain (unslotted) dataclasses, so a bare
+          ``setattr`` of an undeclared name succeeds and produces an attribute nothing
+          reads -- which is how ``max_action_state`` sat here undetected since the
+          initial commit, and how the high-level planners (no ``chunk_size``, no
+          ``max_action_dim``) were being given a junk ``chunk_size``.
+        - An override that actually *changes* a value is logged at WARNING, so the
+          checkpoint-says-6 / pipeline-says-32 case is visible rather than silent.
+        """
+        if self.policy is None:
+            return
+
+        declared = {f.name for f in fields(type(self.policy))}
+        for pipeline_field, policy_field in PIPELINE_TO_POLICY_SHAPE_FIELDS.items():
+            if policy_field not in declared:
+                continue
+            new_value = getattr(self, pipeline_field)
+            old_value = getattr(self.policy, policy_field, None)
+            if old_value != new_value:
+                logging.warning(
+                    f"Overriding policy.{policy_field}={old_value} with "
+                    f"{pipeline_field}={new_value} from the training config. The "
+                    "dataloader shapes every sample from the pipeline-level value, so "
+                    "it wins. If you meant to keep the policy's value (e.g. it came "
+                    f"from a pretrained checkpoint), set {pipeline_field}={old_value} "
+                    "at the top level of the training config instead."
+                )
+            setattr(self.policy, policy_field, new_value)
 
     def validate(self):
         """Validate and finalize the training configuration.
@@ -301,9 +360,10 @@ class TrainPipelineConfig(HubMixin):
             self.scheduler = self.policy.get_scheduler_preset()
 
         if self.policy:
-            self.policy.max_state_dim = self.max_state_dim
-            self.policy.max_action_state = self.max_action_dim
-            self.policy.chunk_size = self.action_chunk
+            # Re-applied here because the ``--policy.path`` / ``resume`` branches above
+            # may have replaced ``self.policy`` wholesale with a config deserialized
+            # from a checkpoint, carrying that checkpoint's widths.
+            self._propagate_shape_fields_to_policy()
 
             # The dataloader letterboxes every sample to ``self.resolution``
             # before the policy sees it; a differing policy-side
