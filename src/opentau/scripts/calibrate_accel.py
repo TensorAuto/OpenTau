@@ -52,6 +52,7 @@ import argparse
 import json
 import logging
 import math
+from dataclasses import replace
 from pathlib import Path
 
 from opentau.policies.accel import AccelProvenance
@@ -133,7 +134,17 @@ def _resolve_provenance(tasks: list[dict]) -> AccelProvenance | None:
     that leaves the calibration unlabelled, and an unlabelled calibration skips the
     comparability check at apply time instead of passing it on false pretences.
     """
-    seen = {json.dumps(t["metrics"]["accel_provenance"], sort_keys=True) for t in tasks}
+    # Compare ONLY the distribution-shifting fields. The full dict also carries
+    # `dataset_index` and `num_scored_dims`, which are per-sample and vary with batch
+    # composition — `AccelProvenance.COMPARABLE_FIELDS` excludes them for exactly that
+    # reason. Diffing the whole dict declares two otherwise-identical tasks "disagreeing",
+    # drops the label, and then `detect()` skips the comparability check altogether: a
+    # fail-open path that silently removes the guard it exists to enforce.
+    provenances = [AccelProvenance.from_dict(t["metrics"]["accel_provenance"]) for t in tasks]
+    seen = {
+        json.dumps({f: getattr(p, f) for f in AccelProvenance.COMPARABLE_FIELDS}, sort_keys=True)
+        for p in provenances
+    }
     if not seen:
         # No task recorded one. Leaving the calibration unlabelled is the honest outcome:
         # `detect` then skips the comparability check rather than passing it falsely.
@@ -146,7 +157,10 @@ def _resolve_provenance(tasks: list[dict]) -> AccelProvenance | None:
             len(seen),
         )
         return None
-    return AccelProvenance.from_dict(json.loads(seen.pop()))
+    # Every task agrees on what matters. Return the first task's provenance with the
+    # per-sample fields cleared: they legitimately differ between tasks, so carrying one
+    # task's values on a calibration fitted over all of them would be a fiction.
+    return replace(provenances[0], dataset_index=(), num_scored_dims=())
 
 
 def fit(

@@ -47,6 +47,7 @@ Usage:
         --server.port=50051 --planner.enabled=true --planner.interval_s=5
 """
 
+import contextlib
 import io
 import logging
 import threading
@@ -123,6 +124,9 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
         # depends on that method having run — a subclass or a test that stubs policy
         # loading still gets the off-by-default behavior rather than an AttributeError.
         self.accel_prefix: int | None = None
+        # Serializes `sample_actions` with the `last_accel` read that follows it. Only
+        # taken when accel is enabled; see `GetActionChunk` for why the pair must be atomic.
+        self._accel_lock = threading.Lock()
 
         logger.info(f"Initializing policy on device: {self.device}")
 
@@ -502,15 +506,21 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
             batch, action_prefix, delay = self._prepare_observation(request)
 
             # Run inference
-            with torch.inference_mode():
+            # `last_accel` is policy state, and the servicer hands one policy object to all
+            # `max_workers` gRPC threads. Sampling and reading the score must therefore be
+            # atomic with respect to each other, or two concurrent requests interleave as
+            # "A samples, B samples, A reads" and A's response carries B's uncertainty --
+            # a wrong number silently attributed to the wrong observation, which is worse
+            # than no number at all. The lock is taken ONLY when accel is enabled, so the
+            # default serving path keeps its existing concurrency exactly.
+            accel_guard = self._accel_lock if self.accel_prefix else contextlib.nullcontext()
+            with accel_guard, torch.inference_mode():
                 action_chunk = self.policy.sample_actions(batch, action_prefix=action_prefix, delay=delay)
                 # action_chunk shape: (batch_size=1, n_action_steps, action_dim)
                 # Remove batch dimension and convert to numpy
                 action_chunk = action_chunk.squeeze(0).to("cpu", torch.float32).numpy()
-                # `last_accel` is per-sample; this path always builds a batch of 1, so the
-                # score for this request is element 0. Read immediately after the call --
-                # it is policy state shared by every worker thread, exactly like the rest
-                # of `self.policy`. Already plain floats, so nothing escapes inference mode.
+                # Per-sample; this path always builds a batch of 1, so element 0 is this
+                # request. Already plain floats, so nothing escapes inference mode.
                 last_accel = getattr(self.policy, "last_accel", None) if self.accel_prefix else None
 
             if last_accel:

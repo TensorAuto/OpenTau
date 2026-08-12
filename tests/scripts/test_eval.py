@@ -575,3 +575,202 @@ class TestEvalPolicyGoalFrameHarvest:
             rows = list(csv.DictReader(f))
         assert len(rows) == 1
         assert rows[0]["decoder"] == "discrete"
+
+
+# ======================================================================================
+# accel telemetry: the code that actually builds the calibration pairing.
+#
+# `rollout` collects one score per *re-plan* (not per env step) and truncates each env's
+# stream at that env's own done step; `eval_policy` then pairs stream i with episode i's
+# success flag. That pairing IS the calibration set, and a silent misalignment in it
+# produces a threshold fitted on the wrong episodes — with nothing failing anywhere.
+# ======================================================================================
+
+
+class _AccelFakeVecEnv:
+    """A vector env just complete enough to drive the real ``rollout``.
+
+    Each env finishes at its own step (``done_steps``), which is the whole point: the
+    rollout loop keeps stepping envs that are already done (it runs until the LAST one
+    finishes), so every chunk planned after an env's done step describes a
+    post-termination state and must be cut from that env's stream.
+    """
+
+    def __init__(self, num_envs, done_steps, max_steps=12):
+        self.num_envs = num_envs
+        self._done_steps = done_steps
+        self._max_steps = max_steps
+        self._step = 0
+
+    def reset(self, seed=None):
+        self._step = 0
+        return {"pixels": np.zeros((self.num_envs, 4, 4, 3), dtype=np.uint8)}, {}
+
+    def call(self, name):
+        return [self._max_steps] * self.num_envs
+
+    def step(self, action):
+        self._step += 1
+        terminated = np.array([self._step >= d for d in self._done_steps])
+        return (
+            {"pixels": np.zeros((self.num_envs, 4, 4, 3), dtype=np.uint8)},
+            np.zeros(self.num_envs, dtype=np.float32),
+            terminated,
+            np.zeros(self.num_envs, dtype=bool),
+            {},
+        )
+
+
+class _ScriptedAccelPolicy(torch.nn.Module):
+    """Policy that re-plans every ``n_action_steps`` and publishes an identifiable score.
+
+    The published value encodes ``(step, env)`` so a truncation or alignment bug shows up
+    as a specific wrong number rather than merely a wrong count.
+    """
+
+    def __init__(self, num_envs, n_action_steps=2, width=None):
+        super().__init__()  # `rollout` asserts the policy is an nn.Module
+        self.num_envs = num_envs
+        self.n_action_steps = n_action_steps
+        self._width = num_envs if width is None else width
+        self._queue = 0
+        self._step = 0
+        self.accel_prefix = 9
+        self.last_accel = None
+        self.last_accel_provenance = types.SimpleNamespace(to_dict=lambda: {"prefix": 9})
+
+    def reset(self):
+        self._queue = 0
+        self._step = 0
+        self.last_accel = None
+
+    def select_action(self, _observation):
+        self.last_accel = None
+        if self._queue == 0:
+            self._queue = self.n_action_steps
+            self.last_accel = [self._step + env / 100.0 for env in range(self._width)]
+        self._queue -= 1
+        self._step += 1
+        return torch.zeros(self.num_envs, 4)
+
+
+def _patch_rollout_env_helpers(monkeypatch):
+    """Neutralize the observation-plumbing helpers ``rollout`` calls around the policy."""
+    mod = "opentau.scripts.eval"
+    monkeypatch.setattr(f"{mod}.preprocess_observation", lambda obs, cfg=None: dict(obs))
+    monkeypatch.setattr(f"{mod}.add_envs_task", lambda env, obs: obs)
+    monkeypatch.setattr(f"{mod}.add_eval_metadata", lambda obs, cfg=None: obs)
+    monkeypatch.setattr(f"{mod}.check_env_attributes_and_types", lambda env: None)
+    monkeypatch.setattr(f"{mod}.add_subgoal_images", lambda obs, gen: obs)
+    monkeypatch.setattr(f"{mod}.get_proc_accelerator", lambda: None)
+
+
+def _run_accel_rollout(monkeypatch, *, done_steps, n_action_steps=2, width=None):
+    from opentau.scripts.eval import rollout
+
+    _patch_rollout_env_helpers(monkeypatch)
+    num_envs = len(done_steps)
+    env = _AccelFakeVecEnv(num_envs, done_steps)
+    policy = _ScriptedAccelPolicy(num_envs, n_action_steps=n_action_steps, width=width)
+    return rollout(env, policy=policy, cfg=_make_eval_cfg())
+
+
+class TestRolloutAccelCollection:
+    def test_stream_is_truncated_at_each_envs_own_done_step(self, monkeypatch):
+        """Env 0 finishes early, env 1 runs long — their streams must differ in length.
+
+        A single shared truncation (or none at all) would give both envs the same stream,
+        padding the early-finishing episode with scores describing a terminated scene.
+        """
+        data = _run_accel_rollout(monkeypatch, done_steps=[2, 8], n_action_steps=2)
+        assert "accel" in data, "rollout must publish the stream when the policy does"
+        early, late = data["accel"]
+        assert len(early) < len(late), f"expected per-env truncation, got {early} vs {late}"
+        # Re-plans happen at rollout steps 0, 2, 4, 6. Env 0's first `done` lands at index
+        # 1, so only the step-0 chunk survives; the step-2 chunk describes an already
+        # terminated scene and is exactly what truncation must remove.
+        assert early == [0.0], early
+        assert late == [0.01, 2.01, 4.01, 6.01], late
+
+    def test_each_env_gets_its_own_column_not_another_envs(self, monkeypatch):
+        """Env i must receive element i of every chunk — never another env's score."""
+        data = _run_accel_rollout(monkeypatch, done_steps=[8, 8], n_action_steps=2)
+        env0, env1 = data["accel"]
+        # The scripted value is `step + env/100`, so the fractional part identifies the env.
+        assert all(round(v % 1, 2) == 0.0 for v in env0), env0
+        assert all(round(v % 1, 2) == 0.01 for v in env1), env1
+
+    def test_provenance_is_recorded_once(self, monkeypatch):
+        data = _run_accel_rollout(monkeypatch, done_steps=[4, 4])
+        assert data["accel_provenance"] == {"prefix": 9}
+
+    def test_a_wrong_width_score_is_dropped_rather_than_wrongly_attributed(self, monkeypatch):
+        """A score list that does not match ``num_envs`` cannot be assigned to envs.
+
+        Zipping it anyway would hand env 0 a number belonging to something else, which is
+        strictly worse than reporting nothing — so the whole stream is dropped.
+        """
+        data = _run_accel_rollout(monkeypatch, done_steps=[4, 4], width=1)
+        assert "accel" not in data, "a width mismatch must not produce a stream"
+
+    def test_no_accel_key_when_the_policy_publishes_nothing(self, monkeypatch):
+        """A policy without the attribute must leave the rollout dict exactly as before."""
+        from opentau.scripts.eval import rollout
+
+        _patch_rollout_env_helpers(monkeypatch)
+
+        class _Plain(_ScriptedAccelPolicy):
+            def select_action(self, _observation):
+                return torch.zeros(self.num_envs, 4)
+
+        policy = _Plain(2)
+        del policy.last_accel
+        del policy.accel_prefix
+        data = rollout(_AccelFakeVecEnv(2, [3, 3]), policy=policy, cfg=_make_eval_cfg())
+        assert "accel" not in data and "accel_provenance" not in data
+
+
+class TestEvalPolicyAccelPairing:
+    def test_stream_is_paired_with_the_matching_episodes_success(self, monkeypatch):
+        """`accels[i]` must line up with `successes[i]` — that pairing is the calibration set."""
+
+        def fake_rollout(**kwargs):
+            data = _make_rollout_data(num_envs=2, successes=[True, False])
+            data["accel"] = [[0.11], [0.22]]
+            data["accel_provenance"] = {"prefix": 9}
+            return data
+
+        monkeypatch.setattr("opentau.scripts.eval.rollout", fake_rollout)
+        info = eval_policy(
+            _FakeEnv(num_envs=2), policy=Mock(), n_episodes=2, cfg=_make_eval_cfg(seed_list="1,2")
+        )
+
+        episodes = info["per_episode"]
+        assert [ep["success"] for ep in episodes] == [True, False]
+        assert [ep["accel"] for ep in episodes] == [[0.11], [0.22]]
+        assert info["accel_provenance"] == {"prefix": 9}
+
+    def test_count_mismatch_drops_the_streams_instead_of_pairing_them(self, monkeypatch):
+        """Fewer streams than episodes must not silently shift every label by one."""
+
+        def fake_rollout(**kwargs):
+            data = _make_rollout_data(num_envs=2, successes=[True, False])
+            data["accel"] = [[0.11]]  # one stream, two episodes
+            return data
+
+        monkeypatch.setattr("opentau.scripts.eval.rollout", fake_rollout)
+        info = eval_policy(
+            _FakeEnv(num_envs=2), policy=Mock(), n_episodes=2, cfg=_make_eval_cfg(seed_list="1,2")
+        )
+        assert all("accel" not in ep for ep in info["per_episode"])
+
+    def test_absent_accel_leaves_per_episode_untouched(self, monkeypatch):
+        monkeypatch.setattr(
+            "opentau.scripts.eval.rollout",
+            lambda **kwargs: _make_rollout_data(num_envs=2, successes=[True, True]),
+        )
+        info = eval_policy(
+            _FakeEnv(num_envs=2), policy=Mock(), n_episodes=2, cfg=_make_eval_cfg(seed_list="1,2")
+        )
+        assert all("accel" not in ep for ep in info["per_episode"])
+        assert "accel_provenance" not in info

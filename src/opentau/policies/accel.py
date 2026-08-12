@@ -583,9 +583,9 @@ def configure_accel(
     Resolution order, first non-``None`` wins:
 
     1. ``override`` — an entry point's own flag.
-    2. ``cfg.policy.accel_prefix`` — read through ``getattr`` so a future config field needs
-       no change here.
-    3. ``$OPENTAU_ACCEL_PREFIX`` — the knob that works today, since no config field exists.
+    2. ``cfg.policy.accel_prefix`` — the config field on ``PreTrainedConfig``; read through
+       ``getattr`` so a policy config predating it still resolves.
+    3. ``$OPENTAU_ACCEL_PREFIX`` — for entry points driven without a config file.
 
     Call this *before* an entry point's warmup ``sample_actions`` calls: the warmup then
     compiles and autotunes the same graph real requests take rather than forcing a recompile
