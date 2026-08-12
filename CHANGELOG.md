@@ -10,6 +10,56 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added — `accel`, a cost-free flow-matching uncertainty proxy — **opt-in, no config_version bump**
+
+Denoising acceleration (`accel`, [arXiv:2607.27933](https://arxiv.org/abs/2607.27933))
+read off the flow-matching samplers' existing Euler loop. A maximally *certain* CFM field
+is an affine-isotropic contraction, so its denoising trajectory is a straight line at
+constant velocity; the normalized total variation of that velocity over the first `p` of
+`T` Euler steps is a proxy for the endpoint posterior's spread. It needs **no extra
+network evaluations, no resampling, no training, and no auxiliary probe** — the whole cost
+is two vector norms per denoise step, on velocities the sampler already computed.
+
+**No `config_version` bump.** Nothing about what the model sees or produces changes.
+`accel` is off by default (`policy.accel_prefix is None`), and with it off every added
+line in a sampler is dead, so the traced/compiled graph is unchanged.
+
+- `opentau.policies.accel` — the estimator (`AccelMeter`), the action-dim mask recovered
+  from the normalization buffers, `AccelProvenance`, and the shared `configure_accel`
+  enable knob (`OPENTAU_ACCEL_PREFIX=auto`, or an explicit prefix `>= 2`).
+- `opentau.utils.accel_detector` — offline one-sided CUSUM + split-conformal calibration
+  over the per-chunk score stream, fitted on **successful** rollouts only.
+- `opentau-accel-diagnose` — measures the bfloat16 rounding floor, the run-to-run spread,
+  and the prefix profile of a checkpoint. **Run this first**: `accel`'s numerator is a
+  difference of nearly-equal vectors, so bf16 puts a positive-biased floor under the score
+  that compresses exactly the low-uncertainty end the method's premise depends on.
+
+Measured on one real 6-DoF SO101 pi05 checkpoint (`T = 10`, QUANTILE action norm, delta
+actions, `max_delay = 4`) over 8 real frames of its own training data: rounding floor
+**0.0056**, redrawn-noise spread **0.0094**, between-observation spread **0.097** — a
+signal-to-floor ratio of **17**, i.e. the score is measuring field geometry rather than
+bf16 arithmetic on that checkpoint. Re-measure per checkpoint; this is not a constant.
+The prefix sweep on the same run reproduces the paper's terminal singularity: step-over-step
+growth in `accel_p` decelerates monotonically (122% → 62% → 69% → 38% → 41% → 33% → 22%)
+and then *reverses* to +48% at the last step, which is why `default_prefix` returns `T - 1`
+and not `T`.
+
+Note that the serving precision is fixed in code rather than chosen by the caller: the
+pi0/pi05 family routes its embedding path through **two** module-level `_preferred_dtype()`
+hooks (one in `modeling_pi05`, one in `paligemma_with_expert`) that return bfloat16
+unconditionally, so `policy.to(torch.float32)` alone does not produce a float32 forward.
+- `opentau-accel-calibrate` — fits a threshold from an eval run's `eval_info.json`.
+- `eval.py` records a per-episode `accel` stream (done-truncated, paired with `success`);
+  the gRPC `ActionChunkResponse` gained an `optional float accel = 5` (explicit presence,
+  so unset is distinguishable from a maximally-confident `0.0`); the RoboCasa server sends
+  an `accel` envelope only to clients that set `"include_accel": true`.
+
+Known limits, all inherited from the method: it is a *local* statement about the action
+expert's posterior at one observation, blind to confident-but-wrong VLM-level errors and
+to precision-sensitive failures, and it degrades on undertrained models. It is a monitor,
+not a guarantee of correctness.
+
+
 ### Changed — openpi-faithful normalization (zero-range dims + epsilon) — **breaking, gated**
 
 `config_version` **0 → 1.** Two openpi-parity normalization changes are bundled

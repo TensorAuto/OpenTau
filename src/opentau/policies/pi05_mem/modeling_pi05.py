@@ -47,6 +47,9 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import NormalizationMode
+from opentau.policies.accel import AccelMeter, executed_row_mask
+from opentau.policies.accel import build_provenance as build_accel_provenance
+from opentau.policies.accel import make_meter as make_accel_meter
 from opentau.policies.normalize import Normalize, Unnormalize
 from opentau.policies.normalize import resolve_num_datasets as _num_datasets
 from opentau.policies.pi05.paligemma_with_expert import (
@@ -414,6 +417,12 @@ class PI05MemPolicy(PreTrainedPolicy):
         discrete_action_vocab_size = getattr(self.discrete_action_processor, "vocab_size", None)
         self.model = PI05MemFlowMatching(config, discrete_action_vocab_size=discrete_action_vocab_size)
 
+        # Denoising-acceleration uncertainty proxy. Off by default: it is free to compute
+        # but its scale is only meaningful against a calibration, so nothing should read it
+        # implicitly. Set to a prefix length (see `opentau.policies.accel.default_prefix`)
+        # to have every `sample_actions` call publish `last_accel`.
+        self.accel_prefix: int | None = None
+
         self.reset()
 
     def reset(self) -> None:
@@ -422,6 +431,8 @@ class PI05MemPolicy(PreTrainedPolicy):
         # Observation history buffers for inference.
         self._obs_buffers: dict[str, deque] = {}
         self._state_buffer: deque | None = None
+        self.last_accel = None
+        self.last_accel_provenance = None
 
     @classmethod
     def from_pretrained(
@@ -731,6 +742,10 @@ class PI05MemPolicy(PreTrainedPolicy):
         """Select a single action given environment observations."""
         self.eval()
 
+        # Cleared every step so a caller can distinguish "this step re-planned and here is
+        # its score" from "this step popped a queued action". `sample_actions` refills it.
+        self.last_accel = None
+
         # Build temporal observation history if configured.
         if self.config.n_obs_steps > 1:
             batch = self._build_history_batch(batch)
@@ -814,6 +829,13 @@ class PI05MemPolicy(PreTrainedPolicy):
                 (0, 0, 0, self.config.chunk_size - normalized.shape[1]),
             )
 
+        accel_meter = make_accel_meter(
+            self,
+            batch_size=lang_tokens.shape[0],
+            device=lang_tokens.device,
+            dataset_index=dataset_index,
+        )
+
         actions = self.model.sample_actions(
             videos,
             vid_masks,
@@ -824,7 +846,17 @@ class PI05MemPolicy(PreTrainedPolicy):
             delay,
             noise=noise,
             obs_history_is_pad=obs_history_is_pad,
+            accel=accel_meter,
         )
+
+        if accel_meter is not None:
+            # `.to_list()` rather than keeping a tensor: anything allocated inside
+            # `torch.inference_mode()` stays an inference tensor even after `.clone()`, and
+            # the first in-place update a downstream CUSUM accumulator makes would raise.
+            self.last_accel = accel_meter.to_list()
+            self.last_accel_provenance = build_accel_provenance(
+                self, accel_meter, dataset_index=dataset_index
+            )
 
         action_feature = self.config.action_feature
         assert action_feature is not None, "action_feature must be set in output_features"
@@ -1529,6 +1561,7 @@ class PI05MemFlowMatching(nn.Module):
         delay: Tensor,
         noise: Tensor | None = None,
         obs_history_is_pad: Tensor | None = None,
+        accel: AccelMeter | None = None,
     ) -> Tensor:
         """Do a full inference forward and compute the action.
 
@@ -1540,6 +1573,13 @@ class PI05MemFlowMatching(nn.Module):
                 start-of-episode zero-fill. ``None`` falls back to "all
                 history padded except current" via ``embed_prefix`` and the
                 encoder's None-fallback.
+            accel: Optional denoising-acceleration meter. When supplied, the per-step
+                velocities are folded into an uncertainty proxy at zero extra network
+                cost; when ``None`` every added branch is a compile-time constant and the
+                traced graph is unchanged. Passed in rather than stashed on ``self``
+                because this method is ``torch.compile``d and ONNX-exported at several
+                entry points, where a write to an ``nn.Module`` attribute inside the traced
+                region is the construct most likely to break.
         """
         bsize = lang_tokens.shape[0]
         device = lang_tokens.device
@@ -1577,6 +1617,16 @@ class PI05MemFlowMatching(nn.Module):
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
         prefix_mask = rearrange(torch.arange(self.config.chunk_size, device=device), "c -> 1 c") < delay
+        if accel is not None:
+            accel.set_row_mask(
+                executed_row_mask(
+                    prefix_mask=prefix_mask,
+                    delay=delay,
+                    chunk_size=self.config.chunk_size,
+                    n_action_steps=self.config.n_action_steps,
+                    device=device,
+                )
+            )
         while time >= -dt / 2:
             x_t = torch.where(rearrange(prefix_mask, "b c -> b c 1"), action_prefix, x_t)
             masked_time = torch.where(prefix_mask, 0, time)
@@ -1587,6 +1637,11 @@ class PI05MemFlowMatching(nn.Module):
                 x_t,
                 masked_time,
             )
+            if accel is not None:
+                # Must read `v_t` here: the frozen-prefix clamp at the top of the loop means
+                # `(x_{t+1} - x_t) / dt != v_t` on those rows, so accel cannot be recovered
+                # post-hoc from the returned chunk.
+                accel.update(v_t)
 
             x_t += dt * v_t
             time += dt

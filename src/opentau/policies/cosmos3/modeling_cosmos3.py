@@ -44,6 +44,9 @@ from einops import rearrange, repeat
 from torch import Tensor, nn
 from transformers import AutoProcessor, Qwen3VLConfig
 
+from opentau.policies.accel import AccelMeter, executed_row_mask
+from opentau.policies.accel import build_provenance as build_accel_provenance
+from opentau.policies.accel import make_meter as make_accel_meter
 from opentau.policies.cosmos3.configuration_cosmos3 import Cosmos3Config
 from opentau.policies.cosmos3.qwen3vl_with_expert import Qwen3VLWithExpertModel
 from opentau.policies.normalize import Normalize, Unnormalize
@@ -372,8 +375,30 @@ class Cosmos3FlowMatching(nn.Module):
         action_prefix: Tensor,
         delay: Tensor,
         noise: Tensor | None = None,
+        accel: AccelMeter | None = None,
     ) -> Tensor:
-        """Euler-integrate the flow from noise to an action chunk (π0.5 sampler)."""
+        """Euler-integrate the flow from noise to an action chunk (π0.5 sampler).
+
+        Args:
+            input_ids: Qwen3-VL prefix token ids.
+            attention_mask: Prefix attention mask (1 = real token).
+            pixel_values: Flattened image patches, or ``None`` for a text-only prefix.
+            image_grid_thw: Per-image patch grid, or ``None`` alongside ``pixel_values``.
+            state: Proprioceptive state, already padded to ``max_state_dim``.
+            action_prefix: Normalized committed actions used to freeze the first ``delay`` rows.
+            delay: Number of frozen real-time-chunking rows.
+            noise: Optional starting noise; drawn here when ``None``.
+            accel: Optional denoising-acceleration meter. When supplied, the per-step
+                velocities this loop already computes are folded into an uncertainty proxy
+                at zero extra network cost; when ``None`` every added branch is a
+                compile-time constant and the traced graph is unchanged. Passed in rather
+                than stashed on ``self`` because a write to an ``nn.Module`` attribute
+                inside a traced region is a Dynamo side-effect that breaks
+                ``fullgraph``/ONNX export.
+
+        Returns:
+            The denoised action chunk, ``(B, chunk_size, max_action_dim)``.
+        """
         device = input_ids.device
         bsize = input_ids.shape[0]
         if noise is None:
@@ -395,12 +420,28 @@ class Cosmos3FlowMatching(nn.Module):
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
         prefix_mask = rearrange(torch.arange(self.config.chunk_size, device=device), "c -> 1 c") < delay
+        if accel is not None:
+            accel.set_row_mask(
+                executed_row_mask(
+                    prefix_mask=prefix_mask,
+                    delay=delay,
+                    chunk_size=self.config.chunk_size,
+                    n_action_steps=self.config.n_action_steps,
+                    device=device,
+                )
+            )
         while time >= -dt / 2:
             x_t = torch.where(rearrange(prefix_mask, "b c -> b c 1"), action_prefix, x_t)
             masked_time = torch.where(prefix_mask, torch.zeros_like(time), time).expand(
                 bsize, self.config.chunk_size
             )
             v_t = self._run_expert(cached_kv, prefix_position_ids, prefix_pad, x_t, masked_time, state)
+            if accel is not None:
+                # Must read `v_t` here: the frozen-prefix clamp at the top of the loop means
+                # `(x_{t+1} - x_t) / dt != v_t` on those rows, so accel cannot be recovered
+                # post-hoc from the returned chunk.
+                accel.update(v_t)
+
             x_t = x_t + dt * v_t
             time = time + dt
 
@@ -467,10 +508,19 @@ class Cosmos3Policy(PreTrainedPolicy):
             self.processor = AutoProcessor.from_pretrained(config.pretrained_backbone_repo_id)
 
         self.model = Cosmos3FlowMatching(config, qwen3vl_config=qwen3vl_config)
+
+        # Denoising-acceleration uncertainty proxy. Off by default: it is free to compute
+        # but its scale is only meaningful against a calibration, so nothing should read it
+        # implicitly. Set to a prefix length (see `opentau.policies.accel.default_prefix`)
+        # to have every `sample_actions` call publish `last_accel`.
+        self.accel_prefix: int | None = None
+
         self.reset()
 
     def reset(self) -> None:
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
+        self.last_accel = None
+        self.last_accel_provenance = None
 
     def get_optim_params(self) -> list[nn.Parameter]:
         # Only the trainable expert + projections (the 32B backbone is frozen) -- never
@@ -575,6 +625,11 @@ class Cosmos3Policy(PreTrainedPolicy):
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         self.eval()
+
+        # Cleared every step so a caller can distinguish "this step re-planned and here is
+        # its score" from "this step popped a queued action". `sample_actions` refills it.
+        self.last_accel = None
+
         if len(self._action_queue) == 0 or len(self._action_queue) <= self.config.max_delay:
             action_prefix = None
             delay = 0
@@ -615,6 +670,13 @@ class Cosmos3Policy(PreTrainedPolicy):
             action_prefix = self.normalize_targets({"actions": action_prefix}, dataset_index)["actions"]
             action_prefix = F.pad(action_prefix, (0, 0, 0, self.config.chunk_size - action_prefix.shape[1]))
 
+        accel_meter = make_accel_meter(
+            self,
+            batch_size=bsize,
+            device=device,
+            dataset_index=dataset_index,
+        )
+
         actions = self.model.sample_actions(
             input_ids=mm["input_ids"],
             attention_mask=mm["attention_mask"],
@@ -624,7 +686,18 @@ class Cosmos3Policy(PreTrainedPolicy):
             action_prefix=action_prefix,
             delay=delay,
             noise=noise,
+            accel=accel_meter,
         )
+
+        if accel_meter is not None:
+            # `.to_list()` rather than keeping a tensor: anything allocated inside
+            # `torch.inference_mode()` stays an inference tensor even after `.clone()`, and
+            # the first in-place update a downstream CUSUM accumulator makes would raise.
+            self.last_accel = accel_meter.to_list()
+            self.last_accel_provenance = build_accel_provenance(
+                self, accel_meter, dataset_index=dataset_index
+            )
+
         original_action_dim = self.config.action_feature.shape[0]
         actions = actions[:, :, :original_action_dim]
         return self.unnormalize_outputs({"actions": actions}, dataset_index)["actions"]

@@ -231,6 +231,11 @@ _UNROUTED_CAST_IS_INTENTIONAL = {
     # ONNX export casts *up* to float32, which cannot round the pinned tables. This one is
     # safe because of a value rather than a location, so it is pinned separately below.
     "export_to_onnx.py": "float32 upcast, not a downcast",
+    # The accel diagnostic re-runs the sampler in float32 to isolate the bf16 rounding floor.
+    # That is an upcast, which cannot round the pinned tables, and the cast *back* to the
+    # serving dtype does route through the helper. Same value-not-location exemption as the
+    # ONNX export, and pinned the same way below.
+    "diagnose_accel.py": "float32 upcast, not a downcast",
 }
 
 _DTYPE_ATTRS = frozenset({"bfloat16", "float16", "half", "float32", "float64", "float", "double"})
@@ -395,4 +400,41 @@ def test_onnx_export_exemption_is_a_float32_upcast_not_a_downcast():
     assert assigned == {"torch.float32"}, (
         f"export_to_onnx.py binds dtype to {assigned}; its exemption from "
         "to_dtype_preserving_siglip_float32 only holds for a float32 upcast."
+    )
+
+
+def test_accel_diagnostic_exemption_is_a_float32_upcast_and_restores_through_the_helper():
+    """``diagnose_accel.py`` is exempt because of a *value*, so pin the value.
+
+    The filename-keyed allowlist entry would keep passing if the direct cast were switched
+    to bfloat16 — precisely the silent re-rounding rule 6 forbids. Pin both halves of what
+    makes it safe: every *direct* cast is the float32 upcast, and the cast back down to the
+    serving dtype goes through the preserving helper.
+    """
+    path = _SCRIPTS_ROOT / "diagnose_accel.py"
+    tree = ast.parse(path.read_text())
+    flagged = set(_policy_dtype_casts(path))
+    assert flagged, "diagnose_accel.py no longer casts directly; drop its allowlist entry"
+
+    dtypes = {
+        ast.unparse(kw.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and node.lineno in flagged
+        for kw in node.keywords
+        if kw.arg == "dtype"
+    } | {
+        ast.unparse(arg)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and node.lineno in flagged
+        for arg in node.args
+        if _is_dtype_arg(arg)
+    }
+    assert dtypes == {"torch.float32"}, (
+        f"diagnose_accel.py casts a policy to {dtypes}; its exemption from "
+        "to_dtype_preserving_siglip_float32 only holds for a float32 upcast."
+    )
+    assert _calls_preserving_helper(path), (
+        "diagnose_accel.py upcasts to float32 but no longer restores the serving dtype "
+        "through to_dtype_preserving_siglip_float32, so the pinned SigLIP patch/position "
+        "embeddings get re-rounded (CLAUDE.md rule 6)."
     )

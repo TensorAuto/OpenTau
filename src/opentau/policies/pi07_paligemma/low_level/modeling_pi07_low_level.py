@@ -38,6 +38,9 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import NormalizationMode
+from opentau.policies.accel import AccelMeter, executed_row_mask
+from opentau.policies.accel import build_provenance as build_accel_provenance
+from opentau.policies.accel import make_meter as make_accel_meter
 from opentau.policies.flash_attn_cuda import make_att_block_ids
 from opentau.policies.layers import PerGroupLinear
 from opentau.policies.normalize import Normalize, Unnormalize, _materialize
@@ -435,6 +438,12 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
             config, discrete_action_vocab_size=discrete_action_vocab_size, num_datasets=num_datasets
         )
 
+        # Denoising-acceleration uncertainty proxy. Off by default: it is free to compute
+        # but its scale is only meaningful against a calibration, so nothing should read it
+        # implicitly. Set to a prefix length (see `opentau.policies.accel.default_prefix`)
+        # to have every flow-matching `sample_actions` call publish `last_accel`.
+        self.accel_prefix: int | None = None
+
         self.reset()
 
     def reset(self) -> None:
@@ -442,6 +451,8 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
         self._state_buffer: deque | None = None
         self._obs_buffers: dict[str, deque] = {}
+        self.last_accel = None
+        self.last_accel_provenance = None
 
     @classmethod
     def from_pretrained(
@@ -846,6 +857,10 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         """
         self.eval()
 
+        # Cleared every step so a caller can distinguish "this step re-planned and here is
+        # its score" from "this step popped a queued action". `sample_actions` refills it.
+        self.last_accel = None
+
         if self.config.n_obs_steps > 1:
             batch = self._build_history_batch(batch)
 
@@ -1143,11 +1158,23 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
 
         self._hydrate_optional_conditioning_batch(batch)
 
+        # `accel` measures the GEOMETRY of the flow-matching denoising trajectory — the bend
+        # accumulated across the velocity field the Euler integrator evaluates. The discrete
+        # branch below never runs that integrator (it autoregressively decodes FAST tokens),
+        # so there is no velocity sequence and no score to report. Both fields are therefore
+        # cleared HERE, before the branch, so every early return leaves them `None` by
+        # construction: publishing a stale value from an earlier flow-matching call would
+        # attribute one chunk's uncertainty to a completely different chunk, silently and
+        # with no way for a consumer to tell. Repopulated only on the flow path below.
+        self.last_accel = None
+        self.last_accel_provenance = None
+
         if self.config.eval_use_discrete_actions:
             if action_prefix is not None or (delay is not None and int(delay.item()) != 0):
                 raise NotImplementedError(
                     "eval_use_discrete_actions does not support a frozen action prefix (max_delay > 0)."
                 )
+            # accel stays None on this return: it is a flow-matching-only statistic (see above).
             return self._sample_actions_discrete(batch, dataset_index)
 
         prefix_items = self._build_prefix_items(batch, include_discrete_actions=False)
@@ -1180,13 +1207,30 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
                 t_dim,
             )
 
+        accel_meter = make_accel_meter(
+            self,
+            batch_size=bsize,
+            device=device,
+            dataset_index=dataset_index,
+        )
+
         actions = self.model.sample_actions(
             prefix_items,
             action_prefix=action_prefix,
             delay=delay,
             noise=noise,
             group_index=dataset_index,
+            accel=accel_meter,
         )
+
+        if accel_meter is not None:
+            # `.to_list()` rather than keeping a tensor: anything allocated inside
+            # `torch.inference_mode()` stays an inference tensor even after `.clone()`, and
+            # the first in-place update a downstream CUSUM accumulator makes would raise.
+            self.last_accel = accel_meter.to_list()
+            self.last_accel_provenance = build_accel_provenance(
+                self, accel_meter, dataset_index=dataset_index
+            )
 
         # Unpad actions
         original_action_dim = self.config.action_feature.shape[0]
@@ -2719,6 +2763,7 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         delay: Tensor,
         noise: Tensor | None = None,
         group_index: Tensor | None = None,
+        accel: AccelMeter | None = None,
     ) -> Tensor:
         """Do a full inference forward and compute the action.
 
@@ -2729,6 +2774,14 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
             action_prefix: Frozen action prefix ``(B, chunk_size, max_action_dim)``.
             delay: Number of frozen delay actions at the start of the chunk.
             noise: Optional pre-sampled noise.
+            group_index: Per-sample projection/norm group index.
+            accel: Optional denoising-acceleration meter. When supplied, the per-step
+                velocities are folded into an uncertainty proxy at zero extra network
+                cost; when ``None`` every added branch is a compile-time constant and the
+                traced graph is unchanged. Passed in rather than stashed on ``self``
+                because this method is ``torch.compile``d and ONNX-exported at several
+                entry points, where a write to an ``nn.Module`` attribute inside the traced
+                region is the construct most likely to break.
 
         Returns:
             The sampled action tensor.
@@ -2772,6 +2825,16 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
         prefix_mask = rearrange(torch.arange(self.config.chunk_size, device=device), "c -> 1 c") < delay
+        if accel is not None:
+            accel.set_row_mask(
+                executed_row_mask(
+                    prefix_mask=prefix_mask,
+                    delay=delay,
+                    chunk_size=self.config.chunk_size,
+                    n_action_steps=self.config.n_action_steps,
+                    device=device,
+                )
+            )
         while time >= -dt / 2:
             # if delay is greater than 0, then freeze the action prefix at the beginning of action chunk
             x_t = torch.where(rearrange(prefix_mask, "b c -> b c 1"), action_prefix, x_t)
@@ -2783,6 +2846,11 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
                 masked_time,
                 group_index=group_index,
             )
+            if accel is not None:
+                # Must read `v_t` here: the frozen-prefix clamp at the top of the loop means
+                # `(x_{t+1} - x_t) / dt != v_t` on those rows, so accel cannot be recovered
+                # post-hoc from the returned chunk.
+                accel.update(v_t)
 
             # Euler step
             x_t += dt * v_t

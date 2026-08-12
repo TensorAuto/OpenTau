@@ -109,6 +109,8 @@ opentau-so101-record = "opentau.scripts.so101.record:main"
 opentau-so101-setup-motors = "opentau.scripts.so101.setup_motors:main"
 opentau-so101-find-port = "opentau.scripts.so101.find_port:main"
 opentau-so101-find-cameras = "opentau.scripts.so101.find_cameras:main"
+opentau-accel-diagnose = "opentau.scripts.diagnose_accel:main"
+opentau-accel-calibrate = "opentau.scripts.calibrate_accel:main"
 
 [project.optional-dependencies]
 dev = ["pre-commit>=3.7.0",

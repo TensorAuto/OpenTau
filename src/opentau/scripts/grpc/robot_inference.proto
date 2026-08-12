@@ -61,6 +61,22 @@ message ActionChunkResponse {
     int64 timestamp_ns = 2;          // Server timestamp
     string request_id = 3;           // Matching request ID
     float inference_time_ms = 4;     // Time taken for inference
+
+    // Denoising-acceleration uncertainty proxy for this chunk (arXiv:2607.27933);
+    // see `opentau.policies.accel`. Higher means a more bent denoising trajectory,
+    // i.e. more posterior spread. NaN means the score was undefined for this chunk
+    // (see `AccelMeter.value`); it is NOT a low-uncertainty reading.
+    //
+    // `optional` (proto3 explicit presence) on purpose: a bare `float` defaults to
+    // 0.0 when unset, and 0.0 is the *most certain* possible score — a client could
+    // not tell "accel disabled" from "maximally confident". Check presence with
+    // `response.HasField("accel")` before reading. Unset whenever the serving policy
+    // has accel disabled (the default) or does not compute it.
+    //
+    // Added after field 4; old clients ignore the unknown field number and are
+    // unaffected. The score is only comparable within a fixed
+    // (task, embodiment, norm head, action norm mode, T, prefix, dtype) tuple.
+    optional float accel = 5;
 }
 
 // Health check request

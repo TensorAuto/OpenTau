@@ -29,6 +29,9 @@ from einops import rearrange, reduce
 from torch import Tensor, nn
 from transformers import AutoTokenizer
 
+from opentau.policies.accel import AccelMeter, executed_row_mask
+from opentau.policies.accel import build_provenance as build_accel_provenance
+from opentau.policies.accel import make_meter as make_accel_meter
 from opentau.policies.normalize import Normalize, Unnormalize
 from opentau.policies.normalize import resolve_num_datasets as _num_datasets
 from opentau.policies.pi0.configuration_pi0 import PI0Config
@@ -232,11 +235,19 @@ class PI0Policy(PreTrainedPolicy):
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
         self.model = PI0FlowMatching(config)
 
+        # Denoising-acceleration uncertainty proxy. Off by default: it is free to compute
+        # but its scale is only meaningful against a calibration, so nothing should read it
+        # implicitly. Set to a prefix length (see `opentau.policies.accel.default_prefix`)
+        # to have every `sample_actions` call publish `last_accel`.
+        self.accel_prefix: int | None = None
+
         self.reset()
 
     def reset(self) -> None:
         """This should be called whenever the environment is reset."""
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
+        self.last_accel = None
+        self.last_accel_provenance = None
 
     @classmethod
     def _transform_state_dict_keys(cls, state_dict: dict) -> dict:
@@ -436,6 +447,10 @@ class PI0Policy(PreTrainedPolicy):
         """
         self.eval()
 
+        # Cleared every step so a caller can distinguish "this step re-planned and here is
+        # its score" from "this step popped a queued action". `sample_actions` refills it.
+        self.last_accel = None
+
         # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
         # querying the policy.
         if len(self._action_queue) <= self.config.safety_buffer:
@@ -467,6 +482,17 @@ class PI0Policy(PreTrainedPolicy):
         lang_tokens, lang_masks = self.prepare_language(batch)
 
         state = batch["state"]
+
+        # Batch size / device are taken from `state` because the inner sampler derives its
+        # own `bsize` / `device` from it — so the meter's rows line up with the sampler's
+        # by construction on batched multi-env rollouts.
+        accel_meter = make_accel_meter(
+            self,
+            batch_size=state.shape[0],
+            device=state.device,
+            dataset_index=dataset_index,
+        )
+
         actions = self.model.sample_actions(
             images,
             img_masks,
@@ -474,7 +500,17 @@ class PI0Policy(PreTrainedPolicy):
             lang_masks,
             state,
             noise=noise,
+            accel=accel_meter,
         )
+
+        if accel_meter is not None:
+            # `.to_list()` rather than keeping a tensor: anything allocated inside
+            # `torch.inference_mode()` stays an inference tensor even after `.clone()`, and
+            # the first in-place update a downstream CUSUM accumulator makes would raise.
+            self.last_accel = accel_meter.to_list()
+            self.last_accel_provenance = build_accel_provenance(
+                self, accel_meter, dataset_index=dataset_index
+            )
 
         # Unpad actions
         original_action_dim = self.config.action_feature.shape[0]
@@ -1005,6 +1041,7 @@ class PI0FlowMatching(nn.Module):
         lang_masks: Tensor,
         state: Tensor,
         noise: Tensor | None = None,
+        accel: AccelMeter | None = None,
     ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors).
 
@@ -1015,6 +1052,13 @@ class PI0FlowMatching(nn.Module):
             lang_masks: Language mask tensor.
             state: State tensor.
             noise: Optional noise tensor.
+            accel: Optional denoising-acceleration meter. When supplied, the per-step
+                velocities are folded into an uncertainty proxy at zero extra network
+                cost; when ``None`` every added branch is a compile-time constant and the
+                traced graph is unchanged. Passed in rather than stashed on ``self``
+                because this method is ``torch.compile``d and ONNX-exported at several
+                entry points, where a write to an ``nn.Module`` attribute inside the traced
+                region is the construct most likely to break.
 
         Returns:
             The sampled action tensor.
@@ -1051,6 +1095,21 @@ class PI0FlowMatching(nn.Module):
 
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
+        if accel is not None:
+            # pi0 has no real-time-chunking frozen prefix (no `action_prefix`/`delay`
+            # plumbing at all, and `select_action` slices `actions[:n_action_steps]`), so
+            # the only rows to exclude are those outside the executed window. An all-False
+            # `prefix_mask` and `delay = 0` express exactly that through the shared helper,
+            # keeping the window arithmetic in one place instead of re-deriving it here.
+            accel.set_row_mask(
+                executed_row_mask(
+                    prefix_mask=torch.zeros(1, self.config.chunk_size, dtype=torch.bool, device=device),
+                    delay=torch.zeros((), dtype=torch.long, device=device),
+                    chunk_size=self.config.chunk_size,
+                    n_action_steps=self.config.n_action_steps,
+                    device=device,
+                )
+            )
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
             v_t = self.denoise_step(
@@ -1060,6 +1119,11 @@ class PI0FlowMatching(nn.Module):
                 x_t,
                 expanded_time,
             )
+            if accel is not None:
+                # Read the velocity the loop already evaluated — no extra network call, and
+                # no post-hoc reconstruction from consecutive `x_t` (which would bake in the
+                # dtype/rounding of the in-place Euler update below).
+                accel.update(v_t)
 
             # Euler step
             x_t += dt * v_t

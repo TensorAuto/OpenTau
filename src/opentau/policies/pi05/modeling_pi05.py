@@ -37,6 +37,9 @@ from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import NormalizationMode
 from opentau.datasets.action_indexing import add_chunk_start_state, subtract_chunk_start_state
 from opentau.datasets.grounding.tokenizer_utils import ensure_loc_tokens
+from opentau.policies.accel import AccelMeter, executed_row_mask
+from opentau.policies.accel import build_provenance as build_accel_provenance
+from opentau.policies.accel import make_meter as make_accel_meter
 from opentau.policies.normalize import Normalize, Unnormalize
 from opentau.policies.normalize import resolve_num_datasets as _num_datasets
 from opentau.policies.pi05.configuration_pi05 import PI05Config
@@ -340,11 +343,19 @@ class PI05Policy(PreTrainedPolicy):
             language_tokenizer=self.language_tokenizer,
         )
 
+        # Denoising-acceleration uncertainty proxy. Off by default: it is free to compute
+        # but its scale is only meaningful against a calibration, so nothing should read it
+        # implicitly. Set to a prefix length (see `opentau.policies.accel.default_prefix`)
+        # to have every `sample_actions` call publish `last_accel`.
+        self.accel_prefix: int | None = None
+
         self.reset()
 
     def reset(self) -> None:
         """This should be called whenever the environment is reset."""
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
+        self.last_accel = None
+        self.last_accel_provenance = None
 
     @classmethod
     def from_pretrained(
@@ -648,6 +659,10 @@ class PI05Policy(PreTrainedPolicy):
         """
         self.eval()
 
+        # Cleared every step so a caller can distinguish "this step re-planned and here is
+        # its score" from "this step popped a queued action". `sample_actions` refills it.
+        self.last_accel = None
+
         if len(self._action_queue) == 0 or len(self._action_queue) <= self.config.max_delay:
             # Use current queue as action prefix to replenish
             action_prefix = None
@@ -737,6 +752,13 @@ class PI05Policy(PreTrainedPolicy):
 
         state = self.prepare_state(batch) if self.config.state_type == "continuous" else None
 
+        accel_meter = make_accel_meter(
+            self,
+            batch_size=lang_tokens.shape[0],
+            device=lang_tokens.device,
+            dataset_index=dataset_index,
+        )
+
         actions = self.model.sample_actions(
             images,
             img_masks,
@@ -746,7 +768,17 @@ class PI05Policy(PreTrainedPolicy):
             delay,
             noise=noise,
             state=state,
+            accel=accel_meter,
         )
+
+        if accel_meter is not None:
+            # `.to_list()` rather than keeping a tensor: anything allocated inside
+            # `torch.inference_mode()` stays an inference tensor even after `.clone()`, and
+            # the first in-place update a downstream CUSUM accumulator makes would raise.
+            self.last_accel = accel_meter.to_list()
+            self.last_accel_provenance = build_accel_provenance(
+                self, accel_meter, dataset_index=dataset_index
+            )
 
         # Unpad actions
         original_action_dim = self.config.action_feature.shape[0]
@@ -1755,6 +1787,7 @@ class PI05FlowMatching(nn.Module):
         delay: Tensor,
         noise: Tensor | None = None,
         state: Tensor | None = None,
+        accel: AccelMeter | None = None,
     ) -> Tensor:
         """Do a full inference forward and compute the action.
 
@@ -1769,6 +1802,13 @@ class PI05FlowMatching(nn.Module):
             state: Optional continuous state tensor of shape (batch_size, max_state_dim).
             indicator_tokens: Optional indicator token tensor.
             indicator_masks: Optional indicator mask tensor.
+            accel: Optional denoising-acceleration meter. When supplied, the per-step
+                velocities are folded into an uncertainty proxy at zero extra network
+                cost; when ``None`` every added branch is a compile-time constant and the
+                traced graph is unchanged. Passed in rather than stashed on ``self``
+                because this method is ``torch.compile``d and ONNX-exported at several
+                entry points, where a write to an ``nn.Module`` attribute inside the traced
+                region is the construct most likely to break.
         Returns:
             The sampled action tensor.
         """
@@ -1837,6 +1877,16 @@ class PI05FlowMatching(nn.Module):
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
         prefix_mask = rearrange(torch.arange(self.config.chunk_size, device=device), "c -> 1 c") < delay
+        if accel is not None:
+            accel.set_row_mask(
+                executed_row_mask(
+                    prefix_mask=prefix_mask,
+                    delay=delay,
+                    chunk_size=self.config.chunk_size,
+                    n_action_steps=self.config.n_action_steps,
+                    device=device,
+                )
+            )
         while time >= -dt / 2:
             # if delay is greater than 0, then freeze the action prefix at the beginning of action chunk
             x_t = torch.where(rearrange(prefix_mask, "b c -> b c 1"), action_prefix, x_t)
@@ -1847,6 +1897,11 @@ class PI05FlowMatching(nn.Module):
                 x_t,
                 masked_time,
             )
+            if accel is not None:
+                # Must read `v_t` here: the frozen-prefix clamp at the top of the loop means
+                # `(x_{t+1} - x_t) / dt != v_t` on those rows, so accel cannot be recovered
+                # post-hoc from the returned chunk.
+                accel.update(v_t)
 
             # Euler step
             x_t += dt * v_t

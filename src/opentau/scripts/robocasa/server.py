@@ -34,6 +34,24 @@ Each request runs ``policy.sample_actions`` (no internal queue on the server). T
 full predicted chunk per environment: shape ``(n_action_steps, action_dim)`` (trimmed/padded to
 ``--robocasa_action_dim``). **Batched** requests stack observations and call ``sample_actions`` once.
 
+Optional ``accel`` envelope
+---------------------------
+
+The two replies above are *bare* MessagePack arrays, not dicts, so there is no free key to
+hang the denoising-acceleration uncertainty proxy (:mod:`opentau.policies.accel`) on —
+switching to a dict unconditionally would break every stock ``robocasa.scripts.client``.
+A client therefore has to opt in per request by setting ``"include_accel": true``, which
+(and only which) changes the reply shape to a dict::
+
+    Single:  ``{ "actions": [[float, ...], ...], "accel": float | null }``
+    Batched: ``{ "actions": [ [[float, ...], ...], ... ], "accel": [float, ...] | null }``
+
+``accel`` is ``null`` when the server has the proxy disabled (the default) or the policy
+published no score; individual entries may be ``NaN``, which means *undefined*, not
+*confident* (see :meth:`opentau.policies.accel.AccelMeter.value`). In the batched form the
+list is one score per ``items`` entry, in request order. Enable the proxy server-side with
+``--robocasa_accel_prefix auto`` (or an explicit prefix ``>= 2``).
+
 Run::
 
     python -m opentau.scripts.robocasa.server \\
@@ -65,6 +83,7 @@ import websockets
 
 from opentau.configs import parser
 from opentau.configs.train import TrainPipelineConfig
+from opentau.policies.accel import configure_accel
 from opentau.policies.factory import get_policy_class
 from opentau.policies.utils import to_dtype_preserving_siglip_float32
 from opentau.utils.random_utils import set_seed
@@ -77,6 +96,9 @@ ROBOCASA_HOST: str = "0.0.0.0"  # nosec B104 — default listen; use ``--robocas
 ROBOCASA_PORT: int = 8765
 ROBOCASA_ACTION_DIM: int = 16
 ROBOCASA_TORCH_COMPILE: bool = True
+# Denoising-acceleration prefix: ``None`` keeps the proxy off (the default), ``"auto"``
+# selects the paper's ``T - 1``, an integer ``>= 2`` is used verbatim.
+ROBOCASA_ACCEL_PREFIX: str | None = None
 
 # Fallback zero chunk length when sending an error response (client should discard).
 _ERROR_RESPONSE_CHUNK_STEPS: int = 8
@@ -85,6 +107,7 @@ _ERROR_RESPONSE_CHUNK_STEPS: int = 8
 def _parse_robocasa_cli() -> None:
     """Read ``--robocasa_*`` flags into module globals and remove them from ``sys.argv``."""
     global ROBOCASA_HOST, ROBOCASA_PORT, ROBOCASA_ACTION_DIM, ROBOCASA_TORCH_COMPILE
+    global ROBOCASA_ACCEL_PREFIX
 
     def _bool_arg(value: str) -> bool:
         return value.lower() in ("true", "1", "yes", "y")
@@ -94,6 +117,7 @@ def _parse_robocasa_cli() -> None:
     p.add_argument("--robocasa_port", type=int, default=None)
     p.add_argument("--robocasa_action_dim", type=int, default=None)
     p.add_argument("--robocasa_torch_compile", type=str, default=None)
+    p.add_argument("--robocasa_accel_prefix", type=str, default=None)
     args, rest = p.parse_known_args(sys.argv[1:])
     if args.robocasa_host is not None:
         ROBOCASA_HOST = args.robocasa_host
@@ -103,6 +127,8 @@ def _parse_robocasa_cli() -> None:
         ROBOCASA_ACTION_DIM = args.robocasa_action_dim
     if args.robocasa_torch_compile is not None:
         ROBOCASA_TORCH_COMPILE = _bool_arg(args.robocasa_torch_compile)
+    if args.robocasa_accel_prefix is not None:
+        ROBOCASA_ACCEL_PREFIX = args.robocasa_accel_prefix
     sys.argv = [sys.argv[0]] + rest
 
 
@@ -162,6 +188,43 @@ def pack_actions_batch(chunks: List[np.ndarray]) -> bytes:
     """Encode one ``(T, action_dim)`` chunk per batch row (same order as request ``items``)."""
     return msgpack.packb(
         [np.asarray(c, dtype=np.float64).tolist() for c in chunks],
+        use_bin_type=True,
+    )
+
+
+def pack_action_envelope(action_chunk: np.ndarray, accel: float | None) -> bytes:
+    """Encode one env's chunk plus its ``accel`` score as a dict.
+
+    Only sent to clients that asked for it with ``"include_accel": true`` — the default
+    reply stays the bare array :func:`pack_action` produces, which is what the stock
+    ``robocasa.scripts.client`` parses.
+
+    Args:
+        action_chunk: ``(T, action_dim)`` chunk for the single env.
+        accel: This chunk's score, or ``None`` when the proxy is disabled/unpublished.
+    """
+    a = np.asarray(action_chunk, dtype=np.float64)
+    if a.ndim != 2:
+        raise ValueError(f"Expected action chunk of shape (T, action_dim), got shape {a.shape}")
+    return msgpack.packb({"actions": a.tolist(), "accel": accel}, use_bin_type=True)
+
+
+def pack_actions_batch_envelope(chunks: List[np.ndarray], accel: List[float] | None) -> bytes:
+    """Batched counterpart of :func:`pack_action_envelope`.
+
+    Args:
+        chunks: One ``(T, action_dim)`` chunk per batch row, in request ``items`` order.
+        accel: One score per row in that same order, or ``None`` when unavailable. The
+            caller must not pass a shorter list — a length mismatch would silently
+            re-associate scores with the wrong environment.
+    """
+    if accel is not None and len(accel) != len(chunks):
+        raise ValueError(f"accel has {len(accel)} entries but the batch has {len(chunks)} rows.")
+    return msgpack.packb(
+        {
+            "actions": [np.asarray(c, dtype=np.float64).tolist() for c in chunks],
+            "accel": accel,
+        },
         use_bin_type=True,
     )
 
@@ -272,10 +335,28 @@ class OpenTauRoboCasaPolicy:
         *,
         compile_model: bool = True,
         seed: int | None = None,
+        accel_prefix: int | str | None = None,
     ) -> None:
+        """Load the policy and, if asked, arm the denoising-acceleration proxy.
+
+        Args:
+            cfg: Parsed pipeline config; ``cfg.policy.pretrained_path`` is the checkpoint.
+            compile_model: Whether to ``torch.compile`` the inner sampler.
+            seed: Optional seed applied before loading.
+            accel_prefix: ``None`` leaves the ``accel`` uncertainty proxy off (the
+                default); ``"auto"`` or an int ``>= 2`` turns it on. See
+                :func:`opentau.policies.accel.configure_accel`.
+        """
         self.cfg = cfg
         self.device = auto_torch_device()
         self.dtype = torch.bfloat16
+        # Declared up front, resolved after the policy loads: `_read_accel` must never
+        # depend on how far `__init__` got.
+        self.accel_prefix: int | None = None
+        # Per-sample scores for the most recent `infer`/`infer_batch` call, or None.
+        self.last_accel: list[float] | None = None
+        # One-shot: a per-step warning would drown the rollout log.
+        self._accel_missing_warned = False
         if seed is not None:
             set_seed(seed)
 
@@ -293,6 +374,10 @@ class OpenTauRoboCasaPolicy:
             )
 
         self.policy.reset()
+
+        # Set before the warmup calls below so the compiled graph and any
+        # unsupported-checkpoint refusal land at startup, not on the first rollout step.
+        self.accel_prefix = configure_accel(self.policy, cfg, override=accel_prefix)
 
         dummy = build_opentau_batch(
             cfg,
@@ -312,6 +397,40 @@ class OpenTauRoboCasaPolicy:
         self.policy.reset()
         logger.info("OpenTau policy ready on %s", self.device)
 
+    def _read_accel(self, expected_rows: int) -> list[float] | None:
+        """Return this call's per-sample ``accel`` scores, or ``None`` when unavailable.
+
+        ``policy.last_accel`` is one score per batch row, in row order, so a length that
+        disagrees with the batch means the rows and the scores are no longer in
+        correspondence — drop the whole list rather than hand back a misaligned one, which
+        would attribute each environment's uncertainty to a different environment.
+
+        Args:
+            expected_rows: Batch rows the scores must line up with.
+        """
+        if not self.accel_prefix:
+            return None
+        scores = getattr(self.policy, "last_accel", None)
+        if not scores:
+            if not self._accel_missing_warned:
+                self._accel_missing_warned = True
+                logger.warning(
+                    "accel is enabled (prefix=%s) but policy type %r published no score; "
+                    "its `sample_actions` does not populate `last_accel`.",
+                    self.accel_prefix,
+                    self.cfg.policy.type,
+                )
+            return None
+        if len(scores) != expected_rows:
+            logger.warning(
+                "accel published %d score(s) for a batch of %d row(s); dropping them rather "
+                "than misaligning scores with environments.",
+                len(scores),
+                expected_rows,
+            )
+            return None
+        return [float(s) for s in scores]
+
     def infer(
         self,
         images_rgb: Dict[str, np.ndarray],
@@ -319,10 +438,17 @@ class OpenTauRoboCasaPolicy:
         prompt: str,
         action_dim: int,
     ) -> np.ndarray:
-        """Return full action chunk ``(T, action_dim)`` from ``sample_actions`` (trim/pad last dim)."""
+        """Return full action chunk ``(T, action_dim)`` from ``sample_actions`` (trim/pad last dim).
+
+        Also refreshes ``self.last_accel`` (a one-element list on this batch-of-1 path, or
+        ``None``); returning it would change this method's signature, and the handler reads
+        it straight off the runner instead.
+        """
         batch = build_opentau_batch(self.cfg, images_rgb, state_vec, prompt, self.device, self.dtype)
+        self.last_accel = None
         with torch.inference_mode():
             act = self.policy.sample_actions(batch)
+        self.last_accel = self._read_accel(1)
         # (1, T, policy_dim)
         act_np = act.squeeze(0).to("cpu", torch.float32).numpy()
         if act_np.ndim != 2:
@@ -338,11 +464,19 @@ class OpenTauRoboCasaPolicy:
         decoded_items: List[Tuple[Dict[str, np.ndarray], np.ndarray, str]],
         action_dim: int,
     ) -> List[np.ndarray]:
-        """One ``sample_actions`` on a stacked batch; one ``(T, action_dim)`` chunk per env."""
+        """One ``sample_actions`` on a stacked batch; one ``(T, action_dim)`` chunk per env.
+
+        Also refreshes ``self.last_accel`` with the **whole** per-sample list — this path
+        batches several environments through a single ``sample_actions``, so element ``i``
+        belongs to ``decoded_items[i]``, and collapsing it to a scalar would report one
+        environment's uncertainty for all of them.
+        """
         batch = build_opentau_batch_multi(self.cfg, decoded_items, self.device, self.dtype)
         b = len(decoded_items)
+        self.last_accel = None
         with torch.inference_mode():
             act = self.policy.sample_actions(batch)
+        self.last_accel = self._read_accel(b)
         act_np = act.to("cpu", torch.float32).numpy()
         if act_np.ndim == 2:
             act_np = act_np.reshape(1, *act_np.shape)
@@ -365,10 +499,15 @@ class OpenTauRoboCasaPolicy:
 def make_handler(action_dim: int, runner: OpenTauRoboCasaPolicy):
     async def _handler(websocket: Any):
         async for message in websocket:
+            # Whether this reply is the historical bare array or the opt-in dict envelope
+            # is decided solely by the request, so a client never sees a shape it did not
+            # ask for. Recomputed in the error branch from the same request.
+            want_accel = False
             try:
                 data = msgpack.unpackb(message, raw=False)
                 if not isinstance(data, dict):
                     raise ValueError("Expected dict payload")
+                want_accel = data.get("include_accel") is True
 
                 if data.get("batch") is True:
                     items = data.get("items")
@@ -383,27 +522,52 @@ def make_handler(action_dim: int, runner: OpenTauRoboCasaPolicy):
                         decoded.append((images_rgb, state, prompt))
 
                     actions_out = runner.infer_batch(decoded, action_dim)
-                    await websocket.send(pack_actions_batch(actions_out))
+                    # The whole per-sample list: these envs were batched through one
+                    # `sample_actions`, so each row has its own score.
+                    accel_batch = runner.last_accel
+                    logger.debug("accel (batch of %d): %s", len(actions_out), accel_batch)
+                    if want_accel:
+                        await websocket.send(pack_actions_batch_envelope(actions_out, accel_batch))
+                    else:
+                        await websocket.send(pack_actions_batch(actions_out))
                 else:
                     images_jpeg, state, prompt = unpack_payload_dict(data)
                     images_rgb = decode_all_images(images_jpeg)
                     action = runner.infer(images_rgb, state, prompt, action_dim)
-                    await websocket.send(pack_action(action))
+                    # Batch of one on this path, so the single env's score is element 0.
+                    accel_single = runner.last_accel[0] if runner.last_accel else None
+                    logger.debug("accel: %s", accel_single)
+                    if want_accel:
+                        await websocket.send(pack_action_envelope(action, accel_single))
+                    else:
+                        await websocket.send(pack_action(action))
             except Exception as e:
                 logger.exception("Policy step failed: %s", e)
                 try:
                     data = msgpack.unpackb(message, raw=False)
                 except Exception:
                     data = None
+                if isinstance(data, dict):
+                    want_accel = data.get("include_accel") is True
                 if isinstance(data, dict) and data.get("batch") is True:
                     items = data.get("items") if isinstance(data.get("items"), list) else []
                     n = len(items)
                     zero_chunk = [[0.0] * action_dim for _ in range(_ERROR_RESPONSE_CHUNK_STEPS)]
-                    await websocket.send(msgpack.packb([zero_chunk for _ in range(n)], use_bin_type=True))
+                    chunks = [zero_chunk for _ in range(n)]
+                    if want_accel:
+                        # Keep the shape the client asked for even on the error path, so a
+                        # client written against the envelope does not crash parsing it.
+                        await websocket.send(
+                            msgpack.packb({"actions": chunks, "accel": None}, use_bin_type=True)
+                        )
+                    else:
+                        await websocket.send(msgpack.packb(chunks, use_bin_type=True))
                 else:
-                    await websocket.send(
-                        pack_action(np.zeros((_ERROR_RESPONSE_CHUNK_STEPS, action_dim), dtype=np.float64))
-                    )
+                    zeros = np.zeros((_ERROR_RESPONSE_CHUNK_STEPS, action_dim), dtype=np.float64)
+                    if want_accel:
+                        await websocket.send(pack_action_envelope(zeros, None))
+                    else:
+                        await websocket.send(pack_action(zeros))
 
     return _handler
 
@@ -433,12 +597,13 @@ def robocasa_async_main(cfg: TrainPipelineConfig) -> None:
     """Start the RoboCasa WebSocket policy server (single + batched) using OpenTau config parsing."""
     logging.basicConfig(level=logging.INFO)
     logging.info(
-        "%s\nRoboCasa globals: host=%s port=%s action_dim=%s torch_compile=%s",
+        "%s\nRoboCasa globals: host=%s port=%s action_dim=%s torch_compile=%s accel_prefix=%s",
         pformat(asdict(cfg)),
         ROBOCASA_HOST,
         ROBOCASA_PORT,
         ROBOCASA_ACTION_DIM,
         ROBOCASA_TORCH_COMPILE,
+        ROBOCASA_ACCEL_PREFIX,
     )
 
     if cfg.seed is not None:
@@ -448,6 +613,7 @@ def robocasa_async_main(cfg: TrainPipelineConfig) -> None:
         cfg,
         compile_model=ROBOCASA_TORCH_COMPILE,
         seed=cfg.seed,
+        accel_prefix=ROBOCASA_ACCEL_PREFIX,
     )
 
     asyncio.run(

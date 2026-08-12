@@ -326,6 +326,11 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
             inference. Honored by every policy whose ``from_pretrained`` (or ``_load_as_safetensor``)
             calls :py:meth:`~opentau.policies.pretrained.PreTrainedPolicy._strip_normalization_buffers_from_state_dict`.
             Defaults to ``False`` (no behaviour change).
+        accel_prefix: Prefix length for the denoising-acceleration uncertainty proxy
+            (:mod:`opentau.policies.accel`), or ``None`` to leave it off (the default).
+            ``"auto"`` resolves to the paper's ``T - 1``. Inference-only and opt-in; see
+            :func:`opentau.policies.accel.configure_accel` for the resolution order and
+            the refusals (IDENTITY-normalized actions, an unwired policy family).
         skip_input_resolution_check: Escape hatch for
             :py:meth:`validate_input_resolution`. When ``True``, a mismatch
             between the policy's ``resize_imgs_with_padding`` and the ``(H, W)``
@@ -354,6 +359,15 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
     # `use_amp` determines whether to use Automatic Mixed Precision (AMP) for training and evaluation. With AMP,
     # automatic gradient scaling is used.
     use_amp: bool = False
+
+    # Prefix length for the denoising-acceleration uncertainty proxy (`opentau.policies.accel`),
+    # or None to leave it off (the default). A flow-matching policy with this set publishes a
+    # per-chunk `last_accel` score read off velocities its Euler loop already computes — no extra
+    # network evaluations, and with it unset every added line in the sampler is dead, so the
+    # traced graph is unchanged. `"auto"` resolves to the paper's `T - 1`. Only meaningful for
+    # flow-matching policies; `configure_accel` raises on a family whose sampler is not wired.
+    # Inference-only: it is read at `sample_actions` time and never affects training.
+    accel_prefix: int | str | None = None
 
     # When True, training `torch.compile`s the policy's heavy compute submodule
     # (the flow-matching `self.model` for pi05 / pi07) *in place* via

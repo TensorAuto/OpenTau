@@ -43,6 +43,9 @@ from transformers import AutoProcessor, AutoTokenizer
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import NormalizationMode
 from opentau.datasets.grounding.tokenizer_utils import ensure_loc_tokens
+from opentau.policies.accel import AccelMeter, executed_row_mask
+from opentau.policies.accel import build_provenance as build_accel_provenance
+from opentau.policies.accel import make_meter as make_accel_meter
 from opentau.policies.normalize import Normalize, Unnormalize
 from opentau.policies.normalize import resolve_num_datasets as _num_datasets
 from opentau.policies.pi06.configuration_pi06 import PI06Config
@@ -322,11 +325,21 @@ class PI06Policy(PreTrainedPolicy):
             language_tokenizer=self.language_tokenizer,
         )
 
+        # Denoising-acceleration uncertainty proxy. Off by default: it is free to compute
+        # but its scale is only meaningful against a calibration, so nothing should read it
+        # implicitly. Set to a prefix length (see `opentau.policies.accel.default_prefix`)
+        # to have every `sample_actions` call publish `last_accel`. Note π0.6 defaults to
+        # `num_steps=5`, so `default_prefix(5) == 4` leaves only three velocity differences —
+        # a much coarser estimate than pi05's ten-step schedule affords.
+        self.accel_prefix: int | None = None
+
         self.reset()
 
     def reset(self) -> None:
         """Clears the rolling action queue; call on every environment reset."""
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
+        self.last_accel = None
+        self.last_accel_provenance = None
 
     @classmethod
     def from_pretrained(
@@ -583,6 +596,10 @@ class PI06Policy(PreTrainedPolicy):
         """
         self.eval()
 
+        # Cleared every step so a caller can distinguish "this step re-planned and here is
+        # its score" from "this step popped a queued action". `sample_actions` refills it.
+        self.last_accel = None
+
         if len(self._action_queue) == 0 or len(self._action_queue) <= self.config.max_delay:
             action_prefix = None
             delay = 0
@@ -643,9 +660,32 @@ class PI06Policy(PreTrainedPolicy):
             action_prefix = self.normalize_targets({"actions": action_prefix}, dataset_index)["actions"]
             action_prefix = F.pad(action_prefix, (0, 0, 0, self.config.chunk_size - action_prefix.shape[1]))
 
-        actions = self.model.sample_actions(
-            images, img_masks, lang_tokens, lang_masks, action_prefix, delay, noise=noise
+        accel_meter = make_accel_meter(
+            self,
+            batch_size=lang_tokens.shape[0],
+            device=lang_tokens.device,
+            dataset_index=dataset_index,
         )
+
+        actions = self.model.sample_actions(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            action_prefix,
+            delay,
+            noise=noise,
+            accel=accel_meter,
+        )
+
+        if accel_meter is not None:
+            # `.to_list()` rather than keeping a tensor: anything allocated inside
+            # `torch.inference_mode()` stays an inference tensor even after `.clone()`, and
+            # the first in-place update a downstream CUSUM accumulator makes would raise.
+            self.last_accel = accel_meter.to_list()
+            self.last_accel_provenance = build_accel_provenance(
+                self, accel_meter, dataset_index=dataset_index
+            )
 
         original_action_dim = self.config.action_feature.shape[0]
         actions = actions[:, :, :original_action_dim]
@@ -1261,8 +1301,29 @@ class PI06FlowMatching(nn.Module):
         action_prefix: Tensor,
         delay: Tensor,
         noise: Tensor | None = None,
+        accel: AccelMeter | None = None,
     ) -> Tensor:
-        """Inference: encode prefix once, run `num_steps` Euler steps."""
+        """Inference: encode prefix once, run `num_steps` Euler steps.
+
+        Args:
+            images: List of image tensors.
+            img_masks: List of image mask tensors.
+            lang_tokens: Language token tensor.
+            lang_masks: Language mask tensor.
+            action_prefix: Action prefix tensor.
+            delay: Number of delay actions, aka number of actions frozen from the action_prefix.
+            noise: Optional noise tensor.
+            accel: Optional denoising-acceleration meter. When supplied, the per-step
+                velocities are folded into an uncertainty proxy at zero extra network
+                cost; when ``None`` every added branch is a compile-time constant and the
+                traced graph is unchanged. Passed in rather than stashed on ``self``
+                because this method is ``torch.compile``d and ONNX-exported at several
+                entry points, where a write to an ``nn.Module`` attribute inside the traced
+                region is the construct most likely to break.
+
+        Returns:
+            The sampled action tensor.
+        """
         bsize = lang_tokens.shape[0]
         device = lang_tokens.device
 
@@ -1319,10 +1380,26 @@ class PI06FlowMatching(nn.Module):
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
         prefix_mask = rearrange(torch.arange(self.config.chunk_size, device=device), "c -> 1 c") < delay
+        if accel is not None:
+            accel.set_row_mask(
+                executed_row_mask(
+                    prefix_mask=prefix_mask,
+                    delay=delay,
+                    chunk_size=self.config.chunk_size,
+                    n_action_steps=self.config.n_action_steps,
+                    device=device,
+                )
+            )
         while time >= -dt / 2:
             x_t = torch.where(rearrange(prefix_mask, "b c -> b c 1"), action_prefix, x_t)
             masked_time = torch.where(prefix_mask, 0, time)
             v_t = self.denoise_step(prefix_pad_masks, past_key_values, x_t, masked_time)
+            if accel is not None:
+                # Must read `v_t` here: the frozen-prefix clamp at the top of the loop means
+                # `(x_{t+1} - x_t) / dt != v_t` on those rows, so accel cannot be recovered
+                # post-hoc from the returned chunk.
+                accel.update(v_t)
+
             x_t += dt * v_t
             time += dt
 

@@ -66,6 +66,7 @@ from opentau.envs.utils import (
     close_envs,
     preprocess_observation,
 )
+from opentau.policies.accel import configure_accel
 from opentau.policies.factory import make_policy
 from opentau.policies.pretrained import PreTrainedPolicy
 from opentau.policies.utils import to_dtype_preserving_siglip_float32
@@ -108,6 +109,14 @@ def rollout(
         "done": A (batch, sequence) tensor of **cumulative** done conditions. For any given batch element,
             the first True is followed by True's all the way till the end. This can be used for masking
             extraneous elements from the sequences above.
+        (optional) "accel": A per-env list of per-chunk denoising-acceleration scores
+            (``list[list[float]]``, outer index = env). One entry per *planned chunk* (not per
+            step), already truncated at that env's own done step. Present only when the policy
+            publishes ``last_accel`` (i.e. has ``accel_prefix`` set); see
+            :mod:`opentau.policies.accel`.
+        (optional) "accel_provenance": The :class:`~opentau.policies.accel.AccelProvenance` of
+            those scores as a plain dict, captured once (it is constant within a run). Present
+            only alongside "accel".
 
     Args:
         env: The batch of environments.
@@ -160,6 +169,17 @@ def rollout(
     # Per-env final raw camera frames ({camera_key: HxWx3 uint8}); only the frame at each env's
     # done-step is kept (updated every step the env is still live, then frozen).
     last_frames: list[dict[str, np.ndarray] | None] = [None] * env.num_envs
+    # Per-chunk denoising-acceleration telemetry (uncertainty proxy, `opentau.policies.accel`).
+    # The policy sets `last_accel` to a length-num_envs `list[float]` on a step that re-planned
+    # and to None on a step that merely popped a queued action, so keeping the non-None values
+    # gives exactly one entry per planned chunk. `accel_chunk_steps` records which rollout step
+    # each chunk was planned at, so each env's stream can be cut at its own done step below.
+    # Everything here stays empty (and no "accel" key is added to `ret`) unless the policy has
+    # `accel_prefix` set, so this is zero-cost when accel is off.
+    accel_chunks: list[list[float]] = []
+    accel_chunk_steps: list[int] = []
+    accel_provenance: dict | None = None
+    accel_width_warned = False
     while not np.all(done) and step < max_steps:
         # Numpy array to tensor and changing dictionary keys to OpenTau policy format.
         observation = preprocess_observation(observation, cfg=cfg)
@@ -196,6 +216,32 @@ def rollout(
 
         with torch.inference_mode():
             action = policy.select_action(observation)
+
+        # `getattr` so policies that never wired accel are wholly unaffected. `policy` was
+        # unwrapped from the accelerate wrapper at the top of this function; reading the
+        # attribute off a DDP-wrapped module would always miss (DDP doesn't forward
+        # attribute lookups).
+        chunk_accel = getattr(policy, "last_accel", None)
+        if chunk_accel is not None:
+            if len(chunk_accel) != env.num_envs:
+                # accel is per-sample by construction (the meter is built with the sampler's
+                # batch size). A different width cannot be attributed to an env, and pairing
+                # the wrong stream with an episode's success flag is exactly the silent
+                # corruption a calibration set cannot survive — so drop it, loudly and once.
+                if not accel_width_warned:
+                    logging.warning(
+                        f"accel: policy.last_accel has {len(chunk_accel)} entries but the rollout has "
+                        f"{env.num_envs} envs; dropping the accel stream for this rollout rather than "
+                        "pairing it with the wrong per-episode outcomes."
+                    )
+                    accel_width_warned = True
+            else:
+                accel_chunks.append([float(x) for x in chunk_accel])
+                accel_chunk_steps.append(step)
+                if accel_provenance is None:
+                    provenance = getattr(policy, "last_accel_provenance", None)
+                    if provenance is not None:
+                        accel_provenance = provenance.to_dict()
 
         # Convert to CPU / numpy.
         action_numpy: np.ndarray = action.to("cpu").numpy()
@@ -276,6 +322,25 @@ def rollout(
 
     if capture_last_frames:
         ret["last_frames"] = last_frames
+
+    if accel_chunks:
+        # This loop keeps stepping envs that are already done (it runs until the LAST env
+        # finishes), so every chunk planned after an env's own done step describes a
+        # post-termination state. Cut each env's stream there — the same first-True-index
+        # masking `eval_policy` applies to rewards/successes via `batch_done_indices`.
+        # `argmax` over the cumulative done flags returns the first True, and the loop forces
+        # the final column True, so every env has one.
+        done_indices = torch.argmax(ret["done"].to(int), dim=1).tolist()
+        ret["accel"] = [
+            [
+                chunk[env_ix]
+                for chunk, chunk_step in zip(accel_chunks, accel_chunk_steps, strict=True)
+                if chunk_step <= done_index
+            ]
+            for env_ix, done_index in enumerate(done_indices)
+        ]
+        if accel_provenance is not None:
+            ret["accel_provenance"] = accel_provenance
 
     if hasattr(policy, "use_original_modules"):
         policy.use_original_modules()
@@ -400,6 +465,10 @@ def eval_policy(
     all_successes = []
     all_seeds = []
     all_done_indices = []
+    # One already-done-truncated per-chunk accel stream per rollout env, in the same episode
+    # order as `sum_rewards` / `all_successes`. Stays empty unless the policy publishes accel.
+    accel_streams: list[list[float]] = []
+    accel_provenance: dict | None = None
     threads = []  # for video saving threads
     n_episodes_rendered = 0  # for saving the correct number of videos
 
@@ -480,6 +549,15 @@ def eval_policy(
         # Note: this relies on a property of argmax: that it returns the first occurrence as a tiebreaker.
         batch_done_indices = torch.argmax(rollout_data["done"].to(int), dim=1)
         all_done_indices.extend(batch_done_indices.tolist())
+
+        # Per-episode accel streams, already truncated at each env's done step inside
+        # `rollout`. Absent unless the policy has `accel_prefix` set. The provenance is
+        # constant within a run, so only the first one is kept.
+        batch_accel = rollout_data.get("accel")
+        if batch_accel is not None:
+            accel_streams.extend(batch_accel)
+            if accel_provenance is None:
+                accel_provenance = rollout_data.get("accel_provenance")
 
         if return_episode_data:
             batch_size = rollout_data["done"].shape[0]
@@ -640,6 +718,26 @@ def eval_policy(
             "eval_ep_s": (time.time() - start) / n_episodes,
         },
     }
+
+    # Attach the per-chunk accel stream to each episode; pairing it with that episode's
+    # `success` is the calibration set. Both lists come from the same `[:n_episodes]` slice of
+    # the same rollout order, so index i is the same episode in each. The length check keeps a
+    # misalignment from silently producing a stream labelled with another episode's outcome.
+    if accel_streams:
+        streams = accel_streams[:n_episodes]
+        if len(streams) != len(info["per_episode"]):
+            logging.warning(
+                f"accel: collected {len(streams)} stream(s) for {len(info['per_episode'])} episode(s); "
+                "dropping them rather than pairing an accel stream with the wrong episode."
+            )
+        else:
+            for episode_info, stream in zip(info["per_episode"], streams, strict=True):
+                episode_info["accel"] = stream
+            # Recorded once per task, not per episode: it is constant within a run, and without
+            # it the scores are not comparable to any calibration
+            # (`opentau.policies.accel.assert_comparable`).
+            if accel_provenance is not None:
+                info["accel_provenance"] = accel_provenance
 
     if return_episode_data:
         info["episodes"] = episode_data
@@ -1035,6 +1133,13 @@ def eval_main(cfg: TrainPipelineConfig):
     # a plain policy.to(bfloat16) would round them back. Eval runs single-process / DDP, so
     # this is safe (no ZeRO param partitioning). See to_dtype_preserving_siglip_float32.
     to_dtype_preserving_siglip_float32(policy, dtype=torch.bfloat16)
+    # Arm the accel uncertainty proxy, if the config or the environment asked for it.
+    # Must happen BEFORE `accelerator.prepare`: the wrapper does not forward attribute
+    # writes to the module it wraps, so setting `accel_prefix` afterwards would land on the
+    # wrapper and `rollout` — which reads it off the *unwrapped* policy — would never see it.
+    # This is what makes an eval run able to collect the calibration set; without it nothing
+    # in the eval path ever turns the score on and every `accel` field would stay empty.
+    configure_accel(policy, cfg)
     policy = accelerator.prepare(policy)
     policy.eval()
     with (
@@ -1081,8 +1186,22 @@ class TaskMetrics(TypedDict):
     max_rewards: list[float]
     successes: list[bool]
     video_paths: list[str]
+    # Per-episode denoising-acceleration streams (one `list[float]` of per-chunk scores per
+    # episode), index-aligned with `successes` — that pairing IS the calibration set. Empty
+    # unless the policy has `accel_prefix` set.
+    accels: list[list[float]]
+    # The `AccelProvenance` (as a plain dict) those streams were produced under. Recorded once
+    # per task because it is constant within a run; None when accel is off.
+    accel_provenance: dict | None
 
 
+# Keys accumulated into the per-group / overall aggregates. NOTE: this tuple only *seeds* the
+# empty accumulator lists — anything added here also needs a matching `_append(...)` in
+# `_accumulate_to` or it stays permanently empty. `accels` / `accel_provenance` are
+# deliberately NOT here: averaging uncertainty streams across episodes is meaningless, and the
+# per-episode streams already reach disk verbatim on each task's `metrics` dict (which
+# `consolidate_eval_info` passes through untouched), so accumulating them would only duplicate
+# the whole payload into `per_group` and `overall`.
 ACC_KEYS = ("sum_rewards", "max_rewards", "successes", "video_paths")
 
 
@@ -1117,11 +1236,16 @@ def eval_one(
     )
 
     per_episode = task_result["per_episode"]
+    # `eval_policy` attaches "accel" to every episode or to none, so this is either empty
+    # (accel off) or exactly as long as — and index-aligned with — `successes`.
+    accels = [ep["accel"] for ep in per_episode if "accel" in ep]
     return TaskMetrics(
         sum_rewards=[ep["sum_reward"] for ep in per_episode],
         max_rewards=[ep["max_reward"] for ep in per_episode],
         successes=[ep["success"] for ep in per_episode],
         video_paths=task_result.get("video_paths", []),
+        accels=accels,
+        accel_provenance=task_result.get("accel_provenance"),
     ), task_result
 
 
@@ -1173,6 +1297,25 @@ def run_one(
     return task_group, task_id, metrics, task_result
 
 
+def _accel_enabled(policy) -> bool:
+    """Whether ``policy`` publishes per-chunk accel telemetry (``accel_prefix`` is set).
+
+    Unwraps the accelerate wrapper first: DDP does not forward attribute lookups to the module
+    it wraps, so a bare ``getattr(policy, "accel_prefix", None)`` on a prepared model always
+    reads ``None`` and would report accel as off. Mirrors the unwrap in :func:`rollout`.
+
+    Args:
+        policy: The policy, wrapped or not.
+
+    Returns:
+        bool: ``True`` when the policy has a non-``None`` ``accel_prefix``.
+    """
+    acc = get_proc_accelerator()
+    if acc is not None and not isinstance(policy, PreTrainedPolicy):
+        policy = acc.unwrap_model(policy)
+    return getattr(policy, "accel_prefix", None) is not None
+
+
 # compute aggregated metrics helper (robust to lists/scalars)
 def _agg_from_list(xs):
     if not xs:
@@ -1217,6 +1360,20 @@ def eval_policy_all(
             f"eval.recording_root is only supported for the LIBERO env (it uses the LIBERO "
             f"dataset recorder), but env.type={cfg.env.type!r}. Unset recording_root, or add "
             f"an env-aware rollout recorder."
+        )
+
+    # The threaded path below hands the SAME policy object to every worker, which is already
+    # unsound for a stateful policy (the action queue interleaves across tasks). accel telemetry
+    # must not pretend otherwise: `policy.last_accel` is read right after `select_action` on that
+    # shared object, so a chunk planned inside one task's rollout can be read — and stored — by
+    # another task's. Warn rather than raise, so an existing parallel eval keeps running; the
+    # streams it emits are simply not usable as calibration data.
+    if max_parallel_tasks > 1 and _accel_enabled(policy):
+        logging.warning(
+            f"accel collection is enabled and env.max_parallel_tasks={max_parallel_tasks} > 1: all "
+            "tasks share one policy object, so `policy.last_accel` (like the action queue it comes "
+            "from) races between concurrently-running rollouts and a chunk can be attributed to the "
+            "wrong episode. Set env.max_parallel_tasks=1 when collecting accel for calibration."
         )
 
     # Flatten envs into list of (task_group, task_id, env)

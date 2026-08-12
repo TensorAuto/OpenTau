@@ -68,6 +68,7 @@ from opentau.configs import parser
 from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.lerobot_dataset import BaseDataset
 from opentau.planner.gemini_er_planner import GeminiERPlanner
+from opentau.policies.accel import configure_accel
 from opentau.policies.factory import get_policy_class
 from opentau.policies.utils import to_dtype_preserving_siglip_float32
 from opentau.scripts.grpc import auth, robot_inference_pb2, robot_inference_pb2_grpc
@@ -118,6 +119,10 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
         self._request_hook = request_hook or _noop_request_hook
         self.device = auto_torch_device()
         self.dtype = torch.bfloat16
+        # Declared before `_load_policy` (which resolves it) so the response path never
+        # depends on that method having run — a subclass or a test that stubs policy
+        # loading still gets the off-by-default behavior rather than an AttributeError.
+        self.accel_prefix: int | None = None
 
         logger.info(f"Initializing policy on device: {self.device}")
 
@@ -299,6 +304,12 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
 
         self.policy.reset()
 
+        # Denoising-acceleration uncertainty proxy; disabled unless the operator asks for
+        # it (see `configure_accel`). Set before the warmup calls below so the compiled
+        # graph and any unsupported-checkpoint refusal land at startup, not on the first
+        # robot request. `self.accel_prefix` gates the response field.
+        self.accel_prefix = configure_accel(self.policy, self.cfg)
+
         camera_observations = {
             f"camera{i}": torch.zeros((1, 3, *self.cfg.resolution), dtype=self.dtype, device=self.device)
             for i in range(self.cfg.num_cams)
@@ -471,7 +482,10 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
             context: gRPC context.
 
         Returns:
-            ActionChunkResponse containing the predicted action chunk.
+            ActionChunkResponse containing the predicted action chunk, and — only when
+            ``accel`` is enabled and the policy published a score — the chunk's ``accel``
+            uncertainty proxy. The field carries explicit presence, so a client must call
+            ``response.HasField("accel")`` before reading it (see the .proto for why).
         """
         self._notify_request("GetActionChunk")
         start_time = time.perf_counter()
@@ -493,6 +507,17 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
                 # action_chunk shape: (batch_size=1, n_action_steps, action_dim)
                 # Remove batch dimension and convert to numpy
                 action_chunk = action_chunk.squeeze(0).to("cpu", torch.float32).numpy()
+                # `last_accel` is per-sample; this path always builds a batch of 1, so the
+                # score for this request is element 0. Read immediately after the call --
+                # it is policy state shared by every worker thread, exactly like the rest
+                # of `self.policy`. Already plain floats, so nothing escapes inference mode.
+                last_accel = getattr(self.policy, "last_accel", None) if self.accel_prefix else None
+
+            if last_accel:
+                # NaN is forwarded as-is: `AccelMeter` emits it for "score undefined", and
+                # dropping it would be indistinguishable from "accel disabled" downstream.
+                response.accel = float(last_accel[0])
+                logger.debug("accel=%s request_id=%s", response.accel, request.request_id)
 
             # Populate 2D action chunk structure
             for action_vector in action_chunk:
@@ -526,7 +551,9 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
             context: gRPC context.
 
         Yields:
-            ActionChunkResponse messages for each observation.
+            ActionChunkResponse messages for each observation. Delegating to
+            ``GetActionChunk`` means the optional ``accel`` field is populated here on the
+            same terms, with no separate code path to keep in sync.
         """
         for request in request_iterator:
             if context.is_active():
