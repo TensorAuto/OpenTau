@@ -177,6 +177,25 @@ carry a concrete `config_version` (and an informational `opentau_version`).
   current working directory for a Hub checkpoint (which an `@<step>` suffix would
   have turned into a directory named after a git ref). Hub exports go to
   `<output_dir>/onnx/<spec>/`; local checkpoint dirs are unchanged.
+* **`action_chunk` is re-checked against the policy's execution horizon.**
+  `TrainPipelineConfig` copies its pipeline-level `action_chunk` onto
+  `policy.chunk_size` by `setattr`, which lands *after* the policy config's
+  `__post_init__` has run — so the policy's own `n_action_steps <= chunk_size`
+  invariant (and the shortened-horizon-vs-`max_delay`/`safety_buffer` pair) only
+  ever saw the `chunk_size` the policy *declared*, never the propagated one. A
+  config setting `action_chunk` and leaving `n_action_steps` at its default
+  therefore reached, silently, exactly the combination the very same policy
+  config rejects when it appears in JSON. Every in-repo config dodges it only by
+  setting the two equal by hand. The checks are now one shared
+  `PreTrainedConfig.validate_action_horizon` — replacing a copy in each of the
+  seven policy configs that carried it — called from both policy `__post_init__`
+  and the end of `_propagate_shape_fields_to_policy`, and the error names
+  `action_chunk` as the cause.
+  **A config with `n_action_steps > action_chunk` now fails at config time**; the
+  model always decoded only `chunk_size` actions, so set `n_action_steps` to
+  `action_chunk` (what such a run was effectively doing) to keep its behavior.
+  As a side effect of sharing the check, pi0 gains the `safety_buffer <=
+  chunk_size` bound its `max_delay` siblings already enforced.
 
 ### Migration notes
 

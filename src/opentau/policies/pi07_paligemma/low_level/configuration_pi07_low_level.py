@@ -301,25 +301,7 @@ class PI07PaligemmaLowLevelConfig(PreTrainedConfig):
             raise ValueError(f"`n_obs_steps` must be a positive integer, got {self.n_obs_steps}.")
         if not isinstance(self.history_interval, int) or self.history_interval < 1:
             raise ValueError(f"`history_interval` must be a positive integer, got {self.history_interval}.")
-        if self.n_action_steps > self.chunk_size:
-            raise ValueError(
-                f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
-                f"{self.n_action_steps} for `n_action_steps` and {self.chunk_size} for `chunk_size`."
-            )
-
-        if self.max_delay > self.chunk_size:
-            raise ValueError(
-                f"The max delay must be less than or equal to the chunk size. Got {self.max_delay} for `max_delay` and {self.chunk_size} for `chunk_size`."
-            )
-
-        if self.n_action_steps < self.chunk_size and self.max_delay != 0:
-            raise ValueError(
-                "A shortened execution horizon (n_action_steps < chunk_size) is not yet "
-                "supported together with real-time inference delay (max_delay > 0); they "
-                "would entangle the action-queue prefix logic. Got "
-                f"n_action_steps={self.n_action_steps}, chunk_size={self.chunk_size}, "
-                f"max_delay={self.max_delay}."
-            )
+        self.validate_action_horizon()
 
     def validate_features(self) -> None:
         """Validates the features and adds empty cameras if configured.

@@ -22,7 +22,7 @@ optimization, scheduling, and data processing.
 """
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import ClassVar, Literal
 
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
@@ -100,6 +100,11 @@ class PI0Config(PreTrainedConfig):
     chunk_size: int = 50
     n_action_steps: int = 50
     safety_buffer: int = 0
+
+    # pi0 predates the real-time-delay path; its "keep executing past the current
+    # chunk" knob is the overlap-refill `safety_buffer`, not `max_delay`. Tells
+    # `validate_action_horizon` which field to check against `chunk_size`.
+    action_horizon_delay_field: ClassVar[str] = "safety_buffer"
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -216,11 +221,7 @@ class PI0Config(PreTrainedConfig):
                 "the state projection is part of the state/action representation this mode trains, "
                 "so asking for it to be frozen at the same time is self-contradictory."
             )
-        if self.n_action_steps > self.chunk_size:
-            raise ValueError(
-                f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
-                f"{self.n_action_steps} for `n_action_steps` and {self.chunk_size} for `chunk_size`."
-            )
+        self.validate_action_horizon()
         if self.n_obs_steps != 1:
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
@@ -232,15 +233,6 @@ class PI0Config(PreTrainedConfig):
                 "which builds the per-token block-ids the kernel requires. This policy does "
                 "not build them, so the kernel would hard-error at the first forward. "
                 "Use 'eager' or 'sdpa' instead."
-            )
-
-        if self.n_action_steps < self.chunk_size and self.safety_buffer != 0:
-            raise ValueError(
-                "A shortened execution horizon (n_action_steps < chunk_size) is not yet "
-                "supported together with a non-zero safety_buffer; they would entangle the "
-                "action-queue refill logic. Got "
-                f"n_action_steps={self.n_action_steps}, chunk_size={self.chunk_size}, "
-                f"safety_buffer={self.safety_buffer}."
             )
 
     def validate_features(self) -> None:

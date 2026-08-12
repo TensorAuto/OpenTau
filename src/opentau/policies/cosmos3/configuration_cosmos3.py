@@ -242,12 +242,7 @@ class Cosmos3Config(PreTrainedConfig):
         validate_state_action_representation_only_config(
             self, policy_name=self.type, has_discrete_actions=False
         )
-        if self.n_action_steps > self.chunk_size:
-            raise ValueError(
-                "The chunk size is the upper bound for the number of action steps per model "
-                f"invocation. Got {self.n_action_steps} for `n_action_steps` and {self.chunk_size} "
-                "for `chunk_size`."
-            )
+        self.validate_action_horizon()
         if self.n_obs_steps != 1:
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `n_obs_steps={self.n_obs_steps}`"
@@ -257,17 +252,6 @@ class Cosmos3Config(PreTrainedConfig):
             raise ValueError(
                 "cosmos3 supports attention_implementation in {'eager', 'sdpa'} only "
                 f"(MRoPE + QK-norm rule out 'flash_cuda'). Got '{self.attention_implementation}'."
-            )
-
-        if self.max_delay > self.chunk_size:
-            raise ValueError(
-                f"The max delay must be <= the chunk size. Got max_delay={self.max_delay} and "
-                f"chunk_size={self.chunk_size}."
-            )
-        if self.n_action_steps < self.chunk_size and self.max_delay != 0:
-            raise ValueError(
-                "A shortened execution horizon (n_action_steps < chunk_size) is not supported "
-                "together with real-time inference delay (max_delay > 0)."
             )
 
         # Hard concat-attention constraints vs the Qwen3-VL text tower. The exact

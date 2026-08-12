@@ -381,7 +381,10 @@ class TestPI06Config:
         assert not any("knowledge_insulation" in r.message for r in caplog.records)
 
     def test_max_delay_larger_than_chunk_size_raises(self):
-        with pytest.raises(ValueError, match="max delay"):
+        # Matches the field name, not the prose around it: the guard now lives in
+        # the shared `PreTrainedConfig.validate_action_horizon`, which names the
+        # knob it read (`max_delay` here, `safety_buffer` on pi0).
+        with pytest.raises(ValueError, match="max_delay"):
             PI06Config(chunk_size=4, n_action_steps=4, max_delay=8)
 
 

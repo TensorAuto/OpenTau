@@ -307,25 +307,7 @@ class PI05MemConfig(PreTrainedConfig):
                 "Use 'eager' or 'sdpa' instead."
             )
 
-        if self.n_action_steps > self.chunk_size:
-            raise ValueError(
-                f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
-                f"{self.n_action_steps} for `n_action_steps` and {self.chunk_size} for `chunk_size`."
-            )
-
-        if self.max_delay > self.chunk_size:
-            raise ValueError(
-                f"The max delay must be less than or equal to the chunk size. Got {self.max_delay} for `max_delay` and {self.chunk_size} for `chunk_size`."
-            )
-
-        if self.n_action_steps < self.chunk_size and self.max_delay != 0:
-            raise ValueError(
-                "A shortened execution horizon (n_action_steps < chunk_size) is not yet "
-                "supported together with real-time inference delay (max_delay > 0); they "
-                "would entangle the action-queue prefix logic. Got "
-                f"n_action_steps={self.n_action_steps}, chunk_size={self.chunk_size}, "
-                f"max_delay={self.max_delay}."
-            )
+        self.validate_action_horizon()
 
         if not isinstance(self.spacetime_layer_stride, int) or self.spacetime_layer_stride < 1:
             raise ValueError(

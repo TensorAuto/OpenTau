@@ -281,6 +281,20 @@ class TrainPipelineConfig(HubMixin):
           ``max_action_dim``) were being given a junk ``chunk_size``.
         - An override that actually *changes* a value is logged at WARNING, so the
           checkpoint-says-6 / pipeline-says-32 case is visible rather than silent.
+        - **The policy's own invariants keyed on these widths are re-checked** once
+          the copy is done, via
+          :py:meth:`~opentau.configs.policies.PreTrainedConfig.validate_action_horizon`.
+          The ``setattr`` loop lands *after* the policy config's ``__post_init__`` has
+          run, so ``n_action_steps <= chunk_size`` (and the delay-knob pair) would
+          otherwise only ever be checked against the ``chunk_size`` the policy
+          *declared*, never against the propagated ``action_chunk``: a config setting
+          ``action_chunk`` and leaving ``n_action_steps`` at its default reached,
+          silently, exactly the combination that same policy config rejects when it
+          appears in JSON.
+
+        Raises:
+            ValueError: If the propagated ``chunk_size`` contradicts the policy's own
+                execution-horizon fields.
         """
         if self.policy is None:
             return
@@ -301,6 +315,17 @@ class TrainPipelineConfig(HubMixin):
                     "at the top level of the training config instead."
                 )
             setattr(self.policy, policy_field, new_value)
+
+        try:
+            self.policy.validate_action_horizon()
+        except ValueError as e:
+            raise ValueError(
+                f"{e} `policy.chunk_size` was overwritten with the pipeline-level "
+                f"`action_chunk` ({self.action_chunk}), so the conflict is between `action_chunk` "
+                "and the policy fields it does not propagate. Bring the policy field(s) named "
+                "above into range of `action_chunk` (`n_action_steps` is normally set equal to "
+                "it), or change `action_chunk` — a policy-level `chunk_size` is ignored either way."
+            ) from e
 
     def validate(self):
         """Validate and finalize the training configuration.

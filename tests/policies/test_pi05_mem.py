@@ -74,7 +74,10 @@ class TestPI05MemConfig:
             PI05MemConfig(chunk_size=10, n_action_steps=20)
 
     def test_max_delay_exceeds_chunk_size(self):
-        with pytest.raises(ValueError, match="max delay"):
+        # Matches the field name, not the prose around it: the guard now lives in
+        # the shared `PreTrainedConfig.validate_action_horizon`, which names the
+        # knob it read (`max_delay` here, `safety_buffer` on pi0).
+        with pytest.raises(ValueError, match="max_delay"):
             PI05MemConfig(chunk_size=10, n_action_steps=10, max_delay=20)
 
     def test_validate_features_adds_empty_cameras(self):

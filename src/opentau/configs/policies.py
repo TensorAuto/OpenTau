@@ -28,7 +28,7 @@ import tempfile
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Type, TypeVar
+from typing import ClassVar, Type, TypeVar
 
 import draccus
 from huggingface_hub import hf_hub_download
@@ -434,6 +434,14 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
     action_decoder_latency_lower: float = 0.0
     action_decoder_latency_upper: float = 0.0
 
+    #: Name of this policy's "keep executing past the current chunk" knob — the field a
+    #: shortened execution horizon (``n_action_steps < chunk_size``) cannot be combined
+    #: with. Every policy that models real-time inference delay calls it ``max_delay``;
+    #: pi0 predates that path and calls its overlap-refill knob ``safety_buffer``, so it
+    #: overrides this. Read by :py:meth:`validate_action_horizon`; a policy that names the
+    #: knob something else must override this or its knob silently stops being checked.
+    action_horizon_delay_field: ClassVar[str] = "max_delay"
+
     def __post_init__(self):
         """Initialize post-creation attributes.
 
@@ -625,6 +633,64 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         for resolution in self._bound_image_resolutions().values():
             return resolution
         return None
+
+    def validate_action_horizon(self) -> None:
+        """Check the invariants that tie ``n_action_steps`` (and the delay knob) to ``chunk_size``.
+
+        ``chunk_size`` is the trained prediction horizon — the number of actions the
+        model always decodes per invocation. ``n_action_steps`` is how many of them
+        ``select_action`` executes before re-querying, so it is bounded above by
+        ``chunk_size``, and a *shortened* horizon (``n_action_steps < chunk_size``)
+        cannot be combined with the knob that keeps actions flowing past the current
+        chunk (``max_delay``, or ``safety_buffer`` on pi0 — see
+        :py:attr:`action_horizon_delay_field`): the two would entangle the action-queue
+        refill logic.
+
+        Every policy config that declares an execution horizon calls this from its
+        ``__post_init__`` (``value`` and the high-level planners do not, since for them
+        it is the no-op described below), and
+        ``TrainPipelineConfig`` calls it again after copying its pipeline-level
+        ``action_chunk`` onto ``policy.chunk_size`` — that ``setattr`` lands *after*
+        ``__post_init__`` has run, so without the second call a propagated
+        ``chunk_size`` could contradict ``n_action_steps`` with nothing raising. The
+        checks live here rather than being copied into each config so the two callers
+        (and every policy) cannot drift apart.
+
+        No-op for policies that do not declare both fields (the high-level planners
+        declare neither; ``value`` has ``chunk_size`` but no execution horizon).
+
+        Raises:
+            ValueError: If ``n_action_steps`` exceeds ``chunk_size``, the delay knob
+                exceeds ``chunk_size``, or a shortened horizon is combined with a
+                non-zero delay knob.
+        """
+        chunk_size = getattr(self, "chunk_size", None)
+        n_action_steps = getattr(self, "n_action_steps", None)
+        if chunk_size is None or n_action_steps is None:
+            return
+
+        if n_action_steps > chunk_size:
+            raise ValueError(
+                "The chunk size is the upper bound for the number of action steps per model "
+                f"invocation. Got {n_action_steps} for `n_action_steps` and {chunk_size} for "
+                "`chunk_size`."
+            )
+
+        delay_field = self.action_horizon_delay_field
+        delay = getattr(self, delay_field, 0)
+        if delay > chunk_size:
+            raise ValueError(
+                f"`{delay_field}` must be less than or equal to the chunk size. Got {delay} for "
+                f"`{delay_field}` and {chunk_size} for `chunk_size`."
+            )
+
+        if n_action_steps < chunk_size and delay != 0:
+            raise ValueError(
+                "A shortened execution horizon (n_action_steps < chunk_size) is not yet supported "
+                f"together with a non-zero `{delay_field}`; they would entangle the action-queue "
+                f"refill logic. Got n_action_steps={n_action_steps}, chunk_size={chunk_size}, "
+                f"{delay_field}={delay}."
+            )
 
     def validate_input_resolution(self, *, strict: bool) -> None:
         """Check ``resize_imgs_with_padding`` against the bound image features.

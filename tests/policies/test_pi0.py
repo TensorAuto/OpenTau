@@ -446,6 +446,17 @@ class TestPI0ExecutionHorizon:
         cfg = self._config(chunk_size=10, n_action_steps=10, safety_buffer=2)
         assert cfg.safety_buffer == 2
 
+    def test_guard_rejects_safety_buffer_above_chunk_size(self):
+        # `select_action` refills whenever `len(queue) <= safety_buffer`, and the
+        # queue never holds more than `chunk_size` actions — so a safety_buffer
+        # past the chunk size silently re-queries the model every single step,
+        # decoding a full chunk to execute one action. pi0 names this knob
+        # `safety_buffer` where every other policy names it `max_delay`; the
+        # shared `validate_action_horizon` reads the name off
+        # `action_horizon_delay_field`, so this also pins pi0's override of it.
+        with pytest.raises(ValueError, match="safety_buffer"):
+            self._config(chunk_size=10, n_action_steps=10, safety_buffer=11)
+
     def test_select_action_executes_first_n_then_requeries(self):
         """Model decodes the full ``chunk_size`` chunk, but ``select_action``
         executes only the first ``n_action_steps`` before re-querying.

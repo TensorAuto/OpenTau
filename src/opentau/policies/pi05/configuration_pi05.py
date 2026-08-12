@@ -267,11 +267,7 @@ class PI05Config(PreTrainedConfig):
                 "the frozen VLM embedding table), so the trainable set is the discrete-action "
                 "embedding + head and action_in_proj / action_out_proj only."
             )
-        if self.n_action_steps > self.chunk_size:
-            raise ValueError(
-                f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
-                f"{self.n_action_steps} for `n_action_steps` and {self.chunk_size} for `chunk_size`."
-            )
+        self.validate_action_horizon()
         if self.n_obs_steps != 1:
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
@@ -302,20 +298,6 @@ class PI05Config(PreTrainedConfig):
                 "which builds the per-token block-ids the kernel requires. This policy does "
                 "not build them, so the kernel would hard-error at the first forward. "
                 "Use 'eager' or 'sdpa' instead."
-            )
-
-        if self.max_delay > self.chunk_size:
-            raise ValueError(
-                f"The max delay must be less than or equal to the chunk size. Got {self.max_delay} for `max_delay` and {self.chunk_size} for `chunk_size`."
-            )
-
-        if self.n_action_steps < self.chunk_size and self.max_delay != 0:
-            raise ValueError(
-                "A shortened execution horizon (n_action_steps < chunk_size) is not yet "
-                "supported together with real-time inference delay (max_delay > 0); they "
-                "would entangle the action-queue prefix logic. Got "
-                f"n_action_steps={self.n_action_steps}, chunk_size={self.chunk_size}, "
-                f"max_delay={self.max_delay}."
             )
 
     def validate_features(self) -> None:

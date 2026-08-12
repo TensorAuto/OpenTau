@@ -229,28 +229,10 @@ class PI06Config(PreTrainedConfig):
         validate_state_action_representation_only_config(
             self, policy_name=self.type, has_discrete_actions=True
         )
-        if self.n_action_steps > self.chunk_size:
-            raise ValueError(
-                f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
-                f"{self.n_action_steps} for `n_action_steps` and {self.chunk_size} for `chunk_size`."
-            )
+        self.validate_action_horizon()
         if self.n_obs_steps != 1:
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
-            )
-
-        if self.max_delay > self.chunk_size:
-            raise ValueError(
-                f"The max delay must be less than or equal to the chunk size. Got {self.max_delay} for `max_delay` and {self.chunk_size} for `chunk_size`."
-            )
-
-        if self.n_action_steps < self.chunk_size and self.max_delay != 0:
-            raise ValueError(
-                "A shortened execution horizon (n_action_steps < chunk_size) is not yet "
-                "supported together with real-time inference delay (max_delay > 0); they "
-                "would entangle the action-queue prefix logic. Got "
-                f"n_action_steps={self.n_action_steps}, chunk_size={self.chunk_size}, "
-                f"max_delay={self.max_delay}."
             )
 
     def validate_features(self) -> None:

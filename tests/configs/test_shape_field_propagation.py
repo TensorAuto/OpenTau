@@ -36,6 +36,8 @@ import pytest
 from opentau.configs import parser
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.train import PIPELINE_TO_POLICY_SHAPE_FIELDS, TrainPipelineConfig
+from opentau.policies.pi05.configuration_pi05 import PI05Config
+from opentau.policies.value.configuration_value import ValueConfig
 
 TRAIN_CONFIG_SOURCE = Path("src/opentau/configs/train.py")
 ARTIFACT_DIR = Path("tests/artifacts/configs")
@@ -71,6 +73,14 @@ def _make_cfg(dataset_mixture_config, policy_config, **overrides):
         **PIPELINE_WIDTHS,
         **overrides,
     }
+    # `action_chunk` lands on `policy.chunk_size`, and the policy rejects
+    # `n_action_steps > chunk_size` once it does (`validate_action_horizon`).
+    # PIPELINE_WIDTHS deliberately disagrees with every policy default -- including the
+    # default 50-step execution horizon -- so the horizon has to come along, which is
+    # exactly what a real config that sets `action_chunk` has to do. It is not itself a
+    # propagated width, so nothing in this module asserts on it.
+    if "n_action_steps" in _declared_fields(policy_config):
+        policy_config.n_action_steps = kwargs["action_chunk"]
     return TrainPipelineConfig(**kwargs)
 
 
@@ -295,3 +305,131 @@ def test_no_shape_width_is_assigned_to_the_policy_outside_the_helper():
         "assign policy widths only inside _propagate_shape_fields_to_policy(), which "
         f"skips fields the policy does not declare; found: {offenders}"
     )
+
+
+# --- the policy invariants keyed on the propagated widths --------------------------
+#
+# `chunk_size` is not just carried; the policy constrains it. `n_action_steps` (the
+# inference execution horizon) must be <= `chunk_size`, and a shortened horizon cannot
+# be combined with the delay knob. Those checks run in the policy config's
+# `__post_init__` -- which is over by the time the propagation loop above assigns -- so
+# they were only ever checked against the `chunk_size` the policy *declared*, never
+# against the propagated `action_chunk`. `_propagate_shape_fields_to_policy` now re-runs
+# them through `PreTrainedConfig.validate_action_horizon`.
+
+POLICIES_WITH_EXECUTION_HORIZON = [
+    (name, cls)
+    for name, cls in _all_policy_configs()
+    if {"chunk_size", "n_action_steps"} <= {f.name for f in dataclasses.fields(cls)}
+]
+
+
+def test_action_chunk_below_the_policy_execution_horizon_is_rejected(dataset_mixture_config, policy_config):
+    """The reported case: `action_chunk` set, `n_action_steps` left at its default.
+
+    `PI0Config(n_action_steps=50)` under `action_chunk=13` is exactly the pair the
+    policy config raises on when it appears in a JSON config, and it used to be
+    reachable silently through propagation.
+    """
+    with pytest.raises(ValueError, match="n_action_steps") as exc_info:
+        TrainPipelineConfig(
+            dataset_mixture=dataset_mixture_config,
+            policy=policy_config,  # n_action_steps defaults to 50
+            batch_size=8,
+            action_chunk=13,
+        )
+    # Blaming `policy.chunk_size` alone would send the reader to a field that reads as
+    # untouched in their config; the pipeline field that overwrote it has to be named.
+    assert "action_chunk" in str(exc_info.value)
+
+
+def test_action_chunk_matching_the_execution_horizon_propagates(dataset_mixture_config, policy_config):
+    """The legal case still propagates -- the guard rejects only the contradiction."""
+    policy_config.n_action_steps = 13
+
+    cfg = _make_cfg(dataset_mixture_config, policy_config)
+
+    assert (cfg.policy.chunk_size, cfg.policy.n_action_steps) == (13, 13)
+
+
+def test_the_delay_knob_is_rechecked_against_the_propagated_chunk_size(dataset_mixture_config):
+    """Re-validation covers every `chunk_size` invariant, not only `n_action_steps`.
+
+    This policy config is **valid standalone** -- its horizon is not shortened, since
+    `n_action_steps == chunk_size` -- and becomes illegal only once `action_chunk`
+    widens `chunk_size` underneath it.
+    """
+    policy = PI05Config(chunk_size=10, n_action_steps=10, max_delay=5)
+
+    with pytest.raises(ValueError, match="max_delay"):
+        TrainPipelineConfig(
+            dataset_mixture=dataset_mixture_config,
+            policy=policy,
+            batch_size=8,
+            action_chunk=50,
+        )
+
+
+def test_a_policy_without_an_execution_horizon_is_left_alone(dataset_mixture_config):
+    """`value` declares `chunk_size` but no `n_action_steps`, so there is nothing to
+    contradict -- it must still receive the width rather than trip a guard.
+    """
+    cfg = _make_cfg(dataset_mixture_config, ValueConfig())
+
+    assert cfg.policy.chunk_size == 13
+    assert not hasattr(cfg.policy, "n_action_steps")
+
+
+@pytest.mark.parametrize("policy_type,policy_cls", POLICIES_WITH_EXECUTION_HORIZON)
+def test_the_propagated_width_is_rechecked_for_every_policy(dataset_mixture_config, policy_type, policy_cls):
+    """Swept over the registry, like the presence check above.
+
+    Each of these configs carried its own copy of the horizon invariant, so a policy
+    that stops routing through `validate_action_horizon` -- or a new one that never
+    starts -- silently regains the dodge.
+    """
+    policy = policy_cls()  # defaults hold n_action_steps == chunk_size
+
+    with pytest.raises(ValueError, match="n_action_steps"):
+        TrainPipelineConfig(
+            dataset_mixture=dataset_mixture_config,
+            policy=policy,
+            batch_size=8,
+            action_chunk=policy.n_action_steps - 1,
+        )
+
+
+@pytest.mark.parametrize("policy_type,policy_cls", POLICIES_WITH_EXECUTION_HORIZON)
+def test_the_policy_config_still_enforces_the_horizon_itself(policy_type, policy_cls):
+    """The other half: deduplicating the check must not lose it from any config.
+
+    Policy configs are also built directly -- eval, inference, notebooks -- where no
+    pipeline propagation runs to catch it for them.
+    """
+    with pytest.raises(ValueError, match="n_action_steps"):
+        policy_cls(chunk_size=10, n_action_steps=50)
+
+
+def test_validate_rechecks_the_horizon_after_the_pretrained_reload(dataset_mixture_config, tmp_path):
+    """`validate()` replaces `self.policy` wholesale, so it needs the same guard.
+
+    Same route as the width test above: `--policy.path` loads a checkpoint's config
+    *after* `__post_init__` already propagated onto a different (here `None`) policy.
+    """
+    checkpoint_policy = json.loads((ARTIFACT_DIR / "train_config.json").read_text())["policy"]
+    assert checkpoint_policy["n_action_steps"] == 50, "artifact no longer exercises the conflict"
+    (tmp_path / "config.json").write_text(json.dumps(checkpoint_policy))
+
+    with patch.object(parser, "get_path_arg", return_value=tmp_path):
+        cfg = TrainPipelineConfig(
+            dataset_mixture=dataset_mixture_config,
+            policy=None,
+            output_dir=str(tmp_path / "run"),
+            job_name="test_run",
+            batch_size=8,
+            use_policy_training_preset=True,
+            **PIPELINE_WIDTHS,  # action_chunk=13 against the checkpoint's 50-step horizon
+        )
+
+        with pytest.raises(ValueError, match="n_action_steps"):
+            cfg.validate()
