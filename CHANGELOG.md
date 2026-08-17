@@ -162,7 +162,6 @@ the field.
 
 ### Fixed
 
-
 * **The `config_version` normalization gate now actually runs for every policy.**
   It is documented above as the convention a checkpoint's weights were trained
   under, resolved at load time by `PreTrainedPolicy.from_pretrained` — described
