@@ -350,11 +350,10 @@ def _fit_dim_width(per_head: Tensor, max_action_dim: int, pad_value: float | boo
     return per_head[:, :max_action_dim] if width > max_action_dim else per_head
 
 
-def _gather_heads(per_head: Tensor, dataset_index: Tensor) -> Tensor:
-    """Select one ``(dim,)`` row of a per-head quantity for each sample."""
+def _head_index(dataset_index: Tensor, per_head: Tensor) -> Tensor:
+    """Return the clamped ``(B,)`` row index selecting a norm head per sample."""
     index = dataset_index.to(device=per_head.device, dtype=torch.long).reshape(-1)
-    index = index.clamp_(0, per_head.shape[0] - 1)
-    return per_head.index_select(0, index)
+    return index.clamp_(0, per_head.shape[0] - 1)
 
 
 def action_dim_scale(
@@ -393,7 +392,8 @@ def action_dim_scale(
     if norm_mode is not NormalizationMode.MEAN_STD:
         scale = scale / 2.0
     scale = torch.where(torch.isfinite(scale) & (scale >= eps), scale, torch.ones_like(scale))
-    return _gather_heads(_fit_dim_width(scale, max_action_dim, 1.0), dataset_index)
+    per_head = _fit_dim_width(scale, max_action_dim, 1.0)
+    return per_head.index_select(0, _head_index(dataset_index, per_head))
 
 
 def resolve_action_dim_mask(
@@ -440,9 +440,8 @@ def resolve_action_dim_mask(
     signature, norm_mode, eps = _action_dim_signature(unnormalize, action_key)
     # `(num_datasets, action_dim)` -> per-head bool over dims.
     head_mask = _fit_dim_width(torch.isfinite(signature) & (signature >= eps), max_action_dim, False)
-    index = dataset_index.to(device=head_mask.device, dtype=torch.long).reshape(-1)
-    index = index.clamp_(0, head_mask.shape[0] - 1)
-    per_sample = _gather_heads(head_mask, dataset_index)
+    index = _head_index(dataset_index, head_mask)
+    per_sample = head_mask.index_select(0, index)
 
     if not bool(per_sample.any()):
         # Name the head that was actually selected and contrast it with the others. The
