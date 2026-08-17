@@ -43,8 +43,12 @@ from opentau.policies.accel import (
 )
 from opentau.policies.normalize import Unnormalize
 from opentau.scripts.diagnose_accel import (
+    AccelDiagnosticReport,
+    _allocate_draws,
     _posterior_spread,
+    _signal_to_floor,
     _spearman,
+    format_report,
     measure_prefix_quality,
 )
 
@@ -376,6 +380,110 @@ def test_the_study_refuses_a_sample_too_small_to_rank():
         measure_prefix_quality(
             _ScriptedFlowPolicy(late_slope=0.0), _observations([0.01, 0.02]), num_resamples=4
         )
+
+
+# --------------------------------------------------------------------------------------
+# The go/no-go verdict — "not measured" must never render as "OK".
+# --------------------------------------------------------------------------------------
+
+
+def _report(**overrides):
+    payload = {
+        "num_steps": NUM_STEPS,
+        "prefix": 9,
+        "num_scored_dims": [ACTION_DIM],
+        "max_action_dim": ACTION_DIM,
+        "float32_scores": [],
+        "serving_scores": [0.4, 0.5],
+        "serving_dtype": "bfloat16",
+        "dtype_floor": float("nan"),
+        "noise_spread": 0.01,
+        "observation_spread": 0.09,
+        "signal_to_floor": float("nan"),
+    }
+    payload.update(overrides)
+    return AccelDiagnosticReport(**payload)
+
+
+def test_an_unmeasured_floor_is_not_an_infinite_ratio():
+    """NaN is truthy and non-finite, so the obvious guard silently yields `inf`.
+
+    That is the whole bug: skipping the float32 leg leaves nothing to compare against, but
+    an `inf` ratio is indistinguishable from the best possible result.
+    """
+    assert np.isnan(_signal_to_floor(0.09, float("nan")))
+
+
+def test_a_floor_measured_at_exactly_zero_is_still_infinite():
+    """The correction must not overreach — a real zero floor is a real infinite ratio.
+
+    float32 and the serving dtype agreeing on every observation is a legitimate (if
+    unlikely) measurement, and it genuinely means the rounding floor does not bind.
+    """
+    assert _signal_to_floor(0.09, 0.0) == float("inf")
+    assert _signal_to_floor(0.09, 0.009) == pytest.approx(10.0)
+
+
+def test_the_report_refuses_to_certify_a_floor_it_never_measured():
+    """Every `<` comparison against NaN is False, so the thresholds fall through to "OK".
+
+    Without an explicit NaN branch ahead of them, a skipped run prints the single most
+    reassuring line the script has — about a quantity it did not compute. This is the
+    regression test for the path that shipped without one.
+    """
+    rendered = format_report(_report())
+    assert "NOT MEASURED" in rendered
+    assert "OK — real signal dominates" not in rendered
+    assert "MEASURE_DTYPE_FLOOR" in rendered, "must say how to get the missing measurement"
+
+
+def test_the_report_still_certifies_a_genuinely_measured_run():
+    rendered = format_report(_report(dtype_floor=0.0056, signal_to_floor=17.2))
+    assert "OK — real signal dominates" in rendered
+    assert "NOT MEASURED" not in rendered
+
+
+@pytest.mark.parametrize(
+    ("ratio", "expected"),
+    [(1.0, "STOP"), (5.0, "MARGINAL"), (20.0, "OK")],
+)
+def test_the_measured_verdict_bands_are_unchanged(ratio, expected):
+    assert expected in format_report(_report(dtype_floor=0.01, signal_to_floor=ratio))
+
+
+# --------------------------------------------------------------------------------------
+# Observation allocation across a mixture.
+# --------------------------------------------------------------------------------------
+
+
+def test_a_short_dataset_is_made_up_by_the_others():
+    """`count` is the study's sample size, so a shortfall silently weakens every rho.
+
+    A mixture member smaller than its even slice must not lower the total — the datasets
+    after it have frames to spare.
+    """
+    assert sum(_allocate_draws([5, 100], 24)) == 24
+    assert sum(_allocate_draws([100, 5], 24)) == 24
+    assert sum(_allocate_draws([1, 1, 1, 500], 24)) == 24
+
+
+def test_asking_for_fewer_observations_than_datasets_does_not_round_up():
+    """Each observation costs K denoise passes, so overshooting the request is not free."""
+    quotas = _allocate_draws([100] * 5, 2)
+    assert sum(quotas) == 2
+    assert all(q >= 0 for q in quotas)
+
+
+def test_allocation_is_capped_by_what_the_mixture_actually_holds():
+    assert sum(_allocate_draws([3, 4], 24)) == 7
+    assert _allocate_draws([3, 4], 24) == [3, 4]
+
+
+def test_allocation_spreads_across_members_rather_than_draining_the_first():
+    """Drawing everything from one dataset is the narrowed-range failure this replaced."""
+    quotas = _allocate_draws([1000, 1000, 1000], 24)
+    assert sum(quotas) == 24
+    assert min(quotas) > 0, "every dataset must contribute"
 
 
 def test_the_study_restores_the_policy_prefix():

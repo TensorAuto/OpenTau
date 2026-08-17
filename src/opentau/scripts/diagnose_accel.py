@@ -663,12 +663,34 @@ def diagnose_accel(
         dtype_floor=dtype_floor,
         noise_spread=noise_spread,
         observation_spread=observation_spread,
-        signal_to_floor=(
-            observation_spread / dtype_floor if dtype_floor and np.isfinite(dtype_floor) else float("inf")
-        ),
+        signal_to_floor=_signal_to_floor(observation_spread, dtype_floor),
         prefix_sweep=prefix_sweep,
         prefix_study=prefix_study,
     )
+
+
+def _signal_to_floor(observation_spread: float, dtype_floor: float) -> float:
+    """Return the go/no-go ratio, or NaN when there is no floor to compare against.
+
+    The distinction this exists to preserve: a floor that was **never measured** (the
+    float32 leg was skipped, or no observation produced a finite pair) is not the same as a
+    floor measured at zero. Collapsing them to ``inf`` — as a plain
+    ``if dtype_floor and isfinite(...) else inf`` does, because NaN is truthy and not finite
+    — makes an unmeasured run print the most reassuring verdict the script has.
+
+    Args:
+        observation_spread: Std of ``accel`` across observations (the signal).
+        dtype_floor: Median float32-vs-serving difference, or NaN if unmeasured.
+
+    Returns:
+        The ratio; ``inf`` when the floor was measured as exactly zero (float32 and the
+        serving dtype agreed on every observation); NaN when it was never measured.
+    """
+    if not np.isfinite(dtype_floor):
+        return float("nan")
+    if dtype_floor > 0.0:
+        return observation_spread / dtype_floor
+    return float("inf")
 
 
 def format_report(report: AccelDiagnosticReport) -> str:
@@ -679,7 +701,17 @@ def format_report(report: AccelDiagnosticReport) -> str:
     perturbation. Between those, treat the number as suggestive and look at the raw scores.
     """
     ratio = report.signal_to_floor
-    if ratio < 3.0:
+    if np.isnan(ratio):
+        # Must precede the thresholds: every `<` against NaN is False, so a NaN ratio would
+        # otherwise fall through to the "OK" branch and claim the signal dominates a floor
+        # that was never measured.
+        verdict = (
+            "NOT MEASURED — the float32 leg was skipped, so there is no rounding floor to "
+            "compare the signal against and this run cannot answer the go/no-go. Re-run "
+            "once with OPENTAU_ACCEL_MEASURE_DTYPE_FLOOR=1 (the floor is fixed per "
+            "checkpoint, so once is enough)."
+        )
+    elif ratio < 3.0:
         verdict = (
             "STOP — the between-observation spread is within 3x of the pure-rounding floor, "
             "so accel here is mostly measuring bfloat16 arithmetic. Keep the action "
@@ -794,6 +826,47 @@ def _prefix_verdict(study: PrefixStudy) -> list[str]:
     return lines
 
 
+def _allocate_draws(sizes: list[int], count: int) -> list[int]:
+    """Split ``count`` observations across datasets of the given sizes.
+
+    Fair-share with carry-over: each dataset is offered an even slice of what is *still*
+    outstanding, capped by what it actually holds, so a member smaller than its slice is
+    made up by the ones after it instead of quietly lowering the total. The total is also a
+    hard ceiling — asking for fewer observations than there are datasets must not round up
+    to one-each, since every extra observation costs ``K`` denoise passes in the study.
+
+    Args:
+        sizes: Frame count per dataset. Empty datasets should be filtered out first.
+        count: Total observations wanted.
+
+    Returns:
+        Per-dataset draw counts, summing to ``min(count, sum(sizes))``.
+    """
+    quotas = [0] * len(sizes)
+    remaining = min(count, sum(sizes))
+    while remaining > 0:
+        # Re-passing is what makes the carry-over work in both directions. One pass can only
+        # push a shortfall *forward*, so a mixture whose LAST member is the short one would
+        # still come up short — the datasets with spare frames have already been offered
+        # their slice by then.
+        hungry = [i for i, size in enumerate(sizes) if quotas[i] < size]
+        if not hungry:
+            break
+        progressed = False
+        for position, index in enumerate(hungry):
+            if remaining <= 0:
+                break
+            share = max(1, remaining // (len(hungry) - position))
+            take = min(share, remaining, sizes[index] - quotas[index])
+            if take > 0:
+                quotas[index] += take
+                remaining -= take
+                progressed = True
+        if not progressed:
+            break
+    return quotas
+
+
 def dataset_observations(cfg: TrainPipelineConfig, device: torch.device, count: int) -> list[dict]:
     """Draw real observation batches from the configured dataset mixture.
 
@@ -824,23 +897,20 @@ def dataset_observations(cfg: TrainPipelineConfig, device: torch.device, count: 
     from opentau.datasets.factory import make_dataset_mixture
 
     mixture = make_dataset_mixture(cfg)
-    datasets = list(getattr(mixture, "datasets", None) or [mixture])
-    if not any(len(d) for d in datasets):
+    datasets = [d for d in (getattr(mixture, "datasets", None) or [mixture]) if len(d)]
+    if not datasets:
         raise ValueError("The configured dataset mixture is empty; cannot draw observations.")
 
     # Spread the draw across every configured dataset, not just the first. The prefix study
     # correlates accel against posterior spread *across* observations, so it is only as
     # informative as the range of scenes those observations cover; silently sampling one
     # member of a mixture would narrow that range without saying so.
+    quotas = _allocate_draws([len(d) for d in datasets], count)
     observations: list[dict] = []
-    per_dataset = max(1, count // len(datasets))
-    for position, dataset in enumerate(datasets):
-        total = len(dataset)
-        if total == 0:
-            continue
-        wanted = min(per_dataset if position < len(datasets) - 1 else count - len(observations), total)
+    for position, (dataset, wanted) in enumerate(zip(datasets, quotas, strict=True)):
         if wanted <= 0:
-            break
+            continue
+        total = len(dataset)
         stride = max(1, total // wanted)
         indices = [min(i * stride, total - 1) for i in range(wanted)]
         logger.info(
@@ -854,6 +924,18 @@ def dataset_observations(cfg: TrainPipelineConfig, device: torch.device, count: 
             observations.append(
                 {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
             )
+
+    if len(observations) != count:
+        # Never silent: `count` is the prefix study's sample size, i.e. the thing that decides
+        # whether neighbouring prefixes are separable at all. A run that quietly went to
+        # half the requested observations produces rank correlations nobody knows to distrust.
+        logger.warning(
+            "Requested %d observation(s) but the mixture could only supply %d (dataset sizes: "
+            "%s). The prefix study's rank correlations are computed over the smaller sample.",
+            count,
+            len(observations),
+            [len(d) for d in datasets],
+        )
     return observations
 
 
