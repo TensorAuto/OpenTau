@@ -62,8 +62,11 @@ that consumes the per-chunk stream produced here.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import logging
 import os
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -89,6 +92,43 @@ MIN_PREFIX = 2
 # Environment variable that enables ``accel`` on an entry point with no config field for it.
 # Accepts ``auto`` (the paper's default prefix) or an integer ``>= MIN_PREFIX``.
 ACCEL_PREFIX_ENV = "OPENTAU_ACCEL_PREFIX"
+
+# Collects the meters built by `make_meter` while a diagnostic is running, and doubles as
+# the "record a per-step trace" switch (`None` = off). Non-`None` makes every prefix
+# readable from a single denoise pass via `AccelMeter.value_at`. Diagnostics only.
+#
+# A `ContextVar` rather than a module global or a `policy.` attribute: the meter is built
+# deep inside `sample_actions`, so both the switch and the hand-back have to reach it
+# without widening any policy signature — but the gRPC server calls `sample_actions` from
+# multiple threads, and a plain global would splice one thread's diagnostic run into
+# another's serving traffic. A `ContextVar` is per-thread (and per-task) by construction.
+_TRACE_SINK: contextvars.ContextVar[list[AccelMeter] | None] = contextvars.ContextVar(
+    "accel_trace_sink", default=None
+)
+
+
+@contextlib.contextmanager
+def record_traces() -> Iterator[list[AccelMeter]]:
+    """Capture the meters built inside this context, with per-step traces enabled.
+
+    The score at every prefix is recoverable from one denoise pass
+    (:meth:`AccelMeter.value_at`), but the policies hand back only ``last_accel`` — the
+    single configured prefix — so a prefix study needs the meter object itself. Yielding a
+    sink is how it gets one without any policy exposing its internals.
+
+    Off by default: the serving path never needs it, and a captured meter keeps its trace
+    tensors alive. Drain the list between iterations on a long study.
+
+    Yields:
+        A list receiving every meter built in this context, in creation order. The previous
+        setting is restored on exit, including on exception.
+    """
+    created: list[AccelMeter] = []
+    token = _TRACE_SINK.set(created)
+    try:
+        yield created
+    finally:
+        _TRACE_SINK.reset(token)
 
 
 def default_prefix(num_steps: int) -> int:
@@ -236,6 +276,126 @@ def assert_comparable(fitted: AccelProvenance, observed: AccelProvenance) -> Non
         )
 
 
+def _action_dim_signature(
+    unnormalize: torch.nn.Module, action_key: str
+) -> tuple[Tensor, NormalizationMode, float]:
+    """Return the per-head, per-dim normalization *scale* of an action feature.
+
+    One extractor feeds both consumers of these buffers —
+    :func:`resolve_action_dim_mask` (which thresholds the scale to find padded dims) and
+    :func:`action_dim_scale` (which divides by it to standardize a raw-space spread). They
+    must read the same buffer, the same stat names, and the same live ``eps``; two
+    hand-maintained copies would drift the moment a normalization mode is added.
+
+    Args:
+        unnormalize: The policy's ``Unnormalize`` module.
+        action_key: Feature key to read stats for.
+
+    Returns:
+        ``(signature, norm_mode, eps)`` where ``signature`` is ``(num_heads, dim)``: ``std``
+        under MEAN_STD, ``hi - lo`` under MIN_MAX / QUANTILE. Note this is the *range*, not
+        the divisor — MIN_MAX maps ``[lo, hi]`` onto ``[-1, 1]``, so its divisor is half of
+        this. :func:`action_dim_scale` applies that factor; the mask only needs the
+        zero-vs-nonzero distinction, which the factor cannot change.
+
+    Raises:
+        ValueError: When the feature is missing, IDENTITY-normalized, or has no buffer.
+    """
+    norm_map = getattr(unnormalize, "norm_map", {})
+    features = getattr(unnormalize, "features", {})
+    feature = features.get(action_key)
+    if feature is None:
+        raise ValueError(
+            f"accel: no feature {action_key!r} on the policy's Unnormalize; cannot derive "
+            "the action-dim mask."
+        )
+    norm_mode = norm_map.get(feature.type, NormalizationMode.IDENTITY)
+    if norm_mode is NormalizationMode.IDENTITY:
+        raise ValueError(
+            "accel: ACTION normalization is IDENTITY, so no stats buffer exists and the "
+            "padded-action-dim mask cannot be derived. IDENTITY also leaves per-dim scale "
+            "heterogeneous, which violates the estimator's standardized-dimension premise. "
+            "Disable accel for this checkpoint or retrain/serve with MEAN_STD."
+        )
+
+    buffer = getattr(unnormalize, "buffer_" + action_key.replace(".", "_"), None)
+    if buffer is None:
+        raise ValueError(f"accel: Unnormalize has no stats buffer for {action_key!r}.")
+
+    # Import locally: `_materialize` is a private FSDP2/DTensor shim in `normalize`, and a
+    # module-level import would make this module's import graph depend on it by name.
+    from opentau.policies.normalize import _materialize
+
+    if norm_mode is NormalizationMode.MEAN_STD:
+        signature = _materialize(buffer["std"]).abs()
+    else:
+        lo_name, hi_name = stat_names_for_mode(norm_mode)
+        signature = (_materialize(buffer[hi_name]) - _materialize(buffer[lo_name])).abs()
+
+    signature = signature.reshape(signature.shape[0], -1)
+    return signature, norm_mode, float(unnormalize.eps)
+
+
+def _fit_dim_width(per_head: Tensor, max_action_dim: int, pad_value: float | bool) -> Tensor:
+    """Pad or truncate a ``(heads, dim)`` per-dim quantity to the sampler's action width."""
+    width = per_head.shape[1]
+    if width < max_action_dim:
+        pad = torch.full(
+            (per_head.shape[0], max_action_dim - width),
+            pad_value,
+            dtype=per_head.dtype,
+            device=per_head.device,
+        )
+        return torch.cat([per_head, pad], dim=1)
+    return per_head[:, :max_action_dim] if width > max_action_dim else per_head
+
+
+def _gather_heads(per_head: Tensor, dataset_index: Tensor) -> Tensor:
+    """Select one ``(dim,)`` row of a per-head quantity for each sample."""
+    index = dataset_index.to(device=per_head.device, dtype=torch.long).reshape(-1)
+    index = index.clamp_(0, per_head.shape[0] - 1)
+    return per_head.index_select(0, index)
+
+
+def action_dim_scale(
+    unnormalize: torch.nn.Module,
+    *,
+    max_action_dim: int,
+    dataset_index: Tensor,
+    action_key: str = "actions",
+) -> Tensor:
+    """Return the per-sample, per-dim divisor that maps raw actions into normalized space.
+
+    ``accel`` is computed on the sampler's *normalized* velocities, so anything meant to be
+    compared against it — most importantly the resampling-based posterior spread that
+    :mod:`opentau.scripts.diagnose_accel` uses to choose a prefix — has to be expressed in
+    the same units. A spread measured on ``sample_actions`` output is in raw units, where a
+    gripper in ``[0, 1]`` and a shoulder joint in radians contribute on wildly different
+    scales; dividing by this vector removes that.
+
+    Degenerate dims are returned as ``1.0`` rather than ``0.0`` so a caller can divide
+    unconditionally. They carry no signal and are excluded by
+    :func:`resolve_action_dim_mask` anyway, so the value is arbitrary — it only has to be
+    finite and non-zero.
+
+    Args:
+        unnormalize: The policy's ``Unnormalize`` module.
+        max_action_dim: Width to pad/truncate to. Padded dims get ``1.0``.
+        dataset_index: ``(B,)`` long tensor of norm-head row indices.
+        action_key: Feature key to read stats for.
+
+    Returns:
+        ``(B, max_action_dim)`` float32, strictly positive.
+    """
+    signature, norm_mode, eps = _action_dim_signature(unnormalize, action_key)
+    # MIN_MAX / QUANTILE map `[lo, hi]` onto `[-1, 1]`, i.e. divide by half the range.
+    scale = signature.to(torch.float32)
+    if norm_mode is not NormalizationMode.MEAN_STD:
+        scale = scale / 2.0
+    scale = torch.where(torch.isfinite(scale) & (scale >= eps), scale, torch.ones_like(scale))
+    return _gather_heads(_fit_dim_width(scale, max_action_dim, 1.0), dataset_index)
+
+
 def resolve_action_dim_mask(
     unnormalize: torch.nn.Module,
     *,
@@ -277,54 +437,12 @@ def resolve_action_dim_mask(
         ValueError: When the action feature is IDENTITY-normalized (no buffer exists, so
             the mask is underivable) or has no buffer for another reason.
     """
-    norm_map = getattr(unnormalize, "norm_map", {})
-    features = getattr(unnormalize, "features", {})
-    feature = features.get(action_key)
-    if feature is None:
-        raise ValueError(
-            f"accel: no feature {action_key!r} on the policy's Unnormalize; cannot derive "
-            "the action-dim mask."
-        )
-    norm_mode = norm_map.get(feature.type, NormalizationMode.IDENTITY)
-    if norm_mode is NormalizationMode.IDENTITY:
-        raise ValueError(
-            "accel: ACTION normalization is IDENTITY, so no stats buffer exists and the "
-            "padded-action-dim mask cannot be derived. IDENTITY also leaves per-dim scale "
-            "heterogeneous, which violates the estimator's standardized-dimension premise. "
-            "Disable accel for this checkpoint or retrain/serve with MEAN_STD."
-        )
-
-    buffer = getattr(unnormalize, "buffer_" + action_key.replace(".", "_"), None)
-    if buffer is None:
-        raise ValueError(f"accel: Unnormalize has no stats buffer for {action_key!r}.")
-
-    eps = float(unnormalize.eps)
-    # Import locally: `_materialize` is a private FSDP2/DTensor shim in `normalize`, and a
-    # module-level import would make this module's import graph depend on it by name.
-    from opentau.policies.normalize import _materialize
-
-    if norm_mode is NormalizationMode.MEAN_STD:
-        signature = _materialize(buffer["std"]).abs()
-    else:
-        lo_name, hi_name = stat_names_for_mode(norm_mode)
-        signature = (_materialize(buffer[hi_name]) - _materialize(buffer[lo_name])).abs()
-
+    signature, norm_mode, eps = _action_dim_signature(unnormalize, action_key)
     # `(num_datasets, action_dim)` -> per-head bool over dims.
-    signature = signature.reshape(signature.shape[0], -1)
-    head_mask = torch.isfinite(signature) & (signature >= eps)
-
-    width = head_mask.shape[1]
-    if width < max_action_dim:
-        pad = torch.zeros(
-            (head_mask.shape[0], max_action_dim - width), dtype=torch.bool, device=head_mask.device
-        )
-        head_mask = torch.cat([head_mask, pad], dim=1)
-    elif width > max_action_dim:
-        head_mask = head_mask[:, :max_action_dim]
-
+    head_mask = _fit_dim_width(torch.isfinite(signature) & (signature >= eps), max_action_dim, False)
     index = dataset_index.to(device=head_mask.device, dtype=torch.long).reshape(-1)
     index = index.clamp_(0, head_mask.shape[0] - 1)
-    per_sample = head_mask.index_select(0, index)
+    per_sample = _gather_heads(head_mask, dataset_index)
 
     if not bool(per_sample.any()):
         # Name the head that was actually selected and contrast it with the others. The
@@ -387,12 +505,14 @@ class AccelMeter:
     batch_size: int
     device: torch.device
     dim_mask: Tensor | None = None
+    record_trace: bool = False
 
     _numerator: Tensor = field(init=False, repr=False)
     _denominator: Tensor = field(init=False, repr=False)
     _prev: Tensor | None = field(default=None, init=False, repr=False)
     _score_mask: Tensor | None = field(default=None, init=False, repr=False)
     _steps: int = field(default=0, init=False)
+    _trace: list[tuple[Tensor, Tensor]] = field(default_factory=list, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.prefix < MIN_PREFIX:
@@ -434,6 +554,8 @@ class AccelMeter:
             self._numerator = self._numerator + torch.linalg.vector_norm(v - self._prev, dim=1)
         self._prev = v
         self._steps += 1
+        if self.record_trace:
+            self._trace.append((self._numerator, self._denominator))
 
     @property
     def steps(self) -> int:
@@ -457,6 +579,47 @@ class AccelMeter:
             return nan
         scored = self._steps * self._numerator / self._denominator.clamp_min(DENOMINATOR_FLOOR)
         return torch.where(self._denominator > DENOMINATOR_FLOOR, scored, nan)
+
+    def value_at(self, prefix: int) -> Tensor:
+        """Return the ``(B,)`` score this meter *would* have reported at a shorter prefix.
+
+        ``accel_p`` is a prefix statistic of one velocity sequence, so every prefix is
+        recoverable from a single denoise pass — the numerator and denominator are running
+        sums and :meth:`update` snapshots both. That turns a prefix sweep from ``T - 1``
+        forward passes into one, which is what makes the resampling-based prefix study in
+        :mod:`opentau.scripts.diagnose_accel` affordable.
+
+        Requires ``record_trace=True``; the serving path leaves it off so the hot loop
+        allocates nothing extra.
+
+        Args:
+            prefix: Prefix to evaluate, in ``[MIN_PREFIX, steps]``.
+
+        Returns:
+            ``(B,)`` float32, NaN under the same conditions as :meth:`value`.
+
+        Raises:
+            RuntimeError: If the meter was built without ``record_trace``.
+            ValueError: If ``prefix`` is outside ``[MIN_PREFIX, steps]``.
+        """
+        if not self.record_trace:
+            raise RuntimeError(
+                "AccelMeter.value_at requires record_trace=True — build the meter inside "
+                "`opentau.policies.accel.record_traces()`."
+            )
+        if not MIN_PREFIX <= prefix <= self._steps:
+            raise ValueError(f"prefix must be in [{MIN_PREFIX}, {self._steps}] for this meter, got {prefix}.")
+        numerator, denominator = self._trace[prefix - 1]
+        nan = torch.full_like(denominator, float("nan"))
+        scored = prefix * numerator / denominator.clamp_min(DENOMINATOR_FLOOR)
+        return torch.where(denominator > DENOMINATOR_FLOOR, scored, nan)
+
+    def prefix_values(self) -> dict[int, list[float]]:
+        """Return ``{p: per-sample accel_p}`` for every prefix this meter can evaluate."""
+        return {
+            p: [float(x) for x in self.value_at(p).detach().to("cpu", torch.float32).tolist()]
+            for p in range(MIN_PREFIX, self._steps + 1)
+        }
 
     def to_list(self) -> list[float]:
         """Return the score as plain Python floats.
@@ -514,7 +677,17 @@ def make_meter(
         max_action_dim=max_action_dim,
         dataset_index=dataset_index,
     )
-    return AccelMeter(prefix=prefix, batch_size=batch_size, device=device, dim_mask=dim_mask)
+    sink = _TRACE_SINK.get()
+    meter = AccelMeter(
+        prefix=prefix,
+        batch_size=batch_size,
+        device=device,
+        dim_mask=dim_mask,
+        record_trace=sink is not None,
+    )
+    if sink is not None:
+        sink.append(meter)
+    return meter
 
 
 def build_provenance(
