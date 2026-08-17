@@ -10,7 +10,48 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-_Nothing yet._
+### Changed — `accel`'s prefix is now *measured* rather than assumed
+
+`default_prefix` returns `T - 1` because that is the prefix the paper's online detector
+used. The 0.13.0 notes below cite the prefix sweep as confirming it, via the step-over-step
+growth in `accel_p` reversing at the last step. **That inference does not hold**, and this
+entry supersedes it: both of `accel_p`'s sums accumulate over the prefix, so its magnitude
+— and the shape of its growth — rise with `p` whether or not the extra Euler steps carry
+posterior information. The sweep is descriptive; it would produce a similar curve on data
+with no signal at all, so its peak cannot select a prefix.
+
+The criterion that *can* is the rank correlation between `accel_p` and an independent
+measure of posterior spread, and that reference has to be bought the expensive way — `K`
+resampled denoises of one observation, whose disagreement is the posterior width.
+`opentau-accel-diagnose` now measures it (`OPENTAU_ACCEL_OBSERVATIONS`, default 24;
+`OPENTAU_ACCEL_RESAMPLES`, default 32; `0` skips the study) and reports `rho` per prefix
+with a recommendation.
+
+Re-measured on the same 6-DoF SO101 pi05 checkpoint (`T = 10`, 24 real frames, `K = 32`):
+`rho` climbs to **+0.833 at `p = 9`** and falls to **+0.812 at `p = 10`**. So `T - 1` is
+right on this checkpoint and the terminal step really is the weaker one — the same
+conclusion as before, now resting on evidence that supports it. Every prefix scored
++0.70…+0.83, so prefix choice is not very consequential here; the paper's mid-schedule
+optimum (`p/T ~ 0.4-0.5`, i.e. `p = 4-5`, `rho` +0.75) does **not** transfer. Re-measure
+per checkpoint — a `T = 5` schedule (pi06/pi07) is unexamined, and there `T - 1` and the
+paper's mid-schedule choice are far apart.
+
+Supporting changes, none of which alter a served score:
+
+- `AccelMeter` gained an **opt-in** per-step trace and `value_at(p)`, so every prefix is
+  recoverable from **one** denoise pass instead of `T - 1` — that is what makes the study
+  affordable, and it makes the descriptive sweep `T - 1` times cheaper too. Off in serving.
+- `record_traces()` hands the meters built inside it back to a diagnostic, so no policy has
+  to expose its internals. A `ContextVar`, not a global: the gRPC server samples from
+  several threads, and a global would splice a diagnostic into serving traffic.
+- `action_dim_scale()` converts a raw-unit spread into the normalized units `accel` is
+  computed in, sharing one buffer extractor with `resolve_action_dim_mask`.
+- Diagnostic observations are drawn across **every** dataset in the configured mixture
+  rather than only the first — the correlation is taken across observations, so their
+  variety is the study's resolution.
+- The float32 leg of the dtype-floor measurement can be skipped
+  (`OPENTAU_ACCEL_MEASURE_DTYPE_FLOOR=0`). It holds a second copy of the weights and is the
+  first thing to fail on a shared GPU; skipping reports `NaN` rather than a fabricated ratio.
 
 ## [0.13.0] - 2026-08-17
 
