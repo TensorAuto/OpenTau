@@ -132,6 +132,7 @@ class TestRequestHook:
         servicer.GetActionChunk(_request(), MagicMock())
 
         assert calls == ["GetActionChunk"]
+        servicer.policy.sample_actions.assert_called_once()
 
 
 class TestPlannerEnabled:
