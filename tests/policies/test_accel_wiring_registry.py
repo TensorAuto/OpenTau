@@ -39,17 +39,43 @@ corruption it names:
    from a re-plan and a consumer records the same score ``n_action_steps`` times.
 5. ``reset`` must clear the accel state, or it leaks across episodes.
 
+Two of those seven — pi05 and pi06 — are additionally wired for best-of-N candidate sampling
+(:mod:`opentau.policies.candidates`), which rides the same sampler signature and publishes the
+same per-plan state, so its structural invariants live here too:
+
+6. ``n_candidates`` must sit **immediately before** ``accel`` in the inner sampler and default
+   to ``1``. Invariant 3 above pins ``accel`` as the trailing parameter for the positional
+   callers; a parameter inserted on the wrong side of it shifts them silently.
+7. The wrapper attribute and the sampler parameter must appear on **exactly** the same
+   policies. Either half alone is a no-op that reports success: an attribute without the
+   parameter fans out nothing, and a parameter without the attribute is unreachable, since
+   ``configure_candidates`` gates on ``hasattr``.
+8. Every family that is *not* wired must refuse ``n_candidates > 1`` rather than accept the
+   config field and ignore it.
+
 A new flow-matching policy that forgets any of this fails here rather than at the point
 where somebody trusts a number it produced.
 """
 
 import ast
+import inspect
 import re
+import textwrap
+import warnings
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+# The full policy registry, imported rather than copied: that module pins its list against the
+# factory's own `policy_type == "..."` branches, so a second hand-kept copy here would be the
+# "two hand-maintained lists fail open" failure CLAUDE.md rule 5 names — a policy type present
+# in only one copy silently drops out of the sweeps below.
+from test_state_action_representation_only_registry import ALL_POLICY_TYPES
+
 import opentau
+from opentau.policies.candidates import MEDOID, configure_candidates
+from opentau.policies.factory import get_policy_class, make_policy_config
 
 _POLICIES_ROOT = Path(opentau.__file__).parent / "policies"
 
@@ -76,6 +102,23 @@ FLOW_MATCHING_POLICIES = [
 ]
 
 IDS = [entry[0] for entry in FLOW_MATCHING_POLICIES]
+
+#: The subset of :data:`FLOW_MATCHING_POLICIES` wired for best-of-N candidate sampling
+#: (:mod:`opentau.policies.candidates`). Keyed by module path so the tuples stay single-sourced
+#: with the list above. Scoped to pi05 + pi06 for the first release.
+CANDIDATE_WIRED = frozenset({"pi05/modeling_pi05.py", "pi06/modeling_pi06.py"})
+
+CANDIDATE_POLICIES = [entry for entry in FLOW_MATCHING_POLICIES if entry[0] in CANDIDATE_WIRED]
+CANDIDATE_IDS = [entry[0] for entry in CANDIDATE_POLICIES]
+
+#: Policy *types* that route to a wired policy class. ``pi05_continuous_state`` is a deprecated
+#: alias resolving to ``PI05Policy``, so it inherits the wiring and must not be swept as
+#: unwired — a refusal test parametrized over it would assert a refusal that never comes.
+CANDIDATE_WIRED_TYPES = frozenset({"pi05", "pi05_continuous_state", "pi06"})
+UNWIRED_POLICY_TYPES = ALL_POLICY_TYPES - CANDIDATE_WIRED_TYPES
+
+#: Per-plan candidate state published beside ``last_accel``, and cleared wherever it is.
+CANDIDATE_STATE = frozenset({"last_accel_candidates", "last_candidate_scores"})
 
 
 def _tree(rel_path: str) -> ast.Module:
@@ -107,6 +150,60 @@ def _accel_method_calls(node: ast.AST, method: str) -> list[ast.Call]:
         and isinstance(call.func.value, ast.Name)
         and call.func.value.id == "accel"
     ]
+
+
+def _attrs_cleared_to_none(fn: ast.FunctionDef) -> set[str]:
+    """Attribute names that ``fn`` assigns ``None`` to, e.g. ``self.last_accel = None``."""
+    cleared: set[str] = set()
+    for node in ast.walk(fn):
+        if isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        elif isinstance(node, ast.Assign):
+            targets = node.targets
+        else:
+            continue
+        if isinstance(node.value, ast.Constant) and node.value.value is None:
+            cleared |= {t.attr for t in targets if isinstance(t, ast.Attribute)}
+    return cleared
+
+
+def _assigns_n_candidates(node: ast.AST) -> bool:
+    """Whether ``node`` contains any ``<something>.n_candidates = ...`` assignment."""
+    for child in ast.walk(node):
+        if isinstance(child, ast.AnnAssign):
+            targets = [child.target]
+        elif isinstance(child, ast.Assign):
+            targets = child.targets
+        else:
+            continue
+        if any(isinstance(t, ast.Attribute) and t.attr == "n_candidates" for t in targets):
+            return True
+    return False
+
+
+def _init_defs(tree: ast.Module) -> list[ast.FunctionDef]:
+    return [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "__init__"]
+
+
+def _sample_actions_defs(tree: ast.Module) -> list[ast.FunctionDef]:
+    """Every ``sample_actions`` in a module — the wrapper's *and* the inner sampler's."""
+    return [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "sample_actions"]
+
+
+def _policy_class(policy_type: str) -> type:
+    with warnings.catch_warnings():
+        # pi05_continuous_state is deprecated but still routable.
+        warnings.simplefilter("ignore", DeprecationWarning)
+        return get_policy_class(policy_type)
+
+
+def _init_assigns_n_candidates(cls: type) -> bool:
+    """Whether an instance of ``cls`` would end up with an ``n_candidates`` attribute.
+
+    Reads the ``__init__`` Python resolves for ``cls``, so a subclass that inherits its
+    constructor (cosmos3_nano, the pi05_continuous_state alias) inherits the answer too.
+    """
+    return _assigns_n_candidates(ast.parse(textwrap.dedent(inspect.getsource(cls.__init__))))
 
 
 def _euler_update_lines(sampler: ast.FunctionDef) -> list[tuple[int, str]]:
@@ -149,6 +246,37 @@ def test_inner_sampler_takes_accel_last_and_defaults_to_none(rel_path, sampler_c
     assert isinstance(defaults[-1], ast.Constant) and defaults[-1].value is None, (
         f"{sampler_cls}.sample_actions: 'accel' must default to None so the feature is off "
         "by default and the traced graph is unchanged"
+    )
+
+
+@pytest.mark.parametrize(("rel_path", "sampler_cls", "policy_cls"), CANDIDATE_POLICIES, ids=CANDIDATE_IDS)
+def test_inner_sampler_takes_n_candidates_before_accel(rel_path, sampler_cls, policy_cls):
+    """``n_candidates`` must sit immediately before ``accel``, defaulting to ``1``.
+
+    The position is load-bearing rather than cosmetic. The test above pins ``accel`` as the
+    *last* parameter and the *last* default as ``None`` — because the ONNX exporter and the
+    compiled-callable rebinds call this method positionally — so those two assertions read the
+    tail of the signature. Appending ``n_candidates`` after ``accel`` would break them
+    outright; slotting it anywhere else leaves them passing while a positional caller silently
+    hands a meter to the candidate count. Adjacency is what keeps both pins reading the
+    parameters they name.
+
+    The default of ``1`` is the other half of the no-op guarantee: it folds ``bsize *
+    n_candidates`` back to ``bsize``, so every pre-existing caller draws the same noise off the
+    same RNG stream and the ``n_candidates > 1`` fan-out is a compile-time constant.
+    """
+    sampler = _method(_tree(rel_path), sampler_cls, "sample_actions")
+    args = sampler.args.args + sampler.args.kwonlyargs
+    assert [a.arg for a in args[-2:]] == ["n_candidates", "accel"], (
+        f"{sampler_cls}.sample_actions must end (..., n_candidates, accel); got {[a.arg for a in args[-3:]]}"
+    )
+
+    defaults = sampler.args.defaults + [d for d in sampler.args.kw_defaults if d is not None]
+    assert len(defaults) >= 2, f"{sampler_cls}.sample_actions: 'n_candidates' must have a default"
+    default = defaults[-2]
+    assert isinstance(default, ast.Constant) and default.value == 1, (
+        f"{sampler_cls}.sample_actions: 'n_candidates' must default to 1 so existing callers "
+        "are byte-identical and best-of-N stays opt-in"
     )
 
 
@@ -267,36 +395,40 @@ def test_select_action_clears_last_accel(rel_path, sampler_cls, policy_cls):
     Without the clear, a consumer reading ``last_accel`` every step records the same score
     ``n_action_steps`` times — inflating the stream and, worse, feeding a conformal
     calibration duplicated samples it treats as independent.
+
+    The candidate state is published on the same schedule and is stale in exactly the same
+    way, so on a wired policy it has to be cleared here too. It is the more dangerous of the
+    two: ``last_candidate_scores`` reread on a queue-pop step attributes a critic's ranking to
+    a step where no critic ran.
     """
-    select = _method(_tree(rel_path), policy_cls, "select_action")
-    clears = [
-        node.lineno
-        for node in ast.walk(select)
-        if isinstance(node, ast.Assign)
-        and isinstance(node.value, ast.Constant)
-        and node.value.value is None
-        and any(
-            isinstance(t, ast.Attribute) and t.attr == "last_accel" and isinstance(t.value, ast.Name)
-            for t in node.targets
+    cleared = _attrs_cleared_to_none(_method(_tree(rel_path), policy_cls, "select_action"))
+    assert "last_accel" in cleared, (
+        f"{policy_cls}.select_action must clear `self.last_accel` so a queue-pop step reads None"
+    )
+    if rel_path in CANDIDATE_WIRED:
+        assert cleared >= CANDIDATE_STATE, (
+            f"{policy_cls}.select_action must also clear {sorted(CANDIDATE_STATE - cleared)}, "
+            f"cleared: {sorted(cleared)}"
         )
-    ]
-    assert clears, f"{policy_cls}.select_action must clear `self.last_accel` so a queue-pop step reads None"
 
 
 @pytest.mark.parametrize(("rel_path", "sampler_cls", "policy_cls"), FLOW_MATCHING_POLICIES, ids=IDS)
 def test_reset_clears_the_accel_state(rel_path, sampler_cls, policy_cls):
-    """``policy.reset()`` runs once per rollout batch; per-episode state must not survive it."""
-    reset = _method(_tree(rel_path), policy_cls, "reset")
-    cleared = {
-        target.attr
-        for node in ast.walk(reset)
-        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant) and node.value.value is None
-        for target in node.targets
-        if isinstance(target, ast.Attribute)
-    }
+    """``policy.reset()`` runs once per rollout batch; per-episode state must not survive it.
+
+    ``reset`` is also what ``__init__`` calls to declare these attributes, so a name missing
+    here does not merely leak across episodes — it does not exist until the first re-plan, and
+    a consumer reading it before then gets ``AttributeError`` rather than ``None``.
+    """
+    cleared = _attrs_cleared_to_none(_method(_tree(rel_path), policy_cls, "reset"))
     assert {"last_accel", "last_accel_provenance"} <= cleared, (
         f"{policy_cls}.reset must clear last_accel and last_accel_provenance, cleared: {sorted(cleared)}"
     )
+    if rel_path in CANDIDATE_WIRED:
+        assert cleared >= CANDIDATE_STATE, (
+            f"{policy_cls}.reset must also clear {sorted(CANDIDATE_STATE - cleared)}, "
+            f"cleared: {sorted(cleared)}"
+        )
 
 
 @pytest.mark.parametrize(("rel_path", "sampler_cls", "policy_cls"), FLOW_MATCHING_POLICIES, ids=IDS)
@@ -381,3 +513,87 @@ def test_the_registry_covers_every_denoise_loop_in_the_tree():
     )
     stale = listed - found
     assert not stale, f"These entries no longer have a denoise loop: {sorted(stale)}"
+
+
+def test_exactly_the_wired_policies_declare_n_candidates():
+    """Set equality in both directions, over the whole tree and the whole policy registry.
+
+    Best-of-N is two independent halves — the wrapper's ``self.n_candidates`` attribute and
+    the inner sampler's ``n_candidates`` parameter — and each half alone reports success while
+    doing nothing. An attribute without the parameter fans out no candidates, so the critic
+    scores one chunk against itself; a parameter without the attribute is unreachable, because
+    ``configure_candidates`` gates on ``hasattr`` and would refuse the very family it can
+    serve. So both are derived from the tree independently and pinned to the same set, and the
+    sweep is over every ``modeling_*.py`` rather than over
+    :data:`FLOW_MATCHING_POLICIES` — a planner or ``value`` growing either half has to fail
+    here too, and neither appears in that list.
+
+    The third direction is the *registry*: a policy type routing to an already-wired class
+    (as the ``pi05_continuous_state`` alias does) is wired without any file changing, and
+    would otherwise vanish from the refusal sweep below while never being exercised as wired.
+    """
+    declaring: set[str] = set()
+    sampling: set[str] = set()
+    for path in sorted(_POLICIES_ROOT.rglob("modeling_*.py")):
+        tree = ast.parse(path.read_text())
+        rel = str(path.relative_to(_POLICIES_ROOT))
+        if any(_assigns_n_candidates(fn) for fn in _init_defs(tree)):
+            declaring.add(rel)
+        if any(
+            "n_candidates" in {a.arg for a in fn.args.args + fn.args.kwonlyargs}
+            for fn in _sample_actions_defs(tree)
+        ):
+            sampling.add(rel)
+
+    assert declaring == set(CANDIDATE_WIRED), (
+        f"modules declaring `self.n_candidates` but not listed in CANDIDATE_WIRED: "
+        f"{sorted(declaring - CANDIDATE_WIRED)}; listed but not declaring: "
+        f"{sorted(CANDIDATE_WIRED - declaring)}"
+    )
+    assert sampling == set(CANDIDATE_WIRED), (
+        f"modules whose sample_actions takes `n_candidates` but are not listed in "
+        f"CANDIDATE_WIRED: {sorted(sampling - CANDIDATE_WIRED)}; listed but whose sampler "
+        f"ignores it: {sorted(CANDIDATE_WIRED - sampling)}"
+    )
+
+    routed = {t for t in ALL_POLICY_TYPES if _init_assigns_n_candidates(_policy_class(t))}
+    assert routed == set(CANDIDATE_WIRED_TYPES), (
+        f"policy types resolving to a wired policy class but missing from CANDIDATE_WIRED_TYPES: "
+        f"{sorted(routed - CANDIDATE_WIRED_TYPES)}; listed but not wired: "
+        f"{sorted(CANDIDATE_WIRED_TYPES - routed)}"
+    )
+
+
+@pytest.mark.parametrize("policy_type", sorted(UNWIRED_POLICY_TYPES))
+def test_unwired_family_refuses_n_candidates_greater_than_one(policy_type):
+    """An out-of-scope family must raise, and name itself in the message.
+
+    Refusing matters more than it looks: ``n_candidates`` lives on ``PreTrainedConfig``, so
+    *every* policy config accepts the field. Without the refusal an operator sets it on pi0,
+    sees no error, and believes best-of-N is running — the config is even faithfully written
+    back into the checkpoint's ``config.json``. Naming the type is what makes the error
+    actionable rather than a puzzle about which of a mixture's policies objected.
+
+    ``configure_candidates`` gates on ``hasattr(policy, "n_candidates")``, an *instance*
+    attribute assigned in ``__init__``, and these policies cannot be constructed in a CPU test
+    (billions of parameters). So the stand-in is the real class with ``__init__`` skipped,
+    carrying the attribute if and only if the real ``__init__`` would have assigned it — an
+    unconditional stub would pass this test for pi05 too, which is a pin whose passing does
+    not depend on the property it names. Wiring one of these families flips the premise
+    assertion below and fails here, rather than leaving a refusal that quietly became untrue.
+    """
+    cls = _policy_class(policy_type)
+    assert not _init_assigns_n_candidates(cls), (
+        f"{policy_type} now assigns `self.n_candidates`, so it is no longer unwired; move it "
+        "into CANDIDATE_WIRED_TYPES (and its module into CANDIDATE_WIRED)"
+    )
+    stub = object.__new__(cls)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        policy_cfg = make_policy_config(policy_type)
+    policy_cfg.n_candidates = 4
+    policy_cfg.action_chunk_critic_path = MEDOID
+
+    with pytest.raises(ValueError, match=re.escape(repr(policy_type))):
+        configure_candidates(stub, SimpleNamespace(policy=policy_cfg), device="cpu")

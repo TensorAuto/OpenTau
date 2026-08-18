@@ -84,6 +84,7 @@ import websockets
 from opentau.configs import parser
 from opentau.configs.train import TrainPipelineConfig
 from opentau.policies.accel import configure_accel
+from opentau.policies.candidates import configure_candidates
 from opentau.policies.factory import get_policy_class
 from opentau.policies.utils import to_dtype_preserving_siglip_float32
 from opentau.utils.random_utils import set_seed
@@ -378,6 +379,12 @@ class OpenTauRoboCasaPolicy:
         # Set before the warmup calls below so the compiled graph and any
         # unsupported-checkpoint refusal land at startup, not on the first rollout step.
         self.accel_prefix = configure_accel(self.policy, cfg, override=accel_prefix)
+
+        # Best-of-N candidate sampling, off unless the config asks for it. Before the warmup
+        # so critic loading and the shape smoke-test fail at startup rather than mid-rollout;
+        # a batched request multiplies the candidate memory by the number of environments,
+        # which is exactly the sort of OOM that has to surface before the sim is running.
+        configure_candidates(self.policy, cfg, device=self.device, dtype=self.dtype)
 
         dummy = build_opentau_batch(
             cfg,

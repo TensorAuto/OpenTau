@@ -29,6 +29,7 @@ import torch
 from opentau.configs import parser
 from opentau.configs.train import TrainPipelineConfig
 from opentau.policies.accel import configure_accel
+from opentau.policies.candidates import configure_candidates
 from opentau.policies.factory import get_policy_class
 from opentau.policies.utils import to_dtype_preserving_siglip_float32
 from opentau.utils.random_utils import set_seed
@@ -65,6 +66,11 @@ def inference_main(cfg: TrainPipelineConfig):
     # Done before the warmup calls so the compiled graph and any unsupported-checkpoint
     # refusal both land here rather than on the first timed run.
     accel_prefix = configure_accel(policy, cfg)
+
+    # Best-of-N candidate sampling; also a no-op unless the config asks for it. Same reason
+    # for the placement: critic loading, the dtype cast, the shape smoke-test and any
+    # out-of-memory all land here rather than inside a timed run.
+    configure_candidates(policy, cfg, device=device, dtype=torch.bfloat16)
 
     observation = create_dummy_observation(cfg, device, dtype=torch.bfloat16)
 

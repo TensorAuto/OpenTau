@@ -208,6 +208,10 @@ class AccelProvenance:
             :mod:`opentau.utils.accel_detector`).
         num_scored_dims: Action dims that survived the dim mask, per norm head.
         dataset_index: Norm-head row index per sample, when resolvable.
+        n_candidates: Candidates denoised per observation (``opentau.policies.candidates``).
+            Comparability-relevant: best-of-N conditions the emitted chunk on a critic, so
+            the score distribution of the *selected* candidate is not the distribution a
+            single draw produces, and a threshold calibrated at 1 does not transfer.
     """
 
     policy_type: str
@@ -221,6 +225,7 @@ class AccelProvenance:
     velocity_dtype: str
     num_scored_dims: tuple[int, ...] = ()
     dataset_index: tuple[int, ...] = ()
+    n_candidates: int = 1
 
     # Fields that must agree for two scores to be comparable. `dataset_index` and
     # `num_scored_dims` are deliberately excluded: they vary per sample within one run,
@@ -236,6 +241,7 @@ class AccelProvenance:
         "action_norm_mode",
         "has_delta_action_map",
         "velocity_dtype",
+        "n_candidates",
     )
 
     def to_dict(self) -> dict:

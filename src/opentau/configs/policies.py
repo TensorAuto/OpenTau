@@ -369,6 +369,24 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
     # Inference-only: it is read at `sample_actions` time and never affects training.
     accel_prefix: int | str | None = None
 
+    # Number of noise candidates to denoise per observation, and the critic that picks the
+    # chunk which actually reaches the robot (`opentau.policies.candidates`). The candidates
+    # share ONE VLM prefix pass -- only the action expert's Euler loop widens -- so at batch 1
+    # a handful of candidates costs a few percent of wall clock rather than a multiple of it.
+    # Defaults to 1, which is exactly today's single-chunk behaviour: no critic is loaded, no
+    # candidate code runs, and the traced graph is unchanged.
+    #
+    # Inference-only: read at `sample_actions` time, never during training. Only meaningful
+    # for flow-matching policies, and only honoured by the serving entry points -- like
+    # `accel_prefix`, these are read exclusively by `configure_candidates`, so a config that
+    # travels with a checkpoint cannot self-arm best-of-N in a script that never opted in.
+    n_candidates: int = 1
+    # HF repo id (a `repo@revision` suffix is accepted) or local path, or the literal
+    # "medoid" for the built-in parameter-free consensus selector. Required once
+    # `n_candidates > 1`; there is deliberately no implicit default, because a silent
+    # fallback would make best-of-N appear to work while selecting on no real signal.
+    action_chunk_critic_path: str | None = None
+
     # When True, training `torch.compile`s the policy's heavy compute submodule
     # (the flow-matching `self.model` for pi05 / pi07) *in place* via
     # `torch.nn.Module.compile`, leaving the host-side preprocessing in the
@@ -469,6 +487,11 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
                     f"Deprecated config field '{field_name}' must be 0.0, got {value}. "
                     "Non-zero latency config fields are no longer supported."
                 )
+        # Bound only -- deliberately never coerced. `_save_pretrained` encodes the live
+        # object, so silently clamping an out-of-range request would write the user's stated
+        # intent out of the checkpoint's config and make the discrepancy undiscoverable.
+        if self.n_candidates < 1:
+            raise ValueError(f"n_candidates must be >= 1, got {self.n_candidates}.")
 
     def resolved_config_version(self) -> int:
         """Concrete config version, treating the unresolved ``None`` as CURRENT.

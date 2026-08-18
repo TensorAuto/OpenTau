@@ -28,6 +28,7 @@ References:
 """
 
 import builtins
+import dataclasses
 import logging
 import math
 from collections import deque
@@ -46,6 +47,12 @@ from opentau.datasets.grounding.tokenizer_utils import ensure_loc_tokens
 from opentau.policies.accel import AccelMeter, executed_row_mask
 from opentau.policies.accel import build_provenance as build_accel_provenance
 from opentau.policies.accel import make_meter as make_accel_meter
+from opentau.policies.candidates import (
+    collapse_candidates,
+    expand_candidates,
+    expand_kv_cache,
+    select_candidate,
+)
 from opentau.policies.normalize import Normalize, Unnormalize
 from opentau.policies.normalize import resolve_num_datasets as _num_datasets
 from opentau.policies.pi06.configuration_pi06 import PI06Config
@@ -333,6 +340,12 @@ class PI06Policy(PreTrainedPolicy):
         # a much coarser estimate than pi05's ten-step schedule affords.
         self.accel_prefix: int | None = None
 
+        # Best-of-N candidate sampling. Always 1 here regardless of `config`:
+        # `candidates.configure_candidates` is the only writer, so a config travelling with a
+        # checkpoint cannot self-arm best-of-N in a script that never opted in.
+        self.n_candidates: int = 1
+        self._action_chunk_critic = None
+
         self.reset()
 
     def reset(self) -> None:
@@ -340,6 +353,8 @@ class PI06Policy(PreTrainedPolicy):
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
         self.last_accel = None
         self.last_accel_provenance = None
+        self.last_accel_candidates = None
+        self.last_candidate_scores = None
 
     @classmethod
     def from_pretrained(
@@ -599,6 +614,8 @@ class PI06Policy(PreTrainedPolicy):
         # Cleared every step so a caller can distinguish "this step re-planned and here is
         # its score" from "this step popped a queued action". `sample_actions` refills it.
         self.last_accel = None
+        self.last_accel_candidates = None
+        self.last_candidate_scores = None
 
         if len(self._action_queue) == 0 or len(self._action_queue) <= self.config.max_delay:
             action_prefix = None
@@ -644,6 +661,10 @@ class PI06Policy(PreTrainedPolicy):
             )
 
         dataset_index = self._resolve_dataset_index(batch)
+        # Captured before `normalize_inputs` rebinds `batch`: a critic is an independently
+        # trained model with its own norm buffers, so it scores raw observations. The
+        # shallow copy inside `Normalize.forward` makes holding this alias free.
+        raw_batch = batch
         batch = self.normalize_inputs(batch, dataset_index)
 
         images, img_masks = self.prepare_images(batch)
@@ -660,11 +681,23 @@ class PI06Policy(PreTrainedPolicy):
             action_prefix = self.normalize_targets({"actions": action_prefix}, dataset_index)["actions"]
             action_prefix = F.pad(action_prefix, (0, 0, 0, self.config.chunk_size - action_prefix.shape[1]))
 
+        n_candidates = self.n_candidates
+        if n_candidates > 1 and self._action_chunk_critic is None:
+            # Unreachable in a configured deployment; backstops a hand-set attribute.
+            raise ValueError(
+                f"n_candidates={n_candidates} but no action-chunk critic is attached, so there "
+                "is nothing to choose between the candidates. Arm best-of-N through "
+                "`opentau.policies.candidates.configure_candidates`."
+            )
+        # Every per-sample tensor downstream of the sampler has `B * n_candidates` rows and
+        # must be indexed by a matching norm head.
+        sampler_index = dataset_index if n_candidates == 1 else expand_candidates(dataset_index, n_candidates)
+
         accel_meter = make_accel_meter(
             self,
-            batch_size=lang_tokens.shape[0],
+            batch_size=lang_tokens.shape[0] * n_candidates,
             device=lang_tokens.device,
-            dataset_index=dataset_index,
+            dataset_index=sampler_index,
         )
 
         actions = self.model.sample_actions(
@@ -675,13 +708,19 @@ class PI06Policy(PreTrainedPolicy):
             action_prefix,
             delay,
             noise=noise,
+            n_candidates=n_candidates,
             accel=accel_meter,
         )
 
-        if accel_meter is not None:
+        if accel_meter is not None and n_candidates == 1:
             # `.to_list()` rather than keeping a tensor: anything allocated inside
             # `torch.inference_mode()` stays an inference tensor even after `.clone()`, and
             # the first in-place update a downstream CUSUM accumulator makes would raise.
+            #
+            # Position is load-bearing and unchanged: publishing before unnormalize means a
+            # raising unnormalize still leaves `last_accel` populated. The candidate path
+            # cannot publish here -- it does not know the selected row until the critic has
+            # scored raw chunks -- so it publishes below instead.
             self.last_accel = accel_meter.to_list()
             self.last_accel_provenance = build_accel_provenance(
                 self, accel_meter, dataset_index=dataset_index
@@ -689,8 +728,55 @@ class PI06Policy(PreTrainedPolicy):
 
         original_action_dim = self.config.action_feature.shape[0]
         actions = actions[:, :, :original_action_dim]
-        actions = self.unnormalize_outputs({"actions": actions}, dataset_index)["actions"]
+        actions = self.unnormalize_outputs({"actions": actions}, sampler_index)["actions"]
+
+        if n_candidates == 1:
+            return actions
+
+        # Scored in raw units on the executed rows only: frozen rows are identical across
+        # every candidate by construction, and rows past `n_action_steps` are replaced by the
+        # next re-plan, so both only dilute the signal.
+        candidates = collapse_candidates(actions, n_candidates)
+        scores = self._action_chunk_critic.score_chunks(
+            raw_batch,
+            candidates,
+            row_mask=self.model.executed_rows(delay, actions.device),
+            dataset_index=dataset_index,
+        )
+        selected = select_candidate(scores)
+        actions = candidates[torch.arange(candidates.shape[0], device=candidates.device), selected]
+        self.last_candidate_scores = scores.detach().to(torch.float32).cpu().tolist()
+        if accel_meter is not None:
+            self._publish_accel_for_candidates(accel_meter, sampler_index, n_candidates, selected)
+
         return actions
+
+    def _publish_accel_for_candidates(
+        self, meter: AccelMeter, sampler_index: Tensor, n: int, selected: Tensor
+    ) -> None:
+        """Publish ``last_accel`` for the *selected* candidate, keeping the full grid beside it.
+
+        ``last_accel`` stays length ``B``: the gRPC server reads ``float(last_accel[0])`` with
+        no width check, so a ``B * N``-long list would silently report candidate 0's
+        uncertainty for whatever chunk the critic actually picked.
+
+        The provenance is built at ``B * N`` then sliced, because ``build_provenance`` derives
+        ``num_scored_dims`` from the meter's dim mask while taking ``dataset_index`` from its
+        argument -- mixing widths yields a record whose two per-sample tuples cannot be
+        zipped. One ``rows`` list slices both, aligned by construction.
+        """
+        values = meter.to_list()
+        chosen = selected.tolist()  # one device->host sync, reused below
+        rows = [b * n + chosen[b] for b in range(len(chosen))]
+        self.last_accel_candidates = [values[b * n : (b + 1) * n] for b in range(len(chosen))]
+        self.last_accel = [values[i] for i in rows]
+        full = build_accel_provenance(self, meter, dataset_index=sampler_index)
+        self.last_accel_provenance = dataclasses.replace(
+            full,
+            num_scored_dims=tuple(full.num_scored_dims[i] for i in rows),
+            dataset_index=tuple(full.dataset_index[i] for i in rows),
+            n_candidates=n,
+        )
 
     def forward(
         self,
@@ -1301,6 +1387,7 @@ class PI06FlowMatching(nn.Module):
         action_prefix: Tensor,
         delay: Tensor,
         noise: Tensor | None = None,
+        n_candidates: int = 1,
         accel: AccelMeter | None = None,
     ) -> Tensor:
         """Inference: encode prefix once, run `num_steps` Euler steps.
@@ -1328,8 +1415,23 @@ class PI06FlowMatching(nn.Module):
         device = lang_tokens.device
 
         if noise is None:
-            actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
+            # `bsize * n_candidates` folds to `bsize` at the default, so this is the same
+            # shape tuple and the same single `sample_noise` draw off the same RNG stream.
+            actions_shape = (
+                bsize * n_candidates,
+                self.config.chunk_size,
+                self.config.max_action_dim,
+            )
             noise = self.sample_noise(actions_shape, device)
+        elif n_candidates > 1 and noise.shape[0] != bsize * n_candidates:
+            # Deliberately NOT an unconditional shape check: at n_candidates == 1 every
+            # existing explicit-noise caller must keep today's exact behaviour, including
+            # today's silent broadcast.
+            raise ValueError(
+                f"n_candidates={n_candidates} needs noise with {bsize * n_candidates} rows "
+                f"(got {tuple(noise.shape)}); a {bsize}-row noise would make every candidate "
+                "identical, which is best-of-N that silently is not."
+            )
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks
@@ -1374,22 +1476,24 @@ class PI06FlowMatching(nn.Module):
                     device,
                 )
 
+        if n_candidates > 1:
+            # After the autoregressive response loop, not straight after the prefix forward:
+            # `infer_response` rewrites both the cache and `prefix_pad_masks` with
+            # fill_kv_cache=True, so expanding earlier would be overwritten. The response
+            # decode is greedy-argmax and noise-independent, so all N candidates share one
+            # reasoning trace -- this diversifies flow-matching noise only.
+            past_key_values = expand_kv_cache(past_key_values, n_candidates)
+            prefix_pad_masks = expand_candidates(prefix_pad_masks, n_candidates)
+            action_prefix = expand_candidates(action_prefix, n_candidates)
+
         dt = -1.0 / self.config.num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
 
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
-        prefix_mask = rearrange(torch.arange(self.config.chunk_size, device=device), "c -> 1 c") < delay
+        prefix_mask = self._prefix_freeze_mask(delay, device)
         if accel is not None:
-            accel.set_row_mask(
-                executed_row_mask(
-                    prefix_mask=prefix_mask,
-                    delay=delay,
-                    chunk_size=self.config.chunk_size,
-                    n_action_steps=self.config.n_action_steps,
-                    device=device,
-                )
-            )
+            accel.set_row_mask(self.executed_rows(delay, device))
         while time >= -dt / 2:
             x_t = torch.where(rearrange(prefix_mask, "b c -> b c 1"), action_prefix, x_t)
             masked_time = torch.where(prefix_mask, 0, time)
@@ -1406,10 +1510,32 @@ class PI06FlowMatching(nn.Module):
         x_t = torch.where(rearrange(prefix_mask, "b c -> b c 1"), action_prefix, x_t)
         return x_t
 
+    def _prefix_freeze_mask(self, delay: Tensor, device: torch.device) -> Tensor:
+        """``(1, chunk)`` bool marking rows frozen by real-time chunking.
+
+        ``delay`` is a 0-dim tensor on every in-repo path, so this broadcasts against a
+        ``(B * n_candidates, chunk, dim)`` ``x_t`` without its own candidate expansion.
+        """
+        return rearrange(torch.arange(self.config.chunk_size, device=device), "c -> 1 c") < delay
+
+    def executed_rows(self, delay: Tensor, device: torch.device) -> Tensor:
+        """Chunk rows that actually reach the robot: not frozen, inside the execution window.
+
+        Shared by the ``accel`` meter and the candidate critic so the two cannot drift apart
+        about which rows carry signal.
+        """
+        return executed_row_mask(
+            prefix_mask=self._prefix_freeze_mask(delay, device),
+            delay=delay,
+            chunk_size=self.config.chunk_size,
+            n_action_steps=self.config.n_action_steps,
+            device=device,
+        )
+
     def denoise_step(
         self,
         prefix_pad_masks: Tensor,
-        past_key_values: list[dict[str, Tensor]],
+        past_key_values: dict[int, dict[str, Tensor]],
         x_t: Tensor,
         time: Tensor,
     ) -> Tensor:
@@ -1450,13 +1576,13 @@ class PI06FlowMatching(nn.Module):
         prefix_embs: Tensor,
         prefix_pad_masks: Tensor,
         prefix_att_masks: Tensor,
-        past_key_values: list[dict[str, Tensor]],
+        past_key_values: dict[int, dict[str, Tensor]],
         prefix_offsets: Tensor,
         response_tokens: Tensor,
         auto_step: int,
         bsize: int,
         device: torch.device,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, list[dict[str, Tensor]]]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, dict[int, dict[str, Tensor]]]:
         """Autoregressive response-token generation for one step."""
         eos_token_id = self.language_tokenizer.convert_tokens_to_ids(self.language_tokenizer.eos_token)
         if auto_step == 0:

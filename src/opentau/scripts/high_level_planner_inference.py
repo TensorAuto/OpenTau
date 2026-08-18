@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 from opentau.configs import parser
 from opentau.configs.train import TrainPipelineConfig
 from opentau.planner import HighLevelPlanner, Memory
+from opentau.policies.candidates import refuse_candidates
 from opentau.policies.factory import get_policy_class
 from opentau.policies.utils import to_dtype_preserving_siglip_float32
 from opentau.utils.random_utils import set_seed
@@ -44,6 +45,16 @@ def inference_main(cfg: TrainPipelineConfig):
     """
 
     logging.info(pformat(asdict(cfg)))
+
+    # The planner families decode text autoregressively; there is no flow-matching noise draw
+    # to fan out and no action chunk for a critic to compare.
+    refuse_candidates(
+        cfg,
+        reason="this entry point serves the high-level planner families, which emit a subtask "
+        "string rather than an action chunk, so there is nothing for an action-chunk critic to "
+        "score. Diversifying a planner would mean sampling its decode, which is a different "
+        "feature. Run it with policy.n_candidates=1.",
+    )
 
     # Check device is available
     device = "cuda" if torch.cuda.is_available() else "cpu"

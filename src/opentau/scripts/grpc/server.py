@@ -70,6 +70,7 @@ from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.lerobot_dataset import BaseDataset
 from opentau.planner.gemini_er_planner import GeminiERPlanner
 from opentau.policies.accel import configure_accel
+from opentau.policies.candidates import configure_candidates
 from opentau.policies.factory import get_policy_class
 from opentau.policies.utils import to_dtype_preserving_siglip_float32
 from opentau.scripts.grpc import auth, robot_inference_pb2, robot_inference_pb2_grpc
@@ -313,6 +314,11 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
         # graph and any unsupported-checkpoint refusal land at startup, not on the first
         # robot request. `self.accel_prefix` gates the response field.
         self.accel_prefix = configure_accel(self.policy, self.cfg)
+
+        # Best-of-N candidate sampling, off unless the config asks for it. Placed here for
+        # the same reason: the critic is loaded, cast and smoke-called at startup, and the
+        # warmup calls below then trace the widened batch the real requests will use.
+        configure_candidates(self.policy, self.cfg, device=self.device, dtype=self.dtype)
 
         camera_observations = {
             f"camera{i}": torch.zeros((1, 3, *self.cfg.resolution), dtype=self.dtype, device=self.device)

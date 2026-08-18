@@ -27,7 +27,14 @@ signature):
   BENCH_COMPILE_MODE=...      # default "max-autotune"
   BENCH_N_WARMUP=5            # post-compile warmup calls
   BENCH_N_TIMED=50            # timed calls after warmup
+  BENCH_N_CANDIDATES=8        # best-of-N fan-out; unset defers to the config
   BENCH_OUTPUT_DIR=...        # default benchmark_results/
+
+``BENCH_N_CANDIDATES`` measures the cost of best-of-N sampling
+(:mod:`opentau.policies.candidates`). It supplies the parameter-free ``medoid`` selector when
+the config names no critic, since what is being timed is the fan-out, not selection quality.
+**2 is rejected**: ``MedoidCritic`` cannot rank two candidates (their single pairwise distance
+is shared, so every score ties), so sweep 1, 4, 8, 16 rather than doubling from 1.
 
 The script writes a single JSON to ``${BENCH_OUTPUT_DIR}/<host>_<policy>_<ts>.json``
 with the config snapshot, host/GPU/driver/torch versions, per-warmup wall-clock
@@ -50,6 +57,7 @@ import torch
 
 from opentau.configs import parser
 from opentau.configs.train import TrainPipelineConfig
+from opentau.policies.candidates import MEDOID, configure_candidates
 from opentau.policies.factory import make_policy
 from opentau.policies.normalize import NormalizationMode
 from opentau.policies.utils import to_dtype_preserving_siglip_float32
@@ -186,6 +194,10 @@ def benchmark_main(cfg: TrainPipelineConfig):
     compile_mode = os.environ.get("BENCH_COMPILE_MODE", "max-autotune")
     n_warmup = int(os.environ.get("BENCH_N_WARMUP", "5"))
     n_timed = int(os.environ.get("BENCH_N_TIMED", "50"))
+    # Unset means "whatever the config says", which is not the same as 1 — `configure_candidates`
+    # resolves `override=None` by falling through, and `override=1` by disabling.
+    n_candidates_env = os.environ.get("BENCH_N_CANDIDATES")
+    n_candidates_override = int(n_candidates_env) if n_candidates_env is not None else None
     out_dir = Path(os.environ.get("BENCH_OUTPUT_DIR", "benchmark_results"))
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -198,7 +210,8 @@ def benchmark_main(cfg: TrainPipelineConfig):
     is_hl = _is_high_level(cfg.policy.type)
     logging.info(
         f"Policy type={cfg.policy.type} (high_level={is_hl}), no_compile={no_compile}, "
-        f"compile_mode={compile_mode}, n_warmup={n_warmup}, n_timed={n_timed}"
+        f"compile_mode={compile_mode}, n_warmup={n_warmup}, n_timed={n_timed}, "
+        f"n_candidates={n_candidates_override if n_candidates_override is not None else 'from-config'}"
     )
 
     # Random init path: bypass stats requirement.
@@ -212,6 +225,20 @@ def benchmark_main(cfg: TrainPipelineConfig):
     to_dtype_preserving_siglip_float32(policy, device=device, dtype=torch.bfloat16)
     policy.eval()
     policy.reset()
+
+    # Best-of-N fan-out, armed before the compile so the traced graph and the warmup calls
+    # both see the widened batch — compiling at N=1 and then widening would charge the first
+    # timed call for a recompile and invalidate the measurement. What is being timed is the
+    # fan-out, so supply the parameter-free selector when the config names no critic.
+    if (
+        n_candidates_override is not None
+        and n_candidates_override > 1
+        and cfg.policy.action_chunk_critic_path is None
+    ):
+        cfg.policy.action_chunk_critic_path = MEDOID
+    n_candidates = configure_candidates(
+        policy, cfg, device=device, dtype=torch.bfloat16, override=n_candidates_override
+    )
 
     # Compile + verify. We rebind ``policy.model.sample_actions`` on the
     # instance so the outer ``policy.sample_actions`` wrapper (which calls
@@ -286,6 +313,9 @@ def benchmark_main(cfg: TrainPipelineConfig):
         "cudnn_version": torch.backends.cudnn.version(),
         "policy_type": cfg.policy.type,
         "compile_status": compile_status,
+        # Recorded because a latency number is meaningless without the fan-out it was
+        # measured at; the whole point of the flag is comparing records across N.
+        "n_candidates": n_candidates,
         "n_warmup": n_warmup,
         "n_timed": n_timed,
         "warmup_ms": warmup_ms,

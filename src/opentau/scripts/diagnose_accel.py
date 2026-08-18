@@ -94,6 +94,7 @@ from opentau.policies.accel import (
     record_traces,
     resolve_action_dim_mask,
 )
+from opentau.policies.candidates import refuse_candidates
 from opentau.policies.factory import make_policy
 from opentau.policies.utils import to_dtype_preserving_siglip_float32
 from opentau.utils.utils import init_logging
@@ -969,6 +970,19 @@ def diagnose_main(cfg: TrainPipelineConfig):
     """
     init_logging()
     cfg.validate()
+
+    # This study pins the noise itself (`noise=` on every `sample_actions` call) so that the
+    # observation spread it measures is not confounded by the draw. Best-of-N does the
+    # opposite — it fans the draw out and then discards all but one — so the two cannot both
+    # be in effect.
+    refuse_candidates(
+        cfg,
+        reason="this diagnostic controls the noise draw to isolate the observation-driven "
+        "spread of accel, and reads `policy.last_accel` positionally as one score per "
+        "observation. Best-of-N would fan the draw out and publish one score per selected "
+        "candidate, silently changing what every number in the report means. Run it with "
+        "policy.n_candidates=1.",
+    )
 
     logger.info("Loading policy %s from %s", cfg.policy.type, cfg.policy.pretrained_path)
     policy = make_policy(cfg=cfg.policy)

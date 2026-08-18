@@ -39,6 +39,7 @@ from torch import Tensor
 
 from opentau.configs import parser
 from opentau.configs.train import TrainPipelineConfig
+from opentau.policies.candidates import refuse_candidates
 from opentau.policies.factory import get_policy_class
 from opentau.policies.pi05.modeling_pi05 import PI05Policy
 from opentau.utils.hub import format_repo_revision, split_repo_revision
@@ -194,6 +195,18 @@ def main(cfg: TrainPipelineConfig):
     """Main export function."""
     device = auto_torch_device()
     dtype = torch.float32
+
+    # `PI05OnnxWrapper` calls `policy.model.sample_actions` directly, so the policy-level
+    # candidate fan-out and the critic are both outside the graph by construction, and the
+    # export has no dynamic axes to widen the batch through anyway.
+    refuse_candidates(
+        cfg,
+        reason="the ONNX wrapper calls the inner sampler directly, bypassing the policy layer "
+        "where candidates are expanded and scored, and the export pins static batch axes. "
+        "Exporting from an n_candidates>1 config would ship a single-candidate graph that "
+        "behaves differently from the server the config describes. Export with "
+        "policy.n_candidates=1.",
+    )
 
     logging.info("Applying monkey patches...")
     for patch in patches:

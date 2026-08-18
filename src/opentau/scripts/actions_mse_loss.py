@@ -26,6 +26,7 @@ from torch.utils.data import DataLoader
 from opentau.configs import parser
 from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.factory import make_dataset_mixture
+from opentau.policies.candidates import refuse_candidates
 from opentau.policies.factory import get_policy_class
 from opentau.policies.utils import to_dtype_preserving_siglip_float32
 from opentau.utils.random_utils import set_seed
@@ -39,6 +40,16 @@ from opentau.utils.utils import (
 @parser.wrap()
 def inference_main(cfg: TrainPipelineConfig):
     logging.info(pformat(asdict(cfg)))
+    # Unlike the other entry points this one compiles `policy.sample_actions` — the *policy*
+    # level, not the inner sampler — so an armed critic would be traced into the graph.
+    refuse_candidates(
+        cfg,
+        reason="this script torch.compiles the policy-level sample_actions, which would pull "
+        "the critic and the candidate selection inside the traced region; the data-dependent "
+        "argmax would graph-break or bake in a candidate count. It also measures fidelity "
+        "against ground-truth actions, where a best-of-N pick is not the quantity being "
+        "measured. Run it with policy.n_candidates=1.",
+    )
     # build lerobot dataset and dataloader
     datasets = make_dataset_mixture(cfg)
 

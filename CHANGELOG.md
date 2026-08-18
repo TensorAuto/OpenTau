@@ -10,6 +10,88 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added — best-of-N action-chunk sampling — **opt-in, default `1`, no `config_version` bump**
+
+A flow-matching policy maps one Gaussian draw to exactly one action chunk, deterministically,
+so drawing `n_candidates` noises yields `n_candidates` distinct chunks and an
+`ActionChunkCritic` (`opentau.policies.candidates`) picks the one that reaches the robot.
+
+**Why it is nearly free.** The VLM prefix pass runs once per *observation*, and the KV cache it
+fills is never written again during denoising — so expanding that cache across candidates lets
+one prefix pass serve all N. Only the action expert's Euler loop widens, and at batch 1 that
+loop is occupancy-bound rather than FLOP-bound, so widening it rides largely free. Measured on
+an RTX 5090 (bf16, sdpa, 3 cameras, 1024 prefix tokens, chunk 50, 10 Euler steps, batch 1, a
+randomly-initialized 3.36B-parameter pi05), fused against naive replication of the observation
+across the batch — one prefix pass per candidate, same result:
+
+* **N=1** — 152.9 ms fused, 154.3 ms naive
+* **N=2** — 153.2 / 187.7 ms, i.e. **1.23x**; +0.1% over the fused path's own N=1
+* **N=4** — 154.8 / 256.1 ms, **1.65x**; +1.2%
+* **N=8** — 155.5 / 392.1 ms, **2.52x**; +1.7%
+* **N=16** — 191.2 / 698.2 ms, **3.65x**; +25%
+* **N=32** — 277.8 ms fused; naive is out of memory
+
+Peak memory is nearly flat for the same reason: **6.41 GiB at N=1 → 6.95 GiB at N=32**, the
+dominant per-candidate allocation being the prefix KV cache at **18 MiB** (MQA — one KV head,
+head_dim 256, 18 layers). Naive replication runs 6.42 → 8.54 GiB by N=16 and OOMs at N=32. The
+useful envelope is therefore **N ≤ 8**, where the feature costs under 2% of wall clock; N=16 is
+where the Euler loop stops riding free.
+
+**`n_candidates` defaults to `1`, and stays off unless an entry point arms it.** At `1` no
+critic is loaded, no candidate code runs, and the sampler is the one that shipped before —
+verified at full size on GPU, where N=1 after the change reproduces the pre-change output
+digest bit-for-bit (`5a0bf2ed20abbcc2`). `configure_candidates` is the only writer of
+`policy.n_candidates`, so a config travelling with a checkpoint cannot self-arm best-of-N in a
+script that never opted in, the same posture as `accel_prefix`. The serving entry points arm
+it; `scripts/eval.py` **refuses** `n_candidates > 1` outright rather than multiplying its
+default batch of 16 by N.
+
+**Only pi05 and pi06 are wired.** Every other family — pi0, pi05_mem, both pi07 low levels,
+cosmos3, cosmos3_nano, the two high-level planners and `value` — raises on `n_candidates > 1`
+rather than accepting the field and ignoring it, which is the failure an operator would read as
+"the critic never fires".
+
+**The only critic available is `"medoid"`**, a parameter-free consensus selector that keeps the
+candidate closest to all the others. It exists so best-of-N is testable and benchmarkable end
+to end before a trained critic does. It needs `n_candidates >= 3` and **raises** below that: at
+N=2 the one pairwise distance is shared, so every score ties and selection would always fall
+back to candidate 0 — best-of-N that silently is not. And it
+**is not a quality model**: it cannot tell a confidently-wrong mode from a correct one, and on a
+genuinely multimodal task it prefers the more *populated* mode rather than the better one. A
+learned critic is a follow-up; an `action_chunk_critic_path` pointing anywhere else raises
+rather than silently falling back.
+
+**All N candidates share one greedy reasoning trace.** The autoregressive `predict_response`
+decode is argmax and therefore noise-independent, and the candidate fan-out sits after it
+(expanding earlier would be overwritten by the response loop's own `fill_kv_cache=True`
+writes). This feature diversifies flow-matching noise only, not reasoning. Documented rather
+than refused — but it does bound what best-of-N can recover from: a wrong reasoning trace is
+wrong in all N chunks.
+
+**`accel` provenance gained `n_candidates`, and it is comparability-relevant.**
+`AccelProvenance.n_candidates` is now part of `COMPARABLE_FIELDS`, so a calibration fitted on an
+N=1 score stream **refuses to apply** to an N>1 stream: best-of-N conditions the emitted chunk
+on a critic, and the selected candidate's score distribution is not the distribution a single
+draw produces. Calibration JSON written before this release still loads — the reader is
+unknown-key tolerant and the field defaults to `1`, which is what those runs were.
+
+**Both new config fields are written into every saved `config.json`.** draccus encodes the whole
+dataclass with no default filtering, so `n_candidates: 1` and `action_chunk_critic_path: null`
+appear in the config of every checkpoint saved from this release onward — including a **legacy
+checkpoint that is fine-tuned, resumed, or converted and re-uploaded**, which gains both keys on
+the way through. A *pinned older OpenTau install* reading such a config rejects it on the
+unknown fields. The checkpoint convert/upload path is where that bites: a checkpoint rewritten
+here and then loaded by an older deployment fails to decode, so move the reader forward or strip
+the two keys by hand.
+
+**One measured limit worth stating, because this change does not cause it.** The pipeline is
+bit-deterministic at a *fixed* batch shape, but the same noise row decoded at a *different*
+batch size differs by ~5e-3 (fused) / ~7e-3 (naive) — 1-2 ULP of bfloat16 (eps 2^-8 = 3.9e-3),
+from batch-shape-dependent cuBLAS kernel selection. It reproduces on unmodified code. That is
+why the N=1 bit-identity above is claimed at a matched batch shape and nowhere else: candidate 0
+at N=4 is **not** bit-identical to the same noise row at N=1, and no care taken inside this
+feature could make it so.
+
 ### Changed — `accel`'s prefix is now *measured* rather than assumed
 
 `default_prefix` returns `T - 1` because that is the prefix the paper's online detector

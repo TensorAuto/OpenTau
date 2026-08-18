@@ -67,6 +67,7 @@ from opentau.envs.utils import (
     preprocess_observation,
 )
 from opentau.policies.accel import configure_accel
+from opentau.policies.candidates import refuse_candidates
 from opentau.policies.factory import make_policy
 from opentau.policies.pretrained import PreTrainedPolicy
 from opentau.policies.utils import to_dtype_preserving_siglip_float32
@@ -1112,6 +1113,18 @@ def eval_main(cfg: TrainPipelineConfig):
             "a different number of sharded-param all-gathers per rank and hangs at NCCL. Run eval with "
             "replicated params (single GPU / DDP / ZeRO-1/2)."
         )
+
+    # Best-of-N is serving-only for now. Refused here rather than ignored so a checkpoint's
+    # own config, which carries `n_candidates` once a server armed it, cannot quietly change
+    # what an eval measures.
+    refuse_candidates(
+        cfg,
+        reason="best-of-N candidate sampling is wired for the serving entry points only. Eval "
+        f"rolls out {cfg.eval.batch_size} environments per batch, so the fan-out would multiply "
+        "the candidate activations by the eval batch rather than by 1 — a memory profile that "
+        "was never measured. Serve the checkpoint through the gRPC or RoboCasa server to "
+        "evaluate best-of-N, or set policy.n_candidates=1 for this run.",
+    )
 
     details = f"{cfg.env.type}-{cfg.env.task}-{cfg.eval.n_episodes}"
     now = f"{dt.datetime.now():%Y%m%d-%H%M%S}"
