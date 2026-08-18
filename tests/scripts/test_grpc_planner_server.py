@@ -135,6 +135,56 @@ class TestRequestHook:
         servicer.policy.sample_actions.assert_called_once()
 
 
+class TestInferenceThread:
+    """Pins the dedicated-infer-thread contract.
+
+    torch.compile keeps its CUDA-graph state in thread-local storage, so warmup
+    and every request must run ``sample_actions`` on one and the same thread. A
+    test that only asserts the policy was called would still pass if inference
+    reverted to the gRPC handler thread, so these assert the thread identity.
+    """
+
+    def _record_calling_thread(self, servicer) -> list[threading.Thread]:
+        # Thread *objects*, not names or idents: a fresh single-worker pool per
+        # call reuses the "policy-infer" name and CPython recycles idents of dead
+        # threads, so only object identity distinguishes "the servicer's worker"
+        # from "some worker".
+        seen: list[threading.Thread] = []
+
+        def _sample(*_args, **_kwargs):
+            seen.append(threading.current_thread())
+            return torch.zeros((1, 2, 3))
+
+        servicer._prepare_observation = MagicMock(return_value=({}, None, None))
+        servicer.policy = MagicMock()
+        servicer.policy.sample_actions.side_effect = _sample
+        return seen
+
+    @staticmethod
+    def _infer_worker(servicer) -> threading.Thread:
+        """The thread the servicer's own infer executor runs work on."""
+        return servicer._infer_executor.submit(threading.current_thread).result()
+
+    def test_sampling_runs_on_the_servicer_infer_thread(self, make_servicer):
+        servicer, _ = make_servicer(enabled=False)
+        seen = self._record_calling_thread(servicer)
+
+        servicer.GetActionChunk(_request(), MagicMock())
+
+        assert len(seen) == 1
+        assert seen[0] is self._infer_worker(servicer)
+        assert seen[0] is not threading.current_thread()
+
+    def test_consecutive_requests_share_one_thread(self, make_servicer):
+        servicer, _ = make_servicer(enabled=False)
+        seen = self._record_calling_thread(servicer)
+
+        servicer.GetActionChunk(_request(), MagicMock())
+        servicer.GetActionChunk(_request(), MagicMock())
+
+        assert seen == [self._infer_worker(servicer)] * 2
+
+
 class TestPlannerEnabled:
     def test_first_request_blocks_and_uses_subtask(self, make_servicer):
         servicer, fake_planner = make_servicer(enabled=True)
