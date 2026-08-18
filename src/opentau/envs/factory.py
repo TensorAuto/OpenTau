@@ -167,7 +167,7 @@ def make_envs(
     _ensure_nvidia_egl_icd()
     _pin_egl_render_device()
 
-    # "spawn" is more robust (and, for libero on oracle, the only option) than "fork".
+    # "spawn" is more robust than "fork" (and on some cluster setups, the only option).
     # Caveat is that the entry point must be protected by `if __name__ == "__main__":`.
     env_cls = (
         partial(gym.vector.AsyncVectorEnv, context="spawn") if use_async_envs else gym.vector.SyncVectorEnv
