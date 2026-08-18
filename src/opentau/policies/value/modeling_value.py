@@ -351,6 +351,33 @@ class ValueFunction(PreTrainedPolicy):
         return rearrange(value, "b 1 -> b")
 
     @torch.no_grad()
+    def _resolve_dataset_index(self, batch: dict[str, Tensor]) -> Tensor:
+        """Always row 0: the value function uses ONE shared stats head for every dataset.
+
+        The base implementation derives a per-dataset head from
+        ``(robot_type, control_mode)``, falling back to the dataset NAME whenever either tag
+        is missing -- so a dataset whose ``info.json`` lacks ``control_mode`` silently gets
+        its own head, and one whose tags match nothing on the policy raises. Both happened
+        here: evaluating the 14k checkpoint died with ``norm key '' ... not in this policy's
+        training set ['so_follower::joint']`` because ``aggregate_datasets`` had dropped
+        ``control_mode`` from the merged dataset.
+
+        Per-dataset heads are wrong for this policy anyway. A value is a scalar return
+        estimate, not an action in some robot's units -- it is meant to be comparable ACROSS
+        datasets, which it cannot be if each one is normalized against its own statistics.
+        One shared head keeps values on a single scale and makes the policy insensitive to
+        whether a dataset happens to carry its metadata tags.
+
+        Args:
+            batch: The inference or training batch.
+
+        Returns:
+            A ``(batch,)`` long tensor of zeros.
+        """
+        batch_size, device = self._infer_batch_size_and_device(batch)
+        return torch.zeros(batch_size or 1, dtype=torch.long, device=device or self._model_device())
+
+    @torch.no_grad()
     def predict_value(self, batch: dict[str, Tensor]) -> Tensor:
         """Predict value estimates given environment observations.
 
@@ -604,7 +631,13 @@ class ValueFunction(PreTrainedPolicy):
         """
 
         device = batch["state"].device
-        responses = batch["response"]
+        # Datasets without subtask/response annotations don't emit a "response"
+        # key. Default to empty strings so the response branch is masked out of
+        # the loss (empty -> all-pad -> response CE = 0), i.e. the response head
+        # is effectively disabled for robotic datasets with no subtasks.
+        responses = batch.get("response")
+        if responses is None:
+            responses = [""] * batch["state"].shape[0]
 
         # if '' is found in response then response is not for loss calculation (used for robotic dataset with no subtask), so add pad token to the response.
         response_prompt = [f"{response}" for response in responses]
@@ -743,6 +776,19 @@ class ValueModel(nn.Module):
             # full attention between image, language and response inputs
             num_response_embs = response_emb.shape[1]
             att_masks += [1] * num_response_embs
+
+        # <val>: the readout token, appended LAST so it is always the final position and
+        # never padding. att_mask 1 opens a new block, so it attends over the whole prefix
+        # while nothing attends back to it; the 2D mask keeps pad positions out of its keys,
+        # which is what lets it sit after a padded prompt and still see only real tokens.
+        #
+        # Without it the value was read from hidden_states[:, -1, :], which IS padding once
+        # the prompt is padded to prompt_max_length -- the readout carried no information and
+        # the head could only emit a constant. See SiglipGemmaValueModel.value_token.
+        val_emb = self.siglip_gemma_value.value_token.to(dtype=embs[0].dtype, device=embs[0].device)
+        embs.append(val_emb.expand(bsize, 1, -1))
+        pad_masks.append(torch.ones(bsize, 1, dtype=pad_masks[0].dtype, device=pad_masks[0].device))
+        att_masks += [1]
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
