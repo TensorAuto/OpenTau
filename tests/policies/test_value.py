@@ -28,9 +28,9 @@ class TestValueFunctionIntegration:
         """
         assert pad_masks.shape[0] == 1
         if inference_mode:
-            assert pad_masks.shape[1] == 768
+            assert pad_masks.shape[1] == 769
         else:
-            assert pad_masks.shape[1] == 820
+            assert pad_masks.shape[1] == 821
         assert pad_masks.dtype == torch.bool
 
         def _check_ones_before_zeros(mask_slice):
@@ -54,8 +54,9 @@ class TestValueFunctionIntegration:
         for i in range(batch_size):
             assert torch.all(pad_masks[i, :512] == 1)  # image tokens should not be padded
             _check_ones_before_zeros(pad_masks[i, 512:768])  # prompt tokens
+            assert pad_masks[i, 768] == 1  # <val> readout token is never padded
             if not inference_mode:
-                _check_ones_before_zeros(pad_masks[i, 768:820])  # response tokens
+                _check_ones_before_zeros(pad_masks[i, 769:821])  # response tokens
 
     def _verify_position_ids(self, position_ids, pad_masks, inference_mode=False):
         """Verify the position ids are correct. They should increment by 1 for each non-padded token and stay the same for padded tokens.
@@ -65,9 +66,9 @@ class TestValueFunctionIntegration:
         """
         assert position_ids.shape[0] == 1
         if inference_mode:
-            assert position_ids.shape[1] == 768
+            assert position_ids.shape[1] == 769
         else:
-            assert position_ids.shape[1] == 820
+            assert position_ids.shape[1] == 821
         assert position_ids.dtype == torch.long
 
         def _check_position_ids_with_padding(position_ids, pad_masks):
@@ -98,33 +99,37 @@ class TestValueFunctionIntegration:
         """
         assert vlm_attention_mask.shape[0] == 1
         if inference_mode:
-            assert vlm_attention_mask.shape[1] == 768
-            assert vlm_attention_mask.shape[2] == 768
+            assert vlm_attention_mask.shape[1] == 769
+            assert vlm_attention_mask.shape[2] == 769
         else:
-            assert vlm_attention_mask.shape[1] == 820
-            assert vlm_attention_mask.shape[2] == 820
+            assert vlm_attention_mask.shape[1] == 821
+            assert vlm_attention_mask.shape[2] == 821
         assert vlm_attention_mask.dtype == torch.bool
 
         batch_size = vlm_attention_mask.shape[0]
         for i in range(batch_size):
             # construct correct attention mask
             # see diagram here: https://drive.google.com/file/d/12lhS72bnQrKyL4iCfEj6SDRSPi1NABBj/view?usp=sharing
-            correct_vlm_attention_mask = torch.ones(820, 820, dtype=torch.bool)
+            #
+            # Sequence layout: images[0:512] | prompt[512:768] | <val>[768] | response[769:821].
+            # The <val> readout sits right after the prompt and BEFORE the response block, so
+            # it attends over the prefix only -- identical context to inference, where the
+            # response block is absent and <val> is simply the last token.
+            correct_vlm_attention_mask = torch.ones(821, 821, dtype=torch.bool)
 
             # pad tokens should not be attended to or attend to any other tokens
-            prompt_start_idx, response_start_idx = 512, 768
-            num_non_padded_prompt_tokens = pad_masks[i, prompt_start_idx:response_start_idx].sum()
+            prompt_start_idx, val_idx, response_start_idx = 512, 768, 769
+            num_non_padded_prompt_tokens = pad_masks[i, prompt_start_idx:val_idx].sum()
             num_non_padded_response_tokens = pad_masks[i, response_start_idx:].sum()
-            correct_vlm_attention_mask[
-                prompt_start_idx + num_non_padded_prompt_tokens : response_start_idx, :
-            ] = 0
-            correct_vlm_attention_mask[
-                :, prompt_start_idx + num_non_padded_prompt_tokens : response_start_idx
-            ] = 0
+            correct_vlm_attention_mask[prompt_start_idx + num_non_padded_prompt_tokens : val_idx, :] = 0
+            correct_vlm_attention_mask[:, prompt_start_idx + num_non_padded_prompt_tokens : val_idx] = 0
             correct_vlm_attention_mask[response_start_idx + num_non_padded_response_tokens :, :] = 0
             correct_vlm_attention_mask[:, response_start_idx + num_non_padded_response_tokens :] = 0
 
-            correct_vlm_attention_mask[:response_start_idx, response_start_idx:] = 0
+            # The prefix (images + prompt) cannot attend forward to <val> or the response.
+            correct_vlm_attention_mask[:val_idx, val_idx:] = 0
+            # <val> attends to the prefix and itself, but not to the response block after it.
+            correct_vlm_attention_mask[val_idx, response_start_idx:] = 0
 
             response_causal_mask = torch.tril(
                 torch.ones(
@@ -139,7 +144,8 @@ class TestValueFunctionIntegration:
             ] = response_causal_mask
 
             if inference_mode:
-                correct_vlm_attention_mask = correct_vlm_attention_mask[:768, :768]
+                # No response block at inference: keep images + prompt + <val>.
+                correct_vlm_attention_mask = correct_vlm_attention_mask[:769, :769]
 
             assert torch.all(vlm_attention_mask[i].cpu() == correct_vlm_attention_mask.cpu())
 

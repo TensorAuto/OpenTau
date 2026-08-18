@@ -154,8 +154,8 @@ class SiglipGemmaValueModel(PreTrainedModel):
 
         # Value head: projects final hidden state to discretized value bins
         self.value_head = nn.Linear(640, config.num_value_bins)
-        # Learned <val> readout token, appended as the LAST element of every sequence by
-        # ValueModel.embed_sequence. The value is read from ITS hidden state.
+        # Learned <val> readout token, inserted by ValueModel.embed_sequence right after the
+        # prompt and before any response block. The value is read from ITS hidden state.
         #
         # Why it exists: the readout used to be hidden_states[:, -1, :], described as "the
         # last language token". It is not — prepare_language pads the prompt to
@@ -167,8 +167,9 @@ class SiglipGemmaValueModel(PreTrainedModel):
         # training data and held-out data. The model had learned the only thing available to
         # it, the mean return.
         #
-        # A dedicated token fixes this by construction: it is always present, always the last
-        # position, never padding, and it attends over the whole real prefix.
+        # A dedicated token fixes this by construction: it is always present, never padding,
+        # and it attends over the whole real prefix (and only the prefix, since it precedes
+        # the response block) -- so training and inference read it over identical context.
         self.value_token = nn.Parameter(torch.zeros(1, 1, 640))
         nn.init.normal_(self.value_token, std=0.02)
         # Response head: projects response hidden states to logits for response language
@@ -232,13 +233,14 @@ class SiglipGemmaValueModel(PreTrainedModel):
         )
         hidden_states = outputs.last_hidden_state
 
-        # Value comes from the <val> token, which embed_sequence appends LAST. Training and
-        # inference now read the SAME position; they previously did not (-L-1 here vs -1 in
-        # get_value), so with response_max_length=52 they were 52 tokens apart.
-        classification_hidden = hidden_states[:, -1, :]
-        # The response block sits just before <val>, so every index shifts by one. Same
-        # semantics as before: all response tokens except the last (next-token prediction).
-        response_hidden = hidden_states[:, -self.config.response_max_length - 1 : -2, :]
+        # Value comes from the <val> token. embed_sequence now places it right after the
+        # prompt and BEFORE the response block, so it sits at -(response_max_length + 1)
+        # here. This is the same token, over the same prefix-only context, that get_value
+        # reads at -1 when no response is present -- training and inference stay consistent.
+        classification_hidden = hidden_states[:, -self.config.response_max_length - 1, :]
+        # The response block is the final response_max_length positions; drop the last one
+        # for next-token prediction (labels are response_tokens[:, 1:]).
+        response_hidden = hidden_states[:, -self.config.response_max_length : -1, :]
 
         # Project to logits for discretized values
         value_logits = self.value_head(classification_hidden)
@@ -278,8 +280,9 @@ class SiglipGemmaValueModel(PreTrainedModel):
         )
         hidden_states = outputs.last_hidden_state
 
-        # The <val> token is appended last by embed_sequence, so position -1 is it -- not
-        # padding, as the previous comment ("the last language token") assumed.
+        # get_value runs without a response block, so the <val> token is the final position
+        # (index -1) here -- the same token and same prefix-only context the training
+        # forward reads at -(response_max_length + 1).
         value_hidden = hidden_states[:, -1, :]
 
         # Project to logits for discretized values

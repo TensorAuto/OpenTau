@@ -763,6 +763,22 @@ class ValueModel(nn.Module):
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
+        # <val>: the readout token, placed right after the prompt and BEFORE any response
+        # block so its attention context is identical in training and inference. att_mask 1
+        # opens a new block, so it attends over the whole prefix (images + prompt) while
+        # nothing before it attends back; the 2D mask keeps pad positions out of its keys,
+        # which is what lets it sit after a padded prompt and still see only real tokens.
+        # Because the response block follows it, <val> never attends to the response -- and
+        # get_value (no response) reads the same token over the same context.
+        #
+        # Without it the value was read from hidden_states[:, -1, :], which IS padding once
+        # the prompt is padded to prompt_max_length -- the readout carried no information and
+        # the head could only emit a constant. See SiglipGemmaValueModel.value_token.
+        val_emb = self.siglip_gemma_value.value_token.to(dtype=embs[0].dtype, device=embs[0].device)
+        embs.append(val_emb.expand(bsize, 1, -1))
+        pad_masks.append(torch.ones(bsize, 1, dtype=pad_masks[0].dtype, device=pad_masks[0].device))
+        att_masks += [1]
+
         if response_tokens is not None:
             response_emb = self.siglip_gemma_value.embed_language_tokens(response_tokens)
 
@@ -773,22 +789,9 @@ class ValueModel(nn.Module):
             embs.append(response_emb)
             pad_masks.append(response_masks)
 
-            # full attention between image, language and response inputs
+            # response attends to the whole prefix and <val>; causal within itself.
             num_response_embs = response_emb.shape[1]
             att_masks += [1] * num_response_embs
-
-        # <val>: the readout token, appended LAST so it is always the final position and
-        # never padding. att_mask 1 opens a new block, so it attends over the whole prefix
-        # while nothing attends back to it; the 2D mask keeps pad positions out of its keys,
-        # which is what lets it sit after a padded prompt and still see only real tokens.
-        #
-        # Without it the value was read from hidden_states[:, -1, :], which IS padding once
-        # the prompt is padded to prompt_max_length -- the readout carried no information and
-        # the head could only emit a constant. See SiglipGemmaValueModel.value_token.
-        val_emb = self.siglip_gemma_value.value_token.to(dtype=embs[0].dtype, device=embs[0].device)
-        embs.append(val_emb.expand(bsize, 1, -1))
-        pad_masks.append(torch.ones(bsize, 1, dtype=pad_masks[0].dtype, device=pad_masks[0].device))
-        att_masks += [1]
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
