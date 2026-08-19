@@ -52,6 +52,7 @@ from opentau.policies.candidates import (
     expand_candidates,
     expand_kv_cache,
     select_candidate,
+    warn_if_no_candidate_scored,
 )
 from opentau.policies.normalize import Normalize, Unnormalize
 from opentau.policies.normalize import resolve_num_datasets as _num_datasets
@@ -746,6 +747,9 @@ class PI06Policy(PreTrainedPolicy):
         selected = select_candidate(scores)
         actions = candidates[torch.arange(candidates.shape[0], device=candidates.device), selected]
         self.last_candidate_scores = scores.detach().to(torch.float32).cpu().tolist()
+        # Reads the list just synced above, so the all-non-finite fallback inside
+        # `select_candidate` is observable without a second device->host round trip.
+        warn_if_no_candidate_scored(self.last_candidate_scores)
         if accel_meter is not None:
             self._publish_accel_for_candidates(accel_meter, sampler_index, n_candidates, selected)
 

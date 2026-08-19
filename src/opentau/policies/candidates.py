@@ -40,6 +40,7 @@ therefore cannot self-arm best-of-N in a script that never opted in — the same
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, Protocol, runtime_checkable
 
 import torch
@@ -168,6 +169,41 @@ def select_candidate(scores: Tensor) -> Tensor:
     return torch.where(all_bad, torch.zeros_like(picked), picked)
 
 
+#: Set once a degenerate-score warning has been emitted, so a serving loop reports the
+#: condition without printing a line per request.
+_WARNED_DEGENERATE = False
+
+
+def warn_if_no_candidate_scored(score_rows: list[list[float]]) -> None:
+    """Log once when a batch row's scores were all non-finite.
+
+    :func:`select_candidate` falls back to candidate 0 there rather than raising, because a
+    data-dependent raise inside ``select_action`` would abort one rank while its peers block
+    at the next collective. That fallback must still be *observable* — otherwise a critic
+    returning all-NaN looks exactly like a critic that works and happens to prefer candidate
+    0 every time.
+
+    Takes the already-synced host-side scores rather than the device tensor, so it costs no
+    extra device-to-host round trip beyond the one the caller already paid.
+
+    Args:
+        score_rows: ``(B, N)`` scores as nested Python lists.
+    """
+    global _WARNED_DEGENERATE
+    if _WARNED_DEGENERATE:
+        return
+    bad = [i for i, row in enumerate(score_rows) if not any(math.isfinite(v) for v in row)]
+    if not bad:
+        return
+    _WARNED_DEGENERATE = True
+    logging.warning(
+        "action-chunk critic returned no finite score for batch row(s) %s; those rows fell "
+        "back to candidate 0. Best-of-N is not selecting on anything for them. This is "
+        "logged once per process.",
+        bad,
+    )
+
+
 class MedoidCritic(nn.Module):
     """Reference critic: keep the candidate closest to all the others.
 
@@ -232,7 +268,16 @@ class MedoidCritic(nn.Module):
         keep = keep[:, :action_dim]
 
         normed = candidates.float() / rearrange(scale, "b d -> b 1 1 d")
-        valid = rearrange(keep, "b d -> b 1 1 d") & rearrange(row_mask.to(torch.bool), "... c -> ... c 1")
+        # Name the batch axis explicitly rather than letting an ellipsis pattern right-align
+        # it. A ``(B, chunk)`` row_mask -- which this protocol documents, and which
+        # ``executed_row_mask`` produces for a per-sample ``delay`` -- becomes
+        # ``(B, chunk, 1)`` under ``"... c -> ... c 1"``, whose leading B then lands on the
+        # *candidate* axis of keep's ``(B, 1, 1, D)``: a shape error when B != N, and
+        # silently scoring candidate j against observation j's mask when B == N.
+        row_mask = row_mask.to(torch.bool)
+        if row_mask.ndim != 2:
+            raise ValueError(f"row_mask must be (B, chunk) or (1, chunk); got {tuple(row_mask.shape)}.")
+        valid = rearrange(keep, "b d -> b 1 1 d") & rearrange(row_mask, "b c -> b 1 c 1")
         normed = torch.where(valid, normed, torch.zeros_like(normed))
 
         # (B, N, N) pairwise L2 over the flattened executed rows.
@@ -314,8 +359,10 @@ def configure_candidates(
 
     Precedence uses ``is None`` at every step, never ``or``-truthiness: ``override=1`` is a
     caller deliberately *disabling* a config-enabled N, and an ``or`` chain would fall through
-    it. The resolved value is always written to ``policy.n_candidates``, including the N==1
-    case — returning early without writing would leave a stale value from a previous call.
+    it. Whenever the policy is wired for candidates the resolved value is written to
+    ``policy.n_candidates``, including the N==1 case — returning early without writing would
+    leave a stale value from a previous call. An *unwired* policy is never written to, at any
+    N: it is a no-op at 1 and a refusal above it.
 
     Args:
         policy: The loaded policy wrapper.
@@ -339,12 +386,22 @@ def configure_candidates(
     requested: int | None = override
     if requested is None:
         requested = getattr(getattr(cfg, "policy", cfg), "n_candidates", None)
-    if requested is None:
-        return 1
-
-    n = int(requested)
+    n = 1 if requested is None else int(requested)
     if n < 1:
         raise ValueError(f"n_candidates must be >= 1, got {n}.")
+
+    if n == 1:
+        # Return BEFORE the wiring probe below. `PreTrainedConfig.n_candidates` defaults to
+        # `1` — an int, not `None` — so this is the path every unarmed serving process takes,
+        # for every policy family. Probing here would abort startup of the gRPC / RoboCasa /
+        # inference / benchmark entry points for pi0, pi05_mem, both pi07 families, cosmos3
+        # and value, none of which asked for anything.
+        #
+        # Only write when the attribute already exists: creating it on an unwired family
+        # would make a later `n > 1` call believe that family was wired.
+        if hasattr(policy, "n_candidates"):
+            policy.n_candidates = 1
+        return 1
 
     policy_type = getattr(getattr(cfg, "policy", cfg), "type", type(policy).__name__)
     # A family whose sampler has not been wired would accept the attribute and then never
@@ -354,10 +411,6 @@ def configure_candidates(
             f"n_candidates={n} was requested but policy type {policy_type!r} does not expose "
             "`n_candidates`, i.e. its sampler is not wired for best-of-N candidate sampling."
         )
-
-    if n == 1:
-        policy.n_candidates = 1
-        return 1
 
     resolved = critic
     if resolved is None:

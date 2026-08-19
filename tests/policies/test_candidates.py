@@ -26,11 +26,14 @@ precedence that decides whether best-of-N runs at all.
 Built on lightweight shells with no real weights, the same way ``test_pi05_accel.py`` is.
 """
 
+import logging
+
 import pytest
 import torch
 from torch import nn
 
 from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
+from opentau.policies import candidates as candidates_mod
 from opentau.policies.candidates import (
     MEDOID,
     ActionChunkCritic,
@@ -453,3 +456,127 @@ def test_refuse_candidates_fires_only_above_one():
     refuse_candidates(_FakeCfg(), reason="batched eval memory")
     # A config predating the field must not trip it either.
     refuse_candidates(object(), reason="batched eval memory")
+
+
+# --------------------------------------------------------------------------------------
+# Regressions from the #525 review.
+# --------------------------------------------------------------------------------------
+
+
+def test_an_unwired_family_is_a_noop_at_the_default_n_of_one():
+    """The default must not abort startup for a family that was never wired.
+
+    `PreTrainedConfig.n_candidates` defaults to `1` -- an int, not `None` -- so the config
+    lookup always resolves and the "nothing asked for candidates" early return never fires
+    on a real config. A wiring probe placed before the `n == 1` return therefore raised for
+    every unwired family at the default, breaking startup of every serving entry point for
+    pi0, pi05_mem, both pi07 families, cosmos3 and value.
+
+    `test_configure_refuses_a_policy_family_that_is_not_wired` cannot catch this: it only
+    ever passes `n_candidates=4`.
+    """
+    policy = _FakePolicy(wired=False)
+    assert configure_candidates(policy, _FakeCfg(n_candidates=1), device=CPU) == 1
+
+
+def test_configure_never_creates_n_candidates_on_an_unwired_family():
+    """The N==1 no-op must not leave the attribute behind.
+
+    Writing `policy.n_candidates = 1` on an unwired policy would make the wiring probe on a
+    later `n > 1` call believe that family had been wired all along, turning a loud refusal
+    into a silent fan-out the sampler ignores.
+    """
+    policy = _FakePolicy(wired=False)
+    configure_candidates(policy, _FakeCfg(n_candidates=1), device=CPU)
+    assert not hasattr(policy, "n_candidates")
+
+    # And the refusal still fires afterwards, which is the property the no-op protects.
+    with pytest.raises(ValueError, match="not wired"):
+        configure_candidates(policy, _FakeCfg(n_candidates=4, action_chunk_critic_path=MEDOID), device=CPU)
+
+
+@pytest.mark.parametrize("n_cand", [3, 4], ids=["batch_ne_candidates", "batch_eq_candidates"])
+def test_medoid_honours_a_per_observation_row_mask(n_cand):
+    """A ``(B, chunk)`` mask must mask observation *b*, not candidate *b*.
+
+    The protocol documents ``(B, chunk)`` and ``executed_row_mask`` produces it for a
+    per-sample ``delay``. Under an ellipsis rearrange the mask's leading axis right-aligned
+    onto the *candidate* axis: a shape error when B != N, and -- the dangerous half --
+    silently scoring candidate j against observation j's mask when B == N.
+
+    The masks here differ per observation, which is what makes the B == N case observable
+    at all: with one shared mask a transposed axis produces identical numbers and the test
+    cannot fail. The reference is the per-observation ``(1, chunk)`` path, which is
+    independently covered by `test_medoid_honours_the_row_mask`.
+    """
+    batch, chunk, dim = 4, 4, 2
+    critic = _medoid([1.0] * dim)
+
+    # Candidate n differs from its peers on every chunk row, so which row is masked changes
+    # the pairwise distances -- otherwise masking would be unobservable either way.
+    candidates = torch.zeros(batch, n_cand, chunk, dim)
+    for n in range(n_cand):
+        for c in range(chunk):
+            candidates[:, n, c, :] = float(n * 10 + c)
+
+    # Observation b hides chunk row b: a different mask per row of the batch.
+    mask = torch.ones(batch, chunk, dtype=torch.bool)
+    for b in range(batch):
+        mask[b, b % chunk] = False
+
+    batched = critic.score_chunks(
+        {}, candidates, row_mask=mask, dataset_index=torch.zeros(batch, dtype=torch.long)
+    )
+    assert batched.shape == (batch, n_cand)
+
+    for b in range(batch):
+        reference = critic.score_chunks(
+            {},
+            candidates[b : b + 1],
+            row_mask=mask[b : b + 1],
+            dataset_index=torch.zeros(1, dtype=torch.long),
+        )
+        assert torch.allclose(batched[b], reference[0]), (
+            f"observation {b} scored differently in the batched call than on its own, so the "
+            "per-observation mask is not reaching the right rows"
+        )
+
+
+def test_medoid_rejects_a_row_mask_that_is_not_two_dimensional():
+    critic = _medoid([1.0, 1.0])
+    candidates = torch.zeros(1, 3, 2, 2)
+    with pytest.raises(ValueError, match="row_mask must be"):
+        critic.score_chunks(
+            {},
+            candidates,
+            row_mask=torch.ones(2, dtype=torch.bool),
+            dataset_index=torch.zeros(1, dtype=torch.long),
+        )
+
+
+def test_a_degenerate_score_row_warns_so_the_fallback_is_observable(caplog, monkeypatch):
+    """`select_candidate` falls back to candidate 0 silently; the caller must say so.
+
+    Without this an all-NaN critic is indistinguishable from a working critic that happens
+    to prefer candidate 0 on every request.
+    """
+    monkeypatch.setattr(candidates_mod, "_WARNED_DEGENERATE", False)
+    nan = float("nan")
+
+    with caplog.at_level(logging.WARNING):
+        candidates_mod.warn_if_no_candidate_scored([[nan, nan], [1.0, 2.0]])
+    assert "candidate 0" in caplog.text
+    assert "[0]" in caplog.text, "the warning should name which rows were degenerate"
+
+    # Once per process, so a serving loop does not print a line per request.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        candidates_mod.warn_if_no_candidate_scored([[nan, nan]])
+    assert caplog.text == ""
+
+
+def test_healthy_scores_never_warn(caplog, monkeypatch):
+    monkeypatch.setattr(candidates_mod, "_WARNED_DEGENERATE", False)
+    with caplog.at_level(logging.WARNING):
+        candidates_mod.warn_if_no_candidate_scored([[1.0, float("nan")], [0.0, 3.0]])
+    assert caplog.text == ""
