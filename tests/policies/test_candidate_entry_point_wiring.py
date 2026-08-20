@@ -129,16 +129,89 @@ def _calls(tree: ast.AST, name: str) -> list[ast.Call]:
     ]
 
 
-def _first_sampler_call_line(tree: ast.AST) -> int | None:
-    """Line of the earliest ``<obj>.sample_actions(...)`` / ``.select_action(...)`` call."""
-    lines = [
-        node.lineno
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr in _SAMPLER_ATTRS
-    ]
+def _function_defs(tree: ast.AST) -> dict[str, ast.FunctionDef]:
+    """Every ``def`` in the module by bare name, methods included."""
+    return {
+        node.name: node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+
+
+def _called_names(node: ast.AST) -> set[str]:
+    """Bare names of everything ``node`` calls, as ``f()`` or ``self.f()``."""
+    names = set()
+    for sub in ast.walk(node):
+        if not isinstance(sub, ast.Call):
+            continue
+        if isinstance(sub.func, ast.Name):
+            names.add(sub.func.id)
+        elif isinstance(sub.func, ast.Attribute):
+            names.add(sub.func.attr)
+    return names
+
+
+def _samples_directly(node: ast.AST) -> bool:
+    """Whether ``node`` contains a literal ``<obj>.sample_actions(...)`` call."""
+    return any(
+        isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute) and sub.func.attr in _SAMPLER_ATTRS
+        for sub in ast.walk(node)
+    )
+
+
+def _sampler_reaching_functions(tree: ast.AST) -> set[str]:
+    """Names of functions that reach the sampler, directly or through a helper they call.
+
+    Iterated to a fixed point so a chain of helpers resolves, not just one hop.
+    """
+    defs = _function_defs(tree)
+    reaching = {name for name, fn in defs.items() if _samples_directly(fn)}
+    while True:
+        grown = reaching | {name for name, fn in defs.items() if _called_names(fn) & reaching}
+        if grown == reaching:
+            return reaching
+        reaching = grown
+
+
+def _first_sampling_line_within(fn: ast.AST, sampler_reaching: set[str]) -> int | None:
+    """Line inside ``fn`` at which sampling first actually *happens*.
+
+    A ``sample_actions(...)`` written in a helper does not execute where it is written —
+    it executes where that helper is **called**. So a call to a sampler-reaching helper
+    counts at its call site, which is the whole difference between this and comparing raw
+    file offsets.
+
+    Args:
+        fn: The function whose body is scanned.
+        sampler_reaching: Names of functions that reach the sampler, from
+            :func:`_sampler_reaching_functions`.
+
+    Returns:
+        The earliest line in ``fn`` that samples, or ``None`` if it never does.
+    """
+    lines = []
+    for sub in ast.walk(fn):
+        if not isinstance(sub, ast.Call):
+            continue
+        if (
+            isinstance(sub.func, ast.Attribute)
+            and sub.func.attr in _SAMPLER_ATTRS
+            or isinstance(sub.func, ast.Attribute)
+            and sub.func.attr in sampler_reaching
+            or isinstance(sub.func, ast.Name)
+            and sub.func.id in sampler_reaching
+        ):
+            lines.append(sub.lineno)
     return min(lines) if lines else None
+
+
+def _enclosing_function(tree: ast.AST, target: ast.Call) -> ast.FunctionDef | None:
+    """The innermost ``def`` whose body contains ``target``."""
+    best = None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        if any(sub is target for sub in ast.walk(node)) and (best is None or node.lineno > best.lineno):
+            best = node
+    return best
 
 
 def _tree(rel_path: str) -> ast.Module:
@@ -258,17 +331,157 @@ def test_candidates_are_armed_before_the_first_sampler_call(rel_path):
     smoke-called for its output shape, and where the widened batch first allocates. Every one
     of those is a startup concern: a server that warms up at N=1 and only fans out on the
     first real request pays a recompile and can run out of memory with a robot waiting.
+
+    Ordering is resolved by *execution*, not by file offset. Comparing raw line numbers
+    reads a sampler call written in a helper as happening where it is written — so factoring
+    the warmup into a method defined above the arming call reads as "samples before arming"
+    while the runtime order is unchanged. ``grpc/server.py`` did exactly that (#523) and the
+    file-offset form of this test went red on a correct server.
     """
     tree = _tree(rel_path)
     arm = _calls(tree, "configure_candidates")
     assert len(arm) == 1, f"{rel_path}: expected exactly one configure_candidates() call, found {len(arm)}"
 
-    first_sample = _first_sampler_call_line(tree)
-    assert first_sample is not None, f"{rel_path}: no sampler call found; the ordering matcher needs updating"
+    arming_fn = _enclosing_function(tree, arm[0])
+    assert arming_fn is not None, (
+        f"{rel_path}: configure_candidates() is called at module level; the ordering matcher "
+        "assumes it runs inside the startup function that also warms the sampler up"
+    )
+
+    first_sample = _first_sampling_line_within(arming_fn, _sampler_reaching_functions(tree))
+    assert first_sample is not None, (
+        f"{rel_path}: {arming_fn.name}() arms best-of-N but never reaches the sampler, so this "
+        "test would pass without checking anything. Arming and the warmup have been split "
+        "across functions — update the matcher to compare them at their common caller."
+    )
     assert arm[0].lineno < first_sample, (
         f"{rel_path}: configure_candidates() at line {arm[0].lineno} runs after the first "
-        f"sample_actions()/select_action() call at line {first_sample}, so critic loading and "
+        f"sampling reached at line {first_sample} in {arming_fn.name}(), so critic loading and "
         "the candidate fan-out land on a live request instead of at startup"
+    )
+
+
+def _ordering_verdict(source: str) -> tuple[int, int | None, str]:
+    """Run the ordering matcher over a synthetic script.
+
+    Args:
+        source: Module source in the shape of a serving entry point.
+
+    Returns:
+        ``(arming line, first line in the arming function that samples, arming function name)``.
+        The middle element is ``None`` when the arming function never reaches the sampler.
+    """
+    tree = ast.parse(source)
+    arm = _calls(tree, "configure_candidates")[0]
+    arming_fn = _enclosing_function(tree, arm)
+    return (
+        arm.lineno,
+        _first_sampling_line_within(arming_fn, _sampler_reaching_functions(tree)),
+        arming_fn.name,
+    )
+
+
+#: The shape ``grpc/server.py`` took in #523: the warmup is factored into a helper *defined
+#: above* the arming call, so the sampler call's file offset is smaller while the runtime
+#: order is unchanged. Kept as one string with the two variants below differing only in
+#: where the arming line sits, so the pair isolates ordering and nothing else.
+_WARMUP_VIA_HELPER_DEFINED_ABOVE = """
+class Servicer:
+    def _sample_sync(self, batch):
+        return self.policy.sample_actions(batch)
+
+    def _load_policy(self):
+        self.policy = make_policy(cfg=self.cfg.policy)
+        configure_candidates(self.policy, self.cfg, device="cuda", dtype=None)
+        _ = self._sample_sync({})
+"""
+
+_ARMED_AFTER_THE_WARMUP = """
+class Servicer:
+    def _sample_sync(self, batch):
+        return self.policy.sample_actions(batch)
+
+    def _load_policy(self):
+        self.policy = make_policy(cfg=self.cfg.policy)
+        _ = self._sample_sync({})
+        configure_candidates(self.policy, self.cfg, device="cuda", dtype=None)
+"""
+
+
+def test_a_helper_defined_above_the_arming_call_samples_at_its_call_site():
+    """The regression that broke `main`: file offset is not execution order.
+
+    Under the old ``min(lineno)`` matcher the helper's own ``sample_actions`` line won,
+    reporting that a correct server sampled before it armed. Reverting
+    :func:`_first_sampling_line_within` to that form turns this red.
+    """
+    arm_line, sample_line, fn_name = _ordering_verdict(_WARMUP_VIA_HELPER_DEFINED_ABOVE)
+
+    assert fn_name == "_load_policy"
+    assert sample_line is not None
+    assert arm_line < sample_line, (
+        "the warmup helper's definition was read as the sampling site; sampling happens where "
+        f"the helper is called (line {sample_line}), not where it is written"
+    )
+
+
+def test_arming_after_the_warmup_is_still_caught():
+    """The other direction — the fix must not become "never disagree".
+
+    Same two methods, same helper indirection, only the arming call moves below the warmup.
+    Without this, relaxing the matcher into a tautology would fail nothing.
+    """
+    arm_line, sample_line, _ = _ordering_verdict(_ARMED_AFTER_THE_WARMUP)
+
+    assert sample_line is not None
+    assert arm_line > sample_line, (
+        "arming written after the warmup call must still read as late; the ordering check is "
+        "the only thing keeping critic loading off the first robot request"
+    )
+
+
+def test_a_chain_of_helpers_resolves_to_the_outermost_call_site():
+    """``_sampler_reaching_functions`` iterates to a fixed point, so depth doesn't matter."""
+    arm_line, sample_line, _ = _ordering_verdict(
+        """
+class Servicer:
+    def _inner(self, batch):
+        return self.policy.sample_actions(batch)
+
+    def _outer(self, batch):
+        return self._inner(batch)
+
+    def _load_policy(self):
+        self.policy = make_policy(cfg=self.cfg.policy)
+        configure_candidates(self.policy, self.cfg, device="cuda", dtype=None)
+        _ = self._outer({})
+"""
+    )
+
+    assert sample_line is not None and arm_line < sample_line
+
+
+def test_an_arming_function_that_never_samples_is_reported_not_passed():
+    """A vacuous pin is the failure mode this whole module exists to avoid.
+
+    If a refactor splits arming and the warmup across functions, the matcher must say so
+    rather than return "nothing sampled here" and let the assertion succeed by default.
+    """
+    _, sample_line, _ = _ordering_verdict(
+        """
+class Servicer:
+    def _load_policy(self):
+        self.policy = make_policy(cfg=self.cfg.policy)
+        configure_candidates(self.policy, self.cfg, device="cuda", dtype=None)
+
+    def _warmup(self):
+        _ = self.policy.sample_actions({})
+"""
+    )
+
+    assert sample_line is None, (
+        "arming and the warmup now sit in different functions; the ordering test must fail "
+        "loudly and ask for a common-caller comparison instead of passing vacuously"
     )
 
 
