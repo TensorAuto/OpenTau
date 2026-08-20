@@ -171,13 +171,42 @@ def _sampler_reaching_functions(tree: ast.AST) -> set[str]:
         reaching = grown
 
 
+def _walk_skipping_nested_defs(fn: ast.AST) -> list[ast.AST]:
+    """Nodes under ``fn``, without descending into nested ``def`` bodies.
+
+    A nested function's body does not run where it is written, so its sampler calls belong
+    to its call site — which :func:`_sampler_reaching_functions` already resolves by name,
+    nested defs included. Descending would put the sampling back at the definition and
+    reintroduce the file-offset bug one level down.
+
+    ``lambda`` bodies *are* descended into: an anonymous function carries no name for that
+    resolution to key on, so treating it as executing in place fails loud rather than open.
+
+    Args:
+        fn: The function whose body is scanned.
+
+    Returns:
+        Every descendant node of ``fn`` except those inside a nested named function.
+    """
+    out: list[ast.AST] = []
+    stack = list(ast.iter_child_nodes(fn))
+    while stack:
+        node = stack.pop()
+        out.append(node)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+    return out
+
+
 def _first_sampling_line_within(fn: ast.AST, sampler_reaching: set[str]) -> int | None:
     """Line inside ``fn`` at which sampling first actually *happens*.
 
     A ``sample_actions(...)`` written in a helper does not execute where it is written —
     it executes where that helper is **called**. So a call to a sampler-reaching helper
     counts at its call site, which is the whole difference between this and comparing raw
-    file offsets.
+    file offsets. That holds for helpers nested inside ``fn`` too, hence
+    :func:`_walk_skipping_nested_defs`.
 
     Args:
         fn: The function whose body is scanned.
@@ -188,7 +217,7 @@ def _first_sampling_line_within(fn: ast.AST, sampler_reaching: set[str]) -> int 
         The earliest line in ``fn`` that samples, or ``None`` if it never does.
     """
     lines = []
-    for sub in ast.walk(fn):
+    for sub in _walk_skipping_nested_defs(fn):
         if not isinstance(sub, ast.Call):
             continue
         if (
@@ -459,6 +488,54 @@ class Servicer:
     )
 
     assert sample_line is not None and arm_line < sample_line
+
+
+def test_a_warmup_closure_inside_the_arming_function_samples_at_its_call_site():
+    """The same bug one nesting level down — ``ast.walk`` descends into nested ``def`` bodies.
+
+    A warmup factored into a closure *inside* the arming function put the sampling back at
+    the closure's definition, so correct code read as ``arm=7, sample=5``. Caught in review
+    of this PR, which is the point: the fix had to cover the shape it was named after, not
+    just the one that broke ``main``.
+    """
+    arm_line, sample_line, _ = _ordering_verdict(
+        """
+class Servicer:
+    def _load_policy(self):
+        def _warm(batch):
+            return self.policy.sample_actions(batch)
+
+        configure_candidates(self.policy, self.cfg, device="cuda", dtype=None)
+        _ = _warm({})
+"""
+    )
+
+    assert sample_line is not None
+    assert arm_line < sample_line, (
+        "a closure nested in the arming function was read as sampling at its definition; it "
+        f"samples where it is called (line {sample_line}), not where it is written"
+    )
+
+
+def test_a_warmup_closure_called_before_arming_is_still_caught():
+    """The other direction for the nested case — skipping nested bodies must not fail open."""
+    arm_line, sample_line, _ = _ordering_verdict(
+        """
+class Servicer:
+    def _load_policy(self):
+        def _warm(batch):
+            return self.policy.sample_actions(batch)
+
+        _ = _warm({})
+        configure_candidates(self.policy, self.cfg, device="cuda", dtype=None)
+"""
+    )
+
+    assert sample_line is not None, (
+        "the closure's call site must still count as sampling; dropping nested defs entirely "
+        "would make a warmup-before-arming refactor invisible"
+    )
+    assert arm_line > sample_line
 
 
 def test_an_arming_function_that_never_samples_is_reported_not_passed():
