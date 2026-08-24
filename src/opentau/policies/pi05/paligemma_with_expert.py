@@ -23,6 +23,7 @@ action generation and conditioning.
 """
 
 import logging
+from typing import TYPE_CHECKING
 
 import torch
 from einops import rearrange
@@ -43,6 +44,11 @@ from opentau.policies.utils import (
     freeze_with_expert_params_for_state_action_representation_only,
     set_with_expert_train_mode_for_state_action_representation_only,
 )
+
+# Annotation-only import: the TTT layer lives in a policy-agnostic module and the
+# pi05_ttt policy imports *this* file, so a runtime import here would be circular.
+if TYPE_CHECKING:
+    from opentau.policies.ttt_layer import TTTSequenceState
 
 
 def _preferred_dtype():
@@ -557,6 +563,7 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         fill_kv_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
         attention_block_ids: tuple[torch.Tensor, ...] | None = None,
+        ttt_state: "TTTSequenceState | None" = None,
     ) -> tuple[list[torch.FloatTensor | None], list[torch.FloatTensor] | Cache | None]:
         """Forward pass of the model.
 
@@ -574,6 +581,15 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             use_cache: Whether to use KV cache.
             fill_kv_cache: Whether to fill the KV cache.
             adarms_cond: List of AdaRMS conditioning tensors.
+            ttt_state: Test-Time-Training sequence state. ``None`` (the default,
+                and what pi05 / pi05_mem / pi07_paligemma always pass) skips the
+                TTT branch entirely, leaving this forward bit-identical to the
+                pre-TTT implementation. When provided, each expert decoder layer
+                that carries a ``ttt`` submodule blends a TTT contribution into
+                its attention output; see ``opentau.policies.ttt_layer``. The
+                branch is safe under distributed training despite CLAUDE.md rule
+                5 because it is decided by the *policy class*, identically on
+                every rank, and never by micro-batch content.
 
         Returns:
             tuple: A tuple containing:
@@ -631,6 +647,7 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
                     batch_size,
                     head_dim,
                     attention_block_ids,
+                    ttt_state,
                     use_reentrant=False,
                 )
             else:
@@ -647,6 +664,7 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
                     batch_size,
                     head_dim,
                     attention_block_ids,
+                    ttt_state,
                 )
 
         # final norm
@@ -674,6 +692,7 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         batch_size: int,
         head_dim: int,
         attention_block_ids: tuple[torch.Tensor, ...] | None = None,
+        ttt_state: "TTTSequenceState | None" = None,
     ) -> list[torch.FloatTensor | None]:
         """Run a single layer of the dual-tower decoder loop.
 
@@ -700,6 +719,7 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             adarms_cond: Per-tower AdaRMSNorm conditioning tensors (or None).
             batch_size: Cached batch size from the outer forward.
             head_dim: Per-head dimension.
+            ttt_state: Test-Time-Training sequence state, or None to skip TTT.
 
         Returns:
             list[torch.FloatTensor | None]: Per-tower output embeddings for
@@ -781,6 +801,36 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
                 out_emb = layer.self_attn.o_proj(att_output[:, start:end])
 
                 out_emb = self.dropout(out_emb)
+
+                # Test-Time-Training: the only path in this model that carries
+                # information across timesteps. Attention above has just run
+                # strictly *within* each timestep (the sequence axis is folded
+                # into the batch axis), so here we unfold it, let the layer's
+                # fast weights read and update over the time axis, and blend the
+                # result back through the near-zero-initialized tanh gate.
+                #
+                # Sits before the residual so the gate mixes two attention-space
+                # tensors, per Eq. 3 / Fig. 3 of arXiv:2607.15275.
+                ttt_layer = getattr(layer, "ttt", None)
+                if ttt_state is not None and ttt_layer is not None:
+                    num_timesteps = ttt_state.num_timesteps
+                    tokens_per_timestep = out_emb.shape[1]
+                    ttt_out, next_fast_weights = ttt_layer(
+                        rearrange(out_emb, "(b t) s w -> b (t s) w", t=num_timesteps),
+                        mini_batch_size=tokens_per_timestep,
+                        fast_weights=ttt_state.incoming.get(layer_idx),
+                        position_offset=ttt_state.position_offset,
+                    )
+                    out_emb = layer.ttt_gate(
+                        out_emb,
+                        rearrange(ttt_out, "b (t s) w -> (b t) s w", t=num_timesteps),
+                    )
+                    # Idempotent across gradient-checkpoint recompute the same
+                    # way past_key_values is: each layer writes its own key, and
+                    # recompute is deterministic, so a replay stores an equal
+                    # value. The caller reads this after the forward completes,
+                    # i.e. before any recompute can run.
+                    ttt_state.outgoing[layer_idx] = next_fast_weights
 
                 # first residual
                 out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001

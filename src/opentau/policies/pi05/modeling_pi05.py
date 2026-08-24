@@ -345,11 +345,7 @@ class PI05Policy(PreTrainedPolicy):
         self._check_discrete_action_tokenizer_convention(config.discrete_action_tokenizer_path)
         # Get vocab size from processor
         discrete_action_vocab_size = getattr(self.discrete_action_processor, "vocab_size", None)
-        self.model = PI05FlowMatching(
-            config,
-            discrete_action_vocab_size=discrete_action_vocab_size,
-            language_tokenizer=self.language_tokenizer,
-        )
+        self.model = self._build_flow_matching(config, discrete_action_vocab_size)
 
         # Denoising-acceleration uncertainty proxy. Off by default: it is free to compute
         # but its scale is only meaningful against a calibration, so nothing should read it
@@ -365,6 +361,30 @@ class PI05Policy(PreTrainedPolicy):
         self._action_chunk_critic = None
 
         self.reset()
+
+    def _build_flow_matching(
+        self, config: PI05Config, discrete_action_vocab_size: int | None
+    ) -> "PI05FlowMatching":
+        """Builds the inner flow-matching module.
+
+        A seam for subclasses that swap in a variant of the inner module (e.g.
+        pi05_ttt, which adds TTT layers to the action expert). Overriding this
+        instead of reassigning ``self.model`` after ``super().__init__`` avoids
+        constructing — and immediately discarding — a full PaliGemma tower.
+
+        Args:
+            config: Policy configuration.
+            discrete_action_vocab_size: Size of the discrete action vocabulary,
+                or None when the processor does not expose one.
+
+        Returns:
+            The inner flow-matching module.
+        """
+        return PI05FlowMatching(
+            config,
+            discrete_action_vocab_size=discrete_action_vocab_size,
+            language_tokenizer=self.language_tokenizer,
+        )
 
     def reset(self) -> None:
         """This should be called whenever the environment is reset."""

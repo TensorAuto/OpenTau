@@ -135,6 +135,47 @@ Supporting changes, none of which alter a served score:
   (`OPENTAU_ACCEL_MEASURE_DTYPE_FLOOR=0`). It holds a second copy of the weights and is the
   first thing to fail on a shared GPU; skipping reports `NaN` rather than a fabricated ratio.
 
+### Added — `pi05_ttt`, π₀.₅ with Test-Time-Training memory — **new policy, opt-in, no `config_version` bump**
+
+A port of RoboTTT ([arXiv:2607.15275](https://arxiv.org/abs/2607.15275)) onto π₀.₅, registered
+as `policy.type=pi05_ttt`. A TTT layer is inserted after the attention block of each of the
+action expert's 18 layers: attention keeps operating strictly *within* a timestep, and the TTT
+layer's fast weights — a small per-head MLP updated by gradient descent at every timestep, in
+training and at inference alike — are the only path that crosses timesteps. The paper reports
+this buys 8K timesteps of context at constant inference cost, and with it stage tracking on
+long-horizon tasks, one-shot imitation from an in-context human video, and on-the-fly recovery.
+
+**Existing policies are untouched.** `PaliGemmaWithExpertModel.forward` / `_run_layer` gained
+one optional `ttt_state` parameter that defaults to `None`; pi05, pi05_mem and pi07_paligemma
+always pass `None`, which skips the branch entirely and leaves that forward bit-identical. The
+branch is decided by the policy class, identically on every rank, never by micro-batch content,
+so it does not need the OR-reduction CLAUDE.md rule 5 requires of content-dependent branches.
+`PI05Policy` gained an overridable `_build_flow_matching` seam so the subclass does not build a
+PaliGemma tower only to discard it.
+
+**A fresh `pi05_ttt` reproduces stock π₀.₅ at step 0.** Each TTT layer is blended in through a
+learned per-channel `tanh(alpha)` gate initialized to 0.001, so the randomly initialized memory
+cannot perturb a pretrained action expert before training decides how far to open it. The new
+state-dict keys (`...layers.N.ttt.*`, `...layers.N.ttt_gate.*`) are absorbed by the
+`strict=False` load path every `from_pretrained` override already uses, so an existing π₀.₅
+checkpoint warm-starts cleanly.
+
+**Also added:** 16 learned register tokens prepended to the expert's token stream each timestep
+(π₀.₅ carries robot state on the language side, inside the frozen VLM prefix, and the VL tokens
+bypass TTT for cost reasons — the registers are what carry vision and state into the memory);
+sequence action forcing, which samples the flow-matching noise level per timestep rather than
+per sequence; TBPTT with fast weights carried across segment boundaries and their gradients cut
+there; and per-timestep loss masking, so a timestep can act as pure context that updates the
+fast weights without contributing an imitation target.
+
+**Not yet usable for real long-context training.** The dataloader does not emit multi-timestep
+trajectory sequences, so a `pi05_ttt` run against today's data path takes the single-timestep
+branch and trains like stock π₀.₅ with an extra near-zero-gated memory. Gradients are truncated
+as specified, but the *activation-memory* benefit of TBPTT needs one backward per segment, which
+the shared training loop does not do (see `tbptt_backward_fn`). The frozen VLM prefix is also
+recomputed per timestep rather than precomputed and cached. DAgger Distillation is a
+data-collection procedure; the loss masking it needs is here, the procedure is not.
+
 ## [0.13.0] - 2026-08-17
 
 ### Added

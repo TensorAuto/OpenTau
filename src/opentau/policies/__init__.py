@@ -25,6 +25,7 @@ from .pi0.configuration_pi0 import PI0Config as PI0Config
 from .pi05.configuration_pi05 import PI05Config as PI05Config
 from .pi05.configuration_pi05 import PI05ContinuousStateConfig as PI05ContinuousStateConfig
 from .pi05_mem.configuration_pi05 import PI05MemConfig as PI05MemConfig
+from .pi05_ttt.configuration_pi05_ttt import PI05TTTConfig as PI05TTTConfig
 from .pi07.high_level_planner.configuration_pi07_high_level import (
     PI07HighLevelPlannerConfig as PI07HighLevelPlannerConfig,
 )
