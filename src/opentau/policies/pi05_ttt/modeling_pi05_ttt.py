@@ -788,6 +788,26 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         denoising step, or memory would advance ``config.num_steps`` times
         faster at inference than it ever did in training.
 
+        **Known train/inference mismatch in the update's input distribution.**
+        The update *count* is right, but the flow-matching time it is computed at
+        is not. Training runs a single expert forward at
+        ``tau ~ Beta(1.5, 1) * 0.999 + 0.001`` (mean about 0.6, i.e. mostly
+        noisy actions), while the Euler loop runs ``tau = 1 -> 0`` and the
+        adopted update is the one from the final step, at ``tau ~ dt/2``, from
+        nearly-clean actions. Since the action tokens' embeddings depend directly
+        on ``x_t``, the fast weights ingest a systematically different input at
+        deployment than they were trained on.
+
+        The final step is adopted deliberately — it is the update driven by the
+        chunk the robot actually executes, which is the quantity the memory
+        should carry forward — but the mismatch is real and unmeasured. The
+        alternatives are to adopt the *first* step's update (noisy, closer to the
+        training marginal, but derived from a chunk that was discarded) or to add
+        a dedicated write pass at a training-matched ``tau`` (correct, one extra
+        expert forward per call). Deferred until there is a long-context training
+        run to measure it against, because picking between them on reasoning
+        alone is how a plausible-but-wrong default gets locked in.
+
         Args:
             prefix_pad_masks: Prefix padding masks.
             past_key_values: Cached prefix keys and values.
