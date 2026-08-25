@@ -303,16 +303,46 @@ def resolve_delta_timestamps(
         if key not in reverse_name_map:
             continue  # only process camera, state, and action features
 
+        # Trajectory-sequence emission for recurrent policies. The window is
+        # anchored at its *last* timestep, so timestep t sits at frame offset
+        # `-(T - 1 - t) * stride`. Two reasons: it reuses the existing
+        # history-window convention for observations verbatim (all offsets <= 0),
+        # and it matches inference, where the memory is built from the past and
+        # the policy predicts *now*.
+        #
+        # Episode-boundary clamping and per-entry padding flags come free from
+        # the fetch layer — see `lerobot_dataset.py`, which notes that "per-frame
+        # temporal padding info (from clamped episode boundaries) is tracked by
+        # obs_history_is_pad", with `<key>_is_pad` doing the same for actions. So
+        # a window running off the start of an episode is clamped and reported,
+        # and no boundary arithmetic is needed here.
+        seq_len = cfg.dataset_mixture.sequence_length
+        seq_stride = cfg.dataset_mixture.sequence_stride or 1
+
         standard_key = reverse_name_map[key]
         if (
             standard_key == "actions"
             and cfg.policy is not None
             and cfg.policy.action_delta_indices is not None
         ):
-            delta_timestamps[key] = [i / action_freq for i in cfg.policy.action_delta_indices]
+            chunk_offsets = list(cfg.policy.action_delta_indices)
+            # T * H offsets, timestep-major so the reshape to (T, H, ...) is a
+            # plain view and the row order stays batch-major downstream.
+            # At seq_len == 1 this is exactly `chunk_offsets`, byte for byte.
+            delta_timestamps[key] = [
+                (-(seq_len - 1 - t) * seq_stride + h) / action_freq
+                for t in range(seq_len)
+                for h in chunk_offsets
+            ]
         elif "camera" in standard_key or standard_key == "state":
             n_obs = cfg.dataset_mixture.n_obs_history
-            if n_obs is not None:
+            if seq_len > 1:
+                # One observation per supervised timestep. Config validation
+                # already refuses combining this with `n_obs_history`.
+                delta_timestamps[key] = [
+                    -(seq_len - 1 - t) * seq_stride / action_freq for t in range(seq_len)
+                ]
+            elif n_obs is not None:
                 interval = getattr(cfg.policy, "history_interval", 1)
                 delta_timestamps[key] = [-(n_obs - 1 - i) * interval / action_freq for i in range(n_obs)]
             else:
