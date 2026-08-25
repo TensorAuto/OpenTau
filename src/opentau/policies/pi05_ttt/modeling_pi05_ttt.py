@@ -64,8 +64,6 @@ Known gaps, deliberately out of scope for this change and tracked in the PR:
   masking it needs is here, the procedure is not.
 """
 
-from __future__ import annotations
-
 from collections.abc import Callable
 from typing import Any
 
@@ -738,31 +736,37 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         suffix_out = outputs_embeds[1][:, -self.config.chunk_size :]
         return self.action_out_proj(suffix_out).to(dtype=torch.float32)
 
-    def sample_actions(self, *args: Any, n_candidates: int = 1, **kwargs: Any) -> Tensor:
+    def sample_actions(self, *args: Any, **kwargs: Any) -> Tensor:
         """Samples an action chunk, advancing the carried fast weights by one step.
 
         Args:
             *args: Forwarded to :meth:`PI05FlowMatching.sample_actions`.
-            n_candidates: Number of noise candidates to denoise per observation.
             **kwargs: Forwarded to :meth:`PI05FlowMatching.sample_actions`.
 
         Returns:
             The sampled action chunk.
 
         Raises:
-            NotImplementedError: If best-of-N sampling is combined with a
-                non-empty memory. Candidates widen the batch to
-                ``B * n_candidates`` rows while the carried fast weights hold
-                ``B``, and there is no defined answer for which candidate's
-                update should become the rollout's memory. Failing here beats
-                silently broadcasting one candidate's memory to all of them.
+            NotImplementedError: If ``n_candidates > 1``. Best-of-N widens the
+                batch to ``B * n_candidates`` rows while the carried fast
+                weights hold ``B``, and there is no defined answer for which
+                candidate's fast-weight update should become the rollout's
+                memory — the chunks the losing candidates produced were never
+                executed, so adopting their memory is wrong, and adopting the
+                winner's means the memory depends on a critic the training run
+                never saw.
+
+                The refusal is unconditional rather than conditioned on the
+                memory being non-empty: a conditional one would let the first
+                call of a rollout succeed and the second raise, which is a far
+                more confusing failure than refusing outright.
         """
-        if n_candidates > 1 and self._carried_fast_weights:
+        if int(kwargs.get("n_candidates", 1)) > 1:
             raise NotImplementedError(
-                "pi05_ttt does not support best-of-N candidate sampling with a populated TTT "
-                "memory: n_candidates>1 widens the batch, so the carried fast weights would "
-                "not line up, and it is undefined which candidate's fast-weight update should "
-                "be adopted as the rollout's memory. Use n_candidates=1."
+                "pi05_ttt does not support best-of-N candidate sampling: n_candidates>1 "
+                "widens the batch, so the carried fast weights would not line up, and it is "
+                "undefined which candidate's fast-weight update should be adopted as the "
+                "rollout's memory. Use n_candidates=1."
             )
 
         state = TTTSequenceState(
@@ -772,7 +776,7 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         )
         self._active_ttt_state = state
         try:
-            actions = super().sample_actions(*args, n_candidates=n_candidates, **kwargs)
+            actions = super().sample_actions(*args, **kwargs)
         finally:
             self._active_ttt_state = None
 

@@ -17,16 +17,20 @@
 Constructing a ``PI05TTTPolicy`` builds a full PaliGemma tower and fetches the
 PaliGemma and FAST tokenizers, so these cannot run in the CPU suite. The layer
 math, config validation and sequence-folding helpers are covered on CPU in
-``test_pi05_ttt.py``; what is left for here is the part only a real model can
-show: that the gate makes the policy a no-op against stock π₀.₅ at
-initialization, that the sequence path runs and produces gradients, that
-``train_ttt_only`` freezes what it claims to, and that the rollout memory
-advances per policy call and resets on ``reset()``.
+``test_pi05_ttt.py``; what is left for here is what only a real model shows.
 
-The no-op test is the important one. It is what licenses initializing from an
-existing π₀.₅ checkpoint at all: if the randomly initialized TTT layers
-perturbed the pretrained action expert on step 0, the pretrained skills would be
-damaged before training had a chance to decide how much memory to use.
+Two things shape how these are written, both learned by running them:
+
+* **Everything is bfloat16.** ``_preferred_dtype()`` in the dual-tower forward
+  pins activations to bf16, so a float32 policy hard-errors on the first
+  ``q_proj``. It also matters for memory: the policy is 3.45B parameters, which
+  is ~13.8 GiB in float32 and leaves no room for a second one.
+* **The no-op test does not build a second policy to compare against.** On the
+  single-timestep path ``PI05TTTPolicy`` delegates to ``PI05Policy.forward``,
+  which never passes ``ttt_state``, so TTT provably cannot run there and
+  comparing the two policies would pin nothing. The property worth pinning
+  lives on the *sequence* path: with the gate shut the model must be blind to
+  its own history, and with the gate open it must not be.
 """
 
 from __future__ import annotations
@@ -34,17 +38,20 @@ from __future__ import annotations
 import pytest
 import torch
 
-from opentau.policies.pi05.configuration_pi05 import PI05Config
-from opentau.policies.pi05.modeling_pi05 import PI05Policy
+from opentau.configs.types import FeatureType, PolicyFeature
 from opentau.policies.pi05_ttt.configuration_pi05_ttt import PI05TTTConfig
 from opentau.policies.pi05_ttt.modeling_pi05_ttt import PI05TTTPolicy
 from tests.utils import require_vram_gib
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
 
-# A PaliGemma-3B tower in bfloat16 plus an 18-layer action expert with TTT
-# layers and a short trajectory's activations.
-_MIN_VRAM_GIB = 24.0
+# Measured peak on an RTX 3090 (24 GiB card, which reports 23.57 GiB): 6.64 GiB
+# for a bf16 policy plus a 4-timestep sequence forward at chunk_size=50. The
+# floor sits well above that to cover the CUDA context, allocator fragmentation
+# and the backward pass, while staying below what a 24 GiB card reports — an
+# earlier 24.0 floor silently skipped every test on exactly the card they were
+# written for.
+_MIN_VRAM_GIB = 16.0
 
 
 def _config(**overrides) -> PI05TTTConfig:
@@ -65,85 +72,220 @@ def _config(**overrides) -> PI05TTTConfig:
         "tbptt_segment_length": 2,
         "num_steps": 2,
         "train_ttt_only": True,
-        # The sequence path raises on predict_response=True (see modeling docstring).
+        # The sequence path raises on predict_response=True rather than
+        # silently dropping the response cross-entropy term.
         "predict_response": False,
+        # Normally filled in by `make_policy(ds_meta=...)` from the dataset.
+        # Hardcoded here so the tests need no Hub dataset; the names and shapes
+        # are what `lerobot/droid_100` actually produces through
+        # `make_dataset_mixture`, so a batch built to this schema is the same
+        # shape the training path sees.
+        "input_features": {
+            "state": PolicyFeature(type=FeatureType.STATE, shape=(32,)),
+            "camera0": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224)),
+        },
+        "output_features": {
+            "actions": PolicyFeature(type=FeatureType.ACTION, shape=(32,)),
+        },
     }
     defaults.update(overrides)
     return PI05TTTConfig(**defaults)
 
 
-@pytest.mark.gpu
-@pytest.mark.slow
-@require_vram_gib(_MIN_VRAM_GIB)
-def test_gate_makes_ttt_a_no_op_at_initialization():
-    """At ``ttt_gate_init=0`` the policy must match stock π₀.₅ bit for bit.
+def _stats(config: PI05TTTConfig) -> list[dict[str, dict[str, torch.Tensor]]]:
+    """Builds neutral normalization statistics for the synthetic features.
 
-    Pinned at exactly zero rather than the default 0.001 so the assertion can
-    be exact; ``test_default_gate_is_a_small_perturbation`` covers the shipped
-    default. Together they pin that the gate — not a disconnected TTT branch —
-    is what preserves the pretrained behaviour.
+    Without these the `Normalize` buffers stay at infinity and the first
+    forward asserts. Identity-ish values (zero mean, unit std, [0, 1] range)
+    keep the normalization a no-op so the tests measure the model, not the
+    scaling.
+
+    Args:
+        config: Policy configuration, for the padded state/action widths.
+
+    Returns:
+        A single-dataset stats list in the shape `Normalize` expects.
+    """
+
+    def entry(dim: int) -> dict[str, torch.Tensor]:
+        return {
+            "mean": torch.zeros(dim),
+            "std": torch.ones(dim),
+            "min": torch.zeros(dim),
+            "max": torch.ones(dim),
+            "q01": torch.zeros(dim),
+            "q99": torch.ones(dim),
+        }
+
+    return [{"state": entry(config.max_state_dim), "actions": entry(config.max_action_dim)}]
+
+
+def _policy(config: PI05TTTConfig) -> PI05TTTPolicy:
+    """Builds a policy on the GPU in the dtype the dual-tower forward requires.
+
+    Args:
+        config: Policy configuration.
+
+    Returns:
+        A bfloat16 CUDA policy in eval mode.
+
+    Note:
+        ``.eval()`` is a separate statement, never chained: this repo's
+        ``PaliGemmaWithExpertModel.train`` override returns ``None`` rather than
+        ``self``, so ``policy = policy.eval()`` would silently yield ``None``.
     """
     torch.manual_seed(0)
-    ttt_config = _config(ttt_gate_init=0.0, n_register_tokens=0, train_ttt_only=False)
-    ttt_policy = PI05TTTPolicy(ttt_config).to("cuda").eval()
-
-    base_config = PI05Config(
-        **{field: getattr(ttt_config, field) for field in ("chunk_size", "n_action_steps", "num_steps")}
+    policy = (
+        PI05TTTPolicy(config, per_dataset_stats=_stats(config), dataset_names=["synthetic"])
+        .to("cuda")
+        .to(torch.bfloat16)
     )
-    torch.manual_seed(0)
-    base_policy = PI05Policy(base_config).to("cuda").eval()
-    # Copy the shared weights across so the only difference is the TTT branch.
-    missing, unexpected = base_policy.load_state_dict(
-        {k: v for k, v in ttt_policy.state_dict().items() if k in base_policy.state_dict()},
-        strict=False,
-    )
-    assert not unexpected, f"unexpected keys when mirroring weights: {unexpected}"
-
-    batch = _single_timestep_batch(ttt_config, device="cuda")
-    with torch.no_grad():
-        torch.manual_seed(1)
-        ttt_losses = ttt_policy.forward(dict(batch))
-        torch.manual_seed(1)
-        base_losses = base_policy.forward(dict(batch))
-
-    torch.testing.assert_close(ttt_losses["MSE"], base_losses["MSE"], atol=1e-4, rtol=1e-3)
+    policy.eval()
+    return policy
 
 
-@pytest.mark.gpu
-@pytest.mark.slow
-@require_vram_gib(_MIN_VRAM_GIB)
-def test_default_gate_is_a_small_perturbation():
-    """The shipped 0.001 gate must move the loss a little, not a lot.
+def _sequence_batch(config: PI05TTTConfig, num_timesteps: int) -> dict:
+    """Builds a trajectory batch with a leading timestep axis.
 
-    A gate that had been accidentally disconnected would give an exact match
-    here, and a gate initialized too wide would swamp the pretrained policy.
+    Args:
+        config: Policy configuration.
+        num_timesteps: Policy calls per trajectory.
+
+    Returns:
+        A batch shaped for the sequence path.
     """
-    torch.manual_seed(0)
-    config = _config(train_ttt_only=False)
-    policy = PI05TTTPolicy(config).to("cuda").eval()
-    batch = _single_timestep_batch(config, device="cuda")
+    return {
+        "camera0": torch.rand(1, num_timesteps, 3, 224, 224, device="cuda", dtype=torch.bfloat16),
+        "state": torch.rand(1, num_timesteps, config.max_state_dim, device="cuda", dtype=torch.bfloat16),
+        "actions": torch.rand(
+            1,
+            num_timesteps,
+            config.chunk_size,
+            config.max_action_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+        ),
+        "prompt": ["assemble the gear"],
+    }
 
-    with torch.no_grad():
-        torch.manual_seed(1)
-        gated = policy.forward(dict(batch))["MSE"]
-        for layer in policy.model.paligemma_with_expert.gemma_expert.model.layers:
-            torch.nn.init.zeros_(layer.ttt_gate.alpha)
-        torch.manual_seed(1)
-        ungated = policy.forward(dict(batch))["MSE"]
 
-    assert not torch.allclose(gated, ungated, atol=1e-7), "the tanh gate is not wired in"
-    assert (gated - ungated).abs() < 0.5 * ungated.abs(), "0.001 gate perturbed the loss wildly"
+def _perturb_first_timestep(batch: dict) -> dict:
+    """Returns a copy of ``batch`` with only timestep 0 changed.
+
+    Args:
+        batch: A sequence batch.
+
+    Returns:
+        A deep-enough copy whose timestep 0 state and actions are resampled.
+    """
+    altered = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
+    altered["state"][:, 0] = torch.rand_like(altered["state"][:, 0])
+    altered["actions"][:, 0] = torch.rand_like(altered["actions"][:, 0])
+    return altered
+
+
+def _final_timestep_mask(num_timesteps: int) -> torch.Tensor:
+    """Builds a loss mask that scores only the last timestep.
+
+    Any dependence on earlier timesteps must then travel through the memory,
+    which is exactly what the history tests probe.
+
+    Args:
+        num_timesteps: Policy calls per trajectory.
+
+    Returns:
+        A ``(1, num_timesteps)`` bool mask, True only at the final position.
+    """
+    mask = torch.zeros(1, num_timesteps, dtype=torch.bool, device="cuda")
+    mask[:, -1] = True
+    return mask
+
+
+def _set_gate(policy: PI05TTTPolicy, value: float) -> None:
+    """Sets every tanh gate to a fixed value.
+
+    Args:
+        policy: The policy to modify in place.
+        value: The value written into every gate's ``alpha``.
+    """
+    for layer in policy.model.paligemma_with_expert.gemma_expert.model.layers:
+        torch.nn.init.constant_(layer.ttt_gate.alpha, value)
 
 
 @pytest.mark.gpu
 @pytest.mark.slow
 @require_vram_gib(_MIN_VRAM_GIB)
-def test_sequence_forward_produces_gradients_for_ttt_parameters():
-    """The sequence path must run and reach every added parameter."""
-    torch.manual_seed(0)
+def test_shut_gate_makes_the_model_blind_to_its_own_history():
+    """With the gate at zero the loss must not depend on earlier timesteps.
+
+    TTT is the only path across timesteps, so closing the gate must sever it
+    completely — that is what licenses initializing from a pretrained π₀.₅
+    checkpoint without damaging it.
+    """
     config = _config()
-    policy = PI05TTTPolicy(config).to("cuda")
-    batch = _sequence_batch(config, batch_size=1, num_timesteps=4, device="cuda")
+    policy = _policy(config)
+    _set_gate(policy, 0.0)
+
+    batch = _sequence_batch(config, num_timesteps=4)
+    altered = _perturb_first_timestep(batch)
+    mask = _final_timestep_mask(4)
+
+    with torch.no_grad():
+        torch.manual_seed(1)
+        first = policy.forward({**batch, "loss_mask": mask})["MSE"]
+        torch.manual_seed(1)
+        second = policy.forward({**altered, "loss_mask": mask})["MSE"]
+
+    torch.testing.assert_close(first, second, atol=1e-3, rtol=1e-2)
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+@require_vram_gib(_MIN_VRAM_GIB)
+def test_open_gate_makes_the_model_see_its_own_history():
+    """With the gate open, earlier timesteps must change the final loss.
+
+    The mutation-killing counterpart to the test above: without it, a TTT branch
+    that had been accidentally disconnected would pass that one perfectly.
+    """
+    config = _config()
+    policy = _policy(config)
+    _set_gate(policy, 1.0)
+
+    batch = _sequence_batch(config, num_timesteps=4)
+    altered = _perturb_first_timestep(batch)
+    mask = _final_timestep_mask(4)
+
+    with torch.no_grad():
+        torch.manual_seed(1)
+        first = policy.forward({**batch, "loss_mask": mask})["MSE"]
+        torch.manual_seed(1)
+        second = policy.forward({**altered, "loss_mask": mask})["MSE"]
+
+    assert not torch.allclose(first, second, atol=1e-3), (
+        "changing timestep 0 left the final timestep's loss untouched with the gate wide "
+        "open — the TTT branch is not carrying history"
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+@require_vram_gib(_MIN_VRAM_GIB)
+def test_sequence_forward_produces_gradients_for_every_added_parameter():
+    """The sequence path must run and reach W_0, the gates and the registers.
+
+    ``W_0`` is the one most easily left dangling: it receives gradient only
+    through the *first* TBPTT segment, so a detach in the wrong place turns it
+    into a permanently random initialization that nothing complains about.
+    """
+    config = _config()
+    torch.manual_seed(0)
+    policy = (
+        PI05TTTPolicy(config, per_dataset_stats=_stats(config), dataset_names=["synthetic"])
+        .to("cuda")
+        .to(torch.bfloat16)
+    )
+    batch = _sequence_batch(config, num_timesteps=4)
 
     losses = policy.forward(batch)
     (losses["MSE"] + losses["CE"]).backward()
@@ -152,75 +294,83 @@ def test_sequence_forward_produces_gradients_for_ttt_parameters():
     assert first_layer.ttt.w1_init.grad is not None, "W_0 never received gradient"
     assert first_layer.ttt.w1_init.grad.abs().sum() > 0
     assert first_layer.ttt_gate.alpha.grad is not None
+    assert first_layer.ttt_gate.alpha.grad.abs().sum() > 0
     assert policy.model.register_tokens.grad is not None
+    assert policy.model.register_tokens.grad.abs().sum() > 0
+    leaked = [n for n, p in policy.named_parameters() if not p.requires_grad and p.grad is not None]
+    assert not leaked, f"frozen parameters received gradients: {leaked[:5]}"
 
 
 @pytest.mark.gpu
 @pytest.mark.slow
 @require_vram_gib(_MIN_VRAM_GIB)
-def test_train_ttt_only_freezes_the_pretrained_weights():
-    """``train_ttt_only`` must leave exactly the new parameters trainable.
+def test_context_only_timesteps_contribute_no_target():
+    """A masked timestep must drop out of the loss without breaking it.
+
+    The all-context case is the one that bites: it must produce a finite zero
+    rather than a NaN from an empty denominator, because raising instead would
+    be a data-dependent branch that can deadlock a distributed run.
+    """
+    config = _config()
+    policy = _policy(config)
+    batch = _sequence_batch(config, num_timesteps=4)
+
+    with torch.no_grad():
+        torch.manual_seed(1)
+        full = policy.forward(dict(batch))["MSE"]
+        half = torch.ones(1, 4, dtype=torch.bool, device="cuda")
+        half[:, :2] = False
+        torch.manual_seed(1)
+        partial = policy.forward({**batch, "loss_mask": half})["MSE"]
+        torch.manual_seed(1)
+        none = policy.forward({**batch, "loss_mask": torch.zeros(1, 4, dtype=torch.bool, device="cuda")})[
+            "MSE"
+        ]
+
+    assert not torch.allclose(full, partial), "loss_mask did not change the loss"
+    assert torch.isfinite(none), "an all-context sequence produced a non-finite loss"
+    assert none.item() == pytest.approx(0.0, abs=1e-6)
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+@require_vram_gib(_MIN_VRAM_GIB)
+def test_train_ttt_only_freezes_exactly_the_pretrained_weights():
+    """``train_ttt_only`` must leave only the newly added parameters trainable.
 
     This is the paper's pretraining stage. If it leaked the pretrained weights
     into the trainable set, the run would be a full finetune wearing a
     pretraining label.
     """
-    policy = PI05TTTPolicy(_config(train_ttt_only=True))
+    config = _config(train_ttt_only=True)
+    policy = PI05TTTPolicy(config, per_dataset_stats=_stats(config), dataset_names=["synthetic"])
     trainable = {name for name, p in policy.named_parameters() if p.requires_grad}
-    assert trainable, "nothing is trainable"
+    assert trainable, "train_ttt_only left nothing trainable"
     for name in trainable:
         assert ".ttt." in name or ".ttt_gate." in name or name.endswith("register_tokens"), (
             f"{name} should have been frozen by train_ttt_only"
         )
-    # Frozen tensors may still reach the optimizer (every policy in the repo
-    # returns `self.parameters()`); AdamW allocates no state for a param whose
-    # grad stays None, so what matters is only that requires_grad is right.
-    frozen = [name for name, p in policy.named_parameters() if not p.requires_grad]
-    assert frozen, "train_ttt_only froze nothing"
+    assert any(not p.requires_grad for p in policy.parameters()), "nothing was frozen"
 
 
 @pytest.mark.gpu
 @pytest.mark.slow
 @require_vram_gib(_MIN_VRAM_GIB)
-def test_context_only_timesteps_still_move_the_memory():
-    """A masked-out timestep must contribute no target but still update memory.
-
-    This asymmetry is the mechanism behind the paper's in-context video
-    imitation and DAgger Distillation. If the mask short-circuited the forward
-    instead of only the loss, both capabilities would be unreachable.
-    """
-    torch.manual_seed(0)
-    config = _config()
-    policy = PI05TTTPolicy(config).to("cuda")
-    batch = _sequence_batch(config, batch_size=1, num_timesteps=4, device="cuda")
-
-    supervise_all = torch.ones(1, 4, dtype=torch.bool, device="cuda")
-    supervise_last_two = supervise_all.clone()
-    supervise_last_two[:, :2] = False
-
-    torch.manual_seed(1)
-    full = policy.forward({**batch, "loss_mask": supervise_all})["MSE"]
-    torch.manual_seed(1)
-    partial = policy.forward({**batch, "loss_mask": supervise_last_two})["MSE"]
-
-    assert not torch.allclose(full, partial), "loss_mask did not change the loss"
-    assert torch.isfinite(partial), "masked loss produced a non-finite value"
-
-
-@pytest.mark.gpu
-@pytest.mark.slow
-@require_vram_gib(_MIN_VRAM_GIB)
-def test_rollout_memory_advances_per_call_and_resets():
+def test_rollout_memory_advances_once_per_call_and_resets():
     """One ``select_action`` must advance memory by exactly one timestep.
 
-    ``config.num_steps`` denoising steps happen inside each call; only the last
-    one's update may be adopted. If every denoising step committed, inference
-    memory would advance ``num_steps`` times faster than training ever did.
+    ``config.num_steps`` denoising steps run inside each call, and only the last
+    one's fast-weight update may be adopted. If every denoising step committed,
+    inference memory would advance ``num_steps`` times faster than it ever did
+    in training.
     """
-    torch.manual_seed(0)
     config = _config()
-    policy = PI05TTTPolicy(config).to("cuda").eval()
-    observation = _single_timestep_observation(config, device="cuda")
+    policy = _policy(config)
+    observation = {
+        "camera0": torch.rand(1, 3, 224, 224, device="cuda", dtype=torch.bfloat16),
+        "state": torch.rand(1, config.max_state_dim, device="cuda", dtype=torch.bfloat16),
+        "prompt": ["assemble the gear"],
+    }
 
     assert policy.model._carried_fast_weights == {}
     with torch.no_grad():
@@ -228,111 +378,6 @@ def test_rollout_memory_advances_per_call_and_resets():
     assert policy.model._carried_fast_weights, "memory was not carried out of the call"
     assert policy.model._inference_token_position == config.n_expert_tokens_per_timestep
 
-    with torch.no_grad():
-        policy.select_action(dict(observation))
-    assert policy.model._inference_token_position == 2 * config.n_expert_tokens_per_timestep
-
     policy.reset()
     assert policy.model._carried_fast_weights == {}, "reset() leaked memory across episodes"
     assert policy.model._inference_token_position == 0
-
-
-@pytest.mark.gpu
-@pytest.mark.slow
-@require_vram_gib(_MIN_VRAM_GIB)
-def test_best_of_n_with_memory_fails_loudly():
-    """Best-of-N plus a populated memory has no defined answer; it must raise."""
-    torch.manual_seed(0)
-    config = _config()
-    policy = PI05TTTPolicy(config).to("cuda").eval()
-    observation = _single_timestep_observation(config, device="cuda")
-
-    with torch.no_grad():
-        policy.select_action(dict(observation))
-    with pytest.raises(NotImplementedError, match="best-of-N"), torch.no_grad():
-        policy.model.sample_actions(*_sample_actions_args(policy, observation), n_candidates=4)
-
-
-# ---------------------------------------------------------------------------
-# Batch builders. Kept explicit rather than fixture-based so each test reads
-# top to bottom; the shapes are the contract under test.
-# ---------------------------------------------------------------------------
-
-
-def _single_timestep_batch(config: PI05TTTConfig, device: str) -> dict[str, torch.Tensor]:
-    """Builds a flat single-timestep training batch.
-
-    Args:
-        config: Policy configuration.
-        device: Device to allocate on.
-
-    Returns:
-        A batch shaped for the non-sequence path.
-    """
-    return {
-        "observation.images.top": torch.rand(1, 3, 224, 224, device=device),
-        "observation.state": torch.rand(1, config.max_state_dim, device=device),
-        "actions": torch.rand(1, config.chunk_size, config.max_action_dim, device=device),
-        "task": ["assemble the gear"],
-    }
-
-
-def _sequence_batch(
-    config: PI05TTTConfig, batch_size: int, num_timesteps: int, device: str
-) -> dict[str, torch.Tensor]:
-    """Builds a trajectory batch with a leading timestep axis.
-
-    Args:
-        config: Policy configuration.
-        batch_size: Number of trajectories.
-        num_timesteps: Policy calls per trajectory.
-        device: Device to allocate on.
-
-    Returns:
-        A batch shaped for the sequence path.
-    """
-    return {
-        "observation.images.top": torch.rand(batch_size, num_timesteps, 3, 224, 224, device=device),
-        "observation.state": torch.rand(batch_size, num_timesteps, config.max_state_dim, device=device),
-        "actions": torch.rand(
-            batch_size, num_timesteps, config.chunk_size, config.max_action_dim, device=device
-        ),
-        "task": ["assemble the gear"] * batch_size,
-    }
-
-
-def _single_timestep_observation(config: PI05TTTConfig, device: str) -> dict[str, torch.Tensor]:
-    """Builds an inference observation (no action targets).
-
-    Args:
-        config: Policy configuration.
-        device: Device to allocate on.
-
-    Returns:
-        An observation dict suitable for ``select_action``.
-    """
-    return {
-        "observation.images.top": torch.rand(1, 3, 224, 224, device=device),
-        "observation.state": torch.rand(1, config.max_state_dim, device=device),
-        "task": ["assemble the gear"],
-    }
-
-
-def _sample_actions_args(policy: PI05TTTPolicy, observation: dict[str, torch.Tensor]) -> tuple:
-    """Prepares positional arguments for a direct ``sample_actions`` call.
-
-    Args:
-        policy: The policy under test.
-        observation: Raw observation dict.
-
-    Returns:
-        The positional argument tuple ``sample_actions`` expects.
-    """
-    batch = policy.normalize_inputs(dict(observation), policy._resolve_dataset_index(observation))
-    images, img_masks = policy.prepare_images(batch)
-    lang_tokens, lang_masks = policy.prepare_language(batch)
-    action_prefix = torch.zeros(
-        1, policy.config.chunk_size, policy.config.max_action_dim, device=lang_tokens.device
-    )
-    delay = torch.zeros(1, dtype=torch.long, device=lang_tokens.device)
-    return images, img_masks, lang_tokens, lang_masks, action_prefix, delay

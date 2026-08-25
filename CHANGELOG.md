@@ -168,13 +168,24 @@ per sequence; TBPTT with fast weights carried across segment boundaries and thei
 there; and per-timestep loss masking, so a timestep can act as pure context that updates the
 fast weights without contributing an imitation target.
 
+**Verified on real data.** `configs/dev/dev_config_pi05_ttt.json` warm-starts from
+`william-yue/pi05_base` and trains on `lerobot/droid_100`; 10 steps run end to end at ~1 s/step
+on one RTX 3090, peak 6.6 GiB. The warm-start is clean — every pretrained tensor present in that
+checkpoint loads, and the only keys the loader reports missing are the 343 new TTT parameters
+(stock π₀.₅ shows the identical 3-key gap for `da_head` / `discrete_action_embedding`, which that
+checkpoint simply does not carry). After 10 steps the frozen weights are bit-identical to the
+checkpoint at matched dtype, so `train_ttt_only` holds. The sequence path (TBPTT + loss masking)
+was exercised on real DROID trajectory windows.
+
 **Not yet usable for real long-context training.** The dataloader does not emit multi-timestep
 trajectory sequences, so a `pi05_ttt` run against today's data path takes the single-timestep
 branch and trains like stock π₀.₅ with an extra near-zero-gated memory. Gradients are truncated
 as specified, but the *activation-memory* benefit of TBPTT needs one backward per segment, which
 the shared training loop does not do (see `tbptt_backward_fn`). The frozen VLM prefix is also
-recomputed per timestep rather than precomputed and cached. DAgger Distillation is a
-data-collection procedure; the loss masking it needs is here, the procedure is not.
+recomputed per timestep rather than precomputed and cached. Best-of-N candidate sampling is
+refused outright, because there is no defined answer for which candidate's fast-weight update
+should become the rollout's memory. DAgger Distillation is a data-collection procedure; the loss
+masking it needs is here, the procedure is not.
 
 ## [0.13.0] - 2026-08-17
 

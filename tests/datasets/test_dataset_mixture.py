@@ -401,12 +401,15 @@ class TestResolveMixtureDeltaMap:
         across the WHOLE registry (not a hand-picked few): if any future config gains the field
         without the inverse, this fails and forces the guard to be revisited.
 
-        `pi05` is currently the only policy with the delta-action inference inverse.
+        `pi05` owns the delta-action inference inverse. `pi05_ttt` subclasses `PI05Policy`
+        without overriding `sample_actions` — `PI05TTTPolicy.sample_actions is
+        PI05Policy.sample_actions` is literally true — so it inherits that inverse intact.
+        Its own override is on the *inner* `PI05TTTFlowMatching`, a different method.
         """
         from opentau import available_policies
         from opentau.policies.factory import make_policy_config
 
-        delta_capable = {"pi05"}
+        delta_capable = {"pi05", "pi05_ttt"}
         have_field = {
             t
             for t in available_policies

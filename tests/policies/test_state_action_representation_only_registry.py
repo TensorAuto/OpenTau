@@ -51,6 +51,7 @@ ALL_POLICY_TYPES = frozenset(
         "pi05",
         "pi05_continuous_state",
         "pi05_mem",
+        "pi05_ttt",
         "pi06",
         "pi07_paligemma_high_level_planner",
         "pi07_paligemma_low_level",
@@ -70,6 +71,7 @@ EXPECTED_CAPABLE = frozenset(
         "pi05",
         "pi05_continuous_state",
         "pi05_mem",
+        "pi05_ttt",  # a pi05 variant: same projections and discrete-action pathway
         "pi06",  # no state_proj (discrete state), but has the rest
         "pi07_low_level",
         "pi07_paligemma_low_level",
