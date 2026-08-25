@@ -86,9 +86,9 @@ from opentau.configs.train import TrainPipelineConfig
 from opentau.policies.accel import configure_accel
 from opentau.policies.candidates import configure_candidates
 from opentau.policies.factory import get_policy_class
-from opentau.policies.utils import to_dtype_preserving_siglip_float32
+from opentau.policies.utils import maybe_compile_sample_actions, to_dtype_preserving_siglip_float32
 from opentau.utils.random_utils import set_seed
-from opentau.utils.utils import attempt_torch_compile, auto_torch_device, init_logging
+from opentau.utils.utils import auto_torch_device, init_logging
 
 logger = logging.getLogger(__name__)
 
@@ -370,8 +370,8 @@ class OpenTauRoboCasaPolicy:
         self.policy.eval()
 
         if compile_model:
-            self.policy.model.sample_actions = attempt_torch_compile(
-                self.policy.model.sample_actions, device_hint=self.device
+            self.policy.model.sample_actions = maybe_compile_sample_actions(
+                self.policy, self.policy.model.sample_actions, device_hint=self.device
             )
 
         self.policy.reset()
@@ -438,6 +438,23 @@ class OpenTauRoboCasaPolicy:
             return None
         return [float(s) for s in scores]
 
+    def _reset_policy_on_task_change(self, prompt: str) -> None:
+        """Reset the policy when the task changes.
+
+        ``__init__`` resets the policy twice, and nothing resets it afterwards —
+        so a policy carrying recurrent rollout state (pi05_ttt's TTT fast
+        weights) accumulates one sim eval's memory across every episode of the
+        run. `infer` and `infer_batch` are the only per-request entry points, so
+        the reset belongs on them.
+
+        Args:
+            prompt: The incoming task prompt.
+        """
+        if prompt == getattr(self, "_policy_task", None):
+            return
+        self._policy_task = prompt
+        self.policy.reset()
+
     def infer(
         self,
         images_rgb: Dict[str, np.ndarray],
@@ -451,6 +468,7 @@ class OpenTauRoboCasaPolicy:
         ``None``); returning it would change this method's signature, and the handler reads
         it straight off the runner instead.
         """
+        self._reset_policy_on_task_change(prompt)
         batch = build_opentau_batch(self.cfg, images_rgb, state_vec, prompt, self.device, self.dtype)
         self.last_accel = None
         with torch.inference_mode():
@@ -478,6 +496,11 @@ class OpenTauRoboCasaPolicy:
         belongs to ``decoded_items[i]``, and collapsing it to a scalar would report one
         environment's uncertainty for all of them.
         """
+        # Batched path: every item shares one `sample_actions`, so a single
+        # carried memory could not be attributed per environment anyway. Key the
+        # reset off the first item's prompt, which is what changes between evals.
+        if decoded_items:
+            self._reset_policy_on_task_change(decoded_items[0][2])
         batch = build_opentau_batch_multi(self.cfg, decoded_items, self.device, self.dtype)
         b = len(decoded_items)
         self.last_accel = None

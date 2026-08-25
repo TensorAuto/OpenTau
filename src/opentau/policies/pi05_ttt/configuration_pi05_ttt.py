@@ -106,8 +106,11 @@ class PI05TTTConfig(PI05Config):
     ttt_gate_init: float = 0.001
     ttt_scan_checkpoint_group_size: int = 0
 
-    sequence_length: int = 16
-    tbptt_segment_length: int = 4
+    # Defaults to 1 — the only length today's dataloader can supply. A
+    # default-constructed config otherwise raises on the batch shape every
+    # existing loader emits, which makes the class unusable without an override.
+    sequence_length: int = 1
+    tbptt_segment_length: int = 1
 
     train_ttt_only: bool = True
 
@@ -133,6 +136,13 @@ class PI05TTTConfig(PI05Config):
         # time: a bad value used to survive config validation and die only after
         # a 3.4B-parameter model had been constructed. `proj_width` is the
         # action expert's hidden size.
+        # NOTE: validated against `proj_width`, while `TTTMLPLayer` is actually
+        # built from `gemma_expert_config.hidden_size`. Those agree for every
+        # shipped configuration (both are 1024) but they are not the same knob,
+        # and the expert config is not reachable from here — it is constructed
+        # inside `PaliGemmaWithExpertConfig`. `_attach_ttt_layers` re-checks
+        # against the real width, so a divergence fails at model build with a
+        # clear message rather than silently.
         if self.proj_width % self.ttt_num_heads != 0:
             raise ValueError(
                 f"ttt_num_heads={self.ttt_num_heads} must divide the action expert's width "
@@ -165,6 +175,30 @@ class PI05TTTConfig(PI05Config):
             raise ValueError(
                 f"tbptt_segment_length={self.tbptt_segment_length} must divide "
                 f"sequence_length={self.sequence_length}"
+            )
+
+        # `train_ttt_only` freezes everything *except* the TTT parameters, while
+        # `train_state_action_representation_only` / `train_vision_encoder_only`
+        # freeze the TTT parameters (they are default-deny sweeps re-applied in
+        # `PI05TTTFlowMatching.__init__`). The two sets are complementary, so
+        # combining them freezes the entire model: measured at 0 trainable
+        # tensors, 0 elements. pi05 raises for exactly this class of conflict in
+        # `validate_state_action_representation_only_config`; do the same rather
+        # than let a run start with nothing to optimize.
+        exclusive = [
+            name
+            for name, enabled in (
+                ("train_state_action_representation_only", self.train_state_action_representation_only),
+                ("train_vision_encoder_only", self.train_vision_encoder_only),
+                ("train_expert_only", self.train_expert_only),
+            )
+            if enabled
+        ]
+        if self.train_ttt_only and exclusive:
+            raise ValueError(
+                f"train_ttt_only=True is mutually exclusive with {' and '.join(exclusive)}: "
+                "train_ttt_only trains only the TTT parameters while those flags freeze exactly "
+                "those parameters, so together they leave nothing trainable. Pick one."
             )
 
         if self.ttt_gate_init != 0.0 and abs(self.ttt_gate_init) > 0.1:

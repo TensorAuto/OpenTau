@@ -364,6 +364,11 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         config: The configuration instance for this policy.
     """
 
+    # True when `sample_actions` mutates per-rollout state that must be reset
+    # between episodes and cannot be traced or compiled. Read by the serving
+    # entry points, the ONNX exporter and `policies.candidates`.
+    carries_rollout_state: bool = False
+
     config_class: None
     """The configuration class associated with this policy. Must be defined in subclasses."""
 

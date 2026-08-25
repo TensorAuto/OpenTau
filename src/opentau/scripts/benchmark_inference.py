@@ -248,6 +248,14 @@ def benchmark_main(cfg: TrainPipelineConfig):
     compile_status = "no-compile"
     if not no_compile:
         torch._dynamo.reset()
+        if getattr(policy, "carries_rollout_state", False):
+            # Compiling a sampler that mutates per-rollout state would benchmark
+            # a recompile storm or a frozen RoPE phase, not the policy. Found by
+            # sweeping `torch.compile` as well as `attempt_torch_compile`.
+            raise RuntimeError(
+                f"{type(policy).__name__} carries recurrent rollout state, which torch.compile "
+                "cannot trace correctly here; re-run with BENCH_NO_COMPILE=1."
+            )
         compiled = torch.compile(policy.model.sample_actions, mode=compile_mode, fullgraph=False)
         _verify_compile(compiled)
         policy.model.sample_actions = compiled

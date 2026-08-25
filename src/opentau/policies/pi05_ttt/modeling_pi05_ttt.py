@@ -56,9 +56,11 @@ Known gaps, deliberately out of scope for this change and tracked in the PR:
 
 * **The dataloader does not yet emit multi-timestep trajectory sequences.**
   :meth:`PI05TTTPolicy.forward` accepts them and unit tests construct them by
-  hand, but training on real long trajectories needs a dataset-side change.
-  With a plain single-timestep batch this policy trains like stock π₀.₅ with an
-  extra, near-zero-gated memory path.
+  hand, but training on real long trajectories needs a dataset-side change. At
+  ``sequence_length=1`` — the only value today's loader can supply — TTT still
+  runs and every TTT parameter receives gradients, so the plumbing is exercised
+  and distributed training is well-formed; the fast weights simply take one
+  update per sequence and cannot learn anything spanning timesteps.
 * **Truncated gradients, untruncated activation memory.** Gradients are
   truncated exactly as the paper specifies, so the optimization is correct. The
   *activation memory* benefit additionally needs one backward per segment, which
@@ -86,9 +88,10 @@ Known gaps, deliberately out of scope for this change and tracked in the PR:
 from typing import Any
 
 import torch
-from einops import rearrange, repeat
+from einops import rearrange, reduce, repeat
 from torch import Tensor, nn
 
+from opentau.policies.accel import AccelMeter
 from opentau.policies.pi05.modeling_pi05 import (
     PI05FlowMatching,
     PI05Policy,
@@ -101,7 +104,39 @@ from opentau.policies.ttt_layer import (
     TTTMLPLayer,
     TTTSequenceState,
 )
-from opentau.policies.utils import flow_matching_masked_mse
+from opentau.policies.utils import PerSampleLoss, ce_per_sample, flow_matching_masked_mse
+
+
+def _accumulate_per_sample(
+    running: PerSampleLoss | None,
+    segment: PerSampleLoss,
+    batch_size: int,
+    segment_length: int,
+) -> PerSampleLoss:
+    """Folds a segment's per-row loss decomposition into a per-trajectory running total.
+
+    A segment's rows are ``(B, segment_length)`` flattened, so summing over the
+    timestep axis turns per-row numerators and denominators into per-trajectory
+    ones. Summing rather than averaging is the whole point of carrying
+    ``(sum, count)``: the masked mean for any grouping is ``Σsum / Σcount``, so
+    both "combine a trajectory's timesteps" and "combine a sequence's segments"
+    are the same addition, and an all-context timestep contributes ``(0, 0)``
+    without skewing the result.
+
+    Args:
+        running: Accumulated total so far, or None on the first segment.
+        segment: This segment's per-row decomposition, ``(B * segment_length,)``.
+        batch_size: Number of trajectories.
+        segment_length: Timesteps in this segment.
+
+    Returns:
+        The updated per-trajectory total, ``(batch_size,)``.
+    """
+    folded = PerSampleLoss(
+        sum=reduce(segment.sum, "(b t) -> b", "sum", b=batch_size, t=segment_length),
+        count=reduce(segment.count, "(b t) -> b", "sum", b=batch_size, t=segment_length),
+    )
+    return folded if running is None else running + folded
 
 
 class PI05TTTFlowMatching(PI05FlowMatching):
@@ -131,11 +166,16 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         # one timestep's registers from another's, so they need no per-timestep
         # parameters of their own.
         if config.n_register_tokens > 0:
-            # Zero-init, matching the convention `use_modality_embedding` uses
-            # in `PI05FlowMatching` ("zero-init so turning the feature on for an
-            # existing checkpoint is a no-op at step 0"). A random register
-            # table would inject `N(0, 0.02)` vectors into every action token's
-            # attention on step 0 of a warm-start, which no gate covers.
+            # Zero-init so a warm-start is perturbed as little as possible: a
+            # random table would inject `N(0, 0.02)` vectors into every action
+            # token's attention on step 0, which no gate covers.
+            #
+            # The `use_modality_embedding` precedent in `PI05FlowMatching` is
+            # only a partial analogy, and worth not overstating: that table is
+            # *added* to a non-zero token embedding, so zero really is a no-op
+            # there. A register token *is* the whole embedding, so zero means an
+            # exact zero vector entering RMSNorm and occupying an attention
+            # slot. Small, and the smallest available, but not nothing.
             #
             # This does not make the register block a *complete* no-op: the
             # tokens still occupy attention slots, so they take softmax mass
@@ -368,13 +408,17 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         if num_registers == 0:
             return prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
-        batch_size, suffix_len = suffix_pad_masks.shape
-        num_actions = suffix_len - num_registers
-        device = suffix_pad_masks.device
-        action_positions = torch.arange(num_actions, device=device)
-        register_positions = torch.arange(num_actions, num_actions + num_registers, device=device)
-        offsets = torch.cat([register_positions, action_positions])
-        return prefix_offsets + rearrange(offsets, "s -> 1 s")
+        # Pad-aware, like the `num_registers == 0` branch above. π₀.₅'s suffix
+        # mask is all ones today so a plain `arange` would be equivalent, but
+        # having one branch consult the mask and the other ignore it is the kind
+        # of quiet disagreement that outlives the reason for it.
+        register_pad = suffix_pad_masks[:, :num_registers]
+        action_pad = suffix_pad_masks[:, num_registers:]
+        action_positions = torch.cumsum(action_pad, dim=1) - 1
+        # Registers start after the action block, so they never displace it.
+        action_span = action_pad.sum(dim=1, keepdim=True)
+        register_positions = action_span + torch.cumsum(register_pad, dim=1) - 1
+        return prefix_offsets + torch.cat([register_positions, action_positions], dim=1)
 
     def forward_sequence(
         self,
@@ -392,7 +436,8 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         state: Tensor | None = None,
         real_action_dim: Tensor | None = None,
         loss_mask: Tensor | None = None,
-    ) -> dict[str, Tensor]:
+        return_per_sample: bool = False,
+    ) -> dict[str, Tensor | PerSampleLoss]:
         """Runs sequence training with TBPTT over a trajectory.
 
         Every tensor argument arrives already flattened over the sequence axis,
@@ -458,6 +503,12 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         mse_terms: list[Tensor] = []
         ce_terms: list[Tensor] = []
         weights: list[Tensor] = []
+        # Per-trajectory (numerator, denominator) pairs, accumulated across
+        # segments. `PerSampleLoss` carries the pair rather than a mean exactly
+        # so it composes by addition, which is what makes "sum a trajectory's
+        # timesteps" and "sum a segment's contributions" the same operation.
+        mse_per_sample: PerSampleLoss | None = None
+        ce_per_sample_total: PerSampleLoss | None = None
 
         for segment_index in range(num_timesteps // segment_length):
             start = segment_index * segment_length
@@ -489,7 +540,15 @@ class PI05TTTFlowMatching(PI05FlowMatching):
                 num_timesteps=segment_length,
                 loss_mask=segment_loss_mask,
                 ttt_state=ttt_state,
+                return_per_sample=return_per_sample,
             )
+            if return_per_sample:
+                mse_per_sample = _accumulate_per_sample(
+                    mse_per_sample, losses["MSE_per_sample"], batch_size, segment_length
+                )
+                ce_per_sample_total = _accumulate_per_sample(
+                    ce_per_sample_total, losses["CE_per_sample"], batch_size, segment_length
+                )
 
             # Weight each segment by how many supervised timesteps it holds, so
             # the sequence mean is over supervised timesteps and does not shift
@@ -516,10 +575,14 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         # Clamped, so a sequence that is entirely context yields a zero loss
         # rather than a NaN that would propagate into every parameter.
         denominator = torch.stack(weights).sum().clamp(min=1.0)
-        return {
+        out: dict[str, Tensor | PerSampleLoss] = {
             "MSE": torch.stack(mse_terms).sum() / denominator,
             "CE": torch.stack(ce_terms).sum() / denominator,
         }
+        if return_per_sample:
+            out["MSE_per_sample"] = mse_per_sample
+            out["CE_per_sample"] = ce_per_sample_total
+        return out
 
     @staticmethod
     def _segment_rows(
@@ -560,7 +623,8 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         num_timesteps: int,
         loss_mask: Tensor | None,
         ttt_state: TTTSequenceState,
-    ) -> dict[str, Tensor]:
+        return_per_sample: bool = False,
+    ) -> dict[str, Tensor | PerSampleLoss]:
         """Runs one TBPTT segment: prefix pass, expert pass with TTT, losses.
 
         Mirrors the structure of :meth:`PI05FlowMatching.forward` — the same
@@ -690,24 +754,39 @@ class PI05TTTFlowMatching(PI05FlowMatching):
             context_pad = repeat(timestep_is_context, "r -> r c", c=self.config.chunk_size)
             actions_is_pad = context_pad if actions_is_pad is None else (actions_is_pad | context_pad)
 
-        mse_loss = flow_matching_masked_mse(
+        mse_result = flow_matching_masked_mse(
             u_t=u_t,
             v_t=v_t,
             max_action_dim=self.config.max_action_dim,
             prefix_mask=prefix_mask,
             actions_is_pad=actions_is_pad,
             real_action_dim=real_action_dim,
-            return_per_sample=False,
+            return_per_sample=return_per_sample,
         )
+        mse_loss, mse_rows = mse_result if return_per_sample else (mse_result, None)
 
         ce_loss = self._discrete_action_ce(
             prefix_out=prefix_out,
             discrete_actions=discrete_actions,
             discrete_action_masks=discrete_action_masks,
             loss_mask=loss_mask,
-            num_timesteps=num_timesteps,
+            return_per_sample=return_per_sample,
+        ) + self._response_ce(
+            prefix_out=prefix_out,
+            response_tokens=response_tokens,
+            response_masks=response_masks,
+            loss_mask=loss_mask,
         )
-        return {"MSE": mse_loss, "CE": ce_loss}
+        out: dict[str, Tensor | PerSampleLoss] = {"MSE": mse_loss, "CE": ce_loss}
+        if return_per_sample:
+            out["MSE_per_sample"] = mse_rows
+            out["CE_per_sample"] = self._discrete_action_ce_per_sample(
+                prefix_out=prefix_out,
+                discrete_actions=discrete_actions,
+                discrete_action_masks=discrete_action_masks,
+                loss_mask=loss_mask,
+            )
+        return out
 
     def _discrete_action_ce(
         self,
@@ -715,7 +794,6 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         discrete_actions: Tensor | None,
         discrete_action_masks: Tensor | None,
         loss_mask: Tensor | None,
-        num_timesteps: int,
     ) -> Tensor:
         """Cross-entropy over π₀.₅'s discrete-action tokens, with loss masking.
 
@@ -724,7 +802,6 @@ class PI05TTTFlowMatching(PI05FlowMatching):
             discrete_actions: Discrete action targets, ``(B * T, L)``.
             discrete_action_masks: True on real (non-pad) target tokens.
             loss_mask: Per-timestep supervision mask, ``(B, T)``.
-            num_timesteps: Timesteps in this segment.
 
         Returns:
             The cross-entropy summed over supervised, non-pad tokens and divided
@@ -755,7 +832,7 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         if loss_mask is not None:
             valid = valid & rearrange(loss_mask, "b t -> (b t) 1")
 
-        # Zero the excluded slots, then take a plain mean over *all* slots.
+        # Zero the excluded slots, then divide by (supervised rows x slots).
         #
         # This deliberately matches `PI05FlowMatching.forward` rather than
         # dividing by the number of valid tokens. Dividing by `valid.sum()`
@@ -767,7 +844,136 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         # that cannot be compared against any existing π₀.₅ run. One policy
         # must not compute CE two ways depending on the batch's shape.
         # `policies/utils.py::ce_per_sample` documents the same distinction.
-        return (loss * valid).mean()
+        #
+        # The denominator counts *supervised* rows, not all rows. Dividing by all
+        # rows would make this term already proportional to the segment's
+        # supervised fraction, and `forward_sequence` then weights it by that
+        # same fraction again — CE scaled twice while MSE (normalized over
+        # unmasked slots by `flow_matching_masked_mse`) is scaled once. Measured
+        # at 2.15x on a half-masked segment. With every row supervised this
+        # reduces to exactly the parent's `.mean()` over `B * S`, so parity with
+        # stock pi05 is preserved.
+        rows, slots = loss.shape
+        supervised_rows = (
+            torch.tensor(float(rows), device=loss.device)
+            if loss_mask is None
+            else loss_mask.sum().to(loss.dtype)
+        )
+        return (loss * valid).sum() / (supervised_rows * slots).clamp(min=1.0)
+
+    def _discrete_action_ce_per_sample(
+        self,
+        prefix_out: Tensor,
+        discrete_actions: Tensor | None,
+        discrete_action_masks: Tensor | None,
+        loss_mask: Tensor | None,
+    ) -> PerSampleLoss:
+        """Per-row ``(Σ valid CE, #valid tokens)`` for the validation breakdown.
+
+        Normalized over *valid tokens* rather than all slots, which is the
+        convention `ce_per_sample` documents for the per-group breakdown — it
+        differs from the scalar reduction on purpose, and the scalar is
+        unaffected by whether this is computed.
+
+        Args:
+            prefix_out: VLM prefix output, ``(B * T, prefix_len, hidden)``.
+            discrete_actions: Discrete action targets.
+            discrete_action_masks: True on real (non-pad) target tokens.
+            loss_mask: Per-timestep supervision mask, ``(B, T)``.
+
+        Returns:
+            A per-row decomposition, or an all-zero one when there are no targets.
+        """
+        rows = prefix_out.shape[0]
+        if discrete_actions is None:
+            zeros = torch.zeros(rows, device=prefix_out.device, dtype=torch.float32)
+            return PerSampleLoss(sum=zeros, count=zeros)
+
+        start = -self.config.discrete_action_max_length
+        logits = self.paligemma_with_expert.da_head(prefix_out[:, slice(start - 1, -1)]).to(
+            dtype=torch.float32
+        )
+        loss = torch.nn.functional.cross_entropy(
+            rearrange(logits, "b s d -> (b s) d"),
+            rearrange(discrete_actions, "b s -> (b s)"),
+            reduction="none",
+        )
+        loss = rearrange(loss, "(b s) -> b s", b=discrete_actions.shape[0])
+
+        valid = (
+            torch.ones_like(loss, dtype=torch.bool)
+            if discrete_action_masks is None
+            else discrete_action_masks
+        )
+        if loss_mask is not None:
+            valid = valid & rearrange(loss_mask, "b t -> (b t) 1")
+        return ce_per_sample(loss * valid, valid)
+
+    def _response_ce(
+        self,
+        prefix_out: Tensor,
+        response_tokens: Tensor | None,
+        response_masks: Tensor | None,
+        loss_mask: Tensor | None,
+    ) -> Tensor:
+        """Cross-entropy over π₀.₅'s response (subtask) tokens, with loss masking.
+
+        Mirrors the ``predict_response`` block of :meth:`PI05FlowMatching.forward`,
+        including the two off-by-one slices: the last language token predicts the
+        response's ``<BOS>`` and the last response token predicts the first
+        discrete-action token, so neither is scored. Normalized over supervised
+        rows for the same reason as :meth:`_discrete_action_ce`.
+
+        Implemented rather than refused. Refusing meant ``predict_response=True``
+        was unusable with this policy at all once the flat-batch fall-through was
+        removed, which is a capability regression against stock π₀.₅ rather than
+        a missing extra.
+
+        Args:
+            prefix_out: VLM prefix output, ``(B * T, prefix_len, hidden)``.
+            response_tokens: Response token targets, ``(B * T, L)``.
+            response_masks: True on real (non-pad) response tokens.
+            loss_mask: Per-timestep supervision mask, ``(B, T)``.
+
+        Returns:
+            The masked response cross-entropy, or a zero scalar when response
+            prediction is off or there are no response targets.
+        """
+        if not self.config.predict_response or response_tokens is None:
+            return torch.zeros((), device=prefix_out.device, dtype=torch.float32)
+
+        rows, seq_len = response_tokens.shape
+        start = (
+            -self.config.response_max_length
+            - self.config.discrete_action_max_length
+            - self.config.discrete_action_indicator_max_length
+        )
+        end = -self.config.discrete_action_max_length - self.config.discrete_action_indicator_max_length - 1
+        response_out = prefix_out[:, slice(start, end)]
+        logits = self.paligemma_with_expert.paligemma.lm_head(response_out).to(dtype=torch.float32)
+
+        label_slice = slice(1, None)
+        loss = torch.nn.functional.cross_entropy(
+            rearrange(logits, "b s d -> (b s) d"),
+            rearrange(response_tokens[:, label_slice], "b s -> (b s)"),
+            reduction="none",
+        )
+        loss = rearrange(loss, "(b s) -> b s", b=rows, s=seq_len - 1)
+
+        valid = (
+            torch.ones_like(loss, dtype=torch.bool)
+            if response_masks is None
+            else response_masks[:, label_slice]
+        )
+        if loss_mask is not None:
+            valid = valid & rearrange(loss_mask, "b t -> (b t) 1")
+
+        supervised_rows = (
+            torch.tensor(float(rows), device=loss.device)
+            if loss_mask is None
+            else loss_mask.sum().to(loss.dtype)
+        )
+        return (loss * valid).sum() / (supervised_rows * loss.shape[1]).clamp(min=1.0)
 
     def denoise_step(
         self,
@@ -852,22 +1058,22 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         delay: Tensor,
         noise: Tensor | None = None,
         state: Tensor | None = None,
-        accel: Any = None,
+        accel: AccelMeter | None = None,
         **kwargs: Any,
     ) -> Tensor:
         """Samples an action chunk, advancing the carried fast weights by one step.
 
-        The signature mirrors :meth:`PI05FlowMatching.sample_actions` parameter
-        for parameter, with ``accel`` trailing and defaulting to ``None`` — that
-        ordering is a pinned contract, because this method is ``torch.compile``d
-        at four serving entry points and ONNX-exported at one, all calling it
-        positionally.
+        The signature matches :meth:`PI05FlowMatching.sample_actions` for every
+        parameter a positional caller can reach, with ``accel`` trailing and
+        defaulting to ``None`` — that ordering is a pinned contract, because
+        this method is compiled at several serving entry points and
+        ONNX-exported at one, all calling it positionally.
 
-        ``n_candidates`` is deliberately *not* named. The enclosing wrapper
-        passes it by keyword, so ``**kwargs`` receives it; naming it would make
-        the AST wiring sweep classify this family as best-of-N-wired, which it
-        is not — see the refusal below and
-        ``policies.candidates.configure_candidates``.
+        It is *not* parameter-for-parameter identical: ``n_candidates`` is
+        deliberately absent. The enclosing wrapper passes it by keyword, so
+        ``**kwargs`` receives it, and naming it would make the AST wiring sweep
+        classify this family as best-of-N-wired, which it is not — see the
+        refusal below and ``policies.candidates.configure_candidates``.
 
         Args:
             images: Per-camera image tensors.
@@ -1021,32 +1227,40 @@ class PI05TTTPolicy(PI05Policy):
         noise: Tensor | None = None,
         time: Tensor | None = None,
         return_per_sample: bool = False,
-    ) -> dict[str, Tensor]:
-        """Computes the training loss, taking the sequence path when given sequences.
+    ) -> dict[str, Tensor | PerSampleLoss]:
+        """Computes the training loss over a trajectory sequence.
 
-        A batch whose ``actions`` carry an extra leading timestep axis
-        (``(B, T, chunk_size, action_dim)``) is trained as a trajectory with
-        sequence action forcing and TBPTT. A plain ``(B, chunk_size, action_dim)``
-        batch falls through to stock π₀.₅ behavior, which is what makes this
-        policy usable with today's single-timestep dataloader — though with
-        nothing for the memory to learn.
+        There is one path. A batch whose ``actions`` carry a leading timestep
+        axis (``(B, T, chunk_size, action_dim)``) is trained as a trajectory
+        with sequence action forcing and TBPTT; a flat
+        ``(B, chunk_size, action_dim)`` batch is the ``T = 1`` case of the same
+        path, and ``config.sequence_length`` must say so.
+
+        An earlier revision delegated the flat case to ``PI05Policy.forward``,
+        which never passes a ``ttt_state`` — so the TTT branch was skipped and
+        not one TTT parameter reached the autograd graph. See the comment in the
+        body.
 
         Args:
             batch: Training batch, optionally with a leading timestep axis on
                 every per-timestep entry, plus an optional ``loss_mask`` of
                 shape ``(B, T)`` marking supervised timesteps.
-            noise: Optional noise tensor. Sequence path only accepts ``None``.
-            time: Optional time tensor. Sequence path only accepts ``None``,
-                since it draws one level per timestep itself.
-            return_per_sample: Per-sample loss breakdown. Not available on the
-                sequence path.
+            noise: Must be ``None``; the sequence path draws its own noise.
+            time: Must be ``None``; the sequence path draws one noise level per
+                timestep (sequence action forcing).
+            return_per_sample: Additionally return ``MSE_per_sample`` /
+                ``CE_per_sample`` as :class:`PerSampleLoss`, decomposed *per
+                trajectory* — a trajectory is the sample, so a sequence's
+                timesteps are pooled into one ``(numerator, denominator)`` pair.
+                The validation loop selects this by signature introspection and
+                calls it without a guard, so it must not raise.
 
         Returns:
-            A dict with the ``MSE`` and ``CE`` loss components.
+            A dict with the ``MSE`` and ``CE`` loss components, plus
+            ``MSE_per_sample`` / ``CE_per_sample`` when requested.
 
         Raises:
-            NotImplementedError: If ``noise``, ``time`` or ``return_per_sample``
-                is used together with a sequence batch.
+            NotImplementedError: If ``noise`` or ``time`` is supplied.
         """
         # Every batch goes through the sequence path, including a flat one,
         # which is treated as a single-timestep sequence.
@@ -1073,25 +1287,6 @@ class PI05TTTPolicy(PI05Policy):
                 "pi05_ttt's sequence path draws its own per-timestep noise level (sequence "
                 "action forcing); passing `noise` or `time` explicitly would defeat it."
             )
-        if return_per_sample:
-            raise NotImplementedError(
-                "return_per_sample is not implemented on pi05_ttt's sequence path: the "
-                "validation breakdown buckets by sample, and a sequence's loss is a mean over "
-                "timesteps whose provenance the loop does not currently carry."
-            )
-        if self.config.predict_response:
-            # The sequence path computes the discrete-action CE but not the
-            # response CE. Raising beats returning a loss that quietly omits a
-            # term the config asked for — that reads as a converging run right
-            # up until the subtask head turns out to be untrained.
-            raise NotImplementedError(
-                "pi05_ttt's sequence path does not yet compute the response (subtask) "
-                "cross-entropy, so running it with predict_response=True would silently drop "
-                "that loss term. Set predict_response=False for sequence training, or use the "
-                "single-timestep path. Feeding the predicted subtask into the memory stream is "
-                "a natural follow-up: pi05 hands the fast weights a ready-made progress summary."
-            )
-
         loss_mask = batch.get("loss_mask")
         batch_size = batch["actions"].shape[0]
         flat_batch = self._flatten_sequence_batch(batch, batch_size, num_timesteps)

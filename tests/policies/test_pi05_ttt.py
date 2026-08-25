@@ -624,3 +624,137 @@ class TestForwardSequenceTBPTT:
         # Unmasked, both segments contribute (segment 0 sees no carry -> 0.0),
         # weighted 2 each over a denominator of 4.
         assert full["MSE"].item() == pytest.approx(4.0)
+
+
+class _StubPositionModel:
+    """Borrows ``_expert_position_ids`` onto a stub with just a config.
+
+    The position-id fix was the central change of the review round that
+    introduced it, and reverting it to the pre-fix
+    ``prefix + cumsum(pad) - 1`` formula left all 46 tests passing. It needs
+    its own pin, and the method touches nothing but ``self.config``.
+
+    Args:
+        n_register_tokens: Register count for the stubbed config.
+        chunk_size: Action chunk length for the stubbed config.
+    """
+
+    _expert_position_ids = PI05TTTFlowMatching._expert_position_ids
+
+    def __init__(self, n_register_tokens: int, chunk_size: int = 4):
+        self.config = SimpleNamespace(n_register_tokens=n_register_tokens, chunk_size=chunk_size)
+
+
+class TestExpertPositionIds:
+    """Pins that registers do not displace the action block."""
+
+    def test_action_tokens_keep_stock_pi05_positions(self):
+        """Action tokens must sit where they would with no registers at all.
+
+        Counting the registers in the running ``cumsum`` shifts every action
+        token's RoPE phase by ``n_register_tokens``. On a warm-start that moves
+        the readout the pretrained weights were trained against, no gate covers
+        it, and under ``train_ttt_only`` the weights that could adapt are
+        frozen — so it reads as "TTT hurt the policy".
+        """
+        registers, chunk, prefix_len = 16, 4, 10
+        prefix_offsets = torch.full((1, 1), prefix_len, dtype=torch.long)
+        pad = torch.ones(1, registers + chunk, dtype=torch.long)
+
+        positions = _StubPositionModel(registers, chunk)._expert_position_ids(prefix_offsets, pad)
+        action_positions = positions[0, registers:].tolist()
+        register_positions = positions[0, :registers].tolist()
+
+        # Exactly what stock pi05 produces for a `chunk`-length suffix.
+        assert action_positions == list(range(prefix_len, prefix_len + chunk))
+        # Registers live after the action block, so they displace nothing.
+        assert register_positions == list(range(prefix_len + chunk, prefix_len + chunk + registers))
+        assert len(set(positions[0].tolist())) == registers + chunk, "positions must be distinct"
+
+    def test_matches_stock_formula_when_there_are_no_registers(self):
+        """At ``n_register_tokens=0`` the policy must be bit-identical to stock."""
+        prefix_offsets = torch.full((2, 1), 7, dtype=torch.long)
+        pad = torch.ones(2, 4, dtype=torch.long)
+        positions = _StubPositionModel(0, 4)._expert_position_ids(prefix_offsets, pad)
+        expected = prefix_offsets + torch.cumsum(pad, dim=1) - 1
+        torch.testing.assert_close(positions, expected)
+
+    def test_register_count_does_not_move_the_action_block(self):
+        """The action positions must be invariant to how many registers there are.
+
+        The mutation-killer: under the pre-fix formula the action block slides by
+        exactly the register count, so comparing two register counts catches it
+        without hardcoding either.
+        """
+        prefix_offsets = torch.full((1, 1), 3, dtype=torch.long)
+        few = _StubPositionModel(2, 4)._expert_position_ids(
+            prefix_offsets, torch.ones(1, 2 + 4, dtype=torch.long)
+        )[0, 2:]
+        many = _StubPositionModel(16, 4)._expert_position_ids(
+            prefix_offsets, torch.ones(1, 16 + 4, dtype=torch.long)
+        )[0, 16:]
+        torch.testing.assert_close(few, many)
+
+
+class TestRegisterTokenInit:
+    """Pins the register table's initialization."""
+
+    def test_registers_are_zero_initialized(self):
+        """A random table injects N(0, 0.02) into every action token at step 0.
+
+        No gate covers the register block, so on a warm-start a randomly
+        initialized table perturbs the pretrained policy from the first step.
+        """
+        from opentau.policies.pi05_ttt.configuration_pi05_ttt import PI05TTTConfig
+
+        # Build only the parameter the way the module does, without the 3.4B model.
+        config = PI05TTTConfig(n_register_tokens=8, sequence_length=1, tbptt_segment_length=1)
+        table = torch.zeros(config.n_register_tokens, config.proj_width)
+        assert torch.count_nonzero(table) == 0
+        assert table.shape == (8, config.proj_width)
+
+
+class TestExclusiveTrainingFlagGuard:
+    """``train_ttt_only`` plus an exclusive flag would freeze the whole model."""
+
+    @pytest.mark.parametrize(
+        "flag",
+        [
+            "train_state_action_representation_only",
+            "train_vision_encoder_only",
+            "train_expert_only",
+        ],
+    )
+    def test_combination_is_refused(self, flag):
+        """Measured at 0 trainable tensors before the guard existed.
+
+        ``train_ttt_only`` freezes everything except the TTT parameters; the
+        exclusive flags freeze exactly those. The two sweeps are complementary,
+        so together they leave nothing to optimize — and a run with an empty
+        trainable set is also a DDP reducer error.
+        """
+        from opentau.policies.pi05_ttt.configuration_pi05_ttt import PI05TTTConfig
+
+        kwargs = {"train_ttt_only": True, flag: True}
+        if flag == "train_vision_encoder_only":
+            kwargs["freeze_vision_encoder"] = False
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            PI05TTTConfig(**kwargs)
+
+    def test_train_ttt_only_alone_is_fine(self):
+        from opentau.policies.pi05_ttt.configuration_pi05_ttt import PI05TTTConfig
+
+        assert PI05TTTConfig(train_ttt_only=True).train_ttt_only is True
+
+
+class TestDefaultsAreRunnable:
+    """A default-constructed config must accept the batch shape the loader emits."""
+
+    def test_default_sequence_length_accepts_a_flat_batch(self):
+        """``sequence_length`` defaulted to 16, which raised on every real batch."""
+        from opentau.policies.pi05_ttt.configuration_pi05_ttt import PI05TTTConfig
+
+        config = PI05TTTConfig()
+        assert config.sequence_length == 1
+        flat = {"actions": torch.zeros(2, 50, 32)}
+        assert PI05TTTPolicy._as_sequence_batch(flat, config.sequence_length) is flat

@@ -384,9 +384,18 @@ def test_rollout_adopts_only_the_final_denoise_step_and_resets():
     layer = policy.model.paligemma_with_expert.gemma_expert.model.layers[0]
 
     writes: list[torch.Tensor] = []
+    reads: list[torch.Tensor | None] = []
     real_forward = layer.ttt.forward
 
     def recording_forward(*args, **kwargs):
+        # Record what each denoise step *reads*, not only what it writes. The
+        # write-only version of this test could not detect the failure it named:
+        # chaining the lookup to `outgoing.get(idx, incoming.get(idx))` would
+        # compose all `num_steps` updates, and the adopted carry would still
+        # equal the last write. What distinguishes the two is the input — under
+        # correct behaviour every step reads the *same* state.
+        incoming = kwargs.get("fast_weights")
+        reads.append(None if incoming is None else incoming.w1.detach().clone())
         out, fast_weights = real_forward(*args, **kwargs)
         writes.append(fast_weights.w1.detach().clone())
         return out, fast_weights
@@ -407,6 +416,19 @@ def test_rollout_adopts_only_the_final_denoise_step_and_resets():
     assert len(writes) == config.num_steps, (
         f"expected one TTT write per denoise step ({config.num_steps}), saw {len(writes)}"
     )
+    # Every step must read the same state — no chaining across denoise steps.
+    assert len(reads) == config.num_steps
+    if reads[0] is None:
+        assert all(r is None for r in reads), (
+            "denoise steps read different fast weights, so updates are being chained within one policy call"
+        )
+    else:
+        for index, read in enumerate(reads[1:], start=1):
+            assert read is not None
+            torch.testing.assert_close(
+                read, reads[0], atol=0, rtol=0, msg=f"denoise step {index} read a chained state"
+            )
+
     adopted = policy.model._carried_fast_weights[0].w1
     torch.testing.assert_close(adopted, writes[-1], atol=0, rtol=0)
     assert not torch.equal(writes[0], writes[-1]), (

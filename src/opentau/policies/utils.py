@@ -134,6 +134,43 @@ _SIGLIP_FLOAT32_PARAM_SUFFIXES = (
 )
 
 
+def maybe_compile_sample_actions(policy, sample_actions, device_hint=None):
+    """Compile a policy's ``sample_actions`` unless the policy carries rollout state.
+
+    Every serving and scoring entry point wants the compiled sampler, and each
+    one previously called ``attempt_torch_compile`` directly. That is a manual
+    sweep, and manual sweeps over ``scripts/`` are exactly what CLAUDE.md rule 6
+    records going wrong — a six-file pass missed ``robocasa/server.py``, and a
+    later four-site pass missed it again. Routing every site through one helper
+    makes the gate single-sourced and lets an AST test pin that no script calls
+    the raw helper on a sampler (see
+    ``tests/policies/test_rollout_state_entry_points.py``).
+
+    The gate itself: a policy whose ``carries_rollout_state`` is True mutates
+    Python-level state inside ``sample_actions`` — pi05_ttt carries fast weights
+    and an integer token position that feeds RoPE. Best case that recompiles per
+    distinct position and then falls back to eager forever; worst case the
+    position specializes into the graph and the phase silently freezes.
+
+    Args:
+        policy: The policy owning ``sample_actions``.
+        sample_actions: The bound method to compile.
+        device_hint: Optional device hint forwarded to ``attempt_torch_compile``.
+
+    Returns:
+        Either a compiled callable or ``sample_actions`` unchanged.
+    """
+    from opentau.utils.utils import attempt_torch_compile
+
+    if getattr(policy, "carries_rollout_state", False):
+        logging.info(
+            "Skipping torch.compile of sample_actions: %s carries recurrent rollout state.",
+            type(policy).__name__,
+        )
+        return sample_actions
+    return attempt_torch_compile(sample_actions, device_hint=device_hint)
+
+
 def to_dtype_preserving_siglip_float32(
     module: nn.Module,
     *,
