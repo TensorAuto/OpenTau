@@ -1364,9 +1364,15 @@ class PI05TTTPolicy(PI05Policy):
             having the dataloader label its per-timestep keys explicitly when
             the sequence data path lands.
         """
-        if num_timesteps == 1:
-            # `_as_sequence_batch` leaves a single-timestep batch flat, and
-            # flattening (B, 1, ...) would be the identity anyway.
+        # Short-circuit on the batch being *already flat*, not on
+        # `num_timesteps == 1`. At sequence_length 1 a caller may legitimately
+        # pass either shape: a flat `(B, chunk, dim)` batch (what the dataloader
+        # emits today) or an explicit `(B, 1, chunk, dim)` one. Keying off the
+        # timestep count returned the latter untouched, so its 5-D camera
+        # tensors reached `prepare_images` and it raised
+        # `(b,c,h,w) expected, but torch.Size([1, 1, 3, 224, 224])`.
+        actions = batch.get("actions")
+        if actions is not None and actions.ndim == 3:
             return dict(batch)
 
         flat: dict[str, Any] = {}

@@ -390,9 +390,14 @@ class TestSequenceBatchHandling:
         order were timestep-major instead, the memory would interleave
         trajectories and still produce plausible-looking losses.
         """
-        batch = {"actions": rearrange(torch.arange(2 * 3 * 4).float(), "(b t x) -> b t x", b=2, t=3)}
+        # Shaped like the real contract — (B, T, chunk, dim) — because the
+        # flat/sequence distinction is made on `actions.ndim`: 3 is a flat batch,
+        # 4 carries a timestep axis. A 3-D fixture would be read as flat.
+        batch = {
+            "actions": rearrange(torch.arange(2 * 3 * 5 * 4).float(), "(b t c d) -> b t c d", b=2, t=3, c=5)
+        }
         flat = PI05TTTPolicy._flatten_sequence_batch(batch, batch_size=2, num_timesteps=3)
-        assert flat["actions"].shape == (6, 4)
+        assert flat["actions"].shape == (6, 5, 4)
         # Row 1 must be trajectory 0's timestep 1, not trajectory 1's timestep 0.
         torch.testing.assert_close(flat["actions"][1], batch["actions"][0, 1])
         torch.testing.assert_close(flat["actions"][3], batch["actions"][1, 0])
@@ -758,3 +763,28 @@ class TestDefaultsAreRunnable:
         assert config.sequence_length == 1
         flat = {"actions": torch.zeros(2, 50, 32)}
         assert PI05TTTPolicy._as_sequence_batch(flat, config.sequence_length) is flat
+
+
+class TestSequenceLengthOneAcceptsBothShapes:
+    """At ``sequence_length == 1`` both batch shapes must work.
+
+    The dataloader emits flat ``(B, chunk, dim)`` batches, but a caller (a test,
+    or a sequence loader configured at T=1) may pass an explicit
+    ``(B, 1, chunk, dim)``. An earlier short-circuit keyed off
+    ``num_timesteps == 1`` rather than off the batch already being flat, so the
+    explicit form was returned untouched and its 5-D camera tensors reached
+    ``prepare_images``, which raised
+    ``(b,c,h,w) expected, but torch.Size([1, 1, 3, 224, 224])``.
+    """
+
+    def test_flat_batch_passes_through(self):
+        flat = {"actions": torch.zeros(2, 10, 32), "camera0": torch.zeros(2, 3, 224, 224)}
+        out = PI05TTTPolicy._flatten_sequence_batch(flat, batch_size=2, num_timesteps=1)
+        assert out["actions"].shape == (2, 10, 32)
+        assert out["camera0"].shape == (2, 3, 224, 224)
+
+    def test_explicit_single_timestep_axis_is_flattened(self):
+        seq = {"actions": torch.zeros(2, 1, 10, 32), "camera0": torch.zeros(2, 1, 3, 224, 224)}
+        out = PI05TTTPolicy._flatten_sequence_batch(seq, batch_size=2, num_timesteps=1)
+        assert out["actions"].shape == (2, 10, 32), "the T=1 axis was not folded away"
+        assert out["camera0"].shape == (2, 3, 224, 224), "camera kept a 5-D shape"
