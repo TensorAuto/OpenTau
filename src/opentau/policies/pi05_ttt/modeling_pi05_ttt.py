@@ -85,6 +85,7 @@ Known gaps, deliberately out of scope for this change and tracked in the PR:
   masking it needs is here, the procedure is not.
 """
 
+from functools import partial
 from typing import Any
 
 import torch
@@ -522,7 +523,33 @@ class PI05TTTFlowMatching(PI05FlowMatching):
             )
 
             segment_loss_mask = None if loss_mask is None else loss_mask[:, start:stop]
-            losses = self._forward_segment(
+            # Gradient-checkpoint each segment when asked. This is what makes
+            # activation memory depend on `tbptt_segment_length` instead of
+            # `sequence_length` — measured at 6.75 GiB fixed + 0.304 GiB per
+            # timestep without it, i.e. ~47 GiB for a median LIBERO episode at
+            # stride 1, against a 23.57 GiB card.
+            #
+            # Chosen over a per-segment `backward()` (the removed
+            # `tbptt_backward_fn` hook) because it needs no change to the
+            # training loop's single-backward contract: the returned losses stay
+            # graph-carrying and `train.py` backwards them exactly once. The cost
+            # is one extra forward per segment.
+            #
+            # Safe here specifically because a segment is already independent:
+            # its incoming fast weights are detached at the boundary, so they are
+            # leaf inputs and the recompute cannot diverge. The `ttt_state`
+            # side-effect write is idempotent for the same reason the KV-cache
+            # write is — deterministic recompute stores an equal value, and the
+            # caller reads `outgoing` after the forward completes, before any
+            # recompute can run.
+            segment_forward = self._forward_segment
+            if self.config.checkpoint_tbptt_segments and torch.is_grad_enabled():
+                segment_forward = partial(
+                    torch.utils.checkpoint.checkpoint,
+                    self._forward_segment,
+                    use_reentrant=False,
+                )
+            losses = segment_forward(
                 images=[img[rows] for img in images],
                 img_masks=[mask[rows] for mask in img_masks],
                 lang_tokens=lang_tokens[rows],

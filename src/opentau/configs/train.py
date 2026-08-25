@@ -418,6 +418,21 @@ class TrainPipelineConfig(HubMixin):
                         "mismatch, set policy.skip_input_resolution_check=true."
                     )
 
+            # A recurrent policy's `sequence_length` is what its forward slices
+            # into TBPTT segments; the mixture's is what the dataloader actually
+            # emits. They must agree, or `_as_sequence_batch` raises on the
+            # first batch — after the dataset has been built and the model
+            # loaded, which is a slow way to learn about a typo.
+            if self.dataset_mixture is not None:
+                policy_seq = getattr(self.policy, "sequence_length", None)
+                if policy_seq is not None and policy_seq != self.dataset_mixture.sequence_length:
+                    raise ValueError(
+                        f"policy.sequence_length ({policy_seq}) != "
+                        f"dataset_mixture.sequence_length ({self.dataset_mixture.sequence_length}). "
+                        "The policy decides how many timesteps it segments; the mixture decides "
+                        "how many it emits. Set them to the same value."
+                    )
+
             # The policy's ``n_obs_steps`` determines the T dimension its
             # encoder expects; the dataset_mixture's ``n_obs_history`` is
             # what the dataloader actually produces. They must agree.

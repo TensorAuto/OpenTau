@@ -114,6 +114,16 @@ class PI05TTTConfig(PI05Config):
 
     train_ttt_only: bool = True
 
+    # Gradient-checkpoint each TBPTT segment's forward, so activation memory
+    # scales with `tbptt_segment_length` rather than `sequence_length`. Measured
+    # on an RTX 3090 at chunk 10: 6.75 GiB fixed + 0.304 GiB per timestep
+    # without it, so a median LIBERO episode at stride 1 (T~131) would need
+    # ~47 GiB against a 23.57 GiB card. Costs one extra forward per segment.
+    #
+    # Off by default: it changes nothing numerically, but it is pure overhead at
+    # the sequence lengths that already fit.
+    checkpoint_tbptt_segments: bool = False
+
     # `PI05TTTPolicy.supports_torch_compile` is False (the sequence path drives a
     # Python-level loop over TBPTT segments), so inheriting π₀.₅'s `True` meant
     # every default run hit `maybe_compile_for_training`'s warn-and-skip path.

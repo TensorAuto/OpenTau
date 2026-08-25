@@ -511,6 +511,10 @@ class _StubSequenceModel:
         self.config = SimpleNamespace(
             tbptt_segment_length=segment_length,
             n_expert_tokens_per_timestep=3,
+            # The real config field; False keeps the stub's scripted segment
+            # forward out of torch.utils.checkpoint, which cannot carry the
+            # dataclass-valued dict this stub returns.
+            checkpoint_tbptt_segments=False,
         )
         self.root = root
         self.seen_incoming: list[dict] = []
