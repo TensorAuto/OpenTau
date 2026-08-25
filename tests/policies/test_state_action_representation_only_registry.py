@@ -141,6 +141,12 @@ def test_flag_can_be_enabled(policy_type):
     if policy_type in ("cosmos3", "cosmos3_nano"):
         # cosmos3 defaults train_expert_only=True, which is mutually exclusive.
         kwargs["train_expert_only"] = False
+    if policy_type == "pi05_ttt":
+        # pi05_ttt defaults train_ttt_only=True, which is mutually exclusive with
+        # this flag for the same reason: the two are complementary default-deny
+        # sweeps, so together they freeze the entire model (measured at 0
+        # trainable tensors).
+        kwargs["train_ttt_only"] = False
     assert getattr(_config_for(policy_type).__class__(**kwargs), FLAG) is True
 
 
@@ -157,6 +163,8 @@ def test_draccus_round_trips_the_flag(policy_type):
     kwargs = {FLAG: True}
     if policy_type in ("cosmos3", "cosmos3_nano"):
         kwargs["train_expert_only"] = False
+    if policy_type == "pi05_ttt":
+        kwargs["train_ttt_only"] = False
     cfg = _config_for(policy_type).__class__(**kwargs)
 
     reparsed = draccus.decode(type(cfg), draccus.encode(cfg))

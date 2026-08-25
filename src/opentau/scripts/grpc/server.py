@@ -90,6 +90,12 @@ def _noop_request_hook(_method: str) -> None:
 
 
 class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
+    # Class-level default so the attribute always exists. `_load_policy` sets it
+    # per instance, but the gRPC tests construct the servicer with an injected
+    # mock policy and never call that, which made `_reset_policy_on_task_change`
+    # raise AttributeError inside the request path.
+    _policy_task: str | None = None
+
     """gRPC servicer implementing the RobotPolicyService.
 
     When ``cfg.planner.enabled`` is set, a high-level planner runs alongside
@@ -288,10 +294,6 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
             self._policy_task = prompt
         logger.info("Task changed to %r — resetting policy state", prompt)
         self.policy.reset()
-        # Tracks the prompt the policy was last reset for; see
-        # `_reset_policy_on_task_change`. Separate from `self._task`, which the
-        # planner owns and which is only maintained when the planner is enabled.
-        self._policy_task: str | None = None
 
     def _apply_planner(self, request: robot_inference_pb2.ObservationRequest) -> None:
         """Rewrite ``request.prompt`` to the planner's current subtask.
