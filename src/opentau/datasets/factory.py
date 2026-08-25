@@ -316,8 +316,29 @@ def resolve_delta_timestamps(
         # obs_history_is_pad", with `<key>_is_pad` doing the same for actions. So
         # a window running off the start of an episode is clamped and reported,
         # and no boundary arithmetic is needed here.
-        seq_len = cfg.dataset_mixture.sequence_length
-        seq_stride = cfg.dataset_mixture.sequence_stride or 1
+        # `getattr` because tests build the mixture as a SimpleNamespace stand-in
+        # that only carries the fields the case under test needs.
+        seq_len = getattr(cfg.dataset_mixture, "sequence_length", 1)
+        seq_stride = getattr(cfg.dataset_mixture, "sequence_stride", None) or 1
+
+        # `sequence_stride` is documented in *frames*, but every offset here is
+        # converted with `action_freq` — the resampling rate — so the two agree
+        # only when `action_freq == ds_meta.fps`. Oversampling makes consecutive
+        # timesteps land inside one source frame, and the nearest-frame fetch
+        # returns the *same* observation for both: the memory sees duplicates
+        # and TTT has nothing to carry. Caught on droid_100, which is 15 fps
+        # while the dev config asks for 30, giving bit-identical frames at
+        # stride 1.
+        if seq_len > 1 and action_freq > ds_meta.fps + 1e-6:
+            raise ValueError(
+                f"sequence_length={seq_len} with action_freq={action_freq} Hz on a dataset "
+                f"recorded at {ds_meta.fps} Hz: a stride of {seq_stride} frame(s) is "
+                f"{seq_stride / action_freq:.4f}s, shorter than one source frame "
+                f"({1 / ds_meta.fps:.4f}s), so consecutive timesteps would resolve to the same "
+                "observation. Set dataset_mixture.action_freq to the dataset's fps, or raise "
+                "sequence_stride to at least "
+                f"{int(-(-action_freq // ds_meta.fps))}."
+            )
 
         standard_key = reverse_name_map[key]
         if (

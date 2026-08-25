@@ -889,12 +889,20 @@ class BaseDataset(torch.utils.data.Dataset):
         Args:
             img: Image tensor to validate.
             name: Human-readable key name for the error message.
-            expect_temporal: If ``None``, defers to ``self.n_obs_history``. If
+            expect_temporal: If ``None``, defers to whether a time axis is
+                active — ``self.n_obs_history`` or ``self.sequence_length > 1``. If
                 ``True`` force-expects ``(T, 3, H, W)``. If ``False`` force-expects
                 ``(3, H, W)``.
         """
         if expect_temporal is None:
-            expect_temporal = self.n_obs_history is not None
+            # Either mechanism puts a leading time axis on a camera:
+            # `n_obs_history` or `sequence_length`. Deferring to
+            # `n_obs_history` alone made a sequence batch fail this assertion
+            # with "Expected image camera0 to have shape (3, H, W) ... Got
+            # torch.Size([4, 3, 224, 224])".
+            expect_temporal = (
+                self.n_obs_history is not None or getattr(self, "sequence_length", 1) > 1
+            )
         if expect_temporal:
             expected_ndim = 4
             expected_c_dim = 1
@@ -938,20 +946,34 @@ class BaseDataset(torch.utils.data.Dataset):
             std_key = f"camera{cam_idx}"
             key = name_map.get(std_key)
 
+            # A camera carries a leading time axis under either mechanism:
+            # `n_obs_history` (a history window for one prediction) or
+            # `sequence_length` (one observation per supervised timestep). They
+            # are mutually exclusive by config validation, so at most one is
+            # active — but the *shape handling* is identical, and keying it on
+            # `n_obs_history` alone sent sequence batches down the scalar path,
+            # where `item[key + "_is_pad"].item()` raised
+            # "a Tensor with 4 elements cannot be converted to Scalar".
+            temporal_frames = (
+                self.n_obs_history
+                if self.n_obs_history is not None
+                else (_seq_len if (_seq_len := getattr(self, "sequence_length", 1)) > 1 else None)
+            )
+
             if key is None:
-                if self.n_obs_history is not None:
-                    standard_item[std_key] = torch.zeros((self.n_obs_history, 3, *self.resolution))
+                if temporal_frames is not None:
+                    standard_item[std_key] = torch.zeros((temporal_frames, 3, *self.resolution))
                 else:
                     standard_item[std_key] = torch.zeros((3, *self.resolution))
                 image_is_pad.append(True)
-            elif self.n_obs_history is not None:
+            elif temporal_frames is not None:
                 img = item[key]
                 # n_obs_history == 1 produces a length-1 delta-timestamps
                 # query, which the fetch paths collapse to (C, H, W) —
                 # `_query_videos` for video keys, the single-delta squeeze in
                 # `__getitem__` for image columns. Restore the temporal dim so
                 # the (T, C, H, W) contract holds for T == 1.
-                if self.n_obs_history == 1 and img.ndim == 3:
+                if temporal_frames == 1 and img.ndim == 3:
                     img = rearrange(img, "c h w -> 1 c h w")
                 standard_item[std_key] = self.resize_with_pad(
                     img, self.resolution[1], self.resolution[0], pad_value=0
@@ -1105,7 +1127,7 @@ class BaseDataset(torch.utils.data.Dataset):
         Args:
             standard_item: The sample being assembled, modified in place.
         """
-        seq_len = self.sequence_length
+        seq_len = getattr(self, "sequence_length", 1)
         if seq_len <= 1:
             return
 
@@ -2887,9 +2909,22 @@ class LeRobotDataset(BaseDataset):
                 item["return_bin_idx"] = torch.tensor(0, dtype=torch.long)
                 item["return_continuous"] = torch.tensor(0, dtype=torch.float32)
 
-            # sanity check for action chunk lengths
-            assert item["actions"].shape[0] == self.cfg.action_chunk
-            assert item["action_is_pad"].shape[0] == self.cfg.action_chunk
+            # Sanity check for action chunk lengths. Under sequence emission the
+            # chunk sits on the *second* axis — `_reshape_to_sequence` has
+            # already folded the flat `T * chunk` query into `(T, chunk, ...)` —
+            # so check the whole leading shape rather than just dim 0, which
+            # would otherwise be T and fail.
+            if getattr(self, "sequence_length", 1) > 1:
+                expected = (self.sequence_length, self.cfg.action_chunk)
+                assert tuple(item["actions"].shape[:2]) == expected, (
+                    f"expected actions {expected} + dims, got {tuple(item['actions'].shape)}"
+                )
+                assert tuple(item["action_is_pad"].shape[:2]) == expected, (
+                    f"expected action_is_pad {expected}, got {tuple(item['action_is_pad'].shape)}"
+                )
+            else:
+                assert item["actions"].shape[0] == self.cfg.action_chunk
+                assert item["action_is_pad"].shape[0] == self.cfg.action_chunk
 
         return item
 

@@ -1,0 +1,118 @@
+{
+    "dataset_mixture": {
+        "datasets": [
+            {
+                "repo_id": "lerobot/droid_100"
+            }
+        ],
+        "weights": [
+            1.0
+        ],
+        "action_freq": 15.0,
+        "image_resample_strategy": "nearest",
+        "vector_resample_strategy": "nearest",
+        "sequence_length": 4,
+        "sequence_stride": 1
+    },
+    "policy": {
+        "type": "pi05_ttt",
+        "pretrained_path": "TensorAuto/pi05_base",
+        "n_obs_steps": 1,
+        "normalization_mapping": {
+            "VISUAL": "IDENTITY",
+            "STATE": "MIN_MAX",
+            "ACTION": "MEAN_STD"
+        },
+        "chunk_size": 10,
+        "n_action_steps": 10,
+        "max_state_dim": 32,
+        "max_action_dim": 32,
+        "proj_width": 1024,
+        "num_steps": 10,
+        "attention_implementation": "eager",
+        "freeze_vision_encoder": true,
+        "train_expert_only": false,
+        "prompt_max_length": 256,
+        "discrete_action_max_length": 75,
+        "optimizer_lr": 2.5e-05,
+        "optimizer_betas": [
+            0.9,
+            0.95
+        ],
+        "optimizer_eps": 1e-08,
+        "optimizer_weight_decay": 1e-10,
+        "scheduler_warmup_steps": 1000,
+        "scheduler_decay_steps": 30000,
+        "scheduler_decay_lr": 2.5e-06,
+        "predict_response": false,
+        "use_torch_compile": false,
+        "n_register_tokens": 16,
+        "ttt_num_heads": 8,
+        "ttt_mlp_hidden_multiplier": 2,
+        "ttt_base_lr": 0.1,
+        "ttt_rope_theta": 10000.0,
+        "ttt_gate_init": 0.001,
+        "ttt_scan_checkpoint_group_size": 0,
+        "sequence_length": 4,
+        "tbptt_segment_length": 2,
+        "train_ttt_only": true,
+        "checkpoint_tbptt_segments": false
+    },
+    "resume": false,
+    "seed": 1000,
+    "resolution": [
+        224,
+        224
+    ],
+    "num_cams": 1,
+    "max_state_dim": 32,
+    "max_action_dim": 32,
+    "action_chunk": 10,
+    "loss_weighting": {
+        "MSE": 10,
+        "CE": 1
+    },
+    "num_workers": 2,
+    "batch_size": 1,
+    "gradient_accumulation_steps": 1,
+    "dataloader_batch_size": 1,
+    "prefetch_factor": 8,
+    "steps": 10,
+    "log_freq": 1,
+    "save_checkpoint": true,
+    "save_freq": 10,
+    "use_policy_training_preset": true,
+    "trace_nans": true,
+    "val_freq": 0,
+    "optimizer": {
+        "type": "adamw",
+        "lr": 2.5e-05,
+        "weight_decay": 1e-10,
+        "grad_clip_norm": 10.0,
+        "betas": [
+            0.9,
+            0.95
+        ],
+        "eps": 1e-08
+    },
+    "scheduler": {
+        "type": "cosine_decay_with_warmup",
+        "num_warmup_steps": 1000,
+        "num_decay_steps": 30000,
+        "peak_lr": 2.5e-05,
+        "decay_lr": 2.5e-06
+    },
+    "wandb": {
+        "enable": false,
+        "project": "pi05",
+        "run_id": null,
+        "name": null,
+        "notes": "pi05_ttt sequence-loader validation on droid_100",
+        "tags": [],
+        "group": null,
+        "job_type": null,
+        "mode": null,
+        "on_resume": "fork",
+        "disable_artifact": false
+    }
+}
