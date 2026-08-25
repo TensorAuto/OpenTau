@@ -221,6 +221,17 @@ def main(cfg: TrainPipelineConfig):
 
     if not isinstance(policy, PI05Policy):
         raise ValueError(f"ONNX export currently only supports PI05Policy, got {type(policy)}")
+    # `isinstance` accepts subclasses, so a policy carrying recurrent rollout
+    # state (pi05_ttt's TTT fast weights) passes the check above. Tracing it
+    # would constant-fold the learned initialization into the graph and drop
+    # every update — an exported model that looks fine and has no memory.
+    if getattr(policy, "carries_rollout_state", False):
+        raise ValueError(
+            f"{type(policy).__name__} carries recurrent rollout state (test-time-training fast "
+            "weights) that ONNX export does not model: the initial state would be constant-"
+            "folded into the graph and the per-step updates discarded, producing a silently "
+            "memoryless model. Export is refused until the fast weights are graph inputs/outputs."
+        )
 
     # Create ONNX-compatible wrapper
     wrapper = PI05OnnxWrapper(policy)

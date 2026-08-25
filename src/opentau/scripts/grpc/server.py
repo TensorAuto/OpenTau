@@ -212,6 +212,15 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
                 self._plan_generation += 1
                 self._subtask_ready.clear()
                 self._replan_event.set()
+                # Also reset the *policy*, not just the planner. A policy with
+                # recurrent rollout state (pi05_ttt's TTT fast weights) is
+                # otherwise reset exactly once, in `_load_policy`, and then
+                # carries one episode's memory into every later episode and
+                # task — the precise failure the architecture exists to
+                # prevent. Cheap and a no-op for stateless policies, which
+                # only clear an already-drained action queue here.
+                if getattr(self, "policy", None) is not None:
+                    self.policy.reset()
 
     def _planner_loop(self) -> None:
         """Free-running planner: replan every ``interval_s`` on fresh observations.
@@ -339,9 +348,22 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
         # a plain .to(bfloat16) would round them back. Serving is single-process, so this is safe.
         to_dtype_preserving_siglip_float32(self.policy, device=self.device, dtype=self.dtype)
         self.policy.eval()
-        self.policy.model.sample_actions = attempt_torch_compile(
-            self.policy.model.sample_actions, device_hint=self.device
-        )
+        # A policy carrying recurrent rollout state is not safe to compile here:
+        # its `sample_actions` mutates Python-level state (the carried fast
+        # weights, and an integer token position that feeds RoPE). Best case
+        # that recompiles once per distinct position and then falls back to
+        # eager permanently; worst case the position specializes into the graph
+        # and the phase silently freezes. `supports_torch_compile` only gates
+        # the training-side helper and never reaches this call site.
+        if getattr(self.policy, "carries_rollout_state", False):
+            logger.info(
+                "Skipping torch.compile of sample_actions: %s carries recurrent rollout state.",
+                type(self.policy).__name__,
+            )
+        else:
+            self.policy.model.sample_actions = attempt_torch_compile(
+                self.policy.model.sample_actions, device_hint=self.device
+            )
 
         self.policy.reset()
 

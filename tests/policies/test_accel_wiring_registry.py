@@ -87,6 +87,15 @@ FLOW_MATCHING_POLICIES = [
     ("pi0/modeling_pi0.py", "PI0FlowMatching", "PI0Policy"),
     ("pi05/modeling_pi05.py", "PI05FlowMatching", "PI05Policy"),
     ("pi05_mem/modeling_pi05.py", "PI05MemFlowMatching", "PI05MemPolicy"),
+    # `pi05_ttt` is deliberately absent. It overrides `denoise_step` (one step)
+    # and the inner `sample_actions` (to carry TTT fast weights across calls),
+    # but it does not carry a denoise loop of its own — the Euler loop it runs
+    # is `PI05FlowMatching.sample_actions` via `super()`. Membership here is
+    # machine-derived and two-way in
+    # `test_the_registry_covers_every_denoise_loop_in_the_tree`: a module
+    # qualifies only if its own `sample_actions` steps a denoise state, so
+    # listing pi05_ttt trips that test's `stale` assertion. Its accel wiring is
+    # the parent's, unmodified.
     ("pi06/modeling_pi06.py", "PI06FlowMatching", "PI06Policy"),
     (
         "pi07/low_level/modeling_pi07_low_level.py",

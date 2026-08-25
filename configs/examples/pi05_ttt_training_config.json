@@ -55,6 +55,7 @@
     "scheduler_warmup_steps": 1000,
     "scheduler_decay_steps": 30000,
     "scheduler_decay_lr": 2.5e-06,
+    "use_torch_compile": false,
     "n_register_tokens": 16,
     "ttt_num_heads": 8,
     "ttt_mlp_hidden_multiplier": 2,
@@ -62,8 +63,8 @@
     "ttt_rope_theta": 10000.0,
     "ttt_gate_init": 0.001,
     "ttt_scan_checkpoint_group_size": 0,
-    "sequence_length": 4,
-    "tbptt_segment_length": 2,
+    "sequence_length": 1,
+    "tbptt_segment_length": 1,
     "train_ttt_only": true
   },
   "resume": false,

@@ -27,6 +27,19 @@ What this adds to π₀.₅, and nothing else:
   :class:`~opentau.policies.ttt_layer.TanhGate` initialized at ~0.001. Attention
   keeps operating strictly within one timestep; the TTT layer is the only path
   that crosses timesteps.
+
+  **What the gate does and does not buy.** At ``alpha = 0`` the TTT branch
+  contributes exactly nothing — verified bit-identical against the same forward
+  with no ``ttt_state``. It does *not* follow that the whole policy reproduces
+  stock π₀.₅ at step 0, and an earlier version of this file claimed that it
+  did. The register block is a second change to the expert's input and no gate
+  covers it: the tokens occupy attention slots, so they take softmax mass from
+  the action tokens. Two things narrow the gap as far as it can go — the
+  register table is zero-initialized, and the position ids are built so the
+  action block keeps the RoPE phase it has without registers (see
+  :meth:`PI05TTTFlowMatching._expert_position_ids`). The honest statement is:
+  the *memory* is inert at init, the register block is a small ungated
+  perturbation, and at ``n_register_tokens=0`` the policy is stock π₀.₅.
 * ``n_register_tokens`` learned register tokens prepended to the expert's token
   stream each timestep. π₀.₅ carries robot state on the *language* side, inside
   the frozen VLM prefix, and the VL tokens deliberately bypass TTT for cost
@@ -46,10 +59,16 @@ Known gaps, deliberately out of scope for this change and tracked in the PR:
   hand, but training on real long trajectories needs a dataset-side change.
   With a plain single-timestep batch this policy trains like stock π₀.₅ with an
   extra, near-zero-gated memory path.
-* **Truncated gradients, untruncated memory.** Gradients are truncated exactly
-  as the paper specifies, so the optimization is correct. The *activation
-  memory* benefit additionally needs one backward per segment, which the shared
-  training loop does not do; see ``tbptt_backward_fn``.
+* **Truncated gradients, untruncated activation memory.** Gradients are
+  truncated exactly as the paper specifies, so the optimization is correct. The
+  *activation memory* benefit additionally needs one backward per segment, which
+  the shared training loop does not do. An earlier revision exposed a
+  ``tbptt_backward_fn`` hook for that; it was removed because it could not be
+  used as documented — the same graph-carrying tensors were also returned for
+  the caller's own backward, so the natural wiring raised "Trying to backward
+  through the graph a second time", and the callback bypassed
+  ``cfg.loss_weighting``. It belongs with the segmented loop that will use it,
+  not ahead of it.
 * **The VLM prefix is recomputed for every timestep in a sequence.** Since the
   VLM is frozen during the paper's pretraining stage, its outputs can be
   precomputed and cached offline, which removes most of the cost. That is a
@@ -64,7 +83,6 @@ Known gaps, deliberately out of scope for this change and tracked in the PR:
   masking it needs is here, the procedure is not.
 """
 
-from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -113,13 +131,35 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         # one timestep's registers from another's, so they need no per-timestep
         # parameters of their own.
         if config.n_register_tokens > 0:
-            self.register_tokens = nn.Parameter(
-                torch.normal(0.0, 0.02, size=(config.n_register_tokens, config.proj_width))
-            )
+            # Zero-init, matching the convention `use_modality_embedding` uses
+            # in `PI05FlowMatching` ("zero-init so turning the feature on for an
+            # existing checkpoint is a no-op at step 0"). A random register
+            # table would inject `N(0, 0.02)` vectors into every action token's
+            # attention on step 0 of a warm-start, which no gate covers.
+            #
+            # This does not make the register block a *complete* no-op: the
+            # tokens still occupy attention slots, so they take softmax mass
+            # away from the action tokens even when their values are zero. See
+            # the class docstring for the exact claim.
+            self.register_tokens = nn.Parameter(torch.zeros(config.n_register_tokens, config.proj_width))
         else:
             self.register_tokens = None
 
         self._attach_ttt_layers()
+
+        # `super().__init__()` above already ran both default-deny freeze
+        # sweeps to completion — `set_requires_grad()` inside
+        # `PaliGemmaWithExpertModel.__init__` and
+        # `freeze_policy_level_params_for_state_action_representation_only(...)`
+        # as the last statement of `PI05FlowMatching.__init__`. Everything
+        # created *after* that (the register table and all 343 TTT tensors) is
+        # born with `requires_grad=True` and would never be swept, which routes
+        # around the very guarantee the comment on that sweep claims
+        # ("so a module added later cannot silently keep training"). So re-apply
+        # the two exclusive-training flags to the parameters this class adds.
+        if config.train_state_action_representation_only or config.train_vision_encoder_only:
+            for param in self.ttt_parameters():
+                param.requires_grad_(False)
 
         # Fast weights carried across inference calls, and the token position
         # the next call's RoPE should start from. Both are rollout state, reset
@@ -154,6 +194,12 @@ class PI05TTTFlowMatching(PI05FlowMatching):
                 base_lr=self.config.ttt_base_lr,
                 rope_theta=self.config.ttt_rope_theta,
                 scan_checkpoint_group_size=self.config.ttt_scan_checkpoint_group_size,
+                # Pin the inner-step size to exactly one timestep's tokens. The
+                # hook in `_run_layer` derives it from `out_emb.shape[1]`, so
+                # without this the coupling would be incidental — and a
+                # mini-batch spanning two timesteps silently leaks the later
+                # one into the earlier one's output.
+                expected_mini_batch_size=self.config.n_expert_tokens_per_timestep,
             )
             layer.ttt_gate = TanhGate(width, init_value=self.config.ttt_gate_init)
 
@@ -292,6 +338,44 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         )
         return embs, pad_masks, att_masks, adarms_cond
 
+    def _expert_position_ids(self, prefix_offsets: Tensor, suffix_pad_masks: Tensor) -> Tensor:
+        """Position ids for the expert suffix that leave the action block where π₀.₅ puts it.
+
+        The obvious construction — ``prefix_offsets + cumsum(suffix_pad_masks) - 1``
+        over the whole suffix — counts the prepended registers, so every action
+        token's RoPE phase shifts by ``n_register_tokens`` relative to stock
+        π₀.₅. On a warm-start that moves the action readout the pretrained
+        weights were trained against, and no gate covers it: it happens at step
+        0 regardless of ``alpha``, and under ``train_ttt_only`` the weights that
+        could adapt to the shift are frozen. The symptom looks like "TTT hurt
+        the policy" when the cause is the displaced readout.
+
+        So the action block keeps positions ``prefix .. prefix + chunk - 1``,
+        exactly as without registers, and the registers are placed *after* it in
+        position space (``prefix + chunk ..``) while staying first in token
+        order. They share one bidirectional attention block with the actions, so
+        their position relative to the actions carries no ordering semantics —
+        only their displacement of the actions did.
+
+        Args:
+            prefix_offsets: ``(B, 1)`` count of prefix tokens the suffix follows.
+            suffix_pad_masks: ``(B, S)`` suffix padding mask.
+
+        Returns:
+            ``(B, S)`` position ids, register block first in token order.
+        """
+        num_registers = self.config.n_register_tokens
+        if num_registers == 0:
+            return prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+
+        batch_size, suffix_len = suffix_pad_masks.shape
+        num_actions = suffix_len - num_registers
+        device = suffix_pad_masks.device
+        action_positions = torch.arange(num_actions, device=device)
+        register_positions = torch.arange(num_actions, num_actions + num_registers, device=device)
+        offsets = torch.cat([register_positions, action_positions])
+        return prefix_offsets + rearrange(offsets, "s -> 1 s")
+
     def forward_sequence(
         self,
         images: list[Tensor],
@@ -308,7 +392,6 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         state: Tensor | None = None,
         real_action_dim: Tensor | None = None,
         loss_mask: Tensor | None = None,
-        tbptt_backward_fn: Callable[[Tensor], None] | None = None,
     ) -> dict[str, Tensor]:
         """Runs sequence training with TBPTT over a trajectory.
 
@@ -343,12 +426,6 @@ class PI05TTTFlowMatching(PI05FlowMatching):
                 still update the fast weights — that asymmetry is the whole
                 point, and is what makes in-context video demonstrations and
                 DAgger-style failure-to-correction distillation expressible.
-            tbptt_backward_fn: Optional callback invoked with each segment's
-                loss as soon as it is computed. Supplying it is what makes TBPTT
-                bound activation memory by the segment length; without it the
-                per-segment graphs are all retained until the caller's single
-                backward, so memory scales with the full sequence even though
-                the *gradients* are already correctly truncated.
 
         Returns:
             A dict with the mean ``MSE`` and ``CE`` losses over the sequence.
@@ -432,8 +509,6 @@ class PI05TTTFlowMatching(PI05FlowMatching):
             mse_terms.append(losses["MSE"] * weight)
             ce_terms.append(losses["CE"] * weight)
             weights.append(weight)
-            if tbptt_backward_fn is not None:
-                tbptt_backward_fn(losses["MSE"] * weight + losses["CE"] * weight)
 
             # The TBPTT boundary. Values cross, the graph does not.
             carried = {idx: fw.detach() for idx, fw in ttt_state.outgoing.items()}
@@ -582,7 +657,7 @@ class PI05TTTFlowMatching(PI05FlowMatching):
             ],
             dim=-1,
         )[:, None]
-        action_expert_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        action_expert_position_ids = self._expert_position_ids(prefix_offsets, suffix_pad_masks)
 
         if self.config.knowledge_insulation:
             for layer_idx in past_key_values:
@@ -652,8 +727,9 @@ class PI05TTTFlowMatching(PI05FlowMatching):
             num_timesteps: Timesteps in this segment.
 
         Returns:
-            The mean cross-entropy over supervised, non-pad tokens, or a zero
-            scalar when there are no discrete-action targets.
+            The cross-entropy summed over supervised, non-pad tokens and divided
+            by the total slot count — the same reduction stock π₀.₅ uses — or a
+            zero scalar when there are no discrete-action targets.
         """
         if discrete_actions is None:
             return torch.zeros((), device=prefix_out.device, dtype=torch.float32)
@@ -679,9 +755,19 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         if loss_mask is not None:
             valid = valid & rearrange(loss_mask, "b t -> (b t) 1")
 
-        # Mean over supervised, non-pad tokens. Clamped so an all-context
-        # segment yields 0 rather than a NaN that would poison the whole step.
-        return (loss * valid).sum() / valid.sum().clamp(min=1)
+        # Zero the excluded slots, then take a plain mean over *all* slots.
+        #
+        # This deliberately matches `PI05FlowMatching.forward` rather than
+        # dividing by the number of valid tokens. Dividing by `valid.sum()`
+        # scales the term by `discrete_action_max_length / mean valid tokens per
+        # row` — greater than one and data-dependent per batch, because FAST
+        # emits variable-length sequences. Since `train.py::_assemble_weighted_loss`
+        # multiplies this scalar by `loss_weighting["CE"]` directly, the two
+        # conventions optimize different MSE:CE balances and log a `Train/CE`
+        # that cannot be compared against any existing π₀.₅ run. One policy
+        # must not compute CE two ways depending on the batch's shape.
+        # `policies/utils.py::ce_per_sample` documents the same distinction.
+        return (loss * valid).mean()
 
     def denoise_step(
         self,
@@ -721,7 +807,7 @@ class PI05TTTFlowMatching(PI05FlowMatching):
             cross_att_pad_masks=prefix_pad_masks[:, :num_cross_att_tokens],
         )
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
-        action_expert_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        action_expert_position_ids = self._expert_position_ids(prefix_offsets, suffix_pad_masks)
 
         outputs_embeds, _ = self.paligemma_with_expert.forward(
             attention_mask=action_expert_2d_attention_mask,
@@ -736,12 +822,44 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         suffix_out = outputs_embeds[1][:, -self.config.chunk_size :]
         return self.action_out_proj(suffix_out).to(dtype=torch.float32)
 
-    def sample_actions(self, *args: Any, **kwargs: Any) -> Tensor:
+    def sample_actions(
+        self,
+        images: list[Tensor],
+        img_masks: list[Tensor],
+        lang_tokens: Tensor,
+        lang_masks: Tensor,
+        action_prefix: Tensor,
+        delay: Tensor,
+        noise: Tensor | None = None,
+        state: Tensor | None = None,
+        accel: Any = None,
+        **kwargs: Any,
+    ) -> Tensor:
         """Samples an action chunk, advancing the carried fast weights by one step.
 
+        The signature mirrors :meth:`PI05FlowMatching.sample_actions` parameter
+        for parameter, with ``accel`` trailing and defaulting to ``None`` — that
+        ordering is a pinned contract, because this method is ``torch.compile``d
+        at four serving entry points and ONNX-exported at one, all calling it
+        positionally.
+
+        ``n_candidates`` is deliberately *not* named. The enclosing wrapper
+        passes it by keyword, so ``**kwargs`` receives it; naming it would make
+        the AST wiring sweep classify this family as best-of-N-wired, which it
+        is not — see the refusal below and
+        ``policies.candidates.configure_candidates``.
+
         Args:
-            *args: Forwarded to :meth:`PI05FlowMatching.sample_actions`.
-            **kwargs: Forwarded to :meth:`PI05FlowMatching.sample_actions`.
+            images: Per-camera image tensors.
+            img_masks: Per-camera masks.
+            lang_tokens: Language tokens.
+            lang_masks: Language masks.
+            action_prefix: Frozen action prefix for real-time inference.
+            delay: Number of frozen prefix actions.
+            noise: Optional starting noise.
+            state: Optional continuous state.
+            accel: Optional denoising-acceleration meter.
+            **kwargs: Remaining keyword arguments, forwarded to the parent.
 
         Returns:
             The sampled action chunk.
@@ -769,21 +887,44 @@ class PI05TTTFlowMatching(PI05FlowMatching):
                 "rollout's memory. Use n_candidates=1."
             )
 
-        state = TTTSequenceState(
+        # A memory built at one batch size would broadcast silently against a
+        # wider batch, mixing one rollout's history into another's.
+        if self._carried_fast_weights:
+            carried_batch = next(iter(self._carried_fast_weights.values())).w1.shape[0]
+            incoming_batch = lang_tokens.shape[0]
+            if carried_batch != incoming_batch:
+                raise ValueError(
+                    f"carried TTT memory was built at batch size {carried_batch} but this call "
+                    f"has {incoming_batch} rows. Call `reset()` between rollouts, and do not "
+                    "change batch size mid-rollout: the fast weights are per-trajectory state."
+                )
+
+        ttt_state = TTTSequenceState(
             num_timesteps=1,
             position_offset=self._inference_token_position,
             incoming=self._carried_fast_weights,
         )
-        self._active_ttt_state = state
+        self._active_ttt_state = ttt_state
         try:
-            actions = super().sample_actions(*args, **kwargs)
+            actions = super().sample_actions(
+                images,
+                img_masks,
+                lang_tokens,
+                lang_masks,
+                action_prefix,
+                delay,
+                noise=noise,
+                state=state,
+                accel=accel,
+                **kwargs,
+            )
         finally:
             self._active_ttt_state = None
 
         # Adopt only the final Euler step's update, and detach: a rollout is not
         # a training graph, and keeping one would grow without bound.
-        if state.outgoing:
-            self._carried_fast_weights = {idx: fw.detach() for idx, fw in state.outgoing.items()}
+        if ttt_state.outgoing:
+            self._carried_fast_weights = {idx: fw.detach() for idx, fw in ttt_state.outgoing.items()}
             self._inference_token_position += self.config.n_expert_tokens_per_timestep
         return actions
 
@@ -799,6 +940,14 @@ class PI05TTTPolicy(PI05Policy):
 
     config_class = PI05TTTConfig
     name = "pi05_ttt"
+    # Read by `policies.candidates.configure_candidates`, which otherwise probes
+    # `hasattr(policy, "n_candidates")` — an attribute this class inherits from
+    # `PI05Policy.__init__`, so the probe alone would let best-of-N arm and fail
+    # only on the first robot request.
+    supports_candidate_sampling = False
+    # Read by the gRPC server and the ONNX exporter: the fast weights are
+    # per-rollout state that must be reset per episode and cannot be traced.
+    carries_rollout_state = True
     # The sequence path drives a Python-level loop over TBPTT segments whose
     # trip count depends on the batch's timestep count, which is exactly the
     # shape of graph break torch.compile handles worst. Left off until the
@@ -815,9 +964,6 @@ class PI05TTTPolicy(PI05Policy):
         self.config: PI05TTTConfig = config
         if config.train_ttt_only:
             self.model.freeze_pretrained_parameters()
-        # Optional per-segment backward, for a training loop that opts into
-        # bounded activation memory. See `forward_sequence`.
-        self.tbptt_backward_fn: Callable[[Tensor], None] | None = None
 
     def _build_flow_matching(
         self, config: PI05TTTConfig, discrete_action_vocab_size: int | None
@@ -882,9 +1028,25 @@ class PI05TTTPolicy(PI05Policy):
             NotImplementedError: If ``noise``, ``time`` or ``return_per_sample``
                 is used together with a sequence batch.
         """
-        num_timesteps = self._sequence_length(batch)
-        if num_timesteps is None:
-            return super().forward(batch, noise=noise, time=time, return_per_sample=return_per_sample)
+        # Every batch goes through the sequence path, including a flat one,
+        # which is treated as a single-timestep sequence.
+        #
+        # Delegating a flat batch to `PI05Policy.forward` (the previous
+        # behaviour) meant `PI05FlowMatching.forward` ran without a
+        # `ttt_state`, so the TTT branch in `_run_layer` was skipped and *no
+        # TTT parameter reached the autograd graph at all*. Combined with
+        # `train_ttt_only=True` that left 85.3M parameters nominally trainable
+        # of which only the 16K register table received a gradient — and under
+        # DDP with FIND_UNUSED_PARAMS=false, or under ZeRO-3, an unused
+        # parameter is a reducer error or an NCCL hang rather than a slow run.
+        #
+        # The number of timesteps comes from `config.sequence_length`, not from
+        # the batch, and the batch is validated against it. That keeps the TBPTT
+        # segment count — and therefore the number of backward calls — identical
+        # on every rank by construction (CLAUDE.md rule 5) instead of depending
+        # on what each rank's micro-batch happened to contain.
+        num_timesteps = self.config.sequence_length
+        batch = self._as_sequence_batch(batch, num_timesteps)
 
         if noise is not None or time is not None:
             raise NotImplementedError(
@@ -942,7 +1104,6 @@ class PI05TTTPolicy(PI05Policy):
             state=state,
             real_action_dim=flat_batch.get("real_action_dim"),
             loss_mask=loss_mask,
-            tbptt_backward_fn=self.tbptt_backward_fn,
         )
 
     @staticmethod
@@ -977,6 +1138,8 @@ class PI05TTTPolicy(PI05Policy):
 
         Returns:
             A new dict with every per-timestep entry flattened to ``B * T`` rows.
+            At ``num_timesteps == 1`` the batch is already in that shape and is
+            returned as a shallow copy.
 
         Note:
             The rule is shape-based, so a trajectory-level tensor that happens
@@ -986,6 +1149,11 @@ class PI05TTTPolicy(PI05Policy):
             having the dataloader label its per-timestep keys explicitly when
             the sequence data path lands.
         """
+        if num_timesteps == 1:
+            # `_as_sequence_batch` leaves a single-timestep batch flat, and
+            # flattening (B, 1, ...) would be the identity anyway.
+            return dict(batch)
+
         flat: dict[str, Any] = {}
         for key, value in batch.items():
             if key == "loss_mask":
@@ -1009,16 +1177,53 @@ class PI05TTTPolicy(PI05Policy):
         return flat
 
     @staticmethod
-    def _sequence_length(batch: dict[str, Tensor]) -> int | None:
-        """Detects a trajectory batch and returns its timestep count.
+    def _as_sequence_batch(batch: dict[str, Any], num_timesteps: int) -> dict[str, Any]:
+        """Normalizes a batch to carry a leading timestep axis of ``num_timesteps``.
+
+        A batch whose ``actions`` are ``(B, chunk, dim)`` is a single timestep
+        per row; it is unsqueezed to ``(B, 1, chunk, dim)`` so the sequence path
+        can run it. A batch that already carries a timestep axis must match
+        ``config.sequence_length`` exactly — a mismatch is a config error, and
+        silently adopting the batch's length would make the segment count
+        rank-dependent.
 
         Args:
-            batch: Candidate training batch.
+            batch: Training batch, with or without a timestep axis.
+            num_timesteps: The configured ``sequence_length``.
 
         Returns:
-            ``T`` when ``actions`` carries a leading timestep axis, else None.
+            The batch, unchanged if it already has the right shape.
+
+        Raises:
+            ValueError: If ``actions`` is missing, has an unusable rank, or
+                carries a timestep axis that disagrees with the config.
         """
         actions = batch.get("actions")
-        if actions is None or actions.ndim != 4:
-            return None
-        return actions.shape[1]
+        if actions is None:
+            raise ValueError("pi05_ttt.forward requires an `actions` entry in the batch")
+
+        if actions.ndim == 3:
+            if num_timesteps != 1:
+                raise ValueError(
+                    f"config.sequence_length={num_timesteps} but the batch carries no timestep "
+                    "axis (actions is (B, chunk, dim)), so only sequence_length=1 can consume "
+                    "it. Today's dataloader emits one timestep per row; set sequence_length=1, "
+                    "or supply (B, T, chunk, dim) batches."
+                )
+            # Left flat on purpose: unsqueezing to (B, 1, ...) and flattening
+            # straight back is the identity, so the round trip would only add a
+            # chance to misclassify which keys are per-timestep.
+            return batch
+
+        if actions.ndim != 4:
+            raise ValueError(
+                f"`actions` must be (B, chunk, dim) or (B, T, chunk, dim), got rank {actions.ndim}"
+            )
+        if actions.shape[1] != num_timesteps:
+            raise ValueError(
+                f"batch carries T={actions.shape[1]} timesteps but "
+                f"config.sequence_length={num_timesteps}. The configured value is the source of "
+                "truth so the TBPTT segment count is identical on every rank; fix the config or "
+                "the dataloader rather than letting the batch decide."
+            )
+        return batch

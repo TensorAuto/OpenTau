@@ -404,6 +404,21 @@ def configure_candidates(
         return 1
 
     policy_type = getattr(getattr(cfg, "policy", cfg), "type", type(policy).__name__)
+    # A policy carrying recurrent rollout state cannot fan out candidates: the
+    # chunks the losing candidates produced are never executed, so adopting
+    # their state is wrong, and adopting the winner's makes the state depend on
+    # a critic the training run never saw. Such a family may *inherit* a wired
+    # `__init__` (pi05_ttt inherits `PI05Policy`'s, attribute included), so the
+    # `hasattr` probe below cannot see it — check the opt-out explicitly, and
+    # here rather than in the sampler, so the failure lands at startup like
+    # every other configure-time failure this function exists to surface.
+    if not getattr(policy, "supports_candidate_sampling", True):
+        raise ValueError(
+            f"n_candidates={n} was requested but policy type {policy_type!r} carries recurrent "
+            "rollout state (test-time-training fast weights), so best-of-N is undefined for it: "
+            "there is no correct answer for which candidate's state update the rollout should "
+            "adopt. Use n_candidates=1."
+        )
     # A family whose sampler has not been wired would accept the attribute and then never
     # read it — the silent no-op an operator would read as "the critic never fires". Refuse.
     if not hasattr(policy, "n_candidates"):

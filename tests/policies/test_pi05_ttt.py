@@ -25,13 +25,15 @@ an error in that algebra hides under the tolerance you need for the noise; in
 float64 the equivalences below hold to ~1e-12, so they actually pin the math.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F  # noqa: N812
 from einops import rearrange
 
 from opentau.policies.pi05_ttt.configuration_pi05_ttt import PI05TTTConfig
-from opentau.policies.pi05_ttt.modeling_pi05_ttt import PI05TTTPolicy
+from opentau.policies.pi05_ttt.modeling_pi05_ttt import PI05TTTFlowMatching, PI05TTTPolicy
 from opentau.policies.ttt_layer import (
     TanhGate,
     TTTFastWeights,
@@ -163,9 +165,16 @@ class TestTBPTT:
     def test_position_offset_is_load_bearing(self):
         """Resuming without the offset must give a different answer.
 
-        Mutation-killing counterpart to the test above: if the offset were
-        ignored, that test would pass anyway on a layer whose RoPE silently
-        restarted at zero every segment.
+        The mutation this uniquely kills is **RoPE being a no-op**: with
+        ``_rotary_1d`` returning ``x`` unchanged,
+        ``test_segmented_run_matches_single_run`` still passes and only this
+        test fails.
+
+        It is *not* the mutation-killer for "the offset is ignored" — an earlier
+        docstring here claimed that, and the claim was wrong. Dropping the
+        offset makes ``test_segmented_run_matches_single_run`` fail first. Said
+        the wrong way round, this note would tell a maintainer trimming tests
+        that the stronger test above is the redundant one.
         """
         layer = _layer()
         sequence = torch.randn(2, 4 * MINI_BATCH, WIDTH, dtype=torch.float64)
@@ -231,16 +240,37 @@ class TestTBPTT:
         torch.testing.assert_close(detached.w1, weights.w1, atol=0, rtol=0)
         assert not detached.w1.requires_grad
 
-    def test_checkpointed_scan_matches_plain_scan(self):
-        """Gradient checkpointing must only trade compute, never change values."""
+    def test_checkpointed_scan_matches_plain_scan_in_forward_and_backward(self):
+        """Checkpointing must trade compute only — including in the backward.
+
+        The forward half of this cannot fail: recompute is the same code on the
+        same inputs. The backward half can. ``_scan_mini_batches`` threads the
+        fast-weight carry between groups through ``torch.utils.checkpoint``
+        outputs; if that carry leaves the autograd graph, every gradient
+        reaching ``w1_init``/``b1_init``/``w2_init``/``b2_init``, ``wk``, ``wv``,
+        ``ttt_lr_*`` and ``ttt_norm_weight`` from all but the final group is
+        silently dropped — with no error, because the output still requires grad
+        through ``xq``. Detaching the carry at line ~374 leaves the forward
+        bit-identical and shifts the gradient w.r.t. the initial fast weights by
+        roughly 30%, so only a gradient assertion catches it.
+        """
         plain = _layer()
         checkpointed = _layer(scan_checkpoint_group_size=2)
         checkpointed.load_state_dict(plain.state_dict())
 
         sequence = torch.randn(2, 4 * MINI_BATCH, WIDTH, dtype=torch.float64)
+
         plain_out, _ = plain(sequence, mini_batch_size=MINI_BATCH)
+        plain_out.square().sum().backward()
         checkpointed_out, _ = checkpointed(sequence, mini_batch_size=MINI_BATCH)
+        checkpointed_out.square().sum().backward()
+
         torch.testing.assert_close(checkpointed_out, plain_out, atol=1e-10, rtol=0)
+        for name in ("w1_init", "b1_init", "w2_init", "b2_init", "ttt_norm_weight"):
+            expected = getattr(plain, name).grad
+            actual = getattr(checkpointed, name).grad
+            assert expected is not None and actual is not None, f"{name} has no gradient"
+            torch.testing.assert_close(actual, expected, atol=1e-9, rtol=1e-7)
 
 
 class TestTanhGate:
@@ -329,12 +359,29 @@ class TestPI05TTTConfig:
 class TestSequenceBatchHandling:
     """Pins the ``(B, T)`` folding the sequence path depends on."""
 
-    def test_sequence_length_detects_a_trajectory_batch(self):
-        assert PI05TTTPolicy._sequence_length({"actions": torch.zeros(2, 5, 50, 32)}) == 5
+    def test_flat_batch_is_accepted_only_at_sequence_length_one(self):
+        """A flat batch is a one-timestep sequence, and only that.
 
-    def test_sequence_length_is_none_for_a_flat_batch(self):
-        assert PI05TTTPolicy._sequence_length({"actions": torch.zeros(2, 50, 32)}) is None
-        assert PI05TTTPolicy._sequence_length({}) is None
+        The configured length is the source of truth so the TBPTT segment count
+        is identical on every rank; adopting the batch's length instead would
+        make the number of backward calls depend on micro-batch content.
+        """
+        flat = {"actions": torch.zeros(2, 50, 32)}
+        assert PI05TTTPolicy._as_sequence_batch(flat, 1) is flat
+        with pytest.raises(ValueError, match="no timestep axis"):
+            PI05TTTPolicy._as_sequence_batch(flat, 4)
+
+    def test_sequence_batch_must_match_the_configured_length(self):
+        good = {"actions": torch.zeros(2, 4, 50, 32)}
+        assert PI05TTTPolicy._as_sequence_batch(good, 4) is good
+        with pytest.raises(ValueError, match="config.sequence_length"):
+            PI05TTTPolicy._as_sequence_batch({"actions": torch.zeros(2, 3, 50, 32)}, 4)
+
+    def test_rejects_a_batch_with_no_actions_or_a_bad_rank(self):
+        with pytest.raises(ValueError, match="requires an `actions`"):
+            PI05TTTPolicy._as_sequence_batch({}, 1)
+        with pytest.raises(ValueError, match="rank 2"):
+            PI05TTTPolicy._as_sequence_batch({"actions": torch.zeros(2, 32)}, 1)
 
     def test_per_timestep_tensors_are_flattened_batch_major(self):
         """Row order must be ``(batch, timestep)``.
@@ -407,10 +454,173 @@ class TestTTTSequenceState:
         )
         assert second.outgoing == {}, "default_factory leaked a shared dict between instances"
 
-    def test_missing_incoming_key_means_start_from_w0(self):
+    def test_a_layer_absent_from_incoming_starts_from_w0(self):
+        """A per-layer lookup miss must mean "start from W_0", not "reuse someone else's".
+
+        The previous version of this test passed ``incoming.get(0)`` on a state
+        with an empty ``incoming``, i.e. ``None`` on both sides of the
+        comparison — true for any implementation whatsoever. Populating a
+        *different* layer index is what makes the lookup do work.
+        """
         layer = _layer()
-        state = TTTSequenceState(num_timesteps=1)
         x = torch.randn(1, MINI_BATCH, WIDTH, dtype=torch.float64)
+
+        _, other_layers_weights = layer(x, mini_batch_size=MINI_BATCH)
+        state = TTTSequenceState(num_timesteps=1, incoming={7: other_layers_weights})
+
         from_w0, _ = layer(x, mini_batch_size=MINI_BATCH, fast_weights=None)
-        from_missing, _ = layer(x, mini_batch_size=MINI_BATCH, fast_weights=state.incoming.get(0))
-        torch.testing.assert_close(from_missing, from_w0, atol=0, rtol=0)
+        layer_0, _ = layer(x, mini_batch_size=MINI_BATCH, fast_weights=state.incoming.get(0))
+        layer_7, _ = layer(x, mini_batch_size=MINI_BATCH, fast_weights=state.incoming.get(7))
+
+        torch.testing.assert_close(layer_0, from_w0, atol=0, rtol=0)
+        assert not torch.allclose(layer_7, from_w0, atol=1e-8), (
+            "the populated layer index resolved to W_0, so `incoming` is being ignored"
+        )
+
+
+class _StubSequenceModel:
+    """Drives the real ``forward_sequence`` with a scripted segment forward.
+
+    ``forward_sequence`` is the correctness core of this policy — it owns the
+    TBPTT boundary, the per-segment loss weighting and the denominator clamp —
+    and all of it is pure tensor logic. Exercising it previously required a
+    3.4B-parameter model on a GPU, which is why none of it was pinned at any
+    level. Borrowing the unbound method onto a stub puts it in the CPU suite,
+    where the gating check actually runs it.
+
+    The stub's segment forward records the incoming carry, publishes a new one
+    derived from ``root``, and returns a loss that *reads the incoming carry* —
+    so a gradient reaching ``root`` from a later segment is exactly the signal
+    that the boundary failed to detach.
+
+    Args:
+        segment_length: Value for ``config.tbptt_segment_length``.
+        root: Leaf tensor every published carry is derived from.
+    """
+
+    forward_sequence = PI05TTTFlowMatching.forward_sequence
+    _segment_rows = staticmethod(PI05TTTFlowMatching._segment_rows)
+
+    def __init__(self, segment_length: int, root: torch.Tensor):
+        self.config = SimpleNamespace(
+            tbptt_segment_length=segment_length,
+            n_expert_tokens_per_timestep=3,
+        )
+        self.root = root
+        self.seen_incoming: list[dict] = []
+        self.seen_offsets: list[int] = []
+
+    def _forward_segment(self, **kwargs) -> dict[str, torch.Tensor]:
+        """Scripted stand-in for the real per-segment forward.
+
+        Args:
+            **kwargs: Whatever ``forward_sequence`` passes; only ``ttt_state``
+                and ``loss_mask`` are used.
+
+        Returns:
+            ``MSE``/``CE`` scalars that depend on the incoming carry.
+        """
+        state = kwargs["ttt_state"]
+        self.seen_incoming.append(dict(state.incoming))
+        self.seen_offsets.append(state.position_offset)
+
+        carry_in = state.incoming.get(0)
+        loss = self.root.sum() * 0.0 if carry_in is None else carry_in.w1.sum()
+
+        published = self.root * 2.0
+        state.outgoing[0] = TTTFastWeights(w1=published, b1=published, w2=published, b2=published)
+        return {"MSE": loss, "CE": torch.zeros((), dtype=loss.dtype)}
+
+
+def _run_stub(num_timesteps: int, segment_length: int, loss_mask=None):
+    """Runs the stub through ``forward_sequence``.
+
+    Args:
+        num_timesteps: Sequence length.
+        segment_length: TBPTT segment length.
+        loss_mask: Optional ``(B, T)`` supervision mask.
+
+    Returns:
+        ``(model, losses, root)``.
+    """
+    root = torch.ones(2, 2, dtype=torch.float64, requires_grad=True)
+    model = _StubSequenceModel(segment_length, root)
+    rows = num_timesteps  # batch_size = 1
+    losses = model.forward_sequence(
+        images=[torch.zeros(rows, 1, dtype=torch.float64)],
+        img_masks=[torch.ones(rows, dtype=torch.bool)],
+        lang_tokens=torch.zeros(rows, 1, dtype=torch.long),
+        lang_masks=torch.ones(rows, 1, dtype=torch.bool),
+        actions=torch.zeros(rows, 4, 32, dtype=torch.float64),
+        num_timesteps=num_timesteps,
+        loss_mask=loss_mask,
+    )
+    return model, losses, root
+
+
+class TestForwardSequenceTBPTT:
+    """Pins the TBPTT boundary and the loss arithmetic around it."""
+
+    def test_boundary_detaches_the_carry(self):
+        """A later segment must not backpropagate into an earlier one.
+
+        This is the "truncated" in truncated BPTT, and deleting the ``.detach()``
+        in ``forward_sequence`` used to leave every test in the suite passing
+        while activation memory grew with ``sequence_length`` instead of
+        ``tbptt_segment_length``.
+        """
+        model, losses, root = _run_stub(num_timesteps=4, segment_length=2)
+        losses["MSE"].backward()
+        assert root.grad is None or root.grad.abs().sum() == 0, (
+            "gradient flowed from a later segment into an earlier segment's carry — "
+            "the TBPTT boundary is not detaching"
+        )
+
+    def test_carry_values_still_cross_the_boundary(self):
+        """Detaching must cut the graph without dropping the values.
+
+        The counterpart to the test above: a boundary that dropped the carry
+        entirely would also show no gradient, and would be just as wrong.
+        """
+        model, _, _ = _run_stub(num_timesteps=4, segment_length=2)
+        assert model.seen_incoming[0] == {}, "the first segment should start from W_0"
+        assert 0 in model.seen_incoming[1], "the second segment received no carry at all"
+        torch.testing.assert_close(model.seen_incoming[1][0].w1, torch.full((2, 2), 2.0, dtype=torch.float64))
+
+    def test_position_offset_advances_by_a_whole_segment(self):
+        """RoPE must resume where the previous segment stopped."""
+        model, _, _ = _run_stub(num_timesteps=6, segment_length=2)
+        tokens = model.config.n_expert_tokens_per_timestep
+        assert model.seen_offsets == [0, 2 * tokens, 4 * tokens]
+
+    def test_rejects_a_segment_length_that_does_not_divide(self):
+        with pytest.raises(ValueError, match="multiple of"):
+            _run_stub(num_timesteps=5, segment_length=2)
+
+    def test_all_context_sequence_yields_a_finite_zero(self):
+        """An all-masked sequence must not divide by zero.
+
+        Raising instead would be a data-dependent branch, which must never
+        decide control flow that fires collectives.
+        """
+        mask = torch.zeros(1, 4, dtype=torch.bool)
+        _, losses, _ = _run_stub(num_timesteps=4, segment_length=2, loss_mask=mask)
+        assert torch.isfinite(losses["MSE"])
+        assert losses["MSE"].item() == pytest.approx(0.0)
+
+    def test_loss_is_weighted_by_supervised_timestep_count(self):
+        """The sequence mean must be over supervised timesteps only.
+
+        With segment 0 fully masked and segment 1 fully supervised, the
+        denominator must be segment 1's count — not the whole sequence's — so
+        masking part of a sequence does not silently scale the loss down.
+        """
+        mask = torch.tensor([[False, False, True, True]])
+        _, masked, _ = _run_stub(num_timesteps=4, segment_length=2, loss_mask=mask)
+        _, full, _ = _run_stub(num_timesteps=4, segment_length=2)
+        # Segment 1 reads a carry of 2.0 over 4 elements = 8.0, weighted by 2
+        # supervised timesteps and divided by the same 2.
+        assert masked["MSE"].item() == pytest.approx(8.0)
+        # Unmasked, both segments contribute (segment 0 sees no carry -> 0.0),
+        # weighted 2 each over a denominator of 4.
+        assert full["MSE"].item() == pytest.approx(4.0)

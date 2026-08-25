@@ -41,6 +41,7 @@ import torch
 from opentau.configs.types import FeatureType, PolicyFeature
 from opentau.policies.pi05_ttt.configuration_pi05_ttt import PI05TTTConfig
 from opentau.policies.pi05_ttt.modeling_pi05_ttt import PI05TTTPolicy
+from opentau.policies.utils import to_dtype_preserving_siglip_float32
 from tests.utils import require_vram_gib
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
@@ -135,11 +136,12 @@ def _policy(config: PI05TTTConfig) -> PI05TTTPolicy:
         ``self``, so ``policy = policy.eval()`` would silently yield ``None``.
     """
     torch.manual_seed(0)
-    policy = (
-        PI05TTTPolicy(config, per_dataset_stats=_stats(config), dataset_names=["synthetic"])
-        .to("cuda")
-        .to(torch.bfloat16)
-    )
+    policy = PI05TTTPolicy(config, per_dataset_stats=_stats(config), dataset_names=["synthetic"])
+    # Routed rather than a blanket `.to(bfloat16)`: since #482 the SigLIP patch
+    # embedding conv and position table are pinned float32 (CLAUDE.md rule 6),
+    # and a blanket cast re-rounds them. Nothing here measures the vision tower,
+    # but the tests should exercise the same tower every served checkpoint uses.
+    policy = to_dtype_preserving_siglip_float32(policy, dtype=torch.bfloat16, device="cuda")
     policy.eval()
     return policy
 
@@ -280,11 +282,8 @@ def test_sequence_forward_produces_gradients_for_every_added_parameter():
     """
     config = _config()
     torch.manual_seed(0)
-    policy = (
-        PI05TTTPolicy(config, per_dataset_stats=_stats(config), dataset_names=["synthetic"])
-        .to("cuda")
-        .to(torch.bfloat16)
-    )
+    policy = PI05TTTPolicy(config, per_dataset_stats=_stats(config), dataset_names=["synthetic"])
+    policy = to_dtype_preserving_siglip_float32(policy, dtype=torch.bfloat16, device="cuda")
     batch = _sequence_batch(config, num_timesteps=4)
 
     losses = policy.forward(batch)
@@ -345,39 +344,120 @@ def test_train_ttt_only_freezes_exactly_the_pretrained_weights():
     config = _config(train_ttt_only=True)
     policy = PI05TTTPolicy(config, per_dataset_stats=_stats(config), dataset_names=["synthetic"])
     trainable = {name for name, p in policy.named_parameters() if p.requires_grad}
-    assert trainable, "train_ttt_only left nothing trainable"
-    for name in trainable:
-        assert ".ttt." in name or ".ttt_gate." in name or name.endswith("register_tokens"), (
-            f"{name} should have been frozen by train_ttt_only"
-        )
+    expected = {
+        name
+        for name, _ in policy.named_parameters()
+        if ".ttt." in name or ".ttt_gate." in name or name.endswith("register_tokens")
+    }
+    # Two-way on purpose. A subset check (`trainable <= expected`) passes with
+    # the TTT layers frozen entirely as long as one register parameter survives
+    # — the state this policy was actually in while the flat-batch path bypassed
+    # the sequence path and no TTT parameter reached the graph.
+    assert trainable == expected, (
+        f"trainable but should not be: {sorted(trainable - expected)}; "
+        f"should be trainable but frozen: {sorted(expected - trainable)}"
+    )
     assert any(not p.requires_grad for p in policy.parameters()), "nothing was frozen"
 
 
 @pytest.mark.gpu
 @pytest.mark.slow
 @require_vram_gib(_MIN_VRAM_GIB)
-def test_rollout_memory_advances_once_per_call_and_resets():
-    """One ``select_action`` must advance memory by exactly one timestep.
+def test_rollout_adopts_only_the_final_denoise_step_and_resets():
+    """One policy call must commit exactly one fast-weight update — the last.
 
-    ``config.num_steps`` denoising steps run inside each call, and only the last
-    one's fast-weight update may be adopted. If every denoising step committed,
-    inference memory would advance ``num_steps`` times faster than it ever did
-    in training.
+    ``config.num_steps`` denoising steps run inside a single ``select_action``,
+    and each one drives the TTT layers and writes into ``ttt_state.outgoing``.
+    Only the final write may be adopted; if every step committed, inference
+    memory would advance ``num_steps`` times faster than training ever did.
+
+    An earlier version of this test asserted only
+    ``_inference_token_position == n_expert_tokens_per_timestep``. That counter
+    is incremented once per call unconditionally, outside any loop, so it reads
+    the same value whether one update or ten were composed — it could not detect
+    the failure the docstring named. This records every write the layer makes
+    and pins the adopted carry to the last of them, with the first as the
+    mutation-killer.
     """
     config = _config()
     policy = _policy(config)
+    layer = policy.model.paligemma_with_expert.gemma_expert.model.layers[0]
+
+    writes: list[torch.Tensor] = []
+    real_forward = layer.ttt.forward
+
+    def recording_forward(*args, **kwargs):
+        out, fast_weights = real_forward(*args, **kwargs)
+        writes.append(fast_weights.w1.detach().clone())
+        return out, fast_weights
+
+    layer.ttt.forward = recording_forward
     observation = {
         "camera0": torch.rand(1, 3, 224, 224, device="cuda", dtype=torch.bfloat16),
         "state": torch.rand(1, config.max_state_dim, device="cuda", dtype=torch.bfloat16),
         "prompt": ["assemble the gear"],
     }
+    try:
+        assert policy.model._carried_fast_weights == {}
+        with torch.no_grad():
+            policy.select_action(dict(observation))
+    finally:
+        layer.ttt.forward = real_forward
 
-    assert policy.model._carried_fast_weights == {}
-    with torch.no_grad():
-        policy.select_action(dict(observation))
-    assert policy.model._carried_fast_weights, "memory was not carried out of the call"
+    assert len(writes) == config.num_steps, (
+        f"expected one TTT write per denoise step ({config.num_steps}), saw {len(writes)}"
+    )
+    adopted = policy.model._carried_fast_weights[0].w1
+    torch.testing.assert_close(adopted, writes[-1], atol=0, rtol=0)
+    assert not torch.equal(writes[0], writes[-1]), (
+        "every denoise step produced the same fast weights, so this test cannot "
+        "distinguish adopting the first from adopting the last"
+    )
     assert policy.model._inference_token_position == config.n_expert_tokens_per_timestep
 
     policy.reset()
     assert policy.model._carried_fast_weights == {}, "reset() leaked memory across episodes"
     assert policy.model._inference_token_position == 0
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+@require_vram_gib(_MIN_VRAM_GIB)
+def test_trajectories_do_not_interleave_at_batch_size_two():
+    """Two trajectories in one batch must keep separate memories.
+
+    Every other sequence test here runs at ``batch_size=1``, where batch-major
+    and time-major row order are *identical* — so the ``(b t)`` contract shared
+    by ``_flatten_sequence_batch``, ``_segment_rows`` and the hook's inverse
+    ``rearrange(out_emb, "(b t) s w -> b (t s) w")`` is never exercised end to
+    end, even though all three docstrings warn that getting it wrong "would
+    silently interleave trajectories inside the memory".
+
+    Scoring only trajectory 0's final timestep and then changing *trajectory
+    1's* inputs is a direct probe: under a correct row order the loss cannot
+    move.
+    """
+    config = _config()
+    policy = _policy(config)
+    _set_gate(policy, 1.0)  # memory wide open, so a leak would show
+
+    batch = _sequence_batch(config, num_timesteps=4)
+    two = {
+        key: (torch.cat([value, value.clone()], dim=0) if isinstance(value, torch.Tensor) else value * 2)
+        for key, value in batch.items()
+    }
+    altered = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in two.items()}
+    altered["state"][1] = torch.rand_like(altered["state"][1])
+    altered["actions"][1] = torch.rand_like(altered["actions"][1])
+
+    # Supervise only trajectory 0's last timestep.
+    mask = torch.zeros(2, 4, dtype=torch.bool, device="cuda")
+    mask[0, -1] = True
+
+    with torch.no_grad():
+        torch.manual_seed(1)
+        first = policy.forward({**two, "loss_mask": mask})["MSE"]
+        torch.manual_seed(1)
+        second = policy.forward({**altered, "loss_mask": mask})["MSE"]
+
+    torch.testing.assert_close(first, second, atol=1e-3, rtol=1e-2)

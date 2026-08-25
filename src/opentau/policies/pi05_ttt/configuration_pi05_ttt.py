@@ -40,7 +40,13 @@ class PI05TTTConfig(PI05Config):
     Inherits every π₀.₅ field unchanged and adds the TTT-specific ones below.
     A TTT layer is inserted after the attention block of each action-expert
     layer, gated by ``tanh(alpha)`` with ``alpha`` initialized to
-    ``ttt_gate_init``, so at step 0 the policy reproduces stock π₀.₅.
+    ``ttt_gate_init``, so the TTT *memory* contributes nothing at step 0.
+
+    That is not the same as reproducing stock π₀.₅: with ``n_register_tokens >
+    0`` the register block is an ungated change to the expert's input, taking
+    softmax mass from the action tokens even though the table is zero-initialized
+    and the action block's position ids are held fixed. Only
+    ``n_register_tokens=0`` is bit-identical to stock π₀.₅.
 
     Note on the meaning of a "timestep": in RoboTTT a timestep is one control
     step at 30 Hz, and 8K timesteps is about five minutes. Here a timestep is
@@ -105,6 +111,11 @@ class PI05TTTConfig(PI05Config):
 
     train_ttt_only: bool = True
 
+    # `PI05TTTPolicy.supports_torch_compile` is False (the sequence path drives a
+    # Python-level loop over TBPTT segments), so inheriting π₀.₅'s `True` meant
+    # every default run hit `maybe_compile_for_training`'s warn-and-skip path.
+    use_torch_compile: bool = False
+
     def __post_init__(self):
         """Validates the TTT fields on top of π₀.₅'s own validation.
 
@@ -118,6 +129,20 @@ class PI05TTTConfig(PI05Config):
             raise ValueError(f"n_register_tokens must be >= 0, got {self.n_register_tokens}")
         if self.ttt_num_heads <= 0:
             raise ValueError(f"ttt_num_heads must be > 0, got {self.ttt_num_heads}")
+        # The documented contract, enforced here rather than at model-build
+        # time: a bad value used to survive config validation and die only after
+        # a 3.4B-parameter model had been constructed. `proj_width` is the
+        # action expert's hidden size.
+        if self.proj_width % self.ttt_num_heads != 0:
+            raise ValueError(
+                f"ttt_num_heads={self.ttt_num_heads} must divide the action expert's width "
+                f"proj_width={self.proj_width}"
+            )
+        if (self.proj_width // self.ttt_num_heads) % 2 != 0:
+            raise ValueError(
+                f"ttt_num_heads={self.ttt_num_heads} gives an odd TTT head dim "
+                f"({self.proj_width // self.ttt_num_heads}); rotary embeddings need it even"
+            )
         if self.ttt_mlp_hidden_multiplier <= 0:
             raise ValueError(f"ttt_mlp_hidden_multiplier must be > 0, got {self.ttt_mlp_hidden_multiplier}")
         if self.ttt_base_lr <= 0:
@@ -152,10 +177,12 @@ class PI05TTTConfig(PI05Config):
 
         if self.sequence_length == 1:
             logging.warning(
-                "sequence_length=1 trains the TTT layers on a single timestep per sequence, so "
-                "the fast weights never take more than one update and the memory cannot learn "
-                "anything across time. This is stock pi05 plus dead parameters — set "
-                "sequence_length > 1 to actually train the memory."
+                "sequence_length=1 trains the TTT layers on a single timestep per sequence. "
+                "Every TTT parameter is still on the autograd graph and receives gradients, so "
+                "the plumbing is exercised and distributed training is well-formed — but the "
+                "fast weights only ever take one update per sequence, so the memory cannot "
+                "learn anything that spans timesteps. This is the only value today's dataloader "
+                "can supply; raise it once the data path emits trajectory sequences."
             )
 
     @property

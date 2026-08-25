@@ -178,14 +178,22 @@ checkpoint at matched dtype, so `train_ttt_only` holds. The sequence path (TBPTT
 was exercised on real DROID trajectory windows.
 
 **Not yet usable for real long-context training.** The dataloader does not emit multi-timestep
-trajectory sequences, so a `pi05_ttt` run against today's data path takes the single-timestep
-branch and trains like stock π₀.₅ with an extra near-zero-gated memory. Gradients are truncated
-as specified, but the *activation-memory* benefit of TBPTT needs one backward per segment, which
-the shared training loop does not do (see `tbptt_backward_fn`). The frozen VLM prefix is also
-recomputed per timestep rather than precomputed and cached. Best-of-N candidate sampling is
-refused outright, because there is no defined answer for which candidate's fast-weight update
-should become the rollout's memory. DAgger Distillation is a data-collection procedure; the loss
-masking it needs is here, the procedure is not.
+trajectory sequences, so `sequence_length` is 1 in both shipped configs: TTT runs and every TTT
+parameter receives gradients, but the fast weights take one update per sequence and cannot learn
+anything spanning timesteps. Gradients are truncated as specified; the *activation-memory*
+benefit of TBPTT additionally needs one backward per segment, which the shared training loop does
+not do. The frozen VLM prefix is recomputed per timestep rather than precomputed and cached.
+Best-of-N candidate sampling and ONNX export are refused outright, and the gRPC server skips
+compiling `sample_actions` and resets the policy per task, because the fast weights are
+per-rollout state. DAgger Distillation is a data-collection procedure; the loss masking it needs
+is here, the procedure is not.
+
+**The gate makes the TTT branch inert at init, not the whole policy.** At `alpha = 0` the TTT
+contribution is bit-identical to not running it. The register block is a separate, ungated change
+to the action expert's input: the tokens take softmax mass from the action tokens. The table is
+zero-initialized and the position ids are built so the action block keeps the RoPE phase it has
+without registers, which is as close as this gets — only `n_register_tokens=0` is bit-identical to
+stock π₀.₅.
 
 ## [0.13.0] - 2026-08-17
 

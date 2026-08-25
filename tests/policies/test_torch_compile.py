@@ -38,6 +38,7 @@ import torch.nn as nn
 from opentau.policies.pi0.configuration_pi0 import PI0Config
 from opentau.policies.pi05.configuration_pi05 import PI05Config, PI05ContinuousStateConfig
 from opentau.policies.pi05_mem.configuration_pi05 import PI05MemConfig
+from opentau.policies.pi05_ttt.configuration_pi05_ttt import PI05TTTConfig
 from opentau.policies.pi06.configuration_pi06 import PI06Config
 from opentau.policies.pi07.high_level_planner.configuration_pi07_high_level import (
     PI07HighLevelPlannerConfig as PI07HighLevelConfig,
@@ -57,6 +58,7 @@ _POLICY_CONFIG_CASES = [
     (PI05Config, "PI05Config"),
     (PI05ContinuousStateConfig, "PI05ContinuousStateConfig"),
     (PI05MemConfig, "PI05MemConfig"),
+    (PI05TTTConfig, "PI05TTTConfig"),
     (PI06Config, "PI06Config"),
     (PI07LowLevelConfig, "PI07LowLevelConfig"),
     (PI07HighLevelConfig, "PI07HighLevelConfig"),
@@ -69,7 +71,11 @@ _POLICY_CONFIG_IDS = [name for _, name in _POLICY_CONFIG_CASES]
 
 # Policies wired for (and defaulting to) torch.compile — their forward dispatches
 # self.model via __call__ and they set supports_torch_compile=True. PI05Config's
-# default propagates to its PI05ContinuousStateConfig subclass.
+# default propagates to its PI05ContinuousStateConfig subclass, but *not* to
+# PI05TTTConfig, which overrides it back to False: that policy's sequence path
+# drives a Python-level loop over TBPTT segments and sets
+# supports_torch_compile=False, so inheriting True would send every default run
+# through maybe_compile_for_training's warn-and-skip path.
 _COMPILE_ON_BY_DEFAULT = {PI05Config, PI05ContinuousStateConfig, PI07LowLevelConfig}
 
 

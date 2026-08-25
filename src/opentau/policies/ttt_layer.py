@@ -220,16 +220,18 @@ def _rotary_1d(x: Tensor, positions: Tensor, theta: float) -> Tensor:
     if positions.ndim == 1:
         positions = repeat(positions, "l -> b l", b=x.shape[0])
 
-    # float32 for the trig regardless of model dtype: the angle grows linearly
-    # with position, and at 8K timesteps a bf16 angle has ~1e-2 absolute error.
-    inv_freq = 1.0 / (
-        theta ** (torch.arange(0, head_dim, 2, device=x.device, dtype=torch.float32) / head_dim)
-    )
-    angles = rearrange(positions.to(torch.float32), "b l -> b l 1") * inv_freq
+    # At least float32 for the trig: the angle grows linearly with position, and
+    # at 8K timesteps a bf16 angle carries ~1e-2 absolute error. Promote rather
+    # than pin, matching the dtype policy in `TTTMLPLayer.forward` — pinning
+    # float32 here would cap a float64 module at float32 through this path,
+    # which is what the unit tests use float64 to avoid.
+    angle_dtype = torch.float32 if x.dtype in (torch.float16, torch.bfloat16) else x.dtype
+    inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=x.device, dtype=angle_dtype) / head_dim))
+    angles = rearrange(positions.to(angle_dtype), "b l -> b l 1") * inv_freq
     cos = rearrange(torch.cos(angles), "b l d -> b l 1 d")
     sin = rearrange(torch.sin(angles), "b l d -> b l 1 d")
 
-    pairs = rearrange(x.to(torch.float32), "b l h (d two) -> b l h d two", two=2)
+    pairs = rearrange(x.to(angle_dtype), "b l h (d two) -> b l h d two", two=2)
     even, odd = pairs[..., 0], pairs[..., 1]
     rotated = torch.stack((even * cos - odd * sin, even * sin + odd * cos), dim=-1)
     return rearrange(rotated, "b l h d two -> b l h (d two)", two=2).to(x.dtype)
@@ -246,12 +248,22 @@ def _ttt_mini_batch_step(
 ) -> tuple[TTTFastWeights, Tensor]:
     """Runs one inner gradient step and produces the mini-batch's outputs.
 
-    This is the dual form: instead of updating the fast weights token by token
-    and applying them one at a time, it computes every token's output against
-    the *running* fast weights with two attention-like matmuls, then computes
-    the end-of-mini-batch fast weights once. The two are algebraically
-    identical for a single gradient-descent step per token, which is why the
-    layer can be trained at long sequence lengths.
+    This is the dual form. It takes **one** gradient step over the whole
+    mini-batch and applies the resulting weights to every query in it — it is
+    *not* a causal per-token cascade, and there is no causal mask anywhere in
+    this function. :meth:`TTTMLPLayer._inner_learning_rates` builds a
+    row-constant ``eta`` precisely so that this holds: the tokens of one
+    mini-batch are one observation, arriving together, with no ordering among
+    them. Verified in float64 to agree with "one step over all C tokens, then
+    apply to every query" to 4.4e-16, and to differ from a strictly causal
+    per-token loop by ~0.03-0.09.
+
+    **Why that makes the mini-batch size load-bearing.** Because a mini-batch is
+    non-causal, grouping two timesteps into one inner step lets the later
+    timestep influence the earlier one's output — measured at 0.66 versus
+    exactly 0.0 when one mini-batch is one timestep. The caller must therefore
+    keep ``mini_batch_size`` equal to the token count of a single timestep;
+    :class:`TTTMLPLayer` enforces it rather than trusting the call site.
 
     Shapes use ``B`` batch, ``H`` heads, ``C`` mini-batch size (tokens per
     inner step), ``D`` head dim, ``F`` fast-MLP hidden dim.
@@ -283,9 +295,10 @@ def _ttt_mini_batch_step(
     grad_z2 = _layer_norm_fused_l2_backward(z2, reconstruction_target, ln_weight, ln_bias)
     grad_z1 = grad_z2 @ w2.transpose(-2, -1) * _gelu_backward(z1)
 
-    # Apply the *running* (per-token) updated weights to the queries. The
-    # `eta * Attn` terms are what make this equivalent to having taken one
-    # gradient step per preceding token inside the mini-batch.
+    # Apply the updated weights to the queries. With a row-constant eta the
+    # `eta * Attn` terms reduce exactly to `xq @ W_after + b_after`, which is
+    # what the update-then-apply unit test pins. They are NOT a per-token causal
+    # cascade; see this function's docstring.
     attn1 = xq @ xk.transpose(-2, -1)
     b1_bar = b1 - eta @ grad_z1
     z1_bar = xq @ w1 - (eta * attn1) @ grad_z1 + b1_bar
@@ -416,6 +429,7 @@ class TTTMLPLayer(nn.Module):
         base_lr: float = 0.1,
         rope_theta: float = 10000.0,
         scan_checkpoint_group_size: int = 0,
+        expected_mini_batch_size: int | None = None,
     ):
         super().__init__()
         if width % num_heads != 0:
@@ -431,6 +445,11 @@ class TTTMLPLayer(nn.Module):
         self.base_lr = base_lr
         self.rope_theta = rope_theta
         self.scan_checkpoint_group_size = scan_checkpoint_group_size
+        # When set, `forward` refuses any other mini-batch size. A mini-batch is
+        # processed non-causally, so one holding two timesteps would let the
+        # later one influence the earlier one's output — a silent leak that
+        # looks like a harmless efficiency win at the call site.
+        self.expected_mini_batch_size = expected_mini_batch_size
 
         self.wq = nn.Linear(width, width, bias=True)
         self.wk = nn.Linear(width, width, bias=True)
@@ -528,12 +547,20 @@ class TTTMLPLayer(nn.Module):
             matching the input, and the outgoing fast weights.
 
         Raises:
-            ValueError: If ``L`` is not a multiple of ``mini_batch_size``.
+            ValueError: If ``L`` is not a multiple of ``mini_batch_size``, or if
+                ``mini_batch_size`` disagrees with ``expected_mini_batch_size``.
         """
         batch_size, seq_len, _ = hidden_states.shape
         if seq_len % mini_batch_size != 0:
             raise ValueError(
                 f"sequence length {seq_len} must be a multiple of mini_batch_size {mini_batch_size}"
+            )
+        if self.expected_mini_batch_size is not None and mini_batch_size != self.expected_mini_batch_size:
+            raise ValueError(
+                f"mini_batch_size={mini_batch_size} but this layer was built for "
+                f"{self.expected_mini_batch_size} (one timestep's tokens). A mini-batch is "
+                "processed non-causally, so grouping several timesteps into one inner step "
+                "lets a later timestep change an earlier timestep's output."
             )
 
         input_dtype = hidden_states.dtype
