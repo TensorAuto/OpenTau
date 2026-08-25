@@ -42,6 +42,7 @@ from opentau.policies.ttt_layer import (
     _layer_norm_forward,
     _rotary_1d,
 )
+from opentau.policies.utils import PerSampleLoss
 
 WIDTH = 32
 NUM_HEADS = 4
@@ -788,3 +789,99 @@ class TestSequenceLengthOneAcceptsBothShapes:
         out = PI05TTTPolicy._flatten_sequence_batch(seq, batch_size=2, num_timesteps=1)
         assert out["actions"].shape == (2, 10, 32), "the T=1 axis was not folded away"
         assert out["camera0"].shape == (2, 3, 224, 224), "camera kept a 5-D shape"
+
+
+class TestForwardSequencePerSample:
+    """The validation path must work — the training loop calls it without a guard.
+
+    ``train.py`` decides whether a policy supports the per-sample breakdown by
+    *signature introspection* (``"return_per_sample" in signature(forward).parameters``)
+    and then calls ``policy.forward(batch, return_per_sample=True)`` with no
+    ``try``. So this path is not optional: if it raises, every run with
+    ``val_freq > 0`` dies at the first validation step. A stray keyword argument
+    in the segment forward did exactly that, and no test covered it.
+    """
+
+    def test_per_sample_is_returned_and_pools_per_trajectory(self):
+        """Decomposition is per *trajectory*: a sequence's timesteps pool.
+
+        ``PerSampleLoss`` carries ``(sum, count)`` rather than a mean precisely
+        so that pooling is addition — which makes "combine a trajectory's
+        timesteps" and "combine a sequence's segments" the same operation, and
+        lets an all-context timestep contribute ``(0, 0)`` without skewing it.
+        """
+        batch_size, num_timesteps, segment_length = 2, 4, 2
+        root = torch.ones(2, 2, dtype=torch.float64, requires_grad=True)
+        model = _StubSequenceModel(segment_length, root)
+
+        rows = batch_size * num_timesteps
+        per_row = torch.arange(rows, dtype=torch.float64)
+
+        def segment_forward(**kwargs):
+            state = kwargs["ttt_state"]
+            state.outgoing[0] = TTTFastWeights(w1=model.root, b1=model.root, w2=model.root, b2=model.root)
+            sub = kwargs["actions"].shape[0]
+            ones = torch.ones(sub, dtype=torch.float64)
+            loss = model.root.sum() * 0.0
+            return {
+                "MSE": loss,
+                "CE": torch.zeros((), dtype=torch.float64),
+                "MSE_per_sample": PerSampleLoss(sum=ones, count=ones),
+                "CE_per_sample": PerSampleLoss(sum=ones * 2, count=ones),
+            }
+
+        model._forward_segment = segment_forward
+        losses = model.forward_sequence(
+            images=[torch.zeros(rows, 1, dtype=torch.float64)],
+            img_masks=[torch.ones(rows, dtype=torch.bool)],
+            lang_tokens=torch.zeros(rows, 1, dtype=torch.long),
+            lang_masks=torch.ones(rows, 1, dtype=torch.bool),
+            actions=torch.zeros(rows, 4, 32, dtype=torch.float64),
+            num_timesteps=num_timesteps,
+            return_per_sample=True,
+        )
+
+        assert "MSE_per_sample" in losses and "CE_per_sample" in losses
+        mse_ps = losses["MSE_per_sample"]
+        # One entry per trajectory, not per row.
+        assert mse_ps.sum.shape == (batch_size,)
+        assert mse_ps.count.shape == (batch_size,)
+        # Each trajectory pooled `num_timesteps` rows of (1, 1).
+        expected = torch.full((batch_size,), float(num_timesteps), dtype=torch.float64)
+        torch.testing.assert_close(mse_ps.count, expected)
+        torch.testing.assert_close(mse_ps.sum, expected)
+        # CE carried 2 per row, so its numerator is twice the count.
+        torch.testing.assert_close(
+            losses["CE_per_sample"].sum,
+            torch.full((batch_size,), 2.0 * num_timesteps, dtype=torch.float64),
+        )
+        del per_row
+
+    def test_scalars_are_unchanged_by_requesting_per_sample(self):
+        """Asking for the breakdown must not perturb the training reduction."""
+        without = _run_stub(num_timesteps=4, segment_length=2)[1]
+
+        root = torch.ones(2, 2, dtype=torch.float64, requires_grad=True)
+        model = _StubSequenceModel(2, root)
+        base_forward = model._forward_segment
+
+        def segment_forward(**kwargs):
+            out = base_forward(**kwargs)
+            sub = kwargs["actions"].shape[0]
+            ones = torch.ones(sub, dtype=torch.float64)
+            out["MSE_per_sample"] = PerSampleLoss(sum=ones, count=ones)
+            out["CE_per_sample"] = PerSampleLoss(sum=ones, count=ones)
+            return out
+
+        model._forward_segment = segment_forward
+        rows = 4
+        with_ps = model.forward_sequence(
+            images=[torch.zeros(rows, 1, dtype=torch.float64)],
+            img_masks=[torch.ones(rows, dtype=torch.bool)],
+            lang_tokens=torch.zeros(rows, 1, dtype=torch.long),
+            lang_masks=torch.ones(rows, 1, dtype=torch.bool),
+            actions=torch.zeros(rows, 4, 32, dtype=torch.float64),
+            num_timesteps=4,
+            return_per_sample=True,
+        )
+        torch.testing.assert_close(with_ps["MSE"], without["MSE"], atol=0, rtol=0)
