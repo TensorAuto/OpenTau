@@ -770,7 +770,6 @@ class PI05TTTFlowMatching(PI05FlowMatching):
             discrete_actions=discrete_actions,
             discrete_action_masks=discrete_action_masks,
             loss_mask=loss_mask,
-            return_per_sample=return_per_sample,
         ) + self._response_ce(
             prefix_out=prefix_out,
             response_tokens=response_tokens,
