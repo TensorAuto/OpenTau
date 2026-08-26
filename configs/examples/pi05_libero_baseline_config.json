@@ -53,7 +53,17 @@
           46,
           47,
           48,
-          49
+          49,
+          50,
+          51,
+          52,
+          53,
+          54,
+          55,
+          56,
+          57,
+          58,
+          59
         ]
       }
     ],
@@ -85,16 +95,16 @@
     "train_expert_only": true,
     "prompt_max_length": 256,
     "discrete_action_max_length": 100,
-    "optimizer_lr": 2.5e-05,
+    "optimizer_lr": 0.0001,
     "optimizer_betas": [
       0.9,
       0.95
     ],
     "optimizer_eps": 1e-08,
     "optimizer_weight_decay": 1e-10,
-    "scheduler_warmup_steps": 1000,
-    "scheduler_decay_steps": 30000,
-    "scheduler_decay_lr": 2.5e-06,
+    "scheduler_warmup_steps": 100,
+    "scheduler_decay_steps": 3000,
+    "scheduler_decay_lr": 1e-05,
     "use_torch_compile": false
   },
   "resume": false,
@@ -117,7 +127,7 @@
   "dataloader_batch_size": 1,
   "prefetch_factor": 8,
   "steps": 3000,
-  "log_freq": 5,
+  "log_freq": 10,
   "save_checkpoint": true,
   "save_freq": 1000,
   "val_freq": 0,
@@ -125,7 +135,7 @@
   "trace_nans": false,
   "optimizer": {
     "type": "adamw",
-    "lr": 2.5e-05,
+    "lr": 0.0001,
     "weight_decay": 1e-10,
     "grad_clip_norm": 10.0,
     "betas": [
@@ -136,10 +146,10 @@
   },
   "scheduler": {
     "type": "cosine_decay_with_warmup",
-    "num_warmup_steps": 1000,
-    "num_decay_steps": 30000,
-    "peak_lr": 2.5e-05,
-    "decay_lr": 2.5e-06
+    "num_warmup_steps": 100,
+    "num_decay_steps": 3000,
+    "peak_lr": 0.0001,
+    "decay_lr": 1e-05
   },
   "wandb": {
     "enable": false,
@@ -147,7 +157,7 @@
     "project": "pi05",
     "run_id": null,
     "name": null,
-    "notes": "stock pi05 on LIBERO, matched baseline",
+    "notes": "stock pi05 LIBERO matched baseline",
     "tags": [],
     "group": null,
     "job_type": null,
