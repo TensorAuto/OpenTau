@@ -640,6 +640,16 @@ class PI05Policy(PreTrainedPolicy):
                 new_key = key.replace("action_time_mlp_in.", "time_mlp_in.")
             elif key.startswith("action_time_mlp_out."):
                 new_key = key.replace("action_time_mlp_out.", "time_mlp_out.")
+
+            # Legacy discrete-action normalizer name. Checkpoints saved before the
+            # `normalize_actions` -> `normalize_discrete_actions` rename (e.g.
+            # TensorAuto/tPi0.5-libero) carry the discrete min/max stats under the
+            # old prefix. Without this remap those buffers land as unexpected keys,
+            # the module's own buffers stay +inf when no dataset stats are supplied
+            # (the eval/inference path), and `make_policy`'s
+            # `_check_norm_stats_loaded` rejects the checkpoint at load time.
+            if key.startswith("normalize_actions."):
+                new_key = key.replace("normalize_actions.", "normalize_discrete_actions.", 1)
             if key.startswith("state_proj.") and model_config.state_type == "discrete":
                 logging.warning(f"Skipping state_proj key in discrete state mode: {key}")
                 continue

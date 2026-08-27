@@ -68,6 +68,7 @@ from opentau.utils.train_utils import (
     reseed_new_ranks_on_resume,
     save_checkpoint,
     save_running_best_state,
+    save_trainable_params_snapshot,
 )
 from opentau.utils.utils import (
     encode_accelerator_state_dict,
@@ -898,6 +899,19 @@ def train(cfg: TrainPipelineConfig):
             )
         eval_subgoal_generator = make_subgoal_generator(cfg)
 
+    if cfg.save_trainable_params and (
+        accelerator.distributed_type == accelerate.DistributedType.FSDP
+        or _deepspeed_zero_stage(accelerator) >= 3
+    ):
+        # Fail here rather than at the first saving step: under ZeRO-3/FSDP each
+        # rank's named_parameters are shards, so the snapshot would be silently
+        # truncated — and dying `save_freq` steps into a run wastes the run.
+        raise ValueError(
+            "save_trainable_params requires replicated parameters (DDP or DeepSpeed "
+            "ZeRO-1/2); under ZeRO-3/FSDP each rank only holds a parameter shard. "
+            "Disable save_trainable_params or switch the accelerate config."
+        )
+
     logging.info("Creating policy")
     # FSDP needs the policy built in fp32 so its ``MixedPrecision(
     # param_dtype=bf16, reduce_dtype=bf16, buffer_dtype=bf16)`` policy can
@@ -1197,6 +1211,18 @@ def train(cfg: TrainPipelineConfig):
                 logging.info(f"Checkpoint policy after step {step}")
                 cfg.policy.pretrained_path = checkpoint_dir
                 save_checkpoint(checkpoint_dir, step, cfg)
+                if cfg.save_trainable_params:
+                    # Kept-forever trainable-only snapshot, written OUTSIDE the
+                    # checkpoints/ tree so `prune_old_checkpoints` never sees it.
+                    # Startup validation already rejected sharded-parameter
+                    # backends, so the unwrapped module holds full parameters.
+                    snapshot_path = save_trainable_params_snapshot(
+                        accelerator.unwrap_model(policy),
+                        cfg.output_dir / "trainable_params",
+                        step,
+                        cfg.steps,
+                    )
+                    logging.info(f"Saved trainable-only parameter snapshot to {snapshot_path}")
                 if cfg.last_checkpoint_only:
                     # Protect running-best checkpoints from the latest-only prune. Read live each
                     # save so bests created since the last save are not deleted.

@@ -537,3 +537,64 @@ def test_prune_protected_none_is_backward_compatible(tmp_path):
 
     assert latest.exists()
     assert not old.exists()
+
+
+class TestSaveTrainableParamsSnapshot:
+    """`save_trainable_params_snapshot` writes exactly the requires_grad subset."""
+
+    @staticmethod
+    def _module_with_frozen_half():
+        import torch
+
+        module = torch.nn.Sequential(torch.nn.Linear(4, 3), torch.nn.Linear(3, 2))
+        for param in module[0].parameters():
+            param.requires_grad_(False)
+        return module
+
+    def test_snapshot_holds_exactly_the_trainable_names(self, tmp_path):
+        import torch
+        from safetensors.torch import load_file
+
+        from opentau.utils.train_utils import save_trainable_params_snapshot
+
+        module = self._module_with_frozen_half()
+        path = save_trainable_params_snapshot(
+            module, tmp_path / "trainable_params", step=1000, total_steps=20000
+        )
+
+        assert path.exists()
+        loaded = load_file(str(path))
+        expected = {name for name, p in module.named_parameters() if p.requires_grad}
+        assert set(loaded) == expected == {"1.weight", "1.bias"}
+        for name, tensor in loaded.items():
+            assert torch.equal(tensor, dict(module.named_parameters())[name].detach().cpu())
+
+    def test_snapshot_name_uses_zero_padded_step(self, tmp_path):
+        from opentau.utils.train_utils import save_trainable_params_snapshot
+
+        module = self._module_with_frozen_half()
+        path = save_trainable_params_snapshot(module, tmp_path, step=1000, total_steps=20000)
+        assert path.name == f"step_{get_step_identifier(1000, 20000)}.safetensors"
+
+    def test_fully_frozen_module_raises(self, tmp_path):
+        import pytest
+        import torch
+
+        from opentau.utils.train_utils import save_trainable_params_snapshot
+
+        module = torch.nn.Linear(4, 3)
+        for param in module.parameters():
+            param.requires_grad_(False)
+        with pytest.raises(ValueError, match="no requires_grad=True"):
+            save_trainable_params_snapshot(module, tmp_path, step=10, total_steps=100)
+
+    def test_buffers_are_excluded(self, tmp_path):
+        import torch
+        from safetensors.torch import load_file
+
+        from opentau.utils.train_utils import save_trainable_params_snapshot
+
+        module = torch.nn.BatchNorm1d(4)  # has running_mean/running_var buffers
+        path = save_trainable_params_snapshot(module, tmp_path, step=10, total_steps=100)
+        loaded = load_file(str(path))
+        assert set(loaded) == {"weight", "bias"}

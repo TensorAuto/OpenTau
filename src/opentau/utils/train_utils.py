@@ -42,6 +42,7 @@ from opentau.utils.random_utils import load_rng_state, save_rng_state
 
 if TYPE_CHECKING:
     import accelerate
+    import torch
 
 
 def log_output_dir(out_dir):
@@ -130,6 +131,62 @@ def save_checkpoint(
     cfg.save_pretrained(checkpoint_dir)
     save_training_step(step, checkpoint_dir)
     save_rng_state(checkpoint_dir)
+
+
+def save_trainable_params_snapshot(
+    policy: "torch.nn.Module",
+    output_dir: Path,
+    step: int,
+    total_steps: int,
+) -> Path:
+    """Write only the ``requires_grad=True`` parameters to a safetensors file.
+
+    The point is a kept-forever, per-save-step parameter history for runs that
+    freeze most of the model (``train_ttt_only`` trains 85M of 3.4B parameters):
+    a full checkpoint is ~50x the size and `last_checkpoint_only` prunes it, so
+    dumping just the trainable subset is what makes "keep every checkpoint"
+    affordable. Frozen parameters and buffers are reproducible from the base
+    checkpoint the run warm-started from; only the trained subset is history.
+
+    Restoring a step: build the policy from the run's base checkpoint, then
+    ``policy.load_state_dict(load_file(snapshot), strict=False)``.
+
+    The caller is responsible for only invoking this where each rank holds the
+    full parameters (DDP, DeepSpeed ZeRO-1/2) and on one rank only — under
+    ZeRO-3/FSDP the local ``named_parameters`` are shards and the snapshot
+    would be silently truncated. ``train.py`` guards this at startup.
+
+    Args:
+        policy: The unwrapped policy module.
+        output_dir: Directory for snapshots (created if needed). Deliberately
+            distinct from the ``checkpoints/`` tree so pruning never sees it.
+        step: Current training step.
+        total_steps: Total steps for zero-padded naming.
+
+    Returns:
+        Path of the written snapshot.
+
+    Raises:
+        ValueError: If the policy has no trainable parameters — a snapshot of
+            nothing means the run's freeze flags are wrong, which should fail
+            loudly rather than write empty files every ``save_freq`` steps.
+    """
+    from safetensors.torch import save_file
+
+    trainable = {
+        name: param.detach().cpu().contiguous()
+        for name, param in policy.named_parameters()
+        if param.requires_grad
+    }
+    if not trainable:
+        raise ValueError(
+            "save_trainable_params is enabled but the policy has no requires_grad=True "
+            "parameters. Check the run's freeze flags."
+        )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"step_{get_step_identifier(step, total_steps)}.safetensors"
+    save_file(trainable, str(path))
+    return path
 
 
 def find_missing_rng_state_ranks(checkpoint_dir: Path, world_size: int) -> list[int]:

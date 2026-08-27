@@ -131,6 +131,13 @@ class TrainPipelineConfig(HubMixin):
         save_freq: Frequency of checkpoint saving in training iterations. Checkpoints
             are saved every `save_freq` steps and after the last training step.
             Defaults to 20,000.
+        save_trainable_params: If True, every saving step additionally writes a
+            safetensors snapshot holding only the `requires_grad=True` parameters to
+            `output_dir/trainable_params/step_<id>.safetensors`. Snapshots are exempt
+            from `last_checkpoint_only` pruning, giving mostly-frozen runs (e.g.
+            `train_ttt_only`) a cheap kept-forever parameter history. Requires
+            replicated parameters (DDP or DeepSpeed ZeRO-1/2); raises at startup
+            under ZeRO-3/FSDP. Defaults to False.
         use_policy_training_preset: If True, use optimizer and scheduler presets from
             the policy configuration. Defaults to False.
         optimizer: Configuration for the optimizer. Required if
@@ -200,6 +207,15 @@ class TrainPipelineConfig(HubMixin):
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     save_freq: int = 20_000
+    # At every saving step, additionally write a small safetensors snapshot holding ONLY the
+    # parameters with requires_grad=True (e.g. the 85M TTT parameters of a `train_ttt_only`
+    # run, against a 3.4B frozen base) to `output_dir/trainable_params/`. These snapshots are
+    # never pruned — `last_checkpoint_only` does not touch them — so a mostly-frozen run can
+    # keep a per-save-step parameter history at ~2% of the full-checkpoint cost. Restoring a
+    # step = load the base checkpoint, then `load_state_dict(snapshot, strict=False)`.
+    # Requires replicated parameters (DDP or ZeRO-1/2); raises at startup under ZeRO-3/FSDP,
+    # where each rank only holds a shard.
+    save_trainable_params: bool = False
     use_policy_training_preset: bool = False
     optimizer: OptimizerConfig | None = None
     scheduler: LRSchedulerConfig | None = None
