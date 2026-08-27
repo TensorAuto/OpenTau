@@ -279,3 +279,54 @@ class TestEnvConfigMetadataField:
         assert isinstance(config.metadata, EnvMetadataConfig)
         assert config.metadata.speed is None
         assert config.metadata.control_mode is None
+
+
+class TestLiberoEnvTaskDistribution:
+    """`LiberoEnv.gym_kwargs` must always hand integer task ids downstream.
+
+    Regression: with ``task_ids=None`` under an accelerator, the pre-split dict
+    was filled with ``_get_suite(suite).tasks`` — Task *objects* — so the
+    modulo split forwarded Tasks into ``create_libero_envs``, whose
+    ``_select_task_ids`` does ``int(task)`` and died with ``TypeError``.
+    Explicit ``task_ids`` configs always passed ints, which is why every
+    production run (explicit lists) missed it and only the
+    all-tasks-multi-rank path (e.g. a 4-suite baseline eval) hit it.
+    """
+
+    class _FakeAccelerator:
+        num_processes = 8
+        process_index = 3
+
+    @staticmethod
+    def _fake_suite(n_tasks: int):
+        class _Suite:
+            tasks = [object() for _ in range(n_tasks)]  # opaque Task stand-ins
+
+        return _Suite()
+
+    def _gym_kwargs_with(self, monkeypatch, task_ids):
+        import sys
+        import types
+
+        from opentau.envs import configs as env_configs
+        from opentau.envs.configs import LiberoEnv
+
+        monkeypatch.setattr(env_configs, "get_proc_accelerator", lambda: self._FakeAccelerator())
+        stub = types.ModuleType("opentau.envs.libero")
+        stub._get_suite = lambda suite: self._fake_suite(10)
+        monkeypatch.setitem(sys.modules, "opentau.envs.libero", stub)
+        return LiberoEnv(task="libero_10", task_ids=task_ids).gym_kwargs
+
+    def test_none_task_ids_distribute_as_ints(self, monkeypatch):
+        kwargs = self._gym_kwargs_with(monkeypatch, task_ids=None)
+        distributed = kwargs["task_ids"]["libero_10"]
+        # rank 3 of 8 over 10 tasks -> [3]
+        assert distributed == [3]
+        assert all(isinstance(t, int) for t in distributed)
+
+    def test_explicit_task_ids_distribute_as_ints(self, monkeypatch):
+        kwargs = self._gym_kwargs_with(monkeypatch, task_ids=[0, 1, 2, 3, 4, 5, 6, 8])
+        distributed = kwargs["task_ids"]["libero_10"]
+        # rank 3 of 8 over an 8-element list -> the element at index 3
+        assert distributed == [3]
+        assert all(isinstance(t, int) for t in distributed)

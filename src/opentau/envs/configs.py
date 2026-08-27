@@ -284,8 +284,14 @@ class LiberoEnv(EnvConfig):
         else:
             from opentau.envs.libero import _get_suite
 
+            # ``task_ids=None`` means "all tasks in the suite" — materialize it as the
+            # *index* range, not ``.tasks`` (a list of Task objects): the modulo split
+            # below hands its elements to ``create_libero_envs``, whose
+            # ``_select_task_ids`` calls ``int()`` on each and raises ``TypeError``
+            # on a Task. Explicit configs always passed ints, so only the
+            # ``None``-under-multi-rank path ever hit this.
             task_ids = {
-                suite: _get_suite(suite).tasks if self.task_ids is None else self.task_ids
+                suite: (list(range(len(_get_suite(suite).tasks))) if self.task_ids is None else self.task_ids)
                 for suite in suite_names
             }
             logging.info(f"[LIBERO environment] Before distributing, using {task_ids=}.")
