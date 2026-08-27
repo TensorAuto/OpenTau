@@ -224,6 +224,15 @@ rank's `named_parameters` are shards and the snapshot would be silently truncate
   per-rank modulo split, and `create_libero_envs` then called `int()` on them. It now
   distributes the index range. Explicit `task_ids` lists (every production config) were
   unaffected; the all-tasks default under an accelerator always crashed.
+- **Sequence-mode training with `dataloader_batch_size > 1` no longer crashes in
+  `default_collate` with `Trying to resize storage that is not resizable`.** The fetch
+  layer attaches per-step state pad flags only to samples whose query window crossed an
+  episode boundary; interior samples fell through to a fixed `(1,)` `obs_history_is_pad`
+  fallback, so a batch mixing interior and boundary sequence samples carried `(1,)` against
+  `(sequence_length,)` and could not collate. Both fallback sites (the base emission and the
+  history-drop branch) now emit through `BaseDataset._obs_history_pad_fallback`, sized by the
+  active temporal mode. Invisible at `batch_size == 1` — the only shape the `pi05_ttt`
+  sequence loader had run at — and a no-op for history-mode and single-step configs.
 
 ## [0.13.0] - 2026-08-17
 

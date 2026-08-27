@@ -1057,10 +1057,8 @@ class BaseDataset(torch.utils.data.Dataset):
         state_pad_key = f"{state_raw_key}_is_pad" if state_raw_key else None
         if state_pad_key and state_pad_key in item:
             standard_item["obs_history_is_pad"] = item[state_pad_key]
-        elif self.n_obs_history is not None:
-            standard_item["obs_history_is_pad"] = torch.zeros(self.n_obs_history, dtype=torch.bool)
         else:
-            standard_item["obs_history_is_pad"] = torch.tensor([False], dtype=torch.bool)
+            standard_item["obs_history_is_pad"] = self._obs_history_pad_fallback(padded=False)
 
         # Emit optional keys (memory, next_memory, speed, mistake, quality,
         # robot_type, control_mode, subgoalK) with their _is_pad siblings,
@@ -1174,6 +1172,36 @@ class BaseDataset(torch.utils.data.Dataset):
                 standard_item["actions"], standard_item["state"], self.delta_action_state_map
             )
 
+    def _obs_history_pad_fallback(self, padded: bool) -> torch.Tensor:
+        """Build ``obs_history_is_pad`` when the fetch layer produced no state pad flags.
+
+        The passthrough branch in :meth:`_to_standard_data_format` forwards the fetch
+        layer's per-step state pad flags, whose length is the temporal layout:
+        ``n_obs_history`` frames in history mode, ``sequence_length`` timesteps in
+        sequence mode, and a single step otherwise. The fetch layer only attaches
+        those flags to samples whose query window actually crossed an episode
+        boundary, so interior samples fall through to this fallback — and it must
+        emit the *same* length, because one interior and one boundary sample land in
+        the same ``default_collate`` batch. A fixed ``(1,)`` here against the
+        passthrough's ``(T,)`` kills the batch with "Trying to resize storage that
+        is not resizable" — invisible at ``batch_size == 1``, which was the only
+        batch shape the sequence loader had run at before.
+
+        Args:
+            padded: Flag value to fill with — ``True`` marks every step padded
+                (the history-drop branch), ``False`` marks none padded.
+
+        Returns:
+            A bool tensor of shape ``(n_obs_history,)``, ``(sequence_length,)``, or
+            ``(1,)`` depending on the active temporal mode, filled with ``padded``.
+        """
+        if self.n_obs_history is not None:
+            length = self.n_obs_history
+        else:
+            seq_len = getattr(self, "sequence_length", 1) or 1
+            length = seq_len if seq_len > 1 else 1
+        return torch.full((length,), padded, dtype=torch.bool)
+
     def _emit_optional_keys(self, item: dict, standard_item: dict) -> None:
         """Emit optional memory/subgoal/metadata keys with training-time dropout.
 
@@ -1245,15 +1273,12 @@ class BaseDataset(torch.utils.data.Dataset):
         # The current step — current state and current camera frame — is kept.
         drop_hist = _roll(self.history_state_drop_prob)
         if drop_hist:
-            if self.n_obs_history is not None:
-                standard_item["obs_history_is_pad"] = torch.ones(self.n_obs_history, dtype=torch.bool)
-                if self.n_obs_history > 1:
-                    for k in range(self.num_cams):
-                        cam_key = f"camera{k}"
-                        if cam_key in standard_item:
-                            standard_item[cam_key][:-1] = 0
-            else:
-                standard_item["obs_history_is_pad"] = torch.tensor([True], dtype=torch.bool)
+            standard_item["obs_history_is_pad"] = self._obs_history_pad_fallback(padded=True)
+            if self.n_obs_history is not None and self.n_obs_history > 1:
+                for k in range(self.num_cams):
+                    cam_key = f"camera{k}"
+                    if cam_key in standard_item:
+                        standard_item[cam_key][:-1] = 0
 
         # (2) Subgoal drop. A single ``subgoal_is_pad`` flag covers every slot
         # because subgoals are either all present (annotated and not dropped)

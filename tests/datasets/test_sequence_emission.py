@@ -239,3 +239,65 @@ class TestNumpyRoundTrip:
         grid = arr.reshape(4, 10)
         assert np.all(np.diff(grid, axis=1) > 0)
         assert np.allclose(np.diff(grid[:, 0]), 1 / 20.0)
+
+
+class TestObsHistoryPadFallback:
+    """The interior-sample fallback must match the boundary passthrough's shape.
+
+    The fetch layer attaches per-step state pad flags only to samples whose
+    query window crossed an episode boundary; interior samples fall through to
+    ``BaseDataset._obs_history_pad_fallback``. Both kinds land in one
+    ``default_collate`` batch, so the fallback length must equal the
+    passthrough length in every temporal mode — a fixed ``(1,)`` against the
+    passthrough's ``(sequence_length,)`` crashed every ``batch_size > 1``
+    sequence run with "Trying to resize storage that is not resizable"
+    (invisible at batch 1, the only batch shape pi05_ttt had run at).
+    """
+
+    @staticmethod
+    def _stub(sequence_length: int = 1, n_obs_history: int | None = None):
+        from opentau.datasets.lerobot_dataset import BaseDataset
+
+        ds = object.__new__(BaseDataset)
+        ds.sequence_length = sequence_length
+        ds.n_obs_history = n_obs_history
+        return ds
+
+    def test_sequence_mode_matches_the_boundary_passthrough_shape(self):
+        seq_len = 32
+        ds = self._stub(sequence_length=seq_len)
+        fallback = ds._obs_history_pad_fallback(padded=False)
+        assert fallback.shape == (seq_len,)
+        assert fallback.dtype == torch.bool and not fallback.any()
+
+    def test_interior_and_boundary_samples_collate(self):
+        """The actual crash case: one interior + one boundary sample in a batch."""
+        from torch.utils.data import default_collate
+
+        seq_len = 32
+        ds = self._stub(sequence_length=seq_len)
+        interior = {"obs_history_is_pad": ds._obs_history_pad_fallback(padded=False)}
+        boundary_passthrough = torch.zeros(seq_len, dtype=torch.bool)
+        boundary_passthrough[-3:] = True  # window ran off the episode end
+        boundary = {"obs_history_is_pad": boundary_passthrough}
+        batch = default_collate([interior, boundary])
+        assert batch["obs_history_is_pad"].shape == (2, seq_len)
+        assert batch["obs_history_is_pad"][1, -3:].all()
+
+    def test_history_mode_is_unchanged(self):
+        ds = self._stub(n_obs_history=5)
+        torch.testing.assert_close(
+            ds._obs_history_pad_fallback(padded=False), torch.zeros(5, dtype=torch.bool)
+        )
+        torch.testing.assert_close(ds._obs_history_pad_fallback(padded=True), torch.ones(5, dtype=torch.bool))
+
+    def test_plain_mode_is_byte_identical_to_the_pre_fix_fallback(self):
+        ds = self._stub(sequence_length=1)
+        torch.testing.assert_close(ds._obs_history_pad_fallback(padded=False), torch.tensor([False]))
+        torch.testing.assert_close(ds._obs_history_pad_fallback(padded=True), torch.tensor([True]))
+
+    def test_history_drop_marks_every_sequence_timestep(self):
+        """The drop branch (padded=True) must also be sequence-shaped."""
+        ds = self._stub(sequence_length=8)
+        dropped = ds._obs_history_pad_fallback(padded=True)
+        assert dropped.shape == (8,) and dropped.all()
