@@ -195,6 +195,34 @@ zero-initialized and the position ids are built so the action block keeps the Ro
 without registers, which is as close as this gets — only `n_register_tokens=0` is bit-identical to
 stock π₀.₅.
 
+### Added — `save_trainable_params`, kept-forever trainable-only checkpoint snapshots — **opt-in, default `False`**
+
+Every saving step additionally writes `output_dir/trainable_params/step_<id>.safetensors`
+holding only the `requires_grad=True` parameters. The snapshots sit outside the
+`checkpoints/` tree, so `last_checkpoint_only` pruning never touches them: a mostly-frozen
+run (`train_ttt_only` trains 85M of 3.4B parameters) keeps a per-save-step parameter
+history at ~2% of full-checkpoint cost, while full resumable state stays latest-only.
+Restoring a step = build the policy from the run's base checkpoint, then
+`load_state_dict(load_file(snapshot), strict=False)`. Requires replicated parameters —
+DDP or DeepSpeed ZeRO-1/2; the run **raises at startup** under ZeRO-3/FSDP, where each
+rank's `named_parameters` are shards and the snapshot would be silently truncated.
+
+### Fixed
+
+- **Pre-rename π₀.₅ checkpoints load again: legacy `normalize_actions.*` state-dict keys
+  are remapped to `normalize_discrete_actions.*`.** Checkpoints saved before the
+  discrete-action normalizer rename (e.g. `TensorAuto/tPi0.5-libero`) carried their
+  discrete min/max stats under the old module name; on the stat-less eval path the
+  current module's buffers stayed `+inf` and `make_policy`'s `_check_norm_stats_loaded`
+  rejected the checkpoint. The remap lives in `PI05Policy._fix_pytorch_state_dict_keys`
+  next to the other legacy-key fixes.
+- **Multi-rank LIBERO eval with `env.task_ids: null` no longer crashes with
+  `TypeError: int() argument must be ... not 'Task'`.** `LiberoEnv.gym_kwargs`
+  materialized "all tasks" as `_get_suite(suite).tasks` — Task objects — before the
+  per-rank modulo split, and `create_libero_envs` then called `int()` on them. It now
+  distributes the index range. Explicit `task_ids` lists (every production config) were
+  unaffected; the all-tasks default under an accelerator always crashed.
+
 ## [0.13.0] - 2026-08-17
 
 ### Added
