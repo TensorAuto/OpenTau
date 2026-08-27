@@ -33,17 +33,24 @@ import torch
 from opentau.policies.pi05.modeling_pi05 import PI05Policy
 from opentau.policies.pi05_mem.modeling_pi05 import PI05MemPolicy
 from opentau.policies.pi06.modeling_pi06 import PI06Policy
+from opentau.policies.pi07.low_level.modeling_pi07_low_level import PI07LowLevelPolicy
 from opentau.policies.pi07_paligemma.low_level.modeling_pi07_low_level import (
     PI07PaligemmaLowLevelPolicy,
 )
 
 # EVERY hand-duplicated copy of the method that owns a `normalize_discrete_actions`
-# module and supports a pi05 warm-start must carry the remap: pi05's (which
-# pi05_ttt inherits), pi05_mem's, pi06's (its docstring advertises `lerobot/pi05`
-# warm-starts), and the pi07_paligemma low level's. Sweeping a subset is exactly
-# the miss-by-omission CLAUDE.md rule 6 documents — the first two passes of this
-# very sweep each missed copies.
-POLICY_CLASSES = [PI05Policy, PI05MemPolicy, PI06Policy, PI07PaligemmaLowLevelPolicy]
+# module and supports a pi05-lineage warm-start must carry the remap: pi05's
+# (which pi05_ttt inherits), pi05_mem's, pi06's (its docstring advertises
+# `lerobot/pi05` warm-starts), and both pi07 low levels'. Sweeping a subset is
+# exactly the miss-by-omission CLAUDE.md rule 6 documents — the first passes of
+# this very sweep each missed copies.
+POLICY_CLASSES = [
+    PI05Policy,
+    PI05MemPolicy,
+    PI06Policy,
+    PI07LowLevelPolicy,
+    PI07PaligemmaLowLevelPolicy,
+]
 
 
 def _run_fix(policy_cls, state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
