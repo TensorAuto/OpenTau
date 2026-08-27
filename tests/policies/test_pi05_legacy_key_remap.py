@@ -32,23 +32,29 @@ import torch
 
 from opentau.policies.pi05.modeling_pi05 import PI05Policy
 from opentau.policies.pi05_mem.modeling_pi05 import PI05MemPolicy
+from opentau.policies.pi06.modeling_pi06 import PI06Policy
+from opentau.policies.pi07_paligemma.low_level.modeling_pi07_low_level import (
+    PI07PaligemmaLowLevelPolicy,
+)
 
-# Both copies of the hand-duplicated method must carry the remap: pi05's (which
-# pi05_ttt inherits) and pi05_mem's. Sweeping only one is exactly the
-# miss-by-omission CLAUDE.md rule 6 documents.
-POLICY_CLASSES = [PI05Policy, PI05MemPolicy]
+# EVERY hand-duplicated copy of the method that owns a `normalize_discrete_actions`
+# module and supports a pi05 warm-start must carry the remap: pi05's (which
+# pi05_ttt inherits), pi05_mem's, pi06's (its docstring advertises `lerobot/pi05`
+# warm-starts), and the pi07_paligemma low level's. Sweeping a subset is exactly
+# the miss-by-omission CLAUDE.md rule 6 documents — the first two passes of this
+# very sweep each missed copies.
+POLICY_CLASSES = [PI05Policy, PI05MemPolicy, PI06Policy, PI07PaligemmaLowLevelPolicy]
 
 
 def _run_fix(policy_cls, state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Invokes the real (unbound) key-fixing method with a minimal stub self/config."""
     # `self` is only consulted by the adaRMS branches (via `self.model...`); give it
     # a shape those branches can read without triggering the skip.
+    expert_tower = SimpleNamespace(gemma_expert=SimpleNamespace(config=SimpleNamespace(use_adarms=False)))
+    # pi05/pi05_mem/pi07_paligemma consult `paligemma_with_expert`; pi06 consults
+    # `gemma3_with_expert` — provide both so one stub serves every copy.
     stub_self = SimpleNamespace(
-        model=SimpleNamespace(
-            paligemma_with_expert=SimpleNamespace(
-                gemma_expert=SimpleNamespace(config=SimpleNamespace(use_adarms=False))
-            )
-        )
+        model=SimpleNamespace(paligemma_with_expert=expert_tower, gemma3_with_expert=expert_tower)
     )
     stub_config = SimpleNamespace(state_type="continuous")
     return policy_cls._fix_pytorch_state_dict_keys(stub_self, state_dict, stub_config)

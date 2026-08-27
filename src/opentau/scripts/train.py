@@ -66,6 +66,7 @@ from opentau.utils.train_utils import (
     load_training_step,
     prune_old_checkpoints,
     reseed_new_ranks_on_resume,
+    resolve_periodic_save_flags,
     save_checkpoint,
     save_running_best_state,
     save_trainable_params_snapshot,
@@ -1172,12 +1173,12 @@ def train(cfg: TrainPipelineConfig):
         current_success = None
         current_val_loss = None
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
-        is_saving_step = (step % cfg.save_freq == 0 or step == cfg.steps) and cfg.save_checkpoint
-        # Deliberately NOT gated on `save_checkpoint`, mirroring `running_best_count`:
-        # a snapshots-only run (small per-step history, no full resumable state) is a
-        # legitimate configuration, and gating on `save_checkpoint` would turn the
-        # opt-in flag into a silent no-op there.
-        is_snapshot_step = (step % cfg.save_freq == 0 or step == cfg.steps) and cfg.save_trainable_params
+        # The snapshot flag is deliberately independent of `save_checkpoint`
+        # (mirroring `running_best_count`) — the helper's docstring and its test
+        # pin that contract.
+        is_saving_step, is_snapshot_step = resolve_periodic_save_flags(
+            step, cfg.steps, cfg.save_freq, cfg.save_checkpoint, cfg.save_trainable_params
+        )
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
         is_val_step = cfg.val_freq > 0 and step % cfg.val_freq == 0
 

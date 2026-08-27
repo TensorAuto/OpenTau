@@ -585,6 +585,13 @@ class PI06Policy(PreTrainedPolicy):
             elif new_key.startswith("action_time_mlp_out."):
                 new_key = new_key.replace("action_time_mlp_out.", "time_mlp_out.")
 
+            # Legacy discrete-action normalizer name — same remap as pi05's copy of
+            # this hand-duplicated method, so a pre-rename π₀.₅ checkpoint
+            # warm-starting π₀.₆ carries its discrete min/max stats over instead of
+            # dropping them as unexpected keys.
+            if new_key.startswith("normalize_actions."):
+                new_key = new_key.replace("normalize_actions.", "normalize_discrete_actions.", 1)
+
             # `state_proj` doesn't exist in either π0.5 or π0.6 — drop silently.
             if new_key.startswith("state_proj."):
                 logging.warning(f"Skipping state_proj key in pi06 mode: {new_key}")

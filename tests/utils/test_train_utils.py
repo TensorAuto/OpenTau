@@ -598,3 +598,36 @@ class TestSaveTrainableParamsSnapshot:
         path = save_trainable_params_snapshot(module, tmp_path, step=10, total_steps=100)
         loaded = load_file(str(path))
         assert set(loaded) == {"weight", "bias"}
+
+
+class TestResolvePeriodicSaveFlags:
+    """The snapshot flag must be independent of `save_checkpoint` — the contract
+    that makes a snapshots-only run possible instead of a silent no-op."""
+
+    @staticmethod
+    def _flags(**kw):
+        from opentau.utils.train_utils import resolve_periodic_save_flags
+
+        defaults = {
+            "step": 1000,
+            "total_steps": 20000,
+            "save_freq": 1000,
+            "save_checkpoint": True,
+            "save_trainable_params": True,
+        }
+        defaults.update(kw)
+        return resolve_periodic_save_flags(**defaults)
+
+    def test_snapshot_fires_with_save_checkpoint_disabled(self):
+        # THE pinned contract: snapshots-only run still snapshots.
+        assert self._flags(save_checkpoint=False) == (False, True)
+
+    def test_checkpoint_fires_with_snapshots_disabled(self):
+        assert self._flags(save_trainable_params=False) == (True, False)
+
+    def test_both_fire_on_cadence_and_neither_off_cadence(self):
+        assert self._flags() == (True, True)
+        assert self._flags(step=999) == (False, False)
+
+    def test_final_step_saves_regardless_of_cadence(self):
+        assert self._flags(step=20000, save_freq=1234) == (True, True)

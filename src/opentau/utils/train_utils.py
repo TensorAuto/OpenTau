@@ -133,6 +133,39 @@ def save_checkpoint(
     save_rng_state(checkpoint_dir)
 
 
+def resolve_periodic_save_flags(
+    step: int,
+    total_steps: int,
+    save_freq: int,
+    save_checkpoint: bool,
+    save_trainable_params: bool,
+) -> tuple[bool, bool]:
+    """Decides ``(is_saving_step, is_snapshot_step)`` for one training step.
+
+    Both fire on the same cadence — every ``save_freq`` steps and after the last
+    step — but gate on *independent* flags: full checkpoints on
+    ``save_checkpoint``, trainable-only snapshots on ``save_trainable_params``.
+    The independence is the contract (mirroring ``running_best_count``, which
+    also works with ``save_checkpoint=False``): a snapshots-only run must write
+    snapshots, not silently no-op because full checkpointing is off. Extracted
+    into a pure helper precisely so a test can pin that — a refactor that
+    re-nests the snapshot under the checkpoint flag fails the suite instead of
+    shipping the no-op.
+
+    Args:
+        step: The just-completed training step (1-based, as in the train loop).
+        total_steps: ``cfg.steps``; the final step always saves.
+        save_freq: Cadence in steps.
+        save_checkpoint: Whether full checkpoints are enabled.
+        save_trainable_params: Whether trainable-only snapshots are enabled.
+
+    Returns:
+        ``(is_saving_step, is_snapshot_step)``.
+    """
+    periodic = step % save_freq == 0 or step == total_steps
+    return periodic and save_checkpoint, periodic and save_trainable_params
+
+
 def save_trainable_params_snapshot(
     policy: "torch.nn.Module",
     output_dir: Path,

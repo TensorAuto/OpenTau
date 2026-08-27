@@ -739,6 +739,13 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
             elif key.startswith("action_time_mlp_out."):
                 new_key = key.replace("action_time_mlp_out.", "time_mlp_out.")
 
+            # Legacy discrete-action normalizer name — same remap as pi05's copy of
+            # this hand-duplicated method, so a pre-rename π₀.₅ checkpoint
+            # warm-starting the pi07_paligemma low level carries its discrete
+            # min/max stats over instead of dropping them as unexpected keys.
+            if key.startswith("normalize_actions."):
+                new_key = key.replace("normalize_actions.", "normalize_discrete_actions.", 1)
+
             # Handle vision tower embedding layer potential differences
             if "patch_embedding" in key:
                 # Some checkpoints might have this, but current model expects different structure
