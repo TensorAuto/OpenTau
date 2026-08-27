@@ -635,6 +635,15 @@ class PI05MemPolicy(PreTrainedPolicy):
                 new_key = key.replace("action_time_mlp_in.", "time_mlp_in.")
             elif key.startswith("action_time_mlp_out."):
                 new_key = key.replace("action_time_mlp_out.", "time_mlp_out.")
+
+            # Legacy discrete-action normalizer name — same remap as pi05's copy
+            # of this method (this class duplicates it rather than inheriting),
+            # so pre-rename checkpoints (e.g. TensorAuto/tPi0.5-libero) warm-start
+            # pi05_mem without their discrete min/max stats landing as
+            # unexpected keys and the module's own buffers staying +inf.
+            if key.startswith("normalize_actions."):
+                new_key = key.replace("normalize_actions.", "normalize_discrete_actions.", 1)
+
             if "patch_embedding" in key:
                 logging.warning(f"Vision embedding key might need handling: {key}")
 

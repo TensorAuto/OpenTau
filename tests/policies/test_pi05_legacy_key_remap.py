@@ -27,12 +27,19 @@ run without building a 3.4B-parameter model.
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from opentau.policies.pi05.modeling_pi05 import PI05Policy
+from opentau.policies.pi05_mem.modeling_pi05 import PI05MemPolicy
+
+# Both copies of the hand-duplicated method must carry the remap: pi05's (which
+# pi05_ttt inherits) and pi05_mem's. Sweeping only one is exactly the
+# miss-by-omission CLAUDE.md rule 6 documents.
+POLICY_CLASSES = [PI05Policy, PI05MemPolicy]
 
 
-def _run_fix(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+def _run_fix(policy_cls, state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Invokes the real (unbound) key-fixing method with a minimal stub self/config."""
     # `self` is only consulted by the adaRMS branches (via `self.model...`); give it
     # a shape those branches can read without triggering the skip.
@@ -44,15 +51,17 @@ def _run_fix(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         )
     )
     stub_config = SimpleNamespace(state_type="continuous")
-    return PI05Policy._fix_pytorch_state_dict_keys(stub_self, state_dict, stub_config)
+    return policy_cls._fix_pytorch_state_dict_keys(stub_self, state_dict, stub_config)
 
 
-def test_legacy_discrete_normalizer_keys_are_remapped():
+@pytest.mark.parametrize("policy_cls", POLICY_CLASSES)
+def test_legacy_discrete_normalizer_keys_are_remapped(policy_cls):
     fixed = _run_fix(
+        policy_cls,
         {
             "normalize_actions.buffer_actions.min": torch.zeros(32),
             "normalize_actions.buffer_actions.max": torch.ones(32),
-        }
+        },
     )
     assert set(fixed) == {
         "normalize_discrete_actions.buffer_actions.min",
@@ -60,7 +69,8 @@ def test_legacy_discrete_normalizer_keys_are_remapped():
     }
 
 
-def test_current_discrete_normalizer_keys_pass_through_unchanged():
+@pytest.mark.parametrize("policy_cls", POLICY_CLASSES)
+def test_current_discrete_normalizer_keys_pass_through_unchanged(policy_cls):
     keys = {
         "normalize_discrete_actions.buffer_actions.min": torch.zeros(32),
         "normalize_discrete_actions.buffer_actions.max": torch.ones(32),
@@ -68,13 +78,14 @@ def test_current_discrete_normalizer_keys_pass_through_unchanged():
         "normalize_targets.buffer_actions.mean": torch.zeros(32),
         "unnormalize_outputs.buffer_actions.std": torch.ones(32),
     }
-    fixed = _run_fix(dict(keys))
+    fixed = _run_fix(policy_cls, dict(keys))
     assert set(fixed) == set(keys)
 
 
-def test_remap_hits_only_the_module_prefix():
+@pytest.mark.parametrize("policy_cls", POLICY_CLASSES)
+def test_remap_hits_only_the_module_prefix(policy_cls):
     # A key merely *containing* the substring elsewhere must not be rewritten:
     # startswith-anchored, first occurrence only.
     weird = "model.some_module.normalize_actions.weight"
-    fixed = _run_fix({weird: torch.zeros(1)})
+    fixed = _run_fix(policy_cls, {weird: torch.zeros(1)})
     assert set(fixed) == {weird}

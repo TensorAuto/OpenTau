@@ -197,11 +197,13 @@ stock π₀.₅.
 
 ### Added — `save_trainable_params`, kept-forever trainable-only checkpoint snapshots — **opt-in, default `False`**
 
-Every saving step additionally writes `output_dir/trainable_params/step_<id>.safetensors`
-holding only the `requires_grad=True` parameters. The snapshots sit outside the
-`checkpoints/` tree, so `last_checkpoint_only` pruning never touches them: a mostly-frozen
-run (`train_ttt_only` trains 85M of 3.4B parameters) keeps a per-save-step parameter
-history at ~2% of full-checkpoint cost, while full resumable state stays latest-only.
+Every `save_freq` steps (and after the last step) a safetensors snapshot holding only the
+`requires_grad=True` parameters is written to `output_dir/trainable_params/step_<id>.safetensors`.
+The snapshots sit outside the `checkpoints/` tree, so `last_checkpoint_only` pruning never
+touches them, and — like `running_best_count` — they fire independently of `save_checkpoint`,
+so a snapshots-only run is possible: a mostly-frozen run (`train_ttt_only` trains 85M of 3.4B
+parameters) keeps a per-save-step parameter history at ~2% of full-checkpoint cost, while full
+resumable state stays latest-only.
 Restoring a step = build the policy from the run's base checkpoint, then
 `load_state_dict(load_file(snapshot), strict=False)`. Requires replicated parameters —
 DDP or DeepSpeed ZeRO-1/2; the run **raises at startup** under ZeRO-3/FSDP, where each

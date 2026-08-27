@@ -1173,6 +1173,11 @@ def train(cfg: TrainPipelineConfig):
         current_val_loss = None
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
         is_saving_step = (step % cfg.save_freq == 0 or step == cfg.steps) and cfg.save_checkpoint
+        # Deliberately NOT gated on `save_checkpoint`, mirroring `running_best_count`:
+        # a snapshots-only run (small per-step history, no full resumable state) is a
+        # legitimate configuration, and gating on `save_checkpoint` would turn the
+        # opt-in flag into a silent no-op there.
+        is_snapshot_step = (step % cfg.save_freq == 0 or step == cfg.steps) and cfg.save_trainable_params
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
         is_val_step = cfg.val_freq > 0 and step % cfg.val_freq == 0
 
@@ -1211,18 +1216,6 @@ def train(cfg: TrainPipelineConfig):
                 logging.info(f"Checkpoint policy after step {step}")
                 cfg.policy.pretrained_path = checkpoint_dir
                 save_checkpoint(checkpoint_dir, step, cfg)
-                if cfg.save_trainable_params:
-                    # Kept-forever trainable-only snapshot, written OUTSIDE the
-                    # checkpoints/ tree so `prune_old_checkpoints` never sees it.
-                    # Startup validation already rejected sharded-parameter
-                    # backends, so the unwrapped module holds full parameters.
-                    snapshot_path = save_trainable_params_snapshot(
-                        accelerator.unwrap_model(policy),
-                        cfg.output_dir / "trainable_params",
-                        step,
-                        cfg.steps,
-                    )
-                    logging.info(f"Saved trainable-only parameter snapshot to {snapshot_path}")
                 if cfg.last_checkpoint_only:
                     # Protect running-best checkpoints from the latest-only prune. Read live each
                     # save so bests created since the last save are not deleted.
@@ -1247,6 +1240,21 @@ def train(cfg: TrainPipelineConfig):
                         accelerator.num_processes - len(missing_ranks),
                         accelerator.num_processes,
                     )
+
+        if is_snapshot_step and accelerator.is_main_process:
+            # Kept-forever trainable-only snapshot, written OUTSIDE the checkpoints/
+            # tree so `prune_old_checkpoints` never sees it, and independent of the
+            # full-checkpoint block above so it fires even with `save_checkpoint=False`.
+            # Rank-0-only with no barrier: parameters are replicated (the startup
+            # validation rejected sharded backends) and the copy to CPU completes
+            # before this rank re-enters the training loop.
+            snapshot_path = save_trainable_params_snapshot(
+                accelerator.unwrap_model(policy),
+                cfg.output_dir / "trainable_params",
+                step,
+                cfg.steps,
+            )
+            logging.info(f"Saved trainable-only parameter snapshot to {snapshot_path}")
 
         if is_val_step and val_dataloader is not None:
             policy.eval()

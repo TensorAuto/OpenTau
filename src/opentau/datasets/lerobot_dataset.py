@@ -900,9 +900,7 @@ class BaseDataset(torch.utils.data.Dataset):
             # `n_obs_history` alone made a sequence batch fail this assertion
             # with "Expected image camera0 to have shape (3, H, W) ... Got
             # torch.Size([4, 3, 224, 224])".
-            expect_temporal = (
-                self.n_obs_history is not None or getattr(self, "sequence_length", 1) > 1
-            )
+            expect_temporal = self.n_obs_history is not None or getattr(self, "sequence_length", 1) > 1
         if expect_temporal:
             expected_ndim = 4
             expected_c_dim = 1
