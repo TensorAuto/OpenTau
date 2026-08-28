@@ -889,3 +889,56 @@ class TestForwardSequencePerSample:
             return_per_sample=True,
         )
         torch.testing.assert_close(with_ps["MSE"], without["MSE"], atol=0, rtol=0)
+
+
+class TestInferenceDiagnostics:
+    """The three inference-only knobs: validated, behavior-preserving by default."""
+
+    def test_adoption_choices_validated(self):
+        assert PI05TTTConfig(ttt_inference_update_adoption="last").ttt_inference_update_adoption == "last"
+        assert PI05TTTConfig(ttt_inference_update_adoption="first").ttt_inference_update_adoption == "first"
+        with pytest.raises(ValueError, match="'last' or 'first'"):
+            PI05TTTConfig(ttt_inference_update_adoption="middle")
+
+    def test_defaults_are_the_shipped_behavior(self):
+        config = PI05TTTConfig()
+        assert config.ttt_inference_update_adoption == "last"
+        assert config.ttt_inference_alpha_scale == pytest.approx(1.0)
+        assert config.ttt_inference_zero_registers is False
+
+    def test_alpha_scale_silences_memory_in_eval_mode_only(self):
+        from opentau.policies.ttt_layer import TanhGate
+
+        gate = TanhGate(width=4, init_value=0.5)
+        attn = torch.randn(2, 3, 4)
+        ttt = torch.randn(2, 3, 4)
+
+        gate.eval()
+        gate.inference_alpha_scale = 0.0
+        torch.testing.assert_close(gate(attn, ttt), attn)  # memory contribution silenced
+
+        gate.train()  # training mode ignores the diagnostic scale entirely
+        torch.testing.assert_close(gate(attn, ttt), attn + torch.tanh(gate.alpha) * ttt)
+
+        gate.eval()
+        gate.inference_alpha_scale = 1.0  # default scale is a no-op in eval too
+        torch.testing.assert_close(gate(attn, ttt), attn + torch.tanh(gate.alpha) * ttt)
+
+    def test_zero_registers_feeds_the_step_zero_table_in_eval_mode_only(self):
+        """Drives the real selection method on a stub, without the 3.4B model."""
+        from opentau.policies.pi05_ttt.modeling_pi05_ttt import PI05TTTFlowMatching
+
+        stub = object.__new__(PI05TTTFlowMatching)
+        stub.config = PI05TTTConfig(n_register_tokens=4, sequence_length=1, tbptt_segment_length=1)
+        stub.register_tokens = torch.full((4, stub.config.proj_width), 0.7)
+
+        stub.training = False
+        stub.config.ttt_inference_zero_registers = True
+        assert torch.all(stub._register_table_for_forward() == 0)
+
+        stub.config.ttt_inference_zero_registers = False
+        assert torch.all(stub._register_table_for_forward() == 0.7)
+
+        stub.training = True  # training mode always uses the trained table
+        stub.config.ttt_inference_zero_registers = True
+        assert torch.all(stub._register_table_for_forward() == 0.7)

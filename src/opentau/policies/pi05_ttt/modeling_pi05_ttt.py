@@ -311,6 +311,22 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         time_beta = beta_dist.sample((batch_size, num_timesteps)).to(device=device, dtype=torch.float32)
         return time_beta * 0.999 + 0.001
 
+    def _register_table_for_forward(self) -> Tensor:
+        """Selects the register table the forward embeds.
+
+        Returns the trained table, except under the
+        ``ttt_inference_zero_registers`` diagnostic in inference mode, where the
+        step-0 (zero) table is substituted so the trained registers' ungated
+        perturbation of the frozen expert can be isolated from the gated memory
+        contribution. Training mode always uses the trained table.
+
+        Returns:
+            The ``(n_register_tokens, proj_width)`` table to embed.
+        """
+        if self.config.ttt_inference_zero_registers and not self.training:
+            return torch.zeros_like(self.register_tokens)
+        return self.register_tokens
+
     def embed_suffix(
         self,
         noisy_actions: Tensor,
@@ -357,13 +373,9 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         # The parent embeds `timestep` for AdaRMS but derives the token
         # embeddings only from `noisy_actions`, so `embs` covers the action
         # block while `adarms_cond` already covers registers + actions.
-        register_table = self.register_tokens
-        if self.config.ttt_inference_zero_registers and not self.training:
-            # Diagnostic: evaluate with the step-0 (zero) register table so the
-            # trained registers' ungated perturbation of the frozen expert can
-            # be isolated from the gated memory contribution.
-            register_table = torch.zeros_like(register_table)
-        register_emb = repeat(register_table.to(embs.dtype), "r w -> b r w", b=embs.shape[0])
+        register_emb = repeat(
+            self._register_table_for_forward().to(embs.dtype), "r w -> b r w", b=embs.shape[0]
+        )
         embs = torch.cat([register_emb, embs], dim=1)
 
         pad_masks = torch.cat(
