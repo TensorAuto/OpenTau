@@ -243,8 +243,10 @@ rank's `named_parameters` are shards and the snapshot would be silently truncate
   (observed at stride 1 with chunk 20: 0% eval success from a frozen base that scores 33%).
   Migration: delete `sequence_stride` from sequence configs (or set it equal to
   `action_chunk`); non-sequence configs (`sequence_length: 1`) never read the field and are
-  unaffected. The stride-1 recipe used by the original pi05_ttt validation is deliberately
-  rejected now — it silently optimizes the copy shortcut.
+  unaffected. The two shipped sequence configs are migrated in the same change — the LIBERO
+  example also drops `sequence_length` 32 → 4 so the chunk-tiled window (`T * chunk` frames)
+  fits the dataset's shortest episodes. The stride-1 recipe used by the original pi05_ttt
+  validation is deliberately rejected now — it silently optimizes the copy shortcut.
 
 ## [0.13.0] - 2026-08-17
 

@@ -103,7 +103,14 @@ class TestWindowAnchoring:
         assert all(o <= 0.0 for o in offsets)
 
     def test_stride_one_uses_consecutive_frames(self):
-        """RoboTTT's own definition: one timestep is one control step."""
+        """The offset math places consecutive timesteps ``stride`` frames apart.
+
+        Exercised at stride 1 as pure offset arithmetic. Note stride 1 is no
+        longer a *reachable configuration* — RoboTTT's timestep is one action
+        chunk, so the config layer derives ``stride = action_chunk`` and rejects
+        anything else (see ``TestStrideEqualsChunkContract``); the mirror math
+        itself is stride-agnostic.
+        """
         freq = 20.0
         offsets = _obs_offsets(5, 1, freq)
         frames = [round(o * freq) for o in offsets]
@@ -112,8 +119,10 @@ class TestWindowAnchoring:
     def test_window_span_in_frames(self):
         """A T-timestep window spans ``(T-1)*stride + chunk`` frames.
 
-        This is what makes stride 1 tractable on short episodes: at chunk 10,
-        T=32 needs 41 frames, and LIBERO's shortest episode is 75.
+        With the derived ``stride = action_chunk``, the span is ``T * chunk``
+        frames — the budget that sizes ``sequence_length`` against a dataset's
+        shortest episodes (e.g. chunk 10: T=4 spans 40 frames vs LIBERO's
+        shortest episode of 75; the boundary-padding path absorbs the rest).
         """
         chunk = 10
         offsets = _action_offsets(32, 1, list(range(chunk)), 20.0)
@@ -223,6 +232,16 @@ class TestMirrorMatchesImplementation:
         )
         assert "-(seq_len - 1 - t) * seq_stride / action_freq" in source, (
             "the observation-offset expression changed; update _obs_offsets to match"
+        )
+        # The stride derivation is the behavior this contract rests on: `None`
+        # must resolve to `action_chunk` (chunk-tiled sequences), and the old
+        # stride-1 fallback must stay gone — reverting it re-opens the
+        # teacher-forcing leak while every validator-level test still passes.
+        assert "seq_stride = cfg.action_chunk if seq_len > 1 else 1" in source, (
+            "the stride derivation changed; sequence timesteps must tile in action chunks"
+        )
+        assert 'getattr(cfg.dataset_mixture, "sequence_stride", None) or 1' not in source, (
+            "the stride-1 fallback is back; that recipe leaks overlapping action targets"
         )
 
 

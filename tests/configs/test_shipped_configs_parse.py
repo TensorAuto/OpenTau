@@ -70,3 +70,44 @@ def test_shipped_config_is_valid_json(path: Path):
             "If this appeared after a formatting pass, check whether a Python formatter "
             "was pointed at a .json path — ruff will happily add magic trailing commas."
         )
+
+
+def _sequence_config_files() -> list[Path]:
+    """Shipped train configs that enable sequence training.
+
+    Returns:
+        JSON configs whose ``dataset_mixture.sequence_length`` exceeds 1 —
+        the ones the sequence-stride contract applies to.
+    """
+    out = []
+    for path in _config_files():
+        try:
+            data = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            continue  # the parse test above owns this failure
+        if not isinstance(data, dict):
+            continue  # e.g. list-shaped configs (accelerate deepspeed fragments)
+        mixture = data.get("dataset_mixture") or {}
+        if isinstance(mixture, dict) and (mixture.get("sequence_length") or 1) > 1:
+            out.append(path)
+    return out
+
+
+@pytest.mark.parametrize("path", _sequence_config_files(), ids=lambda p: p.name)
+def test_shipped_sequence_configs_satisfy_the_stride_contract(path: Path):
+    """Every shipped sequence config must pass the stride-equals-chunk guard.
+
+    The guard (`TrainPipelineConfig._validate_sequence_stride`) rejects
+    sub-chunk strides because overlapping action targets leak into the
+    teacher-forced context and collapse closed-loop rollouts. A shipped config
+    that fails it dies at startup for whoever copies it — exactly what the
+    JSON-parse test above exists to prevent for syntax, extended here to this
+    one semantic contract (a full ``validate()`` has side effects and external
+    dependencies, so only the stride guard is exercised).
+    """
+    import draccus
+
+    from opentau.configs.train import TrainPipelineConfig
+
+    cfg = draccus.parse(TrainPipelineConfig, config_path=str(path), args=[])
+    cfg._validate_sequence_stride()

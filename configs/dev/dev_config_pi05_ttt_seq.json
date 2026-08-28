@@ -11,8 +11,7 @@
         "action_freq": 15.0,
         "image_resample_strategy": "nearest",
         "vector_resample_strategy": "nearest",
-        "sequence_length": 4,
-        "sequence_stride": 1
+        "sequence_length": 4
     },
     "policy": {
         "type": "pi05_ttt",

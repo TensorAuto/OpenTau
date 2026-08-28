@@ -338,15 +338,14 @@ def resolve_delta_timestamps(
         # and TTT has nothing to carry. Caught on droid_100, which is 15 fps
         # while the dev config asks for 30, giving bit-identical frames at
         # stride 1.
-        if seq_len > 1 and action_freq > ds_meta.fps + 1e-6:
+        if seq_len > 1 and action_freq > seq_stride * ds_meta.fps + 1e-6:
             raise ValueError(
                 f"sequence_length={seq_len} with action_freq={action_freq} Hz on a dataset "
                 f"recorded at {ds_meta.fps} Hz: a stride of {seq_stride} frame(s) is "
                 f"{seq_stride / action_freq:.4f}s, shorter than one source frame "
                 f"({1 / ds_meta.fps:.4f}s), so consecutive timesteps would resolve to the same "
-                "observation. Set dataset_mixture.action_freq to the dataset's fps, or raise "
-                "sequence_stride to at least "
-                f"{int(-(-action_freq // ds_meta.fps))}."
+                "observation. Set dataset_mixture.action_freq to the dataset's fps (the stride "
+                "itself is derived from action_chunk and is not a tuning knob)."
             )
 
         standard_key = reverse_name_map[key]
