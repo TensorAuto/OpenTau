@@ -454,7 +454,10 @@ class DatasetMixtureConfig:
             default) emits today's single-timestep batches unchanged; >1 adds a
             leading time axis for recurrent policies. Mutually exclusive with
             ``n_obs_history``.
-        sequence_stride: Frames between consecutive timesteps, defaulting to 1
+        sequence_stride: Frames between consecutive timesteps; ``None`` (default)
+            derives ``action_chunk`` (RoboTTT's chunk-tiled sequences), and any
+            other explicit value is rejected at ``TrainPipelineConfig.validate``.
+            Historic note: this used to default to 1
             (one control step per timestep, RoboTTT's definition).
         n_obs_history: Number of historical observation steps to include. When
             set to ``T``, each camera returns shape ``(T, C, H, W)`` and state
@@ -629,13 +632,20 @@ class DatasetMixtureConfig:
     # T separate predictions the memory is carried across.
     #
     # `sequence_stride` is the gap, in frames, between consecutive timesteps.
-    # RoboTTT's own definition of a timestep is one control step, i.e. stride 1;
-    # a larger stride trades temporal resolution for wall-clock coverage at the
-    # same number of fast-weight updates.
+    # RoboTTT defines one timestep as one H-step action chunk (its trajectories
+    # are (obs, proprio, chunk) tuples tiling the episode; inference advances
+    # t -> t+H), so the only paper-faithful stride is `action_chunk` — `None`
+    # (the default) derives exactly that, and `TrainPipelineConfig.validate`
+    # rejects any other explicit value: a sub-chunk stride overlaps consecutive
+    # timesteps' action targets, the mostly-teacher-forced context then contains
+    # the current chunk's answers, and the TTT layers learn to copy them —
+    # training loss falls while closed-loop rollouts collapse (observed at
+    # stride 1, chunk 20: zero closed-loop success from a frozen base that
+    # succeeds on a third of episodes).
     #
-    # 1 and None leave every existing run byte-identical: at
+    # None leaves every existing non-sequence run byte-identical: at
     # `sequence_length == 1` the action offsets below collapse to exactly
-    # `policy.action_delta_indices`.
+    # `policy.action_delta_indices` and the stride is never read.
     sequence_length: int = 1
     sequence_stride: int | None = None
 
@@ -717,8 +727,8 @@ class DatasetMixtureConfig:
             or self.sequence_stride < 1
         ):
             raise ValueError(
-                "`sequence_stride` must be None (defaults to 1, one control step per timestep, "
-                f"as RoboTTT defines it) or a positive integer, got {self.sequence_stride!r}."
+                "`sequence_stride` must be None (derives `action_chunk`: RoboTTT tiles a "
+                f"trajectory into disjoint action chunks) or a positive integer, got {self.sequence_stride!r}."
             )
         if self.sequence_length > 1 and any(
             getattr(d, "use_delta_joint_actions", False) for d in (self.datasets or [])

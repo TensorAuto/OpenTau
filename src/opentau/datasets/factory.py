@@ -319,7 +319,16 @@ def resolve_delta_timestamps(
         # `getattr` because tests build the mixture as a SimpleNamespace stand-in
         # that only carries the fields the case under test needs.
         seq_len = getattr(cfg.dataset_mixture, "sequence_length", 1)
-        seq_stride = getattr(cfg.dataset_mixture, "sequence_stride", None) or 1
+        seq_stride = getattr(cfg.dataset_mixture, "sequence_stride", None)
+        if seq_stride is None:
+            # RoboTTT semantics: one timestep IS one action chunk, so consecutive
+            # timesteps tile the trajectory in disjoint chunks. Any other stride
+            # overlaps adjacent timesteps' action targets and hands the mostly
+            # teacher-forced context the current chunk's answers to copy —
+            # `TrainPipelineConfig.validate` rejects explicit mismatches.
+            # Only resolved in sequence mode: at seq_len == 1 the stride is never
+            # read downstream, and test stubs legitimately omit `action_chunk`.
+            seq_stride = cfg.action_chunk if seq_len > 1 else 1
 
         # `sequence_stride` is documented in *frames*, but every offset here is
         # converted with `action_freq` — the resampling rate — so the two agree

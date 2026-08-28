@@ -301,3 +301,55 @@ class TestObsHistoryPadFallback:
         ds = self._stub(sequence_length=8)
         dropped = ds._obs_history_pad_fallback(padded=True)
         assert dropped.shape == (8,) and dropped.all()
+
+
+class TestStrideEqualsChunkContract:
+    """`sequence_stride` is derived from `action_chunk`, never a free knob.
+
+    RoboTTT's timestep is one H-step action chunk — its sequences tile the
+    trajectory in disjoint chunks and the paper has no stride concept. A
+    sub-chunk stride overlaps consecutive timesteps' action targets, so the
+    mostly teacher-forced context contains the current chunk's answers; the TTT
+    layers learn to copy them and closed-loop rollouts collapse (observed at
+    stride 1, chunk 20: 0% success from a 33%-success frozen base).
+    """
+
+    @staticmethod
+    def _cfg(sequence_length: int, sequence_stride: int | None, action_chunk: int = 20):
+        import draccus
+
+        from opentau.configs.train import TrainPipelineConfig
+
+        overrides = [
+            "--dataset_mixture.datasets",
+            '[{"repo_id": "dummy/dummy"}]',
+            "--dataset_mixture.sequence_length",
+            str(sequence_length),
+            "--action_chunk",
+            str(action_chunk),
+            "--batch_size",
+            "2",
+            "--dataloader_batch_size",
+            "2",
+        ]
+        if sequence_stride is not None:
+            overrides += ["--dataset_mixture.sequence_stride", str(sequence_stride)]
+        return draccus.parse(TrainPipelineConfig, args=overrides)
+
+    def test_mismatched_stride_is_rejected(self):
+        cfg = self._cfg(sequence_length=8, sequence_stride=1)
+        with pytest.raises(ValueError, match="disjoint action chunks"):
+            cfg._validate_sequence_stride()
+
+    def test_explicit_equal_stride_is_accepted(self):
+        cfg = self._cfg(sequence_length=8, sequence_stride=20)
+        cfg._validate_sequence_stride()
+
+    def test_none_is_accepted_and_derives_the_chunk(self):
+        cfg = self._cfg(sequence_length=8, sequence_stride=None)
+        cfg._validate_sequence_stride()
+
+    def test_stride_is_inert_at_sequence_length_one(self):
+        """Non-sequence configs keep any stride value: the field is never read."""
+        cfg = self._cfg(sequence_length=1, sequence_stride=3)
+        cfg._validate_sequence_stride()

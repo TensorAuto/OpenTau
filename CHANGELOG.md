@@ -233,6 +233,18 @@ rank's `named_parameters` are shards and the snapshot would be silently truncate
   history-drop branch) now emit through `BaseDataset._obs_history_pad_fallback`, sized by the
   active temporal mode. Invisible at `batch_size == 1` — the only shape the `pi05_ttt`
   sequence loader had run at — and a no-op for history-mode and single-step configs.
+- **`dataset_mixture.sequence_stride` is no longer a free knob: `None` (default) now derives
+  `action_chunk`, and any other value is rejected at config validation.** RoboTTT's timestep
+  *is* one H-step action chunk — its training sequences tile the trajectory in disjoint
+  chunks, and the paper has no stride concept; the configurable stride (previously defaulting
+  to 1) was this port's own addition. A sub-chunk stride overlaps consecutive timesteps'
+  action targets, so the mostly teacher-forced context contains the current chunk's answers:
+  the TTT layers learn to copy them, training loss falls, and closed-loop rollouts collapse
+  (observed at stride 1 with chunk 20: 0% eval success from a frozen base that scores 33%).
+  Migration: delete `sequence_stride` from sequence configs (or set it equal to
+  `action_chunk`); non-sequence configs (`sequence_length: 1`) never read the field and are
+  unaffected. The stride-1 recipe used by the original pi05_ttt validation is deliberately
+  rejected now — it silently optimizes the copy shortcut.
 
 ## [0.13.0] - 2026-08-17
 

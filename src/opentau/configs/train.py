@@ -347,6 +347,37 @@ class TrainPipelineConfig(HubMixin):
                 "it), or change `action_chunk` — a policy-level `chunk_size` is ignored either way."
             ) from e
 
+    def _validate_sequence_stride(self) -> None:
+        """Reject a sequence stride that is not the action chunk.
+
+        RoboTTT's timestep IS one H-step action chunk: its sequences tile the
+        trajectory in disjoint chunks and the paper has no stride knob. A
+        sub-chunk stride overlaps consecutive timesteps' action targets, so the
+        mostly teacher-forced context contains the current chunk's answers — the
+        TTT layers learn to copy them, training loss falls, and closed-loop
+        rollouts collapse (observed at stride 1, chunk 20: 0% success from a
+        33%-success frozen base). ``None`` derives ``action_chunk`` (in
+        ``datasets/factory.py``); anything else is a config error, not a knob.
+        Inert at ``sequence_length == 1``, where the stride is never read.
+
+        Raises:
+            ValueError: If an explicit ``sequence_stride`` differs from
+                ``action_chunk`` while sequence training is enabled.
+        """
+        if self.dataset_mixture is None or getattr(self.dataset_mixture, "sequence_length", 1) <= 1:
+            return
+        stride = getattr(self.dataset_mixture, "sequence_stride", None)
+        if stride is not None and stride != self.action_chunk:
+            raise ValueError(
+                f"dataset_mixture.sequence_stride={stride} != action_chunk={self.action_chunk}: "
+                "sequence timesteps must tile the trajectory in disjoint action chunks "
+                "(one timestep = one chunk, matching both the RoboTTT paper and the "
+                "inference call cadence). Any other stride leaks overlapping action "
+                "targets into the teacher-forced context and collapses closed-loop "
+                "performance. Leave sequence_stride unset (null) to derive it from "
+                "action_chunk, or set it equal explicitly."
+            )
+
     def validate(self):
         """Validate and finalize the training configuration.
 
@@ -362,6 +393,16 @@ class TrainPipelineConfig(HubMixin):
             FileExistsError: If output directory exists and resume is False.
             NotADirectoryError: If config_path for resuming doesn't exist locally.
         """
+        # Sequence training tiles a trajectory into disjoint action chunks (RoboTTT's
+        # timestep IS one H-step chunk; the paper has no stride knob). A sub-chunk
+        # stride overlaps consecutive timesteps' action targets, so the mostly
+        # teacher-forced context contains the current chunk's answers — the TTT
+        # layers learn to copy them, training loss falls, and closed-loop rollouts
+        # collapse (observed at stride 1, chunk 20: 0% success from a 33%-success
+        # frozen base). `None` derives `action_chunk`; any other value is a config
+        # error, not a tuning knob.
+        self._validate_sequence_stride()
+
         # HACK: We parse again the cli args here to get the pretrained paths if there was some.
         policy_path = parser.get_path_arg("policy")
         if policy_path:
