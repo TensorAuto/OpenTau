@@ -26,6 +26,8 @@ Real sim rollouts are validated separately on a CUDA box.
 import contextlib
 import json
 import os
+import sys
+import types
 from functools import partial
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -129,6 +131,83 @@ class TestRoboCasaConfig:
 
     def test_gym_kwargs_omits_split_when_none(self):
         assert "split" not in RoboCasaEnv().gym_kwargs
+
+    def test_gym_kwargs_carries_layout_and_style_ids(self):
+        cfg = RoboCasaEnv(layout_and_style_ids=[[11, 26], [12, 15]])
+        assert cfg.gym_kwargs["layout_and_style_ids"] == [[11, 26], [12, 15]]
+
+    def test_gym_kwargs_omits_layout_and_style_ids_when_none(self):
+        assert "layout_and_style_ids" not in RoboCasaEnv().gym_kwargs
+
+
+class TestEnsureEnvSplitRerouting:
+    """`_ensure_env`'s split handling when an explicit kitchen list is set.
+
+    robocasa's `create_env` split branches OVERWRITE `layout_and_style_ids`, so
+    the wrapper must send the list with `split=None` and carry the
+    object-instance split separately — and `"all"` must reroute to
+    `obj_instance_split=None`, since the object sampler accepts only
+    `"pretrain"`/`"target"`/`None` (forwarding `"all"` verbatim raises in the
+    spawn worker at object-sampling time).
+    """
+
+    @pytest.mark.parametrize(
+        ("split", "expected_obj_split"),
+        [("pretrain", "pretrain"), ("target", "target"), ("all", None), (None, "pretrain")],
+    )
+    def test_explicit_scene_list_reroutes_split(self, split, expected_obj_split, monkeypatch):
+        from opentau.envs import robocasa as robocasa_mod
+
+        captured: dict = {}
+
+        class _FakeGymEnv:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.env = types.SimpleNamespace(get_ep_meta=lambda: {"lang": "close it"})
+
+        # `_ensure_env` imports RoboCasaGymEnv lazily from
+        # `robocasa.wrappers.gym_wrapper`, so patch the module it imports from.
+        fake_mod = types.ModuleType("robocasa.wrappers.gym_wrapper")
+        fake_mod.RoboCasaGymEnv = _FakeGymEnv
+        fake_pkg = types.ModuleType("robocasa.wrappers")
+        fake_root = types.ModuleType("robocasa")
+        monkeypatch.setitem(sys.modules, "robocasa", fake_root)
+        monkeypatch.setitem(sys.modules, "robocasa.wrappers", fake_pkg)
+        monkeypatch.setitem(sys.modules, "robocasa.wrappers.gym_wrapper", fake_mod)
+        env = robocasa_mod.RoboCasaEnv(
+            task="CloseCabinet",
+            camera_name=["robot0_eye_in_hand"],
+            split=split,
+            layout_and_style_ids=[[11, 26]],
+        )
+        env._ensure_env()
+        assert captured["split"] is None
+        assert captured["obj_instance_split"] == expected_obj_split
+        assert captured["layout_and_style_ids"] == [[11, 26]]
+
+    def test_no_scene_list_keeps_split_verbatim(self, monkeypatch):
+        from opentau.envs import robocasa as robocasa_mod
+
+        captured: dict = {}
+
+        class _FakeGymEnv:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.env = types.SimpleNamespace(get_ep_meta=lambda: {"lang": "close it"})
+
+        # `_ensure_env` imports RoboCasaGymEnv lazily from
+        # `robocasa.wrappers.gym_wrapper`, so patch the module it imports from.
+        fake_mod = types.ModuleType("robocasa.wrappers.gym_wrapper")
+        fake_mod.RoboCasaGymEnv = _FakeGymEnv
+        fake_pkg = types.ModuleType("robocasa.wrappers")
+        fake_root = types.ModuleType("robocasa")
+        monkeypatch.setitem(sys.modules, "robocasa", fake_root)
+        monkeypatch.setitem(sys.modules, "robocasa.wrappers", fake_pkg)
+        monkeypatch.setitem(sys.modules, "robocasa.wrappers.gym_wrapper", fake_mod)
+        env = robocasa_mod.RoboCasaEnv(task="CloseCabinet", camera_name=["robot0_eye_in_hand"], split="all")
+        env._ensure_env()
+        assert captured["split"] == "all"
+        assert "layout_and_style_ids" not in captured
 
 
 class TestMakeEnvConfigRoboCasa:

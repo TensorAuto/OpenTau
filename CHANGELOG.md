@@ -209,6 +209,18 @@ Restoring a step = build the policy from the run's base checkpoint, then
 DDP or DeepSpeed ZeRO-1/2; the run **raises at startup** under ZeRO-3/FSDP, where each
 rank's `named_parameters` are shards and the snapshot would be silently truncated.
 
+### Added — `env.layout_and_style_ids`, explicit RoboCasa kitchen-scene lists — **opt-in, default `null`**
+
+Evaluate (or train-eval) in an explicit list of `[layout_id, style_id]` kitchen scenes instead
+of a `split`-derived set. RoboCasa's `pretrain` split spans 2,500 kitchen combos while a task
+fine-tune's demos typically cover a small subset, so a split-wide eval measures scene
+generalization; this field measures the in-distribution number on the policy's actual training
+kitchens (readable from a dataset's `extras/*/ep_meta.json`). robocasa's `create_env` split
+branches overwrite `layout_and_style_ids`, so the wrapper sends an explicit list with
+`split=None` and forwards the object-instance split directly — mapping `"all"` to `None`, the
+only spelling its object sampler accepts. `null` (default) keeps split-derived sampling
+unchanged.
+
 ### Fixed
 
 - **Pre-rename π₀.₅ checkpoints load again: legacy `normalize_actions.*` state-dict keys

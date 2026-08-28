@@ -563,6 +563,11 @@ class RoboCasaEnv(gym.Env):
             visualization_height: Height of visualization frames.
             split: RoboCasa dataset split (``None``/``"all"``/``"pretrain"``/``"target"``);
                 ``None`` resolves to ``"pretrain"`` at env construction.
+            layout_and_style_ids: Explicit ``[layout_id, style_id]`` kitchen-scene
+                pairs to sample from instead of the ``split``-derived kitchen sets
+                (``split`` then still selects the object-instance split). ``None``
+                keeps the split-derived sampling. See the config-side docstring
+                (``RoboCasaEnv.layout_and_style_ids`` in ``envs/configs.py``).
             episode_length: Max steps per episode (``_max_episode_steps``); defaults to 1000.
             obj_registries: Object-mesh registries to sample assets from.
             episode_index: Per-worker index (``0..n_envs-1``) used as the
@@ -676,7 +681,10 @@ class RoboCasaEnv(gym.Env):
                 # with `split=None`; the object-instance split (the only other
                 # thing `split` controls) is preserved by passing it directly.
                 extra_env_kwargs["layout_and_style_ids"] = [list(p) for p in self.layout_and_style_ids]
-                extra_env_kwargs["obj_instance_split"] = split_arg
+                # Mirror create_env's own split branches: "all" maps to
+                # obj_instance_split=None there, and robocasa's object sampler
+                # accepts only "pretrain"/"target"/None.
+                extra_env_kwargs["obj_instance_split"] = None if split_arg == "all" else split_arg
                 split_arg = None
             self._env = RoboCasaGymEnv(
                 env_name=self.task,
