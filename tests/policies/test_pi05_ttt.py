@@ -977,3 +977,26 @@ class TestInferenceDiagnostics:
         stub._adopt_fast_weights(SimpleNamespace(outgoing={0: later}))
         assert torch.equal(stub._carried_fast_weights[0], later)
         assert stub._first_step_adoption is None
+
+    def test_attach_wires_the_alpha_scale_from_config(self):
+        """Dropping the config->gate wiring must fail a test, not silently no-op the knob."""
+        from types import SimpleNamespace
+
+        from opentau.policies.pi05_ttt.modeling_pi05_ttt import PI05TTTFlowMatching
+
+        stub = object.__new__(PI05TTTFlowMatching)
+        stub.config = PI05TTTConfig(
+            n_register_tokens=2,
+            sequence_length=1,
+            tbptt_segment_length=1,
+            ttt_num_heads=2,
+            ttt_inference_alpha_scale=0.25,
+        )
+        layers = [SimpleNamespace(), SimpleNamespace()]
+        stub.paligemma_with_expert = SimpleNamespace(
+            gemma_expert=SimpleNamespace(model=SimpleNamespace(layers=layers)),
+            config=SimpleNamespace(gemma_expert_config=SimpleNamespace(hidden_size=8)),
+        )
+        stub._attach_ttt_layers()
+        for layer in layers:
+            assert layer.ttt_gate.inference_alpha_scale == pytest.approx(0.25)
