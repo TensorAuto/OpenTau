@@ -998,5 +998,12 @@ class TestInferenceDiagnostics:
             config=SimpleNamespace(gemma_expert_config=SimpleNamespace(hidden_size=8)),
         )
         stub._attach_ttt_layers()
+        attn = torch.zeros(1, 2, 8)
+        ttt = torch.ones(1, 2, 8)
         for layer in layers:
-            assert layer.ttt_gate.inference_alpha_scale == pytest.approx(0.25)
+            gate = layer.ttt_gate.eval()
+            scaled = gate(attn, ttt)
+            stub.config.ttt_inference_alpha_scale = 0.0  # flip LIVE on the built policy
+            torch.testing.assert_close(gate(attn, ttt), attn)
+            stub.config.ttt_inference_alpha_scale = 0.25
+            torch.testing.assert_close(gate(attn, ttt), scaled)

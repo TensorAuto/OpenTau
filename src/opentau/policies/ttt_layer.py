@@ -669,7 +669,25 @@ class TanhGate(nn.Module):
         # eval mode — which includes in-training validation, so leave it at 1.0
         # in training configs. 0.0 silences the memory contribution entirely so
         # an existing checkpoint can be evaluated with the TTT pathway off.
+        # When a policy config is bound (`bind_diagnostics_config`), the scale
+        # is read live from it so flipping the knob on an already-built policy
+        # takes effect; the plain attribute remains the unbound fallback.
         self.inference_alpha_scale: float = 1.0
+        self._diagnostics_config = None
+
+    def bind_diagnostics_config(self, config) -> None:
+        """Binds a policy config whose ``ttt_inference_alpha_scale`` is read live.
+
+        Object identity makes later mutations of the config visible to the gate,
+        so the diagnostic scale can be flipped on an already-built policy — the
+        natural paired-eval flow on one loaded checkpoint. Stored as a plain
+        attribute (not a submodule/buffer), so ``load_state_dict`` never touches it.
+
+        Args:
+            config: The owning policy's config object (must expose
+                ``ttt_inference_alpha_scale``).
+        """
+        self._diagnostics_config = config
 
     def forward(self, attention_output: Tensor, ttt_output: Tensor) -> Tensor:
         """Adds the gated TTT contribution to the attention output.
@@ -682,8 +700,14 @@ class TanhGate(nn.Module):
             The blended output, same shape and dtype as ``attention_output``.
         """
         gate = torch.tanh(self.alpha).to(ttt_output.dtype)
-        if not self.training and self.inference_alpha_scale != 1.0:
-            gate = gate * self.inference_alpha_scale
+        if not self.training:
+            scale = (
+                self._diagnostics_config.ttt_inference_alpha_scale
+                if self._diagnostics_config is not None
+                else self.inference_alpha_scale
+            )
+            if scale != 1.0:
+                gate = gate * scale
         return attention_output + gate * ttt_output
 
 
