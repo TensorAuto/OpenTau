@@ -372,3 +372,58 @@ class TestStrideEqualsChunkContract:
         """Non-sequence configs keep any stride value: the field is never read."""
         cfg = self._cfg(sequence_length=1, sequence_stride=3)
         cfg._validate_sequence_stride()
+
+
+class TestOversamplingGuardStrideAware:
+    """The mixed-frequency guard trips only when timesteps land inside one frame.
+
+    Consecutive timesteps are ``seq_stride / action_freq`` seconds apart and
+    collide only when that is shorter than one source frame — i.e. when
+    ``action_freq > seq_stride * fps``. The stride-1-era predicate
+    (``action_freq > fps``) would wrongly reject valid oversampled configs now
+    that the stride derives from ``action_chunk``; the boundary cases below
+    fail under a revert.
+    """
+
+    @staticmethod
+    def _resolve(action_freq: float, fps: int, chunk: int = 2, stride: int | None = None):
+        from types import SimpleNamespace
+
+        from opentau.configs.default import DatasetConfig
+        from opentau.datasets.factory import resolve_delta_timestamps
+
+        train_cfg = SimpleNamespace(
+            dataset_mixture=SimpleNamespace(
+                action_freq=action_freq,
+                n_obs_history=None,
+                sequence_length=2,
+                sequence_stride=stride,
+            ),
+            action_chunk=chunk,
+            policy=None,
+        )
+        ds_cfg = DatasetConfig(
+            repo_id="_tests/oversampling",
+            data_features_name_mapping={"state": "observation.state", "actions": "action"},
+        )
+        meta = SimpleNamespace(
+            features={"observation.state": {}, "action": {}}, fps=fps, control_mode="joint"
+        )
+        return resolve_delta_timestamps(train_cfg, ds_cfg, meta)
+
+    def test_boundary_equal_passes(self):
+        """action_freq == stride * fps: timesteps exactly one frame apart — valid.
+
+        The stride-1-era predicate (``action_freq > fps``) raised here; passing
+        is the revert detector.
+        """
+        self._resolve(action_freq=20.0, fps=10)
+
+    def test_over_boundary_raises(self):
+        with pytest.raises(ValueError, match="resolve to the same"):
+            self._resolve(action_freq=21.0, fps=10)
+
+    def test_explicit_equal_stride_same_boundary(self):
+        self._resolve(action_freq=20.0, fps=10, stride=2)
+        with pytest.raises(ValueError, match="resolve to the same"):
+            self._resolve(action_freq=21.0, fps=10, stride=2)
