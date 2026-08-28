@@ -246,6 +246,7 @@ class PI05TTTFlowMatching(PI05FlowMatching):
                 expected_mini_batch_size=self.config.n_expert_tokens_per_timestep,
             )
             layer.ttt_gate = TanhGate(width, init_value=self.config.ttt_gate_init)
+            layer.ttt_gate.inference_alpha_scale = self.config.ttt_inference_alpha_scale
 
     def ttt_parameters(self) -> list[nn.Parameter]:
         """Returns every parameter this policy adds on top of stock π₀.₅.
@@ -356,7 +357,13 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         # The parent embeds `timestep` for AdaRMS but derives the token
         # embeddings only from `noisy_actions`, so `embs` covers the action
         # block while `adarms_cond` already covers registers + actions.
-        register_emb = repeat(self.register_tokens.to(embs.dtype), "r w -> b r w", b=embs.shape[0])
+        register_table = self.register_tokens
+        if self.config.ttt_inference_zero_registers and not self.training:
+            # Diagnostic: evaluate with the step-0 (zero) register table so the
+            # trained registers' ungated perturbation of the frozen expert can
+            # be isolated from the gated memory contribution.
+            register_table = torch.zeros_like(register_table)
+        register_emb = repeat(register_table.to(embs.dtype), "r w -> b r w", b=embs.shape[0])
         embs = torch.cat([register_emb, embs], dim=1)
 
         pad_masks = torch.cat(

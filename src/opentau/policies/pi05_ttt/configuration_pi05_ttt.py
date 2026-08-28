@@ -133,6 +133,15 @@ class PI05TTTConfig(PI05Config):
     # proprioception) the way training drove it. Inference-only semantics; safe
     # to flip on an existing checkpoint.
     ttt_inference_update_adoption: str = "last"
+    # Inference-only diagnostics for isolating a trained checkpoint's damage
+    # vector without retraining. `ttt_inference_alpha_scale` multiplies every
+    # tanh gate at rollout (0.0 = memory contribution off; training unaffected).
+    # `ttt_inference_zero_registers` feeds the zero-init register table instead
+    # of the trained one at rollout, reproducing the step-0 register condition.
+    # Both at their "off" pair (0.0, True) should reproduce the stock base
+    # policy's behavior through the TTT wrapper.
+    ttt_inference_alpha_scale: float = 1.0
+    ttt_inference_zero_registers: bool = False
 
     # `PI05TTTPolicy.supports_torch_compile` is False (the sequence path drives a
     # Python-level loop over TBPTT segments), so inheriting π₀.₅'s `True` meant
