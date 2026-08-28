@@ -221,6 +221,20 @@ branches overwrite `layout_and_style_ids`, so the wrapper sends an explicit list
 only spelling its object sampler accepts. `null` (default) keeps split-derived sampling
 unchanged.
 
+### Added — pi05_ttt inference-only diagnostics — **opt-in, defaults preserve behavior**
+
+Three config knobs that change rollout behavior only, so a trained TTT checkpoint can be
+dissected without retraining: `ttt_inference_update_adoption` ("last", the historic default,
+or "first" — which Euler step's fast-weight update a policy call adopts; "first" ingests the
+pure-noise action tokens matching the mode of the training marginal), `ttt_inference_alpha_scale`
+(multiplies every tanh gate at rollout; `0.0` silences the memory contribution), and
+`ttt_inference_zero_registers` (feeds the zero-init register table, reproducing the step-0
+register condition). Together they isolate a checkpoint's damage vector in minutes: on one
+degraded frozen-base checkpoint, memory-off recovered 12.5% → 43.75% closed-loop success while
+registers-zeroed changed nothing — pinning the harm on the learned memory output and steering
+the training recipe to expert co-adaptation. All three default to the shipped behavior and are
+never read in training mode.
+
 ### Fixed
 
 - **Pre-rename π₀.₅ checkpoints load again: legacy `normalize_actions.*` state-dict keys
