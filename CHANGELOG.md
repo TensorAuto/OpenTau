@@ -232,8 +232,8 @@ pure-noise action tokens matching the mode of the training marginal), `ttt_infer
 register condition). Together they isolate a checkpoint's damage vector in minutes: on one
 degraded frozen-base checkpoint, memory-off recovered 12.5% → 43.75% closed-loop success while
 registers-zeroed changed nothing — pinning the harm on the learned memory output and steering
-the training recipe to expert co-adaptation. All three default to the shipped behavior and are
-never read in training mode.
+the training recipe to expert co-adaptation. All three default to the shipped behavior and are read only in eval mode —
+which includes in-training *validation*, so leave them at defaults in training configs.
 
 ### Fixed
 

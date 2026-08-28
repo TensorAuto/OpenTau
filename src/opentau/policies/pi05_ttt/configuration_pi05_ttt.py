@@ -138,8 +138,12 @@ class PI05TTTConfig(PI05Config):
     # tanh gate at rollout (0.0 = memory contribution off; training unaffected).
     # `ttt_inference_zero_registers` feeds the zero-init register table instead
     # of the trained one at rollout, reproducing the step-0 register condition.
-    # Both at their "off" pair (0.0, True) should reproduce the stock base
-    # policy's behavior through the TTT wrapper.
+    # Both at their "off" pair (0.0, True) reproduce the *step-0 wrapper
+    # condition* (zero-init registers, silent memory) — close to, but not
+    # bit-identical with, the stock base policy: zeroed registers still occupy
+    # attention slots (only `n_register_tokens=0` removes them). NOTE these
+    # knobs are read whenever the module is in eval mode — which includes
+    # in-training validation — so leave them at defaults in training configs.
     ttt_inference_alpha_scale: float = 1.0
     ttt_inference_zero_registers: bool = False
 

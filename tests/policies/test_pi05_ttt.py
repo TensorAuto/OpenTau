@@ -942,3 +942,38 @@ class TestInferenceDiagnostics:
         stub.training = True  # training mode always uses the trained table
         stub.config.ttt_inference_zero_registers = True
         assert torch.all(stub._register_table_for_forward() == 0.7)
+
+    def test_first_step_capture_fires_once_and_adoption_resets(self):
+        """Capture-once / adopt / between-calls-reset, on a stub (no 3.4B model)."""
+        from types import SimpleNamespace
+
+        from opentau.policies.pi05_ttt.modeling_pi05_ttt import PI05TTTFlowMatching
+
+        stub = object.__new__(PI05TTTFlowMatching)
+        stub.config = PI05TTTConfig(
+            n_register_tokens=4,
+            sequence_length=1,
+            tbptt_segment_length=1,
+            ttt_inference_update_adoption="first",
+        )
+        first, later = torch.tensor([1.0]), torch.tensor([2.0])
+        stub._first_step_adoption = None
+        stub._active_ttt_state = SimpleNamespace(outgoing={0: first})
+        stub._maybe_capture_first_step_update()
+        stub._active_ttt_state.outgoing = {0: later}
+        stub._maybe_capture_first_step_update()  # must NOT overwrite the first capture
+        assert torch.equal(stub._first_step_adoption[0], first)
+
+        stub._carried_fast_weights = {}
+        stub._inference_token_position = 0
+        stub._adopt_fast_weights(SimpleNamespace(outgoing={0: later}))
+        assert torch.equal(stub._carried_fast_weights[0], first)  # "first" wins over outgoing
+        assert stub._inference_token_position == stub.config.n_expert_tokens_per_timestep
+        assert stub._first_step_adoption is None  # reset between calls
+
+        # "last" adoption ignores a stale capture and takes outgoing.
+        stub.config.ttt_inference_update_adoption = "last"
+        stub._first_step_adoption = {0: first}
+        stub._adopt_fast_weights(SimpleNamespace(outgoing={0: later}))
+        assert torch.equal(stub._carried_fast_weights[0], later)
+        assert stub._first_step_adoption is None
