@@ -411,6 +411,18 @@ class RoboCasaEnv(EnvConfig):
     def __post_init__(self):
         if self.fps <= 0:
             raise ValueError(f"RoboCasa env.fps (control frequency in Hz) must be positive, got {self.fps}")
+        if self.layout_and_style_ids is not None:
+            if not self.layout_and_style_ids:
+                raise ValueError(
+                    "layout_and_style_ids must be a non-empty list of [layout_id, style_id] "
+                    "pairs, or null for split-derived kitchen sampling."
+                )
+            for pair in self.layout_and_style_ids:
+                if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                    raise ValueError(
+                        f"layout_and_style_ids entries must be [layout_id, style_id] pairs; got "
+                        f"{pair!r}. For a single scene write [[layout, style]], not a flat list."
+                    )
         if self.obs_type not in ("pixels", "pixels_agent_pos"):
             raise ValueError(f"Unsupported obs_type: {self.obs_type}")
 

@@ -1094,3 +1094,19 @@ def test_robocasa_autodownload_and_rollout_from_relocated_root(monkeypatch):
         assert "pixels" in obs
     finally:
         env.close()
+
+
+class TestLayoutAndStyleIdsValidation:
+    """Malformed scene lists must fail at config parse, not in a spawn worker."""
+
+    def test_empty_list_rejected(self):
+        with pytest.raises(ValueError, match="non-empty"):
+            RoboCasaEnv(layout_and_style_ids=[])
+
+    def test_flat_list_rejected(self):
+        with pytest.raises(ValueError, match="flat list"):
+            RoboCasaEnv(layout_and_style_ids=[11, 26])
+
+    def test_pairs_accepted(self):
+        cfg = RoboCasaEnv(layout_and_style_ids=[[11, 26], [12, 15]])
+        assert cfg.layout_and_style_ids == [[11, 26], [12, 15]]
