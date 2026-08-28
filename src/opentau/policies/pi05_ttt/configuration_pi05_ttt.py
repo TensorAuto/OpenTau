@@ -123,6 +123,16 @@ class PI05TTTConfig(PI05Config):
     # Off by default: it changes nothing numerically, but it is pure overhead at
     # the sequence lengths that already fit.
     checkpoint_tbptt_segments: bool = False
+    # Which Euler step's fast-weight update a rollout adopts ("one mini batch per
+    # inference"). "last" (historic default) uses the final step: nearly-clean,
+    # self-generated action tokens — a noise level the training marginal
+    # (tau ~ Beta(1.5, 1), mass toward pure noise) almost never visits, so the
+    # memory ingests out-of-distribution inputs exactly when the gates open.
+    # "first" uses the first step: pure-noise action tokens, the mode of the
+    # training marginal, so the update is driven by the observation (registers +
+    # proprioception) the way training drove it. Inference-only semantics; safe
+    # to flip on an existing checkpoint.
+    ttt_inference_update_adoption: str = "last"
 
     # `PI05TTTPolicy.supports_torch_compile` is False (the sequence path drives a
     # Python-level loop over TBPTT segments), so inheriting π₀.₅'s `True` meant
@@ -175,6 +185,11 @@ class PI05TTTConfig(PI05Config):
             )
         if self.sequence_length <= 0:
             raise ValueError(f"sequence_length must be > 0, got {self.sequence_length}")
+        if self.ttt_inference_update_adoption not in ("last", "first"):
+            raise ValueError(
+                f"ttt_inference_update_adoption must be 'last' or 'first', got "
+                f"{self.ttt_inference_update_adoption!r}."
+            )
         if self.tbptt_segment_length <= 0:
             raise ValueError(f"tbptt_segment_length must be > 0, got {self.tbptt_segment_length}")
         if self.sequence_length % self.tbptt_segment_length != 0:

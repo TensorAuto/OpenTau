@@ -206,6 +206,9 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         # the next call's RoPE should start from. Both are rollout state, reset
         # by ``PI05TTTPolicy.reset``.
         self._carried_fast_weights: dict[int, TTTFastWeights] = {}
+        # First-Euler-step fast-weight capture for
+        # `config.ttt_inference_update_adoption == "first"`; None outside a call.
+        self._first_step_adoption: dict[int, TTTFastWeights] | None = None
         self._inference_token_position: int = 0
         # Set for the duration of a ``sample_actions`` call so the overridden
         # ``denoise_step`` can reach it without changing the parent's signature.
@@ -1071,6 +1074,18 @@ class PI05TTTFlowMatching(PI05FlowMatching):
             adarms_cond=[None, adarms_cond],
             ttt_state=self._active_ttt_state,
         )
+        if (
+            self.config.ttt_inference_update_adoption == "first"
+            and self._active_ttt_state is not None
+            and self._first_step_adoption is None
+            and self._active_ttt_state.outgoing
+        ):
+            # The first Euler step runs at tau = 1: pure-noise action tokens, the
+            # mode of the training marginal — capture its update before later
+            # (nearly-clean) steps overwrite `outgoing`.
+            self._first_step_adoption = {
+                idx: fw.detach() for idx, fw in self._active_ttt_state.outgoing.items()
+            }
         suffix_out = outputs_embeds[1][:, -self.config.chunk_size :]
         return self.action_out_proj(suffix_out).to(dtype=torch.float32)
 
@@ -1157,6 +1172,9 @@ class PI05TTTFlowMatching(PI05FlowMatching):
             incoming=self._carried_fast_weights,
         )
         self._active_ttt_state = ttt_state
+        # Clear any capture a mid-call exception may have stranded, so this
+        # call's first Euler step is the one captured.
+        self._first_step_adoption = None
         try:
             actions = super().sample_actions(
                 images,
@@ -1173,11 +1191,18 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         finally:
             self._active_ttt_state = None
 
-        # Adopt only the final Euler step's update, and detach: a rollout is not
-        # a training graph, and keeping one would grow without bound.
-        if ttt_state.outgoing:
+        # Adopt exactly one step's update per policy call, and detach: a rollout
+        # is not a training graph, and keeping one would grow without bound.
+        # Which step is `config.ttt_inference_update_adoption`: "last" (historic)
+        # ingests nearly-clean self-generated actions; "first" ingests the pure-
+        # noise tokens matching the mode of the training marginal.
+        if self.config.ttt_inference_update_adoption == "first" and self._first_step_adoption:
+            self._carried_fast_weights = self._first_step_adoption
+            self._inference_token_position += self.config.n_expert_tokens_per_timestep
+        elif ttt_state.outgoing:
             self._carried_fast_weights = {idx: fw.detach() for idx, fw in ttt_state.outgoing.items()}
             self._inference_token_position += self.config.n_expert_tokens_per_timestep
+        self._first_step_adoption = None
         return actions
 
 
