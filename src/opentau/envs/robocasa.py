@@ -543,6 +543,7 @@ class RoboCasaEnv(gym.Env):
         visualization_width: int = 512,
         visualization_height: int = 512,
         split: str | None = None,
+        layout_and_style_ids: Sequence[Sequence[int]] | None = None,
         episode_length: int | None = None,
         obj_registries: Sequence[str] = DEFAULT_OBJ_REGISTRIES,
         episode_index: int = 0,
@@ -582,6 +583,12 @@ class RoboCasaEnv(gym.Env):
         self.visualization_width = visualization_width
         self.visualization_height = visualization_height
         self.split = split
+        # Normalize to hashable tuples; None keeps the split-derived kitchen sampling.
+        self.layout_and_style_ids = (
+            tuple(tuple(int(x) for x in pair) for pair in layout_and_style_ids)
+            if layout_and_style_ids is not None
+            else None
+        )
         self.obj_registries = tuple(obj_registries)
         self.episode_index = int(episode_index)
 
@@ -661,12 +668,23 @@ class RoboCasaEnv(gym.Env):
             # None/"all"/"pretrain"/"target" are valid). create_robocasa_envs resolves
             # the split for the eval path; default to "pretrain" here too so a direct
             # RoboCasaEnv(split=None) construction stays valid and consistent.
+            extra_env_kwargs: dict[str, Any] = {}
+            split_arg = self.split if self.split is not None else "pretrain"
+            if self.layout_and_style_ids is not None:
+                # robocasa's `create_env` split branches OVERWRITE
+                # `layout_and_style_ids`, so an explicit scene list must travel
+                # with `split=None`; the object-instance split (the only other
+                # thing `split` controls) is preserved by passing it directly.
+                extra_env_kwargs["layout_and_style_ids"] = [list(p) for p in self.layout_and_style_ids]
+                extra_env_kwargs["obj_instance_split"] = split_arg
+                split_arg = None
             self._env = RoboCasaGymEnv(
                 env_name=self.task,
                 camera_widths=self.observation_width,
                 camera_heights=self.observation_height,
-                split=self.split if self.split is not None else "pretrain",
+                split=split_arg,
                 obj_registries=self.obj_registries,
+                **extra_env_kwargs,
             )
 
             ep_meta = self._env.env.get_ep_meta()
@@ -794,6 +812,7 @@ def _make_env_fns(
     visualization_width: int,
     visualization_height: int,
     split: str | None,
+    layout_and_style_ids: Sequence[Sequence[int]] | None,
     episode_length: int | None,
     obj_registries: Sequence[str],
 ) -> list[Callable[[], RoboCasaEnv]]:
@@ -815,6 +834,7 @@ def _make_env_fns(
             visualization_width=visualization_width,
             visualization_height=visualization_height,
             split=split,
+            layout_and_style_ids=layout_and_style_ids,
             episode_length=episode_length,
             obj_registries=obj_registries,
             episode_index=episode_index,
@@ -925,6 +945,7 @@ def create_robocasa_envs(
     visualization_width = gym_kwargs.pop("visualization_width", 512)
     visualization_height = gym_kwargs.pop("visualization_height", 512)
     split = gym_kwargs.pop("split", None)
+    layout_and_style_ids = gym_kwargs.pop("layout_and_style_ids", None)
 
     camera_names = _parse_camera_names(camera_name)
     task_names, group_split = _resolve_tasks(str(task))
@@ -972,6 +993,7 @@ def create_robocasa_envs(
             visualization_width=visualization_width,
             visualization_height=visualization_height,
             split=split,
+            layout_and_style_ids=layout_and_style_ids,
             episode_length=task_episode_length,
             obj_registries=obj_registries,
         )

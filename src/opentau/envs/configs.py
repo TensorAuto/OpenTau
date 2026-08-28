@@ -353,6 +353,12 @@ class RoboCasaEnv(EnvConfig):
             ``"target"``). Defaults to ``"pretrain"`` when left ``None`` — every
             task-group shortcut and concrete single-task config resolves to the
             pretrain kitchen-scene distribution; set explicitly to override.
+        layout_and_style_ids: Explicit list of ``[layout_id, style_id]`` kitchen-scene
+            pairs to sample from, overriding the ``split``-derived kitchen set (the
+            robocasa ``create_env`` precedence). Use to evaluate on a policy's exact
+            training kitchens (in-distribution) instead of the whole split — e.g. the
+            demo scenes recorded in a dataset's ``extras/*/ep_meta.json``. ``None``
+            (default) keeps the split-derived sampling.
         obj_registries: Object-mesh registries to sample assets from. Defaults to
             ``["lightwheel"]`` (the pack the asset downloader ships by default);
             add ``"objaverse"`` only after downloading that ~30GB pack.
@@ -385,6 +391,7 @@ class RoboCasaEnv(EnvConfig):
     visualization_height: int = 512
     visualization_width: int = 512
     split: str | None = None
+    layout_and_style_ids: list[list[int]] | None = None
     obj_registries: list[str] = field(default_factory=lambda: ["lightwheel"])
     assets_root: str | None = None
     auto_download_assets: bool = True
@@ -440,4 +447,6 @@ class RoboCasaEnv(EnvConfig):
         }
         if self.split is not None:
             kwargs["split"] = self.split
+        if self.layout_and_style_ids is not None:
+            kwargs["layout_and_style_ids"] = self.layout_and_style_ids
         return kwargs
