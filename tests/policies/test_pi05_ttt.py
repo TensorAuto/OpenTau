@@ -1007,3 +1007,24 @@ class TestInferenceDiagnostics:
             torch.testing.assert_close(gate(attn, ttt), attn)
             stub.config.ttt_inference_alpha_scale = 0.25
             torch.testing.assert_close(gate(attn, ttt), scaled)
+
+    def test_first_mode_falls_back_to_outgoing_without_a_capture(self):
+        """ "first" adoption with no capture (e.g. empty first-step outgoing) takes outgoing."""
+        from types import SimpleNamespace
+
+        from opentau.policies.pi05_ttt.modeling_pi05_ttt import PI05TTTFlowMatching
+
+        stub = object.__new__(PI05TTTFlowMatching)
+        stub.config = PI05TTTConfig(
+            n_register_tokens=2,
+            sequence_length=1,
+            tbptt_segment_length=1,
+            ttt_inference_update_adoption="first",
+        )
+        later = torch.tensor([2.0])
+        stub._first_step_adoption = None  # no capture happened this call
+        stub._carried_fast_weights = {}
+        stub._inference_token_position = 0
+        stub._adopt_fast_weights(SimpleNamespace(outgoing={0: later}))
+        assert torch.equal(stub._carried_fast_weights[0], later)
+        assert stub._inference_token_position == stub.config.n_expert_tokens_per_timestep
