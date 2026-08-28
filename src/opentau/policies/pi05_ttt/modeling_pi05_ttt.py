@@ -246,7 +246,7 @@ class PI05TTTFlowMatching(PI05FlowMatching):
                 expected_mini_batch_size=self.config.n_expert_tokens_per_timestep,
             )
             layer.ttt_gate = TanhGate(width, init_value=self.config.ttt_gate_init)
-            layer.ttt_gate.inference_alpha_scale = self.config.ttt_inference_alpha_scale
+            layer.ttt_gate.bind_diagnostics_config(self.config)
 
     def ttt_parameters(self) -> list[nn.Parameter]:
         """Returns every parameter this policy adds on top of stock π₀.₅.
