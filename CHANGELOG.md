@@ -274,6 +274,29 @@ which includes in-training *validation*, so leave them at defaults in training c
   fits the dataset's shortest episodes. The stride-1 recipe used by the original pi05_ttt
   validation is deliberately rejected now — it silently optimizes the copy shortcut.
 
+### Changed — gRPC api-key auth renamed to `x-bicameral-api-key` / `BICAMERAL_INFERENCE_API_KEY` — **breaking on both, no `config_version` bump**
+
+`ApiKeyInterceptor` reads the key from the `x-bicameral-api-key` metadata
+header, and the `UNAUTHENTICATED` message names that header. `interceptor_from_env`
+reads the expected key from `BICAMERAL_INFERENCE_API_KEY`. The previous
+`x-tuner-api-key` and `TUNER_INFERENCE_API_KEY` are gone rather than accepted
+alongside: a dual-header transition leaves a second, unrouted spelling that
+whatever sits in front of this server never sees.
+
+Migration, and the two failure modes are not alike:
+
+* **Clients** send `x-bicameral-api-key` instead. A client left on the old
+  header fails closed, with `UNAUTHENTICATED` naming the header it should have
+  sent. A proxy in front of the server should be renamed too rather than made
+  to translate between the two.
+* **Whoever launches the server** sets `BICAMERAL_INFERENCE_API_KEY` instead.
+  This one fails *open*: auth is opt-in, so a launcher still exporting the old
+  name leaves the variable unset, and an unset variable means no interceptor
+  and an unauthenticated server. There is no error to notice. Rename the
+  launcher and the server together.
+
+Servers that never enabled authentication are unaffected.
+
 ## [0.13.0] - 2026-08-17
 
 ### Added

@@ -39,11 +39,35 @@ def test_extract_api_key():
     assert auth.extract_api_key(None) is None
 
 
+def test_the_pre_rename_header_is_not_accepted():
+    # The gateway in front of this server sends x-bicameral-api-key only;
+    # honoring the old spelling would keep a second, unrouted way in.
+    md = (("x-tuner-api-key", "secret"),)
+    assert auth.extract_api_key(md) is None
+    assert auth.is_authorized(md, "secret") is False
+
+
 def test_is_authorized():
     md = ((auth.API_KEY_HEADER, "secret"),)
     assert auth.is_authorized(md, "secret") is True
     assert auth.is_authorized(md, "wrong") is False
     assert auth.is_authorized((), "secret") is False
+
+
+def test_the_env_var_names_are_the_published_ones():
+    # Both names are a contract with code that lives outside this repo, so the
+    # constants are pinned to their literals rather than only used through the
+    # constant. The env var matters most: auth is opt-in, so a launcher that
+    # exports the pre-rename name leaves it unset and starts an unauthenticated
+    # server. Nothing about that failure is visible.
+    assert auth.API_KEY_ENV == "BICAMERAL_INFERENCE_API_KEY"
+    assert auth.API_KEY_HEADER == "x-bicameral-api-key"
+
+
+def test_the_pre_rename_env_var_does_not_enable_auth(monkeypatch):
+    monkeypatch.delenv(auth.API_KEY_ENV, raising=False)
+    monkeypatch.setenv("TUNER_INFERENCE_API_KEY", "secret")
+    assert auth.interceptor_from_env() is None
 
 
 def test_interceptor_from_env(monkeypatch):
@@ -122,7 +146,14 @@ def test_valid_key_passes_through_streaming():
         server.stop(None)
 
 
-@pytest.mark.parametrize("metadata", [(), (("x-tuner-api-key", "wrong"),)])
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        (),
+        ((auth.API_KEY_HEADER, "wrong"),),
+        (("x-tuner-api-key", "secret"),),  # right key, pre-rename header
+    ],
+)
 def test_missing_or_wrong_key_unauthenticated(metadata):
     server, port = _start_echo_server(auth.ApiKeyInterceptor("secret"))
     try:
@@ -133,7 +164,14 @@ def test_missing_or_wrong_key_unauthenticated(metadata):
         server.stop(None)
 
 
-@pytest.mark.parametrize("metadata", [(), (("x-tuner-api-key", "wrong"),)])
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        (),
+        ((auth.API_KEY_HEADER, "wrong"),),
+        (("x-tuner-api-key", "secret"),),  # right key, pre-rename header
+    ],
+)
 def test_missing_or_wrong_key_unauthenticated_streaming(metadata):
     # The deny handler is unary_unary only, but context.abort() fires before the
     # request stream is read, so it must reject stream_stream RPCs too.
