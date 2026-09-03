@@ -237,6 +237,13 @@ which includes in-training *validation*, so leave them at defaults in training c
 
 ### Fixed
 
+- **`EpisodeAwareSampler` shuffling is now rank-independent and reproducible.**
+  Shuffled episode indices use a dedicated `torch.Generator` with an optional
+  explicit seed instead of the process-global RNG.  This prevents
+  `accelerate` workers from constructing different permutations when the global
+  seed is intentionally offset per rank, while preserving caller control via
+  either `generator` or `seed`.
+
 - **Pre-rename π₀.₅ checkpoints load again: legacy `normalize_actions.*` state-dict keys
   are remapped to `normalize_discrete_actions.*`.** Checkpoints saved before the
   discrete-action normalizer rename (e.g. `TensorAuto/tPi0.5-libero`) carried their

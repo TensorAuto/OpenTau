@@ -14,6 +14,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from unittest.mock import MagicMock
+
+import torch
 from datasets import Dataset
 
 from opentau.datasets.push_dataset_to_hub.utils import calculate_episode_data_index
@@ -89,3 +92,74 @@ def test_shuffle():
     assert sampler.indices == [0, 1, 2, 3, 4, 5]
     assert len(sampler) == 6
     assert set(sampler) == {0, 1, 2, 3, 4, 5}
+
+
+def _episode_data_index():
+    """Small multi-episode index used by the sampler RNG tests."""
+    return {
+        "from": torch.tensor([0, 4, 9]),
+        "to": torch.tensor([4, 9, 15]),
+    }
+
+
+def test_seeded_shuffle_is_replayable_and_seed_sensitive():
+    """A sampler seed must determine the permutation, not global RNG history."""
+    data_index = _episode_data_index()
+    first = list(EpisodeAwareSampler(data_index, shuffle=True, seed=1234))
+    replay = list(EpisodeAwareSampler(data_index, shuffle=True, seed=1234))
+    different = list(EpisodeAwareSampler(data_index, shuffle=True, seed=5678))
+
+    assert first == replay
+    assert first != different
+
+
+def test_shuffle_does_not_read_rank_dependent_global_rng():
+    """Every simulated rank must emit the same seeded episode stream.
+
+    ``set_seed`` offsets the process-global torch RNG by rank to decorrelate
+    per-sample augmentation draws.  The sampler must use its own generator so
+    that this rank-local offset cannot change the shared data order.
+    """
+    from opentau.utils.random_utils import set_seed
+
+    streams = []
+    for rank in range(4):
+        set_seed(1000, accelerator=MagicMock(process_index=rank))
+        streams.append(list(EpisodeAwareSampler(_episode_data_index(), shuffle=True, seed=1000)))
+
+    assert all(stream == streams[0] for stream in streams[1:])
+
+
+def test_shuffle_keeps_global_rng_state_untouched():
+    """Constructing and iterating a sampler must not consume global draws."""
+    torch.manual_seed(2026)
+    before = torch.get_rng_state()
+    sampler = EpisodeAwareSampler(_episode_data_index(), shuffle=True, seed=9)
+    list(sampler)
+    after = torch.get_rng_state()
+
+    assert torch.equal(after, before)
+
+
+def test_explicit_generator_and_seed_contract():
+    """The explicit generator is supported and ``seed`` takes precedence."""
+    generator = torch.Generator().manual_seed(7)
+    sampler = EpisodeAwareSampler(
+        _episode_data_index(), shuffle=True, generator=generator, seed=1234
+    )
+
+    assert list(sampler) == list(
+        EpisodeAwareSampler(_episode_data_index(), shuffle=True, seed=1234)
+    )
+    assert generator.initial_seed() == 1234
+
+
+def test_unseeded_shuffle_uses_private_generator():
+    """The no-argument fallback is isolated from the process-global stream."""
+    data_index = _episode_data_index()
+    torch.manual_seed(1)
+    first = list(EpisodeAwareSampler(data_index, shuffle=True))
+    torch.manual_seed(999)
+    second = list(EpisodeAwareSampler(data_index, shuffle=True))
+
+    assert first == second
