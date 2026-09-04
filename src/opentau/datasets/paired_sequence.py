@@ -298,7 +298,8 @@ class PairedSequenceDataset(Dataset):
         Returns:
             The concatenated sample. Timestep-axis tensors are joined A-then-B;
             ``loss_mask`` is False across A and True across B; ``prompt`` is the
-            key's ambiguous instruction on both halves.
+            key's ambiguous instruction when one was supplied, and otherwise the
+            rollout half's own instruction (see ``prompts``).
 
         Raises:
             ValueError: If the two halves disagree on their timestep count,
