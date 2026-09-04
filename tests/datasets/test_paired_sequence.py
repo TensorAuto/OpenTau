@@ -23,9 +23,8 @@ constructed the breaking case first.
 CPU-only: the base dataset is stubbed, so none of this touches the Hub.
 """
 
-from types import SimpleNamespace
-
 import logging
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -257,11 +256,10 @@ class TestPairingIsActuallyWired:
 
         ds_cfg = SimpleNamespace(repo_id="r", episodes=[1, 2], ambiguous_prompt=None)
         cfg = SimpleNamespace(dataset_mixture=SimpleNamespace(pair_episodes=True), seed=0)
-        with caplog.at_level(logging.WARNING):
-            with pytest.raises(TypeError):
-                # Proceeds past the prompt check and fails later on the stub
-                # dataset, which is the point: the prompt no longer blocks it.
-                _maybe_pair(SimpleNamespace(episodes=[1, 2]), ds_cfg, cfg)
+        # Proceeds past the prompt check and fails later on the stub dataset,
+        # which is the point: the prompt no longer blocks it.
+        with caplog.at_level(logging.WARNING), pytest.raises(TypeError):
+            _maybe_pair(SimpleNamespace(episodes=[1, 2]), ds_cfg, cfg)
         assert "ambiguous_prompt" in caplog.text
         assert "cross-task transfer" in caplog.text
 
