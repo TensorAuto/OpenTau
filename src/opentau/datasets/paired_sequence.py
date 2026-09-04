@@ -67,7 +67,10 @@ class PairedSequenceDataset(Dataset):
         pairing_keys: ``{key: [episode_index, ...]}``. A pair is always drawn
             within a single key, so the key is exactly what the demonstration
             conveys and the prompt withholds.
-        prompts: ``{key: instruction}`` with the varying slot removed.
+        prompts: ``{key: instruction}`` with the varying slot removed, applied
+            to both halves. ``None`` for a key means keep each sample's own
+            prompt -- the cross-task-transfer case, where the instruction names
+            the task and overwriting it would erase the task identity.
         samples_per_epoch: Length reported to the sampler. Pairs are drawn on
             demand, so this sets epoch size rather than the size of anything
             stored.
@@ -130,7 +133,7 @@ class PairedSequenceDataset(Dataset):
         self,
         base: LeRobotDataset,
         pairing_keys: dict[str, list[int]],
-        prompts: dict[str, str],
+        prompts: dict[str, str | None],
         samples_per_epoch: int = 100_000,
         seed: int = 0,
         forbid_same_scene: bool = True,

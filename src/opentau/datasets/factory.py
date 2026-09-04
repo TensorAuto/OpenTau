@@ -822,8 +822,10 @@ def _maybe_pair(dataset, dataset_cfg: DatasetConfig, cfg: TrainPipelineConfig):
         The dataset, wrapped when pairing is enabled.
 
     Raises:
-        ValueError: If pairing is on but the subset has no ambiguous prompt, or
-            has fewer than two episodes to pair.
+        ValueError: If pairing is on but the subset resolves to fewer than two
+            episodes to pair. A missing ``ambiguous_prompt`` only warns: it is
+            required for within-task ambiguity but wrong for cross-task
+            transfer, and this cannot tell the two apart.
     """
     if not cfg.dataset_mixture.pair_episodes:
         return dataset
