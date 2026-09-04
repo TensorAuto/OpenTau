@@ -15,9 +15,9 @@
 """Optional API-key authentication for the robot inference gRPC server.
 
 Authentication is opt-in: it is activated only when the
-``OPENTAU_INFERENCE_API_KEY`` environment variable is set to a non-empty
+``INFERENCE_API_KEY`` environment variable is set to a non-empty
 value. When active, every RPC must carry the matching key in the
-``x-opentau-api-key`` metadata header; otherwise the call is rejected with
+``x-api-key`` metadata header; otherwise the call is rejected with
 ``UNAUTHENTICATED``. When the variable is unset/empty the server runs with no
 authentication (the historical behavior).
 
@@ -39,12 +39,12 @@ import grpc
 
 logger = logging.getLogger(__name__)
 
-API_KEY_HEADER = "x-opentau-api-key"
-API_KEY_ENV = "OPENTAU_INFERENCE_API_KEY"
+API_KEY_HEADER = "x-api-key"
+API_KEY_ENV = "INFERENCE_API_KEY"
 
 
 def extract_api_key(metadata) -> str | None:
-    """Return the ``x-opentau-api-key`` value from gRPC invocation metadata.
+    """Return the ``x-api-key`` value from gRPC invocation metadata.
 
     Args:
         metadata: Iterable of ``(key, value)`` pairs (gRPC invocation
@@ -77,7 +77,7 @@ def is_authorized(metadata, expected_key: str) -> bool:
 
 
 class ApiKeyInterceptor(grpc.ServerInterceptor):
-    """Server interceptor that requires a valid ``x-opentau-api-key`` header.
+    """Server interceptor that requires a valid ``x-api-key`` header.
 
     RPCs whose metadata is missing the header or carries a wrong key are
     aborted with ``grpc.StatusCode.UNAUTHENTICATED`` before reaching the
@@ -104,7 +104,7 @@ class ApiKeyInterceptor(grpc.ServerInterceptor):
 
 
 def interceptor_from_env() -> ApiKeyInterceptor | None:
-    """Build an :class:`ApiKeyInterceptor` from ``OPENTAU_INFERENCE_API_KEY``.
+    """Build an :class:`ApiKeyInterceptor` from ``INFERENCE_API_KEY``.
 
     Returns:
         An interceptor when the env var is set to a non-empty (stripped)

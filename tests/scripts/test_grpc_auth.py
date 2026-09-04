@@ -59,8 +59,8 @@ def test_the_env_var_names_are_the_published_ones():
     # constant. The env var matters most: auth is opt-in, so a launcher that
     # exports the pre-rename name leaves it unset and starts an unauthenticated
     # server. Nothing about that failure is visible.
-    assert auth.API_KEY_ENV == "OPENTAU_INFERENCE_API_KEY"
-    assert auth.API_KEY_HEADER == "x-opentau-api-key"
+    assert auth.API_KEY_ENV == "INFERENCE_API_KEY"
+    assert auth.API_KEY_HEADER == "x-api-key"
 
 
 def test_the_pre_rename_env_var_does_not_enable_auth(monkeypatch):
