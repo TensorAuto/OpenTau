@@ -22,8 +22,14 @@ gradient on B can therefore only fall by having absorbed something from A.
 
 **Nothing is written to disk.** The pair exists as a tensor for one training
 step. Materializing ~146k pairs at 196 timesteps and 3 cameras would be on the
-order of 100 TB, and would freeze one arbitrary draw of a pair space the sampler
-otherwise re-draws every epoch.
+order of 100 TB.
+
+The draw is a pure function of ``(seed, index)``, so within a run the
+``samples_per_epoch`` pairs are *fixed* and replayed identically each epoch —
+that is what makes ranks agree and resumes reproducible (see ``seed`` below).
+The set is a sample of the pair space, not the whole of it; widening or
+re-drawing it means raising ``samples_per_epoch`` or changing ``seed``, which
+costs nothing here and would cost a re-materialization on disk.
 
 **Why this cannot be a config flag on the existing loader.**
 :class:`~opentau.datasets.lerobot_dataset.LeRobotDataset` builds a window from

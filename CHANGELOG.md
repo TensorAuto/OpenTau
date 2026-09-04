@@ -235,6 +235,41 @@ registers-zeroed changed nothing — pinning the harm on the learned memory outp
 the training recipe to expert co-adaptation. All three default to the shipped behavior and are read only in eval mode —
 which includes in-training *validation*, so leave them at defaults in training configs.
 
+### Added — `pair_episodes`, paired-episode sequences for one-shot in-context imitation — **opt-in, default `False`, no `config_version` bump**
+
+`PairedSequenceDataset` (`opentau.datasets.paired_sequence`) emits one sample as *two* episodes
+of the same task concatenated along the timestep axis — episode A the demonstration, episode B
+the rollout — with `loss_mask` zero across A and one across B. A's timesteps still update a
+TTT policy's fast weights but carry no imitation target, so the gradient on B can only fall by
+having absorbed something from A. This is the data side of one-shot in-context imitation: the
+supervised signal measures whether a demonstration in context makes the rollout easier.
+
+Enabled with `dataset_mixture.pair_episodes: true`, which wraps each mixture entry — one entry
+is one pairing key, so a pair never crosses keys. Two knobs decide the rest:
+
+* **`dataset.ambiguous_prompt`** (optional) replaces both halves' instruction. Required for
+  *within-task* ambiguity, where episodes of a key differ only in their target: the episode's
+  own prompt would name that target and make the demonstration redundant. It must be **omitted**
+  for *cross-task* transfer, where the prompt supplies WHAT and the demonstration supplies HOW —
+  overwriting it there erases the task identity. The loader cannot tell these apart, so it warns
+  and lets the config's author own the choice.
+* **`policy.sequence_length` must be `2 ×` the mixture's**, since the mixture is configured
+  per-half and the policy sees the concatenation. `validate()` applies the doubling, so a
+  correct paired config is accepted and a mismatched one is rejected at config time.
+
+Nothing is written to disk — a pair exists as a tensor for one training step; materializing them
+would run to ~100 TB. The draw is a pure function of `(seed, index)`, so the pairs are fixed
+within a run and identical across ranks and resumes.
+
+**Two constraints are enforced rather than documented,** because both failed silently in
+practice. `val_freq > 0` is **rejected** with pairing: the split is `random_split`, which
+partitions frames rather than episodes, so both halves keep every episode and a paired val subset
+would pair across the training half — hold out episodes as a separate dataset entry instead. And
+a draw that cannot satisfy `forbid_same_scene` falls back to a random *distinct* pair rather than
+a fixed one; the earlier fixed fallback collapsed an entire key onto a single pair while the logs
+still reported thousands available. A construction-time probe now logs `PAIR DIVERSITY COLLAPSE`
+when the reachable pair space is not being covered.
+
 ### Fixed
 
 - **Pre-rename π₀.₅ checkpoints load again: legacy `normalize_actions.*` state-dict keys

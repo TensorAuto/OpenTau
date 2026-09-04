@@ -485,6 +485,25 @@ class TrainPipelineConfig(HubMixin):
             # first batch — after the dataset has been built and the model
             # loaded, which is a slow way to learn about a typo.
             if self.dataset_mixture is not None:
+                # `val_freq > 0` and `pair_episodes` cannot both hold. The split
+                # is `torch.utils.data.random_split`, which partitions *frames*:
+                # both halves therefore still claim every episode, so a paired
+                # val subset would draw its pairs from episodes whose frames are
+                # in the training half — the split would measure nothing. It also
+                # cannot be built at all, because the `Subset` it returns exposes
+                # none of the episode-level attributes (`episodes`,
+                # `episode_data_index`, `epi2idx`) the paired loader indexes with.
+                # Splitting for pairing has to be done per *episode*, upstream of
+                # here; until it is, refuse rather than emit a meaningless metric.
+                if self.dataset_mixture.pair_episodes and self.val_freq > 0:
+                    raise ValueError(
+                        f"pair_episodes is on with val_freq={self.val_freq}. The validation "
+                        "split partitions frames, not episodes, so both halves keep every "
+                        "episode and a paired val subset would pair across the training "
+                        "half. Set val_freq=0 and hold out episodes explicitly (a separate "
+                        "dataset entry with its own `episodes` list) to measure held-out loss."
+                    )
+
                 policy_seq = getattr(self.policy, "sequence_length", None)
                 # With `pair_episodes` the mixture emits one *half* per episode
                 # and the paired loader concatenates two, so the policy sees

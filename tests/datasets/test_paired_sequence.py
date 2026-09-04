@@ -32,6 +32,7 @@ import torch
 from opentau.datasets.paired_sequence import PairedSequenceDataset
 
 T = 4  # timesteps per half
+EPISODES = (10, 11, 12)  # default stub episodes for one pairing key
 
 
 class _StubBase:
@@ -73,8 +74,11 @@ class _StubBase:
             "dataset_index": torch.tensor(0),
         }
 
+    def __len__(self):
+        return len(self._episodes)
 
-def _make(episodes=(10, 11, 12), scenes=None, ragged=None, **kw):
+
+def _make(episodes=EPISODES, scenes=None, ragged=None, **kw):
     base = _StubBase(episodes, scenes, ragged)
     return PairedSequenceDataset(
         base=base,
@@ -212,35 +216,103 @@ class TestPairingIsActuallyWired:
     pin the two places that connect the loader to the training path.
     """
 
-    def test_validate_accepts_doubled_policy_length_when_pairing(self):
-        from opentau.configs.default import DatasetMixtureConfig
+    @staticmethod
+    def _cfg(policy_seq, mixture_seq, pair, val_freq=0, tmp_path=None, prompt="Open the drawer."):
+        """Builds a real ``TrainPipelineConfig`` so ``validate()`` runs for real."""
+        from opentau.configs.default import DatasetConfig, DatasetMixtureConfig
+        from opentau.configs.train import TrainPipelineConfig
+        from opentau.policies.pi05_ttt.configuration_pi05_ttt import PI05TTTConfig
 
-        cfg = DatasetMixtureConfig(sequence_length=98, pair_episodes=True)
-        assert cfg.pair_episodes and cfg.sequence_length == 98
-
-    def test_validate_rejects_undoubled_policy_length(self):
-        """The breaking case: pairing on, policy still expecting one half."""
-        import re
-
-        from opentau.configs import train as train_cfg
-
-        src = __import__("inspect").getsource(train_cfg.TrainPipelineConfig.validate)
-        assert "pair_episodes" in src, (
-            "validate() no longer accounts for pairing; a correct paired config "
-            "would be rejected and an unpaired one silently accepted"
+        return TrainPipelineConfig(
+            dataset_mixture=DatasetMixtureConfig(
+                datasets=[
+                    DatasetConfig(
+                        repo_id="mock",
+                        root="/tmp/mock",
+                        episodes=list(EPISODES),
+                        ambiguous_prompt=prompt,
+                    )
+                ],
+                weights=[1.0],
+                action_freq=30.0,
+                sequence_length=mixture_seq,
+                pair_episodes=pair,
+            ),
+            policy=PI05TTTConfig(sequence_length=policy_seq, tbptt_segment_length=policy_seq),
+            output_dir=str(tmp_path),
+            job_name="test_run",
+            seed=42,
+            batch_size=8,
+            val_freq=val_freq,
+            use_policy_training_preset=True,
         )
-        assert re.search(r"emitted \*= 2", src), "the doubling rule is gone"
 
-    def test_factory_wraps_subsets_when_pairing(self):
-        import inspect
+    def test_validate_accepts_doubled_policy_length_when_pairing(self, tmp_path):
+        """Pairing on, policy sized for the concatenation: must pass."""
+        self._cfg(policy_seq=2 * T, mixture_seq=T, pair=True, tmp_path=tmp_path).validate()
 
+    def test_validate_rejects_undoubled_policy_length(self, tmp_path):
+        """The breaking case: pairing on, policy still expecting one half."""
+        cfg = self._cfg(policy_seq=T, mixture_seq=T, pair=True, tmp_path=tmp_path)
+        with pytest.raises(ValueError, match="pair_episodes doubles"):
+            cfg.validate()
+
+    def test_validate_leaves_unpaired_configs_alone(self, tmp_path):
+        """The doubling must not leak into configs that do not pair."""
+        self._cfg(policy_seq=T, mixture_seq=T, pair=False, tmp_path=tmp_path).validate()
+        cfg = self._cfg(policy_seq=2 * T, mixture_seq=T, pair=False, tmp_path=tmp_path)
+        with pytest.raises(ValueError, match="!= emitted timesteps"):
+            cfg.validate()
+
+    def test_validate_rejects_val_freq_with_pairing(self, tmp_path):
+        """`val_freq` and pairing are incompatible, and silently so without this.
+
+        `random_split` partitions frames, not episodes, so both halves keep every
+        episode: a paired val subset would draw its pairs from episodes whose
+        frames are in the training half. It also cannot be constructed, since the
+        `Subset` exposes none of the episode-level attributes the loader indexes
+        with. Rejecting at config time beats an AttributeError after the model has
+        loaded -- or, worse, a val curve that means nothing.
+        """
+        cfg = self._cfg(policy_seq=2 * T, mixture_seq=T, pair=True, val_freq=100, tmp_path=tmp_path)
+        with pytest.raises(ValueError, match="pair_episodes is on with val_freq"):
+            cfg.validate()
+
+        # ...and stays out of the way when pairing is off.
+        self._cfg(policy_seq=T, mixture_seq=T, pair=False, val_freq=100, tmp_path=tmp_path).validate()
+
+    def test_factory_emits_paired_samples(self, tmp_path, monkeypatch):
+        """`make_dataset_mixture` must hand the mixture a *paired* dataset.
+
+        Runs the real factory path with only the base-dataset build and the
+        metadata-heavy mixture constructor stubbed, then inspects what the
+        mixture was actually handed: a `PairedSequenceDataset` emitting
+        `2 * sequence_length` timesteps with the ambiguous prompt applied. A
+        source-level check that `_maybe_pair` is *called* would still pass if it
+        returned the dataset unwrapped.
+        """
         from opentau.datasets import factory
 
-        src = inspect.getsource(factory.make_dataset_mixture)
-        assert "_maybe_pair(" in src, (
-            "make_dataset_mixture no longer wraps subsets; train.py would build "
-            "an unpaired dataloader from a paired config"
+        cfg = self._cfg(policy_seq=2 * T, mixture_seq=T, pair=True, tmp_path=tmp_path)
+        handed = {}
+
+        monkeypatch.setattr(factory, "make_dataset", lambda dcfg, c, **kw: _StubBase(EPISODES))
+        monkeypatch.setattr(factory, "_validate_metadata_requirements", lambda *a, **k: None)
+        monkeypatch.setattr(
+            factory,
+            "WeightedDatasetMixture",
+            lambda cfg_, datasets, weights, freq: handed.setdefault("datasets", datasets),
         )
+
+        factory.make_dataset_mixture(cfg)
+        wrapped = handed["datasets"][0]
+        assert isinstance(wrapped, PairedSequenceDataset), (
+            f"factory handed the mixture a {type(wrapped).__name__}; training would "
+            "run on single unpaired windows from a paired config"
+        )
+        sample = wrapped[0]
+        assert sample["state"].shape[0] == 2 * T, "paired sample is not the concatenation"
+        assert sample["prompt"] == "Open the drawer."
 
     def test_missing_ambiguous_prompt_warns_but_is_allowed(self, caplog):
         """No prompt is legitimate for cross-task transfer, so warn rather than refuse.
