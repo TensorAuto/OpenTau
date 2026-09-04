@@ -237,13 +237,6 @@ which includes in-training *validation*, so leave them at defaults in training c
 
 ### Fixed
 
-- **`EpisodeAwareSampler` shuffling is now rank-independent and reproducible.**
-  Shuffled episode indices use a dedicated `torch.Generator` with an optional
-  explicit seed instead of the process-global RNG.  This prevents
-  `accelerate` workers from constructing different permutations when the global
-  seed is intentionally offset per rank, while preserving caller control via
-  either `generator` or `seed`.
-
 - **Pre-rename π₀.₅ checkpoints load again: legacy `normalize_actions.*` state-dict keys
   are remapped to `normalize_discrete_actions.*`.** Checkpoints saved before the
   discrete-action normalizer rename (e.g. `TensorAuto/tPi0.5-libero`) carried their
@@ -280,6 +273,12 @@ which includes in-training *validation*, so leave them at defaults in training c
   example also drops `sequence_length` 32 → 4 so the chunk-tiled window (`T * chunk` frames)
   fits the dataset's shortest episodes. The stride-1 recipe used by the original pi05_ttt
   validation is deliberately rejected now — it silently optimizes the copy shortcut.
+- **`EpisodeAwareSampler` shuffling is now rank-independent and reproducible.**
+  Shuffled episode indices use a dedicated `torch.Generator` with an optional
+  explicit seed instead of the process-global RNG. This prevents `accelerate`
+  workers from constructing different permutations when the global seed is
+  intentionally offset per rank, while preserving caller control via either
+  `generator` or `seed`. Unseeded shuffles are now deterministic across runs.
 
 ## [0.13.0] - 2026-08-17
 

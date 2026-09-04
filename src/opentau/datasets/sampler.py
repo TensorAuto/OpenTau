@@ -71,8 +71,11 @@ class EpisodeAwareSampler:
     is applied to the supplied generator in place, matching
     :class:`~opentau.datasets.dataset_mixture.HierarchicalSampler`.  When
     neither is supplied, a private default ``torch.Generator`` is used rather
-    than the global RNG; this keeps the sampler isolated even for callers that
-    have not configured a run seed.
+    than the global RNG. PyTorch currently initializes a bare generator with a
+    fixed constant, so this fallback produces the same shuffle across launches
+    and processes. That is an implementation detail rather than a documented
+    PyTorch guarantee; callers that require an explicitly controlled stream
+    should pass ``seed`` or ``generator``.
     """
 
     def __init__(

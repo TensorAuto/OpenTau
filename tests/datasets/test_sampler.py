@@ -24,6 +24,7 @@ from opentau.datasets.sampler import EpisodeAwareSampler
 from opentau.datasets.utils import (
     hf_transform_to_torch,
 )
+from opentau.utils.random_utils import seeded_context, set_seed
 
 
 def test_drop_n_first_frames():
@@ -120,12 +121,11 @@ def test_shuffle_does_not_read_rank_dependent_global_rng():
     per-sample augmentation draws.  The sampler must use its own generator so
     that this rank-local offset cannot change the shared data order.
     """
-    from opentau.utils.random_utils import set_seed
-
     streams = []
     for rank in range(4):
-        set_seed(1000, accelerator=MagicMock(process_index=rank))
-        streams.append(list(EpisodeAwareSampler(_episode_data_index(), shuffle=True, seed=1000)))
+        with seeded_context(2026):
+            set_seed(1000, accelerator=MagicMock(process_index=rank))
+            streams.append(list(EpisodeAwareSampler(_episode_data_index(), shuffle=True, seed=1000)))
 
     assert all(stream == streams[0] for stream in streams[1:])
 
@@ -144,22 +144,24 @@ def test_shuffle_keeps_global_rng_state_untouched():
 def test_explicit_generator_and_seed_contract():
     """The explicit generator is supported and ``seed`` takes precedence."""
     generator = torch.Generator().manual_seed(7)
-    sampler = EpisodeAwareSampler(
-        _episode_data_index(), shuffle=True, generator=generator, seed=1234
-    )
+    sampler = EpisodeAwareSampler(_episode_data_index(), shuffle=True, generator=generator, seed=1234)
 
-    assert list(sampler) == list(
-        EpisodeAwareSampler(_episode_data_index(), shuffle=True, seed=1234)
-    )
+    assert list(sampler) == list(EpisodeAwareSampler(_episode_data_index(), shuffle=True, seed=1234))
     assert generator.initial_seed() == 1234
 
 
 def test_unseeded_shuffle_uses_private_generator():
-    """The no-argument fallback is isolated from the process-global stream."""
+    """Pin the intentional, though implementation-defined, fixed fallback."""
     data_index = _episode_data_index()
     torch.manual_seed(1)
+    first_state = torch.get_rng_state()
     first = list(EpisodeAwareSampler(data_index, shuffle=True))
+    first_after = torch.get_rng_state()
     torch.manual_seed(999)
+    second_state = torch.get_rng_state()
     second = list(EpisodeAwareSampler(data_index, shuffle=True))
+    second_after = torch.get_rng_state()
 
     assert first == second
+    assert torch.equal(first_state, first_after)
+    assert torch.equal(second_state, second_after)
