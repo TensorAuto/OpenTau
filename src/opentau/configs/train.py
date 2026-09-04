@@ -485,13 +485,59 @@ class TrainPipelineConfig(HubMixin):
             # first batch — after the dataset has been built and the model
             # loaded, which is a slow way to learn about a typo.
             if self.dataset_mixture is not None:
-                policy_seq = getattr(self.policy, "sequence_length", None)
-                if policy_seq is not None and policy_seq != self.dataset_mixture.sequence_length:
+                # `val_freq > 0` and `pair_episodes` cannot both hold. The split
+                # is `torch.utils.data.random_split`, which partitions *frames*:
+                # both halves therefore still claim every episode, so a paired
+                # val subset would draw its pairs from episodes whose frames are
+                # in the training half — the split would measure nothing. It also
+                # cannot be built at all, because the `Subset` it returns exposes
+                # none of the episode-level attributes (`episodes`,
+                # `episode_data_index`, `epi2idx`) the paired loader indexes with.
+                # Splitting for pairing has to be done per *episode*, upstream of
+                # here; until it is, refuse rather than emit a meaningless metric.
+                # Pairing concatenates along a timestep axis, which only exists
+                # above `sequence_length == 1` -- there the base loader emits no
+                # `loss_mask` and `state` keeps its bare `(state_dim,)` shape.
+                # Caught here because a policy without a `sequence_length` field
+                # skips the doubled-length check below, so nothing else on the
+                # config path would reject it.
+                if self.dataset_mixture.pair_episodes and (self.dataset_mixture.sequence_length or 1) <= 1:
                     raise ValueError(
-                        f"policy.sequence_length ({policy_seq}) != "
-                        f"dataset_mixture.sequence_length ({self.dataset_mixture.sequence_length}). "
-                        "The policy decides how many timesteps it segments; the mixture decides "
-                        "how many it emits. Set them to the same value."
+                        "pair_episodes is on with dataset_mixture.sequence_length="
+                        f"{self.dataset_mixture.sequence_length}. Pairing concatenates two "
+                        "episodes along a timestep axis, which the base dataset only emits "
+                        "above 1. Set sequence_length to the per-half timestep count."
+                    )
+
+                if self.dataset_mixture.pair_episodes and self.val_freq > 0:
+                    raise ValueError(
+                        f"pair_episodes is on with val_freq={self.val_freq}. The validation "
+                        "split partitions frames, not episodes, so both halves keep every "
+                        "episode and a paired val subset would pair across the training "
+                        "half. Set val_freq=0 and hold out episodes explicitly (a separate "
+                        "dataset entry with its own `episodes` list) to measure held-out loss."
+                    )
+
+                policy_seq = getattr(self.policy, "sequence_length", None)
+                # With `pair_episodes` the mixture emits one *half* per episode
+                # and the paired loader concatenates two, so the policy sees
+                # twice what the mixture is configured for. Without this a
+                # correct paired config is rejected here.
+                emitted = self.dataset_mixture.sequence_length
+                if self.dataset_mixture.pair_episodes:
+                    emitted *= 2
+                if policy_seq is not None and policy_seq != emitted:
+                    pairing = (
+                        " (pair_episodes doubles the mixture's "
+                        f"{self.dataset_mixture.sequence_length} to {emitted})"
+                        if self.dataset_mixture.pair_episodes
+                        else ""
+                    )
+                    raise ValueError(
+                        f"policy.sequence_length ({policy_seq}) != emitted timesteps "
+                        f"({emitted}){pairing}. The policy decides how many timesteps it "
+                        "segments; the mixture decides how many it emits. Set them to "
+                        "the same value."
                     )
 
             # The policy's ``n_obs_steps`` determines the T dimension its
