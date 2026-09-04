@@ -695,7 +695,7 @@ def serve(cfg: TrainPipelineConfig, request_hook: RequestHook | None = None):
     """
     server_cfg = cfg.server
 
-    # Optional API-key auth, activated by the TUNER_INFERENCE_API_KEY env var.
+    # Optional API-key auth, activated by the OPENTAU_INFERENCE_API_KEY env var.
     # When unset, the server keeps its historical no-auth behavior.
     interceptors = []
     auth_interceptor = auth.interceptor_from_env()
