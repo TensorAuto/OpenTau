@@ -207,6 +207,115 @@ class TestScalarPassthrough:
         assert s["dataset_index"].ndim == 0
 
 
+class TestNonSequenceBaseIsRejected:
+    """A `sequence_length <= 1` base has no timestep axis to concatenate along.
+
+    The earlier guard read the timestep count from whichever of
+    `loss_mask`/`state`/`actions`/`camera0` came first. At `sequence_length == 1`
+    the base emits no `loss_mask` and `state` is `(max_state_dim,)`, so it
+    returned the *feature* dim: both halves agreed, nothing raised, and the pair
+    was concatenated along the feature axis. These pin the two independent places
+    that now stop it -- the loader itself, and the config before a run starts.
+    """
+
+    class _Seq1Base:
+        """A base dataset at `sequence_length == 1`: no `loss_mask`, flat `state`."""
+
+        def __init__(self, episodes):
+            self._episodes = list(episodes)
+            rows = {e: i for i, e in enumerate(self._episodes)}
+            self.epi2idx = rows
+            self.episode_data_index = {
+                "from": torch.tensor([rows[e] for e in self._episodes]),
+                "to": torch.tensor([rows[e] + 1 for e in self._episodes]),
+            }
+            self.meta = SimpleNamespace(episodes={e: {} for e in self._episodes})
+            self._by_row = {v: k for k, v in rows.items()}
+
+        def __len__(self):
+            return len(self._episodes)
+
+        def __getitem__(self, row):
+            e = self._by_row[row]
+            return {
+                "state": torch.full((32,), float(e)),  # (max_state_dim,) -- no time axis
+                "actions": torch.full((50, 7), float(e)),
+                "prompt": "x",
+                "episode_index": torch.tensor(e),
+                "dataset_index": torch.tensor(0),
+            }
+
+    def test_loader_raises_instead_of_corrupting(self):
+        ds = PairedSequenceDataset(
+            base=self._Seq1Base(EPISODES),
+            pairing_keys={"k": list(EPISODES)},
+            prompts={"k": None},
+            samples_per_epoch=4,
+            seed=0,
+        )
+        with pytest.raises(ValueError, match="no `loss_mask`"):
+            ds[0]
+
+    def test_validate_rejects_unit_sequence_length(self, tmp_path):
+        """The config path must reject it too.
+
+        A policy with no `sequence_length` field skips the doubled-length check,
+        so without this the corrupted run starts and converges on nonsense.
+        """
+        cfg = TestPairingIsActuallyWired._cfg(policy_seq=2, mixture_seq=1, pair=True, tmp_path=tmp_path)
+        with pytest.raises(ValueError, match="sequence_length=1"):
+            cfg.validate()
+
+
+class TestOnlyTemporalKeysConcatenate:
+    """Fixed-size tensors must not be doubled when their leading dim equals T.
+
+    `img_is_pad` is `(num_cams,)` and a `subgoal` image is `(3, H, W)`, so the
+    old "leading dim == timestep count" test doubled both at `sequence_length`
+    3 with 3 cameras -- silently, since collation still succeeded.
+    """
+
+    class _CollidingBase(_StubBase):
+        """Adds fixed-size keys whose leading dim happens to equal ``T``."""
+
+        def __getitem__(self, row):
+            item = super().__getitem__(row)
+            item["img_is_pad"] = torch.zeros(T, dtype=torch.bool)  # (num_cams,) == T
+            item["subgoal0"] = torch.zeros(T, 8, 8)  # (3, H, W) with T == 3
+            return item
+
+    @classmethod
+    def _base_with_collisions(cls):
+        return cls._CollidingBase(EPISODES)
+
+    def test_colliding_fixed_size_keys_are_not_doubled(self):
+        ds = PairedSequenceDataset(
+            base=self._base_with_collisions(),
+            pairing_keys={"k": list(EPISODES)},
+            prompts={"k": None},
+            samples_per_epoch=4,
+            seed=0,
+        )
+        sample = ds[0]
+        assert sample["state"].shape[0] == 2 * T, "temporal keys must still concatenate"
+        assert sample["img_is_pad"].shape[0] == T, "img_is_pad is per-camera, not per-timestep"
+        assert sample["subgoal0"].shape[0] == T, "a subgoal image has no timestep axis"
+
+    def test_collision_is_reported_once(self, caplog):
+        ds = PairedSequenceDataset(
+            base=self._base_with_collisions(),
+            pairing_keys={"k": list(EPISODES)},
+            prompts={"k": None},
+            samples_per_epoch=4,
+            seed=0,
+        )
+        with caplog.at_level(logging.WARNING):
+            ds[0]
+            ds[1]
+        assert caplog.text.count("temporal allowlist") == 2, "one warning per colliding key, once each"
+        assert "img_is_pad" in caplog.text and "subgoal0" in caplog.text
+
+
 class TestPairingIsActuallyWired:
     """The pairing must reach ``train.py``, not just exist as a class.
 
@@ -313,6 +422,31 @@ class TestPairingIsActuallyWired:
         sample = wrapped[0]
         assert sample["state"].shape[0] == 2 * T, "paired sample is not the concatenation"
         assert sample["prompt"] == "Open the drawer."
+
+    def test_empty_ambiguous_prompt_is_treated_as_absent(self, tmp_path, monkeypatch):
+        """`ambiguous_prompt: ""` must mean "no override", consistently in both layers.
+
+        The factory's falsy check already read it as absent and warned, but it
+        passed the empty string down to a loader gating on `is not None` -- which
+        blanked the prompt instead of leaving the rollout's in place, erasing the
+        task identity in exactly the cross-task case the warning describes.
+        """
+        from opentau.datasets import factory
+
+        cfg = self._cfg(policy_seq=2 * T, mixture_seq=T, pair=True, tmp_path=tmp_path, prompt="")
+        handed = {}
+        monkeypatch.setattr(factory, "make_dataset", lambda dcfg, c, **kw: _StubBase(EPISODES))
+        monkeypatch.setattr(factory, "_validate_metadata_requirements", lambda *a, **k: None)
+        monkeypatch.setattr(
+            factory,
+            "WeightedDatasetMixture",
+            lambda cfg_, datasets, weights, freq: handed.setdefault("datasets", datasets),
+        )
+
+        factory.make_dataset_mixture(cfg)
+        prompt = handed["datasets"][0][0]["prompt"]
+        assert prompt, "an empty ambiguous_prompt blanked the sample's instruction"
+        assert "drawer" in prompt
 
     def test_missing_ambiguous_prompt_warns_but_is_allowed(self, caplog):
         """No prompt is legitimate for cross-task transfer, so warn rather than refuse.

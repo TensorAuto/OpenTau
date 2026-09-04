@@ -261,7 +261,14 @@ Nothing is written to disk — a pair exists as a tensor for one training step; 
 would run to ~100 TB. The draw is a pure function of `(seed, index)`, so the pairs are fixed
 within a run and identical across ranks and resumes.
 
-**Two constraints are enforced rather than documented,** because both failed silently in
+**Pairing requires `sequence_length > 1`** and is rejected below it: the concatenation needs a
+timestep axis, which the base loader only emits above 1 — at 1 there is no `loss_mask` and
+`state` keeps its bare `(state_dim,)` shape. Only temporal keys are concatenated, from an
+explicit allowlist rather than by testing whether a tensor's leading dim equals the timestep
+count; that test is a shape coincidence, and it silently doubled `img_is_pad` (`(num_cams,)`)
+and subgoal images (`(3, H, W)`) on a 3-camera run at `sequence_length: 3`.
+
+**Two further constraints are enforced rather than documented,** because both failed silently in
 practice. `val_freq > 0` is **rejected** with pairing: the split is `random_split`, which
 partitions frames rather than episodes, so both halves keep every episode and a paired val subset
 would pair across the training half — hold out episodes as a separate dataset entry instead. And

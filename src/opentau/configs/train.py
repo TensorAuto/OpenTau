@@ -495,6 +495,20 @@ class TrainPipelineConfig(HubMixin):
                 # `episode_data_index`, `epi2idx`) the paired loader indexes with.
                 # Splitting for pairing has to be done per *episode*, upstream of
                 # here; until it is, refuse rather than emit a meaningless metric.
+                # Pairing concatenates along a timestep axis, which only exists
+                # above `sequence_length == 1` -- there the base loader emits no
+                # `loss_mask` and `state` keeps its bare `(state_dim,)` shape.
+                # Caught here because a policy without a `sequence_length` field
+                # skips the doubled-length check below, so nothing else on the
+                # config path would reject it.
+                if self.dataset_mixture.pair_episodes and (self.dataset_mixture.sequence_length or 1) <= 1:
+                    raise ValueError(
+                        "pair_episodes is on with dataset_mixture.sequence_length="
+                        f"{self.dataset_mixture.sequence_length}. Pairing concatenates two "
+                        "episodes along a timestep axis, which the base dataset only emits "
+                        "above 1. Set sequence_length to the per-half timestep count."
+                    )
+
                 if self.dataset_mixture.pair_episodes and self.val_freq > 0:
                     raise ValueError(
                         f"pair_episodes is on with val_freq={self.val_freq}. The validation "

@@ -849,8 +849,9 @@ def _maybe_pair(dataset, dataset_cfg: DatasetConfig, cfg: TrainPipelineConfig):
         # The loader cannot tell these apart, so warn rather than refuse and
         # let the experiment's author own the choice.
         logging.warning(
-            "pair_episodes is on for %s with no `ambiguous_prompt`, so each half keeps "
-            "its episode's own instruction. This is correct ONLY for cross-task transfer, "
+            "pair_episodes is on for %s with no `ambiguous_prompt`, so the sample keeps the "
+            "rollout half's own instruction (a pair carries one prompt; the demonstration's "
+            "is dropped). This is correct ONLY for cross-task transfer, "
             "where the prompt names the task and the demonstration shows how. If the "
             "episodes of this key differ only in their target, the prompt names that "
             "target and the demonstration is redundant — set `ambiguous_prompt`.",
@@ -865,8 +866,12 @@ def _maybe_pair(dataset, dataset_cfg: DatasetConfig, cfg: TrainPipelineConfig):
     return PairedSequenceDataset(
         base=dataset,
         pairing_keys={key: episodes},
-        # None -> PairedSequenceDataset leaves each sample's own prompt in place.
-        prompts={key: dataset_cfg.ambiguous_prompt},
+        # `or None` keeps the two layers agreeing on what "no override" means:
+        # the falsy check above already treated `""` as absent and warned, but
+        # `__getitem__` gates on `is not None` and would have blanked both
+        # halves' prompt instead of leaving the rollout's in place.
+        # None -> PairedSequenceDataset leaves the sample's own prompt in place.
+        prompts={key: dataset_cfg.ambiguous_prompt or None},
         samples_per_epoch=len(dataset),
         seed=cfg.seed or 0,
     )

@@ -95,6 +95,37 @@ class PairedSequenceDataset(Dataset):
         }
     )
 
+    # Keys carrying a leading *timestep* axis, and therefore the only ones a
+    # pair concatenates. Everything else is taken from B unchanged.
+    #
+    # This is an allowlist rather than "leading dim == timestep count" because
+    # that test is a shape coincidence: `img_is_pad` is `(num_cams,)` and a
+    # `subgoal{k}` image is `(3, H, W)`, so a 3-camera run at
+    # `sequence_length == 3` silently doubled both and still collated. An
+    # allowlist that omits a temporal key fails loudly instead -- the halves
+    # disagree on length downstream -- which is the failure mode to prefer.
+    _TEMPORAL_KEYS = frozenset(
+        {
+            "state",
+            "actions",
+            "action_is_pad",
+            "loss_mask",
+            "obs_history_is_pad",
+        }
+    )
+
+    @classmethod
+    def _is_temporal(cls, key: str) -> bool:
+        """Whether ``key`` carries a leading timestep axis.
+
+        Args:
+            key: A sample key.
+
+        Returns:
+            True if the key's leading axis is time and the pair concatenates it.
+        """
+        return key in cls._TEMPORAL_KEYS or key.startswith("camera")
+
     def __init__(
         self,
         base: LeRobotDataset,
@@ -104,6 +135,9 @@ class PairedSequenceDataset(Dataset):
         seed: int = 0,
         forbid_same_scene: bool = True,
     ) -> None:
+        # Set before anything else: `__getattr__` forwards unknown attributes to
+        # the wrapped dataset, so a miss here would delegate rather than raise.
+        self._warned_keys: set[str] = set()
         thin = {k: len(v) for k, v in pairing_keys.items() if len(v) < 2}
         if thin:
             raise ValueError(f"pairing keys need >=2 episodes to pair; too thin: {thin}")
@@ -282,16 +316,31 @@ class PairedSequenceDataset(Dataset):
         out: dict[str, Any] = {}
         for k, vb in b.items():
             va = a.get(k)
+            tensors = isinstance(vb, torch.Tensor) and isinstance(va, torch.Tensor) and vb.ndim >= 1
             if (
                 k not in self._SCALAR_PASSTHROUGH
-                and isinstance(vb, torch.Tensor)
-                and isinstance(va, torch.Tensor)
-                and vb.ndim >= 1
+                and tensors
+                and self._is_temporal(k)
                 and va.shape[0] == t_a
                 and vb.shape[0] == t_b
             ):
                 out[k] = torch.cat([va, vb], dim=0)
             else:
+                if tensors and not self._is_temporal(k) and va.shape[0] == t_a and k not in self._warned_keys:
+                    # Not concatenated, but its leading dim coincides with the
+                    # timestep count -- either a genuinely temporal key missing
+                    # from the allowlist, or a fixed-size tensor colliding by
+                    # accident. Both want eyes, and neither should be guessed at
+                    # silently, so say it once per key per process.
+                    self._warned_keys.add(k)
+                    logging.warning(
+                        "paired sample: key %r is not in the temporal allowlist but its leading "
+                        "dim (%d) equals the timestep count, so only the rollout half's copy is "
+                        "kept. If %r is temporal, add it to PairedSequenceDataset._TEMPORAL_KEYS.",
+                        k,
+                        t_a,
+                        k,
+                    )
                 out[k] = vb
 
         out["loss_mask"] = torch.cat([torch.zeros(t_a, dtype=torch.bool), torch.ones(t_b, dtype=torch.bool)])
@@ -349,11 +398,23 @@ class PairedSequenceDataset(Dataset):
         Raises:
             ValueError: If no key carries a usable timestep axis.
         """
-        for k in ("loss_mask", "state", "actions", "camera0"):
-            v = item.get(k)
-            if isinstance(v, torch.Tensor) and v.ndim >= 1:
-                return int(v.shape[0])
+        # `loss_mask` ONLY, and deliberately so. It is the one key the base
+        # dataset emits *because* the sample is a sequence: `_reshape_to_sequence`
+        # early-returns at `sequence_length <= 1` without emitting it, so its
+        # absence is exactly the condition this guard exists to catch.
+        #
+        # Falling back to `state`/`actions`/`camera0` here defeated the guard
+        # entirely: at `sequence_length == 1` those keys are still present but
+        # carry no time axis (`state` is `(max_state_dim,)`), so the fallback
+        # returned the *feature* dim, both halves agreed, and pairing emitted a
+        # corrupted sample -- `state` concatenated along its feature axis to
+        # `(2 * state_dim,)` and a `loss_mask` of length `2 * state_dim` -- in
+        # place of the intended error.
+        v = item.get("loss_mask")
+        if isinstance(v, torch.Tensor) and v.ndim >= 1:
+            return int(v.shape[0])
         raise ValueError(
-            "cannot determine the timestep count; the base dataset is not emitting "
-            "sequences (is dataset_mixture.sequence_length set above 1?)"
+            "cannot determine the timestep count: the base dataset emitted no `loss_mask`, "
+            "so it is not emitting sequences. Pairing concatenates along a timestep axis "
+            "that does not exist here -- set dataset_mixture.sequence_length above 1."
         )
