@@ -801,6 +801,77 @@ def _validate_metadata_requirements(cfg: TrainPipelineConfig, datasets: list, la
         )
 
 
+def _maybe_pair(dataset, dataset_cfg: DatasetConfig, cfg: TrainPipelineConfig):
+    """Wraps one subset in the paired loader when ``pair_episodes`` is set.
+
+    One dataset entry is one pairing key: the loader draws two distinct
+    episodes from *this* subset and concatenates them, so a pair can never
+    cross keys and the demonstration always describes the same variant as the
+    rollout.
+
+    Wrapping happens here rather than inside ``WeightedDatasetMixture`` so the
+    mixture's weighting and hierarchical sampling keep operating on whole
+    subsets, unchanged.
+
+    Args:
+        dataset: The constructed subset.
+        dataset_cfg: Its config, supplying the ambiguous prompt.
+        cfg: The pipeline config.
+
+    Returns:
+        The dataset, wrapped when pairing is enabled.
+
+    Raises:
+        ValueError: If pairing is on but the subset has no ambiguous prompt, or
+            has fewer than two episodes to pair.
+    """
+    if not cfg.dataset_mixture.pair_episodes:
+        return dataset
+
+    from opentau.datasets.paired_sequence import PairedSequenceDataset
+
+    key = dataset_cfg.repo_id or "subset"
+    if dataset_cfg.episodes:
+        key = f"{key}#{len(dataset_cfg.episodes)}eps"
+    if not dataset_cfg.ambiguous_prompt:
+        # Two legitimate designs reach here, and only one is a mistake.
+        #
+        # WITHIN-TASK ambiguity (e.g. NavigateKitchen): every episode of the key
+        # shares a skill and differs only in target, so the episode's own prompt
+        # names that target and the demonstration becomes redundant. An
+        # ambiguous prompt is mandatory there.
+        #
+        # CROSS-TASK transfer (e.g. robolab bowl -> mug): the prompt supplies
+        # WHAT and the demonstration supplies HOW for an object the model has
+        # not manipulated. Overwriting the prompt would destroy the task
+        # identity the model needs. Leaving it is correct.
+        #
+        # The loader cannot tell these apart, so warn rather than refuse and
+        # let the experiment's author own the choice.
+        logging.warning(
+            "pair_episodes is on for %s with no `ambiguous_prompt`, so each half keeps "
+            "its episode's own instruction. This is correct ONLY for cross-task transfer, "
+            "where the prompt names the task and the demonstration shows how. If the "
+            "episodes of this key differ only in their target, the prompt names that "
+            "target and the demonstration is redundant — set `ambiguous_prompt`.",
+            key,
+        )
+    episodes = list(getattr(dataset, "episodes", None) or dataset_cfg.episodes or [])
+    if len(episodes) < 2:
+        raise ValueError(
+            f"pair_episodes is on but {key} resolves to {len(episodes)} episode(s); "
+            "pairing needs at least two."
+        )
+    return PairedSequenceDataset(
+        base=dataset,
+        pairing_keys={key: episodes},
+        # None -> PairedSequenceDataset leaves each sample's own prompt in place.
+        prompts={key: dataset_cfg.ambiguous_prompt},
+        samples_per_epoch=len(dataset),
+        seed=cfg.seed or 0,
+    )
+
+
 def make_dataset_mixture(
     cfg: TrainPipelineConfig, return_advantage_input: bool = False
 ) -> Union[WeightedDatasetMixture, Tuple[WeightedDatasetMixture, WeightedDatasetMixture]]:
@@ -823,10 +894,10 @@ def make_dataset_mixture(
     for dataset_cfg in cfg.dataset_mixture.datasets:
         res = make_dataset(dataset_cfg, cfg, return_advantage_input=return_advantage_input)
         if isinstance(res, tuple):
-            datasets.append(res[0])
-            val_datasets.append(res[1])
+            datasets.append(_maybe_pair(res[0], dataset_cfg, cfg))
+            val_datasets.append(_maybe_pair(res[1], dataset_cfg, cfg))
         else:
-            datasets.append(res)
+            datasets.append(_maybe_pair(res, dataset_cfg, cfg))
 
     _validate_metadata_requirements(cfg, datasets, label="train")
     if val_datasets:

@@ -486,12 +486,25 @@ class TrainPipelineConfig(HubMixin):
             # loaded, which is a slow way to learn about a typo.
             if self.dataset_mixture is not None:
                 policy_seq = getattr(self.policy, "sequence_length", None)
-                if policy_seq is not None and policy_seq != self.dataset_mixture.sequence_length:
+                # With `pair_episodes` the mixture emits one *half* per episode
+                # and the paired loader concatenates two, so the policy sees
+                # twice what the mixture is configured for. Without this a
+                # correct paired config is rejected here.
+                emitted = self.dataset_mixture.sequence_length
+                if self.dataset_mixture.pair_episodes:
+                    emitted *= 2
+                if policy_seq is not None and policy_seq != emitted:
+                    pairing = (
+                        " (pair_episodes doubles the mixture's "
+                        f"{self.dataset_mixture.sequence_length} to {emitted})"
+                        if self.dataset_mixture.pair_episodes
+                        else ""
+                    )
                     raise ValueError(
-                        f"policy.sequence_length ({policy_seq}) != "
-                        f"dataset_mixture.sequence_length ({self.dataset_mixture.sequence_length}). "
-                        "The policy decides how many timesteps it segments; the mixture decides "
-                        "how many it emits. Set them to the same value."
+                        f"policy.sequence_length ({policy_seq}) != emitted timesteps "
+                        f"({emitted}){pairing}. The policy decides how many timesteps it "
+                        "segments; the mixture decides how many it emits. Set them to "
+                        "the same value."
                     )
 
             # The policy's ``n_obs_steps`` determines the T dimension its

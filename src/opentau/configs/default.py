@@ -177,6 +177,20 @@ class DatasetConfig:
     root: str | None = None
     episodes: list[int] | None = None
     excluded_episodes: list[int] | None = None
+
+    # One-shot in-context imitation: the instruction to substitute on *both*
+    # halves of a demonstration+rollout pair. Only read when
+    # `DatasetMixtureConfig.pair_episodes` is set.
+    #
+    # Set it for WITHIN-TASK ambiguity, where the episodes of this entry differ
+    # only in their target ("Open the drawer." rather than "Open the left
+    # drawer."). There the episode's own instruction would name the target and
+    # make the demonstration redundant.
+    #
+    # Leave it None for CROSS-TASK transfer, where the prompt names the task and
+    # the demonstration supplies the handling of an unfamiliar object. Blanking
+    # the prompt there would erase the task identity the policy needs.
+    ambiguous_prompt: str | None = None
     image_transforms: ImageTransformsConfig = field(default_factory=ImageTransformsConfig)
     revision: str | None = None
     use_imagenet_stats: bool = True
@@ -648,6 +662,14 @@ class DatasetMixtureConfig:
     # `policy.action_delta_indices` and the stride is never read.
     sequence_length: int = 1
     sequence_stride: int | None = None
+
+    # Emit demonstration+rollout pairs instead of single windows. Each dataset
+    # entry supplies one pairing key; the loader draws two distinct episodes
+    # from it and concatenates them, so the policy sees `2 * sequence_length`
+    # timesteps with the first half masked out of the loss.
+    #
+    # Nothing is materialized: the pair is a tensor for one step.
+    pair_episodes: bool = False
 
     # Training-time dropout probabilities for optional sample keys.
     history_state_drop_prob: float = 0.3
