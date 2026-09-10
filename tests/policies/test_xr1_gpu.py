@@ -63,7 +63,7 @@ from opentau.policies.xr1.processing_xr1 import (
     render_chat_text,
 )
 from opentau.policies.xr1.state_dict_remap import remap_reference_state_dict
-from tests.utils import require_vram_gib
+from tests.utils import cuda_total_vram_gib, require_vram_gib
 
 pytestmark = pytest.mark.gpu
 
@@ -145,7 +145,12 @@ def _real_config(checkpoint: Path) -> XR1Config:
 @pytest.fixture(scope="module")
 def reference_model():
     """The port, loaded with the reference weights, in eval mode on CUDA (bf16)."""
-    require_vram_gib(20)
+    # `require_vram_gib` is a decorator factory, so it cannot gate a fixture body; do the
+    # same check inline rather than calling it as a statement (which builds a decorator and
+    # throws it away — a gate that silently does nothing).
+    available = cuda_total_vram_gib()
+    if available < 20:
+        pytest.skip(f"requires >= 20 GiB VRAM (device has {available:.1f} GiB)")
     _require_matching_platform()
     checkpoint = _checkpoint_dir()
     config = _real_config(checkpoint)
@@ -185,6 +190,7 @@ def _sha256_tensor(t: torch.Tensor) -> str:
 # =====================================================================================
 
 
+@require_vram_gib(20)
 def test_p6_reference_checkpoint_loads_with_zero_missing_or_unexpected_keys():
     """One remap rule, applied to the whole checkpoint, with nothing left over.
 
@@ -192,7 +198,6 @@ def test_p6_reference_checkpoint_loads_with_zero_missing_or_unexpected_keys():
     indistinguishable from a successful load until the numbers are wrong -- so the gate is
     the key sets, not the absence of an exception.
     """
-    require_vram_gib(20)
     from opentau.policies.xr1.modeling_xr1 import XR1Policy
     from opentau.policies.xr1.state_dict_remap import assert_full_coverage
 
@@ -453,13 +458,13 @@ def test_p12_replay_trace_stays_within_tolerance(reference_model):
 # =====================================================================================
 
 
+@require_vram_gib(24)
 def test_use_cache_survives_gradient_checkpointing_at_full_scale():
     """The trap that returns ``past_key_values=None`` with only a ``warning_once``.
 
     Pinned on the tiny model too, but it is a *transformers* interaction -- worth one
     real-geometry run so a library upgrade that changes the predicate is caught.
     """
-    require_vram_gib(24)
     checkpoint = _checkpoint_dir()
     config = _real_config(checkpoint)
     config.gradient_checkpointing = True
@@ -476,9 +481,9 @@ def test_use_cache_survives_gradient_checkpointing_at_full_scale():
     assert all(k.shape[2] == 32 for k, _ in cached)
 
 
+@require_vram_gib(20)
 def test_frozen_embedding_table_is_excluded_from_the_optimizer_params():
     """~389 M parameters; a fused AdamW handed them still allocates ~4.7 GB of state."""
-    require_vram_gib(20)
     checkpoint = _checkpoint_dir()
     from opentau.policies.xr1.modeling_xr1 import XR1Policy
 
@@ -490,9 +495,9 @@ def test_frozen_embedding_table_is_excluded_from_the_optimizer_params():
     assert sum(p.numel() for p in trainable) < sum(p.numel() for p in policy.parameters())
 
 
+@require_vram_gib(24)
 def test_train_expert_only_gradients_reach_the_dit_and_not_the_backbone():
     """The one-GPU fine-tune mode: 0.60 B trainable, ~19 GB with the frozen weights."""
-    require_vram_gib(24)
     checkpoint = _checkpoint_dir()
     config = _real_config(checkpoint)
     config.train_expert_only = True
@@ -509,6 +514,7 @@ def test_train_expert_only_gradients_reach_the_dit_and_not_the_backbone():
     assert all(p.grad is None for p in model.vlm.parameters())
 
 
+@require_vram_gib(40)
 def test_full_finetune_gradients_reach_the_vit_and_the_llm_mlp_but_not_the_embeddings():
     """The freezing contract at real geometry.
 
@@ -516,7 +522,6 @@ def test_full_finetune_gradients_reach_the_vit_and_the_llm_mlp_but_not_the_embed
     memory reason (~4.7 GB of optimizer state) rather than a modelling one -- so it is
     worth asserting that everything *else* still receives gradient.
     """
-    require_vram_gib(40)
     checkpoint = _checkpoint_dir()
     config = _real_config(checkpoint)
     config.train_expert_only = False
