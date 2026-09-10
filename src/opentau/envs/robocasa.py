@@ -57,7 +57,7 @@ from opentau.utils.io_utils import silence_output_unless_error
 # Flat action/state vector dimensions for the PandaOmron mobile manipulator
 # (RoboCasa365's default robot).
 OBS_STATE_DIM = 16  # base_pos(3) + base_quat(4) + ee_pos_rel(3) + ee_quat_rel(4) + gripper_qpos(2)
-ACTION_DIM = 12  # base_motion(4) + control_mode(1) + ee_pos(3) + ee_rot(3) + gripper(1)
+ACTION_DIM = 12  # ee_pos(3) + ee_rot(3) + gripper(1) + base_motion(4) + control_mode(1)
 ACTION_LOW = -1.0
 ACTION_HIGH = 1.0
 
@@ -510,14 +510,35 @@ def _ensure_robocasa_assets(assets_root: Path, obj_registries: Sequence[str]) ->
 def convert_action(flat_action: np.ndarray) -> dict[str, Any]:
     """Split a flat ``(12,)`` action vector into a RoboCasa action dict.
 
-    Layout: base_motion(4) + control_mode(1) + ee_pos(3) + ee_rot(3) + gripper(1).
+    Layout: ``ee_pos(3) + ee_rot(3) + gripper(1) + base_motion(4) + control_mode(1)``.
+
+    This is RoboCasa's own flat layout (``robocasa.utils.env_utils.convert_action``), and it
+    is what the RoboCasa365 LeRobot datasets store in their ``action`` column — so it is
+    what any policy trained on that data emits. Both halves were verified rather than
+    assumed, because this function previously used a *base-first* layout
+    (``base_motion(4) + control_mode(1) + ee_pos(3) + ee_rot(3) + gripper(1)``) that
+    silently permuted every action:
+
+    * ``robocasa.utils.env_utils.convert_action`` slices ``[0:3]`` / ``[3:6]`` / ``[6:7]`` /
+      ``[7:11]`` / ``[11:12]`` into ee-pos / ee-rot / gripper / base-motion / control-mode.
+    * Over 4000 frames of ``pepijn223/robocasa_pretrain_human300_v4``: columns 0-5 are
+      continuous, column **6 takes exactly two values (-1, +1)** — a gripper flag — columns
+      **7-10 are identically zero** (these task classes hold the base still), and column
+      **11 is the constant -1.0** — a control mode. Under the old layout column 4 would have
+      been the "control mode" while ranging continuously over ±0.49, and column 11 the
+      gripper while never once opening.
+
+    The old layout routed the end-effector command into base motion and read a
+    saturated lateral velocity out of the gripper column, which is silent: the arm still
+    moves, the episode still runs, the success rate is just far lower. Measured on
+    ``xr1`` / CloseFridge, 4/10 with the permutation against ~9/10 without it.
     """
     return {
-        "action.base_motion": flat_action[0:4],
-        "action.control_mode": flat_action[4:5],
-        "action.end_effector_position": flat_action[5:8],
-        "action.end_effector_rotation": flat_action[8:11],
-        "action.gripper_close": flat_action[11:12],
+        "action.end_effector_position": flat_action[0:3],
+        "action.end_effector_rotation": flat_action[3:6],
+        "action.gripper_close": flat_action[6:7],
+        "action.base_motion": flat_action[7:11],
+        "action.control_mode": flat_action[11:12],
     }
 
 
