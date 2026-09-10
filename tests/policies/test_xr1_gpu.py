@@ -48,6 +48,7 @@ import json
 import os
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
@@ -591,3 +592,46 @@ def test_reference_scene_seeds_are_reproduced_from_the_task_registry():
         index = golden["task_indices_in_target50"][task]
         expected = [golden["base_seed"] + index * golden["num_trials"] + i for i in range(int(count))]
         assert [int(s) for s in seed_list.split(",")] == expected, key
+
+
+def test_eval_config_reproduces_the_reference_scene_at_the_same_seed():
+    """The scene OpenTau builds must be the reference's, not merely a scene of that task.
+
+    This is the harness-side half of the parity contract, and it is the one that actually
+    bit: with OpenTau's lightwheel-only ``obj_registries`` default the same reset seed
+    produced a *different* scene, the port scored 0/2 on CloseFridge, and the upstream
+    reference evaluator scored 3/3 on the same box. The robot's starting ``base_position``
+    is a cheap, exact fingerprint of the whole scene, so pin that rather than a success rate.
+
+    Needs the objaverse asset pack; skipped when RoboCasa is not installed.
+    """
+    pytest.importorskip("robocasa")
+    import draccus
+
+    from opentau.configs.train import TrainPipelineConfig
+    from opentau.envs.factory import make_envs
+
+    config_path = (
+        Path(__file__).resolve().parents[2] / "configs" / "examples" / "xr1_robocasa365_eval_config.json"
+    )
+    cfg = draccus.parse(
+        TrainPipelineConfig,
+        args=[
+            f"--config_path={config_path}",
+            "--env.task=CloseFridge",
+            "--eval.n_episodes=1",
+            "--eval.batch_size=1",
+        ],
+    )
+    assert cfg.env.obj_registries == ["objaverse", "lightwheel"]
+
+    envs = make_envs(cfg.env, cfg, n_envs=1, use_async_envs=False)
+    group = next(iter(envs))
+    env = envs[group][next(iter(envs[group]))]
+    try:
+        observation, _ = env.reset(seed=[57])
+        base_position = np.asarray(observation["agent_pos"])[0][:3]
+        # Measured from the reference evaluator on CloseFridge, split="pretrain", seed 57.
+        assert np.allclose(base_position, [1.436575, -3.100518, 0.7], atol=1e-5), base_position.tolist()
+    finally:
+        env.close()
