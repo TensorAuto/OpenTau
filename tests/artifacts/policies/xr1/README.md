@@ -113,7 +113,7 @@ per-task rates.
 
 | Order | Task | Published | Accept | Why this task |
 |---|---|---|---|---|
-| 1 | CloseFridge, n=10 | 94 % | ≥ 5/10 | The canary. `P(X ≤ 4 \| p = .94) ≈ 1e-5`, so it is near-proof of a bug at 1/5 the cost |
+| 1 | CloseFridge, n=10 | 94 % | ≥ 5/10 | The canary. `P(X ≤ 4 \| p = .94) ≈ 1e-5`, so it is near-proof of a bug at 1/5 the cost. **Measured 10/10** (2026-09-10) |
 | 2 | CloseFridge, n=50 | 94 % | 42-50 | |
 | 3 | TurnOnMicrowave, n=50 | 56 % | 21-34 | Most discriminating: shortest horizon (450) *and* mid-range |
 | 4 | OpenDrawer, n=50 | 94 % | 42-50 | Second ceiling task, different scene distribution |
@@ -124,6 +124,14 @@ cannot distinguish 16 % from 6 %. One task outside its interval across four is ~
 chance, so a single outlier is not a failure — but a **directionally consistent shortfall
 across all four** is, regardless, and any task below half its published value is a failure
 outright.
+
+The canary earned its keep twice. It first read **0/10**, which localized
+`obj_registries` (above); then **4/10**, which localized a *second* harness bug — OpenTau's
+`envs/robocasa.py::convert_action` sliced a base-first flat-12 while RoboCasa's own
+converter and the RoboCasa365 datasets use EE-first, so every action reaching the simulator
+was permuted (fixed; see `tests/envs/test_robocasa_action_layout.py`). With both fixed it
+reads **10/10**. Neither bug is xr1-specific, and neither produces an error — the arm moves,
+the episode runs, only the success rate falls.
 
 Failing G4 with G3 (model parity) green means the divergence is in the *harness*, not the
 model: camera order, instruction text, scene seeds, horizons, or the execution horizon.
