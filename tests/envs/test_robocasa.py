@@ -228,13 +228,22 @@ class TestPureHelpers:
     """Helpers that never touch the sim."""
 
     def test_convert_action_layout(self):
+        """RoboCasa's flat-12 is **EE-first**.
+
+        This test previously pinned a base-first layout
+        (``base_motion, control_mode, ee_pos, ee_rot, gripper``) that disagreed with
+        ``robocasa.utils.env_utils.convert_action`` and with the RoboCasa365 datasets every
+        policy trains on, so it locked in a permutation of every action. See
+        ``tests/envs/test_robocasa_action_layout.py`` for the two independent sources the
+        corrected order is checked against.
+        """
         flat = np.arange(ACTION_DIM, dtype=np.float32)
         out = convert_action(flat)
-        np.testing.assert_array_equal(out["action.base_motion"], flat[0:4])
-        np.testing.assert_array_equal(out["action.control_mode"], flat[4:5])
-        np.testing.assert_array_equal(out["action.end_effector_position"], flat[5:8])
-        np.testing.assert_array_equal(out["action.end_effector_rotation"], flat[8:11])
-        np.testing.assert_array_equal(out["action.gripper_close"], flat[11:12])
+        np.testing.assert_array_equal(out["action.end_effector_position"], flat[0:3])
+        np.testing.assert_array_equal(out["action.end_effector_rotation"], flat[3:6])
+        np.testing.assert_array_equal(out["action.gripper_close"], flat[6:7])
+        np.testing.assert_array_equal(out["action.base_motion"], flat[7:11])
+        np.testing.assert_array_equal(out["action.control_mode"], flat[11:12])
 
     def test_parse_camera_names(self):
         assert _parse_camera_names("a, b ,c") == ["a", "b", "c"]
