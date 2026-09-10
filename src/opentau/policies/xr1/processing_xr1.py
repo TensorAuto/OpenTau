@@ -112,7 +112,14 @@ def expand_video_placeholders(
     One ``<T.T seconds><|vision_start|>...<|vision_end|>`` group per temporal patch, each
     holding ``(h * w) / merge_size ** 2`` ``<|video_pad|>`` tokens.
     """
-    grid = torch.as_tensor(np.asarray(video_grid_thw))
+    # `.cpu()` rather than `np.asarray(...)`: the grid is often already a CUDA tensor by the
+    # time this runs (it comes back from `patchify_videos` on the batch's device), and numpy
+    # refuses to convert one -- a crash on the serving path only, since CPU tests never hit it.
+    grid = (
+        video_grid_thw.detach().cpu()
+        if isinstance(video_grid_thw, Tensor)
+        else torch.as_tensor(np.asarray(video_grid_thw))
+    )
     merge_length = merge_size**2
     marker = f"{VISION_START_TOKEN}{VIDEO_TOKEN}{VISION_END_TOKEN}"
     for index in range(grid.shape[0]):

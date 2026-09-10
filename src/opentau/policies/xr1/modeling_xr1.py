@@ -280,9 +280,14 @@ class XR1FlowMatching(Qwen3VLWithDiT):
         cached_kv: list[tuple[Tensor, Tensor]],
         attn_mask: Tensor,
         num_steps: int,
-        prefix_rows: int = 0,
+        prefix_mask: Tensor | None = None,
     ) -> Tensor:
         """Ascending-tau Euler integration used by the **training** weight rollout.
+
+        ``prefix_mask`` ``(B, chunk)`` marks committed rows whose velocity is zeroed, so
+        they stay pinned to the ground-truth actions they were seeded with -- the reference
+        does the same by writing ``output[:, :prefix_length] = 0``. It is a per-sample mask
+        rather than a scalar length because the async-prefix draw here is per-sample.
 
         ``sample_actions`` deliberately writes its own copy of this loop rather than
         calling here: the accel-wiring registry AST-checks that ``accel.update(v_t)`` sits
@@ -291,6 +296,7 @@ class XR1FlowMatching(Qwen3VLWithDiT):
         ``tests/policies/test_xr1_cpu.py`` asserts they agree.
         """
         dt = 1.0 / num_steps
+        freeze = None if prefix_mask is None else rearrange(prefix_mask, "b c -> b c 1")
         for step in range(num_steps):
             t = torch.ones((x.shape[0], 1, 1), device=x.device, dtype=x.dtype) * step / num_steps
             v_t = self.dit_forward(
@@ -302,8 +308,8 @@ class XR1FlowMatching(Qwen3VLWithDiT):
                 past_key_values=cached_kv,
                 attn_mask=attn_mask,
             )
-            if prefix_rows:
-                v_t = torch.cat([torch.zeros_like(v_t[:, :prefix_rows]), v_t[:, prefix_rows:]], dim=1)
+            if freeze is not None:
+                v_t = torch.where(freeze, torch.zeros_like(v_t), v_t)
             x = x + v_t * dt
         return x
 
@@ -537,6 +543,7 @@ class XR1FlowMatching(Qwen3VLWithDiT):
             cached_kv=cached_kv,
             attn_mask=attn_mask,
             num_steps=self.config.num_steps,
+            prefix_mask=prefix_mask,
         )
         weight = (rolled.float() - actions.float()).abs()
         return torch.where(rearrange(has_prefix, "b -> b 1 1"), weight, torch.ones_like(weight))
@@ -583,7 +590,10 @@ class XR1FlowMatching(Qwen3VLWithDiT):
         if delay is None:
             delay = torch.tensor(0, dtype=torch.long, device=device)
         prefix_mask = rearrange(torch.arange(chunk, device=device), "c -> 1 c") < delay
-        prefix_rows = int(delay.max().item()) if delay.numel() else 0
+        # Kept as a mask rather than an int length: `int(delay.max().item())` would force a
+        # device sync every call (and break a traced graph), and a per-sample delay would
+        # over-freeze every row up to the batch maximum.
+        freeze_rows = rearrange(prefix_mask, "b c -> b c 1") if action_prefix is not None else None
 
         cached_kv, attn_mask, dit_position_ids, state_embed = self._run_prefix_and_geometry(
             input_ids=input_ids,
@@ -591,7 +601,7 @@ class XR1FlowMatching(Qwen3VLWithDiT):
             pixel_values_videos=pixel_values_videos,
             video_grid_thw=video_grid_thw,
             state=state,
-            n_prefix_rows=prefix_rows,
+            n_prefix_rows=0,
             dtype=dtype,
         )
         position_embeds = self._position_embeds(dit_position_ids, dtype=action_mask.dtype, device=device)
@@ -630,10 +640,10 @@ class XR1FlowMatching(Qwen3VLWithDiT):
                 past_key_values=cached_kv,
                 attn_mask=attn_mask,
             )
-            if prefix_rows:
+            if freeze_rows is not None:
                 # Freeze the committed rows: their velocity is zeroed so the already-executed
-                # actions cannot drift during the remaining steps.
-                v_t = torch.cat([torch.zeros_like(v_t[:, :prefix_rows]), v_t[:, prefix_rows:]], dim=1)
+                # actions cannot drift over the remaining steps.
+                v_t = torch.where(freeze_rows, torch.zeros_like(v_t), v_t)
             if accel is not None:
                 # Must read `v_t` here: with frozen prefix rows `(x_{k+1} - x_k) / dt` is not
                 # `v_t` on those rows, so accel cannot be recovered from the returned chunk.

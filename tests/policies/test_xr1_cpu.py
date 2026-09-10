@@ -1653,3 +1653,61 @@ def test_only_one_end_of_the_tied_embedding_may_be_missing():
     assert_full_coverage(["model.vlm.model.language_model.embed_tokens.weight"], [])
     with pytest.raises(ValueError, match="Both ends"):
         assert_full_coverage(sorted(TIED_WEIGHT_KEYS), [])
+
+
+def test_expand_video_placeholders_accepts_a_non_cpu_style_grid_tensor():
+    """The grid arrives as a tensor on the batch's device; ``np.asarray`` refuses a CUDA one.
+
+    Reproduced on the serving path (a RoboCasa rollout died in ``select_action``), which no
+    CPU test reaches, so the regression is pinned on the shape of the call instead: a plain
+    ``torch.Tensor`` grid must work without going through numpy.
+    """
+    grid = torch.tensor([[2, 16, 16]], dtype=torch.long)
+    text = render_chat_text("x", ("Left camera: ",))
+    expanded = expand_video_placeholders(text, grid, 2, [[0, 1, 2, 3]])
+    assert expanded.count("<|video_pad|>") == 128
+    # ...and a plain nested list still works, so the numpy path is not dead.
+    assert expand_video_placeholders(text, [[2, 16, 16]], 2, [[0, 1, 2, 3]]) == expanded
+
+
+def test_euler_rollout_pins_the_masked_prefix_rows():
+    """The async-prefix weight rollout must not let committed rows drift.
+
+    The reference zeroes the velocity on those rows (``output[:, :prefix_length] = 0``); the
+    weight it computes is ``|rollout - action|`` on the *suffix*, so a drifting prefix
+    silently changes the conditioning that weight is measuring. Per-sample here, because
+    the prefix length is drawn per sample rather than per batch.
+    """
+    model = _build_model().eval()
+    batch = _video_batch(bsize=2)
+    with torch.no_grad():
+        cached_kv, attn_mask, position_ids, state_embed = model._run_prefix_and_geometry(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            pixel_values_videos=batch["pixel_values_videos"],
+            video_grid_thw=batch["video_grid_thw"],
+            state=batch["state"],
+            n_prefix_rows=0,
+            dtype=batch["action_mask"].dtype,
+        )
+        position_embeds = model.compute_rope(
+            position_ids, dtype=batch["action_mask"].dtype, device=batch["action_mask"].device
+        )
+        seed = torch.randn_like(batch["actions"])
+        # Sample 0 freezes 3 rows, sample 1 freezes none -- the per-sample case a scalar
+        # "prefix_rows" would get wrong for at least one of them.
+        prefix_mask = torch.zeros(2, CHUNK, dtype=torch.bool)
+        prefix_mask[0, :3] = True
+        rolled = model._euler_rollout(
+            seed.clone(),
+            action_mask=batch["action_mask"],
+            state_embed=state_embed,
+            position_embeds=position_embeds,
+            cached_kv=cached_kv,
+            attn_mask=attn_mask,
+            num_steps=model.config.num_steps,
+            prefix_mask=prefix_mask,
+        )
+    assert torch.equal(rolled[0, :3], seed[0, :3])
+    assert not torch.equal(rolled[0, 3:], seed[0, 3:])
+    assert not torch.equal(rolled[1], seed[1])
