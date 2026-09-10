@@ -1711,3 +1711,28 @@ def test_euler_rollout_pins_the_masked_prefix_rows():
     assert torch.equal(rolled[0, :3], seed[0, :3])
     assert not torch.equal(rolled[0, 3:], seed[0, 3:])
     assert not torch.equal(rolled[1], seed[1])
+
+
+def test_eval_config_requests_both_object_registries():
+    """RoboCasa's default is ``("objaverse", "lightwheel")``; OpenTau defaults to lightwheel
+    alone because the objaverse pack is ~30 GB.
+
+    That restriction changes object sampling, so a scene built at the *same* reset seed is
+    not the reference's -- measured on CloseFridge seed 57, the robot's ``base_position``
+    moves from ``[1.4366, -3.1005, 0.7]`` to ``[1.4284, -3.2620, 0.7]``. Since the whole
+    point of the eval config is comparability with the published per-task rates, it has to
+    ask for both.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    cfg = _json.loads(
+        (
+            _Path(__file__).resolve().parents[2] / "configs" / "examples" / "xr1_robocasa365_eval_config.json"
+        ).read_text()
+    )
+    assert cfg["env"]["obj_registries"] == ["objaverse", "lightwheel"]
+    assert cfg["env"]["camera_name"] == "robot0_agentview_left,robot0_agentview_right,robot0_eye_in_hand"
+    assert cfg["env"]["episode_length"] is None  # official per-task horizons
+    assert cfg["env"]["max_parallel_tasks"] == 1
+    assert cfg["eval"]["use_async_envs"] is True

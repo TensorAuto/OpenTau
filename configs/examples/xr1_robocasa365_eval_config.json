@@ -136,6 +136,7 @@
         "visualization_width": 512,
         "split": "pretrain",
         "obj_registries": [
+            "objaverse",
             "lightwheel"
         ],
         "metadata": {
@@ -166,7 +167,7 @@
         "project": "xr1",
         "run_id": null,
         "name": null,
-        "notes": "Xiaomi-Robotics-1 RoboCasa365 eval-parity ladder. Camera order is load-bearing: agentview_left, agentview_right, eye_in_hand (WRIST LAST). Set eval.seed_list to the reference's per-episode seeds (7 + task_index*50 + episode) to evaluate identical scenes.",
+        "notes": "Xiaomi-Robotics-1 RoboCasa365 eval-parity ladder. Three settings are load-bearing for reproducing the published per-task rates. (1) Camera order: agentview_left, agentview_right, eye_in_hand -- WRIST LAST; the env maps cameras to camera{i} positionally and the prompt labels them by position. (2) obj_registries must be ['objaverse', 'lightwheel'] -- OpenTau's ('lightwheel',) default changes object sampling, and a scene generated at the same reset seed then differs from the reference's (measured: the robot's base_position moves ~16 cm). The objaverse pack is ~30 GB; without it the numbers are not comparable to the leaderboard. (3) Set eval.seed_list to the reference's per-episode seeds (7 + target50_index*50 + episode) so both harnesses roll identical scenes.",
         "tags": [],
         "group": null,
         "job_type": null,

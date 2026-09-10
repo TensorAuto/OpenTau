@@ -86,6 +86,26 @@ MUJOCO_GL=egl accelerate launch --num_processes=1 src/opentau/scripts/eval.py \
 Without `--eval.seed_list`, per-task rates are not comparable at n=50 no matter how exact
 the model parity is: the two implementations would be evaluating different scene sets.
 
+## The object-registry contract (found the hard way)
+
+OpenTau's RoboCasa env defaults `obj_registries` to `("lightwheel",)` because the objaverse
+pack is ~30 GB and most setups skip it. That default **changes the scene**: with the same
+reset seed, restricting the registries moves the robot's starting `base_position` from
+`[1.4366, -3.1005, 0.7]` (RoboCasa's default `("objaverse", "lightwheel")`, and the
+reference's) to `[1.4284, -3.2620, 0.7]` on CloseFridge seed 57. The construction seed the
+reference passes to `gym.make` turns out to be irrelevant — it was the registries all along.
+
+The consequence is not subtle. With the restricted default, `xr1` scored **0/2** on
+CloseFridge; the reference evaluator scored **3/3** on the same box, the same seeds and the
+same 900-step horizon. So a sim number produced under the restricted default is not
+comparable to a published RoboCasa365 rate, whatever policy produced it.
+
+`configs/examples/xr1_robocasa365_eval_config.json` therefore sets
+`env.obj_registries = ["objaverse", "lightwheel"]`, and
+`test_eval_config_requests_both_object_registries` pins it. Download the pack with
+`python -m opentau.scripts.download_robocasa_assets` (it fetches `objs_objaverse` when the
+config asks for it) before trusting any number from this ladder.
+
 ## The sim ladder (gate G4)
 
 Stop at the first failure. Accept ranges are Wilson 95 % intervals around the published
