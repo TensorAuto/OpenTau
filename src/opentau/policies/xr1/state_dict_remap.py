@@ -45,10 +45,20 @@ REFERENCE_TOP_LEVEL_MODULES = frozenset(
     }
 )
 
-#: Keys a live model has but a reference checkpoint legitimately does not. Qwen3-VL ties
-#: its output head to the input embedding table (``tie_word_embeddings=True``), so the
-#: checkpoint stores 713 ``vlm.*`` tensors against the live model's 714.
-TIED_WEIGHT_KEYS = frozenset({"model.vlm.lm_head.weight"})
+#: The two ends of Qwen3-VL's tied word embedding. ``tie_word_embeddings=True`` means the
+#: input table and the output head are the **same storage**, so a checkpoint carries only
+#: one of them -- and *which* one depends on where it came from:
+#:
+#: * the reference checkpoint omits ``lm_head.weight`` (it stores ``embed_tokens.weight``);
+#: * a checkpoint written by ``save_pretrained`` omits ``embed_tokens.weight``, because
+#:   ``safetensors`` refuses to serialize aliased storage twice and keeps one name.
+#:
+#: So exactly one of the pair may be missing, and whichever it is, loading the other
+#: populates it once ``tie_weights()`` re-establishes the alias. Both missing is a genuine
+#: failure -- the embedding table really did not arrive.
+TIED_WEIGHT_KEYS = frozenset(
+    {"model.vlm.lm_head.weight", "model.vlm.model.language_model.embed_tokens.weight"}
+)
 
 
 def remap_reference_state_dict(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
@@ -79,9 +89,16 @@ def assert_full_coverage(
             ``config.skip_normalization_weights``.
 
     Raises:
-        ValueError: if anything other than a tied weight or a stripped buffer is missing,
-            or if any key was unexpected.
+        ValueError: if anything other than **one** end of the tied word embedding or a
+            stripped buffer is missing, or if any key was unexpected.
     """
+    missing_tied = [key for key in missing_keys if key in TIED_WEIGHT_KEYS]
+    if len(missing_tied) == len(TIED_WEIGHT_KEYS):
+        raise ValueError(
+            f"Both ends of the tied word embedding are missing ({sorted(missing_tied)}). Exactly "
+            "one may be absent (safetensors stores aliased storage once); both means the "
+            "embedding table did not arrive at all."
+        )
     unintended_missing = [
         key for key in missing_keys if key not in TIED_WEIGHT_KEYS and key not in stripped_keys
     ]

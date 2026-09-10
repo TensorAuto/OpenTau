@@ -369,5 +369,24 @@
         -0.6318072080612183
       ]
     ]
+  },
+  "dataset_state16_layout": [
+    "end_effector_position_relative(3)",
+    "end_effector_rotation_relative_xyzw(4)",
+    "base_position(3)",
+    "base_rotation_xyzw(4)",
+    "gripper_qpos(2)"
+  ],
+  "layout_note": "The simulator's agent_pos (envs/robocasa.py::_format_raw_obs) is BASE-first; the RoboCasa365 LeRobot datasets' observation.state is EE-first. Both are 16 wide and both hold two unit quaternions, so confusing them is silent. Measured on 2000 frames of pepijn223/robocasa_pretrain_human300_v4 (2026-09-10): columns 10 and 11 are IDENTICALLY zero while 12/13 are free and |q| == 1, which is the signature of a yaw-only base rotation; columns 3:7 are a general unit quaternion (the end effector). Column 9 is pinned at ~0.701 (the mobile base's height) and 7/8 range over metres. Use state_adapter='robocasa365_dataset' for training and 'robocasa_panda_omron' for eval.",
+  "dataset_column_signature": {
+    "repo_id": "pepijn223/robocasa_pretrain_human300_v4",
+    "frames_sampled": 2000,
+    "quat_norm_cols_3_7": 1.0,
+    "quat_norm_cols_10_14": 1.0,
+    "cols_10_11_are_identically_zero": true,
+    "col_9_range": [
+      0.7,
+      0.702
+    ]
   }
 }

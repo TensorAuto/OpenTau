@@ -1124,6 +1124,11 @@ class XR1Policy(PreTrainedPolicy):
             )
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
             assert_full_coverage(missing_keys, unexpected_keys, stripped_keys=stripped_keys)
+            # Re-establish the input-embedding / lm_head alias. A checkpoint carries only
+            # one end of it (see TIED_WEIGHT_KEYS), and `load_state_dict` writes into the
+            # existing storage -- so whichever end arrived, the other is only correct once
+            # the tie is restored. Cheap and idempotent when the tie is already intact.
+            model.model.vlm.tie_weights()
             if is_main_process:
                 print("All keys loaded successfully!")
         except Exception as e:

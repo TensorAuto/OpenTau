@@ -89,11 +89,19 @@ class XR1Config(PreTrainedConfig):
         state_token_dim: Width of each state token the DiT's ``state_projector`` consumes.
             60 in the reference: the 14-D adapted state zero-padded out to 60.
         max_action_dim: Padded action width the flow operates in. 60.
-        state_adapter: Which raw-state -> policy-state adapter to apply.
-            ``"robocasa_panda_omron"`` maps the 16-D RoboCasa observation to the
-            reference's EE-first 14-D vector (two quaternion -> axis-angle conversions);
-            ``"identity"`` passes the raw state straight through (zero-padded), for
-            datasets that already store the adapted layout.
+        state_adapter: Which raw-state -> policy-state adapter to apply. Both RoboCasa
+            options produce the reference's EE-first 14-D vector (two quaternion ->
+            axis-angle conversions), but they read **different 16-D input layouts** and are
+            not interchangeable:
+            ``"robocasa_panda_omron"`` for the *simulator's* ``agent_pos``
+            (``base_pos, base_quat, ee_pos_rel, ee_quat_rel, gripper_qpos`` -- what
+            ``envs/robocasa.py`` emits, so this is the **eval** setting), and
+            ``"robocasa365_dataset"`` for the RoboCasa365 LeRobot datasets'
+            ``observation.state`` (``ee_pos_rel, ee_quat_rel, base_pos, base_quat,
+            gripper_qpos`` -- EE-first, so this is the **training** setting).
+            Picking the wrong one is silent: both are 16 wide and both hold two unit
+            quaternions. ``"identity"`` passes the raw state through (zero-padded), for a
+            dataset that already stores the adapted layout.
         quat_order: Quaternion component order in the raw state. ``"xyzw"`` (robosuite's
             convention, and what the reference's ``quat_xyzw_to_axis_angle`` assumes).
         image_size: Square side length every camera frame is fed to the ViT at. 256.
@@ -315,16 +323,17 @@ class XR1Config(PreTrainedConfig):
                 f"({self.max_state_dim}): the adapted state is zero-padded up to the projector width."
             )
 
-        if self.state_adapter not in ("robocasa_panda_omron", "identity"):
+        if self.state_adapter not in ("robocasa_panda_omron", "robocasa365_dataset", "identity"):
             raise ValueError(
-                f"Unknown state_adapter '{self.state_adapter}'; expected 'robocasa_panda_omron' "
-                "or 'identity'."
+                f"Unknown state_adapter '{self.state_adapter}'; expected "
+                "'robocasa_panda_omron', 'robocasa365_dataset' or 'identity'."
             )
-        if self.state_adapter == "robocasa_panda_omron" and self.max_state_dim != 16:
+        if self.state_adapter in ("robocasa_panda_omron", "robocasa365_dataset") and (
+            self.max_state_dim != 16
+        ):
             raise ValueError(
-                "state_adapter='robocasa_panda_omron' consumes the 16-D RoboCasa observation "
-                "(base_pos(3) + base_quat(4) + ee_pos_rel(3) + ee_quat_rel(4) + gripper_qpos(2)); "
-                f"got max_state_dim={self.max_state_dim}."
+                f"state_adapter='{self.state_adapter}' consumes a 16-D RoboCasa state; got "
+                f"max_state_dim={self.max_state_dim}."
             )
         if self.quat_order not in ("xyzw", "wxyz"):
             raise ValueError(f"quat_order must be 'xyzw' or 'wxyz', got '{self.quat_order}'.")

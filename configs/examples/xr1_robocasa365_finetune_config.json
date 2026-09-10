@@ -43,7 +43,7 @@
         "max_state_dim": 16,
         "state_token_dim": 60,
         "max_action_dim": 60,
-        "state_adapter": "robocasa_panda_omron",
+        "state_adapter": "robocasa365_dataset",
         "quat_order": "xyzw",
         "num_steps": 5,
         "training_repeat": 4,

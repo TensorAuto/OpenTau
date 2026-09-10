@@ -43,12 +43,39 @@ from torch import Tensor
 
 from opentau.policies.utils import history_slot_indices
 
-#: Slices of RoboCasa's 16-D ``agent_pos``.
-_BASE_POS = slice(0, 3)
-_BASE_QUAT = slice(3, 7)
-_EE_POS_REL = slice(7, 10)
-_EE_QUAT_REL = slice(10, 14)
-_GRIPPER_QPOS = slice(14, 16)
+#: Slices of the **env's** 16-D ``agent_pos`` (``envs/robocasa.py::_format_raw_obs``),
+#: which flattens the RoboCasa key converter's dict **base-first**.
+_ENV_LAYOUT = {
+    "base_pos": slice(0, 3),
+    "base_quat": slice(3, 7),
+    "ee_pos_rel": slice(7, 10),
+    "ee_quat_rel": slice(10, 14),
+    "gripper_qpos": slice(14, 16),
+}
+
+#: Slices of the **RoboCasa365 LeRobot dataset's** 16-D ``observation.state``, which
+#: flattens the same five fields **EE-first**. The two are *not* interchangeable, and the
+#: mismatch is silent: both are 16 wide, both contain two unit quaternions, and an
+#: axis-angle vector built from the wrong one is still a plausible 3-vector.
+#:
+#: Verified empirically against ``pepijn223/robocasa_pretrain_human300_v4`` rather than
+#: assumed, using a signature that cannot be argued with: a mobile base rotates only about
+#: z, so its quaternion is ``(0, 0, sin(t/2), cos(t/2))`` and its x/y components are
+#: **exactly** zero. In the dataset that pattern sits at columns 10:14, and the general
+#: (all-four-free) quaternion sits at 3:7 -- the opposite assignment from the env.
+_DATASET_LAYOUT = {
+    "ee_pos_rel": slice(0, 3),
+    "ee_quat_rel": slice(3, 7),
+    "base_pos": slice(7, 10),
+    "base_quat": slice(10, 14),
+    "gripper_qpos": slice(14, 16),
+}
+
+#: ``state_adapter`` value -> field slices.
+STATE_LAYOUTS = {
+    "robocasa_panda_omron": _ENV_LAYOUT,
+    "robocasa365_dataset": _DATASET_LAYOUT,
+}
 
 #: Width of the adapted state before zero-padding to ``state_token_dim``.
 XR1_STATE_DIM = 14
@@ -107,28 +134,43 @@ def quat_to_axis_angle(quat: Tensor, quat_order: str = "xyzw") -> Tensor:
     return axis_angle.to(out_dtype)
 
 
-def robocasa_agent_pos_to_xr1_state(agent_pos: Tensor, quat_order: str = "xyzw") -> Tensor:
-    """``(..., 16)`` RoboCasa ``agent_pos`` -> ``(..., 14)`` XR-1 state.
+def robocasa_state_to_xr1_state(
+    raw_state: Tensor, layout: str = "robocasa_panda_omron", quat_order: str = "xyzw"
+) -> Tensor:
+    """``(..., 16)`` RoboCasa state -> ``(..., 14)`` XR-1 state.
+
+    Args:
+        raw_state: The 16-D per-frame state.
+        layout: ``"robocasa_panda_omron"`` for the **env's** base-first ``agent_pos``, or
+            ``"robocasa365_dataset"`` for the **dataset's** EE-first ``observation.state``.
+        quat_order: Quaternion component order within each 4-slice.
+
+    Returns:
+        ``[ee_pos_rel(3), ee_rot_aa(3), gripper_qpos(2), base_pos(3), base_rot_aa(3)]``.
 
     Raises:
-        ValueError: if the trailing dimension is not 16.
+        ValueError: on an unknown layout or a trailing dimension that is not 16.
     """
-    if agent_pos.shape[-1] != 16:
-        raise ValueError(
-            "The robocasa_panda_omron state adapter expects a 16-D agent_pos "
-            "[base_pos(3), base_quat(4), ee_pos_rel(3), ee_quat_rel(4), gripper_qpos(2)]; got "
-            f"{tuple(agent_pos.shape)}."
-        )
+    if layout not in STATE_LAYOUTS:
+        raise ValueError(f"Unknown state layout '{layout}'; expected one of {sorted(STATE_LAYOUTS)}.")
+    if raw_state.shape[-1] != 16:
+        raise ValueError(f"The '{layout}' state adapter expects a 16-D state; got {tuple(raw_state.shape)}.")
+    fields = STATE_LAYOUTS[layout]
     return torch.cat(
         [
-            agent_pos[..., _EE_POS_REL],
-            quat_to_axis_angle(agent_pos[..., _EE_QUAT_REL], quat_order),
-            agent_pos[..., _GRIPPER_QPOS],
-            agent_pos[..., _BASE_POS],
-            quat_to_axis_angle(agent_pos[..., _BASE_QUAT], quat_order),
+            raw_state[..., fields["ee_pos_rel"]],
+            quat_to_axis_angle(raw_state[..., fields["ee_quat_rel"]], quat_order),
+            raw_state[..., fields["gripper_qpos"]],
+            raw_state[..., fields["base_pos"]],
+            quat_to_axis_angle(raw_state[..., fields["base_quat"]], quat_order),
         ],
         dim=-1,
     )
+
+
+def robocasa_agent_pos_to_xr1_state(agent_pos: Tensor, quat_order: str = "xyzw") -> Tensor:
+    """The env-layout adapter. Thin alias kept because it names the common case."""
+    return robocasa_state_to_xr1_state(agent_pos, "robocasa_panda_omron", quat_order)
 
 
 def adapt_state(
@@ -138,7 +180,8 @@ def adapt_state(
 
     Args:
         state: ``(B, T, D_raw)`` (or ``(B, D_raw)``) raw per-frame state.
-        state_adapter: ``"robocasa_panda_omron"`` or ``"identity"``.
+        state_adapter: ``"robocasa_panda_omron"`` (env layout), ``"robocasa365_dataset"``
+            (dataset layout) or ``"identity"``.
         state_token_dim: Width of each DiT state token (60 in the reference).
         quat_order: Quaternion component order in the raw state.
 
@@ -148,8 +191,8 @@ def adapt_state(
     Raises:
         ValueError: on an unknown adapter, or a raw state wider than ``state_token_dim``.
     """
-    if state_adapter == "robocasa_panda_omron":
-        adapted = robocasa_agent_pos_to_xr1_state(state, quat_order)
+    if state_adapter in STATE_LAYOUTS:
+        adapted = robocasa_state_to_xr1_state(state, state_adapter, quat_order)
     elif state_adapter == "identity":
         adapted = state
     else:

@@ -319,7 +319,7 @@ def test_state_adapter_pads_to_the_token_width_and_leaves_the_tail_zero():
 
 
 def test_state_adapter_rejects_a_wrong_width():
-    with pytest.raises(ValueError, match="16-D agent_pos"):
+    with pytest.raises(ValueError, match="16-D state"):
         adapt_state(torch.randn(2, 14), state_adapter="robocasa_panda_omron", state_token_dim=60)
 
 
@@ -1063,7 +1063,7 @@ def test_config_refuses_a_delay_longer_than_training_ever_showed():
 
 
 def test_config_refuses_a_mismatched_state_adapter_width():
-    with pytest.raises(ValueError, match="16-D RoboCasa observation"):
+    with pytest.raises(ValueError, match="16-D RoboCasa state"):
         XR1Config(state_adapter="robocasa_panda_omron", max_state_dim=14)
     XR1Config(state_adapter="identity", max_state_dim=14)
 
@@ -1564,3 +1564,92 @@ def test_validation_forward_uses_a_deterministic_time_grid_and_no_repeat():
         model.dit = real_dit
     assert set(seen) == {3}
     assert model.config.training_repeat > 1  # so the assertion above is not vacuous
+
+
+# =====================================================================================
+# The two 16-D RoboCasa state layouts (they are NOT interchangeable)
+# =====================================================================================
+
+
+def test_the_env_and_dataset_state_layouts_are_different_and_both_supported():
+    """The simulator's ``agent_pos`` is base-first; the dataset's ``observation.state`` is
+    EE-first.
+
+    Both are 16 wide and both hold two unit quaternions, so feeding one to the other's
+    adapter produces a finite, plausible 14-vector and nothing complains -- the eval would
+    simply be conditioned on a scrambled pose. This constructs a state whose two halves are
+    distinguishable and asserts the adapters disagree, so a future "simplification" that
+    collapses them to one layout fails here.
+    """
+    from opentau.policies.xr1.obs_adapter import STATE_LAYOUTS, robocasa_state_to_xr1_state
+
+    assert set(STATE_LAYOUTS) == {"robocasa_panda_omron", "robocasa365_dataset"}
+
+    ee_pos = torch.tensor([0.30, -0.10, 0.50], dtype=torch.float64)
+    ee_quat = torch.tensor([0.1830, 0.3660, 0.5490, 0.7320], dtype=torch.float64)
+    ee_quat = ee_quat / ee_quat.norm()
+    base_pos = torch.tensor([2.50, -3.10, 0.701], dtype=torch.float64)
+    # A mobile base rotates only about z, so x and y are exactly zero -- the signature the
+    # dataset layout was identified by.
+    base_quat = torch.tensor([0.0, 0.0, 0.3827, 0.9239], dtype=torch.float64)
+
+    env_state = torch.cat([base_pos, base_quat, ee_pos, ee_quat, torch.tensor([0.02, -0.02])])
+    dataset_state = torch.cat([ee_pos, ee_quat, base_pos, base_quat, torch.tensor([0.02, -0.02])])
+
+    from_env = robocasa_state_to_xr1_state(env_state, "robocasa_panda_omron")
+    from_dataset = robocasa_state_to_xr1_state(dataset_state, "robocasa365_dataset")
+    # Same physical pose, two encodings -> the same XR-1 state.
+    assert torch.allclose(from_env, from_dataset, atol=1e-12)
+
+    # ...and reading either one with the *other* adapter does not raise; it silently
+    # produces a different vector. That is exactly why the config field exists.
+    wrong = robocasa_state_to_xr1_state(dataset_state, "robocasa_panda_omron")
+    assert torch.isfinite(wrong).all()
+    assert not torch.allclose(wrong, from_dataset, atol=1e-6)
+
+
+def test_dataset_layout_matches_the_recorded_column_signature():
+    """Pin *why* the dataset layout was identified, not just the conclusion.
+
+    The signature is measurable and unambiguous: a yaw-only base quaternion has identically
+    zero x/y components. The fixture records where that pattern sits in the real data.
+    """
+    golden = _golden("state_from_env.json")
+    signature = golden["dataset_column_signature"]
+    assert signature["cols_10_11_are_identically_zero"] is True
+    assert signature["quat_norm_cols_3_7"] == 1.0
+
+    from opentau.policies.xr1.obs_adapter import STATE_LAYOUTS
+
+    fields = STATE_LAYOUTS["robocasa365_dataset"]
+    assert (fields["base_quat"].start, fields["base_quat"].stop) == (10, 14)
+    assert (fields["ee_quat_rel"].start, fields["ee_quat_rel"].stop) == (3, 7)
+    assert golden["dataset_state16_layout"][0].startswith("end_effector_position_relative")
+    assert golden["agent_pos16_layout"][0].startswith("base_position")
+
+
+def test_the_shipped_configs_pick_the_right_adapter_for_their_data_source():
+    """Eval reads the simulator; training reads the dataset. Swapping them is silent."""
+    import json as _json
+    from pathlib import Path as _Path
+
+    root = _Path(__file__).resolve().parents[2] / "configs" / "examples"
+    eval_cfg = _json.loads((root / "xr1_robocasa365_eval_config.json").read_text())
+    train_cfg = _json.loads((root / "xr1_robocasa365_finetune_config.json").read_text())
+    assert eval_cfg["policy"]["state_adapter"] == "robocasa_panda_omron"
+    assert train_cfg["policy"]["state_adapter"] == "robocasa365_dataset"
+
+
+def test_only_one_end_of_the_tied_embedding_may_be_missing():
+    """A checkpoint carries one end of the tie, and *which* end depends on its provenance.
+
+    The reference checkpoint omits ``lm_head.weight``; one written by ``save_pretrained``
+    omits ``embed_tokens.weight``, because ``safetensors`` will not serialize aliased
+    storage twice. Both must load; **both missing** must not.
+    """
+    from opentau.policies.xr1.state_dict_remap import TIED_WEIGHT_KEYS
+
+    assert_full_coverage(["model.vlm.lm_head.weight"], [])
+    assert_full_coverage(["model.vlm.model.language_model.embed_tokens.weight"], [])
+    with pytest.raises(ValueError, match="Both ends"):
+        assert_full_coverage(sorted(TIED_WEIGHT_KEYS), [])
