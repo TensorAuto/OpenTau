@@ -44,6 +44,11 @@ from opentau.policies.pi07_paligemma.low_level.modeling_pi07_low_level import (
 # `lerobot/pi05` warm-starts), and both pi07 low levels'. Sweeping a subset is
 # exactly the miss-by-omission CLAUDE.md rule 6 documents — the first passes of
 # this very sweep each missed copies.
+# NOTE: xr1 is deliberately absent. The remap this file pins is
+# `normalize_actions.*` -> `normalize_discrete_actions.*`, and the inclusion criterion is
+# "owns a `normalize_discrete_actions` module AND accepts a pi0.5-lineage warm-start".
+# xr1 has no discrete-action pathway (no `normalize_discrete_actions`) and warm-starts only
+# from Xiaomi-Robotics-1 checkpoints, so adding it would pin a remap that can never fire.
 POLICY_CLASSES = [
     PI05Policy,
     PI05MemPolicy,
