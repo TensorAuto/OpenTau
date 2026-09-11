@@ -321,6 +321,45 @@ when the reachable pair space is not being covered.
   workers from constructing different permutations when the global seed is
   intentionally offset per rank, while preserving caller control via either
   `generator` or `seed`. Unseeded shuffles are now deterministic across runs.
+- **RoboCasa actions were permuted on every step: the flat 12-D vector is EE-first, not
+  base-first.** `envs/robocasa.py::convert_action` sliced `base_motion(4), control_mode(1),
+  ee_pos(3), ee_rot(3), gripper(1)`, while RoboCasa's own
+  `robocasa.utils.env_utils.convert_action` — and the RoboCasa365 LeRobot datasets every
+  policy trains on — use `ee_pos(3), ee_rot(3), gripper(1), base_motion(4),
+  control_mode(1)`. Every action reaching the simulator was therefore permuted: the
+  end-effector command was routed into base motion, the "control mode" read a continuously
+  varying column, and the gripper read a column that never changed. The failure is silent —
+  the arm still moves, episodes still run to completion, only the success rate falls.
+  The layout is now pinned against both of its independent sources (RoboCasa's converter
+  when the extra is installed; the dataset's own column signature otherwise) in
+  `tests/envs/test_robocasa_action_layout.py`.
+  **Silent result change: every RoboCasa success rate this repository produced before this
+  fix is understated by a policy-dependent, unknown amount, and is not comparable to a
+  post-fix number — nor to another pre-fix number.** Only the in-process eval path
+  (`env.type: robocasa`) is affected: the external WebSocket server/client path converts
+  actions client-side, and no training, dataset or serving path reads the flat-12 layout.
+- **A fully-downloaded RoboCasa asset store no longer fails on a missing download
+  manifest.** `_ensure_robocasa_assets` loaded `box_links_assets.json` unconditionally,
+  ahead of the per-pack loop that skips packs already on disk, so a store holding every pack
+  still died with `FileNotFoundError` before a single env was built. It is reachable in
+  practice because the seeding step keyed on its marker file alone: a store seeded by a run
+  whose package dir was already a symlink never received the wheel-shipped `box_links/` (nor
+  `arenas/empty_kitchen_arena.xml`, which fails later, inside the env workers), and every
+  later run then died on the manifest despite having every pack. The manifest is now
+  resolved only when a pack is genuinely missing — that error is kept, it is actionable —
+  and the seeding step re-seeds whatever the store actually lacks rather than trusting the
+  marker.
+- **A restricted `env.obj_registries` no longer silently produces incomparable success
+  rates.** The `["lightwheel"]` default is kept (RoboCasa's own `["objaverse",
+  "lightwheel"]` needs a ~30 GB pack, and changing the default would make every existing
+  RoboCasa config demand it), but it is not comparability-neutral: the registry set feeds
+  RoboCasa's scene generation, so restricting it changes the generated scene rather than
+  only which meshes are placed in it — on `CloseFridge` / `split="pretrain"` at a fixed
+  reset seed, the fridge's own `base_position` moves from `-3.100518` to `-3.262029`. Rates
+  measured that way are self-consistent but not comparable to published RoboCasa365 or
+  leaderboard numbers, for any policy. Env construction now prints a one-time rank-0 warning
+  saying so, and the constant, the `obj_registries` config docs and the RoboCasa tutorial
+  carry that consequence rather than only the download size.
 
 ### Changed — gRPC api-key auth renamed to `x-api-key` / `INFERENCE_API_KEY` — **breaking on both, no `config_version` bump**
 
