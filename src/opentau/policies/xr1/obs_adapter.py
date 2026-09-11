@@ -31,8 +31,10 @@ plausible-looking 3-vector.
 the start of an episode. OpenTau's dataset does the same at episode boundaries, but the two
 existing inference buffers (pi07 / pi05_mem) **zero-pad** instead -- so a policy ported by
 copying them would see, for the first ``(T-1)*k`` steps of every episode, a distribution it
-was never trained on. :func:`opentau.policies.utils.build_history_batch` carries both
-conventions behind a ``pad_mode`` argument; xr1 passes ``"clamp"``.
+was never trained on. :func:`opentau.policies.utils.history_slot_indices` carries both
+conventions behind a ``pad_mode`` argument; xr1 passes ``"clamp"``. (``_build_history_batch``
+is a per-policy *method* on pi07 / pi05_mem, not a shared helper -- those callers still
+inline the arithmetic this function factored out.)
 """
 
 from __future__ import annotations

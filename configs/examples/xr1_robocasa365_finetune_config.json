@@ -50,7 +50,6 @@
         "train_prefix_prob": 0.5,
         "train_prefix_max": 6,
         "mse_loss_scale": 0.5,
-        "freq_loss_weight": 1.0,
         "freq_loss_excluded_dims": [],
         "enable_choice_heads": false,
         "attention_implementation": "eager",

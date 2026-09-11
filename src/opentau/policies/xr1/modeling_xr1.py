@@ -1162,24 +1162,41 @@ class XR1Policy(PreTrainedPolicy):
         original_state_dict = load_file(weights_file)
 
         stripped_keys: frozenset[str] = frozenset()
+        load_result: tuple[list[str], list[str]] | None = None
         try:
             remapped_state_dict = remap_reference_state_dict(original_state_dict)
             model._promote_legacy_norm_buffers_in_state_dict(remapped_state_dict)
             remapped_state_dict, stripped_keys = cls._strip_normalization_buffers_from_state_dict(
                 remapped_state_dict, model.config, is_main_process=is_main_process
             )
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
-            assert_full_coverage(missing_keys, unexpected_keys, stripped_keys=stripped_keys)
-            # Re-establish the input-embedding / lm_head alias. A checkpoint carries only
-            # one end of it (see TIED_WEIGHT_KEYS), and `load_state_dict` writes into the
-            # existing storage -- so whichever end arrived, the other is only correct once
-            # the tie is restored. Cheap and idempotent when the tie is already intact.
-            model.model.vlm.tie_weights()
-            if is_main_process:
-                print("All keys loaded successfully!")
+            load_result = model.load_state_dict(remapped_state_dict, strict=False)
         except Exception as e:
             if is_main_process:
                 print(f"Warning: Could not remap state dict keys: {e}")
+
+        # Deliberately OUTSIDE the broad catch above. The other policies keep that catch
+        # because they have documented partial-load warm-start paths (e.g. pi06 from a
+        # pi05 checkpoint) where `strict=False` absorbing key mismatches is the intended
+        # behaviour. xr1 has no such path: it loads Xiaomi-Robotics-1 checkpoints, whose
+        # coverage is total. Raising inside the `try` would have the `except` print the
+        # failure as a warning and hand back a half-random 5B model -- which is exactly the
+        # contract `state_dict_remap.assert_full_coverage` exists to prevent, so the gate
+        # has to sit where nothing can swallow it.
+        if load_result is None:
+            raise ValueError(
+                "Loading the xr1 checkpoint failed before `load_state_dict` completed (see the "
+                "warning above). Refusing to return a randomly-initialized 5B model: unlike the "
+                "pi05/pi06 lineage, xr1 has no partial-load warm-start path, so an incomplete "
+                "load is always a bug rather than a supported mode."
+            )
+        assert_full_coverage(*load_result, stripped_keys=stripped_keys)
+        # Re-establish the input-embedding / lm_head alias. A checkpoint carries only one end
+        # of it (see TIED_WEIGHT_KEYS), and `load_state_dict` writes into the existing
+        # storage -- so whichever end arrived, the other is only correct once the tie is
+        # restored. Cheap and idempotent when the tie is already intact.
+        model.model.vlm.tie_weights()
+        if is_main_process:
+            print("All keys loaded successfully!")
 
         cls._assert_normalize_buffers_initialized(model, stripped_keys=stripped_keys)
 

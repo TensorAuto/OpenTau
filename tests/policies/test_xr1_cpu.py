@@ -1915,3 +1915,93 @@ def test_val_deterministic_time_does_not_drive_the_repeat_collapse():
         model.dit = real_dit
     assert set(seen) == {3}
     assert model.config.training_repeat > 1  # so the assertion is not vacuous
+
+
+# =====================================================================================
+# Checkpoint loading: the coverage gate must be fatal, not a log line
+# =====================================================================================
+
+
+def test_incomplete_checkpoint_raises_instead_of_returning_a_half_loaded_model(tmp_path):
+    """A truncated checkpoint must raise out of ``from_pretrained``.
+
+    The sibling policies wrap their remap in a broad ``except Exception`` that warns and
+    returns the model, because they have documented partial-load warm-start paths. xr1 has
+    none, so an incomplete load is always a bug — and a gate that raises *inside* that catch
+    is not a gate at all: it prints a warning and hands back a randomly-initialized 5B model
+    that looks loaded until the numbers are wrong.
+    """
+    from safetensors.torch import load_file, save_file
+
+    policy = _build_policy()
+    policy.config.pretrained_path = None
+    policy.save_pretrained(tmp_path)
+
+    weights = tmp_path / "model.safetensors"
+    state = load_file(weights)
+    victim = next(k for k in state if k.startswith("model.dit.layers.0."))
+    del state[victim]
+    save_file(state, weights)
+
+    with pytest.raises(ValueError, match="did not fully cover"):
+        XR1Policy.from_pretrained(tmp_path, config=policy.config, qwen3vl_config=_tiny_qwen3vl_config(2))
+
+
+def test_a_complete_checkpoint_still_round_trips(tmp_path):
+    """The negative case above must not be passing for the wrong reason."""
+    policy = _build_policy()
+    policy.config.pretrained_path = None
+    policy.save_pretrained(tmp_path)
+
+    reloaded = XR1Policy.from_pretrained(
+        tmp_path, config=policy.config, qwen3vl_config=_tiny_qwen3vl_config(2)
+    )
+    assert torch.equal(reloaded.model.dit.layers[0].adaln_table, policy.model.dit.layers[0].adaln_table)
+
+
+# =====================================================================================
+# The real-time-chunking action queue
+# =====================================================================================
+
+
+def test_replanning_with_a_frozen_prefix_never_evicts_a_queued_action():
+    """The re-plan refill fits the queue exactly at every reachable delay.
+
+    ``_action_queue`` has ``maxlen=n_action_steps``, and a re-plan with ``d`` leftover rows
+    appends ``actions[d : d + n_action_steps]``. That would evict the leftovers — silently
+    skipping ``d`` actions — if the append were longer than the free space. It cannot be:
+    ``validate_action_horizon`` refuses ``n_action_steps < chunk_size`` together with a
+    non-zero delay knob, so whenever a delay is in play ``n_action_steps == chunk_size`` and
+    the slice yields exactly ``chunk_size - d`` rows for the ``d`` free slots.
+
+    Pinned here because the arithmetic is load-bearing but was previously untested, and
+    because the invariant it rests on lives in a *different* file — a future relaxation of
+    that validator would make this silently wrong.
+    """
+    with pytest.raises(ValueError, match="shortened execution horizon"):
+        XR1Config(chunk_size=16, n_action_steps=8, max_delay=4)
+
+    config = XR1Config(chunk_size=16, n_action_steps=16, max_delay=4)
+    for delay in range(config.max_delay + 1):
+        appended = len(range(delay, delay + config.n_action_steps)[: config.chunk_size - delay])
+        assert delay + appended == config.n_action_steps, (
+            f"delay={delay}: {delay} queued + {appended} appended overflows "
+            f"maxlen={config.n_action_steps}, so {delay + appended - config.n_action_steps} "
+            "already-planned action(s) would be evicted unexecuted"
+        )
+
+
+def test_choice_head_state_row_is_the_last_frame_not_a_pooled_window():
+    """The reference's choice head has ``state_shape = (1, 60)`` — one row, the current pose.
+
+    Mean-pooling the window would condition a warm-started head differently from the 5B
+    checkpoint whose weights it inherits, whenever the state moves inside the window.
+    """
+    from opentau.policies.xr1.choice_heads import XR1ChoiceHeads
+
+    heads = XR1ChoiceHeads(hidden_size=8, state_dim=4, action_dim=3, n_choices=2)
+    state = torch.zeros(1, 4, 4)
+    state[0, -1] = 5.0  # only the last frame is non-zero
+    projected = heads.state_projector_choice(state[:, -1])
+    pooled = heads.state_projector_choice(state.mean(dim=1))
+    assert not torch.allclose(projected, pooled), "the test state must distinguish the two"

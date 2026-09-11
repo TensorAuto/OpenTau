@@ -186,17 +186,19 @@ class XR1ChoiceHeads(nn.Module):
         Args:
             input_ids: ``(B, S)``.
             token_embeddings: The backbone's input-embedding module.
-            state: ``(B, T, state_dim)`` adapted state tokens; flattened over ``T`` to fill
-                the (single) ``<state>`` row -- the reference projects the whole history and
-                takes the last, so ``T`` state rows are pooled by mean here and the pooling
-                is stated rather than implicit.
+            state: ``(B, T, state_dim)`` adapted state tokens. Only the **last** frame fills
+                the single ``<state>`` row, because the reference's choice head is built for
+                one: its ``state_shape`` is ``(1, 60)``, so it conditions on the current pose
+                rather than on the history the DiT sees. Pooling the window instead (a mean,
+                say) would condition a warm-started head differently from the 5B checkpoint
+                it inherits weights from, whenever the state moves inside the window.
 
         Returns:
             ``(B, S, hidden)`` embeddings.
         """
         inputs_embeds = token_embeddings(input_ids)
 
-        state_embed = self.state_projector_choice(reduce(state, "b t d -> b d", "mean"))
+        state_embed = self.state_projector_choice(state[:, -1])
         state_mask = rearrange(input_ids == STATE_TOKEN_ID, "b s -> b s 1")
         inputs_embeds = inputs_embeds.masked_scatter(
             state_mask, state_embed.to(inputs_embeds.dtype)[state_mask.squeeze(-1).any(dim=-1)]

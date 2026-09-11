@@ -133,7 +133,10 @@ class XR1Config(PreTrainedConfig):
             ``training_repeat`` collapse to 1 is driven by ``self.training`` and happens in
             eval mode whatever this is set to.
         mse_loss_scale: Weight on the masked flow MSE inside the ``"MSE"`` loss key. 0.5.
-        freq_loss_weight: Weight on the rFFT-L1 term inside the ``"MSE"`` loss key. 0.5.
+        freq_loss_weight: Weight on the rFFT-L1 term inside the ``"MSE"`` loss key. **1.0**,
+            the reference's ``freq_coefficient`` default -- its scalar is
+            ``0.5 * mse + freq_coefficient * freq + 0.5 * choice + 0.5 * score``, so the
+            frequency term is weighted twice the MSE term rather than equally.
         freq_loss_excluded_dims: Action dimensions dropped from the frequency term. The
             reference's ``[17, 18, 19]`` is defined on its canonical 60-D layout, which
             RoboCasa365's flat-12 action has no columns in -- so the RoboCasa365 default
@@ -239,7 +242,7 @@ class XR1Config(PreTrainedConfig):
 
     # --- Losses ---
     mse_loss_scale: float = 0.5
-    freq_loss_weight: float = 0.5
+    freq_loss_weight: float = 1.0
     freq_loss_excluded_dims: tuple[int, ...] = ()
     weight_clamp: tuple[float, float] = (0.5, 5.0)
     n_choices: int = 5
