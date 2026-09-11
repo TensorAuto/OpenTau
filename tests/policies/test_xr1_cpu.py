@@ -1851,3 +1851,67 @@ def test_padded_action_columns_reach_the_dit_as_zeros_under_a_training_shaped_co
     assert first and len(first) == len(second)
     for a, b in zip(first, second, strict=True):
         assert torch.equal(a, b), "padding columns of the noise reached the DiT"
+
+
+def test_choice_heads_and_train_expert_only_are_refused_together():
+    """Half the heads would learn and half would not, silently.
+
+    ``train_expert_only`` runs the backbone prefix under ``no_grad``, so the three modules
+    that feed ``inputs_embeds`` (``state_projector_choice``, ``action_embed``,
+    ``score_embed``) reach only tensors carrying no graph — while the two projectors that
+    read the detached hidden states keep updating. Nothing errors and the loss still moves,
+    which is why this has to be refused at config time rather than documented.
+    """
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        XR1Config(enable_choice_heads=True, train_expert_only=True)
+
+    # ...and each alone is fine, so the guard is about the combination, not either flag.
+    XR1Config(enable_choice_heads=True)
+    XR1Config(train_expert_only=True)
+
+
+def test_attention_implementation_does_not_reach_the_dit():
+    """The config field is the *backbone's* kernel; the DiT always uses SDPA.
+
+    Pins the docstring's corrected claim by exercising it: building under both settings must
+    leave the DiT identical, because the reference hard-codes
+    ``F.scaled_dot_product_attention`` there regardless.
+    """
+    for impl in ("eager", "sdpa"):
+        model = _build_model(attention_implementation=impl)
+        assert model.vlm.config.text_config._attn_implementation == impl
+        # The DiT attention takes no kernel argument at all.
+        import inspect
+
+        from opentau.policies.xr1.dit import XR1DiTAttention
+
+        assert "attention_implementation" not in inspect.signature(XR1DiTAttention.__init__).parameters
+
+
+def test_val_deterministic_time_does_not_drive_the_repeat_collapse():
+    """The flag controls the timestep only; ``self.training`` drives the repeat.
+
+    Rule-8 conflict test: set the flag OFF and stay in eval mode, and the repeat must still
+    collapse to 1 — which is what the corrected docstring claims and the previous one denied.
+    """
+    model = _build_model(val_deterministic_time=False).eval()
+    batch = _video_batch(bsize=3)
+    seen = []
+    real_dit = model.dit
+
+    class _ShapeSpy(torch.nn.Module):
+        def __init__(self, inner):
+            super().__init__()
+            self.inner = inner
+
+        def forward(self, hidden_states, *args, **kwargs):
+            seen.append(hidden_states.shape[0])
+            return self.inner(hidden_states, *args, **kwargs)
+
+    model.dit = _ShapeSpy(real_dit)
+    try:
+        model(**batch)
+    finally:
+        model.dit = real_dit
+    assert set(seen) == {3}
+    assert model.config.training_repeat > 1  # so the assertion is not vacuous

@@ -23,8 +23,12 @@ Two pins, because either alone can rot:
 
 * against ``robocasa.utils.env_utils.convert_action`` when RoboCasa is installed, which is
   the definition the simulator itself is written to; and
-* against the *dataset's* recorded column signature, which is what the policy is trained to
-  emit and needs no RoboCasa install to check.
+* against the dataset's column signature as **measured once and recorded here** as
+  constants. That second one is a regression guard, not a live derivation — it does not read
+  the dataset, so it cannot catch the dataset changing under us. It earns its place by
+  holding when RoboCasa is absent (where the first pin skips) and by writing down *why* the
+  layout is what it is, so a future reader can re-derive it. Re-measuring it means reading
+  the parquet, which belongs behind ``@pytest.mark.network``.
 """
 
 import numpy as np
@@ -67,14 +71,19 @@ def test_convert_action_matches_robocasas_own_converter():
 
 
 def test_convert_action_matches_the_datasets_recorded_column_signature():
-    """The layout is also readable straight off the training data, with no RoboCasa import.
+    """Pin the layout against the dataset column signature measured when it was derived.
 
-    Measured over 4000 frames of ``pepijn223/robocasa_pretrain_human300_v4``: exactly one
-    column is binary +/-1 (the gripper), exactly four consecutive columns are identically
+    The measurement, over 4000 frames of ``pepijn223/robocasa_pretrain_human300_v4``: exactly
+    one column is binary +/-1 (the gripper), exactly four consecutive columns are identically
     zero (base motion, held still in these task classes) and exactly one is constant (the
-    control mode). Those three facts pin the whole layout, and they are the reason the
-    base-first reading was wrong: it put the "control mode" on a column ranging over
-    +/-0.49 and the gripper on one that never opened.
+    control mode). Those three facts pin the whole layout, and they are why the base-first
+    reading was wrong — it put the "control mode" on a column ranging over +/-0.49 and the
+    gripper on one that never opened.
+
+    The numbers below are that measurement written down, **not** re-derived here: this test
+    reads no data and imports nothing, so it guards against the slicing changing, not against
+    the dataset changing. Re-deriving it needs the parquet and therefore a
+    ``@pytest.mark.network`` test.
     """
     binary_column = 6
     zero_columns = [7, 8, 9, 10]

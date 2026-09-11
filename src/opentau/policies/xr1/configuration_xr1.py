@@ -128,8 +128,10 @@ class XR1Config(PreTrainedConfig):
         time_beta_alpha / time_beta_beta: ``Beta`` parameters for the training timestep
             draw. The reference samples ``(1 - Beta(1.5, 1).sample()) * 0.999``.
         val_deterministic_time: In validation, replace the random timestep draw with a
-            deterministic grid and force ``training_repeat = 1``, so the validation curve
-            is not dominated by tau variance. Defaults to True.
+            deterministic grid, so the validation curve tracks the model rather than tau
+            variance. Defaults to True. Note this flag controls *only* the timestep: the
+            ``training_repeat`` collapse to 1 is driven by ``self.training`` and happens in
+            eval mode whatever this is set to.
         mse_loss_scale: Weight on the masked flow MSE inside the ``"MSE"`` loss key. 0.5.
         freq_loss_weight: Weight on the rFFT-L1 term inside the ``"MSE"`` loss key. 0.5.
         freq_loss_excluded_dims: Action dimensions dropped from the frequency term. The
@@ -155,9 +157,11 @@ class XR1Config(PreTrainedConfig):
             ``"Qwen/Qwen3-VL-4B-Instruct"``) to warm-start the VLM from when training a DiT
             from scratch. ``None`` (default) leaves the VLM at its random init, which is
             correct whenever an XR-1 checkpoint is loaded on top.
-        attention_implementation: Backbone + DiT attention kernel. ``"eager"`` is the
-            default because it is what the reference-parity fixtures were captured under;
-            ``"sdpa"`` is numerically close but **not** bit-identical.
+        attention_implementation: **Backbone** attention kernel. ``"eager"`` is the default
+            because it is what the reference-parity fixtures were captured under; ``"sdpa"``
+            is numerically close but **not** bit-identical. It does not reach the DiT, which
+            always calls ``F.scaled_dot_product_attention`` with an explicit boolean mask —
+            the reference does the same, so this field is deliberately not a global switch.
         dit_*: DiT geometry. ``dit_num_key_value_heads`` and ``dit_head_dim`` must match
             the backbone text tower, and ``dit_num_hidden_layers`` must equal the backbone
             depth (layer *i* of the DiT reads cache layer ``start + i``).
@@ -360,6 +364,16 @@ class XR1Config(PreTrainedConfig):
                 f"{self.num_cams}; the prompt labels cameras positionally, so every camera needs one."
             )
 
+        if self.enable_choice_heads and self.train_expert_only:
+            raise ValueError(
+                "`enable_choice_heads=True` and `train_expert_only=True` are mutually "
+                "exclusive. The choice heads are a VLM-side auxiliary signal, and "
+                "`train_expert_only` runs the backbone prefix under `no_grad` — so "
+                "`state_projector_choice`, `action_embed` and `score_embed` feed only into "
+                "tensors that carry no graph and would train on nothing, while the two "
+                "projectors reading the (detached) hidden states would still update. Half "
+                "the heads learning is worse than none: set one flag or the other."
+            )
         if self.max_delay > self.train_prefix_max:
             raise ValueError(
                 f"max_delay ({self.max_delay}) exceeds train_prefix_max ({self.train_prefix_max}): the "

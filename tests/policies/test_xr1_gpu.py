@@ -608,10 +608,28 @@ def test_eval_config_reproduces_the_reference_scene_at_the_same_seed():
     reference evaluator scored 3/3 on the same box. The robot's starting ``base_position``
     is a cheap, exact fingerprint of the whole scene, so pin that rather than a success rate.
 
-    Needs the objaverse asset pack; skipped when RoboCasa is not installed.
+    Skipped unless the objaverse pack is **already on disk**. That guard is the point: the
+    config asks for ``["objaverse", "lightwheel"]`` (it has to, or the scene is not the
+    reference's), and ``gpu_test.yml`` installs the robocasa extra deliberately — so an
+    unguarded build would have the nightly runner fetch a ~30 GB pack on every run. The
+    marker file is what ``_ensure_robocasa_assets`` writes once a pack is present, so this
+    checks for the pack without triggering the download that would create it.
     """
     pytest.importorskip("robocasa")
     import draccus
+
+    from opentau.envs.robocasa import _needed_asset_packs, _resolve_robocasa_assets_root
+
+    assets_root = _resolve_robocasa_assets_root()
+    required = _needed_asset_packs(["objaverse", "lightwheel"])
+    absent = [p for p in required if not (assets_root / f".opentau_pack_{p}.done").exists()]
+    if absent:
+        pytest.skip(
+            f"RoboCasa asset packs {absent} are not on disk under {assets_root}; this test "
+            "deliberately does not trigger the (~30 GB) download. Run "
+            "`python -m opentau.scripts.download_robocasa_assets` with an objaverse-requesting "
+            "config first."
+        )
 
     from opentau.configs.train import TrainPipelineConfig
     from opentau.envs.factory import make_envs
