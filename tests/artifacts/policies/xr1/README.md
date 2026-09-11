@@ -111,13 +111,19 @@ config asks for it) before trusting any number from this ladder.
 Stop at the first failure. Accept ranges are Wilson 95 % intervals around the published
 per-task rates.
 
-| Order | Task | Published | Accept | Why this task |
-|---|---|---|---|---|
-| 1 | CloseFridge, n=10 | 94 % | ≥ 5/10 | The canary. `P(X ≤ 4 \| p = .94) ≈ 1e-5`, so it is near-proof of a bug at 1/5 the cost. **Measured 10/10** (2026-09-10) |
-| 2 | CloseFridge, n=50 | 94 % | 42-50 | |
-| 3 | TurnOnMicrowave, n=50 | 56 % | 21-34 | Most discriminating: shortest horizon (450) *and* mid-range |
-| 4 | OpenDrawer, n=50 | 94 % | 42-50 | Second ceiling task, different scene distribution |
-| 5 | CloseBlenderLid, n=50 | 36 % | 12-25 | Catches a bias that helps easy tasks and hurts hard ones |
+| Order | Task | Published | Accept | **Measured** | Why this task |
+|---|---|---|---|---|---|
+| 1 | CloseFridge, n=10 | 94 % | >= 5/10 | **10/10** | The canary. `P(X <= 4 \| p = .94) ~ 1e-5`, so it is near-proof of a bug at 1/5 the cost |
+| 2 | CloseFridge, n=50 | 94 % | 42-50 | **49/50 (98 %)** | |
+| 3 | TurnOnMicrowave, n=50 | 56 % | 21-34 | **24/50 (48 %)** | Most discriminating: shortest horizon (450) *and* mid-range, so it can fail in both directions |
+| 4 | OpenDrawer, n=50 | 94 % | 42-50 | **48/50 (96 %)** | Second ceiling task, different scene distribution |
+| 5 | CloseBlenderLid, n=50 | 36 % | 12-25 | **20/50 (40 %)** | Catches a bias that helps easy tasks and hurts hard ones |
+
+All five rungs are inside their intervals (measured 2026-09-10, RTX 3090, one rank, batch 2,
+`eval.seed_list` set to the reference's per-episode seeds). Deviations from the published
+rates are +4, +4, -8, +2 and +4 percentage points — no directionally consistent shortfall,
+and the one task below its published value is the mid-range rung that has the room to move
+in either direction.
 
 PrepareCoffee is deliberately skipped: at p = 0.16 and n = 50 its interval is ±10 pp, which
 cannot distinguish 16 % from 6 %. One task outside its interval across four is ~1-in-5 by
