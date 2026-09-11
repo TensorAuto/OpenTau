@@ -458,7 +458,7 @@ def test_p12_replay_trace_stays_within_tolerance(reference_model):
 # =====================================================================================
 
 
-@require_vram_gib(24)
+@require_vram_gib(23)
 def test_use_cache_survives_gradient_checkpointing_at_full_scale():
     """The trap that returns ``past_key_values=None`` with only a ``warning_once``.
 
@@ -495,7 +495,7 @@ def test_frozen_embedding_table_is_excluded_from_the_optimizer_params():
     assert sum(p.numel() for p in trainable) < sum(p.numel() for p in policy.parameters())
 
 
-@require_vram_gib(24)
+@require_vram_gib(23)
 def test_train_expert_only_gradients_reach_the_dit_and_not_the_backbone():
     """The one-GPU fine-tune mode: 0.60 B trainable, ~19 GB with the frozen weights."""
     checkpoint = _checkpoint_dir()
