@@ -271,6 +271,51 @@ class PerSampleLoss:
         return PerSampleLoss(sum=self.sum + other.sum, count=self.count + other.count)
 
 
+def history_slot_indices(
+    buffer_length: int, n_obs_steps: int, interval: int, *, pad_mode: str = "zero"
+) -> list[int]:
+    """Buffer slots an ``n_obs_steps``-frame observation window reads, oldest first.
+
+    The raw arithmetic is ``buffer_length - 1 - (n_obs_steps - 1 - i) * interval`` -- the
+    most recent frame last, stepping back by ``interval``. What differs between policies is
+    what happens at the start of an episode, when the buffer is not yet full:
+
+    * ``pad_mode="zero"`` returns the raw (possibly **negative**) indices; a negative slot
+      means "no frame yet", and the caller zero-fills it and marks it in
+      ``obs_history_is_pad``. This is what ``pi07`` / ``pi05_mem`` do at inference
+      (``_build_history_batch``), and it is reproduced here exactly so a future migration
+      is a no-op.
+    * ``pad_mode="clamp"`` clamps to slot 0, repeating the oldest available frame. This is
+      what ``LeRobotDataset`` does at episode boundaries during *training*, and what
+      Xiaomi-Robotics-1 does at inference -- so it is the mode that keeps a policy's train
+      and eval distributions the same over the first ``(n_obs_steps - 1) * interval`` steps
+      of every episode.
+
+    The two conventions agree once the buffer is full, so the difference is invisible
+    except at episode starts -- which is precisely why it is worth a named argument rather
+    than a copied loop.
+
+    Args:
+        buffer_length: Frames currently buffered (>= 1).
+        n_obs_steps: Frames the window must produce.
+        interval: Temporal stride between window frames.
+        pad_mode: ``"zero"`` or ``"clamp"``.
+
+    Returns:
+        ``n_obs_steps`` slot indices, oldest first. Negative entries appear only under
+        ``pad_mode="zero"``.
+
+    Raises:
+        ValueError: on a non-positive ``buffer_length`` or an unknown ``pad_mode``.
+    """
+    if buffer_length < 1:
+        raise ValueError(f"buffer_length must be >= 1, got {buffer_length}.")
+    if pad_mode not in ("clamp", "zero"):
+        raise ValueError(f"pad_mode must be 'clamp' or 'zero', got '{pad_mode}'.")
+    raw = [buffer_length - 1 - (n_obs_steps - 1 - i) * interval for i in range(n_obs_steps)]
+    return [max(0, index) for index in raw] if pad_mode == "clamp" else raw
+
+
 def make_action_dim_mask(
     real_action_dim: Tensor | None,
     max_action_dim: int,

@@ -52,6 +52,7 @@ from opentau.policies.pi07_paligemma.low_level.configuration_pi07_low_level impo
 )
 from opentau.policies.pretrained import PreTrainedPolicy
 from opentau.policies.value.configuration_value import ValueConfig
+from opentau.policies.xr1.configuration_xr1 import XR1Config
 
 _POLICY_CONFIG_CASES = [
     (PI0Config, "PI0Config"),
@@ -65,6 +66,7 @@ _POLICY_CONFIG_CASES = [
     (PI07PaligemmaLowLevelConfig, "PI07PaligemmaLowLevelConfig"),
     (PI07PaligemmaHighLevelConfig, "PI07PaligemmaHighLevelConfig"),
     (ValueConfig, "ValueConfig"),
+    (XR1Config, "XR1Config"),
 ]
 ALL_POLICY_CONFIGS = [c for c, _ in _POLICY_CONFIG_CASES]
 _POLICY_CONFIG_IDS = [name for _, name in _POLICY_CONFIG_CASES]

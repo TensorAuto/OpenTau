@@ -56,6 +56,7 @@ from opentau.policies.pi07_paligemma.low_level.configuration_pi07_low_level impo
 )
 from opentau.policies.pretrained import PreTrainedPolicy
 from opentau.policies.value.configuration_value import ValueConfig
+from opentau.policies.xr1.configuration_xr1 import XR1Config
 
 
 def get_policy_class(name: str) -> type[PreTrainedPolicy]:
@@ -132,6 +133,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from opentau.policies.cosmos3_nano.modeling_cosmos3_nano import Cosmos3NanoPolicy
 
         return Cosmos3NanoPolicy
+    elif name == "xr1":
+        from opentau.policies.xr1.modeling_xr1 import XR1Policy
+
+        return XR1Policy
     elif name == "value":
         from opentau.policies.value.modeling_value import ValueFunction
 
@@ -183,6 +188,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return Cosmos3Config(**kwargs)
     elif policy_type == "cosmos3_nano":
         return Cosmos3NanoConfig(**kwargs)
+    elif policy_type == "xr1":
+        return XR1Config(**kwargs)
     elif policy_type == "value":
         return ValueConfig(**kwargs)
     else:

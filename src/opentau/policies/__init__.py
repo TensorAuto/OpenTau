@@ -47,3 +47,4 @@ from .pi07_paligemma.low_level import (
     configuration_pi07_low_level as _pi07_paligemma_low_level_config,  # noqa: F401
 )
 from .value.configuration_value import ValueConfig as ValueConfig
+from .xr1.configuration_xr1 import XR1Config as XR1Config

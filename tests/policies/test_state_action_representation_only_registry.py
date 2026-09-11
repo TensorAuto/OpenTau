@@ -59,6 +59,7 @@ ALL_POLICY_TYPES = frozenset(
         "pi07_low_level",
         "cosmos3",
         "cosmos3_nano",
+        "xr1",
         "value",
     }
 )
@@ -77,6 +78,7 @@ EXPECTED_CAPABLE = frozenset(
         "pi07_paligemma_low_level",
         "cosmos3",  # projections only — no discrete-action pathway
         "cosmos3_nano",
+        "xr1",  # state/action projections + action_output_layer; no discrete-action pathway
     }
 )
 
