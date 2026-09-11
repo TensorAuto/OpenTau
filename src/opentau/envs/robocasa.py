@@ -1015,7 +1015,7 @@ def _warn_if_registries_not_comparable(obj_registries: Sequence[str]) -> None:
         "sampling draws from a different registry set, which changes the generated scene itself "
         "(measured on CloseFridge/pretrain at a fixed reset seed, the fixture placement moves). "
         "Success rates measured this way are self-consistent but NOT comparable to published "
-        f"RoboCasa365 / leaderboard numbers. Set env.obj_registries to "
+        "RoboCasa365 / leaderboard numbers. Set env.obj_registries to "
         f"{list(COMPARABLE_OBJ_REGISTRIES)} for a comparable run (one-time ~30GB objaverse pack)."
     )
 
