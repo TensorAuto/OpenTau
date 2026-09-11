@@ -474,13 +474,27 @@ def _unseeded_pkg_entries(pkg_assets: Path, assets_root: Path) -> list[str]:
     Diffing top-level entries is what makes that step self-repairing, because the
     ``.opentau_seeded`` marker only records that a seed once *ran*: a run whose ``pkg_assets`` was
     already a symlink cannot seed at all, so the marker can outlive a store that never received
-    ``box_links/`` or ``arenas/``. Returns empty when ``pkg_assets`` is that symlink (it then *is*
-    the store, so nothing can be missing from it) or when robocasa is not installed.
+    ``box_links/`` or ``arenas/``. Returns empty when robocasa is not installed, and when
+    ``pkg_assets`` is already a symlink -- there is then no wheel directory left to seed *from*,
+    whether it points at this store (nothing can be missing) or, after a mid-flight
+    ``ROBOCASA_ASSETS_ROOT`` change, at a different one. That second case is a silent
+    misconfiguration -- the new store is never seeded or marked, so robocasa keeps reading the
+    old one -- so it is warned about rather than passed over.
 
     Top-level granularity only: it catches a subdir that was never seeded, not one file deleted
     from inside a subdir that is otherwise present.
     """
-    if pkg_assets.is_symlink() or not pkg_assets.is_dir():
+    if pkg_assets.is_symlink():
+        if pkg_assets.resolve() != assets_root.resolve():
+            acc_print(
+                f"[opentau] RoboCasa assets dir {pkg_assets} is already a symlink to "
+                f"{pkg_assets.resolve()}, not to the requested store {assets_root}: the requested "
+                "store cannot be seeded from the wheel and will not be relocated to, so robocasa "
+                "will keep reading the existing store. Point ROBOCASA_ASSETS_ROOT (or "
+                "env.assets_root) back at it, or reinstall robocasa to restore a real assets dir."
+            )
+        return []
+    if not pkg_assets.is_dir():
         return []
     return sorted(entry.name for entry in pkg_assets.iterdir() if not (assets_root / entry.name).exists())
 

@@ -962,9 +962,10 @@ class TestUnseededPkgEntries:
 
         assert _unseeded_pkg_entries(pkg_assets, root) == ["arenas", "box_links"]
 
-    def test_symlinked_pkg_dir_has_nothing_to_seed(self, tmp_path):
+    def test_symlinked_pkg_dir_has_nothing_to_seed(self, monkeypatch, tmp_path):
         """When ``pkg_assets`` *is* the store, nothing can be missing from it (and a
         copytree would be a self-copy)."""
+        monkeypatch.setattr("opentau.envs.robocasa.get_proc_accelerator", lambda: None)
         root = tmp_path / "external"
         root.mkdir()
         pkg_assets = tmp_path / "pkg"
@@ -972,6 +973,36 @@ class TestUnseededPkgEntries:
         pkg_assets.symlink_to(root, target_is_directory=True)
 
         assert _unseeded_pkg_entries(pkg_assets, root) == []
+
+    def test_symlink_to_a_different_store_warns_and_seeds_nothing(self, monkeypatch, tmp_path, capsys):
+        """Switching ``ROBOCASA_ASSETS_ROOT`` in an already-relocated venv is silent otherwise.
+
+        There is no wheel dir left to seed the new store *from*, so it is never seeded, never
+        marked, and never relocated to — robocasa keeps reading the old store while packs
+        download into the new one. Nothing here can fix that; it can only say so.
+        """
+        monkeypatch.setattr("opentau.envs.robocasa.get_proc_accelerator", lambda: None)
+        old_store = tmp_path / "old"
+        old_store.mkdir()
+        new_store = tmp_path / "new"
+        new_store.mkdir()
+        pkg_assets = tmp_path / "pkg"
+        pkg_assets.symlink_to(old_store, target_is_directory=True)
+
+        assert _unseeded_pkg_entries(pkg_assets, new_store) == []
+        out = capsys.readouterr().out
+        assert "not to the requested store" in out
+        assert str(new_store) in out
+
+    def test_symlink_to_this_store_is_silent(self, monkeypatch, tmp_path, capsys):
+        monkeypatch.setattr("opentau.envs.robocasa.get_proc_accelerator", lambda: None)
+        root = tmp_path / "external"
+        root.mkdir()
+        pkg_assets = tmp_path / "pkg"
+        pkg_assets.symlink_to(root, target_is_directory=True)
+
+        assert _unseeded_pkg_entries(pkg_assets, root) == []
+        assert capsys.readouterr().out == ""
 
     def test_uninstalled_package_is_not_an_error(self, tmp_path):
         assert _unseeded_pkg_entries(tmp_path / "nonsuch", tmp_path / "external") == []

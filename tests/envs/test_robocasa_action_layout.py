@@ -30,7 +30,7 @@ Two pins, because either alone can rot:
 import numpy as np
 import pytest
 
-from opentau.envs.robocasa import ACTION_DIM, convert_action
+from opentau.envs.robocasa import ACTION_DIM, _import_robocasa_with_version_shim, convert_action
 
 
 def test_convert_action_uses_the_ee_first_layout():
@@ -45,8 +45,18 @@ def test_convert_action_uses_the_ee_first_layout():
 
 
 def test_convert_action_matches_robocasas_own_converter():
-    """The simulator's definition. Skipped when the robocasa extra is not installed."""
-    env_utils = pytest.importorskip("robocasa.utils.env_utils")
+    """The simulator's definition. Skipped when robocasa is not importable.
+
+    Not ``importorskip``: that only turns ``ImportError`` into a skip, and a stock (non-fork)
+    robocasa install fails its import-time ``mujoco`` / ``numpy`` equality asserts with
+    ``AssertionError`` -- which is precisely what ``_import_robocasa_with_version_shim``
+    exists to get past, so route the import through it and skip on anything it cannot fix.
+    """
+    try:
+        _import_robocasa_with_version_shim()
+        from robocasa.utils import env_utils
+    except Exception as err:  # not installed, or import-time asserts the shim cannot satisfy
+        pytest.skip(f"robocasa is not importable here ({type(err).__name__}: {err})")
 
     flat = np.arange(12, dtype=np.float32)
     ours = convert_action(flat)
