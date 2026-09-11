@@ -77,7 +77,23 @@ DEFAULT_CAMERAS = [
 # `download_kitchen_assets`). When a sampled object category has zero candidates
 # in every registry, robocasa crashes with `ValueError: Probabilities contain
 # NaN`. Restricting to registries that are actually on disk avoids that.
+#
+# This default is NOT comparability-neutral, which the download size alone does not
+# convey: the registry set feeds robocasa's scene generation, so restricting it changes
+# the *generated scene*, not merely which object meshes get placed into it. Measured on
+# CloseFridge / split="pretrain" / reset(seed=57), the fridge's own placement moves --
+# base_position y = -3.100518 under ("objaverse", "lightwheel") vs -3.262029 under
+# ("lightwheel",), same task, same seed, same split. (The construction `seed` kwarg
+# `RoboCasaGymEnv` forwards to `create_env` was ruled out separately; the registries are
+# the whole effect.) So a success rate measured under this default is self-consistent but
+# is NOT comparable to a published RoboCasa365 / leaderboard number, for any policy --
+# `_warn_if_registries_not_comparable` says so once at env construction. Changing this
+# default would make every existing RoboCasa config demand the ~30GB pack, so runs that
+# need comparable numbers opt in via `env.obj_registries` instead.
 DEFAULT_OBJ_REGISTRIES: tuple[str, ...] = ("lightwheel",)
+
+# RoboCasa's own default registry set, i.e. the one published numbers are measured under.
+COMPARABLE_OBJ_REGISTRIES: tuple[str, ...] = ("objaverse", "lightwheel")
 
 # Task-group shortcuts accepted as ``env.task``. A group name expands to the
 # upstream RoboCasa task list and auto-sets the dataset split; individual task
@@ -254,7 +270,11 @@ def _load_box_links(pkg_assets: Path, external_root: Path) -> dict:
         if path.is_file():
             with open(path) as f:
                 return json.load(f)
-    raise FileNotFoundError(f"box_links_assets.json not found under {external_root} or {pkg_assets}.")
+    raise FileNotFoundError(
+        f"box_links_assets.json not found under {external_root} or {pkg_assets}. It ships inside the "
+        "robocasa wheel and no download pack contains it, so an incomplete store is repaired by copying "
+        "`box_links/` out of a fresh install (e.g. `<uv cache>/archive-v0/*/robocasa/models/assets/`)."
+    )
 
 
 def _symlink_pkg_assets_to(pkg_assets: Path, external_root: Path) -> None:
@@ -446,6 +466,25 @@ def _needed_asset_packs(obj_registries: Sequence[str]) -> list[str]:
     return packs
 
 
+def _unseeded_pkg_entries(pkg_assets: Path, assets_root: Path) -> list[str]:
+    r"""Top-level names the installed robocasa wheel ships that are absent from ``assets_root``.
+
+    The seed step copies robocasa's wheel-bundled assets -- arena / scene / fixture XML, and the
+    ``box_links/`` download manifest -- into the external store; no download pack contains them.
+    Diffing top-level entries is what makes that step self-repairing, because the
+    ``.opentau_seeded`` marker only records that a seed once *ran*: a run whose ``pkg_assets`` was
+    already a symlink cannot seed at all, so the marker can outlive a store that never received
+    ``box_links/`` or ``arenas/``. Returns empty when ``pkg_assets`` is that symlink (it then *is*
+    the store, so nothing can be missing from it) or when robocasa is not installed.
+
+    Top-level granularity only: it catches a subdir that was never seeded, not one file deleted
+    from inside a subdir that is otherwise present.
+    """
+    if pkg_assets.is_symlink() or not pkg_assets.is_dir():
+        return []
+    return sorted(entry.name for entry in pkg_assets.iterdir() if not (assets_root / entry.name).exists())
+
+
 def _ensure_robocasa_assets(assets_root: Path, obj_registries: Sequence[str]) -> None:
     r"""Download the asset packs ``obj_registries`` needs into ``assets_root`` and relocate.
 
@@ -478,16 +517,26 @@ def _ensure_robocasa_assets(assets_root: Path, obj_registries: Sequence[str]) ->
         if is_main_or_solo:
             assets_root.mkdir(parents=True, exist_ok=True)
             # 1) Seed the wheel-shipped stubs (XML not in any pack) from the real venv dir.
+            #    Keyed on what the store actually lacks rather than on the marker alone, so a
+            #    store left incomplete by an earlier run gets repaired instead of trusted.
             seed_marker = assets_root / ".opentau_seeded"
-            if not pkg_assets.is_symlink() and pkg_assets.exists() and not seed_marker.exists():
+            unseeded = _unseeded_pkg_entries(pkg_assets, assets_root)
+            if unseeded:
+                if seed_marker.exists():
+                    acc_print(
+                        f"[opentau] RoboCasa asset store {assets_root} is marked seeded but is missing "
+                        f"{len(unseeded)} package-shipped entries ({', '.join(unseeded[:5])}); re-seeding."
+                    )
                 shutil.copytree(pkg_assets, assets_root, dirs_exist_ok=True)
                 seed_marker.touch()
-            # 2) Download each missing pack into the external store.
-            box_links = _load_box_links(pkg_assets, assets_root)
-            for pack in needed:
+            # 2) Download the packs the store is missing. The manifest is resolved only when
+            #    something is genuinely missing: it lives in the wheel-shipped `box_links/`, which
+            #    an incompletely-seeded store can lack, and a store that already holds every pack
+            #    must not be held hostage to a manifest it has no use for.
+            missing = [p for p in needed if not (assets_root / f".opentau_pack_{p}.done").exists()]
+            box_links = _load_box_links(pkg_assets, assets_root) if missing else {}
+            for pack in missing:
                 pack_marker = assets_root / f".opentau_pack_{pack}.done"
-                if pack_marker.exists():
-                    continue
                 box_key, subdir = _PACK_DEST[pack]
                 dest = assets_root / subdir
                 acc_print(f"[opentau] downloading RoboCasa asset pack '{pack}' -> {dest}")
@@ -914,6 +963,41 @@ def _maybe_promote_sync_to_async(
     return env_cls
 
 
+# One line per process, not per task: a task-group eval builds envs in a loop and the
+# warning is a property of the run, not of any one task.
+_WARNED_RESTRICTED_OBJ_REGISTRIES = False
+
+
+def _warn_if_registries_not_comparable(obj_registries: Sequence[str]) -> None:
+    r"""Warn once, on rank 0, when ``obj_registries`` omits ``objaverse``.
+
+    Restricting the registries changes the generated scene rather than just the meshes in
+    it (see ``DEFAULT_OBJ_REGISTRIES`` for the measurement), so the resulting success rates
+    are not comparable to published RoboCasa365 numbers. That is invisible in the rollout
+    -- the episodes run, the videos look right, only the scene differs -- so it is said out
+    loud at env construction rather than left to whoever reads the number later.
+
+    Lives here rather than in ``RoboCasaEnv.__init__`` because the per-env constructor runs
+    inside every ``AsyncVectorEnv`` spawn worker, where there is no accelerator to gate on
+    and the line would repeat once per env per task.
+    """
+    global _WARNED_RESTRICTED_OBJ_REGISTRIES
+    if _WARNED_RESTRICTED_OBJ_REGISTRIES or "objaverse" in obj_registries:
+        return
+    acc = get_proc_accelerator()
+    if acc is not None and not acc.is_main_process:
+        return
+    _WARNED_RESTRICTED_OBJ_REGISTRIES = True
+    acc_print(
+        f"[opentau] RoboCasa obj_registries={tuple(obj_registries)} omits 'objaverse': object "
+        "sampling draws from a different registry set, which changes the generated scene itself "
+        "(measured on CloseFridge/pretrain at a fixed reset seed, the fixture placement moves). "
+        "Success rates measured this way are self-consistent but NOT comparable to published "
+        f"RoboCasa365 / leaderboard numbers. Set env.obj_registries to "
+        f"{list(COMPARABLE_OBJ_REGISTRIES)} for a comparable run (one-time ~30GB objaverse pack)."
+    )
+
+
 # main API entry point
 def create_robocasa_envs(
     task: str,
@@ -965,6 +1049,7 @@ def create_robocasa_envs(
     os.environ[ROBOCASA_ASSETS_ROOT_ENV] = str(resolved_assets_root)
     if auto_download_assets:
         _ensure_robocasa_assets(resolved_assets_root, obj_registries)
+    _warn_if_registries_not_comparable(obj_registries)
 
     gym_kwargs = dict(gym_kwargs or {})
     obs_type = gym_kwargs.pop("obs_type", "pixels_agent_pos")

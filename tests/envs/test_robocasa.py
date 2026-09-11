@@ -43,6 +43,8 @@ from opentau.envs.factory import make_env_config, make_envs
 from opentau.envs.robocasa import (
     ACTION_DIM,
     ALLOW_ROBOCASA_SYNC_ENV,
+    COMPARABLE_OBJ_REGISTRIES,
+    DEFAULT_OBJ_REGISTRIES,
     OBS_STATE_DIM,
     ROBOCASA_ASSETS_ROOT_ENV,
     _default_camera_name_mapping,
@@ -61,6 +63,8 @@ from opentau.envs.robocasa import (
     _robocasa_pkg_assets_dir,
     _robocasa_unshadowed,
     _symlink_pkg_assets_to,
+    _unseeded_pkg_entries,
+    _warn_if_registries_not_comparable,
     convert_action,
     create_robocasa_envs,
 )
@@ -852,6 +856,144 @@ class TestEnsureRoboCasaAssets:
         assert pkg_assets.is_symlink()
         acc.wait_for_everyone.assert_called_once()
 
+    def test_complete_store_does_not_need_the_download_manifest(self, monkeypatch, tmp_path):
+        """A fully-downloaded store must not be held hostage to ``box_links_assets.json``.
+
+        Reproduces the state found on a dev box: every pack marker present, ``box_links/``
+        absent, and ``pkg_assets`` already the symlink a previous run left behind -- so the
+        manifest is unreachable from *either* side ``_load_box_links`` looks in. The load
+        used to run unconditionally, so a store holding every pack died with
+        ``FileNotFoundError`` before a single env was built.
+        """
+        pkg_assets, calls = _fake_robocasa_assets(monkeypatch, tmp_path)
+        monkeypatch.setattr("opentau.envs.robocasa.get_proc_accelerator", lambda: None)
+        root = tmp_path / "external"
+        root.mkdir()
+        (root / ".opentau_seeded").touch()
+        for pack in ("textures", "tex_generative", "fixtures_lw", "objs_lw", "objs_objaverse"):
+            (root / f".opentau_pack_{pack}.done").touch()
+        _symlink_pkg_assets_to(pkg_assets, root)
+        assert not (root / "box_links").exists()
+
+        _ensure_robocasa_assets(root, ["lightwheel", "objaverse"])  # must not raise
+
+        assert calls == []
+        assert pkg_assets.is_symlink()
+
+    def test_missing_pack_without_a_manifest_still_raises(self, monkeypatch, tmp_path):
+        """The *actionable* half of the old failure is kept.
+
+        Paired with the test above so deleting the ``_load_box_links`` call outright --
+        rather than making it conditional -- fails the suite.
+        """
+        pkg_assets, calls = _fake_robocasa_assets(monkeypatch, tmp_path)
+        monkeypatch.setattr("opentau.envs.robocasa.get_proc_accelerator", lambda: None)
+        root = tmp_path / "external"
+        root.mkdir()
+        (root / ".opentau_seeded").touch()
+        for pack in ("textures", "tex_generative", "fixtures_lw"):  # objs_lw genuinely absent
+            (root / f".opentau_pack_{pack}.done").touch()
+        _symlink_pkg_assets_to(pkg_assets, root)
+
+        with pytest.raises(FileNotFoundError, match="box_links_assets.json"):
+            _ensure_robocasa_assets(root, ["lightwheel"])
+
+        assert calls == []
+
+    def test_seeded_store_missing_package_entries_is_repaired(self, monkeypatch, tmp_path):
+        """``.opentau_seeded`` records that a seed *ran*, not that it completed.
+
+        A store left without the wheel-shipped dirs loses more than the manifest --
+        ``arenas/empty_kitchen_arena.xml`` goes with it, and that one fails later, inside
+        the env workers. Re-seed from what the store actually lacks.
+        """
+        pkg_assets, calls = _fake_robocasa_assets(monkeypatch, tmp_path)
+        (pkg_assets / "arenas").mkdir()
+        (pkg_assets / "arenas" / "empty_kitchen_arena.xml").write_text("<mujoco/>")
+        monkeypatch.setattr("opentau.envs.robocasa.get_proc_accelerator", lambda: None)
+        root = tmp_path / "external"
+        root.mkdir()
+        (root / ".opentau_seeded").touch()
+        for pack in ("textures", "tex_generative", "fixtures_lw", "objs_lw"):
+            (root / f".opentau_pack_{pack}.done").touch()
+
+        _ensure_robocasa_assets(root, ["lightwheel"])
+
+        assert (root / "box_links" / "box_links_assets.json").is_file()
+        assert (root / "arenas" / "empty_kitchen_arena.xml").is_file()
+        assert calls == []  # a repair is a copy from the wheel, never a re-download
+
+
+class TestUnseededPkgEntries:
+    """``_unseeded_pkg_entries`` diffs the wheel's assets dir against the external store."""
+
+    def test_lists_only_what_the_store_lacks(self, tmp_path):
+        pkg_assets = tmp_path / "pkg"
+        (pkg_assets / "box_links").mkdir(parents=True)
+        (pkg_assets / "arenas").mkdir()
+        (pkg_assets / "fixtures").mkdir()
+        root = tmp_path / "external"
+        (root / "fixtures").mkdir(parents=True)
+
+        assert _unseeded_pkg_entries(pkg_assets, root) == ["arenas", "box_links"]
+
+    def test_symlinked_pkg_dir_has_nothing_to_seed(self, tmp_path):
+        """When ``pkg_assets`` *is* the store, nothing can be missing from it (and a
+        copytree would be a self-copy)."""
+        root = tmp_path / "external"
+        root.mkdir()
+        pkg_assets = tmp_path / "pkg"
+        pkg_assets.parent.mkdir(parents=True, exist_ok=True)
+        pkg_assets.symlink_to(root, target_is_directory=True)
+
+        assert _unseeded_pkg_entries(pkg_assets, root) == []
+
+    def test_uninstalled_package_is_not_an_error(self, tmp_path):
+        assert _unseeded_pkg_entries(tmp_path / "nonsuch", tmp_path / "external") == []
+
+
+class TestObjRegistryComparabilityWarning:
+    """``_warn_if_registries_not_comparable`` flags a scene-changing registry restriction."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_once_flag(self, monkeypatch):
+        monkeypatch.setattr("opentau.envs.robocasa._WARNED_RESTRICTED_OBJ_REGISTRIES", False)
+        monkeypatch.setattr("opentau.envs.robocasa.get_proc_accelerator", lambda: None)
+
+    def test_warns_when_objaverse_is_omitted(self, capsys):
+        _warn_if_registries_not_comparable(DEFAULT_OBJ_REGISTRIES)
+        out = capsys.readouterr().out
+        assert "NOT comparable" in out
+        assert "objaverse" in out
+
+    def test_silent_when_objaverse_is_present(self, capsys):
+        _warn_if_registries_not_comparable(COMPARABLE_OBJ_REGISTRIES)
+        assert capsys.readouterr().out == ""
+
+    def test_warns_only_once_per_process(self, capsys):
+        _warn_if_registries_not_comparable(["lightwheel"])
+        assert capsys.readouterr().out != ""
+        _warn_if_registries_not_comparable(["lightwheel"])
+        assert capsys.readouterr().out == ""
+
+    def test_non_main_rank_is_silent_and_does_not_consume_the_warning(self, monkeypatch, capsys):
+        acc = Mock()
+        acc.num_processes = 2
+        acc.is_main_process = False
+        monkeypatch.setattr("opentau.envs.robocasa.get_proc_accelerator", lambda: acc)
+
+        _warn_if_registries_not_comparable(["lightwheel"])
+        assert capsys.readouterr().out == ""
+
+        acc.is_main_process = True  # rank 0 still gets to say it
+        _warn_if_registries_not_comparable(["lightwheel"])
+        assert "NOT comparable" in capsys.readouterr().out
+
+    def test_default_registries_are_the_restricted_set(self):
+        """Pins the premise the warning exists for: the default is *not* RoboCasa's own."""
+        assert "objaverse" not in DEFAULT_OBJ_REGISTRIES
+        assert "objaverse" in COMPARABLE_OBJ_REGISTRIES
+
 
 class TestSymlinkAndRelink:
     """``_symlink_pkg_assets_to`` / ``_maybe_relink_robocasa_assets`` relocation behaviour."""
@@ -921,6 +1063,26 @@ class TestCreateRoboCasaEnvsAssets:
         assert os.environ[ROBOCASA_ASSETS_ROOT_ENV] == str(tmp_path)
         ensure.assert_called_once()
         assert ensure.call_args.args[0] == tmp_path
+
+    def test_restricted_registries_warn_even_when_the_download_is_skipped(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """The comparability warning is a property of the run, not of the download path."""
+        monkeypatch.setattr("opentau.envs.robocasa._WARNED_RESTRICTED_OBJ_REGISTRIES", False)
+        monkeypatch.setattr("opentau.envs.robocasa._ensure_robocasa_assets", Mock())
+        monkeypatch.setattr("opentau.envs.robocasa.get_proc_accelerator", lambda: None)
+        env_cls = Mock(return_value=Mock())
+
+        create_robocasa_envs(
+            task="CloseFridge",
+            n_envs=1,
+            env_cls=env_cls,
+            assets_root=str(tmp_path),
+            auto_download_assets=False,
+            obj_registries=["lightwheel"],
+        )
+
+        assert "NOT comparable" in capsys.readouterr().out
 
     def test_auto_download_false_skips_ensure_but_still_sets_env(self, monkeypatch, tmp_path):
         monkeypatch.delenv(ROBOCASA_ASSETS_ROOT_ENV, raising=False)
