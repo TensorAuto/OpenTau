@@ -54,7 +54,39 @@ config fields and a complete example:
 * :ref:`evaluating-robocasa` — the ``env`` block (task, cameras,
   ``metadata.robot_type`` / ``control_mode``) and how eval reports per-task
   results.
-* ``configs/examples/pi05_robocasa_eval_config.json`` — a runnable example.
+* ``configs/examples/pi05_robocasa_eval_config.json`` — a runnable example. It is a
+  two-episode plumbing smoke and is **not** aiming for comparability (see below).
+
+.. _robocasa_comparability:
+
+Comparable success rates
+------------------------------------------
+
+``env.obj_registries`` defaults to ``["lightwheel"]``, because RoboCasa's own default
+adds the ``objaverse`` object pack — a one-time ~30 GB download. The restriction is not
+free, and the cost is not the one the download size suggests: the registry set feeds
+RoboCasa's **scene generation**, so restricting it changes the generated scene, not just
+which object meshes are placed in it. On ``CloseFridge`` / ``split="pretrain"`` at a fixed
+reset seed, the fridge's own placement moves (``base_position`` y ``-3.100518`` with both
+registries vs ``-3.262029`` with ``lightwheel`` alone — same task, same seed, same split).
+
+A success rate measured under the default is therefore self-consistent — fine for A/B
+comparisons between your own runs — but it is **not comparable to a published RoboCasa365
+or leaderboard number**, for any policy. For a comparable run set:
+
+.. code-block:: json
+
+   "obj_registries": ["objaverse", "lightwheel"]
+
+OpenTau prints a one-time warning at env construction when ``objaverse`` is absent, so an
+incomparable run says so in its own log rather than leaving it to whoever reads the number
+later.
+
+.. warning::
+   Success rates this repository produced **before** the flat-action-layout fix (see
+   :ref:`the flat action layout <robocasa_action_layout>`) are lower than the same policy scores today, by a
+   policy-dependent and unknown amount. Treat any earlier RoboCasa number as
+   non-comparable — both to post-fix numbers and to each other.
 
 Alternative: external rollout client
 ------------------------------------------
@@ -195,6 +227,26 @@ Typical layout after copying into a RoboCasa checkout:
   observations for workers that need a **new action chunk**, sends one WebSocket
   message per batch, receives one chunk per batch row, then **steps the
   simulator for every action in each chunk** before querying the server again.
+
+.. _robocasa_action_layout:
+
+**Flat action layout.** RoboCasa's flat 12-D PandaOmron action is **EE-first**:
+
+.. code-block:: text
+
+   [0:3]   end-effector position
+   [3:6]   end-effector rotation
+   [6:7]   gripper
+   [7:11]  base motion
+   [11:12] control mode
+
+That is the order ``robocasa.utils.env_utils.convert_action`` unpacks, and the order the
+RoboCasa365 LeRobot datasets store in their ``action`` column — so it is what any policy
+trained on that data emits. A client that unpacks a different order still runs: the arm
+moves and episodes complete, only the success rate falls. OpenTau's in-process path
+(``envs/robocasa.py::convert_action``) carried exactly that bug, routing the end-effector
+command into base motion, and it is now pinned against both sources in
+``tests/envs/test_robocasa_action_layout.py``.
 
 If your PandaOmron-style env expects actions in a particular layout, the gist
 may include a ``convert_action_pi05`` helper (or equivalent); wire it to match

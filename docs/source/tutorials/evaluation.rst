@@ -93,6 +93,12 @@ Run headless (e.g. on a GPU server) with ``MUJOCO_GL=egl``. As with LIBERO, each
 RoboCasa task is its own group, so eval reports a per-task success rate and a
 per-task video grid, and tasks shard across accelerate ranks.
 
+.. note::
+   ``env.obj_registries`` defaults to the restricted ``["lightwheel"]`` set, which changes
+   the generated scene and makes the resulting rates incomparable to published RoboCasa365
+   numbers. Set it to ``["objaverse", "lightwheel"]`` for a comparable run — see
+   :ref:`robocasa_comparability`.
+
 Running validation during training
 ----------------------------------
 
