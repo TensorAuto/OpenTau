@@ -1992,16 +1992,107 @@ def test_replanning_with_a_frozen_prefix_never_evicts_a_queued_action():
 
 
 def test_choice_head_state_row_is_the_last_frame_not_a_pooled_window():
-    """The reference's choice head has ``state_shape = (1, 60)`` — one row, the current pose.
+    """The ``<state>`` embedding must be the projection of the LAST frame.
 
-    Mean-pooling the window would condition a warm-started head differently from the 5B
-    checkpoint whose weights it inherits, whenever the state moves inside the window.
+    The reference's choice head has ``state_shape = (1, 60)`` — one row, the current pose —
+    so pooling the window would condition a warm-started head differently from the 5B
+    checkpoint it inherits weights from, whenever the state moves inside the window.
+
+    This drives ``build_inputs_embeds`` and reads the row it wrote, rather than recomputing
+    both candidates in the test: an earlier version asserted only that last-frame and mean
+    projections *differ*, which is the precondition, not the property — reverting the
+    production code to mean-pooling would have failed nothing.
     """
-    from opentau.policies.xr1.choice_heads import XR1ChoiceHeads
+    from opentau.policies.xr1.choice_heads import (
+        ACTION_TOKEN_END_ID,
+        IM_START_TOKEN_ID,
+        STATE_TOKEN_ID,
+        XR1ChoiceHeads,
+    )
 
-    heads = XR1ChoiceHeads(hidden_size=8, state_dim=4, action_dim=3, n_choices=2)
-    state = torch.zeros(1, 4, 4)
-    state[0, -1] = 5.0  # only the last frame is non-zero
-    projected = heads.state_projector_choice(state[:, -1])
-    pooled = heads.state_projector_choice(state.mean(dim=1))
-    assert not torch.allclose(projected, pooled), "the test state must distinguish the two"
+    torch.manual_seed(0)
+    hidden, state_dim = 8, 4
+    heads = XR1ChoiceHeads(hidden_size=hidden, state_dim=state_dim, action_dim=3, n_choices=2)
+    token_embeddings = torch.nn.Embedding(ACTION_TOKEN_END_ID + 8, hidden)
+
+    # A state window whose last frame is far from its mean, so the two candidates are
+    # unambiguously distinguishable in the written row.
+    state = torch.zeros(1, 4, state_dim)
+    state[0, -1] = 5.0
+
+    input_ids = torch.tensor([[IM_START_TOKEN_ID, STATE_TOKEN_ID]])
+    embeds = heads.build_inputs_embeds(input_ids, token_embeddings, state)
+
+    written = embeds[0, 1]  # the <state> row
+    from_last = heads.state_projector_choice(state[:, -1])[0]
+    from_mean = heads.state_projector_choice(state.mean(dim=1))[0]
+
+    assert not torch.allclose(from_last, from_mean), "the fixture must distinguish the two"
+    assert torch.allclose(written, from_last, atol=1e-6)
+    assert not torch.allclose(written, from_mean, atol=1e-6)
+    # ...and the non-state row is untouched, so the scatter did not overwrite its neighbour.
+    assert torch.allclose(embeds[0, 0], token_embeddings(input_ids)[0, 0], atol=1e-6)
+
+
+def test_replanning_executes_every_queued_action_without_skipping():
+    """Drive ``select_action`` across a re-plan and assert nothing queued goes unexecuted.
+
+    The arithmetic pin above guards the validator invariant the refill *rests* on; this one
+    guards the refill itself. Without it, changing the slice at the ``extend`` call would
+    evict already-planned actions while the arithmetic test still passed, because that test
+    re-derives the slice rather than driving the code.
+    """
+    policy = _build_policy(max_delay=3)
+    policy.reset()
+
+    plans: list[int] = []
+
+    def fake_sample_actions(batch, action_prefix=None, delay=None, noise=None):
+        index = len(plans)
+        plans.append(int(delay) if delay is not None else 0)
+        # Row j of plan i carries the unique value i * 100 + j, so an evicted action is
+        # visible as a missing value in the executed sequence.
+        values = torch.arange(CHUNK, dtype=torch.float32) + index * 100
+        return values[None, :, None].expand(1, CHUNK, ACTION_DIM).clone()
+
+    policy.sample_actions = fake_sample_actions
+
+    executed: list[float] = []
+    for _ in range(CHUNK + 6):  # enough steps to force a re-plan with leftovers
+        action = policy.select_action({"state": torch.zeros(1, policy.config.max_state_dim)})
+        executed.append(float(action[0, 0]))
+
+    assert len(plans) >= 2, "the loop must actually trigger a re-plan"
+    assert max(plans) > 0, "the re-plan must happen with a non-empty queue (a frozen prefix)"
+
+    # Plan 0 contributed rows 0..CHUNK-1. Every one of them must appear, in order, before
+    # any row of plan 1 — an eviction would drop the tail of plan 0 silently.
+    first_plan = [v for v in executed if v < 100]
+    assert first_plan == sorted(first_plan), f"plan 0 executed out of order: {first_plan}"
+    assert first_plan == list(range(len(first_plan))), f"plan 0 skipped an action: {first_plan}"
+    assert len(first_plan) == CHUNK, (
+        f"plan 0 contributed {CHUNK} actions but only {len(first_plan)} executed — "
+        f"{CHUNK - len(first_plan)} were evicted from the queue unexecuted"
+    )
+
+
+def test_a_failed_load_chains_the_original_exception(tmp_path, monkeypatch):
+    """The re-raise must carry ``__cause__``.
+
+    The warning that would otherwise explain the failure is rank-0 only, so on every other
+    rank the traceback is the sole evidence of what actually went wrong.
+    """
+    policy = _build_policy()
+    policy.config.pretrained_path = None
+    policy.save_pretrained(tmp_path)
+
+    sentinel = RuntimeError("disk went away mid-load")
+
+    def explode(*args, **kwargs):
+        raise sentinel
+
+    monkeypatch.setattr(XR1Policy, "_promote_legacy_norm_buffers_in_state_dict", explode)
+
+    with pytest.raises(ValueError, match="no partial-load warm-start path") as excinfo:
+        XR1Policy.from_pretrained(tmp_path, config=policy.config, qwen3vl_config=_tiny_qwen3vl_config(2))
+    assert excinfo.value.__cause__ is sentinel

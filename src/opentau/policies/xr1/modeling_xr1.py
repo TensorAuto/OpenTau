@@ -1163,6 +1163,7 @@ class XR1Policy(PreTrainedPolicy):
 
         stripped_keys: frozenset[str] = frozenset()
         load_result: tuple[list[str], list[str]] | None = None
+        load_error: Exception | None = None
         try:
             remapped_state_dict = remap_reference_state_dict(original_state_dict)
             model._promote_legacy_norm_buffers_in_state_dict(remapped_state_dict)
@@ -1170,7 +1171,8 @@ class XR1Policy(PreTrainedPolicy):
                 remapped_state_dict, model.config, is_main_process=is_main_process
             )
             load_result = model.load_state_dict(remapped_state_dict, strict=False)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — re-raised below, chained, on every rank
+            load_error = e
             if is_main_process:
                 print(f"Warning: Could not remap state dict keys: {e}")
 
@@ -1183,12 +1185,15 @@ class XR1Policy(PreTrainedPolicy):
         # contract `state_dict_remap.assert_full_coverage` exists to prevent, so the gate
         # has to sit where nothing can swallow it.
         if load_result is None:
+            # Chained, not just described: the `print` above is rank-0 only, so on every other
+            # rank "see the warning above" would point at output that was never emitted — and
+            # the original traceback is the only thing that says *why* the load failed.
             raise ValueError(
-                "Loading the xr1 checkpoint failed before `load_state_dict` completed (see the "
-                "warning above). Refusing to return a randomly-initialized 5B model: unlike the "
-                "pi05/pi06 lineage, xr1 has no partial-load warm-start path, so an incomplete "
-                "load is always a bug rather than a supported mode."
-            )
+                "Loading the xr1 checkpoint failed before `load_state_dict` completed. "
+                "Refusing to return a randomly-initialized 5B model: unlike the pi05/pi06 "
+                "lineage, xr1 has no partial-load warm-start path, so an incomplete load is "
+                "always a bug rather than a supported mode."
+            ) from load_error
         assert_full_coverage(*load_result, stripped_keys=stripped_keys)
         # Re-establish the input-embedding / lm_head alias. A checkpoint carries only one end
         # of it (see TIED_WEIGHT_KEYS), and `load_state_dict` writes into the existing
