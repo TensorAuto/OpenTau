@@ -602,7 +602,10 @@ def convert_action(flat_action: np.ndarray) -> dict[str, Any]:
     The old layout routed the end-effector command into base motion and read a
     saturated lateral velocity out of the gripper column, which is silent: the arm still
     moves, the episode still runs, the success rate is just far lower. Measured on
-    ``xr1`` / CloseFridge, 4/10 with the permutation against ~9/10 without it.
+    ``xr1`` / CloseFridge over one 10-episode set, isolating this from the object-registry
+    restriction described at ``DEFAULT_OBJ_REGISTRIES`` (the two were found together):
+    **0/10** with both, **4/10** with only the registries corrected -- i.e. with this
+    permutation still in place -- and **10/10** with both corrected.
     """
     return {
         "action.end_effector_position": flat_action[0:3],
