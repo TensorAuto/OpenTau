@@ -26,6 +26,7 @@ Real sim rollouts are validated separately on a CUDA box.
 import contextlib
 import json
 import os
+import shutil
 import sys
 import types
 from functools import partial
@@ -879,6 +880,30 @@ class TestEnsureRoboCasaAssets:
 
         assert calls == []
         assert pkg_assets.is_symlink()
+
+    def test_complete_store_without_a_seed_marker_is_still_relocated(self, monkeypatch, tmp_path):
+        """The marker can *lag* the store as well as outlive it.
+
+        Companion to the test above: a fresh venv (a real, non-symlink ``pkg_assets``)
+        against a store that already holds every wheel-shipped entry but lost its hidden
+        ``.opentau_seeded`` -- copied without dotfiles, or deleted to force a reseed --
+        seeds nothing, so keying relocation on "did *this* run copy?" would leave the venv
+        pointing at its own packless assets dir and robocasa would scan that at import.
+        """
+        pkg_assets, calls = _fake_robocasa_assets(monkeypatch, tmp_path)
+        monkeypatch.setattr("opentau.envs.robocasa.get_proc_accelerator", lambda: None)
+        root = tmp_path / "external"
+        shutil.copytree(pkg_assets, root)  # every wheel entry present...
+        for pack in ("textures", "tex_generative", "fixtures_lw", "objs_lw"):
+            (root / f".opentau_pack_{pack}.done").touch()
+        assert not (root / ".opentau_seeded").exists()  # ...but the hidden marker is not
+
+        _ensure_robocasa_assets(root, ["lightwheel"])
+
+        assert (root / ".opentau_seeded").is_file()
+        assert pkg_assets.is_symlink()
+        assert pkg_assets.resolve() == root.resolve()
+        assert calls == []
 
     def test_missing_pack_without_a_manifest_still_raises(self, monkeypatch, tmp_path):
         """The *actionable* half of the old failure is kept.

@@ -528,6 +528,14 @@ def _ensure_robocasa_assets(assets_root: Path, obj_registries: Sequence[str]) ->
                         f"{len(unseeded)} package-shipped entries ({', '.join(unseeded[:5])}); re-seeding."
                     )
                 shutil.copytree(pkg_assets, assets_root, dirs_exist_ok=True)
+            # The marker means "this store holds the wheel-shipped assets", and it is what
+            # gates relocation -- step 3 below, and every spawn worker's
+            # `_maybe_relink_robocasa_assets`. Write it whenever that is now true, not only
+            # when this run did the copying: the marker can *lag* the store as well as
+            # outlive it (a store copied without its hidden files, or a marker deleted to
+            # force a reseed), and a store that already held every entry would otherwise be
+            # left unrelocated -- robocasa would then scan the packless wheel dir.
+            if not pkg_assets.is_symlink() and pkg_assets.is_dir():
                 seed_marker.touch()
             # 2) Download the packs the store is missing. The manifest is resolved only when
             #    something is genuinely missing: it lives in the wheel-shipped `box_links/`, which
