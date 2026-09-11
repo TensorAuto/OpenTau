@@ -501,6 +501,12 @@ class TrainPipelineConfig(HubMixin):
                 # Caught here because a policy without a `sequence_length` field
                 # skips the doubled-length check below, so nothing else on the
                 # config path would reject it.
+                if self.dataset_mixture.pair_episodes and self.dataset_mixture.n_demos < 1:
+                    raise ValueError(
+                        f"n_demos must be >= 1, got {self.dataset_mixture.n_demos}. "
+                        "1 is the original demo+rollout pair."
+                    )
+
                 if self.dataset_mixture.pair_episodes and (self.dataset_mixture.sequence_length or 1) <= 1:
                     raise ValueError(
                         "pair_episodes is on with dataset_mixture.sequence_length="
@@ -525,11 +531,13 @@ class TrainPipelineConfig(HubMixin):
                 # correct paired config is rejected here.
                 emitted = self.dataset_mixture.sequence_length
                 if self.dataset_mixture.pair_episodes:
-                    emitted *= 2
+                    # `n_demos` demonstrations plus one rollout, each of
+                    # `sequence_length` timesteps.
+                    emitted *= self.dataset_mixture.n_demos + 1
                 if policy_seq is not None and policy_seq != emitted:
                     pairing = (
-                        " (pair_episodes doubles the mixture's "
-                        f"{self.dataset_mixture.sequence_length} to {emitted})"
+                        f" (pair_episodes with n_demos={self.dataset_mixture.n_demos} scales "
+                        f"the mixture's {self.dataset_mixture.sequence_length} to {emitted})"
                         if self.dataset_mixture.pair_episodes
                         else ""
                     )

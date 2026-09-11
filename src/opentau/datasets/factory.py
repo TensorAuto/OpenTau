@@ -859,11 +859,14 @@ def _maybe_pair(dataset, dataset_cfg: DatasetConfig, cfg: TrainPipelineConfig):
             "target and the demonstration is redundant — set `ambiguous_prompt`.",
             key,
         )
+    n_demos = cfg.dataset_mixture.n_demos
+    need = n_demos + 1
     episodes = list(getattr(dataset, "episodes", None) or dataset_cfg.episodes or [])
-    if len(episodes) < 2:
+    if len(episodes) < need:
         raise ValueError(
             f"pair_episodes is on but {key} resolves to {len(episodes)} episode(s); "
-            "pairing needs at least two."
+            f"n_demos={n_demos} needs at least {need} (one per demonstration plus "
+            "the rollout)."
         )
     return PairedSequenceDataset(
         base=dataset,
@@ -876,6 +879,7 @@ def _maybe_pair(dataset, dataset_cfg: DatasetConfig, cfg: TrainPipelineConfig):
         prompts={key: dataset_cfg.ambiguous_prompt or None},
         samples_per_epoch=len(dataset),
         seed=cfg.seed or 0,
+        n_demos=n_demos,
     )
 
 

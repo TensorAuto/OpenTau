@@ -670,6 +670,11 @@ class DatasetMixtureConfig:
     #
     # Nothing is materialized: the pair is a tensor for one step.
     pair_episodes: bool = False
+    # Demonstrations placed in context before the supervised rollout. 1 is the
+    # original pair (demo + rollout); 2 concatenates two demonstrations, and so
+    # on. The policy therefore sees `(n_demos + 1) * sequence_length` timesteps.
+    # Only read when `pair_episodes` is set.
+    n_demos: int = 1
 
     # Training-time dropout probabilities for optional sample keys.
     history_state_drop_prob: float = 0.3

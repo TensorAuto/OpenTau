@@ -137,13 +137,20 @@ class PairedSequenceDataset(Dataset):
         samples_per_epoch: int = 100_000,
         seed: int = 0,
         forbid_same_scene: bool = True,
+        n_demos: int = 1,
     ) -> None:
         # Set before anything else: `__getattr__` forwards unknown attributes to
         # the wrapped dataset, so a miss here would delegate rather than raise.
         self._warned_keys: set[str] = set()
-        thin = {k: len(v) for k, v in pairing_keys.items() if len(v) < 2}
+        if n_demos < 1:
+            raise ValueError(f"n_demos must be >= 1, got {n_demos}")
+        self.n_demos = n_demos
+        need = n_demos + 1
+        thin = {k: len(v) for k, v in pairing_keys.items() if len(v) < need}
         if thin:
-            raise ValueError(f"pairing keys need >=2 episodes to pair; too thin: {thin}")
+            raise ValueError(
+                f"pairing keys need >={need} episodes for {n_demos} demo(s) + 1 rollout; too thin: {thin}"
+            )
         missing = sorted(set(pairing_keys) - set(prompts))
         if missing:
             raise ValueError(f"no ambiguous prompt supplied for keys: {missing}")
@@ -185,8 +192,18 @@ class PairedSequenceDataset(Dataset):
         # (plan doc 11.30: two runs trained on one pair per key). Measure what
         # `_draw` actually produces.
         probe = min(1000, max(200, 8 * len(self.keys)))
-        drawn = {self._draw(i) for i in range(probe)}
-        reachable = min(probe, sum(len(v) * (len(v) - 1) for v in self.pairing_keys.values()))
+        # `_draw` returns the demo episodes as a list, so normalise to a tuple
+        # before hashing -- the set is what measures distinctness.
+        drawn = {(k, tuple(ds), b) for k, ds, b in (self._draw(i) for i in range(probe))}
+
+        def _ordered(n: int) -> int:
+            """Ordered (n_demos + 1)-tuples drawable from ``n`` distinct episodes."""
+            out, need = 1, self.n_demos + 1
+            for i in range(need):
+                out *= max(0, n - i)
+            return out
+
+        reachable = min(probe, sum(_ordered(len(v)) for v in self.pairing_keys.values()))
         if len(drawn) < 0.25 * reachable:
             logging.error(
                 "PAIR DIVERSITY COLLAPSE: %d probe draws produced only %d distinct "
@@ -235,30 +252,40 @@ class PairedSequenceDataset(Dataset):
     def __len__(self) -> int:
         return self.samples_per_epoch
 
-    def _draw(self, index: int) -> tuple[str, int, int]:
-        """Chooses a key and two distinct episodes for one sample.
+    def _draw(self, index: int) -> tuple[str, list[int], int]:
+        """Chooses a key, ``n_demos`` demonstrations and one rollout episode.
 
         Derived from ``seed`` and ``index`` alone — never from global RNG state —
-        so every rank draws the same pair for the same index and a resume
-        reproduces the run.
+        so every rank draws the same episodes for the same index and a resume
+        reproduces the run. At ``n_demos == 1`` the draw is bit-identical to the
+        original pair draw, so a 1-shot run stays reproducible against runs made
+        before n-tuples existed.
 
         Args:
             index: Sample index.
 
         Returns:
-            ``(key, episode_a, episode_b)``.
+            ``(key, [demo episodes], rollout episode)``.
         """
         g = torch.Generator().manual_seed(self.seed * 1_000_003 + index)
         key = self.keys[int(torch.randint(len(self.keys), (1,), generator=g))]
         eps = self.pairing_keys[key]
 
+        n = self.n_demos + 1
         for _ in range(16):
-            i, j = torch.randint(len(eps), (2,), generator=g).tolist()
-            if i == j:
+            idx = torch.randint(len(eps), (n,), generator=g).tolist()
+            if len(set(idx)) != n:
                 continue
-            a, b = eps[i], eps[j]
-            if not self.forbid_same_scene or self._scene_of(a) != self._scene_of(b):
-                return key, a, b
+            picked = [eps[i] for i in idx]
+            if not self.forbid_same_scene:
+                return key, picked[:-1], picked[-1]
+            scenes = [self._scene_of(e) for e in picked]
+            # Every episode in the tuple must come from a distinct scene, not
+            # just the rollout: two demonstrations of the same scene make the
+            # second one redundant, which is the degenerate case the constraint
+            # exists to prevent.
+            if len(set(scenes)) == n:
+                return key, picked[:-1], picked[-1]
 
         # The scene constraint is a quality filter; distinctness is the actual
         # invariant. Fall back to a random DISTINCT pair rather than a fixed
@@ -268,9 +295,16 @@ class PairedSequenceDataset(Dataset):
         # logged "N ordered pairs available" stays large while the model sees
         # one example, which looks exactly like a very fast-learning run until
         # rollout success falls off a cliff.
-        i = int(torch.randint(len(eps), (1,), generator=g))
-        j = (i + 1 + int(torch.randint(len(eps) - 1, (1,), generator=g))) % len(eps)
-        return key, eps[i], eps[j]
+        if self.n_demos == 1:
+            i = int(torch.randint(len(eps), (1,), generator=g))
+            j = (i + 1 + int(torch.randint(len(eps) - 1, (1,), generator=g))) % len(eps)
+            return key, [eps[i]], eps[j]
+        # For n > 2 the offset trick above does not generalise; a permutation
+        # prefix is the cheapest way to stay distinct AND stay a pure function
+        # of (seed, index).
+        perm = torch.randperm(len(eps), generator=g)[:n].tolist()
+        picked = [eps[i] for i in perm]
+        return key, picked[:-1], picked[-1]
 
     def _scene_of(self, episode: int) -> Any:
         """Scene identifier for an episode, or the episode itself if unavailable.
@@ -296,39 +330,46 @@ class PairedSequenceDataset(Dataset):
             index: Sample index.
 
         Returns:
-            The concatenated sample. Timestep-axis tensors are joined A-then-B;
-            ``loss_mask`` is False across A and True across B; ``prompt`` is the
+            The concatenated sample. Timestep-axis tensors are joined
+            demos-then-rollout; ``loss_mask`` is False across every demonstration
+            and True across the rollout; ``prompt`` is the
             key's ambiguous instruction when one was supplied, and otherwise the
             rollout half's own instruction (see ``prompts``).
 
         Raises:
-            ValueError: If the two halves disagree on their timestep count,
+            ValueError: If the segments disagree on their timestep count,
                 which would silently misalign the mask against the sequence.
         """
-        key, ep_a, ep_b = self._draw(index)
-        a = self.base[self._last_row[ep_a]]
+        key, ep_demos, ep_b = self._draw(index)
+        demos = [self.base[self._last_row[e]] for e in ep_demos]
         b = self.base[self._last_row[ep_b]]
 
-        t_a = self._timesteps(a)
         t_b = self._timesteps(b)
-        if t_a != t_b:
+        t_demos = [self._timesteps(d) for d in demos]
+        if any(t != t_b for t in t_demos):
             raise ValueError(
-                f"halves disagree on timestep count ({t_a} vs {t_b}) for key {key}; "
+                f"segments disagree on timestep count ({t_demos} vs {t_b}) for key {key}; "
                 "the base dataset's sequence_length must be fixed across episodes"
             )
+        t_a = t_b  # every segment shares one timestep count, checked above
 
         out: dict[str, Any] = {}
         for k, vb in b.items():
-            va = a.get(k)
-            tensors = isinstance(vb, torch.Tensor) and isinstance(va, torch.Tensor) and vb.ndim >= 1
+            demo_vals = [d.get(k) for d in demos]
+            tensors = (
+                isinstance(vb, torch.Tensor)
+                and vb.ndim >= 1
+                and all(isinstance(va, torch.Tensor) for va in demo_vals)
+            )
+            va = demo_vals[0] if tensors else None
             if (
                 k not in self._SCALAR_PASSTHROUGH
                 and tensors
                 and self._is_temporal(k)
-                and va.shape[0] == t_a
+                and all(v.shape[0] == t_a for v in demo_vals)
                 and vb.shape[0] == t_b
             ):
-                out[k] = torch.cat([va, vb], dim=0)
+                out[k] = torch.cat([*demo_vals, vb], dim=0)
             else:
                 if tensors and not self._is_temporal(k) and va.shape[0] == t_a and k not in self._warned_keys:
                     # Not concatenated, but its leading dim coincides with the
@@ -347,7 +388,9 @@ class PairedSequenceDataset(Dataset):
                     )
                 out[k] = vb
 
-        out["loss_mask"] = torch.cat([torch.zeros(t_a, dtype=torch.bool), torch.ones(t_b, dtype=torch.bool)])
+        out["loss_mask"] = torch.cat(
+            [torch.zeros(t_a * len(demos), dtype=torch.bool), torch.ones(t_b, dtype=torch.bool)]
+        )
         # Both halves, not just B: the demonstration must not be labelled with
         # the answer either.
         #
