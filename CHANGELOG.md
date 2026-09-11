@@ -277,6 +277,36 @@ a fixed one; the earlier fixed fallback collapsed an entire key onto a single pa
 still reported thousands available. A construction-time probe now logs `PAIR DIVERSITY COLLAPSE`
 when the reachable pair space is not being covered.
 
+### Added — `xr1`, the Xiaomi-Robotics-1 port (Qwen3-VL-4B + 36-layer DiT) — **new policy, opt-in, no `config_version` bump**
+
+A faithful port of Xiaomi-Robotics-1 (`XiaomiRobotics/Xiaomi-Robotics-1-RoboCasa365`,
+Apache-2.0): a Qwen3-VL-4B vision-language backbone whose per-layer key/value cache is read by
+a 36-layer DiT flow-matching action head, one DiT layer per VLM layer. Four observation frames
+per camera at stride 2 reach the backbone as three two-frame *videos*; the flow integrates
+**ascending** τ (0 → 1, `dt = +1/num_steps`), the opposite direction from π₀.₅ and cosmos3; and
+normalization is identity throughout, because the state adapter consumes raw quaternions and
+the reference's RoboCasa365 action statistics are mean 0 / std 1.
+
+Parity against the reference checkpoint is **bit-identical**, not approximate: the tokenized
+prompt, all 72 prefix key/value tensors, every Euler-step velocity, the full decoded chunk and
+a hash over all 1121 parameters all compare equal, and a 16-chunk open-loop replay stays within
+p99 2e-3. In simulation the five-rung parity ladder measured (ours / published) CloseFridge
+98 % / 94 %, TurnOnMicrowave 48 % / 56 %, OpenDrawer 96 % / 94 % and CloseBlenderLid 40 % / 36 %
+— all inside their Wilson intervals. The goldens, the gates and the ladder recipe are
+documented under `tests/artifacts/policies/xr1/`.
+
+Two settings there are load-bearing for reproducing a published RoboCasa365 rate and are set in
+`configs/examples/xr1_robocasa365_eval_config.json`: the camera order must put the wrist camera
+**last** (the env maps cameras to `camera{i}` positionally and the prompt labels them by
+position), and `env.obj_registries` must be `["objaverse", "lightwheel"]` — OpenTau's
+lightwheel-only default changes the scene generated at a given reset seed, so rates measured
+under it are not comparable to published numbers. A fine-tune config ships alongside it.
+
+One trap worth naming for anyone extending the policy: the RoboCasa365 datasets store
+`observation.state` **EE-first** while the simulator's `agent_pos` is **base-first**. Both are
+16 wide and both carry two unit quaternions, so the wrong one produces a plausible pose and no
+error; `state_adapter` names which layout a config is reading.
+
 ### Fixed
 
 - **Pre-rename π₀.₅ checkpoints load again: legacy `normalize_actions.*` state-dict keys
