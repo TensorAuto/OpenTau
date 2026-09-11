@@ -1736,3 +1736,118 @@ def test_eval_config_requests_both_object_registries():
     assert cfg["env"]["episode_length"] is None  # official per-task horizons
     assert cfg["env"]["max_parallel_tasks"] == 1
     assert cfg["eval"]["use_async_envs"] is True
+
+
+# =====================================================================================
+# The DiT action mask on the TRAINING path
+# =====================================================================================
+
+
+def _training_shaped_policy():
+    """A policy whose ``output_features`` came from a dataset mixture, not a hand-written config.
+
+    ``make_policy`` overwrites ``output_features`` from ``ds_meta`` whenever features are not
+    already set, and ``WeightedDatasetMixture.features`` reports ``actions`` as
+    ``(max_action_dim,)`` for every dataset in the mixture. Reproducing that here is the whole
+    point: every parity gate runs the *eval* config, which declares the true 12-wide action,
+    so nothing that exists today exercises the shape training actually sees.
+    """
+    from opentau.configs.types import FeatureType, PolicyFeature
+
+    policy = _build_policy()
+    policy.config.output_features = {
+        "actions": PolicyFeature(type=FeatureType.ACTION, shape=(policy.config.max_action_dim,))
+    }
+    return policy
+
+
+def test_training_action_mask_comes_from_the_per_sample_dataset_signal():
+    """The mask must mark 12 real columns even when the declared feature width says 60.
+
+    Reading ``config.action_feature`` here yields an all-ones mask, which silently stops
+    ``noisy_action * action_mask`` from zeroing the padding columns — so the DiT would train
+    on noise where inference feeds it zeros, with no error and no failing loss.
+    """
+    policy = _training_shaped_policy()
+    assert policy.config.action_feature.shape[0] == policy.config.max_action_dim  # the trap
+
+    batch = {"real_action_dim": torch.tensor([12, 7])}
+    mask = policy._action_mask(batch, 2, torch.device("cpu"), torch.float32)
+
+    assert mask.shape == (2, policy.config.chunk_size, policy.config.max_action_dim)
+    assert int(mask[0, 0].sum()) == 12
+    assert int(mask[1, 0].sum()) == 7  # per-sample, not one width for the batch
+    assert not bool((mask == 1).all())
+
+
+def test_training_batch_without_real_action_dim_is_refused():
+    """Falling back to the declared width would be the silent bug; refuse instead."""
+    policy = _training_shaped_policy().train()
+    with pytest.raises(ValueError, match="real_action_dim"):
+        policy._action_mask({}, 2, torch.device("cpu"), torch.float32)
+
+
+def test_inference_action_mask_still_reads_the_declared_width():
+    """The eval path has no dataset and no ``real_action_dim``; the config is correct there."""
+    policy = _build_policy().eval()
+    assert policy.config.action_feature.shape[0] == ACTION_DIM
+    mask = policy._action_mask({}, 2, torch.device("cpu"), torch.float32)
+    assert int(mask[0, 0].sum()) == ACTION_DIM
+    assert bool((mask[..., ACTION_DIM:] == 0).all())
+
+
+def test_padded_action_columns_reach_the_dit_as_zeros_under_a_training_shaped_config():
+    """End-to-end: whatever the config declares, the DiT's input padding columns are zero.
+
+    Spies on the tensor the DiT actually receives rather than on the mask, so the assertion
+    survives a refactor that moves where the masking happens.
+    """
+    policy = _training_shaped_policy()
+    model = policy.model
+    seen = []
+    real_dit = model.dit
+
+    class _Spy(torch.nn.Module):
+        def __init__(self, inner):
+            super().__init__()
+            self.inner = inner
+
+        def forward(self, hidden_states, *args, **kwargs):
+            seen.append(hidden_states.detach().clone())
+            return self.inner(hidden_states, *args, **kwargs)
+
+    batch = _video_batch(bsize=2)
+    batch["action_mask"] = build_action_mask(
+        2,
+        CHUNK,
+        MAX_ACTION_DIM,
+        real_action_dim=torch.tensor([ACTION_DIM, ACTION_DIM]),
+        device=batch["actions"].device,
+        dtype=batch["actions"].dtype,
+    )
+    # The action projector consumes `noisy_action * action_mask`, so a non-zero padding
+    # column would show up as a different projected embedding. Compare against the same
+    # batch with the padding columns of the incoming noise perturbed: masked correctly, the
+    # DiT input is identical.
+    noise = torch.randn_like(batch["action_mask"])
+    perturbed = noise.clone()
+    perturbed[..., ACTION_DIM:] += 50.0
+
+    model.dit = _Spy(real_dit)
+    try:
+        with torch.no_grad():
+            # Seed each call: the async-prefix length is drawn per forward, and a different
+            # draw changes `noisy_action` for reasons that have nothing to do with masking.
+            torch.manual_seed(0)
+            model(**batch, noise=noise.clone(), time=torch.zeros(2 * model.config.training_repeat))
+            first = list(seen)
+            seen.clear()
+            torch.manual_seed(0)
+            model(**batch, noise=perturbed, time=torch.zeros(2 * model.config.training_repeat))
+            second = list(seen)
+    finally:
+        model.dit = real_dit
+
+    assert first and len(first) == len(second)
+    for a, b in zip(first, second, strict=True):
+        assert torch.equal(a, b), "padding columns of the noise reached the DiT"

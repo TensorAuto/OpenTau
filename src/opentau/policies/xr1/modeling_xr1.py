@@ -874,13 +874,49 @@ class XR1Policy(PreTrainedPolicy):
             )
         return out
 
-    def _action_mask(self, batch_size: int, device, dtype: torch.dtype) -> Tensor:
-        action_dim = self.config.action_feature.shape[0]
+    def _action_mask(self, batch: dict[str, Tensor], batch_size: int, device, dtype: torch.dtype) -> Tensor:
+        """The DiT's action mask, from the per-sample dataset signal when there is one.
+
+        The two paths disagree about what ``config.action_feature`` means, which is why this
+        cannot just read it:
+
+        * **Inference.** The eval config declares the robot's true action width (12 for
+          RoboCasa), no dataset is involved, and no ``real_action_dim`` reaches the batch.
+        * **Training.** ``make_policy`` overwrites ``output_features`` from the dataset, and
+          a heterogeneous mixture reports ``actions`` as ``(max_action_dim,)`` -- 60 -- for
+          every dataset in it. Reading the declared width there yields an **all-ones** mask,
+          so ``noisy_action * action_mask`` stops zeroing the padding columns and the DiT
+          trains on noise where inference feeds it zeros. Nothing fails: the loss is masked
+          from ``real_action_dim`` separately, so only the input distribution silently
+          diverges from the one every parity gate verified.
+
+        Hence: prefer the per-sample ``real_action_dim`` the dataset emits, and refuse a
+        training batch that lacks it rather than falling back to a width that is wrong there.
+        """
+        real_action_dim = batch.get("real_action_dim")
+        if real_action_dim is not None:
+            return build_action_mask(
+                batch_size,
+                self.config.chunk_size,
+                self.config.max_action_dim,
+                real_action_dim=real_action_dim,
+                device=device,
+                dtype=dtype,
+            )
+        if self.training:
+            raise ValueError(
+                "A training batch must carry `real_action_dim` (LeRobotDataset emits it): the "
+                "DiT's action mask is per-sample, and `config.action_feature` is not a usable "
+                "stand-in during training — `make_policy` sets it from the dataset mixture, "
+                f"which reports every action as max_action_dim ({self.config.max_action_dim}) "
+                "wide, so the mask would come out all-ones and the padded columns would carry "
+                "noise instead of zeros."
+            )
         return build_action_mask(
             batch_size,
             self.config.chunk_size,
             self.config.max_action_dim,
-            action_dim,
+            self.config.action_feature.shape[0],
             device=device,
             dtype=dtype,
         )
@@ -905,7 +941,7 @@ class XR1Policy(PreTrainedPolicy):
         if actions.shape[-1] < self.config.max_action_dim:
             actions = F.pad(actions, (0, self.config.max_action_dim - actions.shape[-1]))
         dtype = self.model.action_projector.layers[0].weight.dtype
-        action_mask = self._action_mask(actions.shape[0], actions.device, dtype)
+        action_mask = self._action_mask(batch, actions.shape[0], actions.device, dtype)
 
         return self.model(
             input_ids=mm["input_ids"],
@@ -983,7 +1019,7 @@ class XR1Policy(PreTrainedPolicy):
         device = mm["input_ids"].device
         bsize = mm["input_ids"].shape[0]
         dtype = self.model.action_projector.layers[0].weight.dtype
-        action_mask = self._action_mask(bsize, device, dtype)
+        action_mask = self._action_mask(batch, bsize, device, dtype)
 
         if delay is None:
             delay = torch.tensor(0, dtype=torch.long, device=device)

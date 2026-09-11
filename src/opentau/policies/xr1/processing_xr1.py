@@ -50,8 +50,10 @@ from __future__ import annotations
 
 import numpy as np
 import torch
-from einops import rearrange
+from einops import rearrange, repeat
 from torch import Tensor
+
+from opentau.policies.utils import make_action_dim_mask
 
 #: The two-turn conversation XR-1 always sends, with the stock Qwen3-VL chat template
 #: already applied. ``{cameras}`` is the concatenation of one labelled video marker per
@@ -136,18 +138,44 @@ def expand_video_placeholders(
 
 
 def build_action_mask(
-    batch_size: int, chunk_size: int, max_action_dim: int, action_dim: int, *, device, dtype
+    batch_size: int,
+    chunk_size: int,
+    max_action_dim: int,
+    action_dim: int | None = None,
+    *,
+    real_action_dim: Tensor | None = None,
+    device,
+    dtype,
 ) -> Tensor:
-    """``(B, chunk, max_action_dim)`` float mask; the first ``action_dim`` columns are 1.
+    """``(B, chunk, max_action_dim)`` float mask marking each sample's real action columns.
 
-    The reference derives this from ``std > 1e-5`` over its per-robot action statistics.
-    For RoboCasa365 those statistics are identity (mean 0 / std 1) on the 12 real columns
-    and exactly zero on the 48 padding columns, so the derived mask is this.
+    The reference derives this from ``std > 1e-5`` over its per-robot action statistics. Two
+    ways to say the same thing here, and **which one applies is not cosmetic**:
 
-    It is a **float** tensor, not bool, and that is load-bearing: the reference draws its
-    flow noise with ``torch.randn_like(action_mask)``, so this tensor's dtype decides the
-    noise dtype (bfloat16 on the real model) and its shape decides the noise shape.
+    * ``real_action_dim`` -- a ``(B,)`` long tensor, the per-sample count OpenTau's dataset
+      emits (``LeRobotDataset._to_standard_data_format``). This is the training-path source,
+      and the only one that is correct there: a heterogeneous mixture pads every sample out
+      to ``max_action_dim``, so the *declared* feature width says nothing about how many
+      columns are real for a given row.
+    * ``action_dim`` -- a single width shared by the batch. The inference-path source, where
+      no dataset is in play and the config's ``action_feature`` declares the true width.
+
+    Exactly one must be given. It is a **float** tensor, not bool, and that is load-bearing:
+    the reference draws its flow noise with ``torch.randn_like(action_mask)``, so this
+    tensor's dtype decides the noise dtype (bfloat16 on the real model) and its shape decides
+    the noise shape.
+
+    Raises:
+        ValueError: if neither or both selectors are given.
     """
+    if (action_dim is None) == (real_action_dim is None):
+        raise ValueError(
+            "Pass exactly one of `action_dim` (a uniform width) or `real_action_dim` (the "
+            "per-sample counts the dataset emits)."
+        )
+    if real_action_dim is not None:
+        dim_mask = make_action_dim_mask(real_action_dim, max_action_dim, batch_size=batch_size, device=device)
+        return repeat(dim_mask.to(dtype), "b d -> b c d", c=chunk_size).contiguous()
     mask = torch.zeros(batch_size, chunk_size, max_action_dim, device=device, dtype=dtype)
     mask[..., :action_dim] = 1.0
     return mask
