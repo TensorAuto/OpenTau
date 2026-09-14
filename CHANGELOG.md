@@ -10,6 +10,10 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.14.0] - 2026-09-14
+
 ### Added — best-of-N action-chunk sampling — **opt-in, default `1`, no `config_version` bump**
 
 A flow-matching policy maps one Gaussian draw to exactly one action chunk, deterministically,
@@ -390,6 +394,17 @@ error; `state_adapter` names which layout a config is reading.
   leaderboard numbers, for any policy. Env construction now prints a one-time rank-0 warning
   saying so, and the constant, the `obj_registries` config docs and the RoboCasa tutorial
   carry that consequence rather than only the download size.
+- **The `value` policy reads its prediction from a learned `<val>` readout token instead of
+  the last sequence position.** Once the prompt was padded to `prompt_max_length`, that last
+  position was padding, so training and inference both read a constant and the head could only
+  emit the mean return. Training and inference now read the same real position. Datasets
+  without a `response` key default it to an empty string (masking the response head off), and
+  `dataset_index` is forced to `0` so the value function uses one shared normalization head
+  across all datasets.
+- **gRPC `GetActionChunk` no longer fails with an empty `Inference error:` after
+  `torch.compile(mode="max-autotune")`.** CUDA graphs are thread-local: warmup ran on the main
+  thread while RPCs ran on the gRPC thread pool. Warmup and every `sample_actions` call now run
+  on one dedicated inference thread, and `INTERNAL` errors include the exception type.
 
 ### Changed — gRPC api-key auth renamed to `x-api-key` / `INFERENCE_API_KEY` — **breaking on both, no `config_version` bump**
 
@@ -852,6 +867,7 @@ carry a concrete `config_version` (and an informational `opentau_version`).
   hand-built dict must re-emit it from the loaded config, or the tag is absent and
   the checkpoint is read as legacy.
 
-[Unreleased]: https://github.com/TensorAuto/OpenTau/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/TensorAuto/OpenTau/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/TensorAuto/OpenTau/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/TensorAuto/OpenTau/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/TensorAuto/OpenTau/compare/v0.11.0...v0.12.0
