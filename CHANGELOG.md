@@ -10,7 +10,52 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added — `flux3_action`, Black Forest Labs' FLUX 3 Action — **new policy, no `config_version` bump**
+
+FLUX 3 Action (F3A) is a 7B world-action model ported from
+[`black-forest-labs/flux-action`](https://github.com/black-forest-labs/flux-action) (Apache-2.0)
+at `e2dd1d8`. It predicts a 32-step action chunk — 2.13 s of motion at 15 fps — by flow matching
+on the FLUX 3 backbone.
+
+**The video stream is not an optional head, and that shapes the whole port.** Every other
+multimodal policy here keeps a frozen backbone and bolts on an action expert (`cosmos3` extracts
+just the Cosmos3 reasoning tower and discards the generative machinery). F3A does not decompose
+that way: its trunk denoises action tokens and *video* tokens jointly in one packed sequence, and
+upstream marks both video streams required —
+
+```python
+REQUIRED_CONTENT_STREAMS = ("video", "video_cond")
+```
+
+— while the released DROID settings apply guidance `4.0` to video tokens against `1.0` (none) on
+action tokens, so the video pathway measurably drives action quality at inference. A
+"keep the actions, drop the video" port is therefore not a lighter variant of this policy; it is
+a non-functional one. The port keeps upstream's architecture intact, following the `xr1`
+precedent rather than the `cosmos3` one.
+
+**What that costs, and does not cost.** Inference needs no future frames — video tokens are
+denoised from noise conditioned on the observed frame — so eval works against the dataloader as
+it stands. *Finetuning* does need them (upstream's `prepare` demands `window_frames` per camera,
+"observations plus future frames"), which the dataset layer cannot currently request: camera keys
+only ever receive non-positive offsets in `resolve_delta_timestamps`. The fetch layer underneath
+is already sign-agnostic — `np.clip(idx + delta_idx, ep_start, ep_end - 1)` clips a positive
+offset at the episode *end* and raises the matching `_is_pad` flag — so enabling training is a
+request-side change, tracked separately.
+
+**Vendoring.** `policies/flux3_action/` keeps upstream's subtree (`models/`, `processing/`,
+`inference/`, `checkpoints/`) so upstream's relative imports resolve unchanged and re-syncing is a
+mechanical `diff -r`. The files are byte-identical to upstream apart from a three-line rewrite of
+its absolute self-imports; `VENDOR.md` records the provenance commit, that exact delta, and what
+was deliberately left out (`transformer_inf_fp8r.py`, rejected explicitly by the config rather
+than left as a latent `ImportError`). The vendored paths join `zero_to_fp32.py` and the generated
+gRPC stubs in the pre-commit global exclude, since formatting them would rewrite code we do not own.
+
+**New dependency: NATTEN.** The video VAE imports `natten` at module scope with no fallback and is
+mandatory on the *encode* path, so it is required at inference, not just for decoding. NATTEN
+publishes no PyPI wheels — only a CUDA-compiling sdist — so the prebuilt
+`natten==0.21.6+torch2100cu128` (cp310, linux-x86_64, from `https://whl.natten.org/`) is pinned
+and marker-gated as the `trt` extra already is. It is pinned to torch 2.10.0 / cu128 exactly: a
+torch bump requires re-pinning it.
 
 ## [0.14.0] - 2026-09-14
 

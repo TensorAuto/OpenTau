@@ -176,8 +176,20 @@ trt = [
 so101 = [
     "feetech-servo-sdk>=1.0.0",
 ]
+# FLUX 3 Action. Its video VAE imports `natten` at module scope with no fallback and the
+# VAE is mandatory on the encode path, so this is required for inference, not just decoding.
+# NATTEN ships no PyPI wheels (sdist only, compiles CUDA kernels), so the prebuilt wheel is
+# pinned via [tool.uv.sources] below. It is built against torch 2.10.0 / cu128 exactly --
+# a torch bump requires re-pinning it -- and exists only for linux x86_64, hence the marker
+# (same shape as the `trt` extra above).
+flux3-action = [
+    "natten==0.21.6+torch2100cu128 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
 
 [tool.uv.sources]
+natten = [
+    { url = "https://github.com/SHI-Labs/NATTEN/releases/download/v0.21.6/natten-0.21.6%2Btorch2100cu128-cp310-cp310-linux_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+]
 libero = { git = "https://github.com/shuheng-liu/LIBERO" , branch = "master" }  # the official libero repo is misconfigured for pip install with git
 # robomimic's egl_probe ships a CMakeLists with cmake_minimum_required(VERSION 2.8.12),
 # which CMake >= 4 rejects. This fork raises the floor to 3.5 so it builds on CMake 4
@@ -222,6 +234,18 @@ where = ["src"]
 [tool.ruff]
 line-length = 110
 target-version = "py310"
+# Vendored third-party sources, kept byte-identical to upstream so re-syncing is a
+# mechanical diff -- linting or formatting them would rewrite code we do not own.
+# Mirrors the pre-commit global exclude; see policies/flux3_action/VENDOR.md.
+extend-exclude = [
+    "src/opentau/policies/flux3_action/config.py",
+    "src/opentau/policies/flux3_action/hub.py",
+    "src/opentau/policies/flux3_action/policy.py",
+    "src/opentau/policies/flux3_action/models",
+    "src/opentau/policies/flux3_action/processing",
+    "src/opentau/policies/flux3_action/inference",
+    "src/opentau/policies/flux3_action/checkpoints",
+]
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "I", "N", "B", "C4", "SIM"]

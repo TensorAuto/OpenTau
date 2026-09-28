@@ -19,6 +19,7 @@
 import opentau
 from opentau.policies.cosmos3.modeling_cosmos3 import Cosmos3Policy
 from opentau.policies.cosmos3_nano.modeling_cosmos3_nano import Cosmos3NanoPolicy
+from opentau.policies.flux3_action.modeling_flux3_action import Flux3ActionPolicy
 from opentau.policies.pi0.modeling_pi0 import PI0Policy
 from opentau.policies.pi05.modeling_pi05 import PI05Policy
 from opentau.policies.pi05_mem.modeling_pi05 import PI05MemPolicy
@@ -51,6 +52,7 @@ def test_available_policies():
         Cosmos3Policy,
         Cosmos3NanoPolicy,
         XR1Policy,
+        Flux3ActionPolicy,
     ]
     policies = [pol_cls.name for pol_cls in policy_classes]
     assert set(policies) == set(opentau.available_policies), policies

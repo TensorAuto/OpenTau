@@ -21,6 +21,7 @@ such as PI0, PI05, and Value policy.
 
 from .cosmos3.configuration_cosmos3 import Cosmos3Config as Cosmos3Config
 from .cosmos3_nano.configuration_cosmos3_nano import Cosmos3NanoConfig as Cosmos3NanoConfig
+from .flux3_action.configuration_flux3_action import Flux3ActionConfig as Flux3ActionConfig
 from .pi0.configuration_pi0 import PI0Config as PI0Config
 from .pi05.configuration_pi05 import PI05Config as PI05Config
 from .pi05.configuration_pi05 import PI05ContinuousStateConfig as PI05ContinuousStateConfig
