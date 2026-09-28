@@ -149,9 +149,10 @@ class Flux3ActionPolicy(PreTrainedPolicy):
         return self.model.get_optim_params()
 
     def reset(self) -> None:
-        """Clear the action queue. Called on every environment reset."""
-        # Guard the attribute: PreTrainedPolicy.__init__ calls reset() before
-        # ``self.model`` is assigned.
-        model = getattr(self, "model", None)
-        if model is not None:
-            model.reset()
+        """Clear the action queue. Called on every environment reset.
+
+        No construction-time guard is needed: ``PreTrainedPolicy.reset`` is abstract and
+        the base ``__init__`` never invokes it, and the inner policy already resets itself
+        at the end of its own ``__init__``.
+        """
+        self.model.reset()

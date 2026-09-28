@@ -66,11 +66,8 @@ class _StubVAE(nn.Module):
 
 def _config(**overrides) -> Flux3ActionConfig:
     kwargs = {
-        "camera_keys": (
-            "observation.images.wrist",
-            "observation.images.left",
-            "observation.images.right",
-        ),
+        # camera_keys deliberately left at their default so the tests exercise the
+        # shipped convention rather than masking a wrong default with an override.
         "video_vae_id": "stub",
         "text_encoder_id": "stub",
         "dit_config": dict(TINY_DIT),
@@ -210,10 +207,49 @@ def test_optim_params_keep_the_heads_learning_rate_group():
     assert len(scales) > 1, f"expected distinct trunk/head learning rates, got {groups!r}"
 
 
-def test_reset_is_safe_before_the_inner_model_exists():
-    """``PreTrainedPolicy.__init__`` calls ``reset()`` before ``self.model`` is assigned."""
+def test_reset_delegates_to_the_inner_policy():
+    """The wrapper owns no queue of its own; the inner policy holds the chunk queue.
+
+    Pins the delegation rather than a construction-order contract the base class does
+    not have -- ``PreTrainedPolicy.reset`` is abstract and the base ``__init__`` never
+    calls it.
+    """
     policy = _policy()
-    policy.reset()  # must not raise after construction either
+    called = []
+    policy.model.reset = lambda: called.append(True)
+    policy.reset()
+    assert called == [True]
+
+
+def test_default_camera_keys_are_opentau_style():
+    """A default-constructed config must find cameras in a real OpenTau batch.
+
+    Upstream resolves cameras by plain ``batch[key]`` lookup, so upstream's own
+    ``images.*`` defaults would raise KeyError on every OpenTau batch -- and would do so
+    only at the first forward, not at construction.
+    """
+    cfg = Flux3ActionConfig()
+    assert all(k.startswith("observation.images.") for k in cfg.camera_keys), cfg.camera_keys
+    # order is load-bearing for the droid layout: [wrist, left exterior, right exterior]
+    assert cfg.camera_keys[0].endswith(".wrist")
+
+
+def test_non_identity_normalization_is_rejected():
+    """F3A normalizes internally, so an OpenTau mode would be silently ignored.
+
+    The wrapper never invokes its Normalize modules, so without this check a CLI
+    override like ``--policy.normalization_mapping.ACTION=MEAN_STD`` is accepted and
+    then does nothing -- the worst kind of failure, since the config reads as if
+    normalization were configured.
+    """
+    with pytest.raises(ValueError, match="IDENTITY"):
+        _config(
+            normalization_mapping={
+                "VISUAL": NormalizationMode.IDENTITY,
+                "STATE": NormalizationMode.IDENTITY,
+                "ACTION": NormalizationMode.MEAN_STD,
+            }
+        )
 
 
 # ------------------------------------------------------------------- the vendoring contract

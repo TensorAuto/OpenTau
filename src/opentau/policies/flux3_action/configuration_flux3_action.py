@@ -76,7 +76,12 @@ class Flux3ActionConfig(PreTrainedConfig):
             full-res above two half-res exteriors), ``"single"``, ``"side_by_side"`` or
             ``"grid"``. The first three are the layouts the released checkpoints were
             trained with; ``"grid"`` runs anywhere but matches no checkpoint.
-        camera_keys: Batch stream names in layout order.
+        camera_keys: Batch stream names in layout order. Upstream resolves cameras by a
+            plain ``batch[key]`` lookup, so these are OpenTau's own
+            ``observation.images.*`` keys rather than upstream's ``images.*`` spelling --
+            which is what lets the frames be read where they already live, with no
+            translation layer. The DROID layout expects [wrist, left exterior, right
+            exterior] in that order.
         canvas_hw: Composited canvas size fed to the video VAE.
         fps: Control rate the action times are built against.
         action_parameterization: ``"absolute"`` (DROID) or ``"joint_delta"`` (SO-101).
@@ -111,7 +116,11 @@ class Flux3ActionConfig(PreTrainedConfig):
     action_dim: int = 8
     action_modality: str = "action"
     camera_layout: str = "droid"
-    camera_keys: tuple[str, ...] = ("images.wrist", "images.left", "images.right")
+    camera_keys: tuple[str, ...] = (
+        "observation.images.wrist",
+        "observation.images.left",
+        "observation.images.right",
+    )
     canvas_hw: tuple[int, int] = (544, 736)
     fps: float = 15.0
     action_scale: float = 2.0
@@ -188,6 +197,22 @@ class Flux3ActionConfig(PreTrainedConfig):
                 f"quantization={self.quantization!r} is not supported: "
                 "models/transformer_inf_fp8r.py is deliberately not vendored "
                 "(see VENDOR.md). Use quantization=None."
+            )
+        non_identity = {
+            feature: mode
+            for feature, mode in self.normalization_mapping.items()
+            if mode != NormalizationMode.IDENTITY
+        }
+        if non_identity:
+            # The wrapper never invokes the Normalize modules -- F3A range-normalizes
+            # state and actions itself from its own q01/q99 bounds. A non-IDENTITY mode
+            # would therefore be accepted and then silently ignored, which reads as
+            # "normalization is configured" while nothing applies it.
+            raise ValueError(
+                "flux3_action normalizes state and actions internally, so every "
+                f"normalization_mapping mode must be IDENTITY; got {non_identity}. "
+                "Set the q01/q99 bounds via action_normalization / state_normalization "
+                "instead."
             )
         if self.n_action_steps > self.chunk_size:
             raise ValueError(

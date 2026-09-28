@@ -55,8 +55,21 @@ inference, not just for decoding. NATTEN ships no PyPI wheels — only an sdist 
 compiles CUDA kernels. Use the prebuilt wheel matching this stack exactly:
 
 ```
-natten==0.21.6+torch2100cu128   # cp310, linux_x86_64, from https://whl.natten.org/
+natten==0.21.6+torch2100cu128   # cp310, linux_x86_64
 ```
 
-The wheel is pinned to torch 2.10.0 / cu128 and to linux-x86_64, so it must stay
-marker-gated (as the `trt` extra already is) and a torch bump requires re-pinning it.
+`[tool.uv.sources]` pins it by its **GitHub release URL** -- that is the artifact
+`uv.lock` records and the one to edit when re-pinning:
+
+```
+https://github.com/SHI-Labs/NATTEN/releases/download/v0.21.6/natten-0.21.6%2Btorch2100cu128-cp310-cp310-linux_x86_64.whl
+```
+
+`https://whl.natten.org/` is only the *index* to browse when picking a new pin: it lists
+one wheel per (python, torch, CUDA, arch) combination. Note 0.21.7 dropped its torch-2.10
+builds, which is why 0.21.6 is pinned.
+
+**To re-pin after a torch bump:** find the wheel for the new torch/CUDA pair in that
+index, update the URL in `[tool.uv.sources]` and the version in the `flux3-action` extra,
+then `uv lock`. The wheel is specific to torch 2.10.0 / cu128 / cp310 / linux-x86_64, so
+it must stay marker-gated (as the `trt` extra already is).
