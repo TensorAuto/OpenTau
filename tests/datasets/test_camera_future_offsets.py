@@ -342,3 +342,70 @@ def test_temporal_camera_frames_resolves_all_three_mechanisms(kwargs, expected):
 
     ds = _standardizer(**kwargs)
     assert BaseDataset.temporal_camera_frames.fget(ds) == expected
+
+
+# ------------------------------------------------- end-to-end config validation
+def _train_cfg(policy, n_obs_history=None, action_chunk=32):
+    ds = DatasetConfig(
+        repo_id="mock_dataset",
+        root="/tmp/mock",
+        image_transforms=ImageTransformsConfig(enable=False),
+        episodes=[0],
+        video_backend=None,
+    )
+    mix = DatasetMixtureConfig(datasets=[ds], weights=[1.0], action_freq=15.0, n_obs_history=n_obs_history)
+    return TrainPipelineConfig(
+        dataset_mixture=mix,
+        policy=policy,
+        batch_size=2,
+        action_chunk=action_chunk,
+        use_policy_training_preset=True,
+    )
+
+
+def _f3a_history():
+    from opentau.policies.flux3_action.configuration_flux3_action import Flux3ActionConfig
+
+    return Flux3ActionConfig(
+        n_obs_steps=4, inference_profile="history", history_snapshots=2, gripper_flip_dims=()
+    )
+
+
+def test_history_profile_is_configurable_end_to_end():
+    """Regression: the F3A history profile used to be dead config space.
+
+    ``validate()`` demanded ``policy.n_obs_steps == dataset_mixture.n_obs_history`` while
+    ``resolve_delta_timestamps`` rejected pairing a policy-owned camera window with
+    ``n_obs_history`` at all — so every route was refused and each error pointed at the
+    other. A policy-owned window is now authoritative, and this builds the config both
+    checks see rather than testing either in isolation, which is how the dead end hid.
+    """
+    cfg = _train_cfg(_f3a_history(), n_obs_history=None)
+    cfg.validate()  # must not raise
+    assert cfg.policy.n_obs_steps == 4
+    assert len(cfg.policy.camera_delta_indices) == cfg.policy.to_policy_config().window_frames
+
+
+def test_mixture_may_not_also_claim_the_camera_window():
+    """The policy owning the window means the mixture must not set one too."""
+    cfg = _train_cfg(_f3a_history(), n_obs_history=4)
+    with pytest.raises(ValueError, match="n_obs_history must stay unset"):
+        cfg.validate()
+
+
+def test_policies_without_a_camera_window_keep_the_original_pairing_rule():
+    """The relaxation is scoped: every other policy still must agree with the mixture.
+
+    Uses a real registered policy rather than the local dummy, so this exercises the same
+    path a shipped config takes — ``validate()`` resolves the draccus choice name, which a
+    test-local subclass has no entry for.
+    """
+    from opentau.policies.pi05.configuration_pi05 import PI05Config
+
+    policy = PI05Config()
+    assert policy.camera_delta_indices is None, "pi05 must not opt into a camera window"
+    # action_chunk matches pi05's own horizon so the failure under test is the
+    # n_obs pairing rule, not an unrelated chunk/horizon conflict.
+    cfg = _train_cfg(policy, n_obs_history=3, action_chunk=policy.chunk_size)
+    with pytest.raises(ValueError, match="n_obs_steps"):
+        cfg.validate()

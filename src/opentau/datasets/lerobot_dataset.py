@@ -889,25 +889,22 @@ class BaseDataset(torch.utils.data.Dataset):
     ) -> None:
         """Assert an image tensor has the expected rank, 3-channel, and [0, 1] range.
 
-        By default, the expected shape follows ``self.n_obs_history``: rank-3
-        ``(3, H, W)`` when None, rank-4 ``(T, 3, H, W)`` otherwise. Pass
+        By default the expected shape follows :attr:`temporal_camera_frames`: rank-3
+        ``(3, H, W)`` when it is None, rank-4 ``(T, 3, H, W)`` otherwise. Pass
         ``expect_temporal`` explicitly to override — e.g. subgoals are always
         single-frame targets regardless of observation history.
 
         Args:
             img: Image tensor to validate.
             name: Human-readable key name for the error message.
-            expect_temporal: If ``None``, defers to whether a time axis is
-                active — ``self.n_obs_history`` or ``self.sequence_length > 1``. If
-                ``True`` force-expects ``(T, 3, H, W)``. If ``False`` force-expects
+            expect_temporal: If ``None``, defers to :attr:`temporal_camera_frames`,
+                which resolves every mechanism that can put a time axis on a camera.
+                If ``True`` force-expects ``(T, 3, H, W)``. If ``False`` force-expects
                 ``(3, H, W)``.
         """
         if expect_temporal is None:
-            # Either mechanism puts a leading time axis on a camera:
-            # `n_obs_history` or `sequence_length`. Deferring to
-            # `n_obs_history` alone made a sequence batch fail this assertion
-            # with "Expected image camera0 to have shape (3, H, W) ... Got
-            # torch.Size([4, 3, 224, 224])".
+            # `temporal_camera_frames` owns this question -- see its docstring for
+            # why enumerating a subset of the mechanisms here has broken twice.
             expect_temporal = self.temporal_camera_frames is not None
         if expect_temporal:
             expected_ndim = 4
@@ -956,7 +953,7 @@ class BaseDataset(torch.utils.data.Dataset):
         Resizes images to the target resolution with padding, and tracks
         which camera slots are padded (absent cameras).
 
-        When ``self.n_obs_history`` is set, camera tensors have shape
+        When :attr:`temporal_camera_frames` is set, camera tensors have shape
         ``(T, C, H, W)`` and each frame is resized individually.
 
         Args:
@@ -973,14 +970,9 @@ class BaseDataset(torch.utils.data.Dataset):
             std_key = f"camera{cam_idx}"
             key = name_map.get(std_key)
 
-            # A camera carries a leading time axis under either mechanism:
-            # `n_obs_history` (a history window for one prediction) or
-            # `sequence_length` (one observation per supervised timestep). They
-            # are mutually exclusive by config validation, so at most one is
-            # active — but the *shape handling* is identical, and keying it on
-            # `n_obs_history` alone sent sequence batches down the scalar path,
-            # where `item[key + "_is_pad"].item()` raised
-            # "a Tensor with 4 elements cannot be converted to Scalar".
+            # Which mechanism supplies the time axis is `temporal_camera_frames`'s
+            # problem, not this loop's -- the shape handling is identical for all of
+            # them, and keying it on a subset here is precisely what has broken twice.
             temporal_frames = self.temporal_camera_frames
 
             if key is None:
