@@ -821,6 +821,14 @@ class BaseDataset(torch.utils.data.Dataset):
         self.n_obs_history = dm.n_obs_history if dm else None
         # Number of supervised timesteps per sample; 1 is today's behaviour.
         self.sequence_length = getattr(dm, "sequence_length", 1) if dm else 1
+        # Frames per camera when the *policy* owns the camera window
+        # (`camera_delta_indices`) rather than `n_obs_history` / `sequence_length`.
+        # A policy that supervises predicted frames asks for the observation plus the
+        # future targets, so the camera tensors carry a leading time axis even though
+        # both mixture-level mechanisms are off -- which is exactly the case that used to
+        # fall through to the scalar path below.
+        _cdi = getattr(cfg.policy, "camera_delta_indices", None) if cfg.policy else None
+        self.camera_window_frames = len(_cdi) if _cdi else None
         # Optional-key dropout probabilities (all default to 0 when no mixture config is
         # provided, preserving legacy/VQA paths that don't use these keys).
         self.history_state_drop_prob = dm.history_state_drop_prob if dm else 0.0
@@ -900,7 +908,7 @@ class BaseDataset(torch.utils.data.Dataset):
             # `n_obs_history` alone made a sequence batch fail this assertion
             # with "Expected image camera0 to have shape (3, H, W) ... Got
             # torch.Size([4, 3, 224, 224])".
-            expect_temporal = self.n_obs_history is not None or getattr(self, "sequence_length", 1) > 1
+            expect_temporal = self.temporal_camera_frames is not None
         if expect_temporal:
             expected_ndim = 4
             expected_c_dim = 1
@@ -920,6 +928,27 @@ class BaseDataset(torch.utils.data.Dataset):
             f"min={img.min()}, max={img.max()}, "
             f"self={self._get_feature_mapping_key()}."
         )
+
+    @property
+    def temporal_camera_frames(self) -> int | None:
+        """Frames on a camera's leading time axis, or ``None`` for a single frame.
+
+        Three mechanisms can put a time axis on a camera and they are mutually exclusive
+        by config validation: ``n_obs_history`` (a history window for one prediction),
+        ``sequence_length`` (one observation per supervised timestep), and a policy-owned
+        ``camera_delta_indices`` window (observation plus future video targets).
+
+        They are resolved in one place deliberately. Keying the shape handling on a
+        subset has now broken twice -- first ``n_obs_history`` alone sent sequence batches
+        down the scalar path, then the same omission sent policy-owned windows there --
+        each time surfacing as ``a Tensor with N elements cannot be converted to Scalar``
+        on the first training batch rather than as a config error.
+        """
+        if self.n_obs_history is not None:
+            return self.n_obs_history
+        if getattr(self, "sequence_length", 1) > 1:
+            return self.sequence_length
+        return getattr(self, "camera_window_frames", None)
 
     def _standardize_images(self, item, standard_item, n_cams) -> list[bool]:
         """Standardize image features to a common format.
@@ -952,11 +981,7 @@ class BaseDataset(torch.utils.data.Dataset):
             # `n_obs_history` alone sent sequence batches down the scalar path,
             # where `item[key + "_is_pad"].item()` raised
             # "a Tensor with 4 elements cannot be converted to Scalar".
-            temporal_frames = (
-                self.n_obs_history
-                if self.n_obs_history is not None
-                else (_seq_len if (_seq_len := getattr(self, "sequence_length", 1)) > 1 else None)
-            )
+            temporal_frames = self.temporal_camera_frames
 
             if key is None:
                 if temporal_frames is not None:

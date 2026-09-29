@@ -36,12 +36,32 @@ Actions read `policy.action_delta_indices`, which may be positive; cameras only 
 the observation history, whose offsets are all `<= 0`. There was no way to ask for a
 future frame.
 
-Everything *below* that was already sign-agnostic —
-`LeRobotDataset._get_query_indices_soft` applies whatever offsets it is handed, clipping
-`idx + delta` into the episode and raising `<key>_is_pad` at whichever end overruns. A
-positive offset clamps at the episode *end* exactly as a negative one clamps at the start.
-Episode boundaries, padding flags, and F3A's own `_valid_windows` (which drops samples by
-scanning those very flags) therefore needed nothing. Only the *request* side did.
+The **fetch** layer was already sign-agnostic: `LeRobotDataset._get_query_indices_soft`
+applies whatever offsets it is handed, clipping `idx + delta` into the episode and raising
+`<key>_is_pad` at whichever end overruns. A positive offset clamps at the episode *end*
+exactly as a negative one clamps at the start, so that layer needed nothing.
+
+The **standardization** layer did, and an earlier draft of this note wrongly said it did
+not. `_standardize_images` decides single- vs multi-frame from the mixture-level knobs
+only, so a policy-owned window — which by construction has `n_obs_history` unset and
+`sequence_length == 1` — fell through to the scalar path and died on the first training
+batch with `a Tensor with 33 elements cannot be converted to Scalar`. The three mechanisms
+now resolve through one `temporal_camera_frames` property so a fourth cannot repeat it.
+
+### A known gap, not yet closed
+
+Per-frame camera padding is **not** visible to the policy. `_standardize_images`
+deliberately reduces camera `_is_pad` to "is this camera slot absent", discarding which
+*frames* were clamped at an episode boundary — and F3A's `_valid_windows` scans only the
+flags that survive. Because the camera window runs to `+chunk_size` while `action_is_pad`
+stops at `chunk_size - 1`, there is exactly one sample position per episode where the
+actions are entirely in-bounds but the final video target is a clamped duplicate of the
+last real frame, and nothing marks it.
+
+One position per episode is small, but it is silent, so it is recorded here rather than
+assumed harmless. Closing it means surfacing per-frame camera pads (additively, so the
+existing slot-level semantics are untouched) or restricting window starts so the camera
+window fits — neither belongs in this PR, and neither matters until training actually runs.
 
 ## What the change is
 

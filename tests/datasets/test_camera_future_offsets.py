@@ -247,3 +247,98 @@ def test_flux3_action_window_is_ascending_and_accepted_by_the_factory():
     np.testing.assert_allclose(dt["camera0"][0], 0.0)
     np.testing.assert_allclose(dt["camera0"][-1], policy.chunk_size / 15.0)
     np.testing.assert_array_equal(dt["state"], [0.0])
+
+
+# ------------------------------------------------- standardization (where it actually broke)
+def _standardizer(*, n_obs_history=None, sequence_length=1, camera_window_frames=None, resolution=(224, 224)):
+    """A ``BaseDataset`` stub wired for ``_standardize_images``, with the real resize.
+
+    Only the config knobs are faked; ``resize_with_pad``, ``temporal_camera_frames`` and
+    the unit-range assertion are the real implementations, so this exercises the actual
+    shape handling rather than a restatement of it.
+    """
+    from opentau.datasets.lerobot_dataset import BaseDataset
+
+    ds = MagicMock(spec=BaseDataset)
+    ds.n_obs_history = n_obs_history
+    ds.sequence_length = sequence_length
+    ds.camera_window_frames = camera_window_frames
+    ds.resolution = resolution
+    ds._get_name_map = lambda: {"camera0": "observation.images.cam0"}
+    ds.resize_with_pad = BaseDataset.resize_with_pad.__get__(ds)
+    ds._assert_image_in_unit_range = BaseDataset._assert_image_in_unit_range.__get__(ds)
+    ds.temporal_camera_frames = BaseDataset.temporal_camera_frames.fget(ds)
+    return ds
+
+
+def _frames(t, h=360, w=640):
+    return {
+        "observation.images.cam0": torch.rand(t, 3, h, w),
+        "observation.images.cam0_is_pad": torch.zeros(t, dtype=torch.bool),
+    }
+
+
+def test_policy_owned_window_survives_standardization():
+    """The regression this PR's first draft missed entirely.
+
+    A policy-owned camera window has ``n_obs_history`` unset and ``sequence_length == 1``
+    *by construction* (the factory rejects the alternatives), so keying the shape handling
+    on those two alone sent it down the scalar path, where ``_is_pad.item()`` raised
+    ``a Tensor with 33 elements cannot be converted to Scalar`` on the first training
+    batch — a crash no request-side test could ever have caught.
+    """
+    from opentau.datasets.lerobot_dataset import BaseDataset
+
+    ds = _standardizer(camera_window_frames=33)
+    out = {}
+    pads = BaseDataset._standardize_images(ds, _frames(33), out, 1)
+    assert out["camera0"].shape == (33, 3, 224, 224)
+    assert pads == [False]
+
+
+def test_absent_camera_still_gets_the_window_shaped_zeros():
+    """A missing camera must match the present ones' rank, or collation breaks."""
+    from opentau.datasets.lerobot_dataset import BaseDataset
+
+    ds = _standardizer(camera_window_frames=33)
+    ds._get_name_map = lambda: {}  # camera0 not present in this dataset
+    out = {}
+    pads = BaseDataset._standardize_images(ds, {}, out, 1)
+    assert out["camera0"].shape == (33, 3, 224, 224)
+    assert pads == [True]
+
+
+def test_single_frame_path_is_untouched():
+    """With no window at all, cameras stay rank-3 — the default every other policy uses."""
+    from opentau.datasets.lerobot_dataset import BaseDataset
+
+    ds = _standardizer()
+    item = {
+        "observation.images.cam0": torch.rand(3, 360, 640),
+        "observation.images.cam0_is_pad": torch.tensor(False),
+    }
+    out = {}
+    pads = BaseDataset._standardize_images(ds, item, out, 1)
+    assert out["camera0"].shape == (3, 224, 224)
+    assert pads == [False]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({}, None),
+        ({"n_obs_history": 4}, 4),
+        ({"sequence_length": 3}, 3),
+        ({"camera_window_frames": 33}, 33),
+        # config validation makes these mutually exclusive; precedence is pinned anyway so
+        # a future overlap fails loudly here rather than silently picking a window.
+        ({"n_obs_history": 4, "camera_window_frames": 33}, 4),
+        ({"sequence_length": 3, "camera_window_frames": 33}, 3),
+    ],
+)
+def test_temporal_camera_frames_resolves_all_three_mechanisms(kwargs, expected):
+    """One property owns the question, because keying on a subset has broken twice."""
+    from opentau.datasets.lerobot_dataset import BaseDataset
+
+    ds = _standardizer(**kwargs)
+    assert BaseDataset.temporal_camera_frames.fget(ds) == expected
