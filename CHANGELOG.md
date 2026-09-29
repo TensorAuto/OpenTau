@@ -53,9 +53,12 @@ gRPC stubs in the pre-commit global exclude, since formatting them would rewrite
 **New dependency: NATTEN.** The video VAE imports `natten` at module scope with no fallback and is
 mandatory on the *encode* path, so it is required at inference, not just for decoding. NATTEN
 publishes no PyPI wheels — only a CUDA-compiling sdist — so the prebuilt
-`natten==0.21.6+torch2100cu128` (cp310, linux-x86_64) is pinned by GitHub-release URL
-and marker-gated as the `trt` extra already is. It is pinned to torch 2.10.0 / cu128 exactly: a
-torch bump requires re-pinning it.
+`natten==0.21.6+torch2100cu128` (cp310, linux-x86_64) is pinned by GitHub-release URL in
+`[tool.uv.sources]`. It is a **required dependency** rather than an extra — it resolves
+without conflict, so isolating it would only add a step — and is marker-gated to linux
+x86_64 exactly as `torchcodec` and `onnxruntime-gpu` are. **It is pinned to torch 2.10.0 /
+cu128, so a torch bump requires re-pinning it; because it is required, a stale pin breaks
+`uv sync` project-wide rather than only for this policy.**
 
 ## [0.14.0] - 2026-09-14
 

@@ -51,8 +51,11 @@ Upstream imports itself absolutely in three places, which cannot resolve under
 
 `models/video_vae.py` imports `natten` at module scope with no fallback, and the video
 VAE is mandatory (asserted in `policy.py`) on the **encode** path, so it is required at
-inference, not just for decoding. NATTEN ships no PyPI wheels — only an sdist that
-compiles CUDA kernels. Use the prebuilt wheel matching this stack exactly:
+inference, not just for decoding. It is a **required dependency** of OpenTau rather than
+an extra — it resolves without conflict, so isolating it would only add a step — and is
+marker-gated to linux x86_64 exactly as `torchcodec` and `onnxruntime-gpu` are. NATTEN
+ships no PyPI wheels — only an sdist that compiles CUDA kernels — so the prebuilt wheel
+matching this stack is pinned by URL:
 
 ```
 natten==0.21.6+torch2100cu128   # cp310, linux_x86_64
@@ -70,6 +73,7 @@ one wheel per (python, torch, CUDA, arch) combination. Note 0.21.7 dropped its t
 builds, which is why 0.21.6 is pinned.
 
 **To re-pin after a torch bump:** find the wheel for the new torch/CUDA pair in that
-index, update the URL in `[tool.uv.sources]` and the version in the `flux3-action` extra,
-then `uv lock`. The wheel is specific to torch 2.10.0 / cu128 / cp310 / linux-x86_64, so
-it must stay marker-gated (as the `trt` extra already is).
+index, update the URL in `[tool.uv.sources]` and the version in the main `dependencies`
+list, then `uv lock`. The wheel is specific to torch 2.10.0 / cu128 / cp310 /
+linux-x86_64, so it must stay marker-gated. Because it is a *required* dependency, a
+stale pin breaks `uv sync` project-wide rather than only for this policy.

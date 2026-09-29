@@ -78,10 +78,7 @@ jobs:
           # @pytest.mark.gpu RoboCasa env test in tests/envs/test_robocasa.py can run instead
           # of erroring with "robocasa is not installed"; it co-resolves with libero on the
           # shared robosuite-master stack, so the resolved env for the other tests is unchanged.
-          # --extra flux3-action installs natten, which tests/policies/test_flux3_action_gpu.py
-          # imports at module scope (via models/video_vae.py). Without it those tests fail with
-          # ModuleNotFoundError rather than skipping. It is marker-gated to linux x86_64.
-          uv sync --extra dev --extra libero --extra robocasa --extra flux3-action
+          uv sync --extra dev --extra libero --extra robocasa
 
       - name: Check GPU
         run: nvidia-smi
