@@ -98,3 +98,10 @@ rejected when unsorted, since frames return in offset order and are stacked as a
    against real checkpoints, not plausible defaults.
 4. **Determinism (CLAUDE.md rule 3) is now checkable.** It was not while the policy could
    not train; once it can, a same-seed smoke run should be bit-identical twice.
+5. **The history profile is configurable but still not trainable.** Making the camera
+   window authoritative removed the config dead end, so
+   `Flux3ActionConfig(inference_profile="history")` now validates — but upstream's
+   `prepare` additionally requires a `command_history` batch key
+   (*"history training requires absolute command_history"*) and nothing in the dataset
+   layer emits one. It fails loudly at the first forward rather than silently, so this is
+   a gap in scope rather than a correctness risk; the default profile is unaffected.

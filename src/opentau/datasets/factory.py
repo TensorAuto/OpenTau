@@ -341,12 +341,14 @@ def resolve_delta_timestamps(
         # that collapses. For a policy that supervises predicted frames those duplicates are
         # video *targets*, so the corruption is silent: the window length is still right and
         # every shape still checks out.
+        # A one-frame window has no adjacent pair to collapse, so no rate can duplicate
+        # anything; guarding it would reject a request the `None` default accepts unchanged.
         spacing = (
             min(b - a for a, b in zip(camera_offsets, camera_offsets[1:], strict=False))
             if len(camera_offsets) > 1
-            else 1
+            else None
         )
-        if action_freq > spacing * ds_meta.fps + 1e-6:
+        if spacing is not None and action_freq > spacing * ds_meta.fps + 1e-6:
             raise ValueError(
                 f"policy.camera_delta_indices with action_freq={action_freq} Hz on a dataset "
                 f"recorded at {ds_meta.fps} Hz: its closest offsets are {spacing} frame(s) apart, "

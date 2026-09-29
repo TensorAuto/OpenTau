@@ -481,3 +481,14 @@ def test_repeated_offset_is_rejected():
     cfg, ds_cfg = _make_cfg(camera_window=(0, 1, 1, 2))
     with pytest.raises(ValueError, match="strictly ascending"):
         resolve_delta_timestamps(cfg, ds_cfg, _meta({"camera0": {}}))
+
+
+def test_single_offset_window_is_not_rejected_by_the_oversampling_guard():
+    """One frame has no adjacent pair, so no rate can collapse it into a duplicate.
+
+    Guarding it anyway would reject a request that the ``None`` default accepts unchanged —
+    the same window, expressed two ways, must not disagree.
+    """
+    cfg, ds_cfg = _make_cfg(camera_window=(0,), action_freq=30.0)
+    dt, _, _, _ = resolve_delta_timestamps(cfg, ds_cfg, _meta({"camera0": {}}, fps=15))
+    np.testing.assert_allclose(dt["camera0"], [0.0])
