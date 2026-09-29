@@ -313,11 +313,13 @@ def resolve_delta_timestamps(
                 "policy.camera_delta_indices must not be empty; return None to use the "
                 "observation-history window instead."
             )
-        if list(camera_offsets) != sorted(camera_offsets):
+        if any(b <= a for a, b in zip(camera_offsets, camera_offsets[1:], strict=False)):
             raise ValueError(
-                f"policy.camera_delta_indices must be temporally ascending, got {camera_offsets}. "
+                f"policy.camera_delta_indices must be strictly ascending, got {camera_offsets}. "
                 "The fetch layer returns frames in offset order and the policy stacks them as a "
-                "time axis, so an unsorted window silently reorders time."
+                "time axis, so an unsorted window silently reorders time -- and a repeated offset "
+                "silently duplicates a frame while keeping the window length, which upstream's "
+                "window_frames check cannot see."
             )
         if getattr(cfg.dataset_mixture, "sequence_length", 1) > 1:
             raise ValueError(

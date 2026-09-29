@@ -409,3 +409,47 @@ def test_policies_without_a_camera_window_keep_the_original_pairing_rule():
     cfg = _train_cfg(policy, n_obs_history=3, action_chunk=policy.chunk_size)
     with pytest.raises(ValueError, match="n_obs_steps"):
         cfg.validate()
+
+
+# ------------------------------------------------- the config -> dataset seam
+def test_dataset_reads_the_camera_window_from_a_real_config():
+    """The one seam the rest of the suite never crosses.
+
+    The request side is tested through ``resolve_delta_timestamps`` and the standardization
+    side by injecting ``camera_window_frames`` onto a stub — so a rename or typo in the
+    ``getattr`` that bridges them would fail *silently*: the window falls back to
+    single-frame and the Scalar crash returns with the whole suite still green. This builds
+    a real ``BaseDataset`` from a real ``TrainPipelineConfig`` and asserts the bridge.
+    """
+    from opentau.datasets.lerobot_dataset import BaseDataset
+    from opentau.policies.flux3_action.configuration_flux3_action import Flux3ActionConfig
+
+    policy = Flux3ActionConfig()
+    cfg = _train_cfg(policy, n_obs_history=None, action_chunk=policy.chunk_size)
+    ds = BaseDataset(cfg)
+
+    assert ds.camera_window_frames == len(policy.camera_delta_indices)
+    assert ds.temporal_camera_frames == policy.to_policy_config().window_frames
+    assert ds.n_obs_history is None and ds.sequence_length == 1
+
+
+def test_dataset_has_no_camera_window_for_a_policy_that_does_not_opt_in():
+    """The default stays single-frame, which is what every other policy relies on."""
+    from opentau.datasets.lerobot_dataset import BaseDataset
+    from opentau.policies.pi05.configuration_pi05 import PI05Config
+
+    policy = PI05Config()
+    ds = BaseDataset(_train_cfg(policy, action_chunk=policy.chunk_size))
+    assert ds.camera_window_frames is None
+    assert ds.temporal_camera_frames is None
+
+
+def test_repeated_offset_is_rejected():
+    """``(0, 1, 1, 2)`` sorts fine and keeps the window length, so nothing downstream sees it.
+
+    Upstream only checks the frame *count*, so a duplicated offset silently stacks the same
+    frame twice on the time axis — every shape checks out and one video target is wrong.
+    """
+    cfg, ds_cfg = _make_cfg(camera_window=(0, 1, 1, 2))
+    with pytest.raises(ValueError, match="strictly ascending"):
+        resolve_delta_timestamps(cfg, ds_cfg, _meta({"camera0": {}}))
