@@ -324,5 +324,26 @@ class Flux3ActionConfig(PreTrainedConfig):
         return list(range(self.chunk_size))
 
     @property
+    def camera_delta_indices(self) -> list[int]:
+        """Frames per camera the loader must fetch: the observation window plus futures.
+
+        F3A supervises predicted frames, so training needs the frames *after* the
+        observation as video targets -- upstream's ``prepare`` refuses a window that is
+        not exactly ``window_frames`` per camera, "observations plus future frames".
+        That window is ``chunk_size`` future frames on top of the observation window
+        (one frame, or ``n_obs_steps`` under the history profile), so the offsets run
+        from ``-(n_obs - 1)`` through ``chunk_size`` inclusive and this list is
+        ``window_frames`` long by construction -- pinned by the CPU suite.
+
+        Note the cost: this multiplies camera decodes per sample by roughly
+        ``chunk_size``, across every camera in ``camera_keys`` (three for the DROID
+        layout). That is inherent to a joint video-action objective, not an accident of
+        this wiring, but it is the reason no other policy here returns anything but
+        ``None``.
+        """
+        n_obs = self.n_obs_steps if self.inference_profile == "history" else 1
+        return list(range(-(n_obs - 1), self.chunk_size + 1))
+
+    @property
     def reward_delta_indices(self) -> None:
         return None

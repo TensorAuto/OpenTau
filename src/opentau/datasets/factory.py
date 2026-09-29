@@ -299,6 +299,39 @@ def resolve_delta_timestamps(
             mkey if mkey in DATA_FEATURES_NAME_MAPPING else dataset_cfg.repo_id
         ]
     reverse_name_map = {v: k for k, v in name_map.items()}
+
+    # A policy that supervises predicted frames (``flux3_action``) needs the frames
+    # *after* the observation as video targets, so it supplies an explicit camera window
+    # that may run forward instead of using the observation history. Resolve it once:
+    # both conflicts below are properties of the config, not of any one feature key, so
+    # checking them inside the loop would raise once per camera and bury the reason.
+    camera_offsets = getattr(cfg.policy, "camera_delta_indices", None) if cfg.policy else None
+    if camera_offsets is not None:
+        camera_offsets = list(camera_offsets)
+        if not camera_offsets:
+            raise ValueError(
+                "policy.camera_delta_indices must not be empty; return None to use the "
+                "observation-history window instead."
+            )
+        if list(camera_offsets) != sorted(camera_offsets):
+            raise ValueError(
+                f"policy.camera_delta_indices must be temporally ascending, got {camera_offsets}. "
+                "The fetch layer returns frames in offset order and the policy stacks them as a "
+                "time axis, so an unsorted window silently reorders time."
+            )
+        if getattr(cfg.dataset_mixture, "sequence_length", 1) > 1:
+            raise ValueError(
+                "policy.camera_delta_indices cannot be combined with "
+                "dataset_mixture.sequence_length > 1: trajectory-sequence mode emits one "
+                "observation per supervised timestep, which is a different camera window."
+            )
+        if cfg.dataset_mixture.n_obs_history is not None:
+            raise ValueError(
+                "policy.camera_delta_indices cannot be combined with "
+                "dataset_mixture.n_obs_history: both define the camera window. The policy's "
+                "own window already spans whatever observation history it needs."
+            )
+
     for key in ds_meta.features:
         if key not in reverse_name_map:
             continue  # only process camera, state, and action features
@@ -363,6 +396,12 @@ def resolve_delta_timestamps(
                 for t in range(seq_len)
                 for h in chunk_offsets
             ]
+        elif "camera" in standard_key and camera_offsets is not None:
+            # Cameras only -- the state stays a single observed frame; it is the *video*
+            # stream that needs future targets. Offsets may be positive: the fetch layer
+            # clips `idx + delta` into the episode and raises `<key>_is_pad` at the end
+            # exactly as it does at the start, so episode boundaries need nothing here.
+            delta_timestamps[key] = [offset / action_freq for offset in camera_offsets]
         elif "camera" in standard_key or standard_key == "state":
             n_obs = cfg.dataset_mixture.n_obs_history
             if seq_len > 1:
