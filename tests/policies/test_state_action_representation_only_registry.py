@@ -60,6 +60,7 @@ ALL_POLICY_TYPES = frozenset(
         "cosmos3",
         "cosmos3_nano",
         "xr1",
+        "flux3_action",
         "value",
     }
 )

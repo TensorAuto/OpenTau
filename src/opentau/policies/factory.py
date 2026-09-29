@@ -37,6 +37,7 @@ from opentau.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from opentau.datasets.utils import dataset_to_policy_features
 from opentau.policies.cosmos3.configuration_cosmos3 import Cosmos3Config
 from opentau.policies.cosmos3_nano.configuration_cosmos3_nano import Cosmos3NanoConfig
+from opentau.policies.flux3_action.configuration_flux3_action import Flux3ActionConfig
 from opentau.policies.pi0.configuration_pi0 import PI0Config
 from opentau.policies.pi05.configuration_pi05 import PI05Config
 from opentau.policies.pi05_mem.configuration_pi05 import PI05MemConfig
@@ -133,6 +134,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from opentau.policies.cosmos3_nano.modeling_cosmos3_nano import Cosmos3NanoPolicy
 
         return Cosmos3NanoPolicy
+    elif name == "flux3_action":
+        from opentau.policies.flux3_action.modeling_flux3_action import Flux3ActionPolicy
+
+        return Flux3ActionPolicy
     elif name == "xr1":
         from opentau.policies.xr1.modeling_xr1 import XR1Policy
 
@@ -188,6 +193,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return Cosmos3Config(**kwargs)
     elif policy_type == "cosmos3_nano":
         return Cosmos3NanoConfig(**kwargs)
+    elif policy_type == "flux3_action":
+        return Flux3ActionConfig(**kwargs)
     elif policy_type == "xr1":
         return XR1Config(**kwargs)
     elif policy_type == "value":

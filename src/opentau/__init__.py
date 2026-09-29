@@ -173,6 +173,7 @@ available_policies = [
     "cosmos3",
     "cosmos3_nano",
     "xr1",
+    "flux3_action",
     "value",
 ]
 

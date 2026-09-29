@@ -1,0 +1,12 @@
+This directory contains code vendored from the FLUX Action project.
+
+    FLUX Action
+    Copyright 2026 Black Forest Labs
+
+    Model components retain their Black Forest Labs copyright and Apache-2.0 notices.
+    Model weights and datasets are separate artifacts; this repository includes neither.
+
+Vendored from https://github.com/black-forest-labs/flux-action at commit
+e2dd1d8dbc5977b54315d61f7548c63c043d6d4f, licensed under the Apache License,
+Version 2.0. The per-file Black Forest Labs copyright headers are retained
+verbatim. See VENDOR.md for the provenance and the exact local delta.
