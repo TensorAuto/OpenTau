@@ -564,8 +564,10 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         ``datasets.factory.resolve_delta_timestamps`` emit those offsets for camera keys
         instead of the history window.
 
-        Offsets are in frames at the resampled ``action_freq``, temporally ascending, and
-        may be negative (past), zero (the observed frame) or positive (future). Nothing
+        Offsets are in frames at the resampled ``action_freq``, **strictly** ascending
+        (a repeated offset is rejected: it would silently duplicate a frame while keeping
+        the window length), and may be negative (past), zero (the observed frame) or
+        positive (future). Nothing
         below this needs changing to support a positive one: the fetch layer clips
         ``idx + delta`` into the episode and raises ``<key>_is_pad`` symmetrically at
         either end.
@@ -575,8 +577,8 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         implement it to say "no".
 
         Returns:
-            Ascending frame offsets for each camera, or None to use the observation
-            history window.
+            Strictly ascending frame offsets for each camera, or None to use the
+            observation history window.
         """
         return None
 

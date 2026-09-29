@@ -98,9 +98,12 @@ def _make_cfg(camera_window=None, n_obs_history=None, action_freq=30.0, sequence
     return cfg, dataset_cfg
 
 
-def _meta(features):
+def _meta(features, fps=30):
+    """Dataset metadata stub. ``fps`` must be a real number: the oversampling guard
+    compares it against ``action_freq``, and a bare MagicMock would compare truthy."""
     meta = MagicMock()
     meta.features = features
+    meta.fps = fps
     return meta
 
 
@@ -242,7 +245,7 @@ def test_flux3_action_window_is_ascending_and_accepted_by_the_factory():
 
     policy = Flux3ActionConfig()
     cfg, ds_cfg = _make_cfg(camera_window=tuple(policy.camera_delta_indices), action_freq=15.0)
-    dt, _, _, _ = resolve_delta_timestamps(cfg, ds_cfg, _meta({"camera0": {}, "state": {}}))
+    dt, _, _, _ = resolve_delta_timestamps(cfg, ds_cfg, _meta({"camera0": {}, "state": {}}, fps=15))
     assert len(dt["camera0"]) == policy.to_policy_config().window_frames
     np.testing.assert_allclose(dt["camera0"][0], 0.0)
     np.testing.assert_allclose(dt["camera0"][-1], policy.chunk_size / 15.0)
@@ -442,6 +445,31 @@ def test_dataset_has_no_camera_window_for_a_policy_that_does_not_opt_in():
     ds = BaseDataset(_train_cfg(policy, action_chunk=policy.chunk_size))
     assert ds.camera_window_frames is None
     assert ds.temporal_camera_frames is None
+
+
+def test_oversampling_the_source_fps_is_rejected():
+    """Distinct offsets can still collapse onto one source frame.
+
+    Offsets are converted to seconds at ``action_freq`` but fetched by nearest *source*
+    frame, so a resampling rate above the dataset's fps makes adjacent offsets land inside
+    one frame — the fetch returns the same image twice. The strictly-ascending check cannot
+    see it: the offsets are distinct, it is their spacing in seconds that collapses, and the
+    window length stays correct so upstream's ``window_frames`` check passes too. This
+    mirrors the guard sequence mode already has for the same fps pairing.
+    """
+    # 30 Hz requested on a 15 fps dataset: 1/30s apart, half a source frame
+    cfg, ds_cfg = _make_cfg(camera_window=(0, 1, 2, 3), action_freq=30.0)
+    meta = _meta({"camera0": {}}, fps=15)
+    with pytest.raises(ValueError, match="same image"):
+        resolve_delta_timestamps(cfg, ds_cfg, meta)
+
+
+def test_matching_the_source_fps_is_accepted():
+    """At action_freq == fps every offset lands on its own frame — the normal case."""
+    cfg, ds_cfg = _make_cfg(camera_window=(0, 1, 2, 3), action_freq=15.0)
+    meta = _meta({"camera0": {}}, fps=15)
+    dt, _, _, _ = resolve_delta_timestamps(cfg, ds_cfg, meta)
+    assert len(dt["camera0"]) == 4
 
 
 def test_repeated_offset_is_rejected():

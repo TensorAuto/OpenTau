@@ -333,6 +333,28 @@ def resolve_delta_timestamps(
                 "dataset_mixture.n_obs_history: both define the camera window. The policy's "
                 "own window already spans whatever observation history it needs."
             )
+        # Oversampling guard, mirroring the sequence-mode one below. Offsets are converted
+        # to seconds at `action_freq` but fetched by nearest *source* frame, so when the
+        # resampling rate outruns the dataset's fps, consecutive offsets land inside one
+        # source frame and the fetch returns the same image twice. The strictly-ascending
+        # check cannot see this -- the offsets are distinct, it is their spacing in seconds
+        # that collapses. For a policy that supervises predicted frames those duplicates are
+        # video *targets*, so the corruption is silent: the window length is still right and
+        # every shape still checks out.
+        spacing = (
+            min(b - a for a, b in zip(camera_offsets, camera_offsets[1:], strict=False))
+            if len(camera_offsets) > 1
+            else 1
+        )
+        if action_freq > spacing * ds_meta.fps + 1e-6:
+            raise ValueError(
+                f"policy.camera_delta_indices with action_freq={action_freq} Hz on a dataset "
+                f"recorded at {ds_meta.fps} Hz: its closest offsets are {spacing} frame(s) apart, "
+                f"i.e. {spacing / action_freq:.4f}s, shorter than one source frame "
+                f"({1 / ds_meta.fps:.4f}s), so they would resolve to the same image and the "
+                "duplicate would be trained on as a distinct video target. Set "
+                "dataset_mixture.action_freq to the dataset's fps."
+            )
 
     for key in ds_meta.features:
         if key not in reverse_name_map:
