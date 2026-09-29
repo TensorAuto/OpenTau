@@ -1,9 +1,7 @@
-# Follow-up: what OpenTau needs before `flux3_action` can be finetuned
+# Training `flux3_action`: the camera window
 
-This port lands **inference and eval**. Finetuning needs one change in the dataset layer
-that is deliberately *not* in this PR, because it touches a path shared by every policy
-and deserves its own review. This note records what the change is, why OpenTau needs it,
-and why it is smaller than it first appears.
+The policy port landed inference and eval. This note records the one dataset-layer change
+finetuning needed, why it was needed, and what still stands between here and a real run.
 
 ## Why F3A needs something no other policy here needs
 
@@ -16,9 +14,9 @@ required:
 REQUIRED_CONTENT_STREAMS = ("video", "video_cond")   # config.py
 ```
 
-So its training loss has a video term (`video_mse`, weighted by `video_loss_weight`)
-whose **targets are the frames that come after the observation**. Upstream says so
-directly, and raises if they are absent (`policy.py`, in `prepare`):
+So its training loss carries a video term (`video_mse`, weighted by `video_loss_weight`)
+whose **targets are the frames after the observation**. Upstream says so directly, and
+raises rather than guessing (`policy.py`, in `prepare`):
 
 ```python
 if t != cfg.window_frames:
@@ -27,76 +25,83 @@ if t != cfg.window_frames:
     )
 ```
 
-Inference needs none of this — the video tokens are denoised from noise conditioned on
-the observed frame — which is exactly why eval works against the dataloader as it stands
-and only training is blocked.
+Inference needs none of this — video tokens are denoised from noise conditioned on the
+observed frame — which is why eval worked against the dataloader unchanged and only
+training was blocked.
 
-## What blocks it today
+## What was missing, and why the fix was small
 
-`datasets/factory.py::resolve_delta_timestamps` decides, per feature key, which frame
-offsets the loader will fetch. Actions get a configurable forward horizon; cameras never
-do. Every camera branch emits non-positive offsets:
+`resolve_delta_timestamps` decides which frame offsets the loader fetches per feature key.
+Actions read `policy.action_delta_indices`, which may be positive; cameras only ever got
+the observation history, whose offsets are all `<= 0`. There was no way to ask for a
+future frame.
+
+The **fetch** layer was already sign-agnostic: `LeRobotDataset._get_query_indices_soft`
+applies whatever offsets it is handed, clipping `idx + delta` into the episode and raising
+`<key>_is_pad` at whichever end overruns. A positive offset clamps at the episode *end*
+exactly as a negative one clamps at the start, so that layer needed nothing.
+
+The **standardization** layer did, and an earlier draft of this note wrongly said it did
+not. `_standardize_images` decides single- vs multi-frame from the mixture-level knobs
+only, so a policy-owned window — which by construction has `n_obs_history` unset and
+`sequence_length == 1` — fell through to the scalar path and died on the first training
+batch with `a Tensor with 33 elements cannot be converted to Scalar`. The three mechanisms
+now resolve through one `temporal_camera_frames` property so a fourth cannot repeat it.
+
+### A known gap, not yet closed
+
+Per-frame camera padding is **not** visible to the policy. `_standardize_images`
+deliberately reduces camera `_is_pad` to "is this camera slot absent", discarding which
+*frames* were clamped at an episode boundary — and F3A's `_valid_windows` scans only the
+flags that survive. Because the camera window runs to `+chunk_size` while `action_is_pad`
+stops at `chunk_size - 1`, there is exactly one sample position per episode where the
+actions are entirely in-bounds but the final video target is a clamped duplicate of the
+last real frame, and nothing marks it.
+
+One position per episode is small, but it is silent, so it is recorded here rather than
+assumed harmless. Closing it means surfacing per-frame camera pads (additively, so the
+existing slot-level semantics are untouched) or restricting window starts so the camera
+window fits — neither belongs in this PR, and neither matters until training actually runs.
+
+## What the change is
+
+`PreTrainedConfig.camera_delta_indices` — a concrete property defaulting to `None`,
+deliberately **not** a fourth `@abc.abstractproperty`, so no existing policy config has to
+implement it to say "no". At `None` the old history path runs unchanged.
+
+`Flux3ActionConfig` returns the window its `window_frames` implies:
 
 ```python
-elif "camera" in standard_key or standard_key == "state":
-    n_obs = cfg.dataset_mixture.n_obs_history
-    if seq_len > 1:
-        delta_timestamps[key] = [-(seq_len - 1 - t) * seq_stride / action_freq for t in range(seq_len)]
-    elif n_obs is not None:
-        delta_timestamps[key] = [-(n_obs - 1 - i) * interval / action_freq for i in range(n_obs)]
-    else:
-        delta_timestamps[key] = [0.0]
+n_obs = self.n_obs_steps if self.inference_profile == "history" else 1
+return list(range(-(n_obs - 1), self.chunk_size + 1))
 ```
 
-Actions, by contrast, read `cfg.policy.action_delta_indices`, which may be positive.
-There is no `camera_delta_indices` equivalent, so a policy cannot ask for future frames
-however it is configured.
+Derived independently of `window_frames` and then asserted equal to it, so a drift between
+the two fails in the CPU suite rather than at the first training forward.
 
-## Why the change is small: the fetch layer is already sign-agnostic
+Constraints, each pinned by a test: cameras only (a forward window on **state** would feed
+the policy future joint positions — a label leak no shape check catches); rejected
+alongside `n_obs_history` or `sequence_length > 1`, which define the camera window too; and
+rejected when unsorted, since frames return in offset order and are stacked as a time axis.
 
-The important part is that nothing *below* this assumes observation offsets are
-non-positive. `LeRobotDataset::_get_query_indices_soft` applies whatever offsets it is
-handed:
+## What still stands between here and a trained policy
 
-```python
-query_indices = {key: np.clip(idx + delta_idx, ep_start, ep_end - 1) for key, delta_idx in delta_indices.items()}
-padding = {
-    f"{key}_is_pad": torch.tensor((idx + delta_idx < ep_start) | (idx + delta_idx >= ep_end), dtype=torch.bool)
-    for key, delta_idx in delta_indices.items()
-}
-```
-
-A **positive** offset clips at the episode *end* rather than the start and raises the
-matching `_is_pad` flag, symmetrically with a negative one. `_add_padding_keys` is
-generic over keys. So episode-boundary handling, padding flags and the windows-that-
-overrun-the-episode logic all work already — F3A's own `_valid_windows` scans exactly
-those `*_is_pad` flags to drop such windows.
-
-The missing piece is only the **request** side.
-
-## Proposed change
-
-1. Add a `camera_delta_indices` property to `PreTrainedConfig`, defaulting to `None`,
-   alongside the existing `observation_delta_indices` / `action_delta_indices`.
-2. In `resolve_delta_timestamps`, when a policy supplies it, emit those offsets for
-   camera keys instead of the history-only window.
-3. Have `Flux3ActionConfig` return the window its `PolicyConfig.window_frames` implies.
-4. Test that a positive offset clips at the episode end and sets `_is_pad` — the
-   mirror of the existing start-of-episode behaviour.
-
-Two things to weigh in that review, neither of which is a blocker:
-
-- **Throughput.** Each extra frame per camera is an extra decode per sample. F3A's DROID
-  layout is three cameras, so the cost is real and worth measuring before it becomes a
-  default anywhere.
-- **Not F3A-specific.** Any future world-model policy that supervises predicted frames
-  needs the same knob, which is the argument for putting it on `PreTrainedConfig` rather
-  than special-casing one policy inside the dataset factory.
-
-## Why not just fold it into this PR
-
-It changes a function every policy's data path runs through, to enable a policy that
-cannot train until several other things land as well (a dataset with the right camera
-layout, the trunk checkpoints, a validated config). Shipping it separately keeps the
-blast radius of a shared-path change reviewable on its own terms, and keeps this PR to
-what it can actually demonstrate: a registered policy that builds, loads and runs.
+1. **Nothing has loaded real weights yet.** Every test to date builds a tiny random
+   `dit_config` with stubbed encoders. `wiring.py::load_action_checkpoint` does real work —
+   content-stream filtering, remapping the co-trained `action_prediction.*` backbone onto
+   this embodiment's modality, deterministic fresh-head seeding — that no test exercises
+   against real tensors.
+2. **Throughput is unmeasured.** 33 frames per camera across three DROID cameras is
+   roughly a 33x increase in camera decodes per sample. Inherent to a joint video-action
+   objective, but it should be measured before anyone plans a run around it.
+3. **No validated train config.** `configs/examples/flux3_action_*.json` should be written
+   against real checkpoints, not plausible defaults.
+4. **Determinism (CLAUDE.md rule 3) is now checkable.** It was not while the policy could
+   not train; once it can, a same-seed smoke run should be bit-identical twice.
+5. **The history profile is configurable but still not trainable.** Making the camera
+   window authoritative removed the config dead end, so
+   `Flux3ActionConfig(inference_profile="history")` now validates — but upstream's
+   `prepare` additionally requires a `command_history` batch key
+   (*"history training requires absolute command_history"*) and nothing in the dataset
+   layer emits one. It fails loudly at the first forward rather than silently, so this is
+   a gap in scope rather than a correctness risk; the default profile is unaffected.

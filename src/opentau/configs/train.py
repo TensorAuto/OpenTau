@@ -542,11 +542,30 @@ class TrainPipelineConfig(HubMixin):
 
             # The policy's ``n_obs_steps`` determines the T dimension its
             # encoder expects; the dataset_mixture's ``n_obs_history`` is
-            # what the dataloader actually produces. They must agree.
+            # what the dataloader actually produces. They must agree -- unless
+            # the policy owns the camera window outright.
             if self.dataset_mixture is not None:
                 dm = self.dataset_mixture
                 dm_n_obs = dm.n_obs_history if dm.n_obs_history is not None else 1
-                if self.policy.n_obs_steps != dm_n_obs:
+                if getattr(self.policy, "camera_delta_indices", None) is not None:
+                    # A policy that supervises predicted frames expresses its whole
+                    # camera window -- observation history *and* future targets -- through
+                    # ``camera_delta_indices``, and ``datasets.factory`` rejects pairing
+                    # that with ``n_obs_history``. Demanding the two agree here would make
+                    # such a policy unconfigurable: unset ``n_obs_history`` fails this
+                    # check for any ``n_obs_steps > 1``, and setting it fails the factory,
+                    # with each error pointing at the other. The policy's window is
+                    # authoritative; all that is required is that the mixture not also
+                    # claim one.
+                    if dm.n_obs_history is not None:
+                        raise ValueError(
+                            f"policy.camera_delta_indices is set (the policy owns its camera "
+                            f"window, spanning {len(self.policy.camera_delta_indices)} frames), "
+                            f"so dataset_mixture.n_obs_history must stay unset; got "
+                            f"{dm.n_obs_history}. The observation history such a policy needs "
+                            "is already part of its own window."
+                        )
+                elif self.policy.n_obs_steps != dm_n_obs:
                     raise ValueError(
                         f"policy.n_obs_steps ({self.policy.n_obs_steps}) != "
                         f"dataset_mixture.n_obs_history ({dm.n_obs_history}; "

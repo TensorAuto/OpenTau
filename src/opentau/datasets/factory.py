@@ -299,6 +299,65 @@ def resolve_delta_timestamps(
             mkey if mkey in DATA_FEATURES_NAME_MAPPING else dataset_cfg.repo_id
         ]
     reverse_name_map = {v: k for k, v in name_map.items()}
+
+    # A policy that supervises predicted frames (``flux3_action``) needs the frames
+    # *after* the observation as video targets, so it supplies an explicit camera window
+    # that may run forward instead of using the observation history. Resolve it once:
+    # both conflicts below are properties of the config, not of any one feature key, so
+    # checking them inside the loop would raise once per camera and bury the reason.
+    camera_offsets = getattr(cfg.policy, "camera_delta_indices", None) if cfg.policy else None
+    if camera_offsets is not None:
+        camera_offsets = list(camera_offsets)
+        if not camera_offsets:
+            raise ValueError(
+                "policy.camera_delta_indices must not be empty; return None to use the "
+                "observation-history window instead."
+            )
+        if any(b <= a for a, b in zip(camera_offsets, camera_offsets[1:], strict=False)):
+            raise ValueError(
+                f"policy.camera_delta_indices must be strictly ascending, got {camera_offsets}. "
+                "The fetch layer returns frames in offset order and the policy stacks them as a "
+                "time axis, so an unsorted window silently reorders time -- and a repeated offset "
+                "silently duplicates a frame while keeping the window length, which upstream's "
+                "window_frames check cannot see."
+            )
+        if getattr(cfg.dataset_mixture, "sequence_length", 1) > 1:
+            raise ValueError(
+                "policy.camera_delta_indices cannot be combined with "
+                "dataset_mixture.sequence_length > 1: trajectory-sequence mode emits one "
+                "observation per supervised timestep, which is a different camera window."
+            )
+        if cfg.dataset_mixture.n_obs_history is not None:
+            raise ValueError(
+                "policy.camera_delta_indices cannot be combined with "
+                "dataset_mixture.n_obs_history: both define the camera window. The policy's "
+                "own window already spans whatever observation history it needs."
+            )
+        # Oversampling guard, mirroring the sequence-mode one below. Offsets are converted
+        # to seconds at `action_freq` but fetched by nearest *source* frame, so when the
+        # resampling rate outruns the dataset's fps, consecutive offsets land inside one
+        # source frame and the fetch returns the same image twice. The strictly-ascending
+        # check cannot see this -- the offsets are distinct, it is their spacing in seconds
+        # that collapses. For a policy that supervises predicted frames those duplicates are
+        # video *targets*, so the corruption is silent: the window length is still right and
+        # every shape still checks out.
+        # A one-frame window has no adjacent pair to collapse, so no rate can duplicate
+        # anything; guarding it would reject a request the `None` default accepts unchanged.
+        spacing = (
+            min(b - a for a, b in zip(camera_offsets, camera_offsets[1:], strict=False))
+            if len(camera_offsets) > 1
+            else None
+        )
+        if spacing is not None and action_freq > spacing * ds_meta.fps + 1e-6:
+            raise ValueError(
+                f"policy.camera_delta_indices with action_freq={action_freq} Hz on a dataset "
+                f"recorded at {ds_meta.fps} Hz: its closest offsets are {spacing} frame(s) apart, "
+                f"i.e. {spacing / action_freq:.4f}s, shorter than one source frame "
+                f"({1 / ds_meta.fps:.4f}s), so they would resolve to the same image and the "
+                "duplicate would be trained on as a distinct video target. Set "
+                "dataset_mixture.action_freq to the dataset's fps."
+            )
+
     for key in ds_meta.features:
         if key not in reverse_name_map:
             continue  # only process camera, state, and action features
@@ -363,6 +422,12 @@ def resolve_delta_timestamps(
                 for t in range(seq_len)
                 for h in chunk_offsets
             ]
+        elif "camera" in standard_key and camera_offsets is not None:
+            # Cameras only -- the state stays a single observed frame; it is the *video*
+            # stream that needs future targets. Offsets may be positive: the fetch layer
+            # clips `idx + delta` into the episode and raises `<key>_is_pad` at the end
+            # exactly as it does at the start, so episode boundaries need nothing here.
+            delta_timestamps[key] = [offset / action_freq for offset in camera_offsets]
         elif "camera" in standard_key or standard_key == "state":
             n_obs = cfg.dataset_mixture.n_obs_history
             if seq_len > 1:

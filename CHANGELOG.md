@@ -60,6 +60,48 @@ x86_64 exactly as `torchcodec` and `onnxruntime-gpu` are. **It is pinned to torc
 cu128, so a torch bump requires re-pinning it; because it is required, a stale pin breaks
 `uv sync` project-wide rather than only for this policy.**
 
+### Added — camera windows that run forward (`policy.camera_delta_indices`) — **opt-in, default `None`, no `config_version` bump**
+
+Until now every camera offset OpenTau emitted was non-positive: `resolve_delta_timestamps`
+gave cameras and state the observation-history window, and only actions had a forward
+horizon (`action_delta_indices`). That is the right default for a policy that consumes the
+past and predicts actions — but it makes a policy that **supervises predicted frames**
+untrainable, because its video targets are the frames *after* the observation.
+
+`flux3_action` is the first such policy here. Upstream refuses any camera window that is
+not exactly `window_frames` — *"observations plus future frames"* — so without this it
+fails at the first training forward rather than at config time.
+
+**Why the change is small.** Nothing below the request side ever assumed non-positive
+offsets. `LeRobotDataset._get_query_indices_soft` applies whatever it is handed:
+
+```python
+query_indices = {key: np.clip(idx + delta_idx, ep_start, ep_end - 1) ...}
+padding = {f"{key}_is_pad": (idx + delta_idx < ep_start) | (idx + delta_idx >= ep_end) ...}
+```
+
+A positive offset clips at the episode *end* and raises its `_is_pad` flag, the exact
+mirror of a negative one clipping at the start. Episode-boundary handling, padding flags,
+and the drop-windows-that-overrun logic therefore all worked already — only the *request*
+side needed a way to ask.
+
+**Shape of the knob.** `PreTrainedConfig.camera_delta_indices` is a concrete property
+defaulting to `None`, deliberately **not** a fourth `@abc.abstractproperty` alongside
+`observation_`/`action_`/`reward_delta_indices` — an abstract one would force all fourteen
+existing policy configs to implement it just to say "no". At `None` the old history path
+runs byte for byte.
+
+It applies to **cameras only**; state stays a single observed frame. Handing state a
+forward window would feed the policy future joint positions — a label leak no shape check
+would catch. It is rejected outright when combined with `dataset_mixture.n_obs_history` or
+`sequence_length > 1` (each defines the camera window too), and when unsorted (frames come
+back in offset order and are stacked as a time axis, so an unsorted window silently
+reorders time).
+
+**Cost.** For `flux3_action` this is `chunk_size + 1` = 33 frames per camera per sample,
+across three cameras in the DROID layout — roughly a 33x increase in camera decodes. That
+is inherent to a joint video-action objective, and the reason no other policy opts in.
+
 ## [0.14.0] - 2026-09-14
 
 ### Added — best-of-N action-chunk sampling — **opt-in, default `1`, no `config_version` bump**
