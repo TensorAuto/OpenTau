@@ -136,9 +136,10 @@ class Flux3ActionPolicy(PreTrainedPolicy):
 
         ``**kwargs`` reaches upstream the way ``select_action`` and ``predict_action_chunk``
         already let theirs through. It carries upstream's ``prepared=`` argument, the
-        pre-encoded windows of a VAE encode issued on another stream; OpenTau's trainer
-        does not use it today, but dropping it here would silently make the pipelined
-        encode unreachable rather than fail visibly.
+        pre-encoded windows of a VAE encode issued on another stream; OpenTau's trainer does
+        not use it today. Taking the argument and *not* forwarding it is the silent failure
+        -- the caller's pre-encoded windows would be dropped and re-encoded, with nothing to
+        see but the cost -- so the test asserts what upstream receives, not the signature.
         """
         return self.model(self._upstream_batch(batch), **kwargs)
 

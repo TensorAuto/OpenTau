@@ -416,7 +416,7 @@ def test_a_training_step_runs_and_moves_both_param_groups():
     for index, group in enumerate(optimizer.param_groups):
         deltas = [
             (new.detach() - old).abs().max().item()
-            for old, new in zip(before[index], group["params"], strict=False)
+            for old, new in zip(before[index], group["params"], strict=True)
             if new.grad is not None
         ]
         assert any(d > 0 for d in deltas), f"param group {index} did not move"
