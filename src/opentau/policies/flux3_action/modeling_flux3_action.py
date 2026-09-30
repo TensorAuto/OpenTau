@@ -126,15 +126,21 @@ class Flux3ActionPolicy(PreTrainedPolicy):
         return out
 
     # ------------------------------------------------------------------ contract
-    def forward(self, batch: dict[str, Any]) -> tuple[Tensor, dict | None]:
+    def forward(self, batch: dict[str, Any], **kwargs: Any) -> tuple[Tensor, dict | None]:
         """Training loss for a micro-batch.
 
         Returns upstream's scalar flow-matching loss unchanged, with its ``video_mse`` /
         ``action_mse`` / ``n_valid_windows`` diagnostics as the auxiliary dict -- the
         video term is part of the joint objective, not an optional extra (see
         ``configuration_flux3_action``).
+
+        ``**kwargs`` reaches upstream the way ``select_action`` and ``predict_action_chunk``
+        already let theirs through. It carries upstream's ``prepared=`` argument, the
+        pre-encoded windows of a VAE encode issued on another stream; OpenTau's trainer
+        does not use it today, but dropping it here would silently make the pipelined
+        encode unreachable rather than fail visibly.
         """
-        return self.model(self._upstream_batch(batch))
+        return self.model(self._upstream_batch(batch), **kwargs)
 
     def select_action(self, batch: dict[str, Any], **kwargs: Any) -> Tensor:
         """Select the next action, refilling upstream's internal chunk queue as needed."""

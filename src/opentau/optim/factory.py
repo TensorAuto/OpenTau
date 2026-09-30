@@ -16,6 +16,7 @@
 # limitations under the License.
 
 
+from torch import Tensor
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
@@ -69,7 +70,13 @@ def _trainable_params(params):
                 f"param group {index} from get_optim_params() has no 'params' key; a group "
                 "must name the parameters it applies its hyperparameters to."
             )
-        groups.append({**group, "params": [p for p in group["params"] if p.requires_grad]})
+        # torch's own ``add_param_group`` accepts a bare Tensor here and wraps it; match that
+        # contract, or the comprehension below would iterate the tensor's *rows* and fail
+        # later with a confusing "can't optimize a non-leaf Tensor".
+        members = group["params"]
+        if isinstance(members, Tensor):
+            members = [members]
+        groups.append({**group, "params": [p for p in members if p.requires_grad]})
     return groups
 
 

@@ -303,3 +303,147 @@ def test_every_upstream_policy_config_field_is_forwarded_explicitly():
     built = _config().to_policy_config()
     assert built.chunk_size == 32 and built.n_action_steps == 32
     assert built.camera_layout == "droid"
+
+
+# ------------------------------------------------------------------- one real training step
+def _prepared(policy: Flux3ActionPolicy, n: int = 2):
+    """Windows as ``prepare`` would return them, with the VAE encode stood in for.
+
+    ``prepare`` runs 33 camera frames through the frozen video VAE; a test that wanted to
+    reach the trunk through it would have to pull ~7B of encoder weights. Everything the
+    optimizer touches is downstream of the encode, so synthetic latents of the right shape
+    exercise the whole trainable path -- packing, the 4D ids, the DiT and the flow loss.
+    """
+    from opentau.policies.flux3_action.policy import PreparedWindows
+
+    upstream = policy.model.config
+    h, w = upstream.latent_hw
+    # 33 camera frames at the VAE's 4x temporal compression -> (33 - 1) / 4 + 1 latent frames,
+    # the first of which packs as the conditioning frame.
+    latents = torch.randn(n, 96, 9, h, w)
+    contexts = [
+        c for c, _ in policy.model._contexts(["pick up the cube"] * n, torch.device("cpu"), fixed_length=None)
+    ]
+    return PreparedWindows(
+        list(range(n)),
+        latents,
+        contexts,
+        torch.randn(n, 8),
+        torch.randn(n, upstream.chunk_size, 8),
+        None,
+    )
+
+
+def _trainable_policy() -> Flux3ActionPolicy:
+    """A policy whose widths agree well enough to run a forward.
+
+    ``TINY_DIT`` is only ever *built* by the other tests, so two of its widths have never
+    been contradicted: ``vec_in_dim`` has to match the text encoder's pooled width (768),
+    and the mock encoder has to emit contexts at the DiT's ``context_in_dim`` rather than
+    the real encoder's 20480.
+    """
+    cfg = _config(dit_config=dict(TINY_DIT, vec_in_dim=768))
+    encoder = MockTextEncoder(context_in_dim=TINY_DIT["context_in_dim"])
+    return Flux3ActionPolicy(cfg, video_vae=_StubVAE(), text_encoder=encoder)
+
+
+def test_a_training_step_runs_and_moves_both_param_groups():
+    """forward -> backward -> optimizer step, through the real optimizer factory.
+
+    This is the claim the whole PR rests on: that OpenTau can fine-tune this policy. Every
+    other test here checks a piece of it -- that the groups survive, that the preset reaches
+    the optimizer, that the loss is joint over video and action -- and none of them execute
+    a step, so a break anywhere between the batch and the weights would pass all of them.
+    """
+    from opentau.configs.default import DatasetConfig, DatasetMixtureConfig
+    from opentau.configs.train import TrainPipelineConfig
+    from opentau.datasets.transforms import ImageTransformsConfig
+    from opentau.optim.factory import make_optimizer_and_scheduler
+
+    torch.manual_seed(0)
+    policy = _trainable_policy()
+    cfg = policy.config
+    policy.train()
+
+    dataset = DatasetConfig(
+        repo_id="m",
+        root="/tmp/m",
+        image_transforms=ImageTransformsConfig(enable=False),
+        episodes=[0],
+        video_backend=None,
+    )
+    train = TrainPipelineConfig(
+        dataset_mixture=DatasetMixtureConfig(datasets=[dataset], weights=[1.0], action_freq=15.0),
+        policy=cfg,
+        batch_size=2,
+        action_chunk=32,
+        use_policy_training_preset=True,
+        steps=30_000,
+    )
+    train.validate()
+    optimizer, scheduler = make_optimizer_and_scheduler(train, policy)
+    assert len(optimizer.param_groups) == 2
+
+    prepared = _prepared(policy)
+    before = [[p.detach().clone() for p in g["params"]] for g in optimizer.param_groups]
+
+    loss, aux = policy.forward({}, prepared=prepared)
+    assert loss.requires_grad and torch.isfinite(loss), "the step must produce a finite, differentiable loss"
+    # both halves of the joint objective contribute; a video-free trunk would leave one at zero
+    assert float(aux["video_mse"]) > 0.0
+    assert float(aux["action_mse"]) > 0.0
+    assert aux["n_valid_windows"] == 2
+
+    loss.backward()
+    # Four output heads take no gradient, and always: the two *conditioning* streams are
+    # clean context the trunk reads, never denoising targets, so `flow_loss` never reaches
+    # their projections. Pinned by name because the consequence is distributed, not local --
+    # DDP needs `find_unused_parameters=True` (the repo's default) and a parameter-sharding
+    # backend can wait on a gradient that never arrives. See TRAINING_ENABLEMENT.md.
+    named = {id(t): n for n, t in policy.named_parameters()}
+    ungrad = {named[id(p)] for g in optimizer.param_groups for p in g["params"] if p.grad is None}
+    assert ungrad == {
+        "model.dit.final_layer.video_cond.linear.weight",
+        "model.dit.final_layer.video_cond.adaLN_modulation.1.weight",
+        "model.dit.final_layer.action_cond.linear.weight",
+        "model.dit.final_layer.action_cond.adaLN_modulation.1.weight",
+    }, f"the set of always-unused parameters changed: {sorted(ungrad)}"
+    optimizer.step()
+    if scheduler is not None:
+        scheduler.step()
+
+    moved = []
+    for index, group in enumerate(optimizer.param_groups):
+        deltas = [
+            (new.detach() - old).abs().max().item()
+            for old, new in zip(before[index], group["params"], strict=False)
+            if new.grad is not None
+        ]
+        assert any(d > 0 for d in deltas), f"param group {index} did not move"
+        moved.append(max(deltas))
+    # the heads' group runs at 5x, so its step is the larger one -- the ratio itself is a
+    # function of AdamW's normalization, so only the ordering is asserted here
+    assert moved[1] > moved[0], "the 5x head group must take the larger step"
+
+
+def test_forward_passes_upstream_kwargs_through():
+    """``prepared=`` has to reach upstream, the way ``select_action``'s kwargs already do.
+
+    Upstream accepts windows encoded on another stream; swallowing the argument here would
+    not fail loudly, it would just make the pipelined encode permanently unreachable.
+    """
+    import inspect
+
+    policy = _trainable_policy()
+    assert "kwargs" in inspect.signature(policy.forward).parameters
+
+    prepared = _prepared(policy)
+    seen = {}
+
+    def _spy(batch, **kwargs):
+        seen.update(kwargs)
+        return torch.zeros(()), {}
+
+    policy.model.forward = _spy
+    policy.forward({}, prepared=prepared)
+    assert seen.get("prepared") is prepared

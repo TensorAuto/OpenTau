@@ -237,3 +237,110 @@ def test_group_params_may_be_any_iterable():
     """A policy may build groups lazily; consuming them once here is fine."""
     (kept,) = _trainable_params([{"params": (p for p in [_param(), _param()]), "lr": 1e-4}])
     assert len(kept["params"]) == 2
+
+
+def test_a_group_whose_params_is_a_single_tensor_is_accepted():
+    """torch's ``add_param_group`` wraps a bare Tensor; this filter has to agree with it.
+
+    Iterating a Tensor yields its *rows*, so without the coercion a group written the way
+    torch permits would be silently rebuilt out of non-leaf slices and fail much later,
+    inside the optimizer, with "can't optimize a non-leaf Tensor".
+    """
+    p = _param()
+    (kept,) = _trainable_params([{"params": p, "lr": 1e-4}])
+    # identity, not equality: iterating a 1-element Parameter also yields a length-1 list
+    # whose single entry compares equal to it, so `== [p]` passes either way. What
+    # distinguishes the two is that the iterated entry is a *view*, not the leaf itself --
+    # which is exactly what the optimizer would later reject.
+    assert len(kept["params"]) == 1
+    assert kept["params"][0] is p, "the tensor must be wrapped, not iterated"
+
+    frozen = _param()
+    frozen.requires_grad_(False)
+    (kept,) = _trainable_params([{"params": frozen, "lr": 1e-4}])
+    assert kept["params"] == [], "a single frozen tensor still filters out"
+
+
+# ------------------------------------------------- the shipped configs this change moves
+def test_every_shipped_config_whose_effective_settings_change_is_declared():
+    """Honouring an explicit optimizer/scheduler changes three configs that set both.
+
+    Those three carried values that the preset overwrote, so they never took effect. The
+    fix makes them take effect -- a real behaviour change to configs this PR does not
+    otherwise touch, and one worth pinning rather than discovering in a training run.
+
+    Anything else that starts diverging (a new config, or a preset edit) fails here, which
+    is the point: the set is small and deliberate, not incidental.
+    """
+    import dataclasses
+    import json
+    from pathlib import Path
+
+    from opentau.policies.factory import make_policy_config
+
+    # config -> {field: the value the preset used to impose}
+    expected = {
+        "configs/dev/ci_config.json": {
+            "optimizer.lr": 2.5e-05,
+            "optimizer.weight_decay": 1e-10,
+            "scheduler.num_warmup_steps": 1000,
+            "scheduler.peak_lr": 2.5e-05,
+            "scheduler.decay_lr": 2.5e-06,
+        },
+        "configs/examples/xr1_robocasa365_eval_config.json": {"optimizer.grad_clip_norm": 10.0},
+        "configs/examples/xr1_robocasa365_finetune_config.json": {"optimizer.grad_clip_norm": 10.0},
+    }
+
+    # The tracked config roots only. A working tree also holds untracked scratch configs,
+    # and sweeping `configs/**` would make this pass or fail on whatever a developer happens
+    # to have lying around.
+    roots = ("configs/dev", "configs/examples", "configs/benchmarks", "configs/libero", "tests/artifacts")
+
+    repo = Path(__file__).resolve().parents[2]
+    candidates = sorted(q for root in roots for q in (repo / root).rglob("*.json"))
+    found: dict[str, dict] = {}
+    scanned = 0
+    for path in candidates:
+        try:
+            raw = json.loads(path.read_text())
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(raw, dict) or not raw.get("use_policy_training_preset"):
+            continue
+        policy_type = (raw.get("policy") or {}).get("type")
+        if not policy_type:
+            continue
+        scanned += 1
+        try:
+            preset = make_policy_config(policy_type)
+        except Exception:  # a policy whose extras are not installed here
+            continue
+        deltas = {}
+        for slot, builder in (
+            ("optimizer", preset.get_optimizer_preset),
+            ("scheduler", preset.get_scheduler_preset),
+        ):
+            explicit = raw.get(slot)
+            if not isinstance(explicit, dict):
+                continue
+            imposed = builder()
+            if imposed is None:
+                continue
+            fields = dataclasses.asdict(imposed)
+            for key, value in explicit.items():
+                if key == "type" or key not in fields:
+                    continue
+                # list/tuple spellings of the same value are not a behaviour change
+                if isinstance(fields[key], tuple) and isinstance(value, list):
+                    value = tuple(value)
+                if fields[key] != value:
+                    deltas[f"{slot}.{key}"] = fields[key]
+        if deltas:
+            found[str(path.relative_to(repo))] = deltas
+
+    assert scanned >= 10, f"only {scanned} preset configs scanned -- the glob stopped matching"
+    assert found == expected, (
+        "the set of shipped configs whose effective settings change is not what is declared.\n"
+        f"found:    {json.dumps(found, indent=2, sort_keys=True)}\n"
+        f"declared: {json.dumps(expected, indent=2, sort_keys=True)}"
+    )

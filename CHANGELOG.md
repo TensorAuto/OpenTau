@@ -178,6 +178,24 @@ belongs to the policy and a reordering must not silently swap them.
 Purely additive — a new registered subclass, no existing scheduler touched, and a test
 asserts no policy's preset selects it.
 
+### Changed — three shipped configs now get the optimizer settings they declare
+
+Honouring an explicit `optimizer`/`scheduler` changes the effective settings of every
+config that set one *and* `use_policy_training_preset`, because the preset used to
+overwrite it. Three do, and their declared values have never taken effect:
+
+- `configs/dev/ci_config.json` (pi05) — `lr` 2.5e-05 → 1e-04, `weight_decay` 1e-10 → 0,
+  warmup 1,000 → 0 steps, `peak_lr` 2.5e-05 → 1e-04, `decay_lr` 2.5e-06 → 0. The regression
+  workflow's 25-step run now uses the settings that file has always asked for; its checks
+  are qualitative (a loss drop, a non-zero grad norm), and a no-warmup run reaches them
+  sooner rather than later.
+- `configs/examples/xr1_robocasa365_finetune_config.json` and
+  `..._eval_config.json` (xr1) — `grad_clip_norm` 10.0 → 1.0.
+
+The values are left as their authors wrote them rather than rewritten to match what the
+preset was imposing. A test pins this exact set, so a fourth config — or a preset edit that
+creates a new divergence — fails rather than changing a training run unannounced.
+
 ## [0.14.0] - 2026-09-14
 
 ### Added — best-of-N action-chunk sampling — **opt-in, default `1`, no `config_version` bump**

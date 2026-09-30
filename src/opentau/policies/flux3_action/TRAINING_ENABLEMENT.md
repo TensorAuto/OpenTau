@@ -120,6 +120,45 @@ Two differences remain:
   card — the weights place at 16.5 GB, leaving too little for VAE activations. The
   optimizer path is verified; the forward is not.
 
+## Four parameters never receive a gradient, and it matters at scale
+
+Running an actual step (`test_a_training_step_runs_and_moves_both_param_groups`) turned up
+something reading the code did not: four of the DiT's output heads take no gradient, on
+every step, by construction.
+
+```
+model.dit.final_layer.video_cond.linear.weight
+model.dit.final_layer.video_cond.adaLN_modulation.1.weight
+model.dit.final_layer.action_cond.linear.weight
+model.dit.final_layer.action_cond.adaLN_modulation.1.weight
+```
+
+The DiT builds one output head per stream, but only the two *content* streams are denoising
+targets. `video_cond` and `action_cond` carry clean context the trunk attends to, so
+`flow_loss` never reads their projections and autograd never reaches them.
+
+Locally this is harmless -- AdamW skips a parameter whose `.grad` is `None`, so the weights
+simply stay at their checkpoint values. Distributed, it is not local at all:
+
+* **DDP** needs `find_unused_parameters=True` or the reducer raises. OpenTau already
+  defaults `FIND_UNUSED_PARAMS` to true, so a run works as shipped -- but the audit that
+  `scripts/find_unused_params.py` exists for cannot be passed here, and the ~10-15% per-step
+  graph walk it buys back is not available to this policy.
+* **Parameter-sharding backends (DeepSpeed ZeRO-3, FSDP)** are the real concern. Their
+  reduce-scatter / reshard hooks can wait on a gradient that never arrives. `train.py`
+  fails fast on the one case it knows about -- a zero entry in `loss_weighting` -- and this
+  is the same hazard arriving by a different route, which that guard does not cover. BFL
+  train at 8 GPUs under FSDP2, so this is precisely the configuration a faithful
+  reproduction reaches for.
+
+**Not fixed here, deliberately.** Freezing the four would remove the hazard and change
+nothing numerically today. It is not done because "these heads are never supervised" is
+verified for the default profile only: the history profile could not be instantiated to
+check (it needs a `command_history` batch key nothing emits yet, see below), and a freeze
+that turns out to be wrong there would silently stop training parameters instead of failing.
+The set is pinned by name in the test, so an upstream change that supervises them -- or adds
+another unused head -- fails rather than drifts.
+
 ## What still stands between here and a trained policy
 
 1. ~~Nothing has loaded real weights yet.~~ **Done.** The unmodified
