@@ -84,13 +84,43 @@ the policy future joint positions — a label leak no shape check catches); reje
 alongside `n_obs_history` or `sequence_length > 1`, which define the camera window too; and
 rejected when unsorted, since frames return in offset order and are stacked as a time axis.
 
+## Fine-tuning: what matches their recipe, and what does not
+
+The policy defaults now follow Black Forest Labs' published DROID recipe. The
+learning-rate **schedule** does not, and cannot yet — see below.
+
+Four differences remain:
+
+* **Learning-rate schedule.** Their recipe holds the pretrained trunk at zero LR for
+  1,000 updates, warms it to 3,000, holds flat to 25,000 and cools linearly to 30,000,
+  while the freshly initialized heads skip the hold and warm over 1,000. Reproducing that
+  needs two curves over two parameter groups, and OpenTau's optimizer factory cannot
+  currently deliver them: `use_policy_training_preset=False` builds the optimizer from
+  flat `policy.parameters()` (one group), and `use_policy_training_preset=True` overwrites
+  the pipeline's `scheduler` with the policy preset. A scheduler with the right shape was
+  written and withdrawn from this PR for that reason; it belongs with the factory work.
+* **`get_optim_params()` does not reach the optimizer.** Related and more immediate:
+  `optim/factory.py` filters its input with `p.requires_grad`, which raises on the
+  param-group dicts this policy returns. So the recipe's 5x head learning rate is not
+  applied today either. This predates this PR and needs its own fix.
+
+* **Trainer.** Their recipe uses a standalone FSDP2/HSDP trainer with power EMA at
+  sigma_rel 0.10/0.05, a 2,048-window global batch and 30,000 updates across 8 GPUs.
+  OpenTau trains through accelerate/DeepSpeed. The losses, timestep sampling and data
+  window match; the distribution strategy and EMA do not, and neither does the schedule
+  (above).
+* **Scale.** A fine-tune at their batch size needs many GPUs, not one. A single training
+  step is also not yet validated: the video VAE's NATTEN attention has no efficient CPU
+  path, so a 33-frame window is GPU-only, and no single GPU with enough free memory was
+  available during this work.
+
 ## What still stands between here and a trained policy
 
-1. **Nothing has loaded real weights yet.** Every test to date builds a tiny random
-   `dit_config` with stubbed encoders. `wiring.py::load_action_checkpoint` does real work —
-   content-stream filtering, remapping the co-trained `action_prediction.*` backbone onto
-   this embodiment's modality, deterministic fresh-head seeding — that no test exercises
-   against real tensors.
+1. ~~Nothing has loaded real weights yet.~~ **Done.** The unmodified
+   `black-forest-labs/flux-3-action-droid` package loads under `strict=True` (6.95B
+   parameters, every key matched) and predicts a 32-step chunk on a real DROID episode
+   with MAE 0.026 against recorded actions of scale 0.70. What remains unvalidated is the
+   *training* forward, which needs a GPU (see above).
 2. **Throughput is unmeasured.** 33 frames per camera across three DROID cameras is
    roughly a 33x increase in camera decodes per sample. Inherent to a joint video-action
    objective, but it should be measured before anyone plans a run around it.

@@ -102,6 +102,46 @@ reorders time).
 across three cameras in the DROID layout — roughly a 33x increase in camera decodes. That
 is inherent to a joint video-action objective, and the reason no other policy opts in.
 
+### Added — load released FLUX 3 Action packages, and match their fine-tuning recipe — **no `config_version` bump**
+
+`flux3_action` could not load a released Black Forest Labs package, and its training
+defaults silently disagreed with the recipe those weights were produced under. Both are
+fixed, and every value below was read off the real artifacts rather than inferred.
+
+**Loading a released package.** `black-forest-labs/flux-3-action-{droid,so101}` ship a
+LeRobot-shaped `config.json` alongside their native one. Six things stood between that and
+`from_pretrained`:
+
+* it declares `"type": "flux3"`, which this repo did not register — now an alias for
+  `flux3_action`, which stays the canonical name;
+* `dit_config`, `text_fixed_length` and `video_position_fps` arrive as `null` meaning
+  "library default", which the non-Optional fields rejected;
+* nine keys are spelled differently or unimplemented here. They are **translated, not
+  stripped**: `conditioning` -> `inference_profile`, `action_representation` ->
+  `action_parameterization`, `delta_absolute_dims` -> `absolute_action_dims`, `dtype` ->
+  `torch_dtype`. This is load-bearing — droid is `frame`/`absolute` where so101 is
+  `history`/`delta`, so dropping them would configure so101 for absolute actions against
+  delta-trained weights and quietly produce wrong ones. The four features this port does
+  not implement (`use_peft`, `use_relative_actions`, `packer`, `action_feature_names`)
+  raise if set rather than being ignored;
+* the released checkpoints are 8-wide, and upstream asserts state/action match
+  `action_dim` exactly, so `max_state_dim`/`max_action_dim` are 8 rather than OpenTau's
+  usual 32;
+* a released `model.safetensors` is rooted at `dit.*` while this wrapper nests the policy
+  as `self.model`. Without re-rooting, every tensor is reported both missing *and*
+  unexpected — and under the default `strict=False` that leaves a randomly initialized
+  7B model that runs and returns plausible-shaped garbage.
+
+Verified end to end: the unmodified `flux-3-action-droid` package loads under
+`strict=True` (6.95B parameters, every key matched) and predicts a 32-step chunk on a real
+DROID episode with a mean absolute error of 0.026 against recorded actions whose own scale
+is 0.70.
+
+**Matching the recipe.** Sixteen of eighteen training fields already agreed with Black
+Forest Labs' published DROID recipe; `optimizer_betas` (0.9, 0.95 -> 0.9, 0.99) and
+`optimizer_weight_decay` (0 -> 0.05) were this repo's generic defaults and are now theirs.
+The camera window is 33 frames, matching the recipe's "33 frames at 15 Hz".
+
 ## [0.14.0] - 2026-09-14
 
 ### Added — best-of-N action-chunk sampling — **opt-in, default `1`, no `config_version` bump**
