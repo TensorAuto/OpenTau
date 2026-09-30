@@ -86,33 +86,39 @@ rejected when unsorted, since frames return in offset order and are stacked as a
 
 ## Fine-tuning: what matches their recipe, and what does not
 
-The policy defaults now follow Black Forest Labs' published DROID recipe. The
-learning-rate **schedule** does not, and cannot yet — see below.
+The policy defaults, the optimizer settings and the learning-rate schedule now follow
+Black Forest Labs' published DROID recipe.
 
-Four differences remain:
+Getting the schedule there required two fixes to the shared training path, both of which
+were silently blocking any policy that wants per-group hyperparameters:
 
-* **Learning-rate schedule.** Their recipe holds the pretrained trunk at zero LR for
-  1,000 updates, warms it to 3,000, holds flat to 25,000 and cools linearly to 30,000,
-  while the freshly initialized heads skip the hold and warm over 1,000. Reproducing that
-  needs two curves over two parameter groups, and OpenTau's optimizer factory cannot
-  currently deliver them: `use_policy_training_preset=False` builds the optimizer from
-  flat `policy.parameters()` (one group), and `use_policy_training_preset=True` overwrites
-  the pipeline's `scheduler` with the policy preset. A scheduler with the right shape was
-  written and withdrawn from this PR for that reason; it belongs with the factory work.
-* **`get_optim_params()` does not reach the optimizer.** Related and more immediate:
-  `optim/factory.py` filters its input with `p.requires_grad`, which raises on the
-  param-group dicts this policy returns. So the recipe's 5x head learning rate is not
-  applied today either. This predates this PR and needs its own fix.
+* `optim/factory.py` filtered its input with `p.requires_grad`, which raises on the
+  param-group dicts `get_optim_params()` returns. The filter now reaches inside the
+  groups, so the recipe's **5x head learning rate** actually reaches the optimizer — it
+  previously could not, meaning the policy could not be trained at all.
+* `configs/train.py` overwrote an explicitly chosen `scheduler` whenever
+  `use_policy_training_preset` was set. Since that is the only path yielding param groups,
+  "per-group learning rates" and "a specific schedule" were mutually exclusive. The preset
+  now fills only what the config left unset.
+
+With both in place, `hold_warmup_constant_cooldown` reproduces the recipe's curve: the
+pretrained trunk held at zero LR through 1,000 updates then warming to 3,000, the freshly
+initialized heads skipping the hold and warming over 1,000, both flat to 25,000 and cooling
+linearly to 30,000. It is opt-in — name it in a train config's `scheduler` field.
+
+Two differences remain:
 
 * **Trainer.** Their recipe uses a standalone FSDP2/HSDP trainer with power EMA at
   sigma_rel 0.10/0.05, a 2,048-window global batch and 30,000 updates across 8 GPUs.
-  OpenTau trains through accelerate/DeepSpeed. The losses, timestep sampling and data
-  window match; the distribution strategy and EMA do not, and neither does the schedule
-  (above).
-* **Scale.** A fine-tune at their batch size needs many GPUs, not one. A single training
-  step is also not yet validated: the video VAE's NATTEN attention has no efficient CPU
-  path, so a 33-frame window is GPU-only, and no single GPU with enough free memory was
-  available during this work.
+  OpenTau trains through accelerate/DeepSpeed. The optimizer, schedule, losses, timestep
+  sampling and data window now match; the distribution strategy and EMA do not, so a run
+  here will not reproduce their curve exactly.
+* **Scale, and one unvalidated step.** A fine-tune at their batch size needs many GPUs,
+  not one. Separately, a single training *forward* has not yet been executed end to end:
+  the video VAE's NATTEN attention has no efficient CPU path, so a 33-frame window is
+  GPU-only, and every attempt during this work ran into a co-tenant holding most of the
+  card — the weights place at 16.5 GB, leaving too little for VAE activations. The
+  optimizer path is verified; the forward is not.
 
 ## What still stands between here and a trained policy
 

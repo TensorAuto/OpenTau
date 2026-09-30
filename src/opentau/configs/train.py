@@ -442,8 +442,15 @@ class TrainPipelineConfig(HubMixin):
         if not self.use_policy_training_preset and (self.optimizer is None or self.scheduler is None):
             raise ValueError("Optimizer and Scheduler must be set when the policy presets are not used.")
         elif self.use_policy_training_preset and not self.resume:
-            self.optimizer = self.policy.get_optimizer_preset()
-            self.scheduler = self.policy.get_scheduler_preset()
+            # Fill in only what the config did not choose. Overwriting unconditionally
+            # made the preset path and an explicit `scheduler`/`optimizer` mutually
+            # exclusive: the preset path is the only one that yields the policy's param
+            # groups, so a policy wanting per-group hyperparameters *and* a specific
+            # schedule could not have both, and the config's choice vanished silently.
+            if self.optimizer is None:
+                self.optimizer = self.policy.get_optimizer_preset()
+            if self.scheduler is None:
+                self.scheduler = self.policy.get_scheduler_preset()
 
         if self.policy:
             # Re-applied here because the ``--policy.path`` / ``resume`` branches above

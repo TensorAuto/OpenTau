@@ -142,6 +142,42 @@ Forest Labs' published DROID recipe; `optimizer_betas` (0.9, 0.95 -> 0.9, 0.99) 
 `optimizer_weight_decay` (0 -> 0.05) were this repo's generic defaults and are now theirs.
 The camera window is 33 frames, matching the recipe's "33 frames at 15 Hz".
 
+### Fixed — `get_optim_params()` param groups now reach the optimizer
+
+`optim/factory.py` filtered its input with `p.requires_grad`, which raises
+`AttributeError: 'dict' object has no attribute 'requires_grad'` on the param-group dicts
+a policy returns when it wants per-group hyperparameters. The effect was silent and total:
+such a policy could not build an optimizer at all, so `flux3_action`'s 5x head learning
+rate — part of the recipe its released weights were trained under — never applied.
+
+The filter now reaches inside the groups. Flat parameter lists, which every other policy
+returns, take an identical path and are unchanged object-for-object. Fully frozen groups
+are kept rather than dropped, so group *indices* stay stable for anything addressing a
+group by position. Malformed input (mixing bare parameters with groups, or a group with no
+`params` key) now raises a message naming the problem instead of leaking the original
+`AttributeError`.
+
+Relatedly, `TrainPipelineConfig` no longer discards an explicitly chosen `optimizer` or
+`scheduler` when `use_policy_training_preset` is set — it fills only what the config left
+unset. The preset path is the only one that yields param groups, so overwriting there made
+per-group learning rates and a chosen schedule mutually exclusive, and the config's choice
+vanished without warning.
+
+### Added — `hold_warmup_constant_cooldown` learning-rate schedule — **opt-in, nothing selects it by default**
+
+Black Forest Labs' FLUX 3 Action recipe runs two curves at once: the pretrained trunk held
+at zero LR for 1,000 updates while AdamW still accumulates moments, then warming to 3,000;
+the freshly initialized embodiment heads skipping the hold and warming over 1,000, since
+they start from noise and nothing is being protected. Both stay flat to 25,000 and cool
+linearly to 30,000. No existing scheduler has that shape.
+
+`LambdaLR` takes one lambda per parameter group, so both curves ride on one scheduler;
+`head_param_group_indices` names which groups get the head curve, because the grouping
+belongs to the policy and a reordering must not silently swap them.
+
+Purely additive — a new registered subclass, no existing scheduler touched, and a test
+asserts no policy's preset selects it.
+
 ## [0.14.0] - 2026-09-14
 
 ### Added — best-of-N action-chunk sampling — **opt-in, default `1`, no `config_version` bump**
