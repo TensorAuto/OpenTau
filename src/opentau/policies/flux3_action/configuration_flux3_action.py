@@ -57,7 +57,42 @@ from opentau.optim.schedulers import (
 
 from .config import PolicyConfig
 
+#: Values a released ``config.json`` sends as ``null`` to mean "library default".
+DEFAULT_VIDEO_POSITION_FPS = 24.0
+DEFAULT_TEXT_FIXED_LENGTH = 320
 
+
+# Black Forest Labs' released packages ship a LeRobot-shaped ``config.json`` that
+# declares ``"type": "flux3"``. Registering that spelling as an alias is what lets
+# ``from_pretrained`` read a released package directly, rather than needing a
+# conversion step; ``flux3_action`` stays the canonical name this repo uses.
+#: Legacy spellings a released package uses, and the fields they translate onto.
+#: ``(legacy_field, canonical_field, value_map)`` -- ``value_map`` is None when the value
+#: carries over unchanged, and ``coerce`` normalizes it onto the canonical field's type.
+#:
+#: This is the single source of truth for three things that must not drift apart: the
+#: translation itself, the conflict guard that stops an explicit override being clobbered,
+#: and the test asserting the guard covers every entry. An earlier version listed them
+#: separately and the guard silently missed one.
+LEGACY_TRANSLATIONS: tuple[tuple[str, str, dict[str, str] | None, object], ...] = (
+    ("conditioning", "inference_profile", {"frame": "default", "history": "history"}, None),
+    (
+        "action_representation",
+        "action_parameterization",
+        {"absolute": "absolute", "delta": "joint_delta"},
+        None,
+    ),
+    ("delta_absolute_dims", "absolute_action_dims", None, tuple),
+    ("dtype", "torch_dtype", None, None),
+)
+
+
+# ORDER IS LOAD-BEARING. Decorators apply bottom-up, and draccus' ``get_choice_name``
+# returns the *first* registered name -- so ``flux3_action`` must stay the lower decorator
+# to remain canonical. Swapping these flips ``cfg.type`` to ``flux3``, which breaks every
+# ``get_policy_class(cfg.policy.type)`` call site and every saved config's ``type`` field.
+# Pinned by ``test_released_packages_declare_type_flux3``.
+@PreTrainedConfig.register_subclass("flux3")
 @PreTrainedConfig.register_subclass("flux3_action")
 @dataclass
 class Flux3ActionConfig(PreTrainedConfig):
@@ -109,8 +144,10 @@ class Flux3ActionConfig(PreTrainedConfig):
         }
     )
 
-    max_state_dim: int = 32
-    max_action_dim: int = 32
+    # The released checkpoints are 8-wide and upstream asserts state/action match
+    # ``action_dim`` exactly, so OpenTau must not pad them to its usual 32.
+    max_state_dim: int = 8
+    max_action_dim: int = 8
 
     # --- upstream-native geometry ------------------------------------------------
     action_dim: int = 8
@@ -137,7 +174,7 @@ class Flux3ActionConfig(PreTrainedConfig):
     trunk_weights: str | None = None
     video_vae_id: str | None = None
     text_encoder_id: str | None = None
-    dit_config: dict = field(default_factory=dict)
+    dit_config: dict | None = field(default_factory=dict)
     content_streams: tuple[str, ...] | None = None
     head_init_seed: int = 0
 
@@ -150,8 +187,11 @@ class Flux3ActionConfig(PreTrainedConfig):
     inference_profile: str = "default"
     history_snapshots: int = 1
     condition_on_past_actions: bool = False
-    video_position_fps: float = 24.0
-    text_fixed_length: int = 320
+    # Released packages send these as ``null`` meaning "use the default", so they are
+    # Optional here and normalized in ``__post_init__`` -- upstream validates them
+    # (fps > 0, 1 <= length <= 8192) and would reject a None outright.
+    video_position_fps: float | None = DEFAULT_VIDEO_POSITION_FPS
+    text_fixed_length: int | None = DEFAULT_TEXT_FIXED_LENGTH
 
     # --- sampling (no preset is implied; these are explicit choices) --------------
     sampler: str | None = None
@@ -179,15 +219,74 @@ class Flux3ActionConfig(PreTrainedConfig):
     # --- optimizer / scheduler ---------------------------------------------------
     optimizer_lr: float = 1.92e-4
     optimizer_lr_heads_multiplier: float = 5.0
-    optimizer_betas: tuple[float, float] = (0.9, 0.95)
+    # These follow Black Forest Labs' published DROID fine-tuning recipe
+    # (docs/droid-finetune.md + configs/droid/train.json) rather than this repo's usual
+    # defaults: beta2 is 0.99 (not 0.95) and weight decay 0.05 (not 0). Matching the
+    # recipe the released weights were produced under matters more here than house
+    # convention, since fine-tuning starts from those weights.
+    optimizer_betas: tuple[float, float] = (0.9, 0.99)
     optimizer_eps: float = 1e-8
-    optimizer_weight_decay: float = 0.0
+    optimizer_weight_decay: float = 0.05
     scheduler_warmup_steps: int = 1_000
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
 
+    # ------------------------------------------------------------------ released-package compat
+    # A released ``config.json`` is a LeRobot-shaped export that spells several of the
+    # fields above differently, and carries a few this port does not implement. They are
+    # declared so ``from_pretrained`` can read a package unmodified -- draccus rejects
+    # unknown keys -- and translated in ``__post_init__``.
+    #
+    # Translating rather than ignoring is load-bearing: droid and so101 genuinely differ
+    # here (droid is frame/absolute, so101 is history/delta), so dropping these would load
+    # so101 configured for absolute actions against delta-trained weights and produce
+    # quietly wrong actions.
+    conditioning: str | None = None
+    action_representation: str | None = None
+    delta_absolute_dims: list[int] | None = None
+    dtype: str | None = None
+    # Declared only so a package parses; this port implements none of them, so a
+    # non-default value raises rather than being silently ignored.
+    use_peft: bool = False
+    use_relative_actions: bool = False
+    relative_exclude_joints: list[str] | None = None
+    packer: str | None = None
+    action_feature_names: list[str] | None = None
+
     def __post_init__(self):
         super().__post_init__()
+        # --- translate the released package's spelling onto this config's fields ---
+        # A legacy key and its canonical counterpart must not both be set: the translation
+        # would overwrite the canonical one, so an explicit `--policy.inference_profile=...`
+        # would lose silently to whatever the checkpoint happened to carry.
+        self._reject_conflicting_spellings()
+        for legacy, canonical, mapping, coerce in LEGACY_TRANSLATIONS:
+            value = getattr(self, legacy)
+            if value is None:
+                continue
+            setattr(self, canonical, self._translate(legacy, value, mapping, coerce))
+            setattr(self, legacy, None)
+        # --- refuse features this port does not implement, rather than ignoring them ---
+        for name, unsupported in (
+            ("use_peft", self.use_peft),
+            ("use_relative_actions", self.use_relative_actions),
+            ("packer", self.packer is not None),
+            ("action_feature_names", self.action_feature_names is not None),
+        ):
+            if unsupported:
+                raise ValueError(
+                    f"the checkpoint sets {name}, which this port does not implement. "
+                    "Loading it anyway would silently ignore a behaviour the weights were "
+                    "trained with."
+                )
+        # A released package sends these as null; upstream rejects None, so restore
+        # the documented default rather than propagating it.
+        if self.dit_config is None:
+            self.dit_config = {}
+        if self.video_position_fps is None:
+            self.video_position_fps = DEFAULT_VIDEO_POSITION_FPS
+        if self.text_fixed_length is None:
+            self.text_fixed_length = DEFAULT_TEXT_FIXED_LENGTH
         if self.quantization is not None:
             # The only import site is lazy (vendored ``policy.py``, under this exact
             # value), so an unvendored fp8r module would surface as a confusing
@@ -225,6 +324,71 @@ class Flux3ActionConfig(PreTrainedConfig):
         # Build the upstream config once so its own cross-field validation runs at
         # construction time rather than at the first forward.
         self.to_policy_config()
+
+    @staticmethod
+    def _field_default(field):
+        """The value a field takes when unset, whether plain or from a factory.
+
+        ``field.default`` is ``MISSING`` for a ``default_factory`` field. Treating that
+        sentinel as the default would make an untouched factory field compare unequal to
+        its own default, so :meth:`_reject_conflicting_spellings` would read it as
+        "explicitly set" and raise on every package load. No current translation targets a
+        factory field, which is precisely why this is easy to break later.
+        """
+        import dataclasses
+
+        if field.default is not dataclasses.MISSING:
+            return field.default
+        if field.default_factory is not dataclasses.MISSING:
+            return field.default_factory()
+        return dataclasses.MISSING
+
+    @staticmethod
+    def _translate(legacy: str, value, mapping: dict[str, str] | None, coerce):
+        """Map one legacy value onto its canonical form, refusing an unknown spelling."""
+        if mapping is not None:
+            translated = mapping.get(value)
+            if translated is None:
+                raise ValueError(
+                    f"unknown {legacy}={value!r} in the checkpoint config; expected one of {sorted(mapping)}."
+                )
+            return translated
+        return coerce(value) if coerce is not None else value
+
+    def _reject_conflicting_spellings(self) -> None:
+        """Raise if a released package's legacy key and its canonical field disagree.
+
+        The translation below overwrites the canonical field, which is right when only the
+        legacy key is present (loading a package) and wrong when the user also set the
+        canonical one explicitly -- their value would vanish without a word.
+
+        One case is not detectable and is left as "the package wins": setting the canonical
+        field to *its own default*. A dataclass cannot distinguish that from not setting it
+        at all, so ``--policy.inference_profile=default`` against a ``history`` package is
+        still overwritten. Closing it would need a sentinel default on every canonical
+        field, which costs more clarity than the case is worth.
+        """
+        import dataclasses
+
+        defaults = {f.name: self._field_default(f) for f in dataclasses.fields(self)}
+        for legacy, canonical, mapping, coerce in LEGACY_TRANSLATIONS:
+            legacy_value = getattr(self, legacy)
+            if legacy_value is None:
+                continue
+            current = getattr(self, canonical)
+            if current == defaults[canonical]:
+                continue  # canonical untouched -- the package's value simply wins
+            translated = self._translate(legacy, legacy_value, mapping, coerce)
+            if isinstance(translated, (list, tuple)) or isinstance(current, (list, tuple)):
+                # the sequence pair (delta_absolute_dims) arrives as a list and is stored
+                # as a tuple, so compare by value rather than by type
+                translated, current = tuple(translated or ()), tuple(current or ())
+            if translated != current:
+                raise ValueError(
+                    f"{legacy}={legacy_value!r} translates to {canonical}={translated!r}, but "
+                    f"{canonical}={current!r} was also set explicitly. Set one or the other: "
+                    f"{legacy} is the released package's spelling, {canonical} is this repo's."
+                )
 
     def to_policy_config(self) -> PolicyConfig:
         """Build the upstream-native :class:`PolicyConfig` this config describes.

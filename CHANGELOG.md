@@ -102,6 +102,100 @@ reorders time).
 across three cameras in the DROID layout — roughly a 33x increase in camera decodes. That
 is inherent to a joint video-action objective, and the reason no other policy opts in.
 
+### Added — load released FLUX 3 Action packages, and match their fine-tuning recipe — **no `config_version` bump**
+
+`flux3_action` could not load a released Black Forest Labs package, and its training
+defaults silently disagreed with the recipe those weights were produced under. Both are
+fixed, and every value below was read off the real artifacts rather than inferred.
+
+**Loading a released package.** `black-forest-labs/flux-3-action-{droid,so101}` ship a
+LeRobot-shaped `config.json` alongside their native one. Six things stood between that and
+`from_pretrained`:
+
+* it declares `"type": "flux3"`, which this repo did not register — now an alias for
+  `flux3_action`, which stays the canonical name;
+* `dit_config`, `text_fixed_length` and `video_position_fps` arrive as `null` meaning
+  "library default", which the non-Optional fields rejected;
+* nine keys are spelled differently or unimplemented here. They are **translated, not
+  stripped**: `conditioning` -> `inference_profile`, `action_representation` ->
+  `action_parameterization`, `delta_absolute_dims` -> `absolute_action_dims`, `dtype` ->
+  `torch_dtype`. This is load-bearing — droid is `frame`/`absolute` where so101 is
+  `history`/`delta`, so dropping them would configure so101 for absolute actions against
+  delta-trained weights and quietly produce wrong ones. The four features this port does
+  not implement (`use_peft`, `use_relative_actions`, `packer`, `action_feature_names`)
+  raise if set rather than being ignored;
+* the released checkpoints are 8-wide, and upstream asserts state/action match
+  `action_dim` exactly, so `max_state_dim`/`max_action_dim` are 8 rather than OpenTau's
+  usual 32;
+* a released `model.safetensors` is rooted at `dit.*` while this wrapper nests the policy
+  as `self.model`. Without re-rooting, every tensor is reported both missing *and*
+  unexpected — and under the default `strict=False` that leaves a randomly initialized
+  7B model that runs and returns plausible-shaped garbage.
+
+Verified end to end: the unmodified `flux-3-action-droid` package loads under
+`strict=True` (6.95B parameters, every key matched) and predicts a 32-step chunk on a real
+DROID episode with a mean absolute error of 0.026 against recorded actions whose own scale
+is 0.70.
+
+**Matching the recipe.** Sixteen of eighteen training fields already agreed with Black
+Forest Labs' published DROID recipe; `optimizer_betas` (0.9, 0.95 -> 0.9, 0.99) and
+`optimizer_weight_decay` (0 -> 0.05) were this repo's generic defaults and are now theirs.
+The camera window is 33 frames, matching the recipe's "33 frames at 15 Hz".
+
+### Fixed — `get_optim_params()` param groups now reach the optimizer
+
+`optim/factory.py` filtered its input with `p.requires_grad`, which raises
+`AttributeError: 'dict' object has no attribute 'requires_grad'` on the param-group dicts
+a policy returns when it wants per-group hyperparameters. The effect was silent and total:
+such a policy could not build an optimizer at all, so `flux3_action`'s 5x head learning
+rate — part of the recipe its released weights were trained under — never applied.
+
+The filter now reaches inside the groups. Flat parameter lists, which every other policy
+returns, take an identical path and are unchanged object-for-object. Fully frozen groups
+are kept rather than dropped, so group *indices* stay stable for anything addressing a
+group by position. Malformed input (mixing bare parameters with groups, or a group with no
+`params` key) now raises a message naming the problem instead of leaking the original
+`AttributeError`.
+
+Relatedly, `TrainPipelineConfig` no longer discards an explicitly chosen `optimizer` or
+`scheduler` when `use_policy_training_preset` is set — it fills only what the config left
+unset. The preset path is the only one that yields param groups, so overwriting there made
+per-group learning rates and a chosen schedule mutually exclusive, and the config's choice
+vanished without warning.
+
+### Added — `hold_warmup_constant_cooldown` learning-rate schedule — **opt-in, nothing selects it by default**
+
+Black Forest Labs' FLUX 3 Action recipe runs two curves at once: the pretrained trunk held
+at zero LR for 1,000 updates while AdamW still accumulates moments, then warming to 3,000;
+the freshly initialized embodiment heads skipping the hold and warming over 1,000, since
+they start from noise and nothing is being protected. Both stay flat to 25,000 and cool
+linearly to 30,000. No existing scheduler has that shape.
+
+`LambdaLR` takes one lambda per parameter group, so both curves ride on one scheduler;
+`head_param_group_indices` names which groups get the head curve, because the grouping
+belongs to the policy and a reordering must not silently swap them.
+
+Purely additive — a new registered subclass, no existing scheduler touched, and a test
+asserts no policy's preset selects it.
+
+### Changed — three shipped configs now get the optimizer settings they declare
+
+Honouring an explicit `optimizer`/`scheduler` changes the effective settings of every
+config that set one *and* `use_policy_training_preset`, because the preset used to
+overwrite it. Three do, and their declared values have never taken effect:
+
+- `configs/dev/ci_config.json` (pi05) — `lr` 2.5e-05 → 1e-04, `weight_decay` 1e-10 → 0,
+  warmup 1,000 → 0 steps, `peak_lr` 2.5e-05 → 1e-04, `decay_lr` 2.5e-06 → 0. The regression
+  workflow's 25-step run now uses the settings that file has always asked for; its checks
+  are qualitative (a loss drop, a non-zero grad norm), and a no-warmup run reaches them
+  sooner rather than later.
+- `configs/examples/xr1_robocasa365_finetune_config.json` and
+  `..._eval_config.json` (xr1) — `grad_clip_norm` 10.0 → 1.0.
+
+The values are left as their authors wrote them rather than rewritten to match what the
+preset was imposing. A test pins this exact set, so a fourth config — or a preset edit that
+creates a new divergence — fails rather than changing a training run unannounced.
+
 ## [0.14.0] - 2026-09-14
 
 ### Added — best-of-N action-chunk sampling — **opt-in, default `1`, no `config_version` bump**

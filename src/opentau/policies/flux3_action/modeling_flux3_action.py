@@ -41,7 +41,7 @@ from torch import Tensor
 
 from opentau.constants import ACTION, OBS_STATE
 from opentau.policies.normalize import Normalize, Unnormalize, resolve_num_datasets
-from opentau.policies.pretrained import PreTrainedPolicy
+from opentau.policies.pretrained import PreTrainedPolicy, log_model_loading_keys
 
 from .configuration_flux3_action import Flux3ActionConfig
 from .policy import FluxActionPolicy
@@ -126,15 +126,22 @@ class Flux3ActionPolicy(PreTrainedPolicy):
         return out
 
     # ------------------------------------------------------------------ contract
-    def forward(self, batch: dict[str, Any]) -> tuple[Tensor, dict | None]:
+    def forward(self, batch: dict[str, Any], **kwargs: Any) -> tuple[Tensor, dict | None]:
         """Training loss for a micro-batch.
 
         Returns upstream's scalar flow-matching loss unchanged, with its ``video_mse`` /
         ``action_mse`` / ``n_valid_windows`` diagnostics as the auxiliary dict -- the
         video term is part of the joint objective, not an optional extra (see
         ``configuration_flux3_action``).
+
+        ``**kwargs`` reaches upstream the way ``select_action`` and ``predict_action_chunk``
+        already let theirs through. It carries upstream's ``prepared=`` argument, the
+        pre-encoded windows of a VAE encode issued on another stream; OpenTau's trainer does
+        not use it today. Taking the argument and *not* forwarding it is the silent failure
+        -- the caller's pre-encoded windows would be dropped and re-encoded, with nothing to
+        see but the cost -- so the test asserts what upstream receives, not the signature.
         """
-        return self.model(self._upstream_batch(batch))
+        return self.model(self._upstream_batch(batch), **kwargs)
 
     def select_action(self, batch: dict[str, Any], **kwargs: Any) -> Tensor:
         """Select the next action, refilling upstream's internal chunk queue as needed."""
@@ -147,6 +154,31 @@ class Flux3ActionPolicy(PreTrainedPolicy):
     def get_optim_params(self) -> list[dict]:
         """Upstream's param groups, which put the embodiment heads at 5x the trunk LR."""
         return self.model.get_optim_params()
+
+    # ------------------------------------------------------------------ checkpoint keys
+    @classmethod
+    def _load_as_safetensor(cls, model, model_file: str, map_location: str, strict: bool):
+        """Load a released package, re-rooting its keys under this wrapper's ``model.``.
+
+        A released ``model.safetensors`` is saved from the upstream policy itself, so its
+        keys are rooted at ``dit.*`` / ``frozen.*``. This wrapper nests that policy as
+        ``self.model``, so every parameter here carries an extra ``model.`` prefix and a
+        plain load reports the entire checkpoint as both missing *and* unexpected --
+        silently leaving a randomly-initialized 7B model if ``strict`` is False.
+
+        Only the wrapper's own prefix is added; nothing inside the checkpoint is renamed.
+        """
+        from safetensors.torch import load_file as load_safetensor_file
+
+        state_dict = load_safetensor_file(model_file, device=map_location)
+        if state_dict and not any(k.startswith("model.") for k in state_dict):
+            state_dict = {f"model.{k}": v for k, v in state_dict.items()}
+        model._promote_legacy_norm_buffers_in_state_dict(state_dict)
+        missing, unexpected = model.load_state_dict(state_dict, strict=strict)
+        log_model_loading_keys(missing, unexpected)
+        if map_location != "cpu":
+            model.to(map_location)
+        return model
 
     def reset(self) -> None:
         """Clear the action queue. Called on every environment reset.
