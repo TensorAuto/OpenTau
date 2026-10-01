@@ -1168,9 +1168,30 @@ class BaseDataset(torch.utils.data.Dataset):
                 standard_item["actions"], self.action_index, what="action", who=who
             )
         if self.delta_action_state_map and "actions" in standard_item and "state" in standard_item:
-            standard_item["actions"] = subtract_chunk_start_state(
-                standard_item["actions"], standard_item["state"], self.delta_action_state_map
-            )
+            actions, state = standard_item["actions"], standard_item["state"]
+            seq_len = getattr(self, "sequence_length", 1)
+            if seq_len > 1:
+                # Sequence mode reaches here BEFORE `_reshape_to_sequence`, so `actions` is still
+                # flat `(T * chunk, D_a)` while `state` already carries its time axis `(T, D_s)`.
+                # Both are rank 2, so `_offset_actions` would read the trailing axis as a history
+                # window and broadcast the LAST timestep's pose across the whole sequence — every
+                # timestep but the final one would be offset from the wrong pose. Fold the
+                # timestep axis out first: at `(T, chunk, D_a)` against `(T, D_s)` the ranks
+                # differ, so each timestep is offset by its own chunk-start state.
+                if actions.shape[0] % seq_len != 0:
+                    raise ValueError(
+                        f"`actions` has leading dim {actions.shape[0]}, not divisible by "
+                        f"sequence_length={seq_len}; cannot fold the timestep axis to form "
+                        "per-timestep deltas. The delta-timestamps query and the reshape have "
+                        "diverged; see `resolve_delta_timestamps`."
+                    )
+                folded = rearrange(actions, "(t h) ... -> t h ...", t=seq_len)
+                folded = subtract_chunk_start_state(folded, state, self.delta_action_state_map)
+                standard_item["actions"] = rearrange(folded, "t h ... -> (t h) ...")
+            else:
+                standard_item["actions"] = subtract_chunk_start_state(
+                    actions, state, self.delta_action_state_map
+                )
 
     def _obs_history_pad_fallback(self, padded: bool) -> torch.Tensor:
         """Build ``obs_history_is_pad`` when the fetch layer produced no state pad flags.
