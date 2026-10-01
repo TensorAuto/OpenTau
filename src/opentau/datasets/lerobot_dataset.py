@@ -1922,7 +1922,24 @@ class LeRobotDataset(BaseDataset):
             self._episodes_were_specified = True
 
         if self.episodes is not None and self.meta._version >= packaging.version.parse("v2.1"):
-            self.stats = aggregate_stats([self.meta.episodes_stats[ep_idx] for ep_idx in self.episodes])
+            # Some v3.0 datasets ship an episodes parquet with no flattened `stats/*`
+            # columns, so `episodes_stats` is empty (or holds empty per-episode dicts)
+            # and there is nothing to aggregate. Overwriting `meta.stats` with that
+            # empty aggregate wipes the real `observation.state` / `action` entries
+            # loaded from `meta/stats.json`; the ImageNet camera override then layers
+            # image keys onto the empty dict, leaving stats that contain ONLY cameras.
+            # `DatasetMixtureMetadata` later reads `m.stats[name_map["state"]]` and
+            # dies with `KeyError: observation.state`. Fall back to the dataset-level
+            # stats in that case: they describe a superset of the selected episodes,
+            # which is strictly better than no stats, and normalization itself comes
+            # from `norm_stats_override_path` / the policy buffers.
+            _per_ep = [
+                self.meta.episodes_stats[ep_idx]
+                for ep_idx in self.episodes
+                if self.meta.episodes_stats.get(ep_idx)
+            ]
+            _subset_stats = aggregate_stats(_per_ep) if _per_ep else {}
+            self.stats = _subset_stats if _subset_stats else self.meta.stats
             # Propagate the selected-episode aggregate onto the metadata so the
             # mixture normalizer (which pools `ds.meta.stats`) reflects the
             # episodes actually trained on, not the full on-disk dataset.
@@ -1935,7 +1952,8 @@ class LeRobotDataset(BaseDataset):
             # reads the `LeRobotDataset.stats` attribute for normalization, so
             # the shared reference (later padded in place by the mixture) is
             # benign.
-            self.meta.stats = self.stats
+            if _subset_stats:
+                self.meta.stats = self.stats
 
         if self.episodes is None:
             self.episodes = list(self.meta.episodes)
