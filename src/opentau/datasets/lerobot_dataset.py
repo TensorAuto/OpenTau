@@ -1159,11 +1159,70 @@ class BaseDataset(torch.utils.data.Dataset):
         # `TrainPipelineConfig._validate_sequence_stride` (one timestep = one disjoint
         # action chunk), so `action_chunk` IS the stride.
         timestep_is_pad = torch.zeros(seq_len, dtype=torch.bool)
+        n_pad = 0
         if frame_index >= 0:
             stride = max(1, int(self.action_chunk))
             n_real = min(seq_len, frame_index // stride + 1)
-            timestep_is_pad[: seq_len - n_real] = True
+            n_pad = seq_len - n_real
+            timestep_is_pad[:n_pad] = True
         standard_item["timestep_is_pad"] = timestep_is_pad
+
+        if n_pad:
+            self._shift_real_timesteps_to_front(standard_item, n_pad)
+
+    # Keys whose leading axis is time. Mirrors
+    # `PairedSequenceDataset._is_temporal`, which concatenates exactly these
+    # across a pair's halves; the two lists must not drift apart or a shifted
+    # half would desynchronise from an unshifted one.
+    _TIME_AXIS_KEYS = (
+        "state",
+        "actions",
+        "action_is_pad",
+        "loss_mask",
+        "obs_history_is_pad",
+        "timestep_is_pad",
+    )
+
+    @classmethod
+    def _shift_real_timesteps_to_front(cls, standard_item: dict, n_pad: int) -> None:
+        """Rotates a padded window so its real timesteps occupy positions ``0..n_real-1``.
+
+        The window is anchored on the episode's last frame, so a short episode
+        arrives with its padding at the FRONT and its real frames at the back.
+        That placement is what the frames are worth keeping -- it ends on task
+        completion -- but it also pushes them to a later RoPE phase than a
+        full-length episode's, and the TTT fast-weight update reads the rotated
+        keys at absolute positions. Training would then show short demonstrations
+        at a phase evaluation never produces, since demo pools skip episodes
+        shorter than the window.
+
+        Rotating left by ``n_pad`` moves the real frames to the front and wraps
+        the padding behind them. It does NOT change which frames were selected
+        or their chronological order -- only the slot each occupies -- so the
+        masked TTT update is bit-identical and only the phase moves.
+
+        Args:
+            standard_item: The in-progress item, modified in place.
+            n_pad: Number of padded timesteps at the front; must be > 0.
+        """
+        shifted = []
+        for key, value in standard_item.items():
+            if not torch.is_tensor(value):
+                continue
+            if key in cls._TIME_AXIS_KEYS or key.startswith("camera"):
+                standard_item[key] = torch.roll(value, shifts=-n_pad, dims=0)
+                shifted.append(key)
+        # Every temporal key must move together. A key that reaches the sample
+        # after this point would keep the old placement while its siblings moved,
+        # which desynchronises the mask from the frames it describes -- silent,
+        # and only visible as degraded training.
+        missing = [k for k in ("state", "actions", "timestep_is_pad") if k not in shifted]
+        if missing:
+            raise RuntimeError(
+                f"timestep shift missed required temporal key(s) {missing}; "
+                f"shifted={sorted(shifted)}. Keys carrying a time axis must be present "
+                "before `_shift_real_timesteps_to_front` runs."
+            )
 
     def _apply_column_index_and_delta(self, standard_item: dict) -> None:
         """Subset/reorder `state` and `actions`, then make mapped action dims relative.

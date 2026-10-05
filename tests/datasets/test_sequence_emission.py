@@ -427,3 +427,93 @@ class TestOversamplingGuardStrideAware:
         self._resolve(action_freq=20.0, fps=10, stride=2)
         with pytest.raises(ValueError, match="resolve to the same"):
             self._resolve(action_freq=21.0, fps=10, stride=2)
+
+
+class TestPadShiftToFront:
+    """Rotating a short episode's real timesteps to the front of the window.
+
+    The window is anchored on the episode's last frame, so a short episode
+    arrives with padding at the FRONT. Keeping that placement would hand short
+    demonstrations to TTT at a RoPE phase evaluation never produces, because
+    demo pools skip episodes shorter than the window. The rotation moves the
+    real frames to positions ``0..n_real-1`` without changing which frames were
+    selected or their order.
+    """
+
+    @staticmethod
+    def _item(seq_len: int = 6, n_pad: int = 2):
+        """Builds a standard-format item whose first ``n_pad`` timesteps are padding.
+
+        Args:
+            seq_len: Timesteps in the window.
+            n_pad: Padded timesteps at the front.
+
+        Returns:
+            The item dict.
+        """
+        tp = torch.zeros(seq_len, dtype=torch.bool)
+        tp[:n_pad] = True
+        return {
+            "state": torch.arange(seq_len * 3, dtype=torch.float32).reshape(seq_len, 3),
+            "actions": torch.arange(seq_len * 2 * 4, dtype=torch.float32).reshape(seq_len, 2, 4),
+            "action_is_pad": torch.zeros(seq_len, 2, dtype=torch.bool),
+            "loss_mask": torch.ones(seq_len, dtype=torch.bool),
+            "obs_history_is_pad": torch.zeros(seq_len, dtype=torch.bool),
+            "timestep_is_pad": tp,
+            "camera0": torch.arange(seq_len * 3, dtype=torch.float32).reshape(seq_len, 3),
+            "prompt": "not a tensor, must be left alone",
+        }
+
+    def test_padding_moves_to_the_back(self):
+        from opentau.datasets.lerobot_dataset import LeRobotDataset
+
+        seq_len, n_pad = 6, 2
+        item = self._item(seq_len, n_pad)
+        LeRobotDataset._shift_real_timesteps_to_front(item, n_pad)
+
+        assert not item["timestep_is_pad"][: seq_len - n_pad].any()
+        assert item["timestep_is_pad"][seq_len - n_pad :].all()
+
+    def test_real_frames_keep_their_content_and_order(self):
+        """The rotation must reposition frames, never reselect or reorder them."""
+        from opentau.datasets.lerobot_dataset import LeRobotDataset
+
+        seq_len, n_pad = 6, 2
+        item = self._item(seq_len, n_pad)
+        before = item["state"].clone()
+        LeRobotDataset._shift_real_timesteps_to_front(item, n_pad)
+
+        # Real frames were rows n_pad..end; they must now be rows 0..n_real-1,
+        # in the same order.
+        torch.testing.assert_close(item["state"][: seq_len - n_pad], before[n_pad:])
+        # And the wrapped padding keeps the rows it had.
+        torch.testing.assert_close(item["state"][seq_len - n_pad :], before[:n_pad])
+
+    def test_every_temporal_key_moves_together(self):
+        """A key left behind would desynchronise the mask from its frames."""
+        from opentau.datasets.lerobot_dataset import LeRobotDataset
+
+        seq_len, n_pad = 6, 2
+        item = self._item(seq_len, n_pad)
+        befores = {k: v.clone() for k, v in item.items() if torch.is_tensor(v)}
+        LeRobotDataset._shift_real_timesteps_to_front(item, n_pad)
+
+        for key, before in befores.items():
+            torch.testing.assert_close(item[key], torch.roll(before, shifts=-n_pad, dims=0))
+
+    def test_non_tensor_keys_are_untouched(self):
+        from opentau.datasets.lerobot_dataset import LeRobotDataset
+
+        item = self._item()
+        LeRobotDataset._shift_real_timesteps_to_front(item, 2)
+        assert item["prompt"] == "not a tensor, must be left alone"
+
+    def test_a_missing_temporal_key_raises(self):
+        """Guards against a future key reaching the sample after the shift."""
+        from opentau.datasets.lerobot_dataset import LeRobotDataset
+
+        item = self._item()
+        del item["timestep_is_pad"]
+
+        with pytest.raises(RuntimeError, match="missed required temporal key"):
+            LeRobotDataset._shift_real_timesteps_to_front(item, 2)
