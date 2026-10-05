@@ -114,6 +114,7 @@ class PairedSequenceDataset(Dataset):
             "action_is_pad",
             "loss_mask",
             "obs_history_is_pad",
+            "timestep_is_pad",
         }
     )
 

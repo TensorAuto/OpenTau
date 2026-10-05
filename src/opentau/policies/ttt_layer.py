@@ -525,6 +525,7 @@ class TTTMLPLayer(nn.Module):
         mini_batch_size: int,
         fast_weights: TTTFastWeights | None = None,
         position_offset: int = 0,
+        timestep_is_pad: Tensor | None = None,
     ) -> tuple[Tensor, TTTFastWeights]:
         """Runs the layer over a sequence, updating and returning fast weights.
 
@@ -616,6 +617,31 @@ class TTTMLPLayer(nn.Module):
         xv = xk + _layer_norm_forward(xv - xk, ln_weight.squeeze(1), ln_bias.squeeze(1))
 
         eta = self._inner_learning_rates(hidden_states.to(compute_dtype), mini_batch_size)
+
+        # Padded timesteps must not be learned from. A timestep whose window
+        # position falls before the episode's first frame carries a repeated
+        # boundary frame; taking an inner gradient step on it writes that
+        # repetition into the fast weights, which is exactly the signal the
+        # demonstration is supposed to supply.
+        #
+        # Zeroing `eta` is sufficient and needs no change to the step itself:
+        # with `eta == 0`, `b1_bar == b1`, `z1_bar` reduces to a forward pass
+        # under the incoming weights, and `last_eta == 0` leaves
+        # `next_fast_weights` equal to `fast_weights`. The timestep is read
+        # with the current memory and contributes nothing to it.
+        #
+        # Masking here rather than skipping mini-batches keeps the scan shape
+        # static (padding differs per sample within a batch) and leaves the
+        # gradient-checkpoint grouping untouched.
+        if timestep_is_pad is not None:
+            num_mini_batch = hidden_states.shape[1] // mini_batch_size
+            if tuple(timestep_is_pad.shape) != (batch_size, num_mini_batch):
+                raise ValueError(
+                    f"timestep_is_pad must have shape ({batch_size}, {num_mini_batch}), "
+                    f"got {tuple(timestep_is_pad.shape)}"
+                )
+            keep = (~timestep_is_pad).to(eta.dtype).view(batch_size, 1, num_mini_batch, 1, 1)
+            eta = eta * keep
 
         to_mini_batches = "b (nc c) h d -> nc b h c d"
         xq = rearrange(xq, to_mini_batches, c=mini_batch_size)
@@ -742,3 +768,4 @@ class TTTSequenceState:
     position_offset: int = 0
     incoming: dict[int, TTTFastWeights] = field(default_factory=dict)
     outgoing: dict[int, TTTFastWeights] = field(default_factory=dict)
+    timestep_is_pad: Tensor | None = None

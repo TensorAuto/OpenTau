@@ -1085,19 +1085,20 @@ class BaseDataset(torch.utils.data.Dataset):
         # per-timestep loss mask. Runs last so every per-frame transform above
         # (padding, column indexing, dtype cast) sees the flat layout it was
         # written for.
-        self._reshape_to_sequence(standard_item)
+        fr = item.get("frame_index")
+        frame_index = int(fr.item() if torch.is_tensor(fr) else fr) if fr is not None else -1
+        self._reshape_to_sequence(standard_item, frame_index)
 
         standard_item["source"] = self._get_feature_mapping_key()
         ep = item.get("episode_index")
         standard_item["episode_index"] = (
             int(ep.item() if torch.is_tensor(ep) else ep) if ep is not None else -1
         )
-        fr = item.get("frame_index")
-        standard_item["frame_index"] = int(fr.item() if torch.is_tensor(fr) else fr) if fr is not None else -1
+        standard_item["frame_index"] = frame_index
 
         return standard_item
 
-    def _reshape_to_sequence(self, standard_item: dict) -> None:
+    def _reshape_to_sequence(self, standard_item: dict, frame_index: int = -1) -> None:
         """Give the sample a leading timestep axis, for recurrent policies.
 
         The fetch layer returns the widened action query flat, as
@@ -1140,6 +1141,29 @@ class BaseDataset(torch.utils.data.Dataset):
             standard_item[key] = rearrange(value, "(t h) ... -> t h ...", t=seq_len)
 
         standard_item["loss_mask"] = torch.ones(seq_len, dtype=torch.bool)
+
+        # `timestep_is_pad`: True where this timestep falls BEFORE the episode's first
+        # frame. The window is anchored on the queried frame and walks backwards in
+        # `sequence_stride` steps, so a query at frame `f` has `floor(f / stride) + 1`
+        # real timesteps and the shortfall lands on the leading (oldest) positions.
+        # Episodes shorter than the full window stay usable -- they carry a padded
+        # prefix -- and TTT zeroes its inner learning rate there instead of taking a
+        # gradient step on a repeated boundary frame.
+        #
+        # Neither existing pad flag can serve here: `action_is_pad` marks missing
+        # FUTURE actions at the episode tail, and `obs_history_is_pad` also goes True
+        # for `history_state_drop_prob` augmentation -- masking TTT on that would
+        # silence learning on real frames. This flag means one thing only.
+        #
+        # `sequence_stride` is pinned to `action_chunk` by
+        # `TrainPipelineConfig._validate_sequence_stride` (one timestep = one disjoint
+        # action chunk), so `action_chunk` IS the stride.
+        timestep_is_pad = torch.zeros(seq_len, dtype=torch.bool)
+        if frame_index >= 0:
+            stride = max(1, int(self.action_chunk))
+            n_real = min(seq_len, frame_index // stride + 1)
+            timestep_is_pad[: seq_len - n_real] = True
+        standard_item["timestep_is_pad"] = timestep_is_pad
 
     def _apply_column_index_and_delta(self, standard_item: dict) -> None:
         """Subset/reorder `state` and `actions`, then make mapped action dims relative.
