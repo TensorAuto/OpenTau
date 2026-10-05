@@ -55,6 +55,7 @@ OVERRIDE_FILES = [
     "pi07/high_level_planner/modeling_pi07_high_level.py",
     "pi07_paligemma/low_level/modeling_pi07_low_level.py",
     "pi07_paligemma/high_level_planner/modeling_pi07_high_level.py",
+    "xr1/modeling_xr1.py",
 ]
 
 

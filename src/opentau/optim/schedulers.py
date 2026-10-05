@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import abc
+import logging
 import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -110,6 +111,106 @@ class CosineDecayWithWarmupSchedulerConfig(LRSchedulerConfig):
             return cosine_decay_schedule(current_step)
 
         return LambdaLR(optimizer, lr_lambda, -1)
+
+
+@LRSchedulerConfig.register_subclass("hold_warmup_constant_cooldown")
+@dataclass
+class HoldWarmupConstantCooldownSchedulerConfig(LRSchedulerConfig):
+    """Black Forest Labs' FLUX 3 Action schedule: hold at zero, warm up, hold, cool down.
+
+    Their published DROID recipe runs two different curves at once -- the trunk is held at
+    zero for the first ``hold_steps`` updates while AdamW still accumulates moments, then
+    warms up and stays flat; the freshly initialized embodiment heads skip the hold and
+    warm up immediately, since they start from noise and nothing is being protected. Both
+    then cool down linearly together over the same window.
+
+    ``LambdaLR`` takes one lambda per parameter group, so the two shapes ride on the same
+    scheduler: ``head_param_group_indices`` selects which of
+    ``optimizer.param_groups`` get the head curve. That matters because the group *order*
+    is the policy's, not this scheduler's -- naming the indices explicitly keeps a
+    reordering from silently swapping the curves.
+
+    Args:
+        hold_steps: Updates the trunk is held at zero LR.
+        cooldown_start: Update index where the linear cooldown begins.
+        total_steps: Update index where the cooldown reaches ``final_lr_scale``.
+        final_lr_scale: Multiplier at the end of cooldown.
+        head_warmup_steps: Warmup duration for head groups, which have no hold.
+        head_param_group_indices: Which optimizer param groups use the head curve.
+    """
+
+    #: Inherited from :class:`LRSchedulerConfig`. For this schedule it is the absolute
+    #: update index at which trunk warmup *completes*, not a duration -- the trunk's
+    #: warmup is preceded by ``hold_steps``, so a duration alone would not locate it.
+    num_warmup_steps: int = 3_000
+    hold_steps: int = 1_000
+    cooldown_start: int = 25_000
+    total_steps: int = 30_000
+    final_lr_scale: float = 0.0
+    head_warmup_steps: int = 1_000
+    head_param_group_indices: tuple[int, ...] = (1,)
+
+    def __post_init__(self):
+        if not 0 <= self.hold_steps < self.num_warmup_steps <= self.cooldown_start < self.total_steps:
+            raise ValueError(
+                "expected 0 <= hold_steps < num_warmup_steps <= cooldown_start < total_steps, got "
+                f"{self.hold_steps}, {self.num_warmup_steps}, {self.cooldown_start}, {self.total_steps}."
+            )
+        if not 0 < self.head_warmup_steps <= self.cooldown_start:
+            # Warming past the cooldown start makes the head curve non-monotonic: it is
+            # still ramping up while the cooldown is already scaling down, so the factor
+            # rises to a peak below 1 and then cliff-drops the moment warmup ends.
+            raise ValueError(
+                "expected 0 < head_warmup_steps <= cooldown_start, got "
+                f"{self.head_warmup_steps} and {self.cooldown_start}."
+            )
+        if not 0.0 <= self.final_lr_scale <= 1.0:
+            raise ValueError(f"final_lr_scale must be in [0, 1], got {self.final_lr_scale}.")
+
+    def _cooldown(self, step: int) -> float:
+        if step < self.cooldown_start:
+            return 1.0
+        span = self.total_steps - self.cooldown_start
+        frac = min(1.0, (step - self.cooldown_start) / span)
+        return 1.0 + frac * (self.final_lr_scale - 1.0)
+
+    def _trunk_factor(self, step: int) -> float:
+        if step < self.hold_steps:
+            return 0.0
+        if step < self.num_warmup_steps:
+            return (step - self.hold_steps) / (self.num_warmup_steps - self.hold_steps)
+        return self._cooldown(step)
+
+    def _head_factor(self, step: int) -> float:
+        if step < self.head_warmup_steps:
+            return step / self.head_warmup_steps
+        return self._cooldown(step)
+
+    def build(self, optimizer: Optimizer, num_training_steps: int) -> LambdaLR:
+        heads = set(self.head_param_group_indices)
+        # Negative indices are a natural spelling for "the last group", but the lookup
+        # below iterates ``range(len(param_groups))``, so a negative entry would match
+        # nothing and hand *every* group the trunk curve -- silently freezing the heads.
+        invalid = [i for i in heads if i < 0 or i >= len(optimizer.param_groups)]
+        if invalid:
+            raise ValueError(
+                f"head_param_group_indices {sorted(invalid)} are out of range for the "
+                f"optimizer's {len(optimizer.param_groups)} parameter group(s); indices must "
+                "be non-negative and the policy's get_optim_params() decides the grouping."
+            )
+        if num_training_steps and num_training_steps > self.total_steps:
+            logging.warning(
+                "training for %d steps but the schedule ends at %d; every step past it runs "
+                "at final_lr_scale=%s. Set total_steps to the run length.",
+                num_training_steps,
+                self.total_steps,
+                self.final_lr_scale,
+            )
+        lambdas = [
+            (self._head_factor if i in heads else self._trunk_factor)
+            for i in range(len(optimizer.param_groups))
+        ]
+        return LambdaLR(optimizer, lambdas, -1)
 
 
 @LRSchedulerConfig.register_subclass("constant")

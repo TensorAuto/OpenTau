@@ -550,6 +550,38 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         """
         raise NotImplementedError
 
+    @property
+    def camera_delta_indices(self) -> list | None:
+        """Frame offsets, per camera, the loader must fetch for one sample.
+
+        ``None`` (the default, and what every policy but ``flux3_action`` wants) leaves
+        the camera window to ``dataset_mixture.n_obs_history`` -- the observation history,
+        whose offsets are all <= 0.
+
+        A policy that **supervises predicted frames** needs the frames *after* the
+        observation as targets, so its camera window is not an observation history at all;
+        it is an explicit offset list that may run forward. Returning one here makes
+        ``datasets.factory.resolve_delta_timestamps`` emit those offsets for camera keys
+        instead of the history window.
+
+        Offsets are in frames at the resampled ``action_freq``, **strictly** ascending
+        (a repeated offset is rejected: it would silently duplicate a frame while keeping
+        the window length), and may be negative (past), zero (the observed frame) or
+        positive (future). Nothing
+        below this needs changing to support a positive one: the fetch layer clips
+        ``idx + delta`` into the episode and raises ``<key>_is_pad`` symmetrically at
+        either end.
+
+        Note this is deliberately **not** abstract, unlike the three ``*_delta_indices``
+        above: a fourth abstract property would force every existing policy config to
+        implement it to say "no".
+
+        Returns:
+            Strictly ascending frame offsets for each camera, or None to use the
+            observation history window.
+        """
+        return None
+
     @abc.abstractproperty
     def reward_delta_indices(self) -> list | None:
         """Get indices for reward delta features.

@@ -1,0 +1,19 @@
+{
+  "crop_ratio": 0.95,
+  "input_size": [
+    256,
+    256
+  ],
+  "crop_side": 243,
+  "box_top_left_h_w": [
+    6,
+    6,
+    243,
+    243
+  ],
+  "resample": "PIL.Image.Resampling.BILINEAR",
+  "input_sha256": "15f826012e66aa19a0fb7e03bcf4944fe1dbb668218b244fdac77fda4b34dcaa",
+  "output_sha256": "c7fe5e9cfbf2ac8d3e615615702c0d2a93a020ce9db64ccf9508cbbebc9938e6",
+  "output_mean": 120.05602518717448,
+  "note": "int(256 * 0.95) = 243 is odd, so 6 columns are dropped on the left and 7 on the right -- the crop box is asymmetric. PIL BILINEAR (no antialias) is not interchangeable with torchvision antialias=True or cv2 INTER_LINEAR."
+}

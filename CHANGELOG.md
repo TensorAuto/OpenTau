@@ -10,6 +10,194 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added — `flux3_action`, Black Forest Labs' FLUX 3 Action — **new policy, no `config_version` bump**
+
+FLUX 3 Action (F3A) is a 7B world-action model ported from
+[`black-forest-labs/flux-action`](https://github.com/black-forest-labs/flux-action) (Apache-2.0)
+at `e2dd1d8`. It predicts a 32-step action chunk — 2.13 s of motion at 15 fps — by flow matching
+on the FLUX 3 backbone.
+
+**The video stream is not an optional head, and that shapes the whole port.** Every other
+multimodal policy here keeps a frozen backbone and bolts on an action expert (`cosmos3` extracts
+just the Cosmos3 reasoning tower and discards the generative machinery). F3A does not decompose
+that way: its trunk denoises action tokens and *video* tokens jointly in one packed sequence, and
+upstream marks both video streams required —
+
+```python
+REQUIRED_CONTENT_STREAMS = ("video", "video_cond")
+```
+
+— while the released DROID settings apply guidance `4.0` to video tokens against `1.0` (none) on
+action tokens, so the video pathway measurably drives action quality at inference. A
+"keep the actions, drop the video" port is therefore not a lighter variant of this policy; it is
+a non-functional one. The port keeps upstream's architecture intact, following the `xr1`
+precedent rather than the `cosmos3` one.
+
+**What that costs, and does not cost.** Inference needs no future frames — video tokens are
+denoised from noise conditioned on the observed frame — so eval works against the dataloader as
+it stands. *Finetuning* does need them (upstream's `prepare` demands `window_frames` per camera,
+"observations plus future frames"), which the dataset layer cannot currently request: camera keys
+only ever receive non-positive offsets in `resolve_delta_timestamps`. The fetch layer underneath
+is already sign-agnostic — `np.clip(idx + delta_idx, ep_start, ep_end - 1)` clips a positive
+offset at the episode *end* and raises the matching `_is_pad` flag — so enabling training is a
+request-side change, tracked separately.
+
+**Vendoring.** `policies/flux3_action/` keeps upstream's subtree (`models/`, `processing/`,
+`inference/`, `checkpoints/`) so upstream's relative imports resolve unchanged and re-syncing is a
+mechanical `diff -r`. The files are byte-identical to upstream apart from a three-line rewrite of
+its absolute self-imports; `VENDOR.md` records the provenance commit, that exact delta, and what
+was deliberately left out (`transformer_inf_fp8r.py`, rejected explicitly by the config rather
+than left as a latent `ImportError`). The vendored paths join `zero_to_fp32.py` and the generated
+gRPC stubs in the pre-commit global exclude, since formatting them would rewrite code we do not own.
+
+**New dependency: NATTEN.** The video VAE imports `natten` at module scope with no fallback and is
+mandatory on the *encode* path, so it is required at inference, not just for decoding. NATTEN
+publishes no PyPI wheels — only a CUDA-compiling sdist — so the prebuilt
+`natten==0.21.6+torch2100cu128` (cp310, linux-x86_64) is pinned by GitHub-release URL in
+`[tool.uv.sources]`. It is a **required dependency** rather than an extra — it resolves
+without conflict, so isolating it would only add a step — and is marker-gated to linux
+x86_64 exactly as `torchcodec` and `onnxruntime-gpu` are. **It is pinned to torch 2.10.0 /
+cu128, so a torch bump requires re-pinning it; because it is required, a stale pin breaks
+`uv sync` project-wide rather than only for this policy.**
+
+### Added — camera windows that run forward (`policy.camera_delta_indices`) — **opt-in, default `None`, no `config_version` bump**
+
+Until now every camera offset OpenTau emitted was non-positive: `resolve_delta_timestamps`
+gave cameras and state the observation-history window, and only actions had a forward
+horizon (`action_delta_indices`). That is the right default for a policy that consumes the
+past and predicts actions — but it makes a policy that **supervises predicted frames**
+untrainable, because its video targets are the frames *after* the observation.
+
+`flux3_action` is the first such policy here. Upstream refuses any camera window that is
+not exactly `window_frames` — *"observations plus future frames"* — so without this it
+fails at the first training forward rather than at config time.
+
+**Why the change is small.** Nothing below the request side ever assumed non-positive
+offsets. `LeRobotDataset._get_query_indices_soft` applies whatever it is handed:
+
+```python
+query_indices = {key: np.clip(idx + delta_idx, ep_start, ep_end - 1) ...}
+padding = {f"{key}_is_pad": (idx + delta_idx < ep_start) | (idx + delta_idx >= ep_end) ...}
+```
+
+A positive offset clips at the episode *end* and raises its `_is_pad` flag, the exact
+mirror of a negative one clipping at the start. Episode-boundary handling, padding flags,
+and the drop-windows-that-overrun logic therefore all worked already — only the *request*
+side needed a way to ask.
+
+**Shape of the knob.** `PreTrainedConfig.camera_delta_indices` is a concrete property
+defaulting to `None`, deliberately **not** a fourth `@abc.abstractproperty` alongside
+`observation_`/`action_`/`reward_delta_indices` — an abstract one would force all fourteen
+existing policy configs to implement it just to say "no". At `None` the old history path
+runs byte for byte.
+
+It applies to **cameras only**; state stays a single observed frame. Handing state a
+forward window would feed the policy future joint positions — a label leak no shape check
+would catch. It is rejected outright when combined with `dataset_mixture.n_obs_history` or
+`sequence_length > 1` (each defines the camera window too), and when unsorted (frames come
+back in offset order and are stacked as a time axis, so an unsorted window silently
+reorders time).
+
+**Cost.** For `flux3_action` this is `chunk_size + 1` = 33 frames per camera per sample,
+across three cameras in the DROID layout — roughly a 33x increase in camera decodes. That
+is inherent to a joint video-action objective, and the reason no other policy opts in.
+
+### Added — load released FLUX 3 Action packages, and match their fine-tuning recipe — **no `config_version` bump**
+
+`flux3_action` could not load a released Black Forest Labs package, and its training
+defaults silently disagreed with the recipe those weights were produced under. Both are
+fixed, and every value below was read off the real artifacts rather than inferred.
+
+**Loading a released package.** `black-forest-labs/flux-3-action-{droid,so101}` ship a
+LeRobot-shaped `config.json` alongside their native one. Six things stood between that and
+`from_pretrained`:
+
+* it declares `"type": "flux3"`, which this repo did not register — now an alias for
+  `flux3_action`, which stays the canonical name;
+* `dit_config`, `text_fixed_length` and `video_position_fps` arrive as `null` meaning
+  "library default", which the non-Optional fields rejected;
+* nine keys are spelled differently or unimplemented here. They are **translated, not
+  stripped**: `conditioning` -> `inference_profile`, `action_representation` ->
+  `action_parameterization`, `delta_absolute_dims` -> `absolute_action_dims`, `dtype` ->
+  `torch_dtype`. This is load-bearing — droid is `frame`/`absolute` where so101 is
+  `history`/`delta`, so dropping them would configure so101 for absolute actions against
+  delta-trained weights and quietly produce wrong ones. The four features this port does
+  not implement (`use_peft`, `use_relative_actions`, `packer`, `action_feature_names`)
+  raise if set rather than being ignored;
+* the released checkpoints are 8-wide, and upstream asserts state/action match
+  `action_dim` exactly, so `max_state_dim`/`max_action_dim` are 8 rather than OpenTau's
+  usual 32;
+* a released `model.safetensors` is rooted at `dit.*` while this wrapper nests the policy
+  as `self.model`. Without re-rooting, every tensor is reported both missing *and*
+  unexpected — and under the default `strict=False` that leaves a randomly initialized
+  7B model that runs and returns plausible-shaped garbage.
+
+Verified end to end: the unmodified `flux-3-action-droid` package loads under
+`strict=True` (6.95B parameters, every key matched) and predicts a 32-step chunk on a real
+DROID episode with a mean absolute error of 0.026 against recorded actions whose own scale
+is 0.70.
+
+**Matching the recipe.** Sixteen of eighteen training fields already agreed with Black
+Forest Labs' published DROID recipe; `optimizer_betas` (0.9, 0.95 -> 0.9, 0.99) and
+`optimizer_weight_decay` (0 -> 0.05) were this repo's generic defaults and are now theirs.
+The camera window is 33 frames, matching the recipe's "33 frames at 15 Hz".
+
+### Fixed — `get_optim_params()` param groups now reach the optimizer
+
+`optim/factory.py` filtered its input with `p.requires_grad`, which raises
+`AttributeError: 'dict' object has no attribute 'requires_grad'` on the param-group dicts
+a policy returns when it wants per-group hyperparameters. The effect was silent and total:
+such a policy could not build an optimizer at all, so `flux3_action`'s 5x head learning
+rate — part of the recipe its released weights were trained under — never applied.
+
+The filter now reaches inside the groups. Flat parameter lists, which every other policy
+returns, take an identical path and are unchanged object-for-object. Fully frozen groups
+are kept rather than dropped, so group *indices* stay stable for anything addressing a
+group by position. Malformed input (mixing bare parameters with groups, or a group with no
+`params` key) now raises a message naming the problem instead of leaking the original
+`AttributeError`.
+
+Relatedly, `TrainPipelineConfig` no longer discards an explicitly chosen `optimizer` or
+`scheduler` when `use_policy_training_preset` is set — it fills only what the config left
+unset. The preset path is the only one that yields param groups, so overwriting there made
+per-group learning rates and a chosen schedule mutually exclusive, and the config's choice
+vanished without warning.
+
+### Added — `hold_warmup_constant_cooldown` learning-rate schedule — **opt-in, nothing selects it by default**
+
+Black Forest Labs' FLUX 3 Action recipe runs two curves at once: the pretrained trunk held
+at zero LR for 1,000 updates while AdamW still accumulates moments, then warming to 3,000;
+the freshly initialized embodiment heads skipping the hold and warming over 1,000, since
+they start from noise and nothing is being protected. Both stay flat to 25,000 and cool
+linearly to 30,000. No existing scheduler has that shape.
+
+`LambdaLR` takes one lambda per parameter group, so both curves ride on one scheduler;
+`head_param_group_indices` names which groups get the head curve, because the grouping
+belongs to the policy and a reordering must not silently swap them.
+
+Purely additive — a new registered subclass, no existing scheduler touched, and a test
+asserts no policy's preset selects it.
+
+### Changed — three shipped configs now get the optimizer settings they declare
+
+Honouring an explicit `optimizer`/`scheduler` changes the effective settings of every
+config that set one *and* `use_policy_training_preset`, because the preset used to
+overwrite it. Three do, and their declared values have never taken effect:
+
+- `configs/dev/ci_config.json` (pi05) — `lr` 2.5e-05 → 1e-04, `weight_decay` 1e-10 → 0,
+  warmup 1,000 → 0 steps, `peak_lr` 2.5e-05 → 1e-04, `decay_lr` 2.5e-06 → 0. The regression
+  workflow's 25-step run now uses the settings that file has always asked for; its checks
+  are qualitative (a loss drop, a non-zero grad norm), and a no-warmup run reaches them
+  sooner rather than later.
+- `configs/examples/xr1_robocasa365_finetune_config.json` and
+  `..._eval_config.json` (xr1) — `grad_clip_norm` 10.0 → 1.0.
+
+The values are left as their authors wrote them rather than rewritten to match what the
+preset was imposing. A test pins this exact set, so a fourth config — or a preset edit that
+creates a new divergence — fails rather than changing a training run unannounced.
+
+## [0.14.0] - 2026-09-14
+
 ### Added — best-of-N action-chunk sampling — **opt-in, default `1`, no `config_version` bump**
 
 A flow-matching policy maps one Gaussian draw to exactly one action chunk, deterministically,
@@ -308,6 +496,36 @@ Both are inert outside sequence mode: `timestep_is_pad` is only emitted at
 `sequence_length > 1`, the mask defaults to `None`, and the rotation runs only when the window
 actually has padding.
 
+### Added — `xr1`, the Xiaomi-Robotics-1 port (Qwen3-VL-4B + 36-layer DiT) — **new policy, opt-in, no `config_version` bump**
+
+A faithful port of Xiaomi-Robotics-1 (`XiaomiRobotics/Xiaomi-Robotics-1-RoboCasa365`,
+Apache-2.0): a Qwen3-VL-4B vision-language backbone whose per-layer key/value cache is read by
+a 36-layer DiT flow-matching action head, one DiT layer per VLM layer. Four observation frames
+per camera at stride 2 reach the backbone as three two-frame *videos*; the flow integrates
+**ascending** τ (0 → 1, `dt = +1/num_steps`), the opposite direction from π₀.₅ and cosmos3; and
+normalization is identity throughout, because the state adapter consumes raw quaternions and
+the reference's RoboCasa365 action statistics are mean 0 / std 1.
+
+Parity against the reference checkpoint is **bit-identical**, not approximate: the tokenized
+prompt, all 72 prefix key/value tensors, every Euler-step velocity, the full decoded chunk and
+a hash over all 1121 parameters all compare equal, and a 16-chunk open-loop replay stays within
+p99 2e-3. In simulation the five-rung parity ladder measured (ours / published) CloseFridge
+98 % / 94 %, TurnOnMicrowave 48 % / 56 %, OpenDrawer 96 % / 94 % and CloseBlenderLid 40 % / 36 %
+— all inside their Wilson intervals. The goldens, the gates and the ladder recipe are
+documented under `tests/artifacts/policies/xr1/`.
+
+Two settings there are load-bearing for reproducing a published RoboCasa365 rate and are set in
+`configs/examples/xr1_robocasa365_eval_config.json`: the camera order must put the wrist camera
+**last** (the env maps cameras to `camera{i}` positionally and the prompt labels them by
+position), and `env.obj_registries` must be `["objaverse", "lightwheel"]` — OpenTau's
+lightwheel-only default changes the scene generated at a given reset seed, so rates measured
+under it are not comparable to published numbers. A fine-tune config ships alongside it.
+
+One trap worth naming for anyone extending the policy: the RoboCasa365 datasets store
+`observation.state` **EE-first** while the simulator's `agent_pos` is **base-first**. Both are
+16 wide and both carry two unit quaternions, so the wrong one produces a plausible pose and no
+error; `state_adapter` names which layout a config is reading.
+
 ### Fixed
 
 - **Pre-rename π₀.₅ checkpoints load again: legacy `normalize_actions.*` state-dict keys
@@ -352,6 +570,56 @@ actually has padding.
   workers from constructing different permutations when the global seed is
   intentionally offset per rank, while preserving caller control via either
   `generator` or `seed`. Unseeded shuffles are now deterministic across runs.
+- **RoboCasa actions were permuted on every step: the flat 12-D vector is EE-first, not
+  base-first.** `envs/robocasa.py::convert_action` sliced `base_motion(4), control_mode(1),
+  ee_pos(3), ee_rot(3), gripper(1)`, while RoboCasa's own
+  `robocasa.utils.env_utils.convert_action` — and the RoboCasa365 LeRobot datasets every
+  policy trains on — use `ee_pos(3), ee_rot(3), gripper(1), base_motion(4),
+  control_mode(1)`. Every action reaching the simulator was therefore permuted: the
+  end-effector command was routed into base motion, the "control mode" read a continuously
+  varying column, and the gripper read a column that never changed. The failure is silent —
+  the arm still moves, episodes still run to completion, only the success rate falls.
+  The layout is now pinned against both of its independent sources (RoboCasa's converter
+  when the extra is installed; the dataset's own column signature otherwise) in
+  `tests/envs/test_robocasa_action_layout.py`.
+  **Silent result change: every RoboCasa success rate this repository produced before this
+  fix is understated by a policy-dependent, unknown amount, and is not comparable to a
+  post-fix number — nor to another pre-fix number.** Only the in-process eval path
+  (`env.type: robocasa`) is affected: the external WebSocket server/client path converts
+  actions client-side, and no training, dataset or serving path reads the flat-12 layout.
+- **A fully-downloaded RoboCasa asset store no longer fails on a missing download
+  manifest.** `_ensure_robocasa_assets` loaded `box_links_assets.json` unconditionally,
+  ahead of the per-pack loop that skips packs already on disk, so a store holding every pack
+  still died with `FileNotFoundError` before a single env was built. It is reachable in
+  practice because the seeding step keyed on its marker file alone: a store seeded by a run
+  whose package dir was already a symlink never received the wheel-shipped `box_links/` (nor
+  `arenas/empty_kitchen_arena.xml`, which fails later, inside the env workers), and every
+  later run then died on the manifest despite having every pack. The manifest is now
+  resolved only when a pack is genuinely missing — that error is kept, it is actionable —
+  and the seeding step re-seeds whatever the store actually lacks rather than trusting the
+  marker.
+- **A restricted `env.obj_registries` no longer silently produces incomparable success
+  rates.** The `["lightwheel"]` default is kept (RoboCasa's own `["objaverse",
+  "lightwheel"]` needs a ~30 GB pack, and changing the default would make every existing
+  RoboCasa config demand it), but it is not comparability-neutral: the registry set feeds
+  RoboCasa's scene generation, so restricting it changes the generated scene rather than
+  only which meshes are placed in it — on `CloseFridge` / `split="pretrain"` at a fixed
+  reset seed, the fridge's own `base_position` moves from `-3.100518` to `-3.262029`. Rates
+  measured that way are self-consistent but not comparable to published RoboCasa365 or
+  leaderboard numbers, for any policy. Env construction now prints a one-time rank-0 warning
+  saying so, and the constant, the `obj_registries` config docs and the RoboCasa tutorial
+  carry that consequence rather than only the download size.
+- **The `value` policy reads its prediction from a learned `<val>` readout token instead of
+  the last sequence position.** Once the prompt was padded to `prompt_max_length`, that last
+  position was padding, so training and inference both read a constant and the head could only
+  emit the mean return. Training and inference now read the same real position. Datasets
+  without a `response` key default it to an empty string (masking the response head off), and
+  `dataset_index` is forced to `0` so the value function uses one shared normalization head
+  across all datasets.
+- **gRPC `GetActionChunk` no longer fails with an empty `Inference error:` after
+  `torch.compile(mode="max-autotune")`.** CUDA graphs are thread-local: warmup ran on the main
+  thread while RPCs ran on the gRPC thread pool. Warmup and every `sample_actions` call now run
+  on one dedicated inference thread, and `INTERNAL` errors include the exception type.
 - **`use_delta_joint_actions` works with `sequence_length > 1`.** The combination was refused
   outright. Sequence mode reaches the delta transform while `actions` are still flat
   `(T * chunk, D_a)` and `state` already carries its time axis `(T, D_s)`; both are rank 2, so
@@ -827,6 +1095,7 @@ carry a concrete `config_version` (and an informational `opentau_version`).
   hand-built dict must re-emit it from the loaded config, or the tag is absent and
   the checkpoint is read as legacy.
 
-[Unreleased]: https://github.com/TensorAuto/OpenTau/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/TensorAuto/OpenTau/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/TensorAuto/OpenTau/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/TensorAuto/OpenTau/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/TensorAuto/OpenTau/compare/v0.11.0...v0.12.0

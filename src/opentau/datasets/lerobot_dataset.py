@@ -821,6 +821,14 @@ class BaseDataset(torch.utils.data.Dataset):
         self.n_obs_history = dm.n_obs_history if dm else None
         # Number of supervised timesteps per sample; 1 is today's behaviour.
         self.sequence_length = getattr(dm, "sequence_length", 1) if dm else 1
+        # Frames per camera when the *policy* owns the camera window
+        # (`camera_delta_indices`) rather than `n_obs_history` / `sequence_length`.
+        # A policy that supervises predicted frames asks for the observation plus the
+        # future targets, so the camera tensors carry a leading time axis even though
+        # both mixture-level mechanisms are off -- which is exactly the case that used to
+        # fall through to the scalar path below.
+        _cdi = getattr(cfg.policy, "camera_delta_indices", None) if cfg.policy else None
+        self.camera_window_frames = len(_cdi) if _cdi else None
         # Optional-key dropout probabilities (all default to 0 when no mixture config is
         # provided, preserving legacy/VQA paths that don't use these keys).
         self.history_state_drop_prob = dm.history_state_drop_prob if dm else 0.0
@@ -881,26 +889,23 @@ class BaseDataset(torch.utils.data.Dataset):
     ) -> None:
         """Assert an image tensor has the expected rank, 3-channel, and [0, 1] range.
 
-        By default, the expected shape follows ``self.n_obs_history``: rank-3
-        ``(3, H, W)`` when None, rank-4 ``(T, 3, H, W)`` otherwise. Pass
+        By default the expected shape follows :attr:`temporal_camera_frames`: rank-3
+        ``(3, H, W)`` when it is None, rank-4 ``(T, 3, H, W)`` otherwise. Pass
         ``expect_temporal`` explicitly to override — e.g. subgoals are always
         single-frame targets regardless of observation history.
 
         Args:
             img: Image tensor to validate.
             name: Human-readable key name for the error message.
-            expect_temporal: If ``None``, defers to whether a time axis is
-                active — ``self.n_obs_history`` or ``self.sequence_length > 1``. If
-                ``True`` force-expects ``(T, 3, H, W)``. If ``False`` force-expects
+            expect_temporal: If ``None``, defers to :attr:`temporal_camera_frames`,
+                which resolves every mechanism that can put a time axis on a camera.
+                If ``True`` force-expects ``(T, 3, H, W)``. If ``False`` force-expects
                 ``(3, H, W)``.
         """
         if expect_temporal is None:
-            # Either mechanism puts a leading time axis on a camera:
-            # `n_obs_history` or `sequence_length`. Deferring to
-            # `n_obs_history` alone made a sequence batch fail this assertion
-            # with "Expected image camera0 to have shape (3, H, W) ... Got
-            # torch.Size([4, 3, 224, 224])".
-            expect_temporal = self.n_obs_history is not None or getattr(self, "sequence_length", 1) > 1
+            # `temporal_camera_frames` owns this question -- see its docstring for
+            # why enumerating a subset of the mechanisms here has broken twice.
+            expect_temporal = self.temporal_camera_frames is not None
         if expect_temporal:
             expected_ndim = 4
             expected_c_dim = 1
@@ -921,13 +926,34 @@ class BaseDataset(torch.utils.data.Dataset):
             f"self={self._get_feature_mapping_key()}."
         )
 
+    @property
+    def temporal_camera_frames(self) -> int | None:
+        """Frames on a camera's leading time axis, or ``None`` for a single frame.
+
+        Three mechanisms can put a time axis on a camera and they are mutually exclusive
+        by config validation: ``n_obs_history`` (a history window for one prediction),
+        ``sequence_length`` (one observation per supervised timestep), and a policy-owned
+        ``camera_delta_indices`` window (observation plus future video targets).
+
+        They are resolved in one place deliberately. Keying the shape handling on a
+        subset has now broken twice -- first ``n_obs_history`` alone sent sequence batches
+        down the scalar path, then the same omission sent policy-owned windows there --
+        each time surfacing as ``a Tensor with N elements cannot be converted to Scalar``
+        on the first training batch rather than as a config error.
+        """
+        if self.n_obs_history is not None:
+            return self.n_obs_history
+        if getattr(self, "sequence_length", 1) > 1:
+            return self.sequence_length
+        return getattr(self, "camera_window_frames", None)
+
     def _standardize_images(self, item, standard_item, n_cams) -> list[bool]:
         """Standardize image features to a common format.
 
         Resizes images to the target resolution with padding, and tracks
         which camera slots are padded (absent cameras).
 
-        When ``self.n_obs_history`` is set, camera tensors have shape
+        When :attr:`temporal_camera_frames` is set, camera tensors have shape
         ``(T, C, H, W)`` and each frame is resized individually.
 
         Args:
@@ -944,19 +970,10 @@ class BaseDataset(torch.utils.data.Dataset):
             std_key = f"camera{cam_idx}"
             key = name_map.get(std_key)
 
-            # A camera carries a leading time axis under either mechanism:
-            # `n_obs_history` (a history window for one prediction) or
-            # `sequence_length` (one observation per supervised timestep). They
-            # are mutually exclusive by config validation, so at most one is
-            # active — but the *shape handling* is identical, and keying it on
-            # `n_obs_history` alone sent sequence batches down the scalar path,
-            # where `item[key + "_is_pad"].item()` raised
-            # "a Tensor with 4 elements cannot be converted to Scalar".
-            temporal_frames = (
-                self.n_obs_history
-                if self.n_obs_history is not None
-                else (_seq_len if (_seq_len := getattr(self, "sequence_length", 1)) > 1 else None)
-            )
+            # Which mechanism supplies the time axis is `temporal_camera_frames`'s
+            # problem, not this loop's -- the shape handling is identical for all of
+            # them, and keying it on a subset here is precisely what has broken twice.
+            temporal_frames = self.temporal_camera_frames
 
             if key is None:
                 if temporal_frames is not None:

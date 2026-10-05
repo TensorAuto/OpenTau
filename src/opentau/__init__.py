@@ -172,6 +172,8 @@ available_policies = [
     "pi07_low_level",
     "cosmos3",
     "cosmos3_nano",
+    "xr1",
+    "flux3_action",
     "value",
 ]
 

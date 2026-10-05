@@ -163,7 +163,7 @@
         "project": "pi05",
         "run_id": null,
         "name": null,
-        "notes": "RoboCasa eval plumbing smoke (CloseFridge). Swap policy.pretrained_path for a RoboCasa-trained checkpoint for meaningful success rates.",
+        "notes": "RoboCasa eval plumbing smoke (CloseFridge, 2 episodes). NOT aiming for comparability: obj_registries is the restricted ['lightwheel'] default, which changes the generated scene, so any rate this config produces is incomparable to published RoboCasa365 numbers. Swap policy.pretrained_path for a RoboCasa-trained checkpoint and set obj_registries to ['objaverse', 'lightwheel'] for meaningful, comparable success rates.",
         "tags": [],
         "group": null,
         "job_type": null,

@@ -360,8 +360,14 @@ class RoboCasaEnv(EnvConfig):
             demo scenes recorded in a dataset's ``extras/*/ep_meta.json``. ``None``
             (default) keeps the split-derived sampling.
         obj_registries: Object-mesh registries to sample assets from. Defaults to
-            ``["lightwheel"]`` (the pack the asset downloader ships by default);
-            add ``"objaverse"`` only after downloading that ~30GB pack.
+            ``["lightwheel"]`` (the pack the asset downloader ships by default).
+            **Not comparability-neutral**: the registry set feeds RoboCasa's scene
+            generation, so restricting it changes the generated scene — not just which
+            meshes get placed — and the resulting success rates are self-consistent but
+            not comparable to published RoboCasa365 numbers. See
+            ``envs/robocasa.py::DEFAULT_OBJ_REGISTRIES`` for the measurement. Set to
+            ``["objaverse", "lightwheel"]`` (RoboCasa's own default) for a comparable
+            run, after downloading that ~30GB pack.
         assets_root: Directory to store/read RoboCasa kitchen assets, kept outside the
             (ephemeral) uv venv. ``None`` resolves to the ``ROBOCASA_ASSETS_ROOT`` env
             var, else ``HF_OPENTAU_HOME/robocasa/assets``.

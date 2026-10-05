@@ -108,6 +108,7 @@ FLOW_MATCHING_POLICIES = [
         "PI07PaligemmaLowLevelPolicy",
     ),
     ("cosmos3/modeling_cosmos3.py", "Cosmos3FlowMatching", "Cosmos3Policy"),
+    ("xr1/modeling_xr1.py", "XR1FlowMatching", "XR1Policy"),
 ]
 
 IDS = [entry[0] for entry in FLOW_MATCHING_POLICIES]
