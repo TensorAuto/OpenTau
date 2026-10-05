@@ -1157,18 +1157,50 @@ class BaseDataset(torch.utils.data.Dataset):
         #
         # `sequence_stride` is pinned to `action_chunk` by
         # `TrainPipelineConfig._validate_sequence_stride` (one timestep = one disjoint
-        # action chunk), so `action_chunk` IS the stride.
+        # action chunk), so `action_chunk` is the stride -- but it is a stride in
+        # `action_freq` units, NOT in source frames. `resolve_delta_timestamps` emits
+        # the window's offsets in SECONDS (`-(T-1-t) * seq_stride / action_freq`) and
+        # `get_delta_indices_soft` converts them back with the dataset's NATIVE fps,
+        # so one timestep spans `seq_stride * fps / action_freq` source frames.
+        # Assuming `action_freq == fps` would place the boundary wrongly on any resampled
+        # dataset -- marking clamped repeated frames as real, and rotating the
+        # window by the same amount. Validation only rejects *over*sampling
+        # (`action_freq > seq_stride * fps`), so undersampling reaches here.
         timestep_is_pad = torch.zeros(seq_len, dtype=torch.bool)
         n_pad = 0
         if frame_index >= 0:
-            stride = max(1, int(self.action_chunk))
-            n_real = min(seq_len, frame_index // stride + 1)
-            n_pad = seq_len - n_real
-            timestep_is_pad[:n_pad] = True
+            timestep_is_pad[: self._pad_timestep_count(frame_index, seq_len)] = True
+            n_pad = int(timestep_is_pad.sum())
         standard_item["timestep_is_pad"] = timestep_is_pad
 
         if n_pad:
             self._shift_real_timesteps_to_front(standard_item, n_pad)
+
+    def _pad_timestep_count(self, frame_index: int, seq_len: int) -> int:
+        """Counts the window's leading timesteps that fall before the episode start.
+
+        The window is anchored on ``frame_index`` and walks backwards one timestep
+        at a time. A timestep spans ``sequence_stride * fps / action_freq`` source
+        frames, because the offsets are built in seconds against ``action_freq``
+        and resolved back to frames against the dataset's native fps.
+
+        Args:
+            frame_index: Queried frame's index within its episode.
+            seq_len: Timesteps in the window.
+
+        Returns:
+            Number of padded timesteps, all at the front of the window.
+        """
+        stride = max(1, int(self.action_chunk))
+        frames_per_timestep = float(stride)
+        if self._action_freq:
+            frames_per_timestep = stride * (float(self.fps) / float(self._action_freq))
+        # A timestep is real when `frame_index - k * frames_per_timestep >= 0`.
+        # `floor` is the conservative rounding: a boundary timestep is called
+        # padding, so a frame the fetch layer clamped is never learned from.
+        frames_per_timestep = max(frames_per_timestep, 1e-9)
+        n_real = min(seq_len, int(frame_index // frames_per_timestep) + 1)
+        return seq_len - n_real
 
     # Keys whose leading axis is time. Mirrors
     # `PairedSequenceDataset._is_temporal`, which concatenates exactly these
@@ -2022,6 +2054,27 @@ class LeRobotDataset(BaseDataset):
                 if self.meta.episodes_stats.get(ep_idx)
             ]
             _subset_stats = aggregate_stats(_per_ep) if _per_ep else {}
+            # Warn on the PARTIAL case. An aggregate over only the episodes that
+            # happen to carry stats is published as `meta.stats` below and pooled
+            # by the mixture normalizer, so a selection where some episodes are
+            # missing stats yields a silently biased sample of the selection --
+            # indistinguishable, downstream, from a complete one.
+            if _per_ep and len(_per_ep) < len(self.episodes):
+                logging.warning(
+                    "%s: %d of %d selected episodes carry per-episode stats; the aggregate "
+                    "published as meta.stats covers only those, so it is biased toward them. "
+                    "Normalization from `norm_stats_override_path` or the policy buffers is "
+                    "unaffected.",
+                    getattr(self, "repo_id", "dataset"),
+                    len(_per_ep),
+                    len(self.episodes),
+                )
+            elif not _per_ep:
+                logging.warning(
+                    "%s: no selected episode carries per-episode stats; falling back to the "
+                    "dataset-level stats, which describe a superset of the selection.",
+                    getattr(self, "repo_id", "dataset"),
+                )
             self.stats = _subset_stats if _subset_stats else self.meta.stats
             # Propagate the selected-episode aggregate onto the metadata so the
             # mixture normalizer (which pools `ds.meta.stats`) reflects the

@@ -277,6 +277,37 @@ a fixed one; the earlier fixed fallback collapsed an entire key onto a single pa
 still reported thousands available. A construction-time probe now logs `PAIR DIVERSITY COLLAPSE`
 when the reachable pair space is not being covered.
 
+`n_demos` (default `1`) places more than one demonstration in context: a sample becomes
+`n_demos` demonstration episodes followed by the rollout, all drawn from one pairing key. At
+`n_demos == 1` the draw is bit-identical to the original pair draw, so runs made before the
+field existed reproduce exactly.
+
+**Episodes shorter than the sequence window are now usable, and TTT no longer learns from the
+padding.** The window is anchored on the episode's last frame, so a short episode arrives with a
+padded prefix repeating a boundary frame. `loss_mask` already marked the demonstration half as
+context-only, but a context timestep still updates the fast weights — that *is* the one-shot
+mechanism — so the inner gradient step ran on every padded frame: at `sequence_length` 31, a
+121-frame episode meant roughly 40 inner updates on one repeated frame. The dataset now emits
+`timestep_is_pad` and `TTTMLPLayer.forward` zeroes `eta` there, which leaves the outgoing fast
+weights equal to the incoming ones and reduces the output to a forward pass under them. The flag
+is derived from the queried frame index and the *source-frame* stride
+(`sequence_stride * fps / action_freq`), not from `action_is_pad` (which marks missing future
+actions) or `obs_history_is_pad` (which also fires for history-drop augmentation).
+
+**A short episode's real timesteps now sit at the start of the window.** Their placement at the
+back gave them the position stamps of the late slots, and RoPE positions are absolute while the
+TTT update reads the rotated keys — so identical footage reached the memory at a different phase
+depending on episode length, a phase evaluation never produces (demonstration pools skip episodes
+shorter than the window). The window is rotated left by the pad count, which changes neither
+which frames were selected nor their order, so the masked update is bit-identical and only the
+phase moves. Long episodes already filled the window from position 0 and are untouched: the rule
+is now uniform rather than length-dependent — real frames start at position 0, padding goes at
+the back.
+
+Both are inert outside sequence mode: `timestep_is_pad` is only emitted at
+`sequence_length > 1`, the mask defaults to `None`, and the rotation runs only when the window
+actually has padding.
+
 ### Fixed
 
 - **Pre-rename π₀.₅ checkpoints load again: legacy `normalize_actions.*` state-dict keys
@@ -321,6 +352,19 @@ when the reachable pair space is not being covered.
   workers from constructing different permutations when the global seed is
   intentionally offset per rank, while preserving caller control via either
   `generator` or `seed`. Unseeded shuffles are now deterministic across runs.
+- **`use_delta_joint_actions` works with `sequence_length > 1`.** The combination was refused
+  outright. Sequence mode reaches the delta transform while `actions` are still flat
+  `(T * chunk, D_a)` and `state` already carries its time axis `(T, D_s)`; both are rank 2, so
+  the offset broadcast read the trailing axis as a history window and applied the *last*
+  timestep's pose to the whole sequence. Folding the timestep axis out first makes each chunk
+  relative to its own start state, and the refusal is lifted.
+- **Episode-subset datasets whose per-episode stats are absent no longer crash with
+  `KeyError: 'observation.state'`.** Some v3.0 datasets ship an episodes parquet carrying no
+  flattened `stats/*` columns, leaving `episodes_stats` empty; selecting a subset of episodes
+  then aggregated nothing and published an empty stats dict. The dataset-level stats are used as
+  the fallback, and a partial case — some selected episodes carrying stats, some not — now warns
+  rather than silently publishing an aggregate biased toward the episodes that happen to have
+  them.
 
 ### Changed — gRPC api-key auth renamed to `x-api-key` / `INFERENCE_API_KEY` — **breaking on both, no `config_version` bump**
 

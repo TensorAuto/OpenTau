@@ -495,10 +495,10 @@ class TestPadShiftToFront:
 
         seq_len, n_pad = 6, 2
         item = self._item(seq_len, n_pad)
-        befores = {k: v.clone() for k, v in item.items() if torch.is_tensor(v)}
+        originals = {k: v.clone() for k, v in item.items() if torch.is_tensor(v)}
         LeRobotDataset._shift_real_timesteps_to_front(item, n_pad)
 
-        for key, before in befores.items():
+        for key, before in originals.items():
             torch.testing.assert_close(item[key], torch.roll(before, shifts=-n_pad, dims=0))
 
     def test_non_tensor_keys_are_untouched(self):
@@ -517,3 +517,143 @@ class TestPadShiftToFront:
 
         with pytest.raises(RuntimeError, match="missed required temporal key"):
             LeRobotDataset._shift_real_timesteps_to_front(item, 2)
+
+
+class TestPadTimestepCount:
+    """``frame_index -> n_pad``, including the resampled case.
+
+    A timestep spans ``sequence_stride * fps / action_freq`` SOURCE frames:
+    ``resolve_delta_timestamps`` emits the window's offsets in seconds against
+    ``action_freq`` and ``get_delta_indices_soft`` resolves them back to frames
+    against the dataset's native fps. Reading ``sequence_stride`` as a frame
+    count holds only when the two rates agree, and validation rejects only
+    *over*sampling, so an undersampled dataset reaches this code.
+    """
+
+    @staticmethod
+    def _stub(action_chunk: int = 15, fps: int = 15, action_freq: float | None = None):
+        from opentau.datasets.lerobot_dataset import BaseDataset
+
+        ds = object.__new__(BaseDataset)
+        ds.action_chunk = action_chunk
+        ds.fps = fps
+        ds._action_freq = action_freq
+        return ds
+
+    def test_long_episode_has_no_padding(self):
+        ds = self._stub()
+        assert ds._pad_timestep_count(frame_index=599, seq_len=31) == 0
+
+    def test_short_episode_pads_the_shortfall(self):
+        ds = self._stub()
+        # frame 120 at 15 frames/timestep -> 9 real timesteps of 31.
+        assert ds._pad_timestep_count(frame_index=120, seq_len=31) == 31 - 9
+
+    def test_first_frame_leaves_one_real_timestep(self):
+        ds = self._stub()
+        assert ds._pad_timestep_count(frame_index=0, seq_len=31) == 30
+
+    def test_undersampled_dataset_uses_source_frames(self):
+        """``action_freq`` below the native fps widens a timestep in source frames.
+
+        At 30 fps with ``action_freq`` 15, one 15-unit timestep spans 30 source
+        frames, so frame 120 covers 5 timesteps -- not the 9 that reading the
+        stride as frames would give.
+        """
+        ds = self._stub(action_chunk=15, fps=30, action_freq=15.0)
+        assert ds._pad_timestep_count(frame_index=120, seq_len=31) == 31 - 5
+
+    def test_matched_rates_agree_with_the_naive_stride(self):
+        """When the rates agree the ratio is 1 and the simple reading is correct."""
+        matched = self._stub(action_chunk=15, fps=15, action_freq=15.0)
+        unset = self._stub(action_chunk=15, fps=15, action_freq=None)
+        for frame_index in (0, 14, 15, 120, 599):
+            assert matched._pad_timestep_count(frame_index, 31) == unset._pad_timestep_count(frame_index, 31)
+
+    def test_a_boundary_timestep_is_called_padding(self):
+        """Conservative rounding: never learn from a frame the fetch layer clamped."""
+        ds = self._stub(action_chunk=15, fps=30, action_freq=15.0)
+        # 29 source frames is one short of a full 30-frame timestep.
+        assert ds._pad_timestep_count(frame_index=29, seq_len=4) == 3
+        assert ds._pad_timestep_count(frame_index=30, seq_len=4) == 2
+
+
+class TestSequenceAwareDeltaFold:
+    """Each timestep's chunk must be offset by its OWN chunk-start state.
+
+    Sequence mode reaches the delta transform while ``actions`` are still flat
+    ``(T * chunk, D_a)`` and ``state`` already carries its time axis
+    ``(T, D_s)``. Both are rank 2, so the offset broadcast reads the trailing
+    axis as a history window and applies the LAST timestep's pose to the whole
+    sequence -- every timestep but the final one offset from the wrong pose.
+    Folding the timestep axis out first is what makes each chunk relative to
+    its own start.
+    """
+
+    @staticmethod
+    def _fold_and_offset(actions_flat, state, delta_map, seq_len):
+        """Mirrors the sequence branch of ``_apply_column_index_and_delta``.
+
+        Args:
+            actions_flat: ``(T * chunk, D_a)`` absolute actions.
+            state: ``(T, D_s)`` per-timestep state.
+            delta_map: ``{action_pos: state_pos}``.
+            seq_len: Timesteps.
+
+        Returns:
+            ``(T * chunk, D_a)`` actions, made relative per timestep.
+        """
+        from opentau.datasets.action_indexing import subtract_chunk_start_state
+
+        folded = rearrange(actions_flat, "(t h) ... -> t h ...", t=seq_len)
+        folded = subtract_chunk_start_state(folded, state, delta_map)
+        return rearrange(folded, "t h ... -> (t h) ...")
+
+    def test_each_timestep_is_offset_by_its_own_start_state(self):
+        seq_len, chunk, dim = 2, 3, 4
+        # Timestep 0 holds 10s, timestep 1 holds 100s, so a cross-timestep
+        # offset is unmistakable in the result.
+        actions = torch.cat(
+            [
+                torch.full((chunk, dim), 10.0),
+                torch.full((chunk, dim), 100.0),
+            ]
+        )
+        state = torch.tensor([[1.0, 1.0, 1.0, 1.0], [5.0, 5.0, 5.0, 5.0]])
+        delta_map = {0: 0, 1: 1}  # dims 2,3 stay absolute
+
+        out = self._fold_and_offset(actions, state, delta_map, seq_len)
+
+        # Timestep 0: 10 - 1 on mapped dims, 10 untouched elsewhere.
+        torch.testing.assert_close(out[:chunk, :2], torch.full((chunk, 2), 9.0))
+        torch.testing.assert_close(out[:chunk, 2:], torch.full((chunk, 2), 10.0))
+        # Timestep 1: 100 - 5, NOT 100 - 1.
+        torch.testing.assert_close(out[chunk:, :2], torch.full((chunk, 2), 95.0))
+        torch.testing.assert_close(out[chunk:, 2:], torch.full((chunk, 2), 100.0))
+
+    def test_the_last_timesteps_pose_is_not_broadcast_to_all(self):
+        """Pins the exact bug the fold prevents."""
+        seq_len, chunk, dim = 2, 3, 2
+        actions = torch.cat([torch.full((chunk, dim), 10.0), torch.full((chunk, dim), 10.0)])
+        state = torch.tensor([[1.0, 1.0], [5.0, 5.0]])
+
+        out = self._fold_and_offset(actions, state, {0: 0, 1: 1}, seq_len)
+
+        # If the last timestep's pose leaked across, timestep 0 would read 5.0.
+        assert not torch.allclose(out[:chunk], torch.full((chunk, dim), 5.0))
+        torch.testing.assert_close(out[:chunk], torch.full((chunk, dim), 9.0))
+
+    def test_round_trips_through_the_inverse(self):
+        from opentau.datasets.action_indexing import add_chunk_start_state
+
+        seq_len, chunk, dim = 3, 4, 5
+        torch.manual_seed(0)
+        actions = torch.randn(seq_len * chunk, dim)
+        state = torch.randn(seq_len, dim)
+        delta_map = {0: 0, 2: 2}
+
+        rel = self._fold_and_offset(actions, state, delta_map, seq_len)
+        folded = rearrange(rel, "(t h) ... -> t h ...", t=seq_len)
+        back = rearrange(add_chunk_start_state(folded, state, delta_map), "t h ... -> (t h) ...")
+
+        torch.testing.assert_close(back, actions)

@@ -640,7 +640,7 @@ class TTTMLPLayer(nn.Module):
                     f"timestep_is_pad must have shape ({batch_size}, {num_mini_batch}), "
                     f"got {tuple(timestep_is_pad.shape)}"
                 )
-            keep = (~timestep_is_pad).to(eta.dtype).view(batch_size, 1, num_mini_batch, 1, 1)
+            keep = rearrange((~timestep_is_pad).to(eta.dtype), "b nc -> b 1 nc 1 1")
             eta = eta * keep
 
         to_mini_batches = "b (nc c) h d -> nc b h c d"
