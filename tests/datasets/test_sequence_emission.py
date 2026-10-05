@@ -657,3 +657,124 @@ class TestSequenceAwareDeltaFold:
         back = rearrange(add_chunk_start_state(folded, state, delta_map), "t h ... -> (t h) ...")
 
         torch.testing.assert_close(back, actions)
+
+
+class TestTemporalKeyMirror:
+    """``_TIME_AXIS_KEYS`` and ``_is_temporal`` must name the same keys.
+
+    The shift rotates every key carrying a time axis; the paired loader
+    concatenates exactly those across a pair's halves. A key in one list and not
+    the other desynchronises a shifted half from an unshifted one — silent, and
+    visible only as degraded training. The comments say they mirror each other;
+    this pins it.
+    """
+
+    def test_the_two_lists_agree(self):
+        from opentau.datasets.lerobot_dataset import BaseDataset
+        from opentau.datasets.paired_sequence import PairedSequenceDataset
+
+        shifted = set(BaseDataset._TIME_AXIS_KEYS)
+        concatenated = set(PairedSequenceDataset._TEMPORAL_KEYS)
+
+        assert shifted == concatenated, (
+            "BaseDataset._TIME_AXIS_KEYS and PairedSequenceDataset._TEMPORAL_KEYS "
+            f"have drifted: only shifted={sorted(shifted - concatenated)}, "
+            f"only concatenated={sorted(concatenated - shifted)}"
+        )
+
+    def test_camera_keys_are_temporal_in_both(self):
+        """Cameras are matched by prefix rather than listed, in both places."""
+        from opentau.datasets.lerobot_dataset import BaseDataset
+        from opentau.datasets.paired_sequence import PairedSequenceDataset
+
+        assert PairedSequenceDataset._is_temporal("camera0")
+        item = {
+            "camera0": torch.arange(4 * 2, dtype=torch.float32).reshape(4, 2),
+            "state": torch.arange(4 * 2, dtype=torch.float32).reshape(4, 2),
+            "actions": torch.zeros(4, 1, 2),
+            "timestep_is_pad": torch.tensor([True, False, False, False]),
+        }
+        before = item["camera0"].clone()
+        BaseDataset._shift_real_timesteps_to_front(item, 1)
+        torch.testing.assert_close(item["camera0"], torch.roll(before, shifts=-1, dims=0))
+
+
+class TestSelectedEpisodeStatsFallback:
+    """Episode-subset stats: the empty case falls back, the partial case warns.
+
+    Some v3.0 datasets ship an episodes parquet with no flattened ``stats/*``
+    columns, leaving ``episodes_stats`` empty. Aggregating that produced an
+    empty dict which then overwrote ``meta.stats``; the ImageNet camera override
+    layered image keys onto it, and ``DatasetMixtureMetadata`` later died with
+    ``KeyError: 'observation.state'``.
+    """
+
+    @staticmethod
+    def _stub(episodes, episodes_stats):
+        """Builds a dataset stand-in carrying only what the aggregation reads.
+
+        Args:
+            episodes: Selected episode indices.
+            episodes_stats: ``{episode_index: stats}``.
+
+        Returns:
+            The stub.
+        """
+        from types import SimpleNamespace
+
+        from opentau.datasets.lerobot_dataset import BaseDataset
+
+        ds = object.__new__(BaseDataset)
+        ds.episodes = episodes
+        ds.repo_id = "org/stub"
+        ds.meta = SimpleNamespace(episodes_stats=episodes_stats)
+        return ds
+
+    @staticmethod
+    def _stats(value):
+        """One well-formed stats dict.
+
+        Args:
+            value: Fill value for every field.
+
+        Returns:
+            A stats dict shaped like the real ones.
+        """
+        return {
+            "observation.state": {
+                "mean": np.array([value]),
+                "std": np.array([1.0]),
+                "min": np.array([value]),
+                "max": np.array([value]),
+                "count": np.array([1]),
+            }
+        }
+
+    def test_no_episode_carries_stats_yields_an_empty_aggregate(self):
+        """The empty dict is what makes the caller keep the dataset-level stats."""
+        ds = self._stub([0, 1, 2], {})
+        assert ds._aggregate_selected_episode_stats() == {}
+
+    def test_empty_per_episode_dicts_count_as_absent(self):
+        ds = self._stub([0, 1], {0: {}, 1: {}})
+        assert ds._aggregate_selected_episode_stats() == {}
+
+    def test_empty_case_warns(self, caplog):
+        ds = self._stub([0, 1], {})
+        with caplog.at_level("WARNING"):
+            ds._aggregate_selected_episode_stats()
+        assert "no selected episode carries per-episode stats" in caplog.text
+
+    def test_partial_case_warns_and_names_the_counts(self, caplog):
+        ds = self._stub([0, 1, 2], {0: self._stats(1.0)})
+        with caplog.at_level("WARNING"):
+            out = ds._aggregate_selected_episode_stats()
+        assert out, "a partial aggregate is still returned"
+        assert "1 of 3 selected episodes carry per-episode stats" in caplog.text
+
+    def test_complete_case_does_not_warn(self, caplog):
+        ds = self._stub([0, 1], {0: self._stats(1.0), 1: self._stats(3.0)})
+        with caplog.at_level("WARNING"):
+            out = ds._aggregate_selected_episode_stats()
+        assert "observation.state" in out
+        assert "per-episode stats" not in caplog.text

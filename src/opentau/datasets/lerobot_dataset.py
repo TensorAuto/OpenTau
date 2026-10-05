@@ -1167,10 +1167,13 @@ class BaseDataset(torch.utils.data.Dataset):
         # prefix -- and TTT zeroes its inner learning rate there instead of taking a
         # gradient step on a repeated boundary frame.
         #
-        # Neither existing pad flag can serve here: `action_is_pad` marks missing
-        # FUTURE actions at the episode tail, and `obs_history_is_pad` also goes True
-        # for `history_state_drop_prob` augmentation -- masking TTT on that would
-        # silence learning on real frames. This flag means one thing only.
+        # Neither existing pad flag can serve here. `action_is_pad` is set on BOTH
+        # sides of the episode (`_get_query_indices_soft` flags `idx + delta < start`
+        # as well as `>= end`) and is keyed to the action chunk rather than the
+        # timestep, so it does not answer "is this timestep outside the episode".
+        # `obs_history_is_pad` also goes True for `history_state_drop_prob`
+        # augmentation, so masking TTT on it would silence learning on real frames.
+        # This flag means one thing only.
         #
         # `sequence_stride` is pinned to `action_chunk` by
         # `TrainPipelineConfig._validate_sequence_stride` (one timestep = one disjoint
@@ -1192,6 +1195,42 @@ class BaseDataset(torch.utils.data.Dataset):
 
         if n_pad:
             self._shift_real_timesteps_to_front(standard_item, n_pad)
+
+    def _aggregate_selected_episode_stats(self) -> dict:
+        """Aggregates per-episode stats over the selected episodes.
+
+        Returns an empty dict when no selected episode carries stats, which the
+        caller reads as "fall back to the dataset-level stats". Warns on the
+        partial case: an aggregate over only the episodes that happen to carry
+        stats is published as ``meta.stats`` and pooled by the mixture
+        normalizer, so it is a biased sample of the selection and is
+        indistinguishable downstream from a complete one.
+
+        Returns:
+            The aggregate, or ``{}`` when there is nothing to aggregate.
+        """
+        per_ep = [
+            self.meta.episodes_stats[ep_idx]
+            for ep_idx in self.episodes
+            if self.meta.episodes_stats.get(ep_idx)
+        ]
+        if per_ep and len(per_ep) < len(self.episodes):
+            logging.warning(
+                "%s: %d of %d selected episodes carry per-episode stats; the aggregate "
+                "published as meta.stats covers only those, so it is biased toward them. "
+                "Normalization from `norm_stats_override_path` or the policy buffers is "
+                "unaffected.",
+                getattr(self, "repo_id", "dataset"),
+                len(per_ep),
+                len(self.episodes),
+            )
+        elif not per_ep:
+            logging.warning(
+                "%s: no selected episode carries per-episode stats; falling back to the "
+                "dataset-level stats, which describe a superset of the selection.",
+                getattr(self, "repo_id", "dataset"),
+            )
+        return aggregate_stats(per_ep) if per_ep else {}
 
     def _pad_timestep_count(self, frame_index: int, seq_len: int) -> int:
         """Counts the window's leading timesteps that fall before the episode start.
@@ -2065,33 +2104,7 @@ class LeRobotDataset(BaseDataset):
             # stats in that case: they describe a superset of the selected episodes,
             # which is strictly better than no stats, and normalization itself comes
             # from `norm_stats_override_path` / the policy buffers.
-            _per_ep = [
-                self.meta.episodes_stats[ep_idx]
-                for ep_idx in self.episodes
-                if self.meta.episodes_stats.get(ep_idx)
-            ]
-            _subset_stats = aggregate_stats(_per_ep) if _per_ep else {}
-            # Warn on the PARTIAL case. An aggregate over only the episodes that
-            # happen to carry stats is published as `meta.stats` below and pooled
-            # by the mixture normalizer, so a selection where some episodes are
-            # missing stats yields a silently biased sample of the selection --
-            # indistinguishable, downstream, from a complete one.
-            if _per_ep and len(_per_ep) < len(self.episodes):
-                logging.warning(
-                    "%s: %d of %d selected episodes carry per-episode stats; the aggregate "
-                    "published as meta.stats covers only those, so it is biased toward them. "
-                    "Normalization from `norm_stats_override_path` or the policy buffers is "
-                    "unaffected.",
-                    getattr(self, "repo_id", "dataset"),
-                    len(_per_ep),
-                    len(self.episodes),
-                )
-            elif not _per_ep:
-                logging.warning(
-                    "%s: no selected episode carries per-episode stats; falling back to the "
-                    "dataset-level stats, which describe a superset of the selection.",
-                    getattr(self, "repo_id", "dataset"),
-                )
+            _subset_stats = self._aggregate_selected_episode_stats()
             self.stats = _subset_stats if _subset_stats else self.meta.stats
             # Propagate the selected-episode aggregate onto the metadata so the
             # mixture normalizer (which pools `ds.meta.stats`) reflects the
