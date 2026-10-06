@@ -1028,3 +1028,87 @@ class TestInferenceDiagnostics:
         stub._adopt_fast_weights(SimpleNamespace(outgoing={0: later}))
         assert torch.equal(stub._carried_fast_weights[0], later)
         assert stub._inference_token_position == stub.config.n_expert_tokens_per_timestep
+
+
+class TestTTTPadMasking:
+    """Pins that padded timesteps contribute nothing to the fast weights.
+
+    A sequence window is end-anchored on the queried frame, so an episode
+    shorter than the window arrives with a padded *prefix* carrying a repeated
+    boundary frame. Learning from it would write that repetition into the
+    memory, which is the one thing the demonstration is supposed to supply.
+    """
+
+    @staticmethod
+    def _sequences(batch: int = 2, real: int = 5, pad: int = 7):
+        """Builds a real sequence and the same sequence behind a padded prefix.
+
+        Args:
+            batch: Batch size.
+            real: Number of real timesteps.
+            pad: Number of padded timesteps prepended.
+
+        Returns:
+            ``(real_x, padded_x, mask)``: the unpadded input, the padded input,
+            and the ``(batch, pad + real)`` pad mask.
+        """
+        torch.manual_seed(1)
+        real_x = torch.randn(batch, real * MINI_BATCH, WIDTH, dtype=torch.float64)
+        # The loader's padding repeats the episode's first frame.
+        prefix = real_x[:, :MINI_BATCH, :].repeat(1, pad, 1)
+        padded_x = torch.cat([prefix, real_x], dim=1)
+        mask = torch.zeros(batch, pad + real, dtype=torch.bool)
+        mask[:, :pad] = True
+        return real_x, padded_x, mask
+
+    def test_padded_prefix_leaves_fast_weights_identical(self):
+        """Masked padding must reproduce the unpadded run's fast weights exactly.
+
+        The unpadded run starts at the RoPE position its frames occupy in the
+        padded run, so the only difference under test is the padding itself.
+        """
+        pad = 7
+        layer = _layer(expected_mini_batch_size=MINI_BATCH)
+        real_x, padded_x, mask = self._sequences(pad=pad)
+
+        _, unpadded_w = layer(real_x, mini_batch_size=MINI_BATCH, position_offset=pad * MINI_BATCH)
+        _, masked_w = layer(padded_x, mini_batch_size=MINI_BATCH, timestep_is_pad=mask)
+
+        for name in ("w1", "b1", "w2", "b2"):
+            torch.testing.assert_close(getattr(masked_w, name), getattr(unpadded_w, name), rtol=0, atol=1e-12)
+
+    def test_unmasked_padding_does_change_the_fast_weights(self):
+        """Without the mask the padding is learned — the behaviour being fixed.
+
+        Guards the test above from passing vacuously (e.g. if the mask silently
+        became a no-op because the padding happened not to move the weights).
+        """
+        pad = 7
+        layer = _layer(expected_mini_batch_size=MINI_BATCH)
+        real_x, padded_x, mask = self._sequences(pad=pad)
+
+        _, unpadded_w = layer(real_x, mini_batch_size=MINI_BATCH, position_offset=pad * MINI_BATCH)
+        _, unmasked_w = layer(padded_x, mini_batch_size=MINI_BATCH)
+
+        assert not torch.allclose(unmasked_w.w1, unpadded_w.w1, rtol=0, atol=1e-12)
+
+    def test_all_padded_sequence_is_a_no_op(self):
+        """A fully padded window must return the incoming weights untouched."""
+        layer = _layer(expected_mini_batch_size=MINI_BATCH)
+        _, padded_x, _ = self._sequences(pad=7)
+        mask = torch.ones(padded_x.shape[0], padded_x.shape[1] // MINI_BATCH, dtype=torch.bool)
+        incoming = layer.initial_fast_weights(padded_x.shape[0]).to(torch.float64)
+
+        _, out_w = layer(padded_x, mini_batch_size=MINI_BATCH, fast_weights=incoming, timestep_is_pad=mask)
+
+        for name in ("w1", "b1", "w2", "b2"):
+            torch.testing.assert_close(getattr(out_w, name), getattr(incoming, name), rtol=0, atol=1e-12)
+
+    def test_wrong_mask_shape_is_rejected(self):
+        """A mask that does not match the timestep count must fail loudly."""
+        layer = _layer(expected_mini_batch_size=MINI_BATCH)
+        _, padded_x, _ = self._sequences(pad=7)
+        bad = torch.zeros(padded_x.shape[0], 3, dtype=torch.bool)
+
+        with pytest.raises(ValueError, match="timestep_is_pad must have shape"):
+            layer(padded_x, mini_batch_size=MINI_BATCH, timestep_is_pad=bad)

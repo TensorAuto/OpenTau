@@ -427,3 +427,354 @@ class TestOversamplingGuardStrideAware:
         self._resolve(action_freq=20.0, fps=10, stride=2)
         with pytest.raises(ValueError, match="resolve to the same"):
             self._resolve(action_freq=21.0, fps=10, stride=2)
+
+
+class TestPadShiftToFront:
+    """Rotating a short episode's real timesteps to the front of the window.
+
+    The window is anchored on the episode's last frame, so a short episode
+    arrives with padding at the FRONT. Keeping that placement would hand short
+    demonstrations to TTT at a RoPE phase evaluation never produces, because
+    demo pools skip episodes shorter than the window. The rotation moves the
+    real frames to positions ``0..n_real-1`` without changing which frames were
+    selected or their order.
+    """
+
+    @staticmethod
+    def _item(seq_len: int = 6, n_pad: int = 2):
+        """Builds a standard-format item whose first ``n_pad`` timesteps are padding.
+
+        Args:
+            seq_len: Timesteps in the window.
+            n_pad: Padded timesteps at the front.
+
+        Returns:
+            The item dict.
+        """
+        tp = torch.zeros(seq_len, dtype=torch.bool)
+        tp[:n_pad] = True
+        return {
+            "state": torch.arange(seq_len * 3, dtype=torch.float32).reshape(seq_len, 3),
+            "actions": torch.arange(seq_len * 2 * 4, dtype=torch.float32).reshape(seq_len, 2, 4),
+            "action_is_pad": torch.zeros(seq_len, 2, dtype=torch.bool),
+            "loss_mask": torch.ones(seq_len, dtype=torch.bool),
+            "obs_history_is_pad": torch.zeros(seq_len, dtype=torch.bool),
+            "timestep_is_pad": tp,
+            "camera0": torch.arange(seq_len * 3, dtype=torch.float32).reshape(seq_len, 3),
+            "prompt": "not a tensor, must be left alone",
+        }
+
+    def test_padding_moves_to_the_back(self):
+        from opentau.datasets.lerobot_dataset import LeRobotDataset
+
+        seq_len, n_pad = 6, 2
+        item = self._item(seq_len, n_pad)
+        LeRobotDataset._shift_real_timesteps_to_front(item, n_pad)
+
+        assert not item["timestep_is_pad"][: seq_len - n_pad].any()
+        assert item["timestep_is_pad"][seq_len - n_pad :].all()
+
+    def test_real_frames_keep_their_content_and_order(self):
+        """The rotation must reposition frames, never reselect or reorder them."""
+        from opentau.datasets.lerobot_dataset import LeRobotDataset
+
+        seq_len, n_pad = 6, 2
+        item = self._item(seq_len, n_pad)
+        before = item["state"].clone()
+        LeRobotDataset._shift_real_timesteps_to_front(item, n_pad)
+
+        # Real frames were rows n_pad..end; they must now be rows 0..n_real-1,
+        # in the same order.
+        torch.testing.assert_close(item["state"][: seq_len - n_pad], before[n_pad:])
+        # And the wrapped padding keeps the rows it had.
+        torch.testing.assert_close(item["state"][seq_len - n_pad :], before[:n_pad])
+
+    def test_every_temporal_key_moves_together(self):
+        """A key left behind would desynchronise the mask from its frames."""
+        from opentau.datasets.lerobot_dataset import LeRobotDataset
+
+        seq_len, n_pad = 6, 2
+        item = self._item(seq_len, n_pad)
+        originals = {k: v.clone() for k, v in item.items() if torch.is_tensor(v)}
+        LeRobotDataset._shift_real_timesteps_to_front(item, n_pad)
+
+        for key, before in originals.items():
+            torch.testing.assert_close(item[key], torch.roll(before, shifts=-n_pad, dims=0))
+
+    def test_non_tensor_keys_are_untouched(self):
+        from opentau.datasets.lerobot_dataset import LeRobotDataset
+
+        item = self._item()
+        LeRobotDataset._shift_real_timesteps_to_front(item, 2)
+        assert item["prompt"] == "not a tensor, must be left alone"
+
+    def test_a_missing_temporal_key_raises(self):
+        """Guards against a future key reaching the sample after the shift."""
+        from opentau.datasets.lerobot_dataset import LeRobotDataset
+
+        item = self._item()
+        del item["timestep_is_pad"]
+
+        with pytest.raises(RuntimeError, match="missed required temporal key"):
+            LeRobotDataset._shift_real_timesteps_to_front(item, 2)
+
+
+class TestPadTimestepCount:
+    """``frame_index -> n_pad``, including the resampled case.
+
+    A timestep spans ``sequence_stride * fps / action_freq`` SOURCE frames:
+    ``resolve_delta_timestamps`` emits the window's offsets in seconds against
+    ``action_freq`` and ``get_delta_indices_soft`` resolves them back to frames
+    against the dataset's native fps. Reading ``sequence_stride`` as a frame
+    count holds only when the two rates agree, and validation rejects only
+    *over*sampling, so an undersampled dataset reaches this code.
+    """
+
+    @staticmethod
+    def _stub(action_chunk: int = 15, fps: int = 15, action_freq: float | None = None):
+        from opentau.datasets.lerobot_dataset import BaseDataset
+
+        ds = object.__new__(BaseDataset)
+        ds.action_chunk = action_chunk
+        ds.fps = fps
+        ds._action_freq = action_freq
+        return ds
+
+    def test_long_episode_has_no_padding(self):
+        ds = self._stub()
+        assert ds._pad_timestep_count(frame_index=599, seq_len=31) == 0
+
+    def test_short_episode_pads_the_shortfall(self):
+        ds = self._stub()
+        # frame 120 at 15 frames/timestep -> 9 real timesteps of 31.
+        assert ds._pad_timestep_count(frame_index=120, seq_len=31) == 31 - 9
+
+    def test_first_frame_leaves_one_real_timestep(self):
+        ds = self._stub()
+        assert ds._pad_timestep_count(frame_index=0, seq_len=31) == 30
+
+    def test_undersampled_dataset_uses_source_frames(self):
+        """``action_freq`` below the native fps widens a timestep in source frames.
+
+        At 30 fps with ``action_freq`` 15, one 15-unit timestep spans 30 source
+        frames, so frame 120 covers 5 timesteps -- not the 9 that reading the
+        stride as frames would give.
+        """
+        ds = self._stub(action_chunk=15, fps=30, action_freq=15.0)
+        assert ds._pad_timestep_count(frame_index=120, seq_len=31) == 31 - 5
+
+    def test_matched_rates_agree_with_the_naive_stride(self):
+        """When the rates agree the ratio is 1 and the simple reading is correct."""
+        matched = self._stub(action_chunk=15, fps=15, action_freq=15.0)
+        unset = self._stub(action_chunk=15, fps=15, action_freq=None)
+        for frame_index in (0, 14, 15, 120, 599):
+            assert matched._pad_timestep_count(frame_index, 31) == unset._pad_timestep_count(frame_index, 31)
+
+    def test_a_boundary_timestep_is_called_padding(self):
+        """Conservative rounding: never learn from a frame the fetch layer clamped."""
+        ds = self._stub(action_chunk=15, fps=30, action_freq=15.0)
+        # 29 source frames is one short of a full 30-frame timestep.
+        assert ds._pad_timestep_count(frame_index=29, seq_len=4) == 3
+        assert ds._pad_timestep_count(frame_index=30, seq_len=4) == 2
+
+
+class TestSequenceAwareDeltaFold:
+    """Each timestep's chunk must be offset by its OWN chunk-start state.
+
+    Sequence mode reaches the delta transform while ``actions`` are still flat
+    ``(T * chunk, D_a)`` and ``state`` already carries its time axis
+    ``(T, D_s)``. Both are rank 2, so the offset broadcast reads the trailing
+    axis as a history window and applies the LAST timestep's pose to the whole
+    sequence -- every timestep but the final one offset from the wrong pose.
+    Folding the timestep axis out first is what makes each chunk relative to
+    its own start.
+    """
+
+    @staticmethod
+    def _fold_and_offset(actions_flat, state, delta_map, seq_len):
+        """Mirrors the sequence branch of ``_apply_column_index_and_delta``.
+
+        Args:
+            actions_flat: ``(T * chunk, D_a)`` absolute actions.
+            state: ``(T, D_s)`` per-timestep state.
+            delta_map: ``{action_pos: state_pos}``.
+            seq_len: Timesteps.
+
+        Returns:
+            ``(T * chunk, D_a)`` actions, made relative per timestep.
+        """
+        from opentau.datasets.action_indexing import subtract_chunk_start_state
+
+        folded = rearrange(actions_flat, "(t h) ... -> t h ...", t=seq_len)
+        folded = subtract_chunk_start_state(folded, state, delta_map)
+        return rearrange(folded, "t h ... -> (t h) ...")
+
+    def test_each_timestep_is_offset_by_its_own_start_state(self):
+        seq_len, chunk, dim = 2, 3, 4
+        # Timestep 0 holds 10s, timestep 1 holds 100s, so a cross-timestep
+        # offset is unmistakable in the result.
+        actions = torch.cat(
+            [
+                torch.full((chunk, dim), 10.0),
+                torch.full((chunk, dim), 100.0),
+            ]
+        )
+        state = torch.tensor([[1.0, 1.0, 1.0, 1.0], [5.0, 5.0, 5.0, 5.0]])
+        delta_map = {0: 0, 1: 1}  # dims 2,3 stay absolute
+
+        out = self._fold_and_offset(actions, state, delta_map, seq_len)
+
+        # Timestep 0: 10 - 1 on mapped dims, 10 untouched elsewhere.
+        torch.testing.assert_close(out[:chunk, :2], torch.full((chunk, 2), 9.0))
+        torch.testing.assert_close(out[:chunk, 2:], torch.full((chunk, 2), 10.0))
+        # Timestep 1: 100 - 5, NOT 100 - 1.
+        torch.testing.assert_close(out[chunk:, :2], torch.full((chunk, 2), 95.0))
+        torch.testing.assert_close(out[chunk:, 2:], torch.full((chunk, 2), 100.0))
+
+    def test_the_last_timesteps_pose_is_not_broadcast_to_all(self):
+        """Pins the exact bug the fold prevents."""
+        seq_len, chunk, dim = 2, 3, 2
+        actions = torch.cat([torch.full((chunk, dim), 10.0), torch.full((chunk, dim), 10.0)])
+        state = torch.tensor([[1.0, 1.0], [5.0, 5.0]])
+
+        out = self._fold_and_offset(actions, state, {0: 0, 1: 1}, seq_len)
+
+        # If the last timestep's pose leaked across, timestep 0 would read 5.0.
+        assert not torch.allclose(out[:chunk], torch.full((chunk, dim), 5.0))
+        torch.testing.assert_close(out[:chunk], torch.full((chunk, dim), 9.0))
+
+    def test_round_trips_through_the_inverse(self):
+        from opentau.datasets.action_indexing import add_chunk_start_state
+
+        seq_len, chunk, dim = 3, 4, 5
+        torch.manual_seed(0)
+        actions = torch.randn(seq_len * chunk, dim)
+        state = torch.randn(seq_len, dim)
+        delta_map = {0: 0, 2: 2}
+
+        rel = self._fold_and_offset(actions, state, delta_map, seq_len)
+        folded = rearrange(rel, "(t h) ... -> t h ...", t=seq_len)
+        back = rearrange(add_chunk_start_state(folded, state, delta_map), "t h ... -> (t h) ...")
+
+        torch.testing.assert_close(back, actions)
+
+
+class TestTemporalKeyMirror:
+    """``_TIME_AXIS_KEYS`` and ``_is_temporal`` must name the same keys.
+
+    The shift rotates every key carrying a time axis; the paired loader
+    concatenates exactly those across a pair's halves. A key in one list and not
+    the other desynchronises a shifted half from an unshifted one — silent, and
+    visible only as degraded training. The comments say they mirror each other;
+    this pins it.
+    """
+
+    def test_the_two_lists_agree(self):
+        from opentau.datasets.lerobot_dataset import BaseDataset
+        from opentau.datasets.paired_sequence import PairedSequenceDataset
+
+        shifted = set(BaseDataset._TIME_AXIS_KEYS)
+        concatenated = set(PairedSequenceDataset._TEMPORAL_KEYS)
+
+        assert shifted == concatenated, (
+            "BaseDataset._TIME_AXIS_KEYS and PairedSequenceDataset._TEMPORAL_KEYS "
+            f"have drifted: only shifted={sorted(shifted - concatenated)}, "
+            f"only concatenated={sorted(concatenated - shifted)}"
+        )
+
+    def test_camera_keys_are_temporal_in_both(self):
+        """Cameras are matched by prefix rather than listed, in both places."""
+        from opentau.datasets.lerobot_dataset import BaseDataset
+        from opentau.datasets.paired_sequence import PairedSequenceDataset
+
+        assert PairedSequenceDataset._is_temporal("camera0")
+        item = {
+            "camera0": torch.arange(4 * 2, dtype=torch.float32).reshape(4, 2),
+            "state": torch.arange(4 * 2, dtype=torch.float32).reshape(4, 2),
+            "actions": torch.zeros(4, 1, 2),
+            "timestep_is_pad": torch.tensor([True, False, False, False]),
+        }
+        before = item["camera0"].clone()
+        BaseDataset._shift_real_timesteps_to_front(item, 1)
+        torch.testing.assert_close(item["camera0"], torch.roll(before, shifts=-1, dims=0))
+
+
+class TestSelectedEpisodeStatsFallback:
+    """Episode-subset stats: the empty case falls back, the partial case warns.
+
+    Some v3.0 datasets ship an episodes parquet with no flattened ``stats/*``
+    columns, leaving ``episodes_stats`` empty. Aggregating that produced an
+    empty dict which then overwrote ``meta.stats``; the ImageNet camera override
+    layered image keys onto it, and ``DatasetMixtureMetadata`` later died with
+    ``KeyError: 'observation.state'``.
+    """
+
+    @staticmethod
+    def _stub(episodes, episodes_stats):
+        """Builds a dataset stand-in carrying only what the aggregation reads.
+
+        Args:
+            episodes: Selected episode indices.
+            episodes_stats: ``{episode_index: stats}``.
+
+        Returns:
+            The stub.
+        """
+        from types import SimpleNamespace
+
+        from opentau.datasets.lerobot_dataset import BaseDataset
+
+        ds = object.__new__(BaseDataset)
+        ds.episodes = episodes
+        ds.repo_id = "org/stub"
+        ds.meta = SimpleNamespace(episodes_stats=episodes_stats)
+        return ds
+
+    @staticmethod
+    def _stats(value):
+        """One well-formed stats dict.
+
+        Args:
+            value: Fill value for every field.
+
+        Returns:
+            A stats dict shaped like the real ones.
+        """
+        return {
+            "observation.state": {
+                "mean": np.array([value]),
+                "std": np.array([1.0]),
+                "min": np.array([value]),
+                "max": np.array([value]),
+                "count": np.array([1]),
+            }
+        }
+
+    def test_no_episode_carries_stats_yields_an_empty_aggregate(self):
+        """The empty dict is what makes the caller keep the dataset-level stats."""
+        ds = self._stub([0, 1, 2], {})
+        assert ds._aggregate_selected_episode_stats() == {}
+
+    def test_empty_per_episode_dicts_count_as_absent(self):
+        ds = self._stub([0, 1], {0: {}, 1: {}})
+        assert ds._aggregate_selected_episode_stats() == {}
+
+    def test_empty_case_warns(self, caplog):
+        ds = self._stub([0, 1], {})
+        with caplog.at_level("WARNING"):
+            ds._aggregate_selected_episode_stats()
+        assert "no selected episode carries per-episode stats" in caplog.text
+
+    def test_partial_case_warns_and_names_the_counts(self, caplog):
+        ds = self._stub([0, 1, 2], {0: self._stats(1.0)})
+        with caplog.at_level("WARNING"):
+            out = ds._aggregate_selected_episode_stats()
+        assert out, "a partial aggregate is still returned"
+        assert "1 of 3 selected episodes carry per-episode stats" in caplog.text
+
+    def test_complete_case_does_not_warn(self, caplog):
+        ds = self._stub([0, 1], {0: self._stats(1.0), 1: self._stats(3.0)})
+        with caplog.at_level("WARNING"):
+            out = ds._aggregate_selected_episode_stats()
+        assert "observation.state" in out
+        assert "per-episode stats" not in caplog.text

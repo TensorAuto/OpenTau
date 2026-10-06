@@ -820,6 +820,7 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
                         mini_batch_size=tokens_per_timestep,
                         fast_weights=ttt_state.incoming.get(layer_idx),
                         position_offset=ttt_state.position_offset,
+                        timestep_is_pad=ttt_state.timestep_is_pad,
                     )
                     out_emb = layer.ttt_gate(
                         out_emb,
