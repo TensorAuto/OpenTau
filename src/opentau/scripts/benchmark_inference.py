@@ -63,6 +63,7 @@ from opentau.policies.normalize import NormalizationMode
 from opentau.policies.utils import to_dtype_preserving_siglip_float32
 from opentau.utils.random_utils import set_seed
 from opentau.utils.utils import (
+    INFERENCE_STATE_DTYPE,
     auto_torch_device,
     create_dummy_observation,
     init_logging,
@@ -106,7 +107,7 @@ def _build_observation(cfg: TrainPipelineConfig, device, dtype) -> dict:
         h, w = cfg.resolution
         for cam_key in [k for k in list(obs.keys()) if k.startswith("camera")]:
             obs[cam_key] = torch.zeros((1, n_obs, 3, h, w), dtype=dtype, device=device)
-        obs["state"] = torch.zeros((1, n_obs, cfg.max_state_dim), dtype=dtype, device=device)
+        obs["state"] = torch.zeros((1, n_obs, cfg.max_state_dim), dtype=INFERENCE_STATE_DTYPE, device=device)
         obs["obs_history_is_pad"] = torch.zeros((1, n_obs), dtype=torch.bool, device=device)
 
     if _is_high_level(cfg.policy.type):

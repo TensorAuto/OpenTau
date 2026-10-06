@@ -24,6 +24,7 @@ information.
 
 import logging
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -123,6 +124,32 @@ def get_dtype_from_parameters(module: nn.Module) -> torch.dtype:
         torch.dtype: The data type of the module's parameters.
     """
     return next(iter(module.parameters())).dtype
+
+
+def cast_to_weight_dtype(
+    x: Tensor, layer: nn.Module | Callable[[Tensor], Tensor], fallback: torch.dtype | None = None
+) -> Tensor:
+    """Cast ``x`` to the dtype of the layer it is about to enter.
+
+    The caller's dtype is no proxy for a projection's: the inference entry points send
+    ``state`` at float32 (the delta-action inverse needs the precision) while the projection
+    runs in the policy's serving dtype, and a hard-coded dtype breaks as soon as the model runs
+    in another (the float32 ONNX export, an all-float32 CPU model). The layer's own weight is
+    right under every cast regime.
+
+    Args:
+        x: The tensor about to enter ``layer``.
+        layer: An ``nn.Linear``, a ``PerGroupLinear``, or anything else carrying a ``weight``.
+        fallback: dtype for a weightless stand-in (the ``nn.Identity`` / lambda stubs unit
+            tests inject for a projection); ``None`` returns ``x`` unchanged.
+
+    Returns:
+        ``x`` in the layer's weight dtype (or ``fallback``).
+    """
+    weight = getattr(layer, "weight", None)
+    if weight is not None:
+        return x.to(dtype=weight.dtype)
+    return x if fallback is None else x.to(dtype=fallback)
 
 
 # Full parameter-name suffixes of the SigLIP patch/position embeddings that

@@ -379,6 +379,17 @@ def attempt_torch_compile(fn: callable, device_hint=None) -> callable:
     return fn
 
 
+#: dtype every inference entry point builds the observation ``state`` in (and any absolute
+#: action prefix), rather than the policy's bfloat16 serving dtype. A delta-action policy adds
+#: the state back onto its predicted deltas, and bfloat16 would put a joint near 3 rad on a
+#: 2**-6 rad grid — an error re-applied to every target of every chunk (see
+#: ``PI05Policy._raw_state_for_delta``). A *normalized* state still reaches the model exactly as
+#: in training, because ``Normalize.forward`` computes in its stats' dtype; the policies that
+#: leave state unnormalized (xr1, flux3_action) preprocess it at float32, as their reference
+#: pipelines do.
+INFERENCE_STATE_DTYPE = torch.float32
+
+
 def create_dummy_observation(cfg, device, dtype=torch.bfloat16) -> dict:
     """Create a dummy observation dictionary for testing or initialization.
 
@@ -386,7 +397,8 @@ def create_dummy_observation(cfg, device, dtype=torch.bfloat16) -> dict:
         cfg: Configuration object with num_cams, resolution, max_state_dim,
             and action_chunk attributes.
         device: Device to create tensors on.
-        dtype: Data type for tensors. Defaults to torch.bfloat16.
+        dtype: Data type for the camera tensors. Defaults to torch.bfloat16. The state is
+            always built at ``INFERENCE_STATE_DTYPE``, like a real served observation's.
 
     Returns:
         Dictionary containing dummy camera observations, state, prompt, and
@@ -398,7 +410,7 @@ def create_dummy_observation(cfg, device, dtype=torch.bfloat16) -> dict:
     }
     return {
         **camera_observations,
-        "state": torch.zeros((1, cfg.max_state_dim), dtype=dtype, device=device),
+        "state": torch.zeros((1, cfg.max_state_dim), dtype=INFERENCE_STATE_DTYPE, device=device),
         "prompt": ["Pick up yellow lego block and put it in the bin"],
         "img_is_pad": torch.zeros((1, cfg.num_cams), dtype=torch.bool, device=device),
         "action_is_pad": torch.zeros((1, cfg.action_chunk), dtype=torch.bool, device=device),

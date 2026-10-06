@@ -42,6 +42,7 @@ from opentau.policies.pi0.paligemma_with_expert import (
 from opentau.policies.pretrained import PreTrainedPolicy
 from opentau.policies.utils import (
     PerSampleLoss,
+    cast_to_weight_dtype,
     freeze_policy_level_params_for_state_action_representation_only,
     freeze_policy_level_params_for_vision_only,
     log_model_loading_keys,
@@ -916,7 +917,7 @@ class PI0FlowMatching(nn.Module):
         att_masks = []
 
         # Embed state
-        state_emb = self.state_proj(state)
+        state_emb = self.state_proj(cast_to_weight_dtype(state, self.state_proj))
         state_emb = state_emb.to(dtype=torch.bfloat16)
         embs.append(state_emb[:, None, :])
         bsize = state_emb.shape[0]

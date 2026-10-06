@@ -76,6 +76,7 @@ from opentau.policies.utils import maybe_compile_sample_actions, to_dtype_preser
 from opentau.scripts.grpc import auth, robot_inference_pb2, robot_inference_pb2_grpc
 from opentau.utils.random_utils import set_seed
 from opentau.utils.utils import (
+    INFERENCE_STATE_DTYPE,
     auto_torch_device,
     init_logging,
 )
@@ -399,7 +400,9 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
         }
         observation = {
             **camera_observations,
-            "state": torch.zeros((1, self.cfg.max_state_dim), dtype=self.dtype, device=self.device),
+            "state": torch.zeros(
+                (1, self.cfg.max_state_dim), dtype=INFERENCE_STATE_DTYPE, device=self.device
+            ),
             "prompt": ["Pick up yellow lego block and put it in the bin"],
             "img_is_pad": torch.zeros((1, 1), dtype=torch.bool, device=self.device),
         }
@@ -415,8 +418,11 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
             observation["control_mode"] = warmup_control_mode
         elif warmup_dataset_repo_id is not None:
             observation["dataset_repo_id"] = warmup_dataset_repo_id
+        # Same dtypes as `_prepare_observation`'s, or the first real request recompiles.
         action_prefix = torch.zeros(
-            (1, self.cfg.action_chunk, self.cfg.max_action_dim), dtype=self.dtype, device=self.device
+            (1, self.cfg.action_chunk, self.cfg.max_action_dim),
+            dtype=INFERENCE_STATE_DTYPE,
+            device=self.device,
         )
         delay = torch.tensor(0, dtype=torch.long, device=self.device)
 
@@ -496,9 +502,11 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
             # Pad to max_state_dim if needed
             if len(state) < self.cfg.max_state_dim:
                 state.extend([0.0] * (self.cfg.max_state_dim - len(state)))
+            # Not the serving dtype: a delta-action policy adds this state back onto its
+            # predicted deltas, so bfloat16 here would round every absolute joint target.
             batch["state"] = torch.tensor(
                 [state[: self.cfg.max_state_dim]],
-                dtype=self.dtype,
+                dtype=INFERENCE_STATE_DTYPE,
                 device=self.device,
             )
         else:
@@ -528,7 +536,8 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
                     [av.values for av in request.prefix_action],
                     dtype=np.float32,
                 ),
-                dtype=self.dtype,
+                # Absolute targets, like the state they are re-anchored to for delta policies.
+                dtype=INFERENCE_STATE_DTYPE,
                 device=self.device,
             )
 
@@ -544,7 +553,9 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
             delay = torch.tensor(request.delay, dtype=torch.long, device=self.device)
         else:
             action_prefix = torch.zeros(
-                (1, self.cfg.action_chunk, self.cfg.max_action_dim), dtype=self.dtype, device=self.device
+                (1, self.cfg.action_chunk, self.cfg.max_action_dim),
+                dtype=INFERENCE_STATE_DTYPE,
+                device=self.device,
             )
             delay = torch.tensor(0, dtype=torch.long, device=self.device)
 

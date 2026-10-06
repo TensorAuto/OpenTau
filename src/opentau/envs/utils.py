@@ -32,7 +32,7 @@ from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.lerobot_dataset import BaseDataset
 from opentau.envs.subgoal import SubgoalImageGenerator
 from opentau.utils.accelerate_utils import get_proc_accelerator
-from opentau.utils.utils import auto_torch_device
+from opentau.utils.utils import INFERENCE_STATE_DTYPE, auto_torch_device
 
 
 def preprocess_observation(np_observations: dict, cfg: TrainPipelineConfig) -> dict[str, Tensor]:
@@ -88,13 +88,17 @@ def preprocess_observation(np_observations: dict, cfg: TrainPipelineConfig) -> d
                 img_is_pad[:, i] = True
         return_observations["img_is_pad"] = img_is_pad
 
-    # convert all floating point tensors to bfloat16 to save memory
+    # convert all floating point tensors to bfloat16 to save memory -- except `state`, which a
+    # delta-action policy adds back onto its predicted deltas (see INFERENCE_STATE_DTYPE).
     acc = get_proc_accelerator()
     device = auto_torch_device() if acc is None else acc.device
 
     for k, v in return_observations.items():
         if isinstance(v, Tensor):
-            dtype = torch.bfloat16 if v.dtype.is_floating_point else v.dtype
+            if k == "state":
+                dtype = INFERENCE_STATE_DTYPE
+            else:
+                dtype = torch.bfloat16 if v.dtype.is_floating_point else v.dtype
             return_observations[k] = v.to(device=device, dtype=dtype)
 
     return return_observations

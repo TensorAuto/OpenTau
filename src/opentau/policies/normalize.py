@@ -532,6 +532,13 @@ class Normalize(nn.Module):
     def forward(self, batch: dict[str, Tensor], dataset_index: Tensor) -> dict[str, Tensor]:
         """Normalizes the batch data per-sample.
 
+        A floating-point input is first cast to the stats' dtype, so the arithmetic is the one
+        training ran whatever precision the caller supplies. Training batches arrive bfloat16
+        (``BaseDataset._to_standard_data_format`` casts every float) against bfloat16 stats;
+        the inference entry points send ``state`` at float32 because the delta-action inverse
+        needs it, and float32 math here would drift off the trained values — enough to move
+        a discretized state token by a bin. A no-op whenever the dtypes already match.
+
         Args:
             batch: Dictionary containing the data to normalize.
             dataset_index: LongTensor of shape ``(B,)`` giving the source
@@ -555,6 +562,9 @@ class Normalize(nn.Module):
                 continue
 
             buffer = getattr(self, "buffer_" + key.replace(".", "_"))
+            stats_dtype = buffer[stat_names_for_mode(norm_mode)[0]].dtype
+            if batch_val.is_floating_point() and batch_val.dtype != stats_dtype:
+                batch_val = batch_val.to(dtype=stats_dtype)
 
             if norm_mode is NormalizationMode.MEAN_STD:
                 mean = _gather_and_broadcast(_materialize(buffer["mean"]), dataset_index, batch_val)

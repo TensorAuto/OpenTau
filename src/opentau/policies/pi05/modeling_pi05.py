@@ -64,6 +64,7 @@ from opentau.policies.pretrained import (
 )
 from opentau.policies.utils import (
     PerSampleLoss,
+    cast_to_weight_dtype,
     ce_per_sample,
     flow_matching_masked_mse,
     freeze_policy_level_params_for_state_action_representation_only,
@@ -930,6 +931,13 @@ class PI05Policy(PreTrainedPolicy):
 
         ``None`` means this policy trains on absolute actions and no inverse is required.
 
+        The copy keeps the caller's precision, and that precision lands in every absolute
+        target: the dataset formed the training deltas against the float32 state *before*
+        casting the sample to bfloat16, so the inverse needs float32 too — which is why the
+        inference entry points build ``state`` at ``INFERENCE_STATE_DTYPE`` rather than the
+        serving dtype. The normalized state the model sees is unaffected: ``Normalize``
+        computes in its stats' dtype, the bfloat16 arithmetic training ran.
+
         Args:
             batch: The inference batch, before ``normalize_inputs`` has run.
 
@@ -1498,7 +1506,7 @@ class PI05FlowMatching(nn.Module):
             att_masks += [0] * state_indicator_emb.shape[1]
             segment_ids += [self._MODALITY_STATE] * state_indicator_emb.shape[1]
 
-            state_emb = self.state_proj(state.to(dtype=_preferred_dtype()))
+            state_emb = self.state_proj(cast_to_weight_dtype(state, self.state_proj, _preferred_dtype()))
             state_emb = rearrange(state_emb, "b d -> b 1 d")
             state_mask = torch.ones(bsize, 1, dtype=torch.bool, device=state.device)
 

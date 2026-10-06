@@ -170,7 +170,7 @@ def _offset_actions(actions: Tensor, state: Tensor, delta_map: dict[int, int], s
         sign: ``-1.0`` to make actions relative, ``+1.0`` to make them absolute.
 
     Returns:
-        A new tensor; ``actions`` is not mutated.
+        A new tensor in the wider of the two input dtypes; ``actions`` is not mutated.
     """
     if not delta_map:
         return actions
@@ -179,10 +179,14 @@ def _offset_actions(actions: Tensor, state: Tensor, delta_map: dict[int, int], s
     current = state[..., -1, :] if state.ndim == actions.ndim else state
     a_pos = torch.as_tensor(sorted(delta_map), dtype=torch.long, device=actions.device)
     s_pos = torch.as_tensor([delta_map[int(a)] for a in a_pos], dtype=torch.long, device=actions.device)
-    out = actions.clone()
+    # Never round to the narrower operand: an absolute joint target near 3 rad sits on a
+    # 2**-6 rad bfloat16 grid, so a bfloat16 `actions` (a policy output, a served prefix) must
+    # not drag a float32 state down to it. Float32 on both sides (the dataset path) is a no-op.
+    dtype = torch.promote_types(actions.dtype, current.dtype)
+    out = actions.to(dtype=dtype, copy=True)
     # Insert the chunk axis so ONE state broadcasts across the whole horizon — the defining
     # property of this transform, mirroring openpi's `np.expand_dims(..., axis=-2)`.
-    offset = current[..., s_pos].unsqueeze(-2).to(out.dtype)
+    offset = current[..., s_pos].unsqueeze(-2).to(dtype)
     out[..., a_pos] = out[..., a_pos] + sign * offset
     return out
 

@@ -15,16 +15,19 @@
 # limitations under the License.
 
 import logging
+from collections.abc import Callable, Iterable
 from dataclasses import asdict
 from pprint import pformat
+from typing import Any
 
 import numpy as np
 import torch
 from sklearn.metrics import r2_score
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 from opentau.configs import parser
 from opentau.configs.train import TrainPipelineConfig
+from opentau.datasets.action_indexing import subtract_chunk_start_state
 from opentau.datasets.factory import make_dataset_mixture
 from opentau.policies.candidates import refuse_candidates
 from opentau.policies.factory import get_policy_class
@@ -34,6 +37,62 @@ from opentau.utils.utils import (
     auto_torch_device,
     init_logging,
 )
+
+
+def dataset_delta_action_state_map(dataset: Dataset) -> dict[int, int] | None:
+    """The post-index delta map ``dataset`` applies to its targets, or ``None`` for absolute ones.
+
+    ``WeightedDatasetMixture`` wraps every entry in ``_TaggedDataset``, and a validation split adds
+    a ``Subset`` beneath it; neither proxies attribute access.
+    """
+    ds = getattr(dataset, "_base", dataset)
+    delta_map = getattr(ds, "delta_action_state_map", None)
+    if delta_map is None and hasattr(ds, "dataset"):
+        delta_map = getattr(ds.dataset, "delta_action_state_map", None)
+    return delta_map or None
+
+
+def first_action_pairs(
+    sample_actions: Callable[[dict[str, Any]], torch.Tensor],
+    dataloader: Iterable[dict[str, Any]],
+    device: torch.device,
+    delta_map: dict[int, int] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Predicted and ground-truth first action of every chunk, each ``(N, action_dim)``.
+
+    They are compared in the space the dataset's targets live in. A delta-action dataset stores
+    each chunk relative to its chunk-start state, while the policy returns absolute targets (it
+    adds that state back), so the prediction is re-expressed against the same batch state rather
+    than the targets rebuilt as absolute. The re-anchoring state then cancels exactly — the
+    dataset emits it rounded to bfloat16, so rebuilt "absolute" targets would not be the recorded
+    ones — and R² is measured against the deltas' own variance; in absolute space it is dominated
+    by the state the policy is given, and reads near 1 for almost any model.
+
+    Args:
+        sample_actions: The policy's ``sample_actions`` (possibly compiled).
+        dataloader: Batches from one dataset of the mixture.
+        device: Device the policy runs on.
+        delta_map: That dataset's post-index ``delta_action_state_map``, or ``None``.
+
+    Returns:
+        ``(predicted, ground_truth)`` first actions, one row per sample, over the pre-pad dims.
+    """
+    pred, truth = [], []
+    for batch in dataloader:
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        actions = sample_actions(batch).to(torch.float32)
+        if delta_map:
+            actions = subtract_chunk_start_state(actions, batch["state"], delta_map)
+        # The dataset's emitted (post-index, pre-pad) width; the zero-padded tail is no robot dim.
+        dof = int(batch["real_action_dim"][0])
+        pred.append(actions[:, 0, :dof].cpu().numpy())
+        truth.append(batch["actions"][:, 0, :dof].to(torch.float32).cpu().numpy())
+    return np.concatenate(pred), np.concatenate(truth)
+
+
+def action_fidelity(pred: np.ndarray, truth: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Per-dimension MSE and R² of ``pred`` against ``truth`` (both ``(N, action_dim)``)."""
+    return np.mean((pred - truth) ** 2, axis=0), r2_score(truth, pred, multioutput="raw_values")
 
 
 @parser.wrap()
@@ -52,7 +111,7 @@ def inference_main(cfg: TrainPipelineConfig):
     # build lerobot dataset and dataloader
     datasets = make_dataset_mixture(cfg)
 
-    # load trained or finetunned model. Change the batch size to 1 in the config
+    # load the trained or fine-tuned model (any batch size: every sample's first action is scored)
 
     device = auto_torch_device()
     if cfg.seed is not None:
@@ -71,29 +130,19 @@ def inference_main(cfg: TrainPipelineConfig):
     policy.reset()
 
     for dataset in datasets.datasets:
-        robot_dof = dataset.meta.info["features"]["actions"]["shape"][0]
-        assert cfg.max_action_dim >= robot_dof
         print(f"The batch size is {cfg.batch_size}")
         dataloader = DataLoader(dataset, batch_size=cfg.batch_size)
+        delta_map = dataset_delta_action_state_map(dataset)
+        if delta_map:
+            print("delta-action targets: comparing in delta space (prediction minus chunk-start state)")
 
-        pred = []
-        truth = []
         with torch.inference_mode():
-            for batch in dataloader:
-                for key, value in batch.items():
-                    if isinstance(value, torch.Tensor):
-                        batch[key] = batch[key].to(device)
-                action = policy_sample_actions(batch)
-                predicted_action = action.to("cpu", torch.float32).numpy()
-                pred.append(predicted_action[0, :, :robot_dof].squeeze(0))
-                truth.append(batch["actions"][:, 0, :].squeeze(0)[:robot_dof].to(torch.float32).cpu().numpy())
+            pred, truth = first_action_pairs(policy_sample_actions, dataloader, device, delta_map)
+        mse, r2 = action_fidelity(pred, truth)
 
-        pred = np.stack(pred, axis=0)
-        truth = np.stack(truth, axis=0)
+        print(f"the mean squared error loss per dimension is {mse}")
 
-        print(f"the mean squared error loss per dimension is {np.mean((pred - truth) ** 2, axis=0)}")
-
-        print(f"the r2 score per dimension is {r2_score(pred, truth, multioutput='raw_values')}")
+        print(f"the r2 score per dimension is {r2}")
     logging.info("End of inference")
 
 
