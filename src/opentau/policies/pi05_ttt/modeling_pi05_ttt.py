@@ -459,6 +459,7 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         state: Tensor | None = None,
         real_action_dim: Tensor | None = None,
         loss_mask: Tensor | None = None,
+        timestep_is_pad: Tensor | None = None,
         return_per_sample: bool = False,
     ) -> dict[str, Tensor | PerSampleLoss]:
         """Runs sequence training with TBPTT over a trajectory.
@@ -542,6 +543,10 @@ class PI05TTTFlowMatching(PI05FlowMatching):
                 num_timesteps=segment_length,
                 position_offset=start * tokens_per_timestep,
                 incoming=carried,
+                # Sliced like `loss_mask` below: the TTT layers see only this
+                # segment's timesteps, so the mask must be sliced to match or a
+                # multi-segment run would mask the wrong positions.
+                timestep_is_pad=None if timestep_is_pad is None else timestep_is_pad[:, start:stop],
             )
 
             segment_loss_mask = None if loss_mask is None else loss_mask[:, start:stop]
@@ -1381,6 +1386,10 @@ class PI05TTTPolicy(PI05Policy):
                 "action forcing); passing `noise` or `time` explicitly would defeat it."
             )
         loss_mask = batch.get("loss_mask")
+        # Absent at `sequence_length == 1` (the dataset only emits it in
+        # sequence mode) and for any dataset predating it; `None` disables the
+        # mask and restores the previous behaviour exactly.
+        timestep_is_pad = batch.get("timestep_is_pad")
         batch_size = batch["actions"].shape[0]
         flat_batch = self._flatten_sequence_batch(batch, batch_size, num_timesteps)
 
@@ -1412,6 +1421,7 @@ class PI05TTTPolicy(PI05Policy):
             state=state,
             real_action_dim=flat_batch.get("real_action_dim"),
             loss_mask=loss_mask,
+            timestep_is_pad=timestep_is_pad,
         )
 
     @staticmethod

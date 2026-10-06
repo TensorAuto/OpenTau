@@ -670,6 +670,11 @@ class DatasetMixtureConfig:
     #
     # Nothing is materialized: the pair is a tensor for one step.
     pair_episodes: bool = False
+    # Demonstrations placed in context before the supervised rollout. 1 is the
+    # original pair (demo + rollout); 2 concatenates two demonstrations, and so
+    # on. The policy therefore sees `(n_demos + 1) * sequence_length` timesteps.
+    # Only read when `pair_episodes` is set.
+    n_demos: int = 1
 
     # Training-time dropout probabilities for optional sample keys.
     history_state_drop_prob: float = 0.3
@@ -752,20 +757,15 @@ class DatasetMixtureConfig:
                 "`sequence_stride` must be None (derives `action_chunk`: RoboTTT tiles a "
                 f"trajectory into disjoint action chunks) or a positive integer, got {self.sequence_stride!r}."
             )
-        if self.sequence_length > 1 and any(
-            getattr(d, "use_delta_joint_actions", False) for d in (self.datasets or [])
-        ):
-            # `subtract_chunk_start_state` reads `actions` as (chunk, dim) and
-            # `state` as (state_dim,). Under sequence emission those are
-            # (T * chunk, dim) and (T, state_dim), so the chunk-start lookup
-            # would align to the wrong timestep. Refuse until the transform is
-            # made sequence-aware; CLAUDE.md rule 7 is about exactly this pair
-            # (a dataset-side transform whose inference inverse must match).
-            raise ValueError(
-                "`sequence_length` > 1 is not yet supported together with "
-                "`use_delta_joint_actions`: the delta transform indexes actions as "
-                "(chunk, dim) and would align to the wrong timestep under a sequence axis."
-            )
+        # `sequence_length` > 1 with `use_delta_joint_actions` used to be refused here:
+        # `subtract_chunk_start_state` read `actions` as (chunk, dim) and `state` as
+        # (state_dim,), but under sequence emission those are (T * chunk, dim) and
+        # (T, state_dim), so the chunk-start lookup aligned to the wrong timestep.
+        # `LeRobotDataset._apply_column_index_and_delta` now folds the timestep axis out
+        # before the transform, so each timestep is offset by its own chunk-start state.
+        # The inference inverse (`add_chunk_start_state` in `PI05Policy.sample_actions`)
+        # runs at a single timestep and is unaffected, keeping CLAUDE.md rule 7's
+        # forward/inverse pair matched.
         if self.sequence_length > 1 and self.n_obs_history is not None:
             # Both would claim the camera/state time axis, and the fetch layer
             # emits one tensor per feature — so the two cannot be composed

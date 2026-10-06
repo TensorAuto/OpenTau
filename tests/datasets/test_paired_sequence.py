@@ -104,7 +104,8 @@ class TestConcatenation:
     def test_a_precedes_b(self):
         """Order matters: the demonstration must be the part that is masked."""
         ds = _make()
-        key, a, b = ds._draw(0)
+        key, demos, b = ds._draw(0)
+        (a,) = demos  # n_demos=1
         s = ds[0]
         assert s["state"][0, 0].item() == float(a)
         assert s["state"][T, 0].item() == float(b)
@@ -147,7 +148,8 @@ class TestSameKey:
             samples_per_epoch=64,
         )
         for i in range(40):
-            key, a, b = ds._draw(i)
+            key, demos, b = ds._draw(i)
+            (a,) = demos  # n_demos=1
             assert {a, b} <= set(ds.pairing_keys[key])
 
 
@@ -157,7 +159,7 @@ class TestDeterminism:
         assert _make()._draw(7) == _make()._draw(7)
 
     def test_different_indices_differ(self):
-        draws = {_make()._draw(i)[1:] for i in range(40)}
+        draws = {(tuple(d), b) for _, d, b in (_make()._draw(i) for i in range(40))}
         assert len(draws) > 1, "sampler is returning one pair for every index"
 
 
@@ -165,7 +167,7 @@ class TestSceneConstraint:
     def test_same_scene_pairs_are_avoided(self):
         """Two episodes of one scene can be solved by copying A's motion."""
         ds = _make(episodes=(1, 2, 3, 4), scenes={1: "k1", 2: "k1", 3: "k2", 4: "k3"})
-        same = sum(1 for i in range(60) if ds._scene_of(ds._draw(i)[1]) == ds._scene_of(ds._draw(i)[2]))
+        same = sum(1 for i in range(60) if ds._scene_of(ds._draw(i)[1][0]) == ds._scene_of(ds._draw(i)[2]))
         assert same == 0
 
     def test_missing_scene_metadata_does_not_reject_everything(self):
@@ -316,6 +318,79 @@ class TestOnlyTemporalKeysConcatenate:
         assert "img_is_pad" in caplog.text and "subgoal0" in caplog.text
 
 
+class TestMultipleDemonstrations:
+    """``n_demos`` places more than one demonstration in context.
+
+    The one-shot recipe concatenated one demo with one rollout. ``n_demos``
+    generalises that to N demos, which is what makes a 2-shot or 3-shot
+    *training* run possible -- and the eval harness can then prime with the same
+    number, so train and test finally agree on how much context the policy sees.
+    """
+
+    WIDE = (10, 11, 12, 13, 14)
+
+    def _ds(self, n_demos, episodes=None, **kw):
+        eps = list(episodes or self.WIDE)
+        return PairedSequenceDataset(
+            base=_StubBase(eps),
+            pairing_keys={"k": eps},
+            prompts={"k": None},
+            samples_per_epoch=16,
+            seed=0,
+            n_demos=n_demos,
+            **kw,
+        )
+
+    @pytest.mark.parametrize("n_demos", [1, 2, 3])
+    def test_sequence_scales_with_demo_count(self, n_demos):
+        """The sample is ``(n_demos + 1)`` segments, not always two."""
+        sample = self._ds(n_demos)[0]
+        assert sample["state"].shape[0] == (n_demos + 1) * T
+
+    @pytest.mark.parametrize("n_demos", [1, 2, 3])
+    def test_only_the_rollout_is_supervised(self, n_demos):
+        """Every demonstration is masked; exactly one rollout carries the loss.
+
+        The whole method rests on this: if a demo were supervised the model could
+        lower the loss by copying it rather than by absorbing it.
+        """
+        lm = self._ds(n_demos)[0]["loss_mask"]
+        assert int((~lm).sum()) == n_demos * T, "demo timesteps must be masked"
+        assert int(lm.sum()) == T, "exactly one rollout's worth may be supervised"
+        assert not lm[: n_demos * T].any(), "mask is not contiguous demos-then-rollout"
+        assert lm[n_demos * T :].all()
+
+    @pytest.mark.parametrize("n_demos", [1, 2, 3])
+    def test_every_episode_in_the_tuple_is_distinct(self, n_demos):
+        """A repeated episode would make one demonstration redundant."""
+        ds = self._ds(n_demos)
+        for i in range(16):
+            _, demos, rollout = ds._draw(i)
+            assert len(demos) == n_demos
+            assert len(set(demos) | {rollout}) == n_demos + 1
+
+    def test_n_demos_one_is_unchanged(self):
+        """The default must reproduce the pair behaviour bit-for-bit.
+
+        Runs made before n-tuples existed have to stay reproducible, so the
+        ``n_demos == 1`` draw deliberately keeps the original sampling path.
+        """
+        ds = self._ds(1)
+        for i in (0, 3, 9):
+            _, demos, rollout = ds._draw(i)
+            assert len(demos) == 1 and demos[0] != rollout
+        assert torch.equal(self._ds(1)[5]["state"], self._ds(1)[5]["state"])
+
+    def test_thin_key_is_rejected_with_the_count_it_needs(self):
+        """Three episodes cannot supply two demos plus a distinct rollout."""
+        with pytest.raises(ValueError, match=r">=4 episodes for 3 demo"):
+            self._ds(3, episodes=(10, 11, 12))
+
+    def test_zero_demos_is_rejected(self):
+        with pytest.raises(ValueError, match="n_demos must be >= 1"):
+            self._ds(0)
+
+
 class TestPairingIsActuallyWired:
     """The pairing must reach ``train.py``, not just exist as a class.
 
@@ -363,7 +438,7 @@ class TestPairingIsActuallyWired:
     def test_validate_rejects_undoubled_policy_length(self, tmp_path):
         """The breaking case: pairing on, policy still expecting one half."""
         cfg = self._cfg(policy_seq=T, mixture_seq=T, pair=True, tmp_path=tmp_path)
-        with pytest.raises(ValueError, match="pair_episodes doubles"):
+        with pytest.raises(ValueError, match="pair_episodes with n_demos"):
             cfg.validate()
 
     def test_validate_leaves_unpaired_configs_alone(self, tmp_path):
@@ -372,6 +447,46 @@ class TestPairingIsActuallyWired:
         cfg = self._cfg(policy_seq=2 * T, mixture_seq=T, pair=False, tmp_path=tmp_path)
         with pytest.raises(ValueError, match="!= emitted timesteps"):
             cfg.validate()
+
+    def test_validate_scales_policy_length_by_demo_count(self, tmp_path):
+        """`validate()` must expect `(n_demos + 1) x sequence_length`, not 2x.
+
+        Without this a correct 2-shot config is rejected at parse time, and --
+        worse -- a config still sized for one demo is silently accepted.
+        """
+        from opentau.configs.default import DatasetConfig, DatasetMixtureConfig
+        from opentau.configs.train import TrainPipelineConfig
+        from opentau.policies.pi05_ttt.configuration_pi05_ttt import PI05TTTConfig
+
+        def build(policy_seq, n_demos):
+            return TrainPipelineConfig(
+                dataset_mixture=DatasetMixtureConfig(
+                    datasets=[
+                        DatasetConfig(
+                            repo_id="mock",
+                            root="/tmp/mock",
+                            episodes=list(range(n_demos + 1)),
+                            ambiguous_prompt="x",
+                        )
+                    ],
+                    weights=[1.0],
+                    action_freq=30.0,
+                    sequence_length=T,
+                    pair_episodes=True,
+                    n_demos=n_demos,
+                ),
+                policy=PI05TTTConfig(sequence_length=policy_seq, tbptt_segment_length=T),
+                output_dir=str(tmp_path),
+                job_name="t",
+                seed=42,
+                batch_size=8,
+                use_policy_training_preset=True,
+            )
+
+        build(policy_seq=3 * T, n_demos=2).validate()  # 2 demos + rollout
+        build(policy_seq=4 * T, n_demos=3).validate()  # 3 demos + rollout
+        with pytest.raises(ValueError, match="pair_episodes with n_demos=2"):
+            build(policy_seq=2 * T, n_demos=2).validate()  # still sized for one demo
 
     def test_validate_rejects_val_freq_with_pairing(self, tmp_path):
         """`val_freq` and pairing are incompatible, and silently so without this.
@@ -461,7 +576,7 @@ class TestPairingIsActuallyWired:
         from opentau.datasets.factory import _maybe_pair
 
         ds_cfg = SimpleNamespace(repo_id="r", episodes=[1, 2], ambiguous_prompt=None)
-        cfg = SimpleNamespace(dataset_mixture=SimpleNamespace(pair_episodes=True), seed=0)
+        cfg = SimpleNamespace(dataset_mixture=SimpleNamespace(pair_episodes=True, n_demos=1), seed=0)
         # Proceeds past the prompt check and fails later on the stub dataset,
         # which is the point: the prompt no longer blocks it.
         with caplog.at_level(logging.WARNING), pytest.raises(TypeError):

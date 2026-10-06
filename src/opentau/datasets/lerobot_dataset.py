@@ -1102,19 +1102,20 @@ class BaseDataset(torch.utils.data.Dataset):
         # per-timestep loss mask. Runs last so every per-frame transform above
         # (padding, column indexing, dtype cast) sees the flat layout it was
         # written for.
-        self._reshape_to_sequence(standard_item)
+        fr = item.get("frame_index")
+        frame_index = int(fr.item() if torch.is_tensor(fr) else fr) if fr is not None else -1
+        self._reshape_to_sequence(standard_item, frame_index)
 
         standard_item["source"] = self._get_feature_mapping_key()
         ep = item.get("episode_index")
         standard_item["episode_index"] = (
             int(ep.item() if torch.is_tensor(ep) else ep) if ep is not None else -1
         )
-        fr = item.get("frame_index")
-        standard_item["frame_index"] = int(fr.item() if torch.is_tensor(fr) else fr) if fr is not None else -1
+        standard_item["frame_index"] = frame_index
 
         return standard_item
 
-    def _reshape_to_sequence(self, standard_item: dict) -> None:
+    def _reshape_to_sequence(self, standard_item: dict, frame_index: int = -1) -> None:
         """Give the sample a leading timestep axis, for recurrent policies.
 
         The fetch layer returns the widened action query flat, as
@@ -1158,6 +1159,159 @@ class BaseDataset(torch.utils.data.Dataset):
 
         standard_item["loss_mask"] = torch.ones(seq_len, dtype=torch.bool)
 
+        # `timestep_is_pad`: True where this timestep falls BEFORE the episode's first
+        # frame. The window is anchored on the queried frame and walks backwards in
+        # `sequence_stride` steps, so a query at frame `f` has `floor(f / stride) + 1`
+        # real timesteps and the shortfall lands on the leading (oldest) positions.
+        # Episodes shorter than the full window stay usable -- they carry a padded
+        # prefix -- and TTT zeroes its inner learning rate there instead of taking a
+        # gradient step on a repeated boundary frame.
+        #
+        # Neither existing pad flag can serve here. `action_is_pad` is set on BOTH
+        # sides of the episode (`_get_query_indices_soft` flags `idx + delta < start`
+        # as well as `>= end`) and is keyed to the action chunk rather than the
+        # timestep, so it does not answer "is this timestep outside the episode".
+        # `obs_history_is_pad` also goes True for `history_state_drop_prob`
+        # augmentation, so masking TTT on it would silence learning on real frames.
+        # This flag means one thing only.
+        #
+        # `sequence_stride` is pinned to `action_chunk` by
+        # `TrainPipelineConfig._validate_sequence_stride` (one timestep = one disjoint
+        # action chunk), so `action_chunk` is the stride -- but it is a stride in
+        # `action_freq` units, NOT in source frames. `resolve_delta_timestamps` emits
+        # the window's offsets in SECONDS (`-(T-1-t) * seq_stride / action_freq`) and
+        # `get_delta_indices_soft` converts them back with the dataset's NATIVE fps,
+        # so one timestep spans `seq_stride * fps / action_freq` source frames.
+        # Assuming `action_freq == fps` would place the boundary wrongly on any resampled
+        # dataset -- marking clamped repeated frames as real, and rotating the
+        # window by the same amount. Validation only rejects *over*sampling
+        # (`action_freq > seq_stride * fps`), so undersampling reaches here.
+        timestep_is_pad = torch.zeros(seq_len, dtype=torch.bool)
+        n_pad = 0
+        if frame_index >= 0:
+            timestep_is_pad[: self._pad_timestep_count(frame_index, seq_len)] = True
+            n_pad = int(timestep_is_pad.sum())
+        standard_item["timestep_is_pad"] = timestep_is_pad
+
+        if n_pad:
+            self._shift_real_timesteps_to_front(standard_item, n_pad)
+
+    def _aggregate_selected_episode_stats(self) -> dict:
+        """Aggregates per-episode stats over the selected episodes.
+
+        Returns an empty dict when no selected episode carries stats, which the
+        caller reads as "fall back to the dataset-level stats". Warns on the
+        partial case: an aggregate over only the episodes that happen to carry
+        stats is published as ``meta.stats`` and pooled by the mixture
+        normalizer, so it is a biased sample of the selection and is
+        indistinguishable downstream from a complete one.
+
+        Returns:
+            The aggregate, or ``{}`` when there is nothing to aggregate.
+        """
+        per_ep = [
+            self.meta.episodes_stats[ep_idx]
+            for ep_idx in self.episodes
+            if self.meta.episodes_stats.get(ep_idx)
+        ]
+        if per_ep and len(per_ep) < len(self.episodes):
+            logging.warning(
+                "%s: %d of %d selected episodes carry per-episode stats; the aggregate "
+                "published as meta.stats covers only those, so it is biased toward them. "
+                "Normalization from `norm_stats_override_path` or the policy buffers is "
+                "unaffected.",
+                getattr(self, "repo_id", "dataset"),
+                len(per_ep),
+                len(self.episodes),
+            )
+        elif not per_ep:
+            logging.warning(
+                "%s: no selected episode carries per-episode stats; falling back to the "
+                "dataset-level stats, which describe a superset of the selection.",
+                getattr(self, "repo_id", "dataset"),
+            )
+        return aggregate_stats(per_ep) if per_ep else {}
+
+    def _pad_timestep_count(self, frame_index: int, seq_len: int) -> int:
+        """Counts the window's leading timesteps that fall before the episode start.
+
+        The window is anchored on ``frame_index`` and walks backwards one timestep
+        at a time. A timestep spans ``sequence_stride * fps / action_freq`` source
+        frames, because the offsets are built in seconds against ``action_freq``
+        and resolved back to frames against the dataset's native fps.
+
+        Args:
+            frame_index: Queried frame's index within its episode.
+            seq_len: Timesteps in the window.
+
+        Returns:
+            Number of padded timesteps, all at the front of the window.
+        """
+        stride = max(1, int(self.action_chunk))
+        frames_per_timestep = float(stride)
+        if self._action_freq:
+            frames_per_timestep = stride * (float(self.fps) / float(self._action_freq))
+        # A timestep is real when `frame_index - k * frames_per_timestep >= 0`.
+        # `floor` is the conservative rounding: a boundary timestep is called
+        # padding, so a frame the fetch layer clamped is never learned from.
+        frames_per_timestep = max(frames_per_timestep, 1e-9)
+        n_real = min(seq_len, int(frame_index // frames_per_timestep) + 1)
+        return seq_len - n_real
+
+    # Keys whose leading axis is time. Mirrors
+    # `PairedSequenceDataset._is_temporal`, which concatenates exactly these
+    # across a pair's halves; the two lists must not drift apart or a shifted
+    # half would desynchronise from an unshifted one.
+    _TIME_AXIS_KEYS = (
+        "state",
+        "actions",
+        "action_is_pad",
+        "loss_mask",
+        "obs_history_is_pad",
+        "timestep_is_pad",
+    )
+
+    @classmethod
+    def _shift_real_timesteps_to_front(cls, standard_item: dict, n_pad: int) -> None:
+        """Rotates a padded window so its real timesteps occupy positions ``0..n_real-1``.
+
+        The window is anchored on the episode's last frame, so a short episode
+        arrives with its padding at the FRONT and its real frames at the back.
+        That placement is what the frames are worth keeping -- it ends on task
+        completion -- but it also pushes them to a later RoPE phase than a
+        full-length episode's, and the TTT fast-weight update reads the rotated
+        keys at absolute positions. Training would then show short demonstrations
+        at a phase evaluation never produces, since demo pools skip episodes
+        shorter than the window.
+
+        Rotating left by ``n_pad`` moves the real frames to the front and wraps
+        the padding behind them. It does NOT change which frames were selected
+        or their chronological order -- only the slot each occupies -- so the
+        masked TTT update is bit-identical and only the phase moves.
+
+        Args:
+            standard_item: The in-progress item, modified in place.
+            n_pad: Number of padded timesteps at the front; must be > 0.
+        """
+        shifted = []
+        for key, value in standard_item.items():
+            if not torch.is_tensor(value):
+                continue
+            if key in cls._TIME_AXIS_KEYS or key.startswith("camera"):
+                standard_item[key] = torch.roll(value, shifts=-n_pad, dims=0)
+                shifted.append(key)
+        # Every temporal key must move together. A key that reaches the sample
+        # after this point would keep the old placement while its siblings moved,
+        # which desynchronises the mask from the frames it describes -- silent,
+        # and only visible as degraded training.
+        missing = [k for k in ("state", "actions", "timestep_is_pad") if k not in shifted]
+        if missing:
+            raise RuntimeError(
+                f"timestep shift missed required temporal key(s) {missing}; "
+                f"shifted={sorted(shifted)}. Keys carrying a time axis must be present "
+                "before `_shift_real_timesteps_to_front` runs."
+            )
+
     def _apply_column_index_and_delta(self, standard_item: dict) -> None:
         """Subset/reorder `state` and `actions`, then make mapped action dims relative.
 
@@ -1185,9 +1339,30 @@ class BaseDataset(torch.utils.data.Dataset):
                 standard_item["actions"], self.action_index, what="action", who=who
             )
         if self.delta_action_state_map and "actions" in standard_item and "state" in standard_item:
-            standard_item["actions"] = subtract_chunk_start_state(
-                standard_item["actions"], standard_item["state"], self.delta_action_state_map
-            )
+            actions, state = standard_item["actions"], standard_item["state"]
+            seq_len = getattr(self, "sequence_length", 1)
+            if seq_len > 1:
+                # Sequence mode reaches here BEFORE `_reshape_to_sequence`, so `actions` is still
+                # flat `(T * chunk, D_a)` while `state` already carries its time axis `(T, D_s)`.
+                # Both are rank 2, so `_offset_actions` would read the trailing axis as a history
+                # window and broadcast the LAST timestep's pose across the whole sequence — every
+                # timestep but the final one would be offset from the wrong pose. Fold the
+                # timestep axis out first: at `(T, chunk, D_a)` against `(T, D_s)` the ranks
+                # differ, so each timestep is offset by its own chunk-start state.
+                if actions.shape[0] % seq_len != 0:
+                    raise ValueError(
+                        f"`actions` has leading dim {actions.shape[0]}, not divisible by "
+                        f"sequence_length={seq_len}; cannot fold the timestep axis to form "
+                        "per-timestep deltas. The delta-timestamps query and the reshape have "
+                        "diverged; see `resolve_delta_timestamps`."
+                    )
+                folded = rearrange(actions, "(t h) ... -> t h ...", t=seq_len)
+                folded = subtract_chunk_start_state(folded, state, self.delta_action_state_map)
+                standard_item["actions"] = rearrange(folded, "t h ... -> (t h) ...")
+            else:
+                standard_item["actions"] = subtract_chunk_start_state(
+                    actions, state, self.delta_action_state_map
+                )
 
     def _obs_history_pad_fallback(self, padded: bool) -> torch.Tensor:
         """Build ``obs_history_is_pad`` when the fetch layer produced no state pad flags.
@@ -1918,7 +2093,19 @@ class LeRobotDataset(BaseDataset):
             self._episodes_were_specified = True
 
         if self.episodes is not None and self.meta._version >= packaging.version.parse("v2.1"):
-            self.stats = aggregate_stats([self.meta.episodes_stats[ep_idx] for ep_idx in self.episodes])
+            # Some v3.0 datasets ship an episodes parquet with no flattened `stats/*`
+            # columns, so `episodes_stats` is empty (or holds empty per-episode dicts)
+            # and there is nothing to aggregate. Overwriting `meta.stats` with that
+            # empty aggregate wipes the real `observation.state` / `action` entries
+            # loaded from `meta/stats.json`; the ImageNet camera override then layers
+            # image keys onto the empty dict, leaving stats that contain ONLY cameras.
+            # `DatasetMixtureMetadata` later reads `m.stats[name_map["state"]]` and
+            # dies with `KeyError: observation.state`. Fall back to the dataset-level
+            # stats in that case: they describe a superset of the selected episodes,
+            # which is strictly better than no stats, and normalization itself comes
+            # from `norm_stats_override_path` / the policy buffers.
+            _subset_stats = self._aggregate_selected_episode_stats()
+            self.stats = _subset_stats if _subset_stats else self.meta.stats
             # Propagate the selected-episode aggregate onto the metadata so the
             # mixture normalizer (which pools `ds.meta.stats`) reflects the
             # episodes actually trained on, not the full on-disk dataset.
@@ -1931,7 +2118,8 @@ class LeRobotDataset(BaseDataset):
             # reads the `LeRobotDataset.stats` attribute for normalization, so
             # the shared reference (later padded in place by the mixture) is
             # benign.
-            self.meta.stats = self.stats
+            if _subset_stats:
+                self.meta.stats = self.stats
 
         if self.episodes is None:
             self.episodes = list(self.meta.episodes)
