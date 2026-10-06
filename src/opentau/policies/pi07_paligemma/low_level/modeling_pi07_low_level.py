@@ -65,6 +65,7 @@ from opentau.policies.pretrained import (
 )
 from opentau.policies.utils import (
     PerSampleLoss,
+    cast_to_weight_dtype,
     ce_per_sample,
     flow_matching_masked_mse,
     freeze_policy_level_params_for_state_action_representation_only,
@@ -2257,7 +2258,11 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
             emb = emb * math.sqrt(emb.shape[-1])
             return emb, item.pad_mask
         if t == "state":
-            emb = self._apply_proj(self.state_proj, item.data.to(dtype=_preferred_dtype()), group_index)
+            emb = self._apply_proj(
+                self.state_proj,
+                cast_to_weight_dtype(item.data, self.state_proj, _preferred_dtype()),
+                group_index,
+            )
             return emb, item.pad_mask
         if t == "discrete_action":
             emb = self.paligemma_with_expert.embed_discrete_actions(item.data)

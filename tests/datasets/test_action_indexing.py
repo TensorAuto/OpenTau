@@ -111,6 +111,21 @@ class TestDeltaTransform:
         subtract_chunk_start_state(actions, torch.tensor([1.0]), {0: 0})
         assert torch.equal(actions, original)
 
+    def test_mixed_precision_computes_in_the_wider_dtype(self):
+        """A bfloat16 chunk (a policy output, a served prefix) must not drag a float32 state down
+        to bfloat16: an absolute target near 3 rad would land on a 2**-6 rad grid."""
+        state = torch.tensor([2.0071, -3.1234])
+        deltas = torch.tensor([[0.25, -0.5], [0.125, 0.0625]], dtype=torch.bfloat16)  # exact in bf16
+        original = deltas.clone()
+
+        out = add_chunk_start_state(deltas, state, {0: 0, 1: 1})
+
+        expected = deltas.float() + state
+        assert not torch.equal((deltas + state.to(torch.bfloat16)).float(), expected), "precondition"
+        assert out.dtype == torch.float32
+        assert torch.equal(out, expected)
+        assert torch.equal(deltas, original)
+
     @pytest.mark.parametrize(
         "actions_shape,state_shape",
         [

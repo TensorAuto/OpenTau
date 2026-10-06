@@ -29,6 +29,7 @@ from opentau.policies.factory import get_policy_class
 from opentau.policies.utils import to_dtype_preserving_siglip_float32
 from opentau.utils.random_utils import set_seed
 from opentau.utils.utils import (
+    INFERENCE_STATE_DTYPE,
     init_logging,
 )
 
@@ -107,7 +108,7 @@ def inference_main(cfg: TrainPipelineConfig):
         logging.info(f"{sub_task}")
         observation = {
             **camera_observations,
-            "state": torch.zeros((1, cfg.max_state_dim), dtype=torch.bfloat16, device=device),
+            "state": torch.zeros((1, cfg.max_state_dim), dtype=INFERENCE_STATE_DTYPE, device=device),
             "prompt": [sub_task],
             "img_is_pad": torch.zeros((1, cfg.num_cams), dtype=torch.bool, device=device),
             "action_is_pad": torch.zeros((1, cfg.action_chunk), dtype=torch.bool, device=device),

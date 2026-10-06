@@ -499,6 +499,19 @@ class TestPreprocessObservationCameraPadding:
         )
         assert torch.equal(out["img_is_pad"].cpu(), expected_pad)
 
+    def test_state_stays_float32_while_cameras_go_bfloat16(self):
+        """``state`` is exempt from the memory-saving bfloat16 cast: a delta-action policy adds it
+        back onto its predicted deltas, and bfloat16 would round a joint near 3 rad by up to
+        2**-7 rad. The cameras still go bfloat16, as in training."""
+        obs = self._make_pixel_obs(batch_size=2, n_present_cams=2)
+        # float64, as sims emit
+        obs["agent_pos"] = np.array([[2.0071, -3.1234, 2.9999, 0.0, 0.0, 0.0, 0.0, 0.0]] * 2)
+        out = preprocess_observation(obs, self._make_cfg(num_cams=2))
+
+        assert out["state"].dtype == torch.float32
+        assert torch.equal(out["state"].cpu(), torch.from_numpy(obs["agent_pos"]).float())
+        assert out["camera0"].dtype == torch.bfloat16
+
     def test_all_cameras_present_no_padding(self):
         """``num_cams=2`` with 2 present cameras → no zero-fill, ``img_is_pad`` all False."""
         cfg = self._make_cfg(num_cams=2)

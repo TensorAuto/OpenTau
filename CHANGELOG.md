@@ -196,6 +196,53 @@ The values are left as their authors wrote them rather than rewritten to match w
 preset was imposing. A test pins this exact set, so a fourth config — or a preset edit that
 creates a new divergence — fails rather than changing a training run unannounced.
 
+### Fixed — delta-action targets are re-anchored on an unrounded state — **served actions change for delta-action checkpoints, no `config_version` bump**
+
+Every inference entry point — the gRPC and RoboCasa servers, `preprocess_observation`
+(`eval.py` and in-training sim eval), and the dummy observations of `inference.py`,
+`benchmark_inference.py` and `high_level_planner_inference.py` — built `state` in the
+policy's bfloat16 serving dtype. A delta-action checkpoint (`delta_action_state_map` set by
+`use_delta_joint_actions`) adds that state back onto its predicted deltas, but the dataset
+formed the training deltas against the float32 state *before* casting the sample to
+bfloat16, so every absolute joint target carried the bfloat16 rounding of the current joint
+position: up to 2**-7 ≈ 0.0078 rad (0.45°) on a joint in [2, 4) rad, re-applied on every
+chunk. `state` is now built at `INFERENCE_STATE_DTYPE` (float32), as is the gRPC RTC
+`prefix_action`, which the same conversion re-anchors on the state. `add_chunk_start_state`
+/ `subtract_chunk_start_state` compute in the wider of their two input dtypes, so a
+bfloat16 chunk cannot drag a float32 state down; float32 on both sides (the dataset path)
+is unchanged.
+
+**What the model sees is unchanged.** Training normalizes a bfloat16 state in bfloat16
+arithmetic. A float32 state would have normalized in float32 and drifted off it, moving a
+discretized state token by a bin for 16–60% of states, depending on the stats (worst when the
+std is small next to the joint's magnitude). So `Normalize` now casts a floating input to its
+stats' dtype first. That is a no-op in training, and a served policy's normalized state stays
+bit-identical to the bfloat16 path (torch already rounded a float64 state to bfloat16 by way of
+float32). Absolute-action checkpoints therefore serve the same actions, except `xr1` and
+`flux3_action`: they leave `state` unnormalized, so they now preprocess it at float32, as their
+reference pipelines do.
+
+The continuous-state projections (pi0, pi05, pi05_mem, and the pi07 / pi07_paligemma low-level
+policies) now cast their input to the projection's own weight dtype rather than a hard-coded
+bfloat16. pi0 had no cast at all, so a float32 state crashed it.
+
+Migration: a caller building its own batch for a delta-action checkpoint should pass `state`
+at float32. A bfloat16 state still runs, but keeps the rounding.
+
+### Fixed — `actions_mse_loss.py` scores a prediction against its target in the same space — **diagnostic script only**
+
+`scripts/actions_mse_loss.py` never gave a usable number for a chunked policy. It compared
+sample 0's whole predicted chunk with every sample's first ground-truth action, which only
+broadcasts when the chunk length happens to equal the sample count. For a delta-action
+checkpoint it also scored the policy's absolute joint targets against the dataset's deltas. It
+read the action width from `meta.info["features"]["actions"]`, a `KeyError` on datasets that use
+LeRobot's `action` column, and called `r2_score(pred, truth)` with the arguments swapped.
+
+It now compares every sample's first action over the dataset's pre-pad width
+(`real_action_dim`). For delta datasets it compares in delta space: the prediction minus the same
+chunk-start state the policy added. That state cancels exactly, and R², now scored against the
+ground truth, measures the deltas rather than joint positions the policy was given.
+
 ## [0.14.0] - 2026-09-14
 
 ### Added — best-of-N action-chunk sampling — **opt-in, default `1`, no `config_version` bump**

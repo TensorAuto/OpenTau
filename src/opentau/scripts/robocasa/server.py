@@ -88,7 +88,7 @@ from opentau.policies.candidates import configure_candidates
 from opentau.policies.factory import get_policy_class
 from opentau.policies.utils import maybe_compile_sample_actions, to_dtype_preserving_siglip_float32
 from opentau.utils.random_utils import set_seed
-from opentau.utils.utils import auto_torch_device, init_logging
+from opentau.utils.utils import INFERENCE_STATE_DTYPE, auto_torch_device, init_logging
 
 logger = logging.getLogger(__name__)
 
@@ -252,7 +252,11 @@ def build_opentau_batch(
     device: torch.device,
     dtype: torch.dtype,
 ) -> dict[str, torch.Tensor]:
-    """Map RoboCasa observation dict to OpenTau policy batch (batch size 1)."""
+    """Map RoboCasa observation dict to OpenTau policy batch (batch size 1).
+
+    ``dtype`` applies to the camera tensors only: ``state`` is built at
+    ``INFERENCE_STATE_DTYPE`` so a delta-action policy re-anchors on an unrounded state.
+    """
     num_cams = cfg.num_cams
     resolution = cfg.resolution
     batch: dict[str, torch.Tensor] = {}
@@ -272,7 +276,7 @@ def build_opentau_batch(
     if len(state_list) < cfg.max_state_dim:
         state_list.extend([0.0] * (cfg.max_state_dim - len(state_list)))
     state_list = state_list[: cfg.max_state_dim]
-    batch["state"] = torch.tensor([state_list], dtype=dtype, device=device)
+    batch["state"] = torch.tensor([state_list], dtype=INFERENCE_STATE_DTYPE, device=device)
     raw_prompt = prompt.strip() if prompt else ""
     batch["prompt"] = [str(raw_prompt) or ""]
     batch["img_is_pad"] = torch.tensor([img_is_pad], dtype=torch.bool, device=device)
@@ -285,7 +289,11 @@ def build_opentau_batch_multi(
     device: torch.device,
     dtype: torch.dtype,
 ) -> dict[str, torch.Tensor]:
-    """Stack multiple RoboCasa observations into one OpenTau batch (batch size B)."""
+    """Stack multiple RoboCasa observations into one OpenTau batch (batch size B).
+
+    As in :func:`build_opentau_batch`, ``dtype`` covers the cameras and ``state`` stays at
+    ``INFERENCE_STATE_DTYPE``.
+    """
     b = len(items)
     if b == 0:
         raise ValueError("empty batch")
@@ -322,7 +330,7 @@ def build_opentau_batch_multi(
         raw_prompt = prompt.strip() if prompt else ""
         prompts.append(str(raw_prompt) or "")
 
-    batch["state"] = torch.tensor(state_rows, dtype=dtype, device=device)
+    batch["state"] = torch.tensor(state_rows, dtype=INFERENCE_STATE_DTYPE, device=device)
     batch["prompt"] = prompts
     return batch
 

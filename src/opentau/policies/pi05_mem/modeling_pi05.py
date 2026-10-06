@@ -68,6 +68,7 @@ from opentau.policies.pretrained import (
 )
 from opentau.policies.utils import (
     PerSampleLoss,
+    cast_to_weight_dtype,
     ce_per_sample,
     flow_matching_masked_mse,
     freeze_policy_level_params_for_state_action_representation_only,
@@ -1345,7 +1346,7 @@ class PI05MemFlowMatching(nn.Module):
 
         # Project each timestep's state into a separate VLM token
         # state: (B, T, max_state_dim) -> state_emb: (B, T, vlm_hidden_size)
-        state_emb = self.state_proj(state.to(dtype=_preferred_dtype()))
+        state_emb = self.state_proj(cast_to_weight_dtype(state, self.state_proj, _preferred_dtype()))
 
         embs.append(state_emb)
         pad_masks.append(state_mask)
