@@ -50,7 +50,7 @@ from opentau.policies.pretrained import (
     resolve_checkpoint_provenance,
     resolve_pretrained_weights_file,
 )
-from opentau.policies.utils import assert_gemma3_input_resolution
+from opentau.policies.utils import assert_gemma3_input_resolution, warn_once_if_state_out_of_range
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.hub import format_repo_revision, split_repo_revision
 
@@ -643,25 +643,22 @@ class PI07HighLevelPlannerPolicy(PreTrainedPolicy):
         """Discretizes the state into bins and converts it to a string representation.
 
         Each dimension of the state vector is discretized into 256 bins.
-        The values of each dimension of the state are expected to be in the range [-1, 1].
+        The values of each dimension of the state are expected to be in the range [-1, 1];
+        values outside it are not rejected but clamped into it, landing in bin 0 or 255.
         The discretization bins are linearly spaced between -1 and 1.
         The index of the bin for each dimension is then concatenated into a space-separated string.
+        An out-of-range state is logged once per process, not per call
+        (see :func:`~opentau.policies.utils.warn_once_if_state_out_of_range`).
 
         Args:
             batch: Batch of data containing the "state" tensor.
 
         Returns:
             A list of strings, where each string is a space-separated list of discretized state values.
-
-        Raises:
-            ValueError: If the state values are not normalized between -1 and 1.
         """
         state = batch["state"]
         state_cpu = state.to(device="cpu", dtype=torch.float32)
-        if torch.any(state_cpu < -1.0) or torch.any(state_cpu > 1.0):
-            logging.warning(
-                f"State values are not normalized between -1 and 1. Min: {state_cpu.min().item()}, Max: {state_cpu.max().item()}"
-            )
+        warn_once_if_state_out_of_range(state_cpu, self.name)
         state_clipped = torch.clamp(state_cpu, -1.0, 1.0)
         # replicate np.digitize with torch for torch.compile compatibility
         bin_indices = ((state_clipped + 1.0) * 128.0).long().clamp(0, 255)

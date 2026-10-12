@@ -75,6 +75,7 @@ from opentau.policies.utils import (
     flow_matching_masked_mse,
     freeze_policy_level_params_for_state_action_representation_only,
     freeze_policy_level_params_for_vision_only,
+    warn_once_if_state_out_of_range,
 )
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.hub import format_repo_revision, split_repo_revision
@@ -842,14 +843,14 @@ class PI06Policy(PreTrainedPolicy):
     def prepare_discrete_state(self, batch: dict[str, Tensor]) -> list[str]:
         """Discretize each state dim into 256 bins and format as a space-joined
         string, matching the π0.5 / π0.6 "State:" prompt template.
+
+        Values outside [-1, 1] are not rejected but clamped into it, landing in bin
+        0 or 255. An out-of-range state is logged once per process, not per call
+        (see :func:`~opentau.policies.utils.warn_once_if_state_out_of_range`).
         """
         state = batch["state"]
         state_cpu = state.to(device="cpu", dtype=torch.float32)
-        if torch.any(state_cpu < -1.0) or torch.any(state_cpu > 1.0):
-            logging.warning(
-                f"State values are not normalized between -1 and 1. "
-                f"Min: {state_cpu.min().item()}, Max: {state_cpu.max().item()}"
-            )
+        warn_once_if_state_out_of_range(state_cpu, self.name)
         state_clipped = torch.clamp(state_cpu, -1.0, 1.0)
         bin_indices = ((state_clipped + 1.0) * 128.0).long().clamp(0, 255)
         discretized_states = bin_indices.cpu().tolist()

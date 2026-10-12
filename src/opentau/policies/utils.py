@@ -23,6 +23,7 @@ information.
 """
 
 import logging
+import threading
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -505,6 +506,74 @@ def log_model_loading_keys(missing_keys: list[str], unexpected_keys: list[str]) 
     if unexpected_keys:
         # DO NOT UPDATE THIS MESSAGE WITHOUT UPDATING THE REGEX IN .gitlab/scripts/check_pi0_state_keys.py
         logging.warning(f"Unexpected key(s) when loading model: {unexpected_keys}")
+
+
+@dataclass
+class _OutOfRangeStateTally:
+    """One policy's out-of-range discrete-state calls so far, and the extremes they reached."""
+
+    calls: int
+    lo: float
+    hi: float
+
+
+# Policy name -> tally. Process-global on purpose: the warning is rate-limited per process, so a
+# policy rebuilt in the same process (an eval reloading checkpoints, a test) does not re-arm it.
+_OUT_OF_RANGE_STATE_TALLY: dict[str, _OutOfRangeStateTally] = {}
+_OUT_OF_RANGE_STATE_LOCK = threading.Lock()
+
+
+@torch.compiler.disable
+def warn_once_if_state_out_of_range(state: Tensor, policy_name: str) -> None:
+    """Warn, once per process, that a discrete-state policy is clamping its state into [-1, 1].
+
+    ``prepare_discrete_state`` bins each normalized state dim over [-1, 1] and clamps whatever falls
+    outside. Under QUANTILE / MIN_MAX normalization a real robot's state routinely overshoots a
+    little (q01/q99 and the dataset min/max are not hard bounds), so warning on every call wrote one
+    line per served request — and on a nearly full disk those synchronous writes stalled requests
+    for seconds. Only the first out-of-range call per process (per ``policy_name``) logs a WARNING.
+    Later ones are counted, and an INFO summary of the count and the extremes seen so far follows
+    the 10th, 100th, 1000th, ... of them, so a persistent or worsening overshoot stays visible at
+    logarithmic cost.
+
+    Log-only: ``state`` is never modified, so the caller's clamped bins are unaffected. Kept out of
+    ``torch.compile``: traced, its data-dependent branch and ``.item()`` calls would break a compiled
+    caller into several small graphs around bookkeeping that has nothing to compile; disabled, it
+    costs the caller one graph break.
+
+    Args:
+        state: The normalized state about to be clamped, on CPU.
+        policy_name: The calling policy's ``name``; keys the rate limit and labels the message.
+    """
+    if not (torch.any(state < -1.0) or torch.any(state > 1.0)):
+        return
+    lo, hi = state.min().item(), state.max().item()
+    with _OUT_OF_RANGE_STATE_LOCK:
+        tally = _OUT_OF_RANGE_STATE_TALLY.setdefault(policy_name, _OutOfRangeStateTally(0, lo, hi))
+        tally.calls += 1
+        tally.lo, tally.hi = min(tally.lo, lo), max(tally.hi, hi)
+        calls, seen_lo, seen_hi = tally.calls, tally.lo, tally.hi
+    # Log outside the lock, so a slow write never holds up another thread's request.
+    if calls == 1:
+        logging.warning(
+            "State values are not normalized between -1 and 1 (policy %s: min %.8g, max %.8g); "
+            "clamping them into [-1, 1] before discretizing. A slight overshoot is routine under "
+            "QUANTILE / MIN_MAX normalization; a large one points at mismatched normalization stats. "
+            "Logged once per process: later out-of-range calls are only counted, with an INFO "
+            "summary after the 10th, 100th, 1000th, ... of them.",
+            policy_name,
+            lo,
+            hi,
+        )
+    elif calls == 10 ** (len(str(calls)) - 1):  # 10, 100, 1000, ...
+        logging.info(
+            "Policy %s has clamped an out-of-range discrete state in %d calls so far "
+            "(min %.8g, max %.8g across them).",
+            policy_name,
+            calls,
+            seen_lo,
+            seen_hi,
+        )
 
 
 def freeze_policy_level_params_for_vision_only(

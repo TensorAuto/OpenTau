@@ -295,6 +295,18 @@ It now compares every sample's first action over the dataset's pre-pad width
 chunk-start state the policy added. That state cancels exactly, and R², now scored against the
 ground truth, measures the deltas rather than joint positions the policy was given.
 
+### Fixed — an out-of-range discrete state is logged once per process, not on every call — **logging only, state tokens unchanged**
+
+The discrete-state policies (pi05, pi05_ttt, pi06, both high-level planners and `value`) clamp
+the normalized state into [-1, 1] before binning it into prompt tokens, and warned on every call
+that had a value outside it. Under QUANTILE / MIN_MAX normalization a real robot's state routinely
+overshoots a little, so a serving process logged that line for nearly every request, and on a
+nearly full disk the synchronous writes stalled requests for seconds. The warning now fires once
+per process for each policy. Later out-of-range calls are only counted, with an INFO line after
+the 10th, 100th, 1000th, ... of them giving the count and the extremes seen so far. The clamped
+state tokens are bit-identical. The `prepare_discrete_state` docstrings also claimed a
+`ValueError` for an out-of-range state that the code never raised; they now describe the clamp.
+
 ## [0.14.0] - 2026-09-14
 
 ### Added — best-of-N action-chunk sampling — **opt-in, default `1`, no `config_version` bump**

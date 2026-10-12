@@ -33,7 +33,12 @@ from transformers import AutoTokenizer
 
 from opentau.policies.normalize import Normalize
 from opentau.policies.pretrained import PreTrainedPolicy
-from opentau.policies.utils import PerSampleLoss, ce_per_sample, log_model_loading_keys
+from opentau.policies.utils import (
+    PerSampleLoss,
+    ce_per_sample,
+    log_model_loading_keys,
+    warn_once_if_state_out_of_range,
+)
 from opentau.policies.value.configuration_value import ValueConfig
 from opentau.policies.value.siglip_gemma import (
     SiglipGemmaValueConfig,
@@ -564,26 +569,23 @@ class ValueFunction(PreTrainedPolicy):
         """Discretizes the state into bins and converts it to a string representation.
 
         Each dimension of the state vector is discretized into 256 bins.
-        The values of each dimension of the state are expected to be in the range [-1, 1].
+        The values of each dimension of the state are expected to be in the range [-1, 1];
+        values outside it are not rejected but clamped into it, landing in bin 0 or 255.
         The discretization bins are linearly spaced between -1 and 1.
         The index of the bin for each dimension is then concatenated into a space-separated string.
+        An out-of-range state is logged once per process, not per call
+        (see :func:`~opentau.policies.utils.warn_once_if_state_out_of_range`).
 
         Args:
             batch: Batch of data containing the "state" tensor.
 
         Returns:
             A list of strings, where each string is a space-separated list of discretized state values.
-
-        Raises:
-            ValueError: If the state values are not normalized between -1 and 1.
         """
         state = batch["state"]
-        state_np = state.to(device="cpu", dtype=torch.float32).numpy()
-        if np.any(state_np < -1.0) or np.any(state_np > 1.0):
-            logging.warning(
-                f"State values are not normalized between -1 and 1. Min: {state_np.min()}, Max: {state_np.max()}"
-            )
-        state_np = np.clip(state_np, -1.0, 1.0)
+        state_cpu = state.to(device="cpu", dtype=torch.float32)
+        warn_once_if_state_out_of_range(state_cpu, self.name)
+        state_np = np.clip(state_cpu.numpy(), -1.0, 1.0)
         discretized_states = np.digitize(state_np, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
         return [
             " ".join(map(str, row)) for row in discretized_states
