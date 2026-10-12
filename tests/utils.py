@@ -151,6 +151,43 @@ def to_cuda_bf16(batch: dict, device: str = "cuda") -> dict:
     }
 
 
+def assert_action_normalization_round_trips(
+    policy: torch.nn.Module, actions: torch.Tensor, dataset_index: torch.Tensor
+) -> None:
+    """Assert that a policy's ``unnormalize_outputs`` inverts its ``normalize_targets`` on ``actions``.
+
+    ``Normalize`` computes in its stats' dtype and casts a floating input to it first, so a
+    served input gets training's arithmetic. On a policy cast to bfloat16, float32 ``actions``
+    therefore come back as bfloat16, exact only to bfloat16's resolution. A plain
+    ``torch.allclose(actions, round_trip, atol=1e-6)`` both raises on the dtype mismatch and
+    could never hold. This checks the two properties that do hold:
+
+    * The normalized actions are in the stats' dtype, whatever dtype ``actions`` arrived in.
+    * The round trip recovers ``actions`` to within the rounding it must incur. MEAN_STD
+      rounds at most five times (the input cast, ``- mean``, ``/ scale``, ``* scale`` and
+      ``+ mean``). Each rounding moves the result by at most ``eps / 2`` times
+      ``|x| + |mean|``.
+
+    A real inversion bug, such as a dropped or wrong mean or a wrong scale, misses by far more
+    than that. On a float32 policy the bound tightens to float32's ``eps``.
+
+    Args:
+        policy: Policy whose ``normalize_targets`` / ``unnormalize_outputs`` normalize
+            ``"actions"`` with ``NormalizationMode.MEAN_STD``.
+        actions: Unnormalized actions, in any floating dtype.
+        dataset_index: ``(B,)`` long index of each sample's row in the normalization stats.
+    """
+    stats = policy.normalize_targets.buffer_actions
+    normalized = policy.normalize_targets({"actions": actions}, dataset_index)["actions"]
+    assert normalized.dtype == stats["mean"].dtype, "Normalize must compute in its stats' dtype"
+    restored = policy.unnormalize_outputs({"actions": normalized}, dataset_index)["actions"]
+    half_ulp = torch.finfo(normalized.dtype).eps / 2
+    mean_scale = stats["mean"][dataset_index].abs().max().item()
+    torch.testing.assert_close(
+        restored.float(), actions.float(), rtol=5 * half_ulp, atol=5 * half_ulp * mean_scale
+    )
+
+
 def require_env(func):
     """
     Decorator that skips the test if the required environment package is not installed.

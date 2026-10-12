@@ -20,6 +20,7 @@ from opentau.policies.pi05.configuration_pi05 import PI05Config
 from opentau.policies.pi05.modeling_pi05 import (
     PI05Policy,
 )
+from tests.utils import assert_action_normalization_round_trips
 
 PALIGEMMA_TOKENIZER_EOS_IDS = 1
 PALIGEMMA_TOKENIZER_PAD_IDS = 0
@@ -366,15 +367,8 @@ class TestPI05Integration:
         # Normalize/Unnormalize now require an explicit `dataset_index`; we're
         # calling the submodules directly here (bypassing the policy's
         # `_resolve_dataset_index` helper), so pass a zero-row index manually.
-        normalize_actions = policy.normalize_targets
-        unnormalize_actions = policy.unnormalize_outputs
-        action_output = {"actions": batch["actions"].to("cuda")}
         dataset_index = torch.zeros(batch_size, dtype=torch.long, device="cuda")
-        assert torch.allclose(
-            action_output["actions"],
-            unnormalize_actions(normalize_actions(action_output, dataset_index), dataset_index)["actions"],
-            atol=1e-6,
-        )
+        assert_action_normalization_round_trips(policy, batch["actions"].to("cuda"), dataset_index)
 
         # Inspect all captured variables
         expected_vars = [

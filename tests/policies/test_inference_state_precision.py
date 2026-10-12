@@ -46,7 +46,7 @@ from opentau.configs.deployment import PlannerConfig
 from opentau.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from opentau.datasets.action_indexing import subtract_chunk_start_state
 from opentau.policies.layers import PerGroupLinear
-from opentau.policies.normalize import Normalize
+from opentau.policies.normalize import Normalize, Unnormalize
 from opentau.policies.pi05 import modeling_pi05
 from opentau.policies.pi05.configuration_pi05 import PI05Config
 from opentau.policies.pi05.modeling_pi05 import PI05Policy
@@ -55,6 +55,7 @@ from opentau.scripts.grpc import robot_inference_pb2
 from opentau.scripts.grpc.server import RobotPolicyServicer
 from opentau.scripts.robocasa import server as robocasa_server
 from opentau.utils.utils import INFERENCE_STATE_DTYPE, create_dummy_observation
+from tests.utils import assert_action_normalization_round_trips
 
 STATE_DIM = 8  # 7 arm joints + gripper; already max_state_dim, so the servers' pad is a no-op
 ACTION_DIM = 8
@@ -371,6 +372,41 @@ def test_normalize_computes_in_its_stats_dtype(mode, stats):
     upcast = norm32({"state": x.to(torch.bfloat16)}, index)["state"]
     assert upcast.dtype == torch.float32
     assert torch.equal(upcast, norm32({"state": x.to(torch.bfloat16).float()}, index)["state"])
+
+
+@pytest.mark.parametrize(
+    "dtype, mean_error",
+    [(torch.bfloat16, 1 / 16), (torch.float32, 1e-3)],
+    ids=["bfloat16", "float32"],
+)
+def test_action_normalization_round_trip_check(lerobot_dataset_metadata, dtype, mean_error):
+    """The round-trip check the pi05 / pi07 GPU integration tests make, run on CPU in the gate.
+
+    Those tests apply ``assert_action_normalization_round_trips`` to a bfloat16 policy built on
+    these fixture stats, nightly, on one fresh unseeded draw. Its bound must therefore hold on
+    every draw. It must still reject an inverse whose mean is slightly off, and on float32,
+    whose bound is tighter, by less.
+    """
+    stats = lerobot_dataset_metadata.stats
+    features = {"actions": PolicyFeature(type=FeatureType.ACTION, shape=stats["actions"]["mean"].shape)}
+    norm_map = {"ACTION": NormalizationMode.MEAN_STD}
+
+    def policy(unnormalize_stats: dict) -> nn.Module:
+        stub = nn.Module()  # the helper reads only these two submodules
+        stub.normalize_targets = Normalize(features, norm_map, per_dataset_stats=[stats])
+        stub.unnormalize_outputs = Unnormalize(features, norm_map, per_dataset_stats=[unnormalize_stats])
+        return stub.to(dtype)
+
+    exact, index = policy(stats), torch.zeros(8, dtype=torch.long)
+    generator = torch.Generator().manual_seed(0)
+    for scale in (1.0, 4.0):  # the GPU tests pass float32 `torch.randn`; 4.0 stretches the tails
+        for _ in range(20):
+            actions = torch.randn(8, *features["actions"].shape, generator=generator) * scale
+            assert_action_normalization_round_trips(exact, actions, index)
+
+    wrong_mean = {**stats, "actions": {**stats["actions"], "mean": stats["actions"]["mean"] + mean_error}}
+    with pytest.raises(AssertionError):
+        assert_action_normalization_round_trips(policy(wrong_mean), actions, index)
 
 
 # --------------------------------------------------------------------------------------

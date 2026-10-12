@@ -27,7 +27,7 @@ from opentau.policies.pi07_paligemma.low_level.modeling_pi07_low_level import (
     PI07PaligemmaLowLevelPolicy,
     make_att_2d_masks,
 )
-from tests.utils import require_vram_gib, to_cuda_bf16
+from tests.utils import assert_action_normalization_round_trips, require_vram_gib, to_cuda_bf16
 
 # VRAM floor for the end-to-end test below, which builds the PaliGemma VLM on
 # CUDA and runs a full forward at 224x224 with T=8. Measured peak in a fresh
@@ -466,15 +466,8 @@ class TestPI07PaligemmaLowLevelIntegration:
         # directly bypasses the policy's `_resolve_dataset_index` helper, so
         # pass an explicit (B,) long index of zeros (this fixture is
         # single-dataset).
-        action_output = {"actions": batch["actions"].to("cuda")}
         dataset_index = torch.zeros(batch_size, dtype=torch.long, device="cuda")
-        assert torch.allclose(
-            action_output["actions"],
-            policy.unnormalize_outputs(policy.normalize_targets(action_output, dataset_index), dataset_index)[
-                "actions"
-            ],
-            atol=1e-6,
-        )
+        assert_action_normalization_round_trips(policy, batch["actions"].to("cuda"), dataset_index)
 
         # Verify all expected captures are present.
         for var in [
