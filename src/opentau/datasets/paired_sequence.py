@@ -113,8 +113,9 @@ class PairedSequenceDataset(Dataset):
             with neither a demonstration nor a task identity.
 
     Raises:
-        ValueError: If a key has fewer than two episodes, ``prompts`` is missing a
-            key, ``n_demos`` is below 1, ``zero_shot_prob`` falls outside
+        ValueError: If a key has fewer than ``n_demos + 1`` episodes (one per
+            demonstration plus the rollout), ``prompts`` is missing a key,
+            ``n_demos`` is below 1, ``zero_shot_prob`` falls outside
             ``[0, 1]``, or ``zero_shot_prob`` is positive while the base dataset
             emits no ``timestep_is_pad`` (which only sequence mode produces, and
             without which the TTT inner loop would train on the blank frames).

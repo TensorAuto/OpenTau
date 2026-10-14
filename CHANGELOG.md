@@ -331,8 +331,8 @@ constant offset below 2^32 — the multipliers alone collapse at `seed == 0`, wh
 since the factory passes `cfg.seed or 0`, and would have correlated the mode with the episode
 choice. Both properties of the offset are load-bearing: torch's CPU generator consumes only the
 low 32 bits of a seed, so a larger offset is silently discarded, and the multipliers' difference
-is divisible by 8, so an odd offset makes a collision unsatisfiable for every seed rather than
-just the default one.
+is even, so an odd offset makes a collision unsatisfiable for every seed rather than just the
+default one.
 
 A blanked sample keeps the rollout's own instruction rather than the key's `ambiguous_prompt`:
 that override exists because the demonstration carries the answer, so applying it to a sample
