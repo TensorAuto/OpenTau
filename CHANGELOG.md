@@ -307,6 +307,32 @@ the 10th, 100th, 1000th, ... of them giving the count and the extremes seen so f
 state tokens are bit-identical. The `prepare_discrete_state` docstrings also claimed a
 `ValueError` for an out-of-range state that the code never raised; they now describe the clamp.
 
+### Added — 0-shot and 1-shot in one run (`dataset_mixture.zero_shot_prob`) — **opt-in, default `0.0`, no `config_version` bump**
+
+A paired sample is `demonstration + rollout`, so a pairing run was wholly 1-shot or wholly
+0-shot. `zero_shot_prob` is the fraction of samples whose demonstration half is **blanked**,
+letting one run train both demo-present and demo-absent behaviour. It extends the one-shot
+in-context imitation entry above.
+
+Blanking zeroes the demonstration half's camera frames *and* sets `timestep_is_pad` across that
+half. The pad flag is load-bearing, not belt-and-braces: `TTTMLPLayer.forward` zeroes the
+inner-loop `eta` only where that flag is set, so without it the inner loop would keep updating
+its fast weights **on the blank frames** — worse than either mode, and silent. The loader raises
+rather than degrading quietly when the flag is absent, and probes for it at construction so a
+misconfigured run fails at startup instead of a few steps in inside a dataloader worker.
+
+`loss_mask` is already `False` across every demonstration, so it is unchanged, and sample shapes
+are unchanged, so batching is unaffected.
+
+The mode is a pure function of `(seed, index)` drawn off an RNG stream separate from the pair
+draw, so `index -> mode` is stable across ranks and epochs and enabling the feature does not
+shift which episodes a given index pairs. The two seeds differ by a multiplier *and* a constant
+offset — the multipliers alone collapse at `seed == 0`, which is the default since the factory
+passes `cfg.seed or 0`, and would have correlated the mode with the episode choice.
+
+At the default `0.0` the feature is inert and pair draws are byte-identical to before, so
+existing n-shot runs are unaffected.
+
 ## [0.14.0] - 2026-09-14
 
 ### Added — best-of-N action-chunk sampling — **opt-in, default `1`, no `config_version` bump**

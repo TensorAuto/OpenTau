@@ -57,6 +57,11 @@ from torch.utils.data import Dataset
 
 from opentau.datasets.lerobot_dataset import LeRobotDataset
 
+#: Added to the zero-shot mode seed so it cannot coincide with the pair-draw
+#: seed. The two differ only by their multiplier, which collapses at ``seed == 0``
+#: -- the default, since the factory passes ``cfg.seed or 0``.
+_MODE_SEED_OFFSET = 1 << 40
+
 
 class PairedSequenceDataset(Dataset):
     """Draws two episodes of one pairing key and returns them as one sequence.
@@ -172,6 +177,21 @@ class PairedSequenceDataset(Dataset):
         # window at its last timestep, so anchoring here makes each half cover
         # its episode end-to-end rather than an arbitrary interior slice.
         self._last_row = self._build_last_row_index()
+
+        # Blanking needs `timestep_is_pad`, which only sequence mode emits. Probe
+        # one sample now: otherwise the first BLANKED sample raises, which at
+        # 0 < p < 1 means a few steps into the run, inside a dataloader worker,
+        # where the traceback is far from the misconfiguration that caused it.
+        if self.zero_shot_prob > 0.0:
+            first = self.base[self._last_row[self.pairing_keys[self.keys[0]][0]]]
+            if not isinstance(first.get("timestep_is_pad"), torch.Tensor):
+                raise ValueError(
+                    "zero_shot_prob > 0 needs `timestep_is_pad` on each demonstration so the "
+                    "TTT inner update is skipped across the blanked half (#558), but the base "
+                    "dataset emitted none. It is only produced in sequence mode -- set the "
+                    "policy's `sequence_length` (and keep `pair_episodes` on), or leave "
+                    "zero_shot_prob at 0."
+                )
 
         # A scene filter that can never be satisfied is worse than none: every
         # draw falls through to the fallback. Say so, loudly, at construction.
@@ -338,6 +358,15 @@ class PairedSequenceDataset(Dataset):
         ``(seed, index)``, so a given index is the same mode on every rank and
         every epoch, which keeps distributed runs and resumes reproducible.
 
+        The ``_MODE_SEED_OFFSET`` is load-bearing, not decoration. Without it the
+        two seeds are ``seed * 7_919_003 + index`` and ``seed * 1_000_003 +
+        index``, which COINCIDE at ``seed == 0`` -- and the factory passes
+        ``cfg.seed or 0``, so that is the default config. The pair draw would
+        still be bit-identical (the generators are separate objects), but the
+        mode would be derived from the same engine state as the episode choice,
+        correlating which episodes get paired with whether the sample is
+        blanked. The offset cannot collide for any ``seed >= 0``.
+
         Args:
             index: Sample index.
 
@@ -348,7 +377,7 @@ class PairedSequenceDataset(Dataset):
             return False
         if self.zero_shot_prob >= 1.0:
             return True
-        g = torch.Generator().manual_seed(self.seed * 7_919_003 + index)
+        g = torch.Generator().manual_seed(self.seed * 7_919_003 + index + _MODE_SEED_OFFSET)
         return bool(torch.rand((1,), generator=g).item() < self.zero_shot_prob)
 
     def _blank_demos(self, demos: list[dict[str, Any]]) -> None:

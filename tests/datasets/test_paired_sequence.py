@@ -653,8 +653,59 @@ class TestZeroShotProb:
         """Without the pad flag the TTT inner loop would train on the blank frames.
 
         That is worse than either mode, so the loader refuses rather than degrading
-        quietly.
+        quietly -- and refuses at CONSTRUCTION, not on the first blanked sample,
+        which at 0 < p < 1 would surface inside a dataloader worker mid-run.
         """
-        d = _make(timestep_pad=False, zero_shot_prob=1.0)
         with pytest.raises(ValueError, match="timestep_is_pad"):
-            d[0]
+            _make(timestep_pad=False, zero_shot_prob=1.0)
+
+    def test_mode_seed_cannot_collide_with_the_pair_seed_at_seed_zero(self):
+        """The two streams must stay distinct at the DEFAULT seed.
+
+        The factory passes ``cfg.seed or 0``; without an offset both generators
+        are seeded with plain ``index`` at ``seed == 0``, which would correlate the
+        mode with the episode choice.
+        """
+        from opentau.datasets.paired_sequence import _MODE_SEED_OFFSET
+
+        for seed in (0, 1, 42):
+            assert seed * 7_919_003 + _MODE_SEED_OFFSET != seed * 1_000_003
+
+        d = _make(timestep_pad=True, zero_shot_prob=0.5, seed=0)
+        hits = sum(d._is_zero_shot(i) for i in range(4000))
+        assert 0.45 < hits / 4000 < 0.55
+
+
+class TestZeroShotProbIsActuallyWired:
+    """``zero_shot_prob`` must reach the dataset, not just exist on the config.
+
+    Every ``TestZeroShotProb`` case builds ``PairedSequenceDataset`` directly, so
+    dropping the kwarg in the factory would leave a configured value silently
+    inert -- the fail-open class ``TestPairingIsActuallyWired`` exists to catch.
+    """
+
+    def test_factory_passes_zero_shot_prob_through(self, monkeypatch):
+        from opentau.configs.default import DatasetConfig, DatasetMixtureConfig
+        from opentau.datasets import factory as ds_factory
+
+        seen = {}
+
+        class _Spy(PairedSequenceDataset):
+            def __init__(self, *a, **kw):
+                seen.update(kw)
+                super().__init__(*a, **kw)
+
+        monkeypatch.setattr("opentau.datasets.paired_sequence.PairedSequenceDataset", _Spy)
+
+        base = _StubBase(EPISODES, timestep_pad=True)
+        dataset_cfg = DatasetConfig(
+            repo_id="mock", root="/tmp/mock", episodes=list(EPISODES), ambiguous_prompt="Open the drawer."
+        )
+        cfg = SimpleNamespace(
+            dataset_mixture=DatasetMixtureConfig(
+                datasets=[dataset_cfg], weights=[1.0], pair_episodes=True, n_demos=1, zero_shot_prob=0.25
+            ),
+            seed=7,
+        )
+        ds_factory._maybe_pair(base, dataset_cfg, cfg)
+        assert seen.get("zero_shot_prob") == 0.25, "the factory dropped zero_shot_prob"
