@@ -705,10 +705,19 @@ class TestZeroShotProb:
         A collision needs ``seed * 6_919_000 + offset = 0 (mod 2**32)``; the first
         term is always a multiple of 8, so an odd offset admits no solution.
         """
-        from opentau.datasets.paired_sequence import _MODE_SEED_OFFSET
+        from opentau.datasets.paired_sequence import (
+            _MODE_SEED_MULTIPLIER,
+            _MODE_SEED_OFFSET,
+            _PAIR_SEED_MULTIPLIER,
+        )
 
-        assert _MODE_SEED_OFFSET % 2 == 1
-        assert not [s for s in range(20000) if (s * 6_919_000 + _MODE_SEED_OFFSET) % 2**32 == 0]
+        # Derived from the source constants, not a copy of their difference, so
+        # changing either multiplier to one whose difference is odd fails here
+        # rather than passing against a stale number.
+        difference = _MODE_SEED_MULTIPLIER - _PAIR_SEED_MULTIPLIER
+        assert _MODE_SEED_OFFSET % 2 == 1, "an even offset admits a colliding seed"
+        assert difference % 2 == 0, "an odd multiplier difference voids the oddness argument"
+        assert not [s for s in range(20000) if (s * difference + _MODE_SEED_OFFSET) % 2**32 == 0]
 
 
 class TestZeroShotProbIsActuallyWired:

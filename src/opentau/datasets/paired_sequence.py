@@ -57,6 +57,11 @@ from torch.utils.data import Dataset
 
 from opentau.datasets.lerobot_dataset import LeRobotDataset
 
+#: Seed multiplier for the pair draw (which episodes a sample pairs).
+_PAIR_SEED_MULTIPLIER = 1_000_003
+#: Seed multiplier for the zero-shot mode draw (whether a sample is blanked).
+_MODE_SEED_MULTIPLIER = 7_919_003
+
 #: Added to the zero-shot mode seed so it can never coincide with the pair-draw
 #: seed. The two otherwise differ only by their multiplier, which collapses at
 #: ``seed == 0`` -- the default, since the factory passes ``cfg.seed or 0``.
@@ -67,11 +72,13 @@ from opentau.datasets.lerobot_dataset import LeRobotDataset
 #:   32 bits of a seed, so a larger offset is silently discarded and the fix
 #:   becomes a no-op (``manual_seed(i)`` and ``manual_seed(i + 2**40)`` yield the
 #:   identical stream).
-#: * It must be **odd**. A collision needs
-#:   ``seed * 6_919_000 + offset = 0 (mod 2**32)`` (the multipliers' difference),
-#:   and ``6_919_000 = 8 * 864_875`` makes the first term a multiple of 8 for every
-#:   seed -- so an odd offset is unsatisfiable, for ALL seeds rather than just the
-#:   default one.
+#: * It must be **odd**, and the multipliers' difference must stay even. A
+#:   collision needs ``seed * difference + offset = 0 (mod 2**32)``; the current
+#:   difference ``7_919_003 - 1_000_003 = 6_919_000 = 8 * 864_875`` makes the first
+#:   term a multiple of 8 for every seed, so an odd offset is unsatisfiable for ALL
+#:   seeds rather than just the default one. Changing either multiplier to one
+#:   whose difference is odd would void the argument -- the tests derive the
+#:   difference from the constants above so that cannot pass unnoticed.
 _MODE_SEED_OFFSET = 0x9E3779B9
 
 
@@ -304,7 +311,7 @@ class PairedSequenceDataset(Dataset):
         Returns:
             ``(key, [demo episodes], rollout episode)``.
         """
-        g = torch.Generator().manual_seed(self.seed * 1_000_003 + index)
+        g = torch.Generator().manual_seed(self.seed * _PAIR_SEED_MULTIPLIER + index)
         key = self.keys[int(torch.randint(len(self.keys), (1,), generator=g))]
         eps = self.pairing_keys[key]
 
@@ -389,7 +396,7 @@ class PairedSequenceDataset(Dataset):
             return False
         if self.zero_shot_prob >= 1.0:
             return True
-        g = torch.Generator().manual_seed(self.seed * 7_919_003 + index + _MODE_SEED_OFFSET)
+        g = torch.Generator().manual_seed(self.seed * _MODE_SEED_MULTIPLIER + index + _MODE_SEED_OFFSET)
         return bool(torch.rand((1,), generator=g).item() < self.zero_shot_prob)
 
     def _blank_demos(self, demos: list[dict[str, Any]]) -> None:
