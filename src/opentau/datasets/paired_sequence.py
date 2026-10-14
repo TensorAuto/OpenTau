@@ -74,10 +74,10 @@ _MODE_SEED_MULTIPLIER = 7_919_003
 #:   identical stream).
 #: * It must be **odd**, and the multipliers' difference must stay even. A
 #:   collision needs ``seed * difference + offset = 0 (mod 2**32)``; the current
-#:   difference ``7_919_003 - 1_000_003 = 6_919_000 = 8 * 864_875`` makes the first
-#:   term a multiple of 8 for every seed, so an odd offset is unsatisfiable for ALL
-#:   seeds rather than just the default one. Changing either multiplier to one
-#:   whose difference is odd would void the argument -- the tests derive the
+#:   difference (``_MODE_SEED_MULTIPLIER - _PAIR_SEED_MULTIPLIER``) is even, which
+#:   makes the first term even for every seed, so an odd offset is unsatisfiable
+#:   for ALL seeds rather than just the default one. Changing either multiplier to
+#:   one whose difference is odd would void the argument -- the tests derive the
 #:   difference from the constants above so that cannot pass unnoticed.
 _MODE_SEED_OFFSET = 0x9E3779B9
 
@@ -378,8 +378,9 @@ class PairedSequenceDataset(Dataset):
         every epoch, which keeps distributed runs and resumes reproducible.
 
         The ``_MODE_SEED_OFFSET`` is load-bearing, not decoration. Without it the
-        two seeds are ``seed * 7_919_003 + index`` and ``seed * 1_000_003 +
-        index``, which COINCIDE at ``seed == 0`` -- and the factory passes
+        two seeds are ``seed * _MODE_SEED_MULTIPLIER + index`` and
+        ``seed * _PAIR_SEED_MULTIPLIER + index``, which COINCIDE at ``seed == 0``
+        regardless of the multipliers' values -- and the factory passes
         ``cfg.seed or 0``, so that is the default config. The pair draw would
         still be bit-identical (the generators are separate objects), but the
         mode would be derived from the same engine state as the episode choice,
