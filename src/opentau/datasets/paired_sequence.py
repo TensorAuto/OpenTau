@@ -57,10 +57,22 @@ from torch.utils.data import Dataset
 
 from opentau.datasets.lerobot_dataset import LeRobotDataset
 
-#: Added to the zero-shot mode seed so it cannot coincide with the pair-draw
-#: seed. The two differ only by their multiplier, which collapses at ``seed == 0``
-#: -- the default, since the factory passes ``cfg.seed or 0``.
-_MODE_SEED_OFFSET = 1 << 40
+#: Added to the zero-shot mode seed so it can never coincide with the pair-draw
+#: seed. The two otherwise differ only by their multiplier, which collapses at
+#: ``seed == 0`` -- the default, since the factory passes ``cfg.seed or 0``.
+#:
+#: Two constraints pin the value:
+#:
+#: * It must be **below 2**:sup:`32`. Torch's CPU generator consumes only the low
+#:   32 bits of a seed, so a larger offset is silently discarded and the fix
+#:   becomes a no-op (``manual_seed(i)`` and ``manual_seed(i + 2**40)`` yield the
+#:   identical stream).
+#: * It must be **odd**. A collision needs
+#:   ``seed * 6_919_000 + offset = 0 (mod 2**32)`` (the multipliers' difference),
+#:   and ``6_919_000 = 8 * 864_875`` makes the first term a multiple of 8 for every
+#:   seed -- so an odd offset is unsatisfiable, for ALL seeds rather than just the
+#:   default one.
+_MODE_SEED_OFFSET = 0x9E3779B9
 
 
 class PairedSequenceDataset(Dataset):
@@ -434,7 +446,8 @@ class PairedSequenceDataset(Dataset):
         demos = [self.base[self._last_row[e]] for e in ep_demos]
         b = self.base[self._last_row[ep_b]]
 
-        if self._is_zero_shot(index):
+        blanked = self._is_zero_shot(index)
+        if blanked:
             self._blank_demos(demos)
 
         t_b = self._timesteps(b)
@@ -492,7 +505,14 @@ class PairedSequenceDataset(Dataset):
         # the demonstration supplies the unfamiliar object's handling. Keeping
         # B's own prompt is then correct; blanking it would erase the task
         # identity the model needs.
-        if self.prompts[key] is not None:
+        #
+        # A BLANKED sample is the one case where the override must not apply. The
+        # ambiguous prompt exists because the demonstration carries the answer --
+        # with the demonstration erased, overwriting the prompt too would leave the
+        # sample with neither, and the target becomes unlearnable (the model can
+        # only guess which variant it is). A 0-shot sample keeps the rollout's own
+        # instruction, which is its only remaining information channel.
+        if self.prompts[key] is not None and not blanked:
             out["prompt"] = self.prompts[key]
         out["pairing_key"] = key
         return out

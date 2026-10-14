@@ -660,20 +660,55 @@ class TestZeroShotProb:
             _make(timestep_pad=False, zero_shot_prob=1.0)
 
     def test_mode_seed_cannot_collide_with_the_pair_seed_at_seed_zero(self):
-        """The two streams must stay distinct at the DEFAULT seed.
+        """The mode stream must not be the ``seed * k + index`` stream at seed 0.
 
-        The factory passes ``cfg.seed or 0``; without an offset both generators
-        are seeded with plain ``index`` at ``seed == 0``, which would correlate the
-        mode with the episode choice.
+        The factory passes ``cfg.seed or 0``, so ``seed == 0`` is the default, and
+        there every ``seed * multiplier + index`` collapses to plain ``index`` --
+        the mode would then come off the same engine state as the episode choice,
+        correlating which episodes a sample pairs with whether it is blanked.
+
+        Pinned against the actual draw rather than the formula: re-deriving the
+        arithmetic from copied multipliers would compare constants to themselves
+        and still pass if the offset were dropped (CLAUDE.md rule 8). The marginal
+        rate would not catch it either -- a collision changes correlation, not the
+        fraction blanked.
+        """
+        d = _make(timestep_pad=True, zero_shot_prob=0.5, seed=0)
+
+        # What `_is_zero_shot` WOULD produce if its seed collapsed to bare `index`,
+        # i.e. the pre-offset implementation this guards against.
+        collided = [
+            bool(torch.rand((1,), generator=torch.Generator().manual_seed(i)).item() < 0.5)
+            for i in range(256)
+        ]
+        actual = [d._is_zero_shot(i) for i in range(256)]
+        assert actual != collided, "mode stream collapsed onto the pair-draw seed at seed 0"
+
+    def test_mode_seed_offset_survives_torchs_32_bit_seed_truncation(self):
+        """The offset must be < 2**32, or torch discards it and the fix is a no-op.
+
+        Torch's CPU generator consumes only the low 32 bits of a seed, so e.g.
+        ``manual_seed(i)`` and ``manual_seed(i + 2**40)`` yield the identical
+        stream. Pinned on the generator itself rather than on the constant, so a
+        revert to a too-large offset fails here.
         """
         from opentau.datasets.paired_sequence import _MODE_SEED_OFFSET
 
-        for seed in (0, 1, 42):
-            assert seed * 7_919_003 + _MODE_SEED_OFFSET != seed * 1_000_003
+        def first(seed):
+            return torch.rand((1,), generator=torch.Generator().manual_seed(seed)).item()
 
-        d = _make(timestep_pad=True, zero_shot_prob=0.5, seed=0)
-        hits = sum(d._is_zero_shot(i) for i in range(4000))
-        assert 0.45 < hits / 4000 < 0.55
+        assert first(7) != first(7 + _MODE_SEED_OFFSET), "offset discarded by seed truncation"
+
+    def test_mode_seed_cannot_collide_for_any_seed(self):
+        """Odd offset vs a multiplier difference divisible by 8 -- unsatisfiable.
+
+        A collision needs ``seed * 6_919_000 + offset = 0 (mod 2**32)``; the first
+        term is always a multiple of 8, so an odd offset admits no solution.
+        """
+        from opentau.datasets.paired_sequence import _MODE_SEED_OFFSET
+
+        assert _MODE_SEED_OFFSET % 2 == 1
+        assert not [s for s in range(20000) if (s * 6_919_000 + _MODE_SEED_OFFSET) % 2**32 == 0]
 
 
 class TestZeroShotProbIsActuallyWired:
@@ -709,3 +744,20 @@ class TestZeroShotProbIsActuallyWired:
         )
         ds_factory._maybe_pair(base, dataset_cfg, cfg)
         assert seen.get("zero_shot_prob") == 0.25, "the factory dropped zero_shot_prob"
+
+
+class TestZeroShotPromptStaysInformative:
+    """A blanked sample keeps a task-identifying prompt.
+
+    ``ambiguous_prompt`` exists because the demonstration carries the answer. With
+    the demonstration erased, overwriting the prompt too would leave the sample
+    with neither and the target unlearnable.
+    """
+
+    def test_blanked_sample_keeps_the_rollouts_own_prompt(self):
+        d = _make(timestep_pad=True, zero_shot_prob=1.0)
+        assert d[0]["prompt"] != "Open the drawer."
+
+    def test_kept_sample_still_gets_the_ambiguous_prompt(self):
+        d = _make(timestep_pad=True, zero_shot_prob=0.0)
+        assert d[0]["prompt"] == "Open the drawer."

@@ -326,9 +326,17 @@ are unchanged, so batching is unaffected.
 
 The mode is a pure function of `(seed, index)` drawn off an RNG stream separate from the pair
 draw, so `index -> mode` is stable across ranks and epochs and enabling the feature does not
-shift which episodes a given index pairs. The two seeds differ by a multiplier *and* a constant
-offset — the multipliers alone collapse at `seed == 0`, which is the default since the factory
-passes `cfg.seed or 0`, and would have correlated the mode with the episode choice.
+shift which episodes a given index pairs. The two seeds differ by a multiplier *and* an odd
+constant offset below 2^32 — the multipliers alone collapse at `seed == 0`, which is the default
+since the factory passes `cfg.seed or 0`, and would have correlated the mode with the episode
+choice. Both properties of the offset are load-bearing: torch's CPU generator consumes only the
+low 32 bits of a seed, so a larger offset is silently discarded, and the multipliers' difference
+is divisible by 8, so an odd offset makes a collision unsatisfiable for every seed rather than
+just the default one.
+
+A blanked sample keeps the rollout's own instruction rather than the key's `ambiguous_prompt`:
+that override exists because the demonstration carries the answer, so applying it to a sample
+whose demonstration was erased would leave neither, making the target unlearnable.
 
 At the default `0.0` the feature is inert and pair draws are byte-identical to before, so
 existing n-shot runs are unaffected.
