@@ -700,10 +700,13 @@ class TestZeroShotProb:
         assert first(7) != first(7 + _MODE_SEED_OFFSET), "offset discarded by seed truncation"
 
     def test_mode_seed_cannot_collide_for_any_seed(self):
-        """Odd offset vs a multiplier difference divisible by 8 -- unsatisfiable.
+        """Odd offset vs an even multiplier difference -- unsatisfiable.
 
-        A collision needs ``seed * 6_919_000 + offset = 0 (mod 2**32)``; the first
-        term is always a multiple of 8, so an odd offset admits no solution.
+        A collision needs ``seed * difference + offset = 0 (mod 2**32)``. With the
+        difference even, that first term is even for every seed, so an odd offset
+        admits no solution. The difference is derived from the source constants
+        rather than copied, so changing a multiplier to one whose difference is odd
+        fails here instead of passing against stale prose.
         """
         from opentau.datasets.paired_sequence import (
             _MODE_SEED_MULTIPLIER,

@@ -103,10 +103,21 @@ class PairedSequenceDataset(Dataset):
             which keeps distributed runs and resumes reproducible.
         forbid_same_scene: Reject a draw whose two episodes share a scene id, so
             the pair cannot be solved by copying A's motion frame-for-frame.
+        n_demos: Demonstrations placed in context before the supervised rollout.
+            The policy sees ``(n_demos + 1) * sequence_length`` timesteps.
+        zero_shot_prob: Fraction of samples whose demonstration half is blanked --
+            frames zeroed and ``timestep_is_pad`` set across it -- so one run
+            trains both demo-present and demo-absent behaviour. ``0.0`` (the
+            default) is inert. A blanked sample keeps the rollout's own prompt
+            rather than the key's ambiguous one, which would otherwise leave it
+            with neither a demonstration nor a task identity.
 
     Raises:
-        ValueError: If a key has fewer than two episodes, or ``prompts`` is
-            missing a key.
+        ValueError: If a key has fewer than two episodes, ``prompts`` is missing a
+            key, ``n_demos`` is below 1, ``zero_shot_prob`` falls outside
+            ``[0, 1]``, or ``zero_shot_prob`` is positive while the base dataset
+            emits no ``timestep_is_pad`` (which only sequence mode produces, and
+            without which the TTT inner loop would train on the blank frames).
     """
 
     #: Keys carrying no timestep axis; taken from B, the supervised half.
