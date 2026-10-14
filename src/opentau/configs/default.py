@@ -675,6 +675,16 @@ class DatasetMixtureConfig:
     # on. The policy therefore sees `(n_demos + 1) * sequence_length` timesteps.
     # Only read when `pair_episodes` is set.
     n_demos: int = 1
+    # Fraction of paired samples whose demonstration half is BLANKED, so one run
+    # trains both 1-shot (demonstration present) and 0-shot (absent) behaviour.
+    # 0.0 is the pure 1-shot run; 1.0 is pure 0-shot; 0.5 gives each mode equal
+    # gradient signal. The blanked half keeps the pair's shape -- its frames are
+    # zeroed and its timesteps marked `timestep_is_pad`, which zeroes the TTT
+    # inner-loop `eta` (#558) so no fast weights are updated from it. The mode is
+    # a pure function of (seed, index) drawn off a stream SEPARATE from the pair
+    # draw, so enabling this leaves 1-shot pair draws bit-identical to earlier
+    # runs. Only read when `pair_episodes` is set.
+    zero_shot_prob: float = 0.0
 
     # Training-time dropout probabilities for optional sample keys.
     history_state_drop_prob: float = 0.3

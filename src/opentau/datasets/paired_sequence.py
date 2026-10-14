@@ -139,6 +139,7 @@ class PairedSequenceDataset(Dataset):
         seed: int = 0,
         forbid_same_scene: bool = True,
         n_demos: int = 1,
+        zero_shot_prob: float = 0.0,
     ) -> None:
         # Set before anything else: `__getattr__` forwards unknown attributes to
         # the wrapped dataset, so a miss here would delegate rather than raise.
@@ -146,6 +147,9 @@ class PairedSequenceDataset(Dataset):
         if n_demos < 1:
             raise ValueError(f"n_demos must be >= 1, got {n_demos}")
         self.n_demos = n_demos
+        if not 0.0 <= zero_shot_prob <= 1.0:
+            raise ValueError(f"zero_shot_prob must be in [0, 1], got {zero_shot_prob}")
+        self.zero_shot_prob = zero_shot_prob
         need = n_demos + 1
         thin = {k: len(v) for k, v in pairing_keys.items() if len(v) < need}
         if thin:
@@ -324,6 +328,62 @@ class PairedSequenceDataset(Dataset):
                 return info[field]
         return episode
 
+    def _is_zero_shot(self, index: int) -> bool:
+        """Whether this sample's demonstration half is blanked.
+
+        Drawn off a stream SEPARATE from ``_draw``'s so that turning
+        ``zero_shot_prob`` on does not consume randomness from the pair draw --
+        a 1-shot run's episode choices stay bit-identical to runs made before
+        this existed. Like the pair draw it is a pure function of
+        ``(seed, index)``, so a given index is the same mode on every rank and
+        every epoch, which keeps distributed runs and resumes reproducible.
+
+        Args:
+            index: Sample index.
+
+        Returns:
+            True if the demonstration half should be blanked.
+        """
+        if self.zero_shot_prob <= 0.0:
+            return False
+        if self.zero_shot_prob >= 1.0:
+            return True
+        g = torch.Generator().manual_seed(self.seed * 7_919_003 + index)
+        return bool(torch.rand((1,), generator=g).item() < self.zero_shot_prob)
+
+    def _blank_demos(self, demos: list[dict[str, Any]]) -> None:
+        """Erases the demonstration halves in place, making the sample 0-shot.
+
+        Two things must both happen. The camera frames are zeroed so the half
+        carries no image content, and ``timestep_is_pad`` is set across it so
+        ``TTTMLPLayer.forward`` zeroes the inner-loop ``eta`` there (#558) and no
+        fast weights are updated from the blanked frames. ``loss_mask`` is
+        already False across every demonstration, so it needs no change.
+
+        Args:
+            demos: The demonstration samples, modified in place.
+
+        Raises:
+            ValueError: If a demonstration carries no ``timestep_is_pad``. Without
+                it the TTT inner loop would train its fast weights on the blank
+                frames -- silently worse than either mode -- so this refuses
+                rather than degrading quietly.
+        """
+        for d in demos:
+            for k, v in d.items():
+                if k.startswith("camera") and isinstance(v, torch.Tensor):
+                    d[k] = torch.zeros_like(v)
+            tp = d.get("timestep_is_pad")
+            if not isinstance(tp, torch.Tensor):
+                raise ValueError(
+                    "zero_shot_prob > 0 needs `timestep_is_pad` on each demonstration so the "
+                    "TTT inner update is skipped across the blanked half (#558), but the base "
+                    "dataset emitted none. It is only produced in sequence mode -- set the "
+                    "policy's `sequence_length` (and keep `pair_episodes` on), or leave "
+                    "zero_shot_prob at 0."
+                )
+            d["timestep_is_pad"] = torch.ones_like(tp)
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         """Builds one demonstration+rollout sample.
 
@@ -344,6 +404,9 @@ class PairedSequenceDataset(Dataset):
         key, ep_demos, ep_b = self._draw(index)
         demos = [self.base[self._last_row[e]] for e in ep_demos]
         b = self.base[self._last_row[ep_b]]
+
+        if self._is_zero_shot(index):
+            self._blank_demos(demos)
 
         t_b = self._timesteps(b)
         t_demos = [self._timesteps(d) for d in demos]

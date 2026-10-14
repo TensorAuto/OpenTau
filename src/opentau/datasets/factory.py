@@ -945,6 +945,7 @@ def _maybe_pair(dataset, dataset_cfg: DatasetConfig, cfg: TrainPipelineConfig):
         samples_per_epoch=len(dataset),
         seed=cfg.seed or 0,
         n_demos=n_demos,
+        zero_shot_prob=cfg.dataset_mixture.zero_shot_prob,
     )
 
 

@@ -48,9 +48,10 @@ class _StubBase:
             mismatch guard.
     """
 
-    def __init__(self, episodes, scenes=None, ragged=None):
+    def __init__(self, episodes, scenes=None, ragged=None, timestep_pad=False):
         self._episodes = list(episodes)
         self._ragged = ragged
+        self._timestep_pad = timestep_pad
         rows = {e: i for i, e in enumerate(self._episodes)}
         self.epi2idx = rows
         self.episode_data_index = {
@@ -65,7 +66,7 @@ class _StubBase:
     def __getitem__(self, row):
         e = self._by_row[row]
         n = T - 1 if e == self._ragged else T
-        return {
+        item = {
             "state": torch.full((n, 3), float(e)),
             "camera0": torch.full((n, 3, 2, 2), float(e)),
             "loss_mask": torch.ones(n, dtype=torch.bool),
@@ -73,13 +74,16 @@ class _StubBase:
             "episode_index": torch.tensor(e),
             "dataset_index": torch.tensor(0),
         }
+        if self._timestep_pad:
+            item["timestep_is_pad"] = torch.zeros(n, dtype=torch.bool)
+        return item
 
     def __len__(self):
         return len(self._episodes)
 
 
-def _make(episodes=EPISODES, scenes=None, ragged=None, **kw):
-    base = _StubBase(episodes, scenes, ragged)
+def _make(episodes=EPISODES, scenes=None, ragged=None, timestep_pad=False, **kw):
+    base = _StubBase(episodes, scenes, ragged, timestep_pad)
     return PairedSequenceDataset(
         base=base,
         pairing_keys={"OpenDrawer__left": list(episodes)},
@@ -592,3 +596,65 @@ class TestPairingIsActuallyWired:
         sentinel = SimpleNamespace(episodes=[1, 2])
         cfg = SimpleNamespace(dataset_mixture=SimpleNamespace(pair_episodes=False), seed=0)
         assert _maybe_pair(sentinel, SimpleNamespace(), cfg) is sentinel
+
+
+class TestZeroShotProb:
+    """`zero_shot_prob` blanks a fraction of demonstrations so one run trains both modes."""
+
+    def test_default_is_inert(self):
+        """At the default 0.0 nothing is blanked, so existing runs are unaffected."""
+        d = _make(timestep_pad=True)
+        assert d.zero_shot_prob == 0.0
+        assert not any(d._is_zero_shot(i) for i in range(500))
+
+    def test_pair_draw_is_unperturbed_by_the_mode_draw(self):
+        """The mode is drawn off a separate RNG stream, so pair draws are unchanged.
+
+        This is what keeps runs made before this feature reproducible: enabling it
+        must not shift which episodes a given index pairs.
+        """
+        off = _make(timestep_pad=True, zero_shot_prob=0.0)
+        on = _make(timestep_pad=True, zero_shot_prob=0.5)
+        assert [off._draw(i) for i in range(200)] == [on._draw(i) for i in range(200)]
+
+    def test_rate_tracks_the_configured_probability(self):
+        d = _make(timestep_pad=True, zero_shot_prob=0.5)
+        hits = sum(d._is_zero_shot(i) for i in range(4000))
+        assert 0.45 < hits / 4000 < 0.55
+
+    def test_mode_is_deterministic_per_index(self):
+        """Same index, same mode -- so ranks agree and a resume reproduces the run."""
+        a = _make(timestep_pad=True, zero_shot_prob=0.5)
+        b = _make(timestep_pad=True, zero_shot_prob=0.5)
+        assert [a._is_zero_shot(i) for i in range(300)] == [b._is_zero_shot(i) for i in range(300)]
+
+    def test_blanked_sample_zeroes_demo_half_and_marks_it_padded(self):
+        """The demonstration half is erased AND padded; the rollout half survives."""
+        d = _make(timestep_pad=True, zero_shot_prob=1.0)
+        s = d[0]
+        cam, tp, lm = s["camera0"], s["timestep_is_pad"], s["loss_mask"]
+        assert torch.all(cam[:T] == 0), "demonstration frames were not blanked"
+        assert not torch.all(cam[T:] == 0), "the rollout half must keep its content"
+        assert torch.all(tp[:T]), "demo half must be marked padded so the TTT inner update skips it"
+        assert not torch.any(lm[:T]), "loss_mask across the demonstration must stay False"
+
+    def test_kept_sample_retains_a_real_demonstration(self):
+        """A non-blanked sample is untouched -- otherwise 1-shot training is destroyed."""
+        d = _make(timestep_pad=True, zero_shot_prob=0.0)
+        s = d[0]
+        assert not torch.all(s["camera0"][:T] == 0)
+        assert not torch.any(s["timestep_is_pad"][:T])
+
+    def test_rejects_an_out_of_range_probability(self):
+        with pytest.raises(ValueError, match="zero_shot_prob"):
+            _make(timestep_pad=True, zero_shot_prob=1.5)
+
+    def test_refuses_to_blank_without_timestep_is_pad(self):
+        """Without the pad flag the TTT inner loop would train on the blank frames.
+
+        That is worse than either mode, so the loader refuses rather than degrading
+        quietly.
+        """
+        d = _make(timestep_pad=False, zero_shot_prob=1.0)
+        with pytest.raises(ValueError, match="timestep_is_pad"):
+            d[0]
