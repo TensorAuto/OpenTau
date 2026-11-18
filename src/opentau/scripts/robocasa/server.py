@@ -67,7 +67,8 @@ from opentau.configs import parser
 from opentau.configs.train import TrainPipelineConfig
 from opentau.policies.factory import get_policy_class
 from opentau.utils.random_utils import set_seed
-from opentau.utils.utils import attempt_torch_compile, auto_torch_device, init_logging
+from opentau.policies.utils import maybe_compile_sample_actions
+from opentau.utils.utils import auto_torch_device, init_logging
 
 logger = logging.getLogger(__name__)
 
@@ -285,8 +286,8 @@ class OpenTauRoboCasaPolicy:
         self.policy.eval()
 
         if compile_model:
-            self.policy.model.sample_actions = attempt_torch_compile(
-                self.policy.model.sample_actions, device_hint=self.device
+            self.policy.model.sample_actions = maybe_compile_sample_actions(
+                self.policy, self.policy.model.sample_actions, device_hint=self.device
             )
 
         self.policy.reset()

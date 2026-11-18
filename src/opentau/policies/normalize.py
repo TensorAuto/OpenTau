@@ -264,6 +264,8 @@ def create_stats_buffers(
             stat_names = ("mean", "std")
         elif norm_mode is NormalizationMode.MIN_MAX:
             stat_names = ("min", "max")
+        elif norm_mode is NormalizationMode.QUANTILES:
+            stat_names = ("q01", "q99")
         else:
             raise ValueError(norm_mode)
 
@@ -414,6 +416,11 @@ class Normalize(nn.Module):
                 if bool((torch.isfinite(rng) & (rng.abs() < EPS)).any()):
                     active = True
                     break
+            elif norm_mode is NormalizationMode.QUANTILES:
+                rng = _materialize(buffer["q99"]) - _materialize(buffer["q01"])
+                if bool((torch.isfinite(rng) & (rng.abs() < EPS)).any()):
+                    active = True
+                    break
         self._snap_active = active
         return active
 
@@ -479,6 +486,25 @@ class Normalize(nn.Module):
                 batch[key] = deviation / (denom + EPS)
                 # normalize to [-1, 1]
                 batch[key] = batch[key] * 2 - 1
+                if (
+                    _SNAP_WARN_TOL > 0
+                    and not (torch.compiler.is_compiling() or torch.onnx.is_in_onnx_export())
+                    and self._snapping_possible()
+                ):
+                    _warn_snapped_deviation(key, denom_is_zero, deviation, dataset_index, self.dataset_names)
+            elif norm_mode is NormalizationMode.QUANTILES:
+                q01 = _gather_and_broadcast(_materialize(buffer["q01"]), dataset_index, batch_val)
+                q99 = _gather_and_broadcast(_materialize(buffer["q99"]), dataset_index, batch_val)
+                assert not torch.isinf(q01).any(), _no_stats_error_str("q01")
+                assert not torch.isinf(q99).any(), _no_stats_error_str("q99")
+                # Same [-1, 1] mapping as MIN_MAX but using q01/q99, then clip
+                # so values outside the quantile band saturate at +/-1.
+                denom = q99 - q01
+                denom_is_zero = denom.abs() < EPS
+                denom = torch.where(denom_is_zero, torch.ones_like(denom), denom)
+                deviation = batch_val - q01
+                batch[key] = deviation / (denom + EPS)
+                batch[key] = (batch[key] * 2 - 1).clamp(-1.0, 1.0)
                 if (
                     _SNAP_WARN_TOL > 0
                     and not (torch.compiler.is_compiling() or torch.onnx.is_in_onnx_export())
@@ -567,6 +593,16 @@ class Unnormalize(nn.Module):
                 denom = torch.where(denom.abs() < EPS, torch.ones_like(denom), denom)
                 batch[key] = (batch_val + 1) / 2
                 batch[key] = batch[key] * (denom + EPS) + min_
+            elif norm_mode is NormalizationMode.QUANTILES:
+                q01 = _gather_and_broadcast(_materialize(buffer["q01"]), dataset_index, batch_val)
+                q99 = _gather_and_broadcast(_materialize(buffer["q99"]), dataset_index, batch_val)
+                if not (torch.compiler.is_compiling() or torch.onnx.is_in_onnx_export()):
+                    assert not torch.isinf(q01).any(), _no_stats_error_str("q01")
+                    assert not torch.isinf(q99).any(), _no_stats_error_str("q99")
+                denom = q99 - q01
+                denom = torch.where(denom.abs() < EPS, torch.ones_like(denom), denom)
+                batch[key] = (batch_val + 1) / 2
+                batch[key] = batch[key] * (denom + EPS) + q01
             else:
                 raise ValueError(norm_mode)
         return batch

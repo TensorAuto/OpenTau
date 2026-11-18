@@ -305,13 +305,78 @@ class PI05Policy(PreTrainedPolicy):
         )
         # Get vocab size from processor
         discrete_action_vocab_size = getattr(self.discrete_action_processor, "vocab_size", None)
-        self.model = PI05FlowMatching(
+        self.model = self._build_flow_matching(config, discrete_action_vocab_size)
+
+        self.reset()
+
+    def _apply_teacher_faithful_transforms(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Applies the opt-in teacher-faithful input transforms, before normalization.
+
+        Two local (non-upstream) options, both no-ops unless configured:
+
+        * ``state_keep_dims`` zeroes every state dim at or after that index, so a
+          13-dim RoboLab ``observation.state`` reduces to the teacher's 8-dim
+          DROID proprio ``[j0..j6, gripper]``.
+        * ``use_delta_joint_actions`` turns the 7 joint targets into deltas
+          against the chunk-start state, matching the teacher's
+          ``AbsoluteActions(mask(7, -1))``. The gripper stays absolute.
+
+        This was inline and duplicated in :meth:`sample_actions` and
+        :meth:`forward`. It is a method now because ``pi05_ttt`` overrides
+        ``forward`` entirely: with the logic inline, a TTT run silently trained
+        on *absolute* actions and a *full* state while its checkpoint and its
+        inference path used deltas and the sliced state — no error, just a
+        different objective. One call site per path is the only shape of this
+        code that cannot drift apart again.
+
+        Shape contract: ``state`` is ``(rows, state_dim)`` and ``actions`` is
+        ``(rows, chunk, action_dim)``. That holds for a flat batch and for a
+        sequence batch already folded to ``rows = B * T``, which is why the
+        sequence path can call this unchanged — but *not* for an unflattened
+        ``(B, T, chunk, dim)`` batch, so call it after flattening.
+
+        Args:
+            batch: Input batch, not modified in place.
+
+        Returns:
+            The batch, with a shallow copy and cloned tensors where a transform
+            fired, or the original object when neither option is set.
+        """
+        if getattr(self.config, "state_keep_dims", None) is not None and "state" in batch:
+            batch = dict(batch)
+            _st = batch["state"].clone()
+            _st[..., int(self.config.state_keep_dims) :] = 0
+            batch["state"] = _st
+        if getattr(self.config, "use_delta_joint_actions", False) and "actions" in batch and "state" in batch:
+            batch = dict(batch)
+            _a = batch["actions"].clone()
+            _a[..., :7] = _a[..., :7] - batch["state"][:, None, :7]  # 7 joints -> delta; gripper absolute
+            batch["actions"] = _a
+        return batch
+
+    def _build_flow_matching(
+        self, config: PI05Config, discrete_action_vocab_size: int | None
+    ) -> "PI05FlowMatching":
+        """Builds the inner flow-matching module.
+
+        A seam for subclasses that swap in a variant of the inner module (e.g.
+        pi05_ttt, which adds TTT layers to the action expert). Overriding this
+        instead of reassigning ``self.model`` after ``super().__init__`` avoids
+        constructing — and immediately discarding — a full PaliGemma tower.
+
+        Args:
+            config: Policy configuration.
+            discrete_action_vocab_size: Size of the discrete action vocabulary,
+                or None when the processor does not expose one.
+
+        Returns:
+            The inner flow-matching module.
+        """
+        return PI05FlowMatching(
             config,
             discrete_action_vocab_size=discrete_action_vocab_size,
             language_tokenizer=self.language_tokenizer,
         )
-
-        self.reset()
 
     def reset(self) -> None:
         """This should be called whenever the environment is reset."""
@@ -534,6 +599,16 @@ class PI05Policy(PreTrainedPolicy):
                 new_key = key.replace("action_time_mlp_in.", "time_mlp_in.")
             elif key.startswith("action_time_mlp_out."):
                 new_key = key.replace("action_time_mlp_out.", "time_mlp_out.")
+
+            # Legacy discrete-action normalizer name. Checkpoints saved before the
+            # `normalize_actions` -> `normalize_discrete_actions` rename (e.g.
+            # TensorAuto/tPi0.5-libero) carry the discrete min/max stats under the
+            # old prefix. Without this remap those buffers land as unexpected keys,
+            # the module's own buffers stay +inf when no dataset stats are supplied
+            # (the eval/inference path), and `make_policy`'s
+            # `_check_norm_stats_loaded` rejects the checkpoint at load time.
+            if key.startswith("normalize_actions."):
+                new_key = key.replace("normalize_actions.", "normalize_discrete_actions.", 1)
             if key.startswith("state_proj.") and model_config.state_type == "discrete":
                 logging.warning(f"Skipping state_proj key in discrete state mode: {key}")
                 continue
@@ -643,6 +718,7 @@ class PI05Policy(PreTrainedPolicy):
             )
 
         dataset_index = self._resolve_dataset_index(batch)
+        batch = self._apply_teacher_faithful_transforms(batch)
         batch = self.normalize_inputs(batch, dataset_index)
 
         images, img_masks = self.prepare_images(batch)
@@ -709,6 +785,7 @@ class PI05Policy(PreTrainedPolicy):
             "MSE_per_sample"/"CE_per_sample" when ``return_per_sample`` is True.
         """
         dataset_index = self._resolve_dataset_index(batch)
+        batch = self._apply_teacher_faithful_transforms(batch)
         batch = self.normalize_inputs(batch, dataset_index)
         batch["discrete_actions"] = self.normalize_discrete_actions(dict(batch), dataset_index)["actions"]
         batch = self.normalize_targets(batch, dataset_index)

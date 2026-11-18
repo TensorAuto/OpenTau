@@ -46,6 +46,8 @@ class NormalizationMode(str, Enum):
     """Normalize using min-max scaling."""
     MEAN_STD = "MEAN_STD"
     """Normalize using mean and standard deviation."""
+    QUANTILES = "QUANTILES"
+    """Normalize by q01/q99 quantiles to [-1, 1] (values outside are clipped)."""
     IDENTITY = "IDENTITY"
     """No normalization (identity transformation)."""
 

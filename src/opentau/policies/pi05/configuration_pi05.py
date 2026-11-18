@@ -191,6 +191,19 @@ class PI05Config(PreTrainedConfig):
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
 
+    # --- Teacher-faithful options (opt-in; default None = no behavior change) ---
+    # Zero every state dim at/after this index BEFORE normalization, reducing a
+    # 13-dim RoboLab observation.state to the teacher's DROID 8-dim proprio
+    # [j0..j6, gripper=state[7]]. None keeps the full state (default).
+    state_keep_dims: int | None = None
+    # Path to an openpi-style droid norm_stats.json. When set, make_policy replaces
+    # the dataset-computed per-task stats with a SINGLE head built from this file
+    # (the teacher's DROID q01/q99), for teacher-faithful / frozen-weight checks.
+    norm_stats_override_path: str | None = None
+    # Convert absolute joint actions -> deltas (action[:,:7] -= state[:7]) before
+    # normalization, matching the teacher's AbsoluteActions(mask(7,-1)). Gripper stays absolute.
+    use_delta_joint_actions: bool = False
+
     def __post_init__(self):
         """Post-initialization validation."""
         super().__post_init__()

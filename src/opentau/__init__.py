@@ -166,6 +166,7 @@ available_policies = [
     "pi0",
     "pi05",
     "pi05_mem",
+    "pi05_ttt",
     "pi06",
     "pi07_high_level",
     "pi07_low_level",

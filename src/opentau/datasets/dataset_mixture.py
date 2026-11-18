@@ -546,7 +546,7 @@ class DatasetMixtureMetadata:
 
         # pad state and action vectors
         for stat in standard_stats["state"]:
-            if stat in ["mean", "std", "min", "max"]:
+            if stat in ["mean", "std", "min", "max", "q01", "q99"]:
                 standard_stats["state"][stat] = pad_vector(
                     standard_stats["state"][stat], self.cfg.max_state_dim
                 )

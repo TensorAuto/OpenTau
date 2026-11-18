@@ -38,6 +38,7 @@ from opentau.policies.cosmos3_nano.configuration_cosmos3_nano import Cosmos3Nano
 from opentau.policies.pi0.configuration_pi0 import PI0Config
 from opentau.policies.pi05.configuration_pi05 import PI05Config
 from opentau.policies.pi05_mem.configuration_pi05 import PI05MemConfig
+from opentau.policies.pi05_ttt.configuration_pi05_ttt import PI05TTTConfig
 from opentau.policies.pi06.configuration_pi06 import PI06Config
 from opentau.policies.pi07.high_level_planner.configuration_pi07_high_level import (
     PI07HighLevelPlannerConfig,
@@ -89,6 +90,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from opentau.policies.pi05_mem.modeling_pi05 import PI05MemPolicy
 
         return PI05MemPolicy
+    elif name == "pi05_ttt":
+        from opentau.policies.pi05_ttt.modeling_pi05_ttt import PI05TTTPolicy
+
+        return PI05TTTPolicy
     elif name == "pi06":
         from opentau.policies.pi06.modeling_pi06 import PI06Policy
 
@@ -160,6 +165,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return PI05Config(**kwargs)
     elif policy_type == "pi05_mem":
         return PI05MemConfig(**kwargs)
+    elif policy_type == "pi05_ttt":
+        return PI05TTTConfig(**kwargs)
     elif policy_type == "pi06":
         return PI06Config(**kwargs)
     elif policy_type == "pi07_paligemma_high_level_planner":
@@ -286,6 +293,20 @@ def make_policy(
         else:
             per_norm_key_stats = list(stats)
             norm_keys = norm_keys or [f"external_{i}" for i in range(len(per_norm_key_stats))]
+
+    _ovr = getattr(cfg, "norm_stats_override_path", None)
+    if _ovr:
+        import json as _json, numpy as _np, logging as _lg
+        _raw = _json.load(open(_ovr))["norm_stats"]
+        def _fs(_n):
+            _s = _raw[_n]
+            _o = {_k: _np.asarray(_s[_k], dtype=_np.float32) for _k in ("mean","std","q01","q99") if _k in _s}
+            _o.setdefault("min", _o.get("q01")); _o.setdefault("max", _o.get("q99"))
+            return _o
+        _head = {"state": _fs("state"), "actions": _fs("actions")}
+        _nheads = len(norm_keys) if norm_keys else 1
+        per_norm_key_stats = [dict(_head) for _ in range(_nheads)]  # all heads = DROID; keep original index mapping
+        _lg.getLogger(__name__).info("[teacher-faithful] DROID norm override -> single head from %s", _ovr)
 
     if per_norm_key_stats is not None:
         # The Normalize / Unnormalize kwargs are named `per_dataset_stats` /

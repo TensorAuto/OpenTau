@@ -69,10 +69,10 @@ from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.lerobot_dataset import BaseDataset
 from opentau.planner.gemini_er_planner import GeminiERPlanner
 from opentau.policies.factory import get_policy_class
+from opentau.policies.utils import maybe_compile_sample_actions
 from opentau.scripts.grpc import auth, robot_inference_pb2, robot_inference_pb2_grpc
 from opentau.utils.random_utils import set_seed
 from opentau.utils.utils import (
-    attempt_torch_compile,
     auto_torch_device,
     init_logging,
 )
@@ -81,6 +81,12 @@ logger = logging.getLogger(__name__)
 
 
 class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
+    # Class-level default so the attribute always exists. The gRPC tests
+    # construct the servicer with an injected mock policy and never call
+    # `_load_policy`, which made `_reset_policy_on_task_change` raise
+    # AttributeError inside the request path.
+    _policy_task: str | None = None
+
     """gRPC servicer implementing the RobotPolicyService.
 
     When ``cfg.planner.enabled`` is set, a high-level planner runs alongside
@@ -225,6 +231,29 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
         with self._lock:
             return self._subtask
 
+    def _reset_policy_on_task_change(self, prompt: str) -> None:
+        """Reset the policy when the task changes.
+
+        Deliberately *not* folded into the planner hook: that returns immediately
+        when the planner is disabled — and `PlannerConfig.enabled` defaults to
+        False — which would leave the reset unreachable for an operator serving a
+        bare VLA policy, i.e. the common case.
+
+        Without this, a policy carrying recurrent rollout state is reset exactly
+        once (in `_load_policy`) and then carries one episode's fast weights into
+        every later episode and task. It is a no-op-shaped call for stateless
+        policies, which only clear an already-drained action queue.
+
+        Args:
+            prompt: The incoming request's task prompt.
+        """
+        with self._lock:
+            if prompt == self._policy_task:
+                return
+            self._policy_task = prompt
+        logger.info("Task changed to %r — resetting policy state", prompt)
+        self.policy.reset()
+
     def _apply_planner(self, request: robot_inference_pb2.ObservationRequest) -> None:
         """Rewrite ``request.prompt`` to the planner's current subtask.
 
@@ -267,8 +296,15 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
         self.policy = policy_class.from_pretrained(self.cfg.policy.pretrained_path, config=self.cfg.policy)
         self.policy.to(device=self.device, dtype=self.dtype)
         self.policy.eval()
-        self.policy.model.sample_actions = attempt_torch_compile(
-            self.policy.model.sample_actions, device_hint=self.device
+        # A policy carrying recurrent rollout state is not safe to compile here:
+        # its `sample_actions` mutates Python-level state (the carried TTT fast
+        # weights, and an integer token position that feeds RoPE). Best case that
+        # recompiles once per distinct position and then falls back to eager
+        # permanently; worst case the position specializes into the graph and the
+        # phase silently freezes. `supports_torch_compile` only gates the
+        # training-side helper and never reaches this call site.
+        self.policy.model.sample_actions = maybe_compile_sample_actions(
+            self.policy, self.policy.model.sample_actions, device_hint=self.device
         )
 
         self.policy.reset()
@@ -455,6 +491,11 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
         try:
             # Substitute the high-level planner's subtask for the prompt (no-op
             # when the planner is disabled).
+            # Reset per-episode policy state on a task change. Runs before the
+            # planner hook and independently of it, since the planner is
+            # disabled by default.
+            self._reset_policy_on_task_change(request.prompt)
+
             self._apply_planner(request)
 
             # Prepare observation batch

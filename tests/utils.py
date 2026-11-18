@@ -206,3 +206,50 @@ def generic_equal(obj1, obj2) -> bool:
     if isinstance(obj1, dict):
         return set(obj1) == set(obj2) and all(generic_equal(obj1[k], obj2[k]) for k in obj1)
     return obj1 == obj2
+
+
+# --- VRAM-gated GPU skips (upstream #513), added with the pi05_ttt port so
+# tests/policies/test_pi05_ttt_gpu.py can gate on card size instead of
+# skipping unconditionally. ---
+def cuda_total_vram_gib() -> float:
+    """Report the total VRAM of the current CUDA device.
+
+    Returns:
+        Total device memory in GiB, or ``0.0`` when CUDA is unavailable.
+    """
+    if not torch.cuda.is_available():
+        return 0.0
+    return torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / 1024**3
+
+
+def require_vram_gib(min_gib: float):
+    """Build a decorator that skips a test unless the CUDA device is big enough.
+
+    Deliberately a call-time decorator rather than a `pytest.mark.skipif`
+    whose condition is evaluated at import: reading device properties
+    initializes a CUDA context, and the gating CPU run (`-n auto`) imports
+    every test module in every xdist worker. On a GPU box that would spawn one
+    context per worker for tests that are deselected anyway.
+
+    Args:
+        min_gib: Total VRAM the card must have, in GiB. This is the card size
+            required, not the test's peak allocation: the conftest
+            `release_cuda_memory_after_gpu_test` fixture keeps peaks from
+            accumulating across tests, but the floor still has to cover the
+            CUDA context and allocator fragmentation on top of that peak.
+
+    Returns:
+        A decorator that skips the wrapped test when the device is smaller.
+    """
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            available = cuda_total_vram_gib()
+            if available < min_gib:
+                pytest.skip(f"requires >= {min_gib} GiB VRAM (device has {available:.1f} GiB)")
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator

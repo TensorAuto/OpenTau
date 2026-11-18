@@ -66,8 +66,10 @@ from opentau.utils.train_utils import (
     load_training_step,
     prune_old_checkpoints,
     reseed_new_ranks_on_resume,
+    resolve_periodic_save_flags,
     save_checkpoint,
     save_running_best_state,
+    save_trainable_params_snapshot,
 )
 from opentau.utils.utils import (
     encode_accelerator_state_dict,
@@ -898,6 +900,19 @@ def train(cfg: TrainPipelineConfig):
             )
         eval_subgoal_generator = make_subgoal_generator(cfg)
 
+    if cfg.save_trainable_params and (
+        accelerator.distributed_type == accelerate.DistributedType.FSDP
+        or _deepspeed_zero_stage(accelerator) >= 3
+    ):
+        # Fail here rather than at the first saving step: under ZeRO-3/FSDP each
+        # rank's named_parameters are shards, so the snapshot would be silently
+        # truncated — and dying `save_freq` steps into a run wastes the run.
+        raise ValueError(
+            "save_trainable_params requires replicated parameters (DDP or DeepSpeed "
+            "ZeRO-1/2); under ZeRO-3/FSDP each rank only holds a parameter shard. "
+            "Disable save_trainable_params or switch the accelerate config."
+        )
+
     logging.info("Creating policy")
     # FSDP needs the policy built in fp32 so its ``MixedPrecision(
     # param_dtype=bf16, reduce_dtype=bf16, buffer_dtype=bf16)`` policy can
@@ -1158,7 +1173,12 @@ def train(cfg: TrainPipelineConfig):
         current_success = None
         current_val_loss = None
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
-        is_saving_step = (step % cfg.save_freq == 0 or step == cfg.steps) and cfg.save_checkpoint
+        # The snapshot flag is deliberately independent of `save_checkpoint`
+        # (mirroring `running_best_count`) — the helper's docstring and its test
+        # pin that contract.
+        is_saving_step, is_snapshot_step = resolve_periodic_save_flags(
+            step, cfg.steps, cfg.save_freq, cfg.save_checkpoint, cfg.save_trainable_params
+        )
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
         is_val_step = cfg.val_freq > 0 and step % cfg.val_freq == 0
 
@@ -1221,6 +1241,21 @@ def train(cfg: TrainPipelineConfig):
                         accelerator.num_processes - len(missing_ranks),
                         accelerator.num_processes,
                     )
+
+        if is_snapshot_step and accelerator.is_main_process:
+            # Kept-forever trainable-only snapshot, written OUTSIDE the checkpoints/
+            # tree so `prune_old_checkpoints` never sees it, and independent of the
+            # full-checkpoint block above so it fires even with `save_checkpoint=False`.
+            # Rank-0-only with no barrier: parameters are replicated (the startup
+            # validation rejected sharded backends) and the copy to CPU completes
+            # before this rank re-enters the training loop.
+            snapshot_path = save_trainable_params_snapshot(
+                accelerator.unwrap_model(policy),
+                cfg.output_dir / "trainable_params",
+                step,
+                cfg.steps,
+            )
+            logging.info(f"Saved trainable-only parameter snapshot to {snapshot_path}")
 
         if is_val_step and val_dataloader is not None:
             policy.eval()

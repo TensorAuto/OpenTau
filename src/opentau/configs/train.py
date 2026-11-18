@@ -109,6 +109,15 @@ class TrainPipelineConfig(HubMixin):
         save_freq: Frequency of checkpoint saving in training iterations. Checkpoints
             are saved every `save_freq` steps and after the last training step.
             Defaults to 20,000.
+        save_trainable_params: If True, every `save_freq` steps (and after the last
+            step) write a safetensors snapshot holding only the `requires_grad=True`
+            parameters to `output_dir/trainable_params/step_<id>.safetensors`.
+            Snapshots are exempt from `last_checkpoint_only` pruning and — like
+            `running_best_count` — independent of `save_checkpoint`, so a
+            snapshots-only run is possible; mostly-frozen runs (e.g.
+            `train_ttt_only`) get a cheap kept-forever parameter history. Requires
+            replicated parameters (DDP or DeepSpeed ZeRO-1/2); raises at startup
+            under ZeRO-3/FSDP. Defaults to False.
         use_policy_training_preset: If True, use optimizer and scheduler presets from
             the policy configuration. Defaults to False.
         optimizer: Configuration for the optimizer. Required if
@@ -178,6 +187,17 @@ class TrainPipelineConfig(HubMixin):
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     save_freq: int = 20_000
+    # Every `save_freq` steps (and after the last step), write a small safetensors snapshot
+    # holding ONLY the parameters with requires_grad=True (e.g. the 85M TTT parameters of a
+    # `train_ttt_only` run, against a 3.4B frozen base) to `output_dir/trainable_params/`.
+    # These snapshots are never pruned — `last_checkpoint_only` does not touch them — and,
+    # like `running_best_count`, they fire independently of `save_checkpoint`, so a
+    # snapshots-only run is possible. A mostly-frozen run keeps a per-save-step parameter
+    # history at roughly one-fiftieth of the full-checkpoint cost. Restoring a step = load the base
+    # checkpoint, then `load_state_dict(snapshot, strict=False)`.
+    # Requires replicated parameters (DDP or ZeRO-1/2); raises at startup under ZeRO-3/FSDP,
+    # where each rank only holds a shard.
+    save_trainable_params: bool = False
     use_policy_training_preset: bool = False
     optimizer: OptimizerConfig | None = None
     scheduler: LRSchedulerConfig | None = None
@@ -239,6 +259,37 @@ class TrainPipelineConfig(HubMixin):
                 "cfg.job_name is deprecated and ignored. Set cfg.wandb.project and/or cfg.wandb.name instead."
             )
 
+    def _validate_sequence_stride(self) -> None:
+        """Reject a sequence stride that is not the action chunk.
+
+        RoboTTT's timestep IS one H-step action chunk: its sequences tile the
+        trajectory in disjoint chunks and the paper has no stride knob. A
+        sub-chunk stride overlaps consecutive timesteps' action targets, so the
+        mostly teacher-forced context contains the current chunk's answers — the
+        TTT layers learn to copy them, training loss falls, and closed-loop
+        rollouts collapse (observed at stride 1, chunk 20: 0% success from a
+        33%-success frozen base). ``None`` derives ``action_chunk`` (in
+        ``datasets/factory.py``); anything else is a config error, not a knob.
+        Inert at ``sequence_length == 1``, where the stride is never read.
+
+        Raises:
+            ValueError: If an explicit ``sequence_stride`` differs from
+                ``action_chunk`` while sequence training is enabled.
+        """
+        if self.dataset_mixture is None or getattr(self.dataset_mixture, "sequence_length", 1) <= 1:
+            return
+        stride = getattr(self.dataset_mixture, "sequence_stride", None)
+        if stride is not None and stride != self.action_chunk:
+            raise ValueError(
+                f"dataset_mixture.sequence_stride={stride} != action_chunk={self.action_chunk}: "
+                "sequence timesteps must tile the trajectory in disjoint action chunks "
+                "(one timestep = one chunk, matching both the RoboTTT paper and the "
+                "inference call cadence). Any other stride leaks overlapping action "
+                "targets into the teacher-forced context and collapses closed-loop "
+                "performance. Leave sequence_stride unset (null) to derive it from "
+                "action_chunk, or set it equal explicitly."
+            )
+
     def validate(self):
         """Validate and finalize the training configuration.
 
@@ -254,6 +305,16 @@ class TrainPipelineConfig(HubMixin):
             FileExistsError: If output directory exists and resume is False.
             NotADirectoryError: If config_path for resuming doesn't exist locally.
         """
+        # Sequence training tiles a trajectory into disjoint action chunks (RoboTTT's
+        # timestep IS one H-step chunk; the paper has no stride knob). A sub-chunk
+        # stride overlaps consecutive timesteps' action targets, so the mostly
+        # teacher-forced context contains the current chunk's answers — the TTT
+        # layers learn to copy them, training loss falls, and closed-loop rollouts
+        # collapse (observed at stride 1, chunk 20: 0% success from a 33%-success
+        # frozen base). `None` derives `action_chunk`; any other value is a config
+        # error, not a tuning knob.
+        self._validate_sequence_stride()
+
         # HACK: We parse again the cli args here to get the pretrained paths if there was some.
         policy_path = parser.get_path_arg("policy")
         if policy_path:
@@ -327,6 +388,21 @@ class TrainPipelineConfig(HubMixin):
                     raise ValueError(
                         message + " If you are deliberately resuming a legacy run trained with this "
                         "mismatch, set policy.skip_input_resolution_check=true."
+                    )
+
+            # A recurrent policy's `sequence_length` is what its forward slices
+            # into TBPTT segments; the mixture's is what the dataloader actually
+            # emits. They must agree, or `_as_sequence_batch` raises on the
+            # first batch — after the dataset has been built and the model
+            # loaded, which is a slow way to learn about a typo.
+            if self.dataset_mixture is not None:
+                policy_seq = getattr(self.policy, "sequence_length", None)
+                if policy_seq is not None and policy_seq != self.dataset_mixture.sequence_length:
+                    raise ValueError(
+                        f"policy.sequence_length ({policy_seq}) != "
+                        f"dataset_mixture.sequence_length ({self.dataset_mixture.sequence_length}). "
+                        "The policy decides how many timesteps it segments; the mixture decides "
+                        "how many it emits. Set them to the same value."
                     )
 
             # The policy's ``n_obs_steps`` determines the T dimension its

@@ -160,16 +160,75 @@ def resolve_delta_timestamps(
         if key not in reverse_name_map:
             continue  # only process camera, state, and action features
 
+        # Trajectory-sequence emission for recurrent policies. The window is
+        # anchored at its *last* timestep, so timestep t sits at frame offset
+        # `-(T - 1 - t) * stride`. Two reasons: it reuses the existing
+        # history-window convention for observations verbatim (all offsets <= 0),
+        # and it matches inference, where the memory is built from the past and
+        # the policy predicts *now*.
+        #
+        # Episode-boundary clamping and per-entry padding flags come free from
+        # the fetch layer — see `lerobot_dataset.py`, which notes that "per-frame
+        # temporal padding info (from clamped episode boundaries) is tracked by
+        # obs_history_is_pad", with `<key>_is_pad` doing the same for actions. So
+        # a window running off the start of an episode is clamped and reported,
+        # and no boundary arithmetic is needed here.
+        # `getattr` because tests build the mixture as a SimpleNamespace stand-in
+        # that only carries the fields the case under test needs.
+        seq_len = getattr(cfg.dataset_mixture, "sequence_length", 1)
+        seq_stride = getattr(cfg.dataset_mixture, "sequence_stride", None)
+        if seq_stride is None:
+            # RoboTTT semantics: one timestep IS one action chunk, so consecutive
+            # timesteps tile the trajectory in disjoint chunks. Any other stride
+            # overlaps adjacent timesteps' action targets and hands the mostly
+            # teacher-forced context the current chunk's answers to copy —
+            # `TrainPipelineConfig.validate` rejects explicit mismatches.
+            # Only resolved in sequence mode: at seq_len == 1 the stride is never
+            # read downstream, and test stubs legitimately omit `action_chunk`.
+            seq_stride = cfg.action_chunk if seq_len > 1 else 1
+
+        # `sequence_stride` is documented in *frames*, but every offset here is
+        # converted with `action_freq` — the resampling rate — so the two agree
+        # only when `action_freq == ds_meta.fps`. Oversampling makes consecutive
+        # timesteps land inside one source frame, and the nearest-frame fetch
+        # returns the *same* observation for both: the memory sees duplicates
+        # and TTT has nothing to carry. Caught on droid_100, which is 15 fps
+        # while the dev config asks for 30, giving bit-identical frames at
+        # stride 1.
+        if seq_len > 1 and action_freq > seq_stride * ds_meta.fps + 1e-6:
+            raise ValueError(
+                f"sequence_length={seq_len} with action_freq={action_freq} Hz on a dataset "
+                f"recorded at {ds_meta.fps} Hz: a stride of {seq_stride} frame(s) is "
+                f"{seq_stride / action_freq:.4f}s, shorter than one source frame "
+                f"({1 / ds_meta.fps:.4f}s), so consecutive timesteps would resolve to the same "
+                "observation. Set dataset_mixture.action_freq to the dataset's fps (the stride "
+                "itself is derived from action_chunk and is not a tuning knob)."
+            )
+
         standard_key = reverse_name_map[key]
         if (
             standard_key == "actions"
             and cfg.policy is not None
             and cfg.policy.action_delta_indices is not None
         ):
-            delta_timestamps[key] = [i / action_freq for i in cfg.policy.action_delta_indices]
+            chunk_offsets = list(cfg.policy.action_delta_indices)
+            # T * H offsets, timestep-major so the reshape to (T, H, ...) is a
+            # plain view and the row order stays batch-major downstream.
+            # At seq_len == 1 this is exactly `chunk_offsets`, byte for byte.
+            delta_timestamps[key] = [
+                (-(seq_len - 1 - t) * seq_stride + h) / action_freq
+                for t in range(seq_len)
+                for h in chunk_offsets
+            ]
         elif "camera" in standard_key or standard_key == "state":
             n_obs = cfg.dataset_mixture.n_obs_history
-            if n_obs is not None:
+            if seq_len > 1:
+                # One observation per supervised timestep. Config validation
+                # already refuses combining this with `n_obs_history`.
+                delta_timestamps[key] = [
+                    -(seq_len - 1 - t) * seq_stride / action_freq for t in range(seq_len)
+                ]
+            elif n_obs is not None:
                 interval = getattr(cfg.policy, "history_interval", 1)
                 delta_timestamps[key] = [-(n_obs - 1 - i) * interval / action_freq for i in range(n_obs)]
             else:

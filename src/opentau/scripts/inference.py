@@ -22,9 +22,9 @@ import torch
 from opentau.configs import parser
 from opentau.configs.train import TrainPipelineConfig
 from opentau.policies.factory import get_policy_class
+from opentau.policies.utils import maybe_compile_sample_actions
 from opentau.utils.random_utils import set_seed
 from opentau.utils.utils import (
-    attempt_torch_compile,
     auto_torch_device,
     create_dummy_observation,
     init_logging,
@@ -46,7 +46,9 @@ def inference_main(cfg: TrainPipelineConfig):
     policy = policy_class.from_pretrained(cfg.policy.pretrained_path, config=cfg.policy)
     policy.to(device=device, dtype=torch.bfloat16)
     policy.eval()
-    policy.model.sample_actions = attempt_torch_compile(policy.model.sample_actions, device_hint=device)
+    policy.model.sample_actions = maybe_compile_sample_actions(
+        policy, policy.model.sample_actions, device_hint=device
+    )
 
     # Always reset policy before episode to clear out action cache.
     policy.reset()

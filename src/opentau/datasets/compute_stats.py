@@ -354,13 +354,25 @@ def aggregate_feature_stats(
         agg_min = np.nanmin(mins_safe, axis=0)
         agg_max = np.nanmax(maxs_safe, axis=0)
 
-    return {
+    agg = {
         "min": agg_min,
         "max": agg_max,
         "mean": total_mean,
         "std": np.sqrt(total_variance),
         "count": total_count,
     }
+    # Carry quantile bands (q01/q99) when every contributor has them. Quantiles
+    # are not additively aggregatable; we store the per-dataset global band
+    # replicated across episodes, so a conservative nanmin(q01)/nanmax(q99)
+    # recovers that band (and only widens if per-episode bands ever differ).
+    if stats_ft_list and all(("q01" in s and "q99" in s) for s in stats_ft_list):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            q01s = np.stack([np.where(np.isfinite(s["q01"]), s["q01"], np.nan) for s in stats_ft_list])
+            q99s = np.stack([np.where(np.isfinite(s["q99"]), s["q99"], np.nan) for s in stats_ft_list])
+            agg["q01"] = np.nanmin(q01s, axis=0)
+            agg["q99"] = np.nanmax(q99s, axis=0)
+    return agg
 
 
 def aggregate_stats(

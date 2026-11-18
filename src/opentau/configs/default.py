@@ -334,6 +334,15 @@ class DatasetMixtureConfig:
             ``DatasetConfig.val_split_ratio`` overrides this value for that
             dataset; ``None`` there inherits this mixture default. Must be in
             ``[0, 1]``. Defaults to 0.05.
+        sequence_length: Number of supervised timesteps per sample. 1 (the
+            default) emits today's single-timestep batches unchanged; >1 adds a
+            leading time axis for recurrent policies. Mutually exclusive with
+            ``n_obs_history``.
+        sequence_stride: Frames between consecutive timesteps; ``None`` (default)
+            derives ``action_chunk`` (RoboTTT's chunk-tiled sequences), and any
+            other explicit value is rejected at ``TrainPipelineConfig.validate``.
+            Historic note: this used to default to 1
+            (one control step per timestep, RoboTTT's definition).
         n_obs_history: Number of historical observation steps to include. When
             set to ``T``, each camera returns shape ``(T, C, H, W)`` and state
             returns shape ``(T, max_state_dim)``. When ``None``, the default
@@ -466,6 +475,34 @@ class DatasetMixtureConfig:
     # Number of historical observation steps. None preserves default single-step behavior.
     n_obs_history: int | None = None
 
+    # --- Trajectory-sequence emission, for recurrent policies (pi05_ttt) ---
+    #
+    # `sequence_length` is the number of *supervised timesteps* per sample: each
+    # gets its own observation, its own action chunk and its own loss
+    # contribution, so the batch gains a leading time axis
+    # (`(B, T, chunk, dim)`). This is NOT `n_obs_history`, which stacks T past
+    # observations for ONE action chunk — that is a history window for a single
+    # prediction (what pi05_mem's space-time encoder consumes), whereas this is
+    # T separate predictions the memory is carried across.
+    #
+    # `sequence_stride` is the gap, in frames, between consecutive timesteps.
+    # RoboTTT defines one timestep as one H-step action chunk (its trajectories
+    # are (obs, proprio, chunk) tuples tiling the episode; inference advances
+    # t -> t+H), so the only paper-faithful stride is `action_chunk` — `None`
+    # (the default) derives exactly that, and `TrainPipelineConfig.validate`
+    # rejects any other explicit value: a sub-chunk stride overlaps consecutive
+    # timesteps' action targets, the mostly-teacher-forced context then contains
+    # the current chunk's answers, and the TTT layers learn to copy them —
+    # training loss falls while closed-loop rollouts collapse (observed at
+    # stride 1, chunk 20: zero closed-loop success from a frozen base that
+    # succeeds on a third of episodes).
+    #
+    # None leaves every existing non-sequence run byte-identical: at
+    # `sequence_length == 1` the action offsets below collapse to exactly
+    # `policy.action_delta_indices` and the stride is never read.
+    sequence_length: int = 1
+    sequence_stride: int | None = None
+
     # Training-time dropout probabilities for optional sample keys.
     history_state_drop_prob: float = 0.3
     subgoal_drop_prob: float = 0.75
@@ -527,6 +564,44 @@ class DatasetMixtureConfig:
             not isinstance(self.n_obs_history, int) or self.n_obs_history < 1
         ):
             raise ValueError(f"`n_obs_history` must be None or a positive integer, got {self.n_obs_history}.")
+        if not isinstance(self.sequence_length, int) or isinstance(self.sequence_length, bool):
+            raise ValueError(f"`sequence_length` must be an integer, got {self.sequence_length!r}.")
+        if self.sequence_length < 1:
+            raise ValueError(f"`sequence_length` must be >= 1, got {self.sequence_length}.")
+        if self.sequence_stride is not None and (
+            not isinstance(self.sequence_stride, int)
+            or isinstance(self.sequence_stride, bool)
+            or self.sequence_stride < 1
+        ):
+            raise ValueError(
+                "`sequence_stride` must be None (derives `action_chunk`: RoboTTT tiles a "
+                f"trajectory into disjoint action chunks) or a positive integer, got {self.sequence_stride!r}."
+            )
+        if self.sequence_length > 1 and any(
+            getattr(d, "use_delta_joint_actions", False) for d in (self.datasets or [])
+        ):
+            # `subtract_chunk_start_state` reads `actions` as (chunk, dim) and
+            # `state` as (state_dim,). Under sequence emission those are
+            # (T * chunk, dim) and (T, state_dim), so the chunk-start lookup
+            # would align to the wrong timestep. Refuse until the transform is
+            # made sequence-aware; CLAUDE.md rule 7 is about exactly this pair
+            # (a dataset-side transform whose inference inverse must match).
+            raise ValueError(
+                "`sequence_length` > 1 is not yet supported together with "
+                "`use_delta_joint_actions`: the delta transform indexes actions as "
+                "(chunk, dim) and would align to the wrong timestep under a sequence axis."
+            )
+        if self.sequence_length > 1 and self.n_obs_history is not None:
+            # Both would claim the camera/state time axis, and the fetch layer
+            # emits one tensor per feature — so the two cannot be composed
+            # without deciding which axis the encoder sees. Refuse rather than
+            # silently letting one win.
+            raise ValueError(
+                f"`sequence_length`={self.sequence_length} cannot be combined with "
+                f"`n_obs_history`={self.n_obs_history}: both define the observation time axis. "
+                "Sequence emission is for recurrent policies (pi05_ttt); n_obs_history is a "
+                "history window for one prediction (pi05_mem)."
+            )
         for name in (
             "history_state_drop_prob",
             "subgoal_drop_prob",

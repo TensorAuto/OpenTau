@@ -800,6 +800,8 @@ class BaseDataset(torch.utils.data.Dataset):
         self.action_chunk = cfg.action_chunk  # number of actions to be processed in a chunk
         dm = cfg.dataset_mixture
         self.n_obs_history = dm.n_obs_history if dm else None
+        # Number of supervised timesteps per sample; 1 is today's behaviour.
+        self.sequence_length = getattr(dm, "sequence_length", 1) if dm else 1
         # Optional-key dropout probabilities (all default to 0 when no mixture config is
         # provided, preserving legacy/VQA paths that don't use these keys).
         self.history_state_drop_prob = dm.history_state_drop_prob if dm else 0.0
@@ -868,12 +870,18 @@ class BaseDataset(torch.utils.data.Dataset):
         Args:
             img: Image tensor to validate.
             name: Human-readable key name for the error message.
-            expect_temporal: If ``None``, defers to ``self.n_obs_history``. If
+            expect_temporal: If ``None``, defers to whether a time axis is
+                active — ``self.n_obs_history`` or ``self.sequence_length > 1``. If
                 ``True`` force-expects ``(T, 3, H, W)``. If ``False`` force-expects
                 ``(3, H, W)``.
         """
         if expect_temporal is None:
-            expect_temporal = self.n_obs_history is not None
+            # Either mechanism puts a leading time axis on a camera:
+            # `n_obs_history` or `sequence_length`. Deferring to
+            # `n_obs_history` alone made a sequence batch fail this assertion
+            # with "Expected image camera0 to have shape (3, H, W) ... Got
+            # torch.Size([4, 3, 224, 224])".
+            expect_temporal = self.n_obs_history is not None or getattr(self, "sequence_length", 1) > 1
         if expect_temporal:
             expected_ndim = 4
             expected_c_dim = 1
@@ -917,20 +925,34 @@ class BaseDataset(torch.utils.data.Dataset):
             std_key = f"camera{cam_idx}"
             key = name_map.get(std_key)
 
+            # A camera carries a leading time axis under either mechanism:
+            # `n_obs_history` (a history window for one prediction) or
+            # `sequence_length` (one observation per supervised timestep). They
+            # are mutually exclusive by config validation, so at most one is
+            # active — but the *shape handling* is identical, and keying it on
+            # `n_obs_history` alone sent sequence batches down the scalar path,
+            # where `item[key + "_is_pad"].item()` raised
+            # "a Tensor with 4 elements cannot be converted to Scalar".
+            temporal_frames = (
+                self.n_obs_history
+                if self.n_obs_history is not None
+                else (_seq_len if (_seq_len := getattr(self, "sequence_length", 1)) > 1 else None)
+            )
+
             if key is None:
-                if self.n_obs_history is not None:
-                    standard_item[std_key] = torch.zeros((self.n_obs_history, 3, *self.resolution))
+                if temporal_frames is not None:
+                    standard_item[std_key] = torch.zeros((temporal_frames, 3, *self.resolution))
                 else:
                     standard_item[std_key] = torch.zeros((3, *self.resolution))
                 image_is_pad.append(True)
-            elif self.n_obs_history is not None:
+            elif temporal_frames is not None:
                 img = item[key]
                 # n_obs_history == 1 produces a length-1 delta-timestamps
                 # query, which the fetch paths collapse to (C, H, W) —
                 # `_query_videos` for video keys, the single-delta squeeze in
                 # `__getitem__` for image columns. Restore the temporal dim so
                 # the (T, C, H, W) contract holds for T == 1.
-                if self.n_obs_history == 1 and img.ndim == 3:
+                if temporal_frames == 1 and img.ndim == 3:
                     img = rearrange(img, "c h w -> 1 c h w")
                 standard_item[std_key] = self.resize_with_pad(
                     img, self.resolution[1], self.resolution[0], pad_value=0
@@ -1010,10 +1032,8 @@ class BaseDataset(torch.utils.data.Dataset):
         state_pad_key = f"{state_raw_key}_is_pad" if state_raw_key else None
         if state_pad_key and state_pad_key in item:
             standard_item["obs_history_is_pad"] = item[state_pad_key]
-        elif self.n_obs_history is not None:
-            standard_item["obs_history_is_pad"] = torch.zeros(self.n_obs_history, dtype=torch.bool)
         else:
-            standard_item["obs_history_is_pad"] = torch.tensor([False], dtype=torch.bool)
+            standard_item["obs_history_is_pad"] = self._obs_history_pad_fallback(padded=False)
 
         # Emit optional keys (memory, next_memory, speed, mistake, quality,
         # robot_type, control_mode, subgoalK) with their _is_pad siblings,
@@ -1036,6 +1056,12 @@ class BaseDataset(torch.utils.data.Dataset):
         # / `frame_index` are plain ints (default-collate to a (B,) int64
         # tensor); VQA / missing values emit the sentinel -1 so a heterogeneous
         # LeRobot+VQA batch stays schema-aligned under default collation.
+        # Fold the flat `T * H` action axis into `(T, H)` and add the
+        # per-timestep loss mask. Runs last so every per-frame transform above
+        # (padding, column indexing, dtype cast) sees the flat layout it was
+        # written for.
+        self._reshape_to_sequence(standard_item)
+
         standard_item["source"] = self._get_feature_mapping_key()
         ep = item.get("episode_index")
         standard_item["episode_index"] = (
@@ -1045,6 +1071,80 @@ class BaseDataset(torch.utils.data.Dataset):
         standard_item["frame_index"] = int(fr.item() if torch.is_tensor(fr) else fr) if fr is not None else -1
 
         return standard_item
+
+    def _reshape_to_sequence(self, standard_item: dict) -> None:
+        """Give the sample a leading timestep axis, for recurrent policies.
+
+        The fetch layer returns the widened action query flat, as
+        ``(sequence_length * chunk, dim)`` — see the ``delta_timestamps``
+        construction in ``datasets/factory.py``. This folds it to
+        ``(sequence_length, chunk, dim)``, and its ``_is_pad`` sibling likewise.
+
+        Camera and state tensors already carry the time axis: their offsets are
+        one per timestep, so the fetch layer stacks them exactly as it does for
+        a history window.
+
+        Also emits ``loss_mask``, a ``(sequence_length,)`` bool that is True
+        where the timestep contributes an imitation target. It is all-True here;
+        a caller that wants context-only timesteps (in-context video
+        demonstrations, DAgger-style failure-to-correction pairs) overwrites it.
+        Emitting it unconditionally keeps the batch schema stable, which matters
+        because a heterogeneous mixture must collate.
+
+        No-op at ``sequence_length == 1``: the offsets collapse to
+        ``policy.action_delta_indices`` and every shape is what it was before
+        this feature existed.
+
+        Args:
+            standard_item: The sample being assembled, modified in place.
+        """
+        seq_len = getattr(self, "sequence_length", 1)
+        if seq_len <= 1:
+            return
+
+        for key in ("actions", "action_is_pad"):
+            value = standard_item.get(key)
+            if value is None:
+                continue
+            if value.shape[0] % seq_len != 0:
+                raise ValueError(
+                    f"`{key}` has leading dim {value.shape[0]}, not divisible by "
+                    f"sequence_length={seq_len}. The delta-timestamps query and the reshape "
+                    "have diverged; see `resolve_delta_timestamps`."
+                )
+            standard_item[key] = rearrange(value, "(t h) ... -> t h ...", t=seq_len)
+
+        standard_item["loss_mask"] = torch.ones(seq_len, dtype=torch.bool)
+
+    def _obs_history_pad_fallback(self, padded: bool) -> torch.Tensor:
+        """Build ``obs_history_is_pad`` when the fetch layer produced no state pad flags.
+
+        The passthrough branch in :meth:`_to_standard_data_format` forwards the fetch
+        layer's per-step state pad flags, whose length is the temporal layout:
+        ``n_obs_history`` frames in history mode, ``sequence_length`` timesteps in
+        sequence mode, and a single step otherwise. The fetch layer only attaches
+        those flags to samples whose query window actually crossed an episode
+        boundary, so interior samples fall through to this fallback — and it must
+        emit the *same* length, because one interior and one boundary sample land in
+        the same ``default_collate`` batch. A fixed ``(1,)`` here against the
+        passthrough's ``(T,)`` kills the batch with "Trying to resize storage that
+        is not resizable" — invisible at ``batch_size == 1``, which was the only
+        batch shape the sequence loader had run at before.
+
+        Args:
+            padded: Flag value to fill with — ``True`` marks every step padded
+                (the history-drop branch), ``False`` marks none padded.
+
+        Returns:
+            A bool tensor of shape ``(n_obs_history,)``, ``(sequence_length,)``, or
+            ``(1,)`` depending on the active temporal mode, filled with ``padded``.
+        """
+        if self.n_obs_history is not None:
+            length = self.n_obs_history
+        else:
+            seq_len = getattr(self, "sequence_length", 1) or 1
+            length = seq_len if seq_len > 1 else 1
+        return torch.full((length,), padded, dtype=torch.bool)
 
     def _emit_optional_keys(self, item: dict, standard_item: dict) -> None:
         """Emit optional memory/subgoal/metadata keys with training-time dropout.
@@ -1117,15 +1217,12 @@ class BaseDataset(torch.utils.data.Dataset):
         # The current step — current state and current camera frame — is kept.
         drop_hist = _roll(self.history_state_drop_prob)
         if drop_hist:
-            if self.n_obs_history is not None:
-                standard_item["obs_history_is_pad"] = torch.ones(self.n_obs_history, dtype=torch.bool)
-                if self.n_obs_history > 1:
-                    for k in range(self.num_cams):
-                        cam_key = f"camera{k}"
-                        if cam_key in standard_item:
-                            standard_item[cam_key][:-1] = 0
-            else:
-                standard_item["obs_history_is_pad"] = torch.tensor([True], dtype=torch.bool)
+            standard_item["obs_history_is_pad"] = self._obs_history_pad_fallback(padded=True)
+            if self.n_obs_history is not None and self.n_obs_history > 1:
+                for k in range(self.num_cams):
+                    cam_key = f"camera{k}"
+                    if cam_key in standard_item:
+                        standard_item[cam_key][:-1] = 0
 
         # (2) Subgoal drop. A single ``subgoal_is_pad`` flag covers every slot
         # because subgoals are either all present (annotated and not dropped)
@@ -1747,7 +1844,14 @@ class LeRobotDataset(BaseDataset):
             # An explicit subset now exists, so download only the kept episodes.
             self._episodes_were_specified = True
 
-        if self.episodes is not None and self.meta._version >= packaging.version.parse("v2.1"):
+        if (self.episodes is not None and self.meta._version >= packaging.version.parse("v2.1")
+                and self.meta.episodes_stats
+                and any(self.meta.episodes_stats.get(ep_idx) for ep_idx in self.episodes)):
+            # Only recompute subset stats when per-episode stats actually exist.
+            # If the episodes parquet has empty per-episode stats (e.g. an
+            # unprocessed node-local cache), keep the global meta/stats.json
+            # (self.meta.stats) so mixture-metadata dim inference + Normalize
+            # sizing still work; real values come from stats.json / norm override.
             self.stats = aggregate_stats([self.meta.episodes_stats[ep_idx] for ep_idx in self.episodes])
             # Propagate the selected-episode aggregate onto the metadata so the
             # mixture normalizer (which pools `ds.meta.stats`) reflects the
@@ -2779,9 +2883,22 @@ class LeRobotDataset(BaseDataset):
                 item["return_bin_idx"] = torch.tensor(0, dtype=torch.long)
                 item["return_continuous"] = torch.tensor(0, dtype=torch.float32)
 
-            # sanity check for action chunk lengths
-            assert item["actions"].shape[0] == self.cfg.action_chunk
-            assert item["action_is_pad"].shape[0] == self.cfg.action_chunk
+            # Sanity check for action chunk lengths. Under sequence emission the
+            # chunk sits on the *second* axis — `_reshape_to_sequence` has
+            # already folded the flat `T * chunk` query into `(T, chunk, ...)` —
+            # so check the whole leading shape rather than just dim 0, which
+            # would otherwise be T and fail.
+            if getattr(self, "sequence_length", 1) > 1:
+                expected = (self.sequence_length, self.cfg.action_chunk)
+                assert tuple(item["actions"].shape[:2]) == expected, (
+                    f"expected actions {expected} + dims, got {tuple(item['actions'].shape)}"
+                )
+                assert tuple(item["action_is_pad"].shape[:2]) == expected, (
+                    f"expected action_is_pad {expected}, got {tuple(item['action_is_pad'].shape)}"
+                )
+            else:
+                assert item["actions"].shape[0] == self.cfg.action_chunk
+                assert item["action_is_pad"].shape[0] == self.cfg.action_chunk
 
         return item
 

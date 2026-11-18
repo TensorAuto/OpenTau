@@ -22,6 +22,7 @@ from opentau.policies.cosmos3_nano.modeling_cosmos3_nano import Cosmos3NanoPolic
 from opentau.policies.pi0.modeling_pi0 import PI0Policy
 from opentau.policies.pi05.modeling_pi05 import PI05Policy
 from opentau.policies.pi05_mem.modeling_pi05 import PI05MemPolicy
+from opentau.policies.pi05_ttt.modeling_pi05_ttt import PI05TTTPolicy
 from opentau.policies.pi06.modeling_pi06 import PI06Policy
 from opentau.policies.pi07.high_level_planner.modeling_pi07_high_level import (
     PI07HighLevelPlannerPolicy,
@@ -42,6 +43,7 @@ def test_available_policies():
         ValueFunction,
         PI05Policy,
         PI05MemPolicy,
+        PI05TTTPolicy,
         PI06Policy,
         PI07HighLevelPlannerPolicy,
         PI07LowLevelPolicy,
